@@ -1,0 +1,7 @@
+# Every scenario test boots its own base + ER topology; cap how many run at once.
+[test-groups]
+topology = { max-threads = 2 }
+
+[[profile.default.overrides]]
+filter = "all()"
+test-group = "topology"
