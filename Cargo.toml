@@ -8,6 +8,7 @@ members = [
     "programs/redline",
     "programs/redshift",
     "programs/redhat",
+    "xtask",
 ]
 
 [workspace.package]
