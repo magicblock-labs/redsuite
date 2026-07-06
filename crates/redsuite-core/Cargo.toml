@@ -8,13 +8,16 @@ authors.workspace = true
 [dependencies]
 tokio = { workspace = true }
 async-trait = { workspace = true }
+reqwest = { workspace = true }
 
 serde = { workspace = true }
 json = { workspace = true }
 rand = { workspace = true }
+base64 = { workspace = true }
 
 pubkey = { workspace = true }
 keypair = { workspace = true }
 signature = { workspace = true }
 instruction = { workspace = true }
 account = { workspace = true }
+signer = { workspace = true }

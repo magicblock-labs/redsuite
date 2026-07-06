@@ -1,5 +1,7 @@
 use async_trait::async_trait;
-use redsuite_core::{run_scenario, BaseCtx, ErCtx, Result, Scenario, ScenarioReport};
+use redsuite_core::{
+    run_scenario, BaseCtx, ErCtx, Result, Scenario, ScenarioReport,
+};
 
 struct IllegalWritable;
 
@@ -9,14 +11,17 @@ impl Scenario for IllegalWritable {
         "redhat/illegal_writable"
     }
 
-    async fn run(&self, _base: &BaseCtx, _er: &ErCtx) -> Result<ScenarioReport> {
+    async fn run(
+        &self,
+        _base: &BaseCtx,
+        _er: &ErCtx,
+    ) -> Result<ScenarioReport> {
         // write to a non-delegated account on the ER must fail InvalidWritableAccount
         Ok(ScenarioReport::ok(self.name()))
     }
 }
 
 #[tokio::test]
-#[ignore = "topology harness not implemented yet"]
 async fn illegal_writable() {
     run_scenario(IllegalWritable).await;
 }

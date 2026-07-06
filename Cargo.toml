@@ -20,17 +20,20 @@ authors = ["Magicblock Labs <dev@magicblock.gg>"]
 [workspace.dependencies]
 redsuite-core = { path = "crates/redsuite-core" }
 
-tokio = { version = "1", features = ["rt", "macros", "time"] }
+tokio = { version = "1", features = ["rt", "macros", "time", "net"] }
 async-trait = "0.1"
+reqwest = { version = "0.12", default-features = false }
 
 serde = { version = "1", features = ["derive"] }
 json = { package = "sonic-rs", version = "0.5" }
 rand = "0.8"
+base64 = "0.22"
 
 pubkey = { package = "solana-pubkey", version = "2" }
 keypair = { package = "solana-keypair", version = "2" }
 signature = { package = "solana-signature", version = "2" }
 instruction = { package = "solana-instruction", version = "2" }
 account = { package = "solana-account", version = "2" }
+signer = { package = "solana-signer", version = "2" }
 
 solana-program = "2.2"

@@ -1,28 +1,20 @@
-//! Statistical aggregation for benchmark observations.
-//!
-//! Uses streaming algorithms (Welford's for mean/variance, reservoir sampling
-//! for percentiles) to efficiently process millions of latency measurements
-//! with minimal memory overhead.
-//!
-//! Ported verbatim from redline `core/src/stats.rs`
-//! (magicblock-labs/redline @ 14c642f).
+//! Statistical aggregation for benchmark observations: Welford's algorithm
+//! for mean/variance, reservoir sampling for percentiles — O(1) memory over
+//! millions of latency measurements.
+
+use std::collections::HashMap;
 
 use json::{Deserialize, Serialize};
 use rand::{rngs::ThreadRng, thread_rng, Rng};
-use std::collections::HashMap;
 
-/// # Streaming Statistics
-///
-/// Collects observations using Welford's algorithm for mean/variance and reservoir
-/// sampling for percentiles. Memory-efficient for millions of observations.
 #[derive(Debug)]
 pub struct StreamingStats {
     count: usize,
     mean: f64,
-    m2: f64, // Sum of squared deviations for variance calculation
+    m2: f64, // sum of squared deviations, for variance
     min: u32,
     max: u32,
-    reservoir: Vec<u32>, // Reservoir sampling for percentile estimation
+    reservoir: Vec<u32>,
     reservoir_size: usize,
     rng: ThreadRng,
 }
@@ -30,12 +22,10 @@ pub struct StreamingStats {
 impl StreamingStats {
     const DEFAULT_RESERVOIR_SIZE: usize = 10_000;
 
-    /// Creates a new `StreamingStats` with default reservoir size (10K samples).
     pub fn new() -> Self {
         Self::with_reservoir_size(Self::DEFAULT_RESERVOIR_SIZE)
     }
 
-    /// Creates a new `StreamingStats` with specified reservoir size.
     pub fn with_reservoir_size(reservoir_size: usize) -> Self {
         Self {
             count: 0,
@@ -49,19 +39,15 @@ impl StreamingStats {
         }
     }
 
-    /// Adds a new observation using Welford's online algorithm.
     pub fn push(&mut self, value: u32) {
-        // Welford's online algorithm for mean and variance
         self.count += 1;
         let delta = value as f64 - self.mean;
         self.mean += delta / self.count as f64;
         self.m2 += delta * (value as f64 - self.mean);
 
-        // Track min/max
         self.min = self.min.min(value);
         self.max = self.max.max(value);
 
-        // Reservoir sampling for percentiles
         if self.reservoir.len() < self.reservoir_size {
             self.reservoir.push(value);
         } else {
@@ -72,13 +58,11 @@ impl StreamingStats {
         }
     }
 
-    /// Finalizes the statistics and returns `ObservationsStats`.
     pub fn finalize(mut self, invertedq: bool) -> ObservationsStats {
         if self.count == 0 {
             return ObservationsStats::default();
         }
 
-        // Sort reservoir for percentile calculation
         self.reservoir.sort_unstable();
 
         let avg = self.mean as i32;
@@ -88,7 +72,6 @@ impl StreamingStats {
             avg
         };
 
-        // Calculate 95th percentile from reservoir
         let q95_count = (self.reservoir.len() as f64 * 0.95).ceil() as usize;
         let p95_idx = if invertedq {
             self.reservoir.len().saturating_sub(q95_count + 1)
@@ -101,7 +84,6 @@ impl StreamingStats {
             avg
         };
 
-        // Calculate standard deviation from variance
         let variance = if self.count > 1 {
             self.m2 / self.count as f64
         } else {
@@ -127,16 +109,12 @@ impl Default for StreamingStats {
     }
 }
 
-/// # Benchmark Statistics
-///
-/// A unified structure for storing all benchmark statistics, with a clear distinction
-/// between transaction and RPC request metrics.
 #[derive(Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct BenchStatistics {
     /// The configuration used for the benchmark.
     pub configuration: json::Value,
-    /// A map of statistics for each RPC-based benchmark mode.
+    /// Statistics per RPC-based benchmark mode.
     pub request_stats: HashMap<String, ObservationsStats>,
     /// Latency for receiving signature confirmations.
     pub signature_confirmation_latency: ObservationsStats,
@@ -146,9 +124,6 @@ pub struct BenchStatistics {
     pub rps: ObservationsStats,
 }
 
-/// # Observation Statistics
-///
-/// A detailed breakdown of a set of observations, including count, median, min, max, average, 95th percentile, and standard deviation.
 #[derive(Deserialize, Serialize, Clone, Copy, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct ObservationsStats {
@@ -162,14 +137,13 @@ pub struct ObservationsStats {
 }
 
 impl BenchStatistics {
-    /// # Merge Statistics
-    ///
-    /// Merges a vector of `BenchStatistics` into a single, consolidated report.
+    /// Consolidate the reports of parallel bench instances into one.
     pub fn merge(mut stats: Vec<Self>) -> Self {
         if stats.is_empty() {
             return Self::default();
         }
-        let configuration = std::mem::take(&mut stats.first_mut().unwrap().configuration);
+        let configuration =
+            std::mem::take(&mut stats.first_mut().unwrap().configuration);
         let mut request_stats = HashMap::new();
         let mut rps = Vec::new();
         let mut account_update_stats = Vec::new();
@@ -194,7 +168,10 @@ impl BenchStatistics {
 
         Self {
             configuration,
-            account_update_latency: ObservationsStats::merge(account_update_stats, true),
+            account_update_latency: ObservationsStats::merge(
+                account_update_stats,
+                true,
+            ),
             signature_confirmation_latency: ObservationsStats::merge(
                 signature_confirmation_stats,
                 true,
@@ -206,9 +183,6 @@ impl BenchStatistics {
 }
 
 impl ObservationsStats {
-    /// # Merge Observation Statistics
-    ///
-    /// Merges a vector of `ObservationsStats` into a single, consolidated report.
     /// With `average` the values are averaged across instances (min-of-mins,
     /// max-of-maxes); without it they are summed (used for RPS totals).
     pub fn merge(stats: Vec<ObservationsStats>, average: bool) -> Self {

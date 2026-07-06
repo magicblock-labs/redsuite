@@ -1,4 +1,6 @@
-# Every scenario test boots its own base + ER topology; cap how many run at once.
+# All scenario tests share one boot-once base+ER stack (the first test boots
+# it, the rest reuse it — see crates/redsuite-core/src/topology/stack.rs).
+# The group caps how many scenarios drive that stack concurrently.
 [test-groups]
 topology = { max-threads = 2 }
 

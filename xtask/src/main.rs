@@ -18,6 +18,9 @@ usage:
   cargo xtask refresh-base-programs <name> --from-chain <url>  dump the deployed program from a cluster
   cargo xtask refresh-base-programs all                        rebuild every base program from source
   cargo xtask check-base-programs                              verify base programs match the manifest sha256s
+  cargo xtask stack status                                     show the shared base+ER stack (booted on demand by tests)
+  cargo xtask stack down                                       stop the shared stack and clear its state
+  cargo xtask fmt [--check]                                    format the workspace (nightly rustfmt, rustfmt-nightly.toml)
 ";
 
 fn main() {
@@ -34,7 +37,9 @@ fn run() -> Result<()> {
         Some("programs") => programs(),
         Some("check-base-programs") => check_base_programs(),
         Some("refresh-base-programs") => match (arg(1), arg(2), arg(3)) {
-            (Some(name), Some("--from-chain"), Some(url)) => dump_from_chain(name, url),
+            (Some(name), Some("--from-chain"), Some(url)) => {
+                dump_from_chain(name, url)
+            }
             (Some("all"), None, None) => {
                 for name in base_program_names()? {
                     build_from_source(&name)?;
@@ -44,8 +49,30 @@ fn run() -> Result<()> {
             (Some(name), None, None) => build_from_source(name),
             _ => usage(),
         },
+        Some("stack") => match arg(1) {
+            Some("status") => stack_status(),
+            Some("down") => stack_down(),
+            _ => usage(),
+        },
+        Some("fmt") => match arg(1) {
+            None => fmt(false),
+            Some("--check") => fmt(true),
+            _ => usage(),
+        },
         _ => usage(),
     }
+}
+
+fn fmt(check: bool) -> Result<()> {
+    let mut cmd = Command::new("cargo");
+    cmd.args(["+nightly", "fmt"]);
+    if check {
+        cmd.arg("--check");
+    }
+    cmd.args(["--", "--config-path"])
+        .arg(root().join("rustfmt-nightly.toml"))
+        .current_dir(root());
+    run_cmd("cargo +nightly fmt", &mut cmd)
 }
 
 fn usage() -> Result<()> {
@@ -54,7 +81,10 @@ fn usage() -> Result<()> {
 }
 
 fn root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .to_path_buf()
 }
 
 fn manifest_path() -> PathBuf {
@@ -79,11 +109,18 @@ fn field(doc: &DocumentMut, name: &str, key: &str) -> Result<String> {
         .and_then(|table| table.get(key))
         .and_then(|item| item.as_str())
         .map(str::to_owned)
-        .ok_or_else(|| format!("missing `{key}` under [{name}] in base-programs/MANIFEST.toml").into())
+        .ok_or_else(|| {
+            format!(
+                "missing `{key}` under [{name}] in base-programs/MANIFEST.toml"
+            )
+            .into()
+        })
 }
 
 fn run_cmd(desc: &str, cmd: &mut Command) -> Result<()> {
-    let status = cmd.status().map_err(|e| format!("{desc}: failed to spawn: {e}"))?;
+    let status = cmd
+        .status()
+        .map_err(|e| format!("{desc}: failed to spawn: {e}"))?;
     if !status.success() {
         return Err(format!("{desc} failed ({status})").into());
     }
@@ -115,11 +152,16 @@ fn build_from_source(name: &str) -> Result<()> {
     println!("==> {name}: cloning {repo} @ {rev}");
     run_cmd(
         "git clone",
-        Command::new("git").args(["clone", "--quiet", &repo]).arg(&src),
+        Command::new("git")
+            .args(["clone", "--quiet", &repo])
+            .arg(&src),
     )?;
     run_cmd(
         "git checkout",
-        Command::new("git").arg("-C").arg(&src).args(["checkout", "--quiet", &rev]),
+        Command::new("git")
+            .arg("-C")
+            .arg(&src)
+            .args(["checkout", "--quiet", &rev]),
     )?;
 
     println!("==> {name}: cargo build-sbf");
@@ -147,14 +189,20 @@ fn build_from_source(name: &str) -> Result<()> {
                 .join(" ")
         })
         .unwrap_or_default();
-    install(name, &so, &format!("built from {repo} @ {rev} ({toolchain})"))
+    install(
+        name,
+        &so,
+        &format!("built from {repo} @ {rev} ({toolchain})"),
+    )
 }
 
 fn dump_from_chain(name: &str, url: &str) -> Result<()> {
     let doc = load_manifest()?;
     let id = field(&doc, name, "program-id")?;
 
-    let out = root().join("target/base-programs-src").join(format!("{name}-dump.so"));
+    let out = root()
+        .join("target/base-programs-src")
+        .join(format!("{name}-dump.so"));
     fs::create_dir_all(out.parent().unwrap())?;
 
     println!("==> {name}: dumping {id} from {url}");
@@ -187,7 +235,8 @@ fn check_base_programs() -> Result<()> {
     let mut failed = false;
     for name in base_program_names()? {
         let want = field(&doc, &name, "sha256")?;
-        let got = sha256(&root().join("base-programs").join(format!("{name}.so")))?;
+        let got =
+            sha256(&root().join("base-programs").join(format!("{name}.so")))?;
         if want == got {
             println!("ok:   {name}.so");
         } else {
@@ -203,8 +252,124 @@ fn check_base_programs() -> Result<()> {
 }
 
 fn sha256(path: &Path) -> Result<String> {
-    let bytes = fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    Ok(Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect())
+    let bytes =
+        fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(Sha256::digest(&bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
+}
+
+/// Subset of redsuite-core's `StackState` (topology/stack.rs); serde
+/// ignores the rest.
+#[derive(json::Deserialize)]
+struct StackState {
+    base_rpc_port: u16,
+    base_pid: u32,
+    base_bin: String,
+    er_rpc_port: u16,
+    er_metrics_port: u16,
+    er_pid: u32,
+    er_bin: String,
+    er_identity: String,
+}
+
+fn stack_state_path() -> PathBuf {
+    root().join("target/redsuite-stack/state.json")
+}
+
+fn read_stack_state() -> Result<Option<StackState>> {
+    let path = stack_state_path();
+    if !path.exists() {
+        return Ok(None);
+    }
+    let state = json::from_str(&fs::read_to_string(&path)?)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(Some(state))
+}
+
+/// PID alive and still the recorded binary (guards against PID reuse).
+fn proc_matches(pid: u32, bin: &str) -> bool {
+    fs::read(format!("/proc/{pid}/cmdline"))
+        .map(|cmdline| String::from_utf8_lossy(&cmdline).contains(bin))
+        .unwrap_or(false)
+}
+
+fn rpc_listening(port: u16) -> bool {
+    use std::net::{SocketAddr, TcpStream};
+    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+    TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(500))
+        .is_ok()
+}
+
+fn stack_status() -> Result<()> {
+    let Some(state) = read_stack_state()? else {
+        println!(
+            "no shared stack ({} absent) — the first scenario test boots it",
+            stack_state_path().display()
+        );
+        return Ok(());
+    };
+    let describe = |name: &str, pid: u32, bin: &str, port: u16| {
+        let proc_state = if proc_matches(pid, bin) {
+            "running"
+        } else {
+            "DEAD"
+        };
+        let rpc_state = if rpc_listening(port) {
+            "rpc up"
+        } else {
+            "rpc DOWN"
+        };
+        println!("{name:5} pid {pid:<8} {proc_state:8} 127.0.0.1:{port:<6} {rpc_state}   ({bin})");
+    };
+    describe("base", state.base_pid, &state.base_bin, state.base_rpc_port);
+    describe("er", state.er_pid, &state.er_bin, state.er_rpc_port);
+    println!("er identity   {}", state.er_identity);
+    println!(
+        "er metrics    http://127.0.0.1:{}/metrics",
+        state.er_metrics_port
+    );
+    println!(
+        "logs          {}",
+        root().join("target/redsuite-stack").display()
+    );
+    Ok(())
+}
+
+fn stack_down() -> Result<()> {
+    let Some(state) = read_stack_state()? else {
+        println!("no shared stack to stop");
+        return Ok(());
+    };
+    let procs = [
+        ("er", state.er_pid, state.er_bin.as_str()),
+        ("base", state.base_pid, state.base_bin.as_str()),
+    ];
+    for (name, pid, bin) in procs {
+        if proc_matches(pid, bin) {
+            println!("stopping {name} (pid {pid})");
+            let _ = Command::new("kill").arg(pid.to_string()).status();
+        }
+    }
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline
+        && procs.iter().any(|(_, pid, bin)| proc_matches(*pid, bin))
+    {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    for (name, pid, bin) in procs {
+        if proc_matches(pid, bin) {
+            println!("killing {name} (pid {pid}) — did not exit in time");
+            let _ = Command::new("kill")
+                .args(["-KILL", &pid.to_string()])
+                .status();
+        }
+    }
+    fs::remove_file(stack_state_path())?;
+    println!("stack down");
+    Ok(())
 }
 
 // Howard Hinnant's civil_from_days; avoids pulling in a date crate.

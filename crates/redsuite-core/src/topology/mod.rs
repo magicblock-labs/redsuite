@@ -1,17 +1,10 @@
-//! Topology harness: spawn / kill / restart the base L1 (`solana-test-validator`)
-//! and the ER (`magicblock-validator`) on dynamically allocated ports, with a
-//! readiness gate, killed on `Drop`. Net-new — the black-box replacement for
-//! test-integration's `test-tools/validator.rs`.
+//! Topology harness: spawn the base L1 and the ER on dynamically allocated
+//! ports, with a readiness gate covering the ER's startup checks (identity
+//! funding, fee-vault init, mdp registration).
+//!
+//! One shared boot-once stack serves all scenarios (see `stack`); private
+//! per-scenario topologies come back with the restart/ledger-restore family.
 
-use crate::{
-    context::{BaseCtx, ErCtx},
-    Result,
-};
+mod stack;
 
-pub struct Topology {}
-
-impl Topology {
-    pub async fn up() -> Result<(Self, BaseCtx, ErCtx)> {
-        todo!()
-    }
-}
+pub use stack::{shared, stack_dir, workspace_root, StackState};
