@@ -1,0 +1,11 @@
+[package]
+name = "redshift"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dev-dependencies]
+redsuite-core = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }

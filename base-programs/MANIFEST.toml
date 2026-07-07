@@ -1,0 +1,29 @@
+# Provenance of the pinned third-party programs loaded into the base L1 of
+# every topology. Refresh with `cargo xtask refresh-base-programs`; verify
+# with `cargo xtask check-base-programs`.
+#
+# Keep `rev` in sync with the client-crate revs pinned by the validator under
+# test (magicblock-validator Cargo.toml: magicblock-delegation-program-api /
+# magic-domain-program) — the ER is compiled against those layouts.
+#
+# The committor program (Comtr…dABq) is deliberately NOT vendored here: it is
+# part of the system-under-test artifact set and must come from the same build
+# as the ER binary.
+
+[dlp]
+program-id = "DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh"
+repo = "https://github.com/magicblock-labs/delegation-program.git"
+rev = "25386a7c1d406d06b8d07a4d5b0fd37d5e74213b"
+artifact = "dlp.so"
+sha256 = "36d4a4e8da1bad834a13c2651dbad7a8fc63df06201107af6b644290eb682d5a"
+obtained = "inherited from the magicblock-validator repo's checked-in elf (blob last updated 2bbcf6fc, 2026-03-26); build rev unknown"
+date = "2026-07-03"
+
+[mdp]
+program-id = "DmnRGfyyftzacFb1XadYhWF6vWqXwtQk5tbr6XgR3BA1"
+repo = "https://github.com/magicblock-labs/magic-domain-program.git"
+rev = "6cb903d"
+artifact = "mdp.so"
+sha256 = "0f673b59241cf9cd1c51dc022e59249892524d1216dc316ef2f80744613dd1aa"
+obtained = "inherited from the magicblock-validator repo's checked-in elf (blob last updated fc447cc7, 2025-06-02); build rev unknown"
+date = "2026-07-03"
