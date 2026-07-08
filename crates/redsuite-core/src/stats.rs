@@ -124,7 +124,7 @@ pub struct BenchStatistics {
     pub rps: ObservationsStats,
 }
 
-#[derive(Deserialize, Serialize, Clone, Copy, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct ObservationsStats {
     pub count: usize,

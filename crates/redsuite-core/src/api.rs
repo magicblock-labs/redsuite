@@ -5,9 +5,12 @@ use std::{collections::HashMap, str::FromStr};
 
 use account::Account;
 use base64::Engine;
+use hash::Hash;
 use json::{Deserialize, Serialize};
 use pubkey::Pubkey;
 use serde::de::DeserializeOwned;
+use signature::Signature;
+use transaction::Transaction;
 
 use crate::{transport::http, Result};
 
@@ -43,6 +46,18 @@ struct WithContext<T> {
 }
 
 #[derive(Deserialize)]
+struct RpcBlockhash {
+    blockhash: String,
+}
+
+#[derive(Deserialize)]
+struct RpcSignatureStatus {
+    #[serde(rename = "confirmationStatus")]
+    confirmation_status: Option<String>,
+    err: Option<json::Value>,
+}
+
+#[derive(Deserialize)]
 struct RpcAccount {
     lamports: u64,
     owner: String,
@@ -52,6 +67,7 @@ struct RpcAccount {
     rent_epoch: u64,
 }
 
+#[derive(Clone)]
 pub struct Api {
     url: String,
     client: reqwest::Client,
@@ -143,6 +159,44 @@ impl Api {
             rent_epoch: raw.rent_epoch,
         }))
     }
+
+    pub async fn get_latest_blockhash(&self) -> Result<Hash> {
+        let resp: WithContext<RpcBlockhash> = self
+            .call("getLatestBlockhash", r#"[{"commitment":"confirmed"}]"#)
+            .await?;
+        Ok(Hash::from_str(&resp.value.blockhash)?)
+    }
+
+    pub async fn send_transaction(
+        &self,
+        tx: &Transaction,
+    ) -> Result<Signature> {
+        let encoded = base64::engine::general_purpose::STANDARD
+            .encode(bincode::serialize(tx)?);
+        let params = format!(
+            r#"["{encoded}", {{"encoding":"base64","skipPreflight":true,"preflightCommitment":"confirmed"}}]"#
+        );
+        let sig: String = self.call("sendTransaction", &params).await?;
+        Ok(Signature::from_str(&sig)?)
+    }
+
+    pub async fn signature_confirmed(&self, sig: &Signature) -> Result<bool> {
+        let params = format!(r#"[["{sig}"]]"#);
+        let resp: WithContext<Vec<Option<RpcSignatureStatus>>> =
+            self.call("getSignatureStatuses", &params).await?;
+        let Some(Some(status)) = resp.value.first() else {
+            return Ok(false);
+        };
+        if let Some(err) = &status.err {
+            return Err(
+                format!("transaction {sig} failed on-chain: {err:?}").into()
+            );
+        }
+        Ok(matches!(
+            status.confirmation_status.as_deref(),
+            Some("confirmed" | "finalized")
+        ))
+    }
 }
 
 /// Snapshot of the ER's Prometheus `/metrics` endpoint.
@@ -193,4 +247,107 @@ pub async fn scrape_metrics(metrics_url: &str) -> Result<Metrics> {
     let url = format!("{}/metrics", metrics_url.trim_end_matches('/'));
     let text = http::get_once(&url).await?;
     Ok(Metrics::parse(&text))
+}
+
+#[derive(Debug)]
+pub struct MetricsDelta {
+    before: Metrics,
+    after: Metrics,
+}
+
+impl MetricsDelta {
+    pub fn new(before: Metrics, after: Metrics) -> Self {
+        Self { before, after }
+    }
+
+    pub fn counter(&self, name: &str) -> Option<f64> {
+        let after = self.after.get(name)?;
+        Some(after - self.before.get(name).unwrap_or(0.0))
+    }
+
+    pub fn gauge(&self, name: &str) -> Option<f64> {
+        self.after.get(name)
+    }
+
+    pub fn histogram_avg(&self, name: &str) -> Option<f64> {
+        let count = self.counter(&suffixed(name, "_count"))?;
+        if count <= 0.0 {
+            return None;
+        }
+        let sum = self.counter(&suffixed(name, "_sum"))?;
+        Some(sum / count)
+    }
+
+    pub fn before(&self) -> &Metrics {
+        &self.before
+    }
+
+    pub fn after(&self) -> &Metrics {
+        &self.after
+    }
+}
+
+// mbv_x{kind="y"} + _sum → mbv_x_sum{kind="y"}
+fn suffixed(name: &str, suffix: &str) -> String {
+    match name.find('{') {
+        Some(i) => format!("{}{}{}", &name[..i], suffix, &name[i..]),
+        None => format!("{name}{suffix}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metrics_delta_semantics() {
+        let before = Metrics::parse(
+            "# HELP mbv_clones total clones\n\
+             mbv_clones 10\n\
+             mbv_monitored_accounts 5\n",
+        );
+        let after = Metrics::parse(
+            "mbv_clones 17\n\
+             mbv_monitored_accounts 41\n\
+             mbv_evictions{reason=\"lru\"} 3\n",
+        );
+        let delta = MetricsDelta::new(before, after);
+        assert_eq!(delta.counter("mbv_clones"), Some(7.0));
+        // appeared inside the window: counts from zero
+        assert_eq!(delta.counter("mbv_evictions"), Some(3.0));
+        assert_eq!(delta.counter(r#"mbv_evictions{reason="lru"}"#), Some(3.0));
+        // absent from the after scrape: not exposed by this build
+        assert_eq!(delta.counter("mbv_nonexistent"), None);
+        assert_eq!(delta.gauge("mbv_monitored_accounts"), Some(41.0));
+        assert_eq!(delta.before().get("mbv_monitored_accounts"), Some(5.0));
+    }
+
+    #[test]
+    fn histogram_window_average() {
+        let before = Metrics::parse(
+            "mbv_proc_time_sum 10.0\n\
+             mbv_proc_time_count 100\n\
+             mbv_ensure_time_sum{kind=\"transaction\"} 2.0\n\
+             mbv_ensure_time_count{kind=\"transaction\"} 40\n\
+             mbv_idle_time_sum 5.0\n\
+             mbv_idle_time_count 50\n",
+        );
+        let after = Metrics::parse(
+            "mbv_proc_time_sum 14.0\n\
+             mbv_proc_time_count 300\n\
+             mbv_ensure_time_sum{kind=\"transaction\"} 3.0\n\
+             mbv_ensure_time_count{kind=\"transaction\"} 140\n\
+             mbv_idle_time_sum 5.0\n\
+             mbv_idle_time_count 50\n",
+        );
+        let delta = MetricsDelta::new(before, after);
+        assert_eq!(delta.histogram_avg("mbv_proc_time"), Some(0.02));
+        assert_eq!(
+            delta.histogram_avg(r#"mbv_ensure_time{kind="transaction"}"#),
+            Some(0.01)
+        );
+        // recorded nothing inside the window
+        assert_eq!(delta.histogram_avg("mbv_idle_time"), None);
+        assert_eq!(delta.histogram_avg("mbv_absent_time"), None);
+    }
 }

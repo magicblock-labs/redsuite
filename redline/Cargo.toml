@@ -5,7 +5,13 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
-[dev-dependencies]
+[dependencies]
 redsuite-core = { workspace = true }
+redline-program = { workspace = true }
+pubkey = { workspace = true }
+keypair = { workspace = true }
+signer = { workspace = true }
+
+[dev-dependencies]
 tokio = { workspace = true }
 async-trait = { workspace = true }

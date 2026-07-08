@@ -1,5 +1,6 @@
-//! Transport layer. Currently only the minimal HTTP shim; redline's pooled
-//! transports (HTTP/WS pools, rate limiting, confirmations) replace it in
-//! the engine port.
+//! Transport layer. The HTTP shim and rate pacer are in; redline's pooled
+//! HTTP/WS transports and confirmation tracking land next.
 
 pub mod http;
+pub mod rate;
+pub mod ws;

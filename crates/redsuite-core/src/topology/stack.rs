@@ -110,6 +110,14 @@ fn read_state() -> Option<StackState> {
     json::from_str(&fs::read_to_string(state_path()).ok()?).ok()
 }
 
+pub fn current_state() -> Option<StackState> {
+    read_state()
+}
+
+pub fn er_bin_path() -> Result<PathBuf> {
+    find_er_bin()
+}
+
 fn write_state(state: &StackState) -> Result<()> {
     let tmp = state_path().with_extension("json.tmp");
     fs::write(&tmp, json::to_string(state)?)?;
