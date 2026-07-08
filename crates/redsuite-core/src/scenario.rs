@@ -32,7 +32,7 @@ async fn run_inner(scenario: impl Scenario) -> ScenarioReport {
         let knobs: Vec<String> = report
             .config
             .iter()
-            .map(|(k, v)| format!("{k}={v}"))
+            .map(|(key, value)| format!("{key}={value}"))
             .collect();
         eprintln!("[redsuite]   config: {}", knobs.join(" "));
     }

@@ -100,11 +100,11 @@ pub fn persist(report: &ScenarioReport) -> Result<PathBuf> {
     let slug = report.scenario.replace(['/', ' '], "-");
     let mut path = dir.join(format!("{}-{slug}.json", meta.recorded_at));
     // same scenario twice within a second — keep both runs
-    for n in 2.. {
+    for attempt in 2.. {
         if !path.exists() {
             break;
         }
-        path = dir.join(format!("{}-{slug}-{n}.json", meta.recorded_at));
+        path = dir.join(format!("{}-{slug}-{attempt}.json", meta.recorded_at));
     }
     fs::write(&path, body)?;
     Ok(path)
@@ -133,7 +133,7 @@ fn run_meta() -> RunMeta {
             .as_deref()
             .and_then(|exe| fs::read_link(exe).ok())
             .or(er.clone())
-            .map(|p| p.display().to_string())
+            .map(|path| path.display().to_string())
             .unwrap_or_else(|| "unknown".into()),
         er_version: er
             .as_deref()
@@ -154,8 +154,8 @@ fn fingerprint(path: &std::path::Path) -> String {
             let mtime = meta
                 .modified()
                 .ok()
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_secs())
                 .unwrap_or(0);
             format!("{}-{}", meta.len(), mtime)
         }
@@ -168,17 +168,25 @@ fn utc_stamp() -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let (hh, mm, ss) = ((secs / 3600) % 24, (secs / 60) % 60, secs % 60);
-    let z = (secs / 86_400) as i64 + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = yoe + era * 400 + i64::from(m <= 2);
-    format!("{y:04}{m:02}{d:02}T{hh:02}{mm:02}{ss:02}Z")
+    let (hours, minutes, seconds) =
+        ((secs / 3600) % 24, (secs / 60) % 60, secs % 60);
+    let days = (secs / 86_400) as i64 + 719_468;
+    let era = days.div_euclid(146_097);
+    let day_of_era = days.rem_euclid(146_097);
+    let year_of_era = (day_of_era - day_of_era / 1460 + day_of_era / 36524
+        - day_of_era / 146_096)
+        / 365;
+    let day_of_year =
+        day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    format!("{year:04}{month:02}{day:02}T{hours:02}{minutes:02}{seconds:02}Z")
 }
 
 #[cfg(test)]

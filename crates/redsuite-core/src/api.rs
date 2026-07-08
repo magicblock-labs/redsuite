@@ -232,7 +232,7 @@ impl Metrics {
             let value = rest
                 .split_whitespace()
                 .next()
-                .and_then(|v| v.parse::<f64>().ok());
+                .and_then(|value| value.parse::<f64>().ok());
             let Some(value) = value else { continue };
             if let Some((bare, _)) = key.split_once('{') {
                 map.insert(bare.to_owned(), value);

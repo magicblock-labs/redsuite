@@ -91,13 +91,13 @@ impl Scenario for WarmIngress {
     }
 
     async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
-        let p = profile();
+        let profile = profile();
         let payers =
-            prep::funded_payers(base, p.payers, PAYER_LAMPORTS).await?;
+            prep::funded_payers(base, profile.payers, PAYER_LAMPORTS).await?;
         let pdas = redline::init_delegated_accounts(
             base,
             &payers[0],
-            p.accounts,
+            profile.accounts,
             redline::ACCOUNT_SPACE,
             er.identity(),
         )
@@ -116,18 +116,25 @@ impl Scenario for WarmIngress {
 
         let shape = |id: u64| {
             let len = pdas.len() as u64;
-            let base = ((id - 1) * 3) % len;
-            let src = pdas[base as usize];
-            let d1 = pdas[((base + 1) % len) as usize];
-            let d2 = pdas[((base + 2) % len) as usize];
-            (build::account_data_copy(id, &[src], &[d1, d2]), d1)
+            let base_index = ((id - 1) * 3) % len;
+            let source = pdas[base_index as usize];
+            let first_dest = pdas[((base_index + 1) % len) as usize];
+            let second_dest = pdas[((base_index + 2) % len) as usize];
+            (
+                build::account_data_copy(
+                    id,
+                    &[source],
+                    &[first_dest, second_dest],
+                ),
+                first_dest,
+            )
         };
 
         let warmup = drive(
             RunConfig {
-                iterations: p.warmup,
-                rate: p.rate,
-                concurrency: p.concurrency,
+                iterations: profile.warmup,
+                rate: profile.rate,
+                concurrency: profile.concurrency,
             },
             |id| {
                 let sender = senders[(id as usize) % senders.len()].clone();
@@ -157,9 +164,9 @@ impl Scenario for WarmIngress {
         // warmup discarded and setup complete — open the measured window
         let before = er.scrape_metrics().await?;
 
-        let offset = p.warmup;
-        let request = |i: u64| {
-            let id = offset + i;
+        let offset = profile.warmup;
+        let request = |iteration: u64| {
+            let id = offset + iteration;
             let sender = senders[(id as usize) % senders.len()].clone();
             let (ix, tracked_dest) = shape(id);
             updates.track(id, tracked_dest);
@@ -173,8 +180,8 @@ impl Scenario for WarmIngress {
                 Ok(())
             }
         };
-        let sync = |i: u64| {
-            let id = offset + i;
+        let sync = |iteration: u64| {
+            let id = offset + iteration;
             let sigs = sigs.clone();
             let updates = updates.clone();
             async move {
@@ -191,9 +198,9 @@ impl Scenario for WarmIngress {
             }
         };
         let cfg = RunConfig {
-            iterations: p.iterations,
-            rate: p.rate,
-            concurrency: p.concurrency,
+            iterations: profile.iterations,
+            rate: profile.rate,
+            concurrency: profile.concurrency,
         };
         let mode = loop_mode();
         let outcome = if mode == "closed" {
@@ -220,10 +227,10 @@ impl Scenario for WarmIngress {
         // nothing-failed-on-chain invariant
         if let Some(processed) = delta.counter("mbv_transaction_count") {
             assert!(
-                processed >= p.iterations as f64,
+                processed >= profile.iterations as f64,
                 "validator processed {processed} txs in the measured window, \
                  expected at least {}",
-                p.iterations
+                profile.iterations
             );
         }
         if let Some(failed) = delta.counter("mbv_failed_transactions_count") {
@@ -233,7 +240,7 @@ impl Scenario for WarmIngress {
         let update_outcome = updates.finalize();
         assert_eq!(
             update_outcome.observed + update_outcome.superseded,
-            p.iterations as usize,
+            profile.iterations as usize,
             "every tracked write must be observed or superseded"
         );
         let sig_outcome = sigs.finalize();
@@ -247,7 +254,7 @@ impl Scenario for WarmIngress {
             "signatures unconfirmed after {CONFIRM_TIMEOUT:?}"
         );
         assert_eq!(
-            sig_outcome.confirmed, p.iterations as usize,
+            sig_outcome.confirmed, profile.iterations as usize,
             "every measured tx must confirm"
         );
 
@@ -255,9 +262,11 @@ impl Scenario for WarmIngress {
             let len = pdas.len() as u64;
             let idx = idx as u64;
             let mut last_id = 0;
-            for id in offset + 1..=offset + p.iterations {
-                let base = ((id - 1) * 3) % len;
-                if (base + 1) % len == idx || (base + 2) % len == idx {
+            for id in offset + 1..=offset + profile.iterations {
+                let base_index = ((id - 1) * 3) % len;
+                if (base_index + 1) % len == idx
+                    || (base_index + 2) % len == idx
+                {
                     last_id = id;
                 }
             }
@@ -275,16 +284,16 @@ impl Scenario for WarmIngress {
         }
 
         let mut report = ScenarioReport::ok(self.name())
-            .setting("profile", p.name)
+            .setting("profile", profile.name)
             .setting("shape", "read-write 3/tx (1 src + 2 dst data-copy)")
             .setting("loop", mode)
             .setting("confirm timeout s", CONFIRM_TIMEOUT.as_secs())
-            .setting("payers", p.payers)
-            .setting("accounts", p.accounts)
-            .setting("warmup iters", p.warmup)
-            .setting("measured iters", p.iterations)
-            .setting("offered tps", p.rate)
-            .setting("concurrency", p.concurrency)
+            .setting("payers", profile.payers)
+            .setting("accounts", profile.accounts)
+            .setting("warmup iters", profile.warmup)
+            .setting("measured iters", profile.iterations)
+            .setting("offered tps", profile.rate)
+            .setting("concurrency", profile.concurrency)
             .observe("delivery us", outcome.delivery)
             .observe("signature latency us", sig_outcome.latency)
             .observe("achieved rps", outcome.rps)
@@ -300,7 +309,7 @@ impl Scenario for WarmIngress {
                 "validator tx processing avg us",
                 delta
                     .histogram_avg("mbv_transaction_processing_time")
-                    .map(|s| s * 1e6),
+                    .map(|seconds| seconds * 1e6),
             )
             .metric_if(
                 "validator ensure accounts avg us",
@@ -308,7 +317,7 @@ impl Scenario for WarmIngress {
                     .histogram_avg(
                         r#"mbv_ensure_accounts_time{kind="transaction"}"#,
                     )
-                    .map(|s| s * 1e6),
+                    .map(|seconds| seconds * 1e6),
             )
             .metric_if(
                 "validator txs in window",

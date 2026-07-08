@@ -138,8 +138,8 @@ impl AccountUpdates {
         count: usize,
         timeout: Duration,
     ) -> Result<()> {
-        self.await_shared(timeout, "subscription acks", |s| {
-            s.ready_subs >= count
+        self.await_shared(timeout, "subscription acks", |shared| {
+            shared.ready_subs >= count
         })
         .await
     }
@@ -156,16 +156,18 @@ impl AccountUpdates {
         count: usize,
         timeout: Duration,
     ) -> Result<()> {
-        self.await_shared(timeout, "account updates", |s| s.observed >= count)
-            .await
+        self.await_shared(timeout, "account updates", |shared| {
+            shared.observed >= count
+        })
+        .await
     }
 
     // Writes coalesce per slot, so completion is "nothing pending" rather
     // than "every id observed": a newer id for the same account settles the
     // older ones as superseded.
     pub async fn await_settled(&self, timeout: Duration) -> Result<()> {
-        self.await_shared(timeout, "pending account updates", |s| {
-            s.pending.is_empty()
+        self.await_shared(timeout, "pending account updates", |shared| {
+            shared.pending.is_empty()
         })
         .await
     }
@@ -271,13 +273,15 @@ async fn read_loop(
                     let settled: Vec<u64> = shared
                         .pending
                         .iter()
-                        .filter(|(&k, (acc, _))| *acc == account && k < id)
-                        .map(|(&k, _)| k)
+                        .filter(|(&pending_id, (acc, _))| {
+                            *acc == account && pending_id < id
+                        })
+                        .map(|(&pending_id, _)| pending_id)
                         .collect();
-                    for k in settled {
-                        shared.pending.remove(&k);
+                    for pending_id in settled {
+                        shared.pending.remove(&pending_id);
                         shared.superseded += 1;
-                        shared.settle_waiter(k);
+                        shared.settle_waiter(pending_id);
                     }
                 }
             }

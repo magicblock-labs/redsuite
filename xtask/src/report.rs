@@ -59,8 +59,8 @@ fn load_all() -> Result<BTreeMap<String, Vec<(String, Persisted)>>> {
     let mut files: Vec<PathBuf> = entries
         .collect::<std::io::Result<Vec<_>>>()?
         .into_iter()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|ext| ext == "json"))
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
         .collect();
     files.sort();
     for path in files {
@@ -91,8 +91,8 @@ pub fn list() -> Result<()> {
                 .report
                 .config
                 .iter()
-                .find(|(k, _)| k == "profile")
-                .map(|(_, v)| v.as_str())
+                .find(|(key, _)| key == "profile")
+                .map(|(_, value)| value.as_str())
                 .unwrap_or("-");
             println!(
                 "  {file}  passed={} profile={profile} er=\"{}\" [{}]",
@@ -111,10 +111,13 @@ enum Direction {
 }
 
 fn direction(label: &str) -> Direction {
-    let l = label.to_ascii_lowercase();
-    if l.contains("rps") || l.contains("tps") {
+    let lowered = label.to_ascii_lowercase();
+    if lowered.contains("rps") || lowered.contains("tps") {
         Direction::Higher
-    } else if l.ends_with(" us") || l.contains("lag") || l.contains("latency") {
+    } else if lowered.ends_with(" us")
+        || lowered.contains("lag")
+        || lowered.contains("latency")
+    {
         Direction::Lower
     } else {
         Direction::Info
@@ -151,8 +154,8 @@ fn verdict(dir: &Direction, old: f64, new: f64) -> Verdict {
     }
 }
 
-fn verdict_tag(v: Verdict) -> &'static str {
-    match v {
+fn verdict_tag(verdict: Verdict) -> &'static str {
+    match verdict {
         Verdict::Flat => "~ flat",
         Verdict::Regression => "!! REGRESSION",
         Verdict::Improvement => "++ improvement",
@@ -173,7 +176,7 @@ pub fn compare(filter: Option<&str>, strict: bool) -> Result<()> {
     let mut compared = 0usize;
 
     for (scenario, runs) in &all {
-        if filter.is_some_and(|f| !scenario.contains(f)) {
+        if filter.is_some_and(|wanted| !scenario.contains(wanted)) {
             continue;
         }
         if runs.len() < 2 {
@@ -219,10 +222,12 @@ pub fn compare(filter: Option<&str>, strict: bool) -> Result<()> {
             let keys: std::collections::BTreeSet<_> =
                 prev_cfg.keys().chain(last_cfg.keys()).collect();
             for key in keys {
-                let a = prev_cfg.get(key).map(String::as_str).unwrap_or("-");
-                let b = last_cfg.get(key).map(String::as_str).unwrap_or("-");
-                if a != b {
-                    println!("    {key}: {a} → {b}");
+                let prev_value =
+                    prev_cfg.get(key).map(String::as_str).unwrap_or("-");
+                let last_value =
+                    last_cfg.get(key).map(String::as_str).unwrap_or("-");
+                if prev_value != last_value {
+                    println!("    {key}: {prev_value} → {last_value}");
                 }
             }
             println!();
@@ -233,16 +238,16 @@ pub fn compare(filter: Option<&str>, strict: bool) -> Result<()> {
             .report
             .observations
             .iter()
-            .map(|(k, v)| (k.clone(), *v))
+            .map(|(label, stats)| (label.clone(), *stats))
             .collect();
         for (label, new_stats) in &last.report.observations {
             let Some(old_stats) = prev_obs.get(label) else {
                 continue;
             };
             let dir = direction(label);
-            let v =
+            let verdict =
                 verdict(&dir, old_stats.median as f64, new_stats.median as f64);
-            if v == Verdict::Regression {
+            if verdict == Verdict::Regression {
                 regressions += 1;
             }
             println!(
@@ -253,7 +258,7 @@ pub fn compare(filter: Option<&str>, strict: bool) -> Result<()> {
                 old_stats.quantile95,
                 new_stats.quantile95,
                 pct(old_stats.quantile95 as f64, new_stats.quantile95 as f64),
-                verdict_tag(v),
+                verdict_tag(verdict),
             );
         }
 
@@ -261,21 +266,21 @@ pub fn compare(filter: Option<&str>, strict: bool) -> Result<()> {
             .report
             .metrics
             .iter()
-            .map(|(k, v)| (k.clone(), *v))
+            .map(|(label, stats)| (label.clone(), *stats))
             .collect();
         for (label, new_value) in &last.report.metrics {
             let Some(old_value) = prev_metrics.get(label) else {
                 continue;
             };
             let dir = direction(label);
-            let v = verdict(&dir, *old_value, *new_value);
-            if v == Verdict::Regression {
+            let verdict = verdict(&dir, *old_value, *new_value);
+            if verdict == Verdict::Regression {
                 regressions += 1;
             }
             println!(
                 "  {label:<34} {old_value:.1} → {new_value:.1} ({})  {}",
                 pct(*old_value, *new_value),
-                verdict_tag(v),
+                verdict_tag(verdict),
             );
         }
         println!();
@@ -311,8 +316,8 @@ fn slug(label: &str) -> String {
         .trim()
         .to_ascii_lowercase()
         .chars()
-        .map(|c| if c == ' ' { '-' } else { c })
-        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+        .map(|ch| if ch == ' ' { '-' } else { ch })
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
         .collect()
 }
 
@@ -338,8 +343,8 @@ fn bmf_document(
                 );
         }
         for (label, value) in &report.metrics {
-            let l = label.to_ascii_lowercase();
-            if l.contains("tps") || l.contains("rps") {
+            let lowered = label.to_ascii_lowercase();
+            if lowered.contains("tps") || lowered.contains("rps") {
                 doc.entry(format!("{scenario}/{}", slug(label)))
                     .or_default()
                     .insert(

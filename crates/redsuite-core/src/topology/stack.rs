@@ -183,7 +183,7 @@ fn proc_running(pid: u32) -> bool {
     // `pid (comm) S …` — comm may contain anything, so find the last ')'.
     let state = stat
         .rfind(')')
-        .and_then(|i| stat[i + 1..].trim_start().chars().next());
+        .and_then(|paren_at| stat[paren_at + 1..].trim_start().chars().next());
     !matches!(state, Some('Z') | None)
 }
 
