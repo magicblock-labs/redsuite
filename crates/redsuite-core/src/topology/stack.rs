@@ -26,9 +26,9 @@ use crate::{
     Result,
 };
 
-const DLP_ID: &str = "DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh";
-const MDP_ID: &str = "DmnRGfyyftzacFb1XadYhWF6vWqXwtQk5tbr6XgR3BA1";
-const COMMITTOR_ID: &str = "ComtrB2KEaWgXsW1dhr1xYL4Ht4Bjj3gXnnL6KMdABq";
+pub const DLP_ID: &str = "DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh";
+pub const MDP_ID: &str = "DmnRGfyyftzacFb1XadYhWF6vWqXwtQk5tbr6XgR3BA1";
+pub const COMMITTOR_ID: &str = "ComtrB2KEaWgXsW1dhr1xYL4Ht4Bjj3gXnnL6KMdABq";
 
 /// Keep in sync with `declare_id!` in `programs/*/src/lib.rs`.
 const FAMILY_PROGRAMS: &[(&str, &str)] = &[
@@ -309,29 +309,16 @@ async fn boot_er(
         .airdrop(&identity.pubkey(), IDENTITY_FUNDING_LAMPORTS)
         .await?;
 
-    let mut cmd = Command::new(er_bin);
-    cmd.arg("--remotes")
-        .arg(format!("http://127.0.0.1:{}", state.base_rpc_port))
-        .arg("--remotes")
-        .arg(format!("ws://127.0.0.1:{}", state.base_ws_port))
-        .args(["--lifecycle", "ephemeral"])
-        .arg("-l")
-        .arg(format!("127.0.0.1:{}", state.er_rpc_port))
-        .arg("-k")
-        .arg(identity.to_base58_string()) // throwaway test identity
-        .arg("--storage")
-        .arg(dir.join("er-storage"))
-        .arg("--reset")
-        .arg("--no-tui");
-    // Not `-m`: the CLI overlay feeds a bare string where a MetricsConfig
-    // struct is expected and the validator exits — the env path works.
-    cmd.env(
-        "MBV_METRICS__ADDRESS",
-        format!("127.0.0.1:{}", state.er_metrics_port),
+    let cmd = er_command(
+        er_bin,
+        identity,
+        &format!("http://127.0.0.1:{}", state.base_rpc_port),
+        &format!("ws://127.0.0.1:{}", state.base_ws_port),
+        state.er_rpc_port,
+        state.er_metrics_port,
+        &dir.join("er-storage"),
+        &[],
     );
-    if std::env::var_os("RUST_LOG").is_none() {
-        cmd.env("RUST_LOG", "info");
-    }
     eprintln!("[redsuite] booting ER on 127.0.0.1:{} …", state.er_rpc_port);
     let er_log = dir.join("er.log");
     let er_pid = spawn_detached(cmd, &er_log)?;
@@ -351,6 +338,132 @@ async fn boot_er(
     }
 
     Ok(er_pid)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn er_command(
+    er_bin: &Path,
+    identity: &Keypair,
+    base_rpc_url: &str,
+    base_ws_url: &str,
+    listen_port: u16,
+    metrics_port: u16,
+    storage_dir: &Path,
+    extra_env: &[(String, String)],
+) -> Command {
+    let mut cmd = Command::new(er_bin);
+    cmd.arg("--remotes")
+        .arg(base_rpc_url)
+        .arg("--remotes")
+        .arg(base_ws_url)
+        .args(["--lifecycle", "ephemeral"])
+        .arg("-l")
+        .arg(format!("127.0.0.1:{listen_port}"))
+        .arg("-k")
+        .arg(identity.to_base58_string()) // throwaway test identity
+        .arg("--storage")
+        .arg(storage_dir)
+        .arg("--reset")
+        .arg("--no-tui");
+    // Not `-m`: the CLI overlay feeds a bare string where a MetricsConfig
+    // struct is expected and the validator exits — the env path works.
+    cmd.env("MBV_METRICS__ADDRESS", format!("127.0.0.1:{metrics_port}"));
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
+    if std::env::var_os("RUST_LOG").is_none() {
+        cmd.env("RUST_LOG", "info");
+    }
+    cmd
+}
+
+pub struct ErOptions {
+    pub label: String,
+    // e.g. ("MBV_CHAINLINK__MAX_MONITORED_ACCOUNTS", "100")
+    pub env: Vec<(String, String)>,
+    pub request_timeout: Option<Duration>,
+}
+
+pub struct PrivateEr {
+    pid: u32,
+    label: String,
+    ctx: ErCtx,
+}
+
+impl PrivateEr {
+    pub fn ctx(&self) -> &ErCtx {
+        &self.ctx
+    }
+}
+
+impl Drop for PrivateEr {
+    fn drop(&mut self) {
+        eprintln!(
+            "[redsuite] stopping private ER `{}` (pid {})",
+            self.label, self.pid
+        );
+        kill_pid(self.pid);
+    }
+}
+
+pub async fn private_er(
+    base: &BaseCtx,
+    options: ErOptions,
+) -> Result<PrivateEr> {
+    let dir = stack_dir();
+    fs::create_dir_all(&dir)?;
+    let er_bin = find_er_bin()?;
+    let identity = Keypair::try_from(&TEST_IDENTITY_KEYPAIR[..])
+        .map_err(|e| format!("bad TEST_IDENTITY_KEYPAIR: {e}"))?;
+    base.airdrop(&identity.pubkey(), IDENTITY_FUNDING_LAMPORTS)
+        .await?;
+
+    let (rpc_port, ws_port) = free_port_pair()?;
+    let metrics_port = free_port()?;
+    let storage_dir = dir.join(format!("er-{}", options.label));
+    let log = dir.join(format!("er-{}.log", options.label));
+    let cmd = er_command(
+        &er_bin,
+        &identity,
+        base.api().url(),
+        base.ws_url(),
+        rpc_port,
+        metrics_port,
+        &storage_dir,
+        &options.env,
+    );
+    eprintln!(
+        "[redsuite] booting private ER `{}` on 127.0.0.1:{rpc_port} …",
+        options.label
+    );
+    let pid = spawn_detached(cmd, &log)?;
+
+    let er_api = Api::new(format!("http://127.0.0.1:{rpc_port}"));
+    let ready = wait_until(
+        ER_READY_TIMEOUT,
+        "private ER RPC answering",
+        &log,
+        pid,
+        || async { er_api.server_alive().await },
+    )
+    .await;
+    if let Err(e) = ready {
+        kill_pid(pid);
+        return Err(e);
+    }
+
+    let ctx = ErCtx::new_with_timeout(
+        format!("http://127.0.0.1:{rpc_port}"),
+        format!("ws://127.0.0.1:{ws_port}"),
+        format!("http://127.0.0.1:{metrics_port}"),
+        identity.pubkey(),
+        options.request_timeout,
+    );
+    Ok(PrivateEr {
+        pid,
+        label: options.label,
+        ctx,
+    })
 }
 
 async fn wait_until<F, Fut>(
@@ -507,6 +620,9 @@ fn bin_name(path: &Path) -> String {
 /// the log is truncated on each boot.
 fn spawn_detached(mut cmd: Command, log: &Path) -> Result<u32> {
     use std::os::unix::process::CommandExt;
+    if log.exists() {
+        let _ = fs::rename(log, log.with_extension("log.prev"));
+    }
     let logfile = fs::File::create(log)?;
     cmd.stdout(logfile.try_clone()?)
         .stderr(logfile)

@@ -168,8 +168,22 @@ impl ErCtx {
         metrics_url: String,
         identity: Pubkey,
     ) -> Self {
+        Self::new_with_timeout(rpc_url, ws_url, metrics_url, identity, None)
+    }
+
+    pub(crate) fn new_with_timeout(
+        rpc_url: String,
+        ws_url: String,
+        metrics_url: String,
+        identity: Pubkey,
+        request_timeout: Option<Duration>,
+    ) -> Self {
+        let api = match request_timeout {
+            Some(timeout) => Api::with_timeout(rpc_url, timeout),
+            None => Api::new(rpc_url),
+        };
         Self {
-            api: Api::new(rpc_url),
+            api,
             ws_url,
             metrics_url,
             identity,
@@ -191,6 +205,10 @@ impl ErCtx {
 
     pub fn identity(&self) -> Pubkey {
         self.identity
+    }
+
+    pub fn metrics_url(&self) -> &str {
+        &self.metrics_url
     }
 
     pub async fn scrape_metrics(&self) -> Result<Metrics> {

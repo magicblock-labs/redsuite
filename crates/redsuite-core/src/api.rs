@@ -1,7 +1,7 @@
 //! Public-API client. Interim JSON-RPC subset until the redline engine port
 //! (pooled transports, WebSocket subscriptions).
 
-use std::{collections::HashMap, str::FromStr};
+use std::{collections::HashMap, str::FromStr, time::Duration};
 
 use account::Account;
 use base64::Engine;
@@ -67,6 +67,40 @@ struct RpcAccount {
     rent_epoch: u64,
 }
 
+#[derive(Deserialize)]
+struct RpcTransaction {
+    slot: u64,
+    meta: Option<RpcTransactionMeta>,
+}
+
+#[derive(Deserialize)]
+struct RpcTransactionMeta {
+    err: Option<json::Value>,
+    #[serde(rename = "logMessages")]
+    log_messages: Option<Vec<String>>,
+}
+
+#[derive(Debug)]
+pub struct TransactionInfo {
+    pub slot: u64,
+    // on-chain execution error; None = the transaction succeeded
+    pub err: Option<json::Value>,
+    pub logs: Vec<String>,
+}
+
+#[derive(Debug)]
+pub struct SignatureStatus {
+    pub confirmed: bool,
+    pub err: Option<json::Value>,
+}
+
+#[derive(Deserialize)]
+struct RpcSignatureInfo {
+    signature: String,
+}
+
+const TX_POLL: Duration = Duration::from_millis(200);
+
 #[derive(Clone)]
 pub struct Api {
     url: String,
@@ -81,6 +115,13 @@ impl Api {
         }
     }
 
+    pub fn with_timeout(url: impl Into<String>, timeout: Duration) -> Self {
+        Self {
+            url: url.into(),
+            client: http::client_with_timeout(timeout),
+        }
+    }
+
     pub fn url(&self) -> &str {
         &self.url
     }
@@ -92,6 +133,19 @@ impl Api {
         method: &str,
         params: &str,
     ) -> Result<T> {
+        self.call_nullable(method, params).await?.ok_or_else(|| {
+            format!("{method}: response carried neither result nor error")
+                .into()
+        })
+    }
+
+    // For methods where a null result is a legitimate answer (getTransaction
+    // on an unknown signature) rather than a protocol violation.
+    pub async fn call_nullable<T: DeserializeOwned>(
+        &self,
+        method: &str,
+        params: &str,
+    ) -> Result<Option<T>> {
         let body = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{params}}}"#
         );
@@ -105,10 +159,7 @@ impl Api {
                 message: err.message,
             }));
         }
-        envelope.result.ok_or_else(|| {
-            format!("{method}: response carried neither result nor error")
-                .into()
-        })
+        Ok(envelope.result)
     }
 
     pub async fn get_health(&self) -> Result<String> {
@@ -181,10 +232,7 @@ impl Api {
     }
 
     pub async fn signature_confirmed(&self, sig: &Signature) -> Result<bool> {
-        let params = format!(r#"[["{sig}"]]"#);
-        let resp: WithContext<Vec<Option<RpcSignatureStatus>>> =
-            self.call("getSignatureStatuses", &params).await?;
-        let Some(Some(status)) = resp.value.first() else {
+        let Some(status) = self.get_signature_status(sig).await? else {
             return Ok(false);
         };
         if let Some(err) = &status.err {
@@ -192,11 +240,92 @@ impl Api {
                 format!("transaction {sig} failed on-chain: {err:?}").into()
             );
         }
-        Ok(matches!(
-            status.confirmation_status.as_deref(),
-            Some("confirmed" | "finalized")
-        ))
+        Ok(status.confirmed)
     }
+
+    pub async fn get_signature_status(
+        &self,
+        sig: &Signature,
+    ) -> Result<Option<SignatureStatus>> {
+        let params = format!(r#"[["{sig}"]]"#);
+        let resp: WithContext<Vec<Option<RpcSignatureStatus>>> =
+            self.call("getSignatureStatuses", &params).await?;
+        let Some(Some(status)) = resp.value.into_iter().next() else {
+            return Ok(None);
+        };
+        Ok(Some(SignatureStatus {
+            confirmed: matches!(
+                status.confirmation_status.as_deref(),
+                Some("confirmed" | "finalized")
+            ),
+            err: status.err,
+        }))
+    }
+
+    pub async fn get_transaction(
+        &self,
+        sig: &Signature,
+    ) -> Result<Option<TransactionInfo>> {
+        let params = format!(
+            r#"["{sig}", {{"encoding":"json","commitment":"confirmed","maxSupportedTransactionVersion":0}}]"#
+        );
+        let raw: Option<RpcTransaction> =
+            self.call_nullable("getTransaction", &params).await?;
+        Ok(raw.map(|tx| {
+            let (err, logs) = match tx.meta {
+                Some(meta) => (meta.err, meta.log_messages.unwrap_or_default()),
+                None => (None, Vec::new()),
+            };
+            TransactionInfo {
+                slot: tx.slot,
+                err,
+                logs,
+            }
+        }))
+    }
+
+    pub async fn get_signatures_for_address(
+        &self,
+        pk: &Pubkey,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        let params = format!(
+            r#"["{pk}", {{"limit":{limit},"commitment":"confirmed"}}]"#
+        );
+        let infos: Vec<RpcSignatureInfo> =
+            self.call("getSignaturesForAddress", &params).await?;
+        Ok(infos.into_iter().map(|info| info.signature).collect())
+    }
+
+    // A delivered transaction lands in the ledger a moment later — poll for it.
+    pub async fn await_transaction(
+        &self,
+        sig: &Signature,
+        timeout: Duration,
+    ) -> Result<TransactionInfo> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if let Some(tx) = self.get_transaction(sig).await? {
+                return Ok(tx);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "transaction {sig} not found within {timeout:?}"
+                )
+                .into());
+            }
+            tokio::time::sleep(TX_POLL).await;
+        }
+    }
+}
+
+pub fn custom_error_code(err: &json::Value) -> Option<u32> {
+    use json::JsonValueTrait;
+    err.get("InstructionError")?
+        .get(1)?
+        .get("Custom")?
+        .as_u64()
+        .and_then(|code| u32::try_from(code).ok())
 }
 
 /// Snapshot of the ER's Prometheus `/metrics` endpoint.
@@ -206,6 +335,23 @@ pub struct Metrics(pub HashMap<String, f64>);
 impl Metrics {
     pub fn get(&self, name: &str) -> Option<f64> {
         self.0.get(name).copied()
+    }
+
+    pub fn value_sum(&self, name: &str) -> Option<f64> {
+        let label_prefix = format!("{name}{{");
+        let mut sum = 0.0;
+        let mut matched = false;
+        for (key, value) in &self.0 {
+            if key.starts_with(&label_prefix) {
+                matched = true;
+                sum += value;
+            }
+        }
+        if matched {
+            Some(sum)
+        } else {
+            self.get(name)
+        }
     }
 
     /// Keys are stored both with their label set (`mbv_x{a="b"}`) and bare
@@ -275,6 +421,34 @@ impl MetricsDelta {
             return None;
         }
         let sum = self.counter(&suffixed(name, "_sum"))?;
+        Some(sum / count)
+    }
+
+    pub fn counter_all(&self, name: &str) -> Option<f64> {
+        let label_prefix = format!("{name}{{");
+        let mut sum = 0.0;
+        let mut matched = false;
+        for (key, after_value) in &self.after.0 {
+            if !key.starts_with(&label_prefix) {
+                continue;
+            }
+            matched = true;
+            sum += after_value - self.before.get(key).unwrap_or(0.0);
+        }
+        if matched {
+            Some(sum)
+        } else {
+            self.counter(name)
+        }
+    }
+
+    // Window average over ALL series of a (possibly labeled) histogram.
+    pub fn histogram_avg_all(&self, name: &str) -> Option<f64> {
+        let count = self.counter_all(&format!("{name}_count"))?;
+        if count <= 0.0 {
+            return None;
+        }
+        let sum = self.counter_all(&format!("{name}_sum"))?;
         Some(sum / count)
     }
 
@@ -349,5 +523,58 @@ mod tests {
         // recorded nothing inside the window
         assert_eq!(delta.histogram_avg("mbv_idle_time"), None);
         assert_eq!(delta.histogram_avg("mbv_absent_time"), None);
+    }
+
+    #[test]
+    fn labeled_family_sums_series_not_the_bare_duplicate() {
+        let before = Metrics::parse(
+            "mbv_failed{intent_kind=\"commit\",error_kind=\"fit\"} 2\n",
+        );
+        let after = Metrics::parse(
+            "mbv_failed{intent_kind=\"commit\",error_kind=\"fit\"} 5\n\
+             mbv_failed{intent_kind=\"commit\",error_kind=\"alt\"} 4\n",
+        );
+        let delta = MetricsDelta::new(before, after);
+        // 3 from the fit series + 4 appeared-in-window, bare key ignored
+        assert_eq!(delta.counter_all("mbv_failed"), Some(7.0));
+        // unlabeled metrics fall through to the plain counter
+        let plain = MetricsDelta::new(
+            Metrics::parse("mbv_intents 10\n"),
+            Metrics::parse("mbv_intents 16\n"),
+        );
+        assert_eq!(plain.counter_all("mbv_intents"), Some(6.0));
+        assert_eq!(plain.counter_all("mbv_never_seen"), None);
+    }
+
+    #[test]
+    fn labeled_histogram_window_average_across_series() {
+        let before = Metrics::parse(
+            "mbv_exec_sum{outcome=\"ok\"} 1.0\n\
+             mbv_exec_count{outcome=\"ok\"} 10\n",
+        );
+        let after = Metrics::parse(
+            "mbv_exec_sum{outcome=\"ok\"} 3.0\n\
+             mbv_exec_count{outcome=\"ok\"} 30\n\
+             mbv_exec_sum{outcome=\"err\"} 1.0\n\
+             mbv_exec_count{outcome=\"err\"} 20\n",
+        );
+        let delta = MetricsDelta::new(before, after);
+        // (2.0 + 1.0) / (20 + 20)
+        assert_eq!(delta.histogram_avg_all("mbv_exec"), Some(0.075));
+    }
+
+    #[test]
+    fn custom_error_code_extraction() {
+        let err: json::Value =
+            json::from_str(r#"{"InstructionError":[0,{"Custom":2684354560}]}"#)
+                .unwrap();
+        assert_eq!(custom_error_code(&err), Some(0xA000_0000));
+        let not_custom: json::Value =
+            json::from_str(r#"{"InstructionError":[1,"InvalidArgument"]}"#)
+                .unwrap();
+        assert_eq!(custom_error_code(&not_custom), None);
+        let other: json::Value =
+            json::from_str(r#""BlockhashNotFound""#).unwrap();
+        assert_eq!(custom_error_code(&other), None);
     }
 }

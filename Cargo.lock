@@ -1824,10 +1824,12 @@ name = "redline"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "futures-util",
  "redline-program",
  "redsuite-core",
  "solana-keypair",
  "solana-pubkey 3.0.0",
+ "solana-signature",
  "solana-signer",
  "tokio",
 ]
