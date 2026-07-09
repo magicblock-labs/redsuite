@@ -17,3 +17,31 @@ signature = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true }
 async-trait = { workspace = true }
+
+[[test]]
+name = "rpc_warm_ingress"
+path = "tests/aperture/rpc_warm_ingress.rs"
+
+[[test]]
+name = "simple_load"
+path = "tests/aperture/simple_load.rs"
+
+[[test]]
+name = "high_cu"
+path = "tests/aperture/high_cu.rs"
+
+[[test]]
+name = "ensure_gate_stall"
+path = "tests/chainlink/ensure_gate_stall.rs"
+
+[[test]]
+name = "commit_throughput_ceiling"
+path = "tests/committor/commit_throughput_ceiling.rs"
+
+[[test]]
+name = "commit_width_envelope"
+path = "tests/committor/commit_width_envelope.rs"
+
+[[test]]
+name = "hot_account_cliff"
+path = "tests/scheduler/hot_account_cliff.rs"
