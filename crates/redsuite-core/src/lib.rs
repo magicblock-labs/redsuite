@@ -1,7 +1,9 @@
 pub mod api;
 pub mod assert;
 pub mod context;
+pub mod monitor;
 pub mod prep;
+pub mod receipt;
 pub mod report;
 pub mod runner;
 pub mod scenario;

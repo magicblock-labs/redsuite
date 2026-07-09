@@ -8,9 +8,11 @@ authors.workspace = true
 [dependencies]
 redsuite-core = { workspace = true }
 redline-program = { workspace = true }
+futures-util = { workspace = true }
 pubkey = { workspace = true }
 keypair = { workspace = true }
 signer = { workspace = true }
+signature = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
