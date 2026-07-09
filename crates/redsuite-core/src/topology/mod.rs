@@ -7,4 +7,6 @@
 
 mod stack;
 
-pub use stack::{shared, stack_dir, workspace_root, StackState};
+pub use stack::{
+    current_state, er_bin_path, shared, stack_dir, workspace_root, StackState,
+};

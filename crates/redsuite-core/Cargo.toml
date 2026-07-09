@@ -7,6 +7,8 @@ authors.workspace = true
 
 [dependencies]
 tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
 async-trait = { workspace = true }
 reqwest = { workspace = true }
 
@@ -21,3 +23,6 @@ signature = { workspace = true }
 instruction = { workspace = true }
 account = { workspace = true }
 signer = { workspace = true }
+hash = { workspace = true }
+transaction = { workspace = true }
+bincode = { workspace = true }

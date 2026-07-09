@@ -1,3 +1,5 @@
+mod report;
+
 use std::{
     env, fs,
     path::{Path, PathBuf},
@@ -20,6 +22,9 @@ usage:
   cargo xtask check-base-programs                              verify base programs match the manifest sha256s
   cargo xtask stack status                                     show the shared base+ER stack (booted on demand by tests)
   cargo xtask stack down                                       stop the shared stack and clear its state
+  cargo xtask report list                                      list persisted scenario reports (target/redsuite-reports/)
+  cargo xtask report compare [scenario] [--strict]             diff the latest two runs per scenario; --strict fails on regressions
+  cargo xtask report bmf [--out <path>]                        export the latest reports as Bencher Metric Format JSON
   cargo xtask fmt [--check]                                    format the workspace (nightly rustfmt, rustfmt-nightly.toml)
 ";
 
@@ -52,6 +57,22 @@ fn run() -> Result<()> {
         Some("stack") => match arg(1) {
             Some("status") => stack_status(),
             Some("down") => stack_down(),
+            _ => usage(),
+        },
+        Some("report") => match arg(1) {
+            Some("list") => report::list(),
+            Some("compare") => {
+                let rest = &args[2..];
+                let strict = rest.iter().any(|a| a == "--strict");
+                let filter =
+                    rest.iter().find(|a| !a.starts_with("--")).cloned();
+                report::compare(filter.as_deref(), strict)
+            }
+            Some("bmf") => match (arg(2), arg(3)) {
+                (Some("--out"), Some(path)) => report::bmf(Some(path)),
+                (None, _) => report::bmf(None),
+                _ => usage(),
+            },
             _ => usage(),
         },
         Some("fmt") => match arg(1) {
