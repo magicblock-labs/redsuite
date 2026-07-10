@@ -63,6 +63,7 @@ const ER_BIN_ENV: &str = "MAGICBLOCK_VALIDATOR_BIN";
 /// ER startup gate: identity must hold ≥ 5 SOL on the base. Fund with headroom.
 const IDENTITY_FUNDING_LAMPORTS: u64 = 20 * 1_000_000_000;
 
+const BASE_LEDGER_SHREDS: &str = "200000";
 const BASE_READY_TIMEOUT: Duration = Duration::from_secs(60);
 const ER_READY_TIMEOUT: Duration = Duration::from_secs(120);
 const KILL_GRACE: Duration = Duration::from_secs(5);
@@ -215,7 +216,7 @@ async fn boot() -> Result<StackState> {
 
     let mut cmd = Command::new(&base_bin);
     cmd.args(["--reset", "--log", "--bind-address", "127.0.0.1"])
-        .args(["--limit-ledger-size", "10000"])
+        .args(["--limit-ledger-size", BASE_LEDGER_SHREDS])
         .arg("--ledger")
         .arg(dir.join("base-ledger"))
         .args(["--rpc-port", &base_rpc_port.to_string()])

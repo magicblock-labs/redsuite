@@ -17,7 +17,6 @@ pub const SPONSORED_COMMIT_LIMIT: u64 = 10;
 const LOG_MARKER: &str = "ScheduledCommitSent ";
 
 const SCHEDULE_FETCH_TIMEOUT: Duration = Duration::from_secs(20);
-const BASE_CONFIRM_POLL: Duration = Duration::from_millis(200);
 
 #[derive(Debug)]
 pub struct CommitReceipt {
@@ -141,19 +140,15 @@ pub async fn confirm_base_signatures(
     timeout: Duration,
 ) -> Result<()> {
     for chain_signature in &receipt.base_signatures {
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            if base.signature_confirmed(chain_signature).await? {
-                break;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return Err(format!(
-                    "base commit tx {chain_signature} not confirmed within \
-                     {timeout:?}"
-                )
-                .into());
-            }
-            tokio::time::sleep(BASE_CONFIRM_POLL).await;
+        let base_tx = base
+            .await_transaction(chain_signature, timeout)
+            .await
+            .map_err(|e| format!("base commit tx {chain_signature}: {e}"))?;
+        if let Some(err) = &base_tx.err {
+            return Err(format!(
+                "base commit tx {chain_signature} failed on-chain: {err:?}"
+            )
+            .into());
         }
     }
     Ok(())

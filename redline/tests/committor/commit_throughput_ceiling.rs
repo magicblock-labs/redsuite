@@ -63,6 +63,18 @@ const LITE: Profile = Profile {
 
 const FULL: Profile = Profile {
     name: "full",
+    fresh_commits: 25,
+    prep_payers: 6,
+    rate: 2,
+    concurrency: 8,
+    drain_cap: Duration::from_secs(180),
+    monitor_window: Duration::from_secs(5),
+    contrast: false,
+    deep_backlog: false,
+};
+
+const DEEP: Profile = Profile {
+    name: "deep",
     fresh_commits: 150,
     prep_payers: 12,
     rate: 2,
@@ -76,8 +88,11 @@ const FULL: Profile = Profile {
 fn profile() -> &'static Profile {
     match std::env::var("REDSUITE_PROFILE") {
         Ok(name) if name == "full" => &FULL,
+        Ok(name) if name == "deep" => &DEEP,
         Ok(name) if name == "lite" => &LITE,
-        Ok(name) => panic!("unknown REDSUITE_PROFILE `{name}` (lite|full)"),
+        Ok(name) => {
+            panic!("unknown REDSUITE_PROFILE `{name}` (lite|full|deep)")
+        }
         Err(_) => &LITE,
     }
 }
