@@ -9,3 +9,11 @@ authors.workspace = true
 redsuite-core = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
+
+[[test]]
+name = "illegal_writable"
+path = "tests/chainlink/illegal_writable.rs"
+
+[[test]]
+name = "fee_payer_rules"
+path = "tests/aperture/fee_payer_rules.rs"

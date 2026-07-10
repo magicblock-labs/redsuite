@@ -9,3 +9,11 @@ authors.workspace = true
 redsuite-core = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
+
+[[test]]
+name = "clone_on_access"
+path = "tests/chainlink/clone_on_access.rs"
+
+[[test]]
+name = "commit_roundtrip"
+path = "tests/committor/commit_roundtrip.rs"
