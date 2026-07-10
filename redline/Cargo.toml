@@ -9,6 +9,7 @@ authors.workspace = true
 redsuite-core = { workspace = true }
 redline-program = { workspace = true }
 futures-util = { workspace = true }
+instruction = { workspace = true }
 pubkey = { workspace = true }
 keypair = { workspace = true }
 signer = { workspace = true }
@@ -19,8 +20,20 @@ tokio = { workspace = true }
 async-trait = { workspace = true }
 
 [[test]]
+name = "rpc_capacity_blast"
+path = "tests/aperture/rpc_capacity_blast.rs"
+
+[[test]]
 name = "rpc_warm_ingress"
 path = "tests/aperture/rpc_warm_ingress.rs"
+
+[[test]]
+name = "ws_fanout_threshold"
+path = "tests/aperture/ws_fanout_threshold.rs"
+
+[[test]]
+name = "ws_conn_capacity"
+path = "tests/aperture/ws_conn_capacity.rs"
 
 [[test]]
 name = "simple_load"
@@ -35,6 +48,14 @@ name = "ensure_gate_stall"
 path = "tests/chainlink/ensure_gate_stall.rs"
 
 [[test]]
+name = "clone_lru_churn"
+path = "tests/chainlink/clone_lru_churn.rs"
+
+[[test]]
+name = "cold_hydration_tail"
+path = "tests/chainlink/cold_hydration_tail.rs"
+
+[[test]]
 name = "commit_throughput_ceiling"
 path = "tests/committor/commit_throughput_ceiling.rs"
 
@@ -45,3 +66,11 @@ path = "tests/committor/commit_width_envelope.rs"
 [[test]]
 name = "hot_account_cliff"
 path = "tests/scheduler/hot_account_cliff.rs"
+
+[[test]]
+name = "storage_prodsize_sustain"
+path = "tests/storage/storage_prodsize_sustain.rs"
+
+[[test]]
+name = "protocol_boundary_selftest"
+path = "tests/harness/protocol_boundary_selftest.rs"

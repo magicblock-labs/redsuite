@@ -46,6 +46,7 @@ struct Profile {
     monitor_window: Duration,
     // reused-pool cell: hot ALTs, pins the fresh-key attribution
     contrast: bool,
+    deep_backlog: bool,
 }
 
 const LITE: Profile = Profile {
@@ -57,17 +58,19 @@ const LITE: Profile = Profile {
     drain_cap: Duration::from_secs(240),
     monitor_window: Duration::from_secs(5),
     contrast: false,
+    deep_backlog: false,
 };
 
 const FULL: Profile = Profile {
     name: "full",
-    fresh_commits: 40,
+    fresh_commits: 150,
     prep_payers: 12,
     rate: 2,
     concurrency: 8,
-    drain_cap: Duration::from_secs(600),
+    drain_cap: Duration::from_secs(900),
     monitor_window: Duration::from_secs(10),
     contrast: true,
+    deep_backlog: true,
 };
 
 fn profile() -> &'static Profile {
@@ -256,6 +259,7 @@ impl Scenario for CommitThroughputCeiling {
             },
         );
 
+        let span_started = Instant::now();
         let (delivered, delivery_outcome) = deliver_commits(
             &sender,
             payer_pubkey,
@@ -284,6 +288,7 @@ impl Scenario for CommitThroughputCeiling {
             profile.drain_cap,
         )
         .await?;
+        let span_wall = span_started.elapsed();
         let steady_state = monitor.finish().await?;
         let after = er.scrape_metrics().await?;
         let delta = MetricsDelta::new(before, after);
@@ -307,19 +312,49 @@ impl Scenario for CommitThroughputCeiling {
             );
         }
 
-        let drain_rate = drain.drained / drain.drain_wall.as_secs_f64();
+        let drain_rate = drain.drained / span_wall.as_secs_f64();
         eprintln!(
-            "[redsuite] {}: fresh drain {:.2} intents/s ({}/{} in {:.1} s), \
-             verdict {}, backlog peak {:.0}, busy peak {:.0}",
+            "[redsuite] {}: fresh drain {:.2} intents/s ({}/{} over {:.1} s \
+             span), verdict {}, outstanding peak {:.0} (backlog gauge peak \
+             {:.0}), busy peak {:.0}",
             self.name(),
             drain_rate,
             drain.drained,
             profile.fresh_commits,
-            drain.drain_wall.as_secs_f64(),
+            span_wall.as_secs_f64(),
             steady_state.verdict,
+            steady_state.outstanding_peak,
             steady_state.backlog_peak,
             steady_state.busy_peak,
         );
+        if profile.deep_backlog {
+            if drain_rate < 0.8 {
+                assert!(
+                    steady_state.outstanding_peak > 50.0,
+                    "deep-backlog cell never exceeded 50 outstanding intents \
+                     (peak {:.0}) — the convoy was not pressured",
+                    steady_state.outstanding_peak
+                );
+                assert!(
+                    steady_state.busy_peak >= 40.0,
+                    "executor permits never saturated (busy peak {:.0})",
+                    steady_state.busy_peak
+                );
+                assert_eq!(
+                    steady_state.verdict.to_string(),
+                    "OVERLOAD",
+                    "arrival outpaced drain with a deep queue yet the \
+                     monitor did not call it"
+                );
+            } else {
+                eprintln!(
+                    "[redsuite] {}: fresh drain {drain_rate:.2}/s is past the \
+                     convoy band — the committor P0 fix likely landed; move \
+                     the asserts to the post-fix drain band",
+                    self.name()
+                );
+            }
+        }
 
         // drain measured a second, independent way: every scheduling tx's
         // receipt exists, succeeded, and its base txs confirm on chain
@@ -369,10 +404,12 @@ impl Scenario for CommitThroughputCeiling {
             .setting("fully drained", drain.fully_drained)
             .observe("delivery us", delivery_outcome.delivery)
             .metric("fresh drain intents/s", drain_rate)
+            .metric("delivery+drain span s", span_wall.as_secs_f64())
             .metric("drain wall s", drain.drain_wall.as_secs_f64())
             .metric("monitor arrival /s", steady_state.arrival_rate)
             .metric("monitor drain /s", steady_state.drain_rate)
-            .metric("backlog peak", steady_state.backlog_peak)
+            .metric("outstanding peak", steady_state.outstanding_peak)
+            .metric("backlog gauge peak", steady_state.backlog_peak)
             .metric("busy peak", steady_state.busy_peak)
             .metric_if(
                 "validator intent exec avg s",
@@ -398,7 +435,14 @@ impl Scenario for CommitThroughputCeiling {
 
         if profile.contrast {
             summary = self
-                .contrast_cell(base, er, &sender, payer_pubkey, summary)
+                .contrast_cell(
+                    base,
+                    er,
+                    &sender,
+                    payer_pubkey,
+                    drain_rate,
+                    summary,
+                )
                 .await?;
         }
         Ok(summary)
@@ -412,11 +456,13 @@ impl CommitThroughputCeiling {
         er: &ErCtx,
         sender: &redsuite_core::TxSender,
         payer_pubkey: Pubkey,
+        fresh_drain_rate: f64,
         summary: ScenarioReport,
     ) -> Result<ScenarioReport> {
-        const CONTRAST_SETS: usize = 10;
+        const CONTRAST_SETS: usize = 30;
+        const ROUNDS: u64 = 3;
         let profile = profile();
-        let commits: u64 = 2 * CONTRAST_SETS as u64;
+        let commits: u64 = ROUNDS * CONTRAST_SETS as u64;
         let contrast_payers =
             prep::funded_payers(base, 4, PREP_PAYER_LAMPORTS).await?;
         let contrast_pool = redline::init_delegated_accounts_batched(
@@ -468,6 +514,7 @@ impl CommitThroughputCeiling {
         quiesce_committor(er).await;
         let before = er.scrape_metrics().await?;
         let executed_before = before.value_sum(EXECUTED_COUNTER).unwrap_or(0.0);
+        let span_started = Instant::now();
         let (_, delivery_outcome) = deliver_commits(
             sender,
             payer_pubkey,
@@ -480,6 +527,7 @@ impl CommitThroughputCeiling {
         let drain =
             await_drain(er, executed_before, commits, profile.drain_cap)
                 .await?;
+        let span_wall = span_started.elapsed();
         let after = er.scrape_metrics().await?;
         let delta = MetricsDelta::new(before, after);
         let failed_intents = delta
@@ -491,14 +539,21 @@ impl CommitThroughputCeiling {
             "INVALID: the reused-pool cell drained nothing"
         );
 
-        let drain_rate = drain.drained / drain.drain_wall.as_secs_f64();
+        let drain_rate = drain.drained / span_wall.as_secs_f64();
+        let contrast_ratio = if fresh_drain_rate > 0.0 {
+            drain_rate / fresh_drain_rate
+        } else {
+            0.0
+        };
         eprintln!(
-            "[redsuite] {}: reused-pool drain {:.2} intents/s ({}/{} in {:.1} s)",
+            "[redsuite] {}: reused-pool drain {:.2} intents/s ({}/{} over \
+             {:.1} s span) — {:.2}x the fresh-key drain",
             self.name(),
             drain_rate,
             drain.drained,
             commits,
-            drain.drain_wall.as_secs_f64(),
+            span_wall.as_secs_f64(),
+            contrast_ratio,
         );
 
         let cell_report =
@@ -507,10 +562,13 @@ impl CommitThroughputCeiling {
                 .setting("width", COMMIT_WIDTH)
                 .setting("commits", commits)
                 .setting("sets", CONTRAST_SETS)
+                .setting("rounds", ROUNDS)
                 .setting("alt warmup round", true)
                 .setting("fully drained", drain.fully_drained)
                 .observe("delivery us", delivery_outcome.delivery)
                 .metric("reused drain intents/s", drain_rate)
+                .metric("reused/fresh drain ratio", contrast_ratio)
+                .metric("delivery+drain span s", span_wall.as_secs_f64())
                 .metric_if(
                     "validator intent exec avg s",
                     delta.histogram_avg_all(
@@ -526,7 +584,9 @@ impl CommitThroughputCeiling {
             ),
         }
 
-        Ok(summary.metric("reused drain intents/s", drain_rate))
+        Ok(summary
+            .metric("reused drain intents/s", drain_rate)
+            .metric("reused/fresh drain ratio", contrast_ratio))
     }
 }
 

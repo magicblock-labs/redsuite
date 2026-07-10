@@ -387,12 +387,21 @@ pub struct ErOptions {
 pub struct PrivateEr {
     pid: u32,
     label: String,
+    storage_dir: PathBuf,
     ctx: ErCtx,
 }
 
 impl PrivateEr {
     pub fn ctx(&self) -> &ErCtx {
         &self.ctx
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    pub fn storage_dir(&self) -> &Path {
+        &self.storage_dir
     }
 }
 
@@ -462,6 +471,7 @@ pub async fn private_er(
     Ok(PrivateEr {
         pid,
         label: options.label,
+        storage_dir,
         ctx,
     })
 }

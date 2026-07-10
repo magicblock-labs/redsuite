@@ -125,6 +125,32 @@ impl TxSender {
     }
 }
 
+pub struct ErClient {
+    api: Api,
+    blockhash: Rc<BlockhashCache>,
+}
+
+impl ErClient {
+    pub fn new(rpc_url: impl Into<String>) -> Self {
+        Self {
+            api: Api::new(rpc_url),
+            blockhash: Rc::new(BlockhashCache::new(ER_BLOCKHASH_TTL)),
+        }
+    }
+
+    pub fn api(&self) -> &Api {
+        &self.api
+    }
+
+    pub fn sender(&self, payer: Rc<Keypair>) -> TxSender {
+        TxSender {
+            api: self.api.clone(),
+            blockhash: self.blockhash.clone(),
+            payer,
+        }
+    }
+}
+
 pub struct BaseCtx {
     api: Api,
     ws_url: String,

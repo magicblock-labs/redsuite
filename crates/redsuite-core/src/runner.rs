@@ -12,6 +12,13 @@ pub struct RunConfig {
     pub concurrency: usize,
 }
 
+pub struct ThreadRunConfig {
+    pub threads: usize,
+    pub iterations: u64,
+    pub rate: u32,
+    pub concurrency: usize,
+}
+
 #[derive(Debug)]
 pub struct RunOutcome {
     pub delivered: u64,
@@ -87,6 +94,97 @@ where
         sync: None,
         rps,
         wall: started.elapsed(),
+    }
+}
+
+pub fn drive_threads<Factory, Request, Fut>(
+    config: ThreadRunConfig,
+    factory: Factory,
+) -> RunOutcome
+where
+    Factory: Fn(usize) -> Request + Clone + Send + 'static,
+    Request: FnMut(u64) -> Fut,
+    Fut: Future<Output = Result<()>> + 'static,
+{
+    let threads = config.threads.max(1);
+    let base_iterations = config.iterations / threads as u64;
+    let remainder = config.iterations % threads as u64;
+    let (outcome_sender, outcome_receiver) = std::sync::mpsc::channel();
+
+    let mut first_id = 0u64;
+    let mut handles = Vec::with_capacity(threads);
+    for thread_index in 0..threads {
+        let iterations =
+            base_iterations + u64::from((thread_index as u64) < remainder);
+        if iterations == 0 {
+            continue;
+        }
+        let thread_first_id = first_id;
+        first_id += iterations;
+        let rate = (config.rate / threads as u32).max(1);
+        let concurrency = (config.concurrency / threads).max(1);
+        let factory = factory.clone();
+        let outcome_sender = outcome_sender.clone();
+        handles.push(std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("driver runtime build is infallible");
+            let local = tokio::task::LocalSet::new();
+            let outcome = runtime.block_on(local.run_until(async move {
+                let mut request = factory(thread_index);
+                drive(
+                    RunConfig {
+                        iterations,
+                        rate,
+                        concurrency,
+                    },
+                    |iteration| request(thread_first_id + iteration),
+                )
+                .await
+            }));
+            let _ = outcome_sender.send(outcome);
+        }));
+    }
+    drop(outcome_sender);
+
+    let mut outcomes = Vec::new();
+    while let Ok(outcome) = outcome_receiver.recv() {
+        outcomes.push(outcome);
+    }
+    for handle in handles {
+        let _ = handle.join();
+    }
+    merge_outcomes(outcomes)
+}
+
+fn merge_outcomes(outcomes: Vec<RunOutcome>) -> RunOutcome {
+    let delivered = outcomes.iter().map(|outcome| outcome.delivered).sum();
+    let failed = outcomes.iter().map(|outcome| outcome.failed).sum();
+    let first_error = outcomes
+        .iter()
+        .find_map(|outcome| outcome.first_error.clone());
+    let wall = outcomes
+        .iter()
+        .map(|outcome| outcome.wall)
+        .max()
+        .unwrap_or_default();
+    let delivery = ObservationsStats::merge(
+        outcomes.iter().map(|outcome| outcome.delivery).collect(),
+        true,
+    );
+    let rps = ObservationsStats::merge(
+        outcomes.iter().map(|outcome| outcome.rps).collect(),
+        false,
+    );
+    RunOutcome {
+        delivered,
+        failed,
+        first_error,
+        delivery,
+        sync: None,
+        rps,
+        wall,
     }
 }
 
