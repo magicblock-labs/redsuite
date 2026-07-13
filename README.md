@@ -42,6 +42,7 @@ reuses them. `cargo xtask stack down` stops the stack.
     redline/                performance scenarios (load)
     redshift/               correctness scenarios (observed state vs expected model)
     redhat/                 security scenarios (adversarial, must-be-rejected)
+    cli/                    the `redsuite` binary — run scenarios without cargo
     programs/               on-chain SBF programs, one per family
     base-programs/          pinned third-party base-L1 programs (dlp, mdp) + provenance manifest
     base-accounts/          pinned genesis account fixtures (test identity + dlp fee vaults)
@@ -49,9 +50,37 @@ reuses them. `cargo xtask stack down` stops the stack.
 
 ## Writing a scenario
 
-One file per scenario under `<family>/tests/`, one `Scenario` impl, one
-`#[tokio::test]` calling `run_scenario` — the harness owns process spawning,
-ports, funding and teardown. See `redshift/tests/commit_roundtrip.rs`.
+Scenarios live in the family libraries under `<family>/src/scenarios/
+<subsystem>/<name>.rs`: one `Scenario` impl each — the harness owns process
+spawning, ports, funding and teardown. See
+`redshift/src/scenarios/committor/commit_roundtrip.rs`.
+
+Each scenario is reachable two ways, and a new one needs both:
+
+- a test shim in `<family>/tests/<subsystem>/<name>.rs` (four lines, calling
+  `run_scenario`) plus its `[[test]]` entry in the family `Cargo.toml`, so it
+  runs under `cargo test` / `cargo nextest`;
+- an entry in the registry in `cli/src/main.rs`, so it runs under the
+  `redsuite` binary.
+
+## The redsuite binary
+
+The whole suite also builds into one executable, which is what CI and
+benchmark hosts use — no cargo, no checkout of the tests:
+
+    cargo build --release -p redsuite
+
+    redsuite list                             # every scenario
+    redsuite run redline/high_cu              # one scenario (short names work too)
+    redsuite run redline --profile full       # a whole family
+    redsuite run all                          # everything, sequentially
+    redsuite stack status                     # ports, pids, health
+    redsuite stack down                       # stop the shared stack
+    redsuite report compare                   # diff the latest two runs
+
+It still needs `solana-test-validator` on PATH and the ER binary under test
+(`MAGICBLOCK_VALIDATOR_BIN`), and it reads the fixtures and built programs from
+the workspace — set `REDSUITE_ROOT` when running it outside a checkout.
 
 ## Running
 

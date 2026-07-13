@@ -6,6 +6,8 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+async-trait = { workspace = true }
+tokio = { workspace = true }
 redsuite-core = { workspace = true }
 redline-program = { workspace = true }
 futures-util = { workspace = true }
@@ -16,8 +18,6 @@ signer = { workspace = true }
 signature = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
-async-trait = { workspace = true }
 
 [[test]]
 name = "rpc_capacity_blast"

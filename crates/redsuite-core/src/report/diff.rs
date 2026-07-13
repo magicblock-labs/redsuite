@@ -1,10 +1,10 @@
-//! `cargo xtask report …` — list, diff and export persisted scenario reports.
+//! Read back persisted scenario reports: list, diff two runs, export BMF.
 
 use std::{collections::BTreeMap, fs, path::PathBuf};
 
 use json::{Deserialize, Serialize};
 
-use crate::Result;
+use crate::{topology::workspace_root, Result};
 
 #[derive(Deserialize)]
 struct Persisted {
@@ -45,7 +45,7 @@ struct Stats {
 }
 
 fn reports_dir() -> PathBuf {
-    crate::root().join("target/redsuite-reports")
+    workspace_root().join("target/redsuite-reports")
 }
 
 // Chronological per scenario — the timestamp prefix makes name order time order.

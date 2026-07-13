@@ -1875,6 +1875,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "redsuite"
+version = "0.1.0"
+dependencies = [
+ "redhat",
+ "redline",
+ "redshift",
+ "redsuite-core",
+ "tokio",
+]
+
+[[package]]
 name = "redsuite-core"
 version = "0.1.0"
 dependencies = [
@@ -4460,6 +4471,7 @@ dependencies = [
 name = "xtask"
 version = "0.1.0"
 dependencies = [
+ "redsuite-core",
  "serde",
  "sha2 0.10.9",
  "sonic-rs",

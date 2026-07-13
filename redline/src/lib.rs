@@ -1,5 +1,6 @@
 //! PERFORMANCE family — load scenarios; shared helpers for its tests live here.
 
+pub mod scenarios;
 use keypair::Keypair;
 use pubkey::Pubkey;
 pub use redline_program as program;

@@ -1,3 +1,4 @@
+mod diff;
 use std::{
     fs,
     path::PathBuf,
@@ -5,6 +6,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+pub use diff::{bmf, compare, list};
 use json::{Deserialize, Serialize};
 
 use crate::{stats::ObservationsStats, topology, Result};

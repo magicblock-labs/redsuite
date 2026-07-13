@@ -1,27 +1,9 @@
-use async_trait::async_trait;
-use redsuite_core::{
-    run_scenario, BaseCtx, ErCtx, Result, Scenario, ScenarioReport,
-};
-
-struct IllegalWritable;
-
-#[async_trait(?Send)]
-impl Scenario for IllegalWritable {
-    fn name(&self) -> &str {
-        "redhat/illegal_writable"
-    }
-
-    async fn run(
-        &self,
-        _base: &BaseCtx,
-        _er: &ErCtx,
-    ) -> Result<ScenarioReport> {
-        // write to a non-delegated account on the ER must fail InvalidWritableAccount
-        Ok(ScenarioReport::ok(self.name()))
-    }
-}
+use redsuite_core::run_scenario;
 
 #[tokio::test]
 async fn illegal_writable() {
-    run_scenario(IllegalWritable).await;
+    run_scenario(
+        redhat::scenarios::chainlink::illegal_writable::IllegalWritable,
+    )
+    .await;
 }

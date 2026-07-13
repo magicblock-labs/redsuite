@@ -9,6 +9,7 @@ members = [
     "programs/redshift",
     "programs/redhat",
     "xtask",
+    "cli",
 ]
 
 [workspace.package]
@@ -19,6 +20,9 @@ authors = ["Magicblock Labs <dev@magicblock.gg>"]
 
 [workspace.dependencies]
 redsuite-core = { path = "crates/redsuite-core" }
+redline = { path = "redline" }
+redshift = { path = "redshift" }
+redhat = { path = "redhat" }
 redline-program = { path = "programs/redline" }
 
 tokio = { version = "1", features = ["rt", "macros", "time", "net"] }
