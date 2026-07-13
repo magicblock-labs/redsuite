@@ -6,6 +6,7 @@ use crate::{api, Result};
 const OVERLOAD_BACKLOG_FLOOR: f64 = 5.0;
 // drain within this fraction of arrival still counts as keeping up
 const DRAIN_KEEPUP_FRACTION: f64 = 0.9;
+const OVERLOAD_STREAK: usize = 2;
 
 pub struct MonitorSpec {
     pub arrival_counter: String,
@@ -49,6 +50,7 @@ pub struct SteadyStateOutcome {
     pub drain_rate: f64,
     pub backlog_peak: f64,
     pub backlog_end: f64,
+    pub outstanding_peak: f64,
     pub busy_peak: f64,
     pub samples: Vec<SteadyStateSample>,
 }
@@ -125,10 +127,18 @@ fn judge(samples: Vec<SteadyStateSample>) -> SteadyStateOutcome {
             drain_rate: 0.0,
             backlog_peak,
             backlog_end,
+            outstanding_peak: 0.0,
             busy_peak,
             samples,
         };
     };
+    let outstanding_peak = samples
+        .iter()
+        .map(|sample| {
+            (sample.arrivals_total - first.arrivals_total)
+                - (sample.drained_total - first.drained_total)
+        })
+        .fold(0.0, f64::max);
     let span_secs = last.elapsed_secs - first.elapsed_secs;
     let arrivals = last.arrivals_total - first.arrivals_total;
     let drained = last.drained_total - first.drained_total;
@@ -138,12 +148,30 @@ fn judge(samples: Vec<SteadyStateSample>) -> SteadyStateOutcome {
         (0.0, 0.0)
     };
 
+    let mut lagging_streak = 0usize;
+    let mut overloaded = false;
+    for pair in samples.windows(2) {
+        let window_arrivals = pair[1].arrivals_total - pair[0].arrivals_total;
+        let window_drained = pair[1].drained_total - pair[0].drained_total;
+        let outstanding_end = (pair[1].arrivals_total - first.arrivals_total)
+            - (pair[1].drained_total - first.drained_total);
+        let queue_deep =
+            outstanding_end.max(pair[1].backlog) >= OVERLOAD_BACKLOG_FLOOR;
+        let drain_lagging = window_arrivals > 0.0
+            && window_drained < window_arrivals * DRAIN_KEEPUP_FRACTION;
+        if queue_deep && drain_lagging {
+            lagging_streak += 1;
+            if lagging_streak >= OVERLOAD_STREAK {
+                overloaded = true;
+            }
+        } else {
+            lagging_streak = 0;
+        }
+    }
     let verdict = if samples.len() < 2 || arrivals <= 0.0 {
         // measured nothing — must never read as a pass (cross-cutting #5)
         SteadyStateVerdict::Invalid
-    } else if backlog_peak >= OVERLOAD_BACKLOG_FLOOR
-        && drained < arrivals * DRAIN_KEEPUP_FRACTION
-    {
+    } else if overloaded {
         SteadyStateVerdict::Overload
     } else {
         SteadyStateVerdict::Pass
@@ -155,6 +183,7 @@ fn judge(samples: Vec<SteadyStateSample>) -> SteadyStateOutcome {
         drain_rate,
         backlog_peak,
         backlog_end,
+        outstanding_peak,
         busy_peak,
         samples,
     }
@@ -209,5 +238,41 @@ mod tests {
         ]);
         assert_eq!(outcome.verdict, SteadyStateVerdict::Invalid);
         assert_eq!(judge(Vec::new()).verdict, SteadyStateVerdict::Invalid);
+    }
+
+    #[test]
+    fn stuck_backlog_gauge_cannot_mask_overload() {
+        let outcome = judge(vec![
+            sample(0.0, 100.0, 100.0, 0.0),
+            sample(10.0, 200.0, 110.0, 0.0),
+            sample(20.0, 300.0, 120.0, 0.0),
+        ]);
+        assert_eq!(outcome.verdict, SteadyStateVerdict::Overload);
+        assert_eq!(outcome.backlog_peak, 0.0);
+        assert_eq!(outcome.outstanding_peak, 180.0);
+    }
+
+    #[test]
+    fn full_eventual_drain_cannot_mask_overload() {
+        let outcome = judge(vec![
+            sample(0.0, 0.0, 0.0, 0.0),
+            sample(10.0, 100.0, 5.0, 0.0),
+            sample(20.0, 150.0, 10.0, 0.0),
+            sample(30.0, 150.0, 80.0, 0.0),
+            sample(40.0, 150.0, 150.0, 0.0),
+        ]);
+        assert_eq!(outcome.verdict, SteadyStateVerdict::Overload);
+        assert_eq!(outcome.outstanding_peak, 140.0);
+    }
+
+    #[test]
+    fn single_lagging_window_is_noise_not_overload() {
+        let outcome = judge(vec![
+            sample(0.0, 0.0, 0.0, 0.0),
+            sample(10.0, 100.0, 90.0, 0.0),
+            sample(20.0, 200.0, 200.0, 0.0),
+            sample(30.0, 300.0, 300.0, 0.0),
+        ]);
+        assert_eq!(outcome.verdict, SteadyStateVerdict::Pass);
     }
 }

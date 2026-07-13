@@ -1,24 +1,25 @@
 //! S4 `sched_hot_account_cliff` — scheduler intake under hot-account
 //! contention. Few hot accounts serialize execution; the campaign measured a
 //! client-latency cliff between 16 and 8 hot accounts at ~13.5k delivered
-//! RPS (15 ms → 170–280 ms). At the rates this single-threaded client
-//! sustains the cliff may not trigger — then the cells document the healthy
-//! floor and the cliff position is release-diffed: a cliff appearing at
-//! these rates is a regression.
+//! RPS (15 ms → 170–280 ms).
 
-use std::{rc::Rc, time::Duration};
+use std::{rc::Rc, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
+use keypair::Keypair;
+use pubkey::Pubkey;
 use redline::program::instruction::build;
 use redsuite_core::{
     assert::poll_until,
     prep, report, run_scenario,
-    runner::{drive, RunConfig},
-    BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
-    TxSender,
+    runner::{drive_threads, RunOutcome, ThreadRunConfig},
+    BaseCtx, ChainCtx, ErClient, ErCtx, MetricsDelta, Result, Scenario,
+    ScenarioReport, TxSender,
 };
 
 const PAYER_LAMPORTS: u64 = 2_000_000_000;
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(300);
+const TX_COUNT: &str = "mbv_transaction_count";
 // healthy cells must stay within this factor of the widest cell's p50
 const FLAT_FACTOR: f64 = 3.0;
 // a cell beyond this factor is the cliff
@@ -32,6 +33,7 @@ struct Profile {
     // hot write-set sizes; widest first (it is the healthy baseline),
     // narrowest last so a wedged cell cannot poison the others
     cells: &'static [u8],
+    threads: usize,
     warmup: u64,
     iterations: u64,
     rate: u32,
@@ -42,26 +44,22 @@ const LITE: Profile = Profile {
     name: "lite",
     payers: 8,
     cells: &[16, 4],
-    warmup: 100,
-    iterations: 1_000,
-    rate: 500,
-    concurrency: 256,
+    threads: 4,
+    warmup: 1_000,
+    iterations: 10_000,
+    rate: 2_000,
+    concurrency: 512,
 };
 
-// The rate must be one this single-threaded client serves with sub-ms
-// deliveries, not merely sustains: on this host the hard throughput ceiling
-// is ~2.3k tps but client-side queueing already dominates latency at 2k
-// (~450 us of client CPU per request → 91% utilization). Above that the
-// sweep measures the harness, not the scheduler (R1/S14) — the INVALID
-// baseline gate below catches it. 1k is proven healthy by S1.
 const FULL: Profile = Profile {
     name: "full",
     payers: 32,
     cells: &[32, 16, 8, 4],
-    warmup: 2_000,
-    iterations: 20_000,
-    rate: 1_000,
-    concurrency: 1_024,
+    threads: 8,
+    warmup: 10_000,
+    iterations: 100_000,
+    rate: 10_000,
+    concurrency: 2_048,
 };
 
 fn profile() -> &'static Profile {
@@ -71,6 +69,58 @@ fn profile() -> &'static Profile {
         Ok(name) => panic!("unknown REDSUITE_PROFILE `{name}` (lite|full)"),
         Err(_) => &LITE,
     }
+}
+
+fn drive_cell(
+    er_rpc_url: String,
+    config: ThreadRunConfig,
+    id_offset: u64,
+    hot_set: Arc<Vec<Pubkey>>,
+    payer_bytes: Arc<Vec<[u8; 64]>>,
+) -> RunOutcome {
+    let threads = config.threads;
+    let factory = move |thread_index: usize| {
+        let client = ErClient::new(er_rpc_url.clone());
+        let senders: Vec<TxSender> = payer_bytes
+            .iter()
+            .enumerate()
+            .filter(|(payer_index, _)| payer_index % threads == thread_index)
+            .map(|(_, bytes)| {
+                let payer = Keypair::try_from(&bytes[..])
+                    .expect("payer bytes round-trip");
+                client.sender(Rc::new(payer))
+            })
+            .collect();
+        let hot_set = hot_set.clone();
+        // same read-write 3/tx shape as S1, confined to the hot set
+        // (hot-set sizes are powers of two — coprime with the stride)
+        move |id: u64| {
+            let global_id = id_offset + id;
+            let len = hot_set.len() as u64;
+            let base_index = ((global_id - 1) * 3) % len;
+            let ix = build::account_data_copy(
+                global_id,
+                &[hot_set[base_index as usize]],
+                &[
+                    hot_set[((base_index + 1) % len) as usize],
+                    hot_set[((base_index + 2) % len) as usize],
+                ],
+            );
+            let sender = senders[(global_id as usize) % senders.len()].clone();
+            async move { sender.send(&[ix]).await.map(|_| ()) }
+        }
+    };
+    drive_threads(config, factory)
+}
+
+async fn drain_intake(er: &ErCtx, target: f64) {
+    poll_until(DRAIN_TIMEOUT, || async {
+        matches!(
+            er.scrape_metrics().await.ok().and_then(|metrics| metrics.get(TX_COUNT)),
+            Some(count) if count >= target
+        )
+    })
+    .await;
 }
 
 struct CellResult {
@@ -107,86 +157,60 @@ impl Scenario for HotAccountCliff {
             })
             .await;
         }
-        let senders: Vec<TxSender> = payers
-            .into_iter()
-            .map(|payer| er.sender(Rc::new(payer)))
-            .collect();
+        let payer_bytes: Arc<Vec<[u8; 64]>> =
+            Arc::new(payers.iter().map(|payer| payer.to_bytes()).collect());
+        let er_rpc_url = er.api().url().to_owned();
 
         let mut offset = 0u64;
         let mut cells: Vec<CellResult> = Vec::new();
         for &hot in profile.cells {
-            let hot_set = &pdas[..hot as usize];
-            // same read-write 3/tx shape as S1, confined to the hot set
-            // (hot-set sizes are powers of two — coprime with the stride)
-            let shape = |id: u64| {
-                let len = hot_set.len() as u64;
-                let base_index = ((id - 1) * 3) % len;
-                build::account_data_copy(
-                    id,
-                    &[hot_set[base_index as usize]],
-                    &[
-                        hot_set[((base_index + 1) % len) as usize],
-                        hot_set[((base_index + 2) % len) as usize],
-                    ],
-                )
-            };
-            let request = |iteration: u64| {
-                let id = offset + iteration;
-                let sender = senders[(id as usize) % senders.len()].clone();
-                let ix = shape(id);
-                async move { sender.send(&[ix]).await.map(|_| ()) }
-            };
+            let hot_set: Arc<Vec<Pubkey>> =
+                Arc::new(pdas[..hot as usize].to_vec());
 
-            let warm = drive(
-                RunConfig {
+            let count_before_warmup = er.scrape_metrics().await?.get(TX_COUNT);
+            let warm = drive_cell(
+                er_rpc_url.clone(),
+                ThreadRunConfig {
+                    threads: profile.threads,
                     iterations: profile.warmup,
                     rate: profile.rate,
                     concurrency: profile.concurrency,
                 },
-                request,
-            )
-            .await;
+                offset,
+                hot_set.clone(),
+                payer_bytes.clone(),
+            );
             assert_eq!(
                 warm.failed, 0,
                 "hot{hot} warmup failed: {:?}",
                 warm.first_error
             );
             offset += profile.warmup;
+            if let Some(seen) = count_before_warmup {
+                drain_intake(er, seen + profile.warmup as f64).await;
+            }
 
             let before = er.scrape_metrics().await?;
-            let request = |iteration: u64| {
-                let id = offset + iteration;
-                let sender = senders[(id as usize) % senders.len()].clone();
-                let ix = shape(id);
-                async move { sender.send(&[ix]).await.map(|_| ()) }
-            };
-            let outcome = drive(
-                RunConfig {
+            let outcome = drive_cell(
+                er_rpc_url.clone(),
+                ThreadRunConfig {
+                    threads: profile.threads,
                     iterations: profile.iterations,
                     rate: profile.rate,
                     concurrency: profile.concurrency,
                 },
-                request,
-            )
-            .await;
+                offset,
+                hot_set.clone(),
+                payer_bytes.clone(),
+            );
             offset += profile.iterations;
             assert_eq!(
                 outcome.failed, 0,
                 "hot{hot} deliveries failed: {:?}",
                 outcome.first_error
             );
-
-            // delivery only proves acceptance — drain the intake queue so
-            // the after-scrape covers everything the cell caused
-            if let Some(seen) = before.get("mbv_transaction_count") {
-                let target = seen + profile.iterations as f64;
-                poll_until(Duration::from_secs(120), || async {
-                    matches!(
-                        er.scrape_metrics().await.ok().and_then(|metrics| metrics.get("mbv_transaction_count")),
-                        Some(count) if count >= target
-                    )
-                })
-                .await;
+            if let Some(seen) = before.get(TX_COUNT) {
+                drain_intake(er, seen + profile.iterations as f64).await;
             }
             let after = er.scrape_metrics().await?;
             let delta = MetricsDelta::new(before, after);
@@ -221,6 +245,7 @@ impl Scenario for HotAccountCliff {
                         "shape",
                         "read-write 3/tx (1 src + 2 dst data-copy)",
                     )
+                    .setting("driver threads", profile.threads)
                     .setting("measured iters", profile.iterations)
                     .setting("offered tps", profile.rate)
                     .setting("concurrency", profile.concurrency)
@@ -292,6 +317,7 @@ impl Scenario for HotAccountCliff {
             .setting("profile", profile.name)
             .setting("cells", cell_names.join("/"))
             .setting("shape", "read-write 3/tx (1 src + 2 dst data-copy)")
+            .setting("driver threads", profile.threads)
             .setting("measured iters per cell", profile.iterations)
             .setting("offered tps", profile.rate)
             .setting("concurrency", profile.concurrency)

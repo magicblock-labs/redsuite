@@ -63,6 +63,7 @@ const ER_BIN_ENV: &str = "MAGICBLOCK_VALIDATOR_BIN";
 /// ER startup gate: identity must hold ≥ 5 SOL on the base. Fund with headroom.
 const IDENTITY_FUNDING_LAMPORTS: u64 = 20 * 1_000_000_000;
 
+const BASE_LEDGER_SHREDS: &str = "200000";
 const BASE_READY_TIMEOUT: Duration = Duration::from_secs(60);
 const ER_READY_TIMEOUT: Duration = Duration::from_secs(120);
 const KILL_GRACE: Duration = Duration::from_secs(5);
@@ -215,7 +216,7 @@ async fn boot() -> Result<StackState> {
 
     let mut cmd = Command::new(&base_bin);
     cmd.args(["--reset", "--log", "--bind-address", "127.0.0.1"])
-        .args(["--limit-ledger-size", "10000"])
+        .args(["--limit-ledger-size", BASE_LEDGER_SHREDS])
         .arg("--ledger")
         .arg(dir.join("base-ledger"))
         .args(["--rpc-port", &base_rpc_port.to_string()])
@@ -301,13 +302,24 @@ async fn boot_er(
     )
     .await?;
 
+    // getHealth answers "ok" mid-genesis; dlp is only invocable once slots tick
+    wait_until(
+        Duration::from_secs(30),
+        "base L1 past genesis (confirmed slot >= 2)",
+        base_log,
+        state.base_pid,
+        || async { matches!(base_api.get_slot().await, Ok(slot) if slot >= 2) },
+    )
+    .await?;
+
     let base_ctx = BaseCtx::new(
         base_rpc_url,
         format!("ws://127.0.0.1:{}", state.base_ws_port),
     );
-    base_ctx
-        .airdrop(&identity.pubkey(), IDENTITY_FUNDING_LAMPORTS)
-        .await?;
+    ensure_identity_funded(&base_ctx, &identity.pubkey()).await?;
+
+    // a fresh base is a new chain — prior-generation ER state is invalid
+    let _ = fs::remove_dir_all(dir.join("er-storage"));
 
     let cmd = er_command(
         er_bin,
@@ -387,12 +399,21 @@ pub struct ErOptions {
 pub struct PrivateEr {
     pid: u32,
     label: String,
+    storage_dir: PathBuf,
     ctx: ErCtx,
 }
 
 impl PrivateEr {
     pub fn ctx(&self) -> &ErCtx {
         &self.ctx
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    pub fn storage_dir(&self) -> &Path {
+        &self.storage_dir
     }
 }
 
@@ -406,6 +427,17 @@ impl Drop for PrivateEr {
     }
 }
 
+async fn ensure_identity_funded(
+    base: &BaseCtx,
+    identity: &pubkey::Pubkey,
+) -> Result<()> {
+    let balance = base.api().get_balance(identity).await.unwrap_or(0);
+    if balance >= IDENTITY_FUNDING_LAMPORTS {
+        return Ok(());
+    }
+    base.airdrop(identity, IDENTITY_FUNDING_LAMPORTS).await
+}
+
 pub async fn private_er(
     base: &BaseCtx,
     options: ErOptions,
@@ -415,12 +447,12 @@ pub async fn private_er(
     let er_bin = find_er_bin()?;
     let identity = Keypair::try_from(&TEST_IDENTITY_KEYPAIR[..])
         .map_err(|e| format!("bad TEST_IDENTITY_KEYPAIR: {e}"))?;
-    base.airdrop(&identity.pubkey(), IDENTITY_FUNDING_LAMPORTS)
-        .await?;
+    ensure_identity_funded(base, &identity.pubkey()).await?;
 
     let (rpc_port, ws_port) = free_port_pair()?;
     let metrics_port = free_port()?;
     let storage_dir = dir.join(format!("er-{}", options.label));
+    let _ = fs::remove_dir_all(&storage_dir);
     let log = dir.join(format!("er-{}.log", options.label));
     let cmd = er_command(
         &er_bin,
@@ -462,6 +494,7 @@ pub async fn private_er(
     Ok(PrivateEr {
         pid,
         label: options.label,
+        storage_dir,
         ctx,
     })
 }

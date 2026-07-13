@@ -21,7 +21,7 @@ use crate::{
     Result,
 };
 
-const AIRDROP_TIMEOUT: Duration = Duration::from_secs(20);
+const AIRDROP_TIMEOUT: Duration = Duration::from_secs(60);
 const AIRDROP_POLL: Duration = Duration::from_millis(200);
 // Same 20s budget as test-integration's 40x500ms convention, but polled at
 // the ER's block cadence so confirm latency reflects the chain, not the poll.
@@ -122,6 +122,32 @@ impl TxSender {
 
     pub async fn send(&self, ixs: &[Instruction]) -> Result<Signature> {
         self.deliver(&self.prepare(ixs).await?).await
+    }
+}
+
+pub struct ErClient {
+    api: Api,
+    blockhash: Rc<BlockhashCache>,
+}
+
+impl ErClient {
+    pub fn new(rpc_url: impl Into<String>) -> Self {
+        Self {
+            api: Api::new(rpc_url),
+            blockhash: Rc::new(BlockhashCache::new(ER_BLOCKHASH_TTL)),
+        }
+    }
+
+    pub fn api(&self) -> &Api {
+        &self.api
+    }
+
+    pub fn sender(&self, payer: Rc<Keypair>) -> TxSender {
+        TxSender {
+            api: self.api.clone(),
+            blockhash: self.blockhash.clone(),
+            payer,
+        }
     }
 }
 

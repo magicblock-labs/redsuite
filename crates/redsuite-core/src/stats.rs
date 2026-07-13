@@ -109,6 +109,34 @@ impl Default for StreamingStats {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_sums_without_overflow() {
+        let mut first = StreamingStats::new();
+        let mut second = StreamingStats::new();
+        for value in [100, 200, 300] {
+            first.push(value);
+            second.push(value * 2);
+        }
+        let summed = ObservationsStats::merge(
+            vec![first.finalize(false), second.finalize(false)],
+            false,
+        );
+        assert_eq!(summed.count, 6);
+        assert_eq!(summed.min, 100 + 200);
+        assert_eq!(summed.max, 300 + 600);
+
+        let averaged = ObservationsStats::merge(
+            vec![ObservationsStats::default(), ObservationsStats::default()],
+            true,
+        );
+        assert_eq!(averaged.count, 0);
+    }
+}
+
 #[derive(Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct BenchStatistics {
@@ -190,8 +218,9 @@ impl ObservationsStats {
         if total_count == 0 {
             return Self::default();
         }
+        let initial_min = if average { u32::MAX } else { 0 };
         let sum = stats.iter().fold(
-            (0usize, 0i32, u32::MAX, 0u32, 0i32, 0i32, 0u32),
+            (0usize, 0i32, initial_min, 0u32, 0i32, 0i32, 0u32),
             |acc, stat| {
                 (
                     acc.0 + stat.count,

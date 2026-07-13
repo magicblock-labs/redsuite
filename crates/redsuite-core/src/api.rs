@@ -166,6 +166,11 @@ impl Api {
         self.call("getHealth", "[]").await
     }
 
+    pub async fn get_slot(&self) -> Result<u64> {
+        self.call("getSlot", r#"[{"commitment":"confirmed"}]"#)
+            .await
+    }
+
     pub async fn server_alive(&self) -> bool {
         match self.get_health().await {
             Ok(_) => true,

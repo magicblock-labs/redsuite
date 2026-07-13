@@ -1827,6 +1827,7 @@ dependencies = [
  "futures-util",
  "redline-program",
  "redsuite-core",
+ "solana-instruction 3.4.0",
  "solana-keypair",
  "solana-pubkey 3.0.0",
  "solana-signature",
