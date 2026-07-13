@@ -23,6 +23,26 @@ const EVICTED_COUNTER: &str = "mbv_evicted_accounts_count";
 const FETCHES_FOUND_COUNTER: &str = "mbv_account_fetches_found_count";
 const ENSURE_HISTOGRAM: &str = r#"mbv_ensure_accounts_time{kind="account"}"#;
 
+const SETTLE_POLL: Duration = Duration::from_millis(500);
+const SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+async fn settled_scrape(er: &ErCtx) -> Result<redsuite_core::Metrics> {
+    let mut last = er.scrape_metrics().await?;
+    let deadline = tokio::time::Instant::now() + SETTLE_TIMEOUT;
+    while tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(SETTLE_POLL).await;
+        let next = er.scrape_metrics().await?;
+        let stable = next.get(EVICTED_COUNTER) == last.get(EVICTED_COUNTER)
+            && next.value_sum(FETCHES_FOUND_COUNTER)
+                == last.value_sum(FETCHES_FOUND_COUNTER);
+        last = next;
+        if stable {
+            break;
+        }
+    }
+    Ok(last)
+}
+
 struct Profile {
     name: &'static str,
     working_set: usize,
@@ -228,7 +248,7 @@ impl Scenario for CloneLruChurn {
                 |iteration| request(offset + iteration),
             )
             .await;
-            let after = cell_er.scrape_metrics().await?;
+            let after = settled_scrape(cell_er).await?;
             let delta = MetricsDelta::new(before, after);
 
             let evictions = delta.counter(EVICTED_COUNTER).unwrap_or(0.0);

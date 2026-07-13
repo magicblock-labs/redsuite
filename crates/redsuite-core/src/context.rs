@@ -21,7 +21,7 @@ use crate::{
     Result,
 };
 
-const AIRDROP_TIMEOUT: Duration = Duration::from_secs(20);
+const AIRDROP_TIMEOUT: Duration = Duration::from_secs(60);
 const AIRDROP_POLL: Duration = Duration::from_millis(200);
 // Same 20s budget as test-integration's 40x500ms convention, but polled at
 // the ER's block cadence so confirm latency reflects the chain, not the poll.

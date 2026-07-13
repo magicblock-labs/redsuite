@@ -4,7 +4,6 @@ use sdk::{
     cpi::{undelegate_account, DelegateAccounts, DelegateConfig},
     utils::create_pda,
 };
-use sha2::{Digest, Sha256};
 use solana_program::{
     account_info::{next_account_info, AccountInfo},
     entrypoint::ProgramResult,
@@ -180,17 +179,12 @@ pub fn multi_account_read(
 pub fn expensive_hash_compute(
     iter: &mut std::slice::Iter<AccountInfo>,
     id: u64,
-    mut hash: [u8; 32],
+    hash: [u8; 32],
     iters: u32,
 ) -> ProgramResult {
     msg!("Starting compute-intensive operation...");
 
-    for i in 0..iters {
-        let mut hasher = Sha256::new();
-        hasher.update(hash);
-        hasher.update(i.to_le_bytes());
-        hash.copy_from_slice(&hasher.finalize());
-    }
+    let hash = crate::utils::hash_chain(hash, iters);
 
     let mut count = 0;
     while let Ok(pda) = next_account_info(iter) {

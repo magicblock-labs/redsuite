@@ -25,6 +25,8 @@ pub mod layout {
     pub const DATA_OFFSET: usize = OWNER_PUBKEY_SIZE;
     pub const ID_OFFSET: usize = DATA_OFFSET;
     pub const ID_SIZE: usize = 8;
+    pub const HASH_OFFSET: usize = ID_OFFSET + ID_SIZE;
+    pub const HASH_SIZE: usize = 32;
 }
 
 fn process_instruction(
