@@ -15,6 +15,7 @@ use std::{
     time::Duration,
 };
 
+use instruction::{AccountMeta, Instruction};
 use json::{Deserialize, Serialize};
 use keypair::Keypair;
 use pubkey::Pubkey;
@@ -46,15 +47,11 @@ const FAMILY_PROGRAMS: &[(&str, &str)] = &[
     ),
 ];
 
-/// `mAGicPQYBMvcYveUZA5F5UNNwyHvfYh5xkLS2Fr1mev` — not random: the
-/// `base-accounts/` vault fixtures are dlp PDAs of this identity, and dlp
-/// refuses `InitMagicFeeVault` unless the validator-fees-vault pre-exists.
-const TEST_IDENTITY_KEYPAIR: [u8; 64] = [
-    7, 83, 184, 55, 200, 223, 238, 137, 166, 244, 107, 126, 189, 16, 194, 36,
-    228, 68, 43, 143, 13, 91, 3, 81, 53, 253, 26, 36, 50, 198, 40, 159, 11, 80,
-    9, 208, 183, 189, 108, 200, 89, 77, 168, 76, 233, 197, 132, 22, 21, 186,
-    202, 240, 105, 168, 157, 64, 233, 249, 100, 104, 210, 41, 83, 87,
-];
+const CLONE_URL_ENV: &str = "REDSUITE_CLONE_URL";
+const DEFAULT_CLONE_URL: &str = "https://api.mainnet-beta.solana.com";
+const LOADER_V3: &str = "BPFLoaderUpgradeab1e11111111111111111111111";
+// UpgradeableLoaderState::ProgramData header preceding the ELF bytes
+const PROGRAM_DATA_HEADER: usize = 45;
 
 const BASE_BIN: &str = "solana-test-validator";
 const ER_BIN: &str = "magicblock-validator";
@@ -84,6 +81,7 @@ pub struct StackState {
     pub er_pid: u32,
     pub er_bin: String,
     pub er_identity: String,
+    pub dlp_admin: Vec<u8>,
 }
 
 pub fn workspace_root() -> PathBuf {
@@ -211,8 +209,9 @@ async fn boot() -> Result<StackState> {
     let (er_rpc_port, er_ws_port) = free_port_pair()?;
     let er_metrics_port = free_port()?;
 
-    let identity = Keypair::try_from(&TEST_IDENTITY_KEYPAIR[..])
-        .map_err(|e| format!("bad TEST_IDENTITY_KEYPAIR: {e}"))?;
+    let identity = Keypair::new();
+    let dlp_admin = Keypair::new();
+    let cloned = ensure_cloned_programs(&dir).await?;
 
     let mut cmd = Command::new(&base_bin);
     cmd.args(["--reset", "--log", "--bind-address", "127.0.0.1"])
@@ -222,11 +221,16 @@ async fn boot() -> Result<StackState> {
         .args(["--rpc-port", &base_rpc_port.to_string()])
         .args(["--faucet-port", &base_faucet_port.to_string()])
         .args(["--gossip-port", &base_gossip_port.to_string()]);
+    // production program bytes resolve their admin from the upgrade
+    // authority, so loading them upgradeable puts our generated key in charge
+    for (id, so) in &cloned {
+        cmd.arg("--upgradeable-program")
+            .arg(id)
+            .arg(so)
+            .arg(dlp_admin.pubkey().to_string());
+    }
     for (id, so) in base_programs(&er_bin)? {
         cmd.arg("--bpf-program").arg(id).arg(so);
-    }
-    for (pubkey, file) in base_accounts()? {
-        cmd.arg("--account").arg(pubkey).arg(file);
     }
     eprintln!("[redsuite] booting base L1 on 127.0.0.1:{base_rpc_port} …");
     let base_log = dir.join("base.log");
@@ -245,9 +249,11 @@ async fn boot() -> Result<StackState> {
         er_pid: 0, // patched below once the ER is spawned
         er_bin: bin_name(&er_bin),
         er_identity: identity.pubkey().to_string(),
+        dlp_admin: dlp_admin.to_bytes().to_vec(),
     };
 
-    match boot_er(&dir, &er_bin, &identity, &state, &base_log).await {
+    match boot_er(&dir, &er_bin, &identity, &dlp_admin, &state, &base_log).await
+    {
         Ok(er_pid) => {
             let state = StackState { er_pid, ..state };
             write_state(&state)?;
@@ -274,6 +280,7 @@ async fn boot_er(
     dir: &Path,
     er_bin: &Path,
     identity: &Keypair,
+    dlp_admin: &Keypair,
     state: &StackState,
     base_log: &Path,
 ) -> Result<u32> {
@@ -317,6 +324,7 @@ async fn boot_er(
         format!("ws://127.0.0.1:{}", state.base_ws_port),
     );
     ensure_identity_funded(&base_ctx, &identity.pubkey()).await?;
+    ensure_fees_vault(&base_ctx, &identity.pubkey(), dlp_admin).await?;
 
     // a fresh base is a new chain — prior-generation ER state is invalid
     let _ = fs::remove_dir_all(dir.join("er-storage"));
@@ -438,6 +446,52 @@ async fn ensure_identity_funded(
     base.airdrop(identity, IDENTITY_FUNDING_LAMPORTS).await
 }
 
+// The ER exits at startup unless its identity's validator-fees-vault exists
+// dlp-owned on the base; only the dlp admin may create it (dlp
+// `InitValidatorFeesVault`, discriminator 6).
+async fn ensure_fees_vault(
+    base: &BaseCtx,
+    identity: &Pubkey,
+    admin: &Keypair,
+) -> Result<()> {
+    let dlp: Pubkey = DLP_ID.parse()?;
+    let vault = Pubkey::find_program_address(
+        &[b"v-fees-vault", identity.as_ref()],
+        &dlp,
+    )
+    .0;
+    if base.account(&vault).await?.is_some() {
+        return Ok(());
+    }
+
+    let admin_balance =
+        base.api().get_balance(&admin.pubkey()).await.unwrap_or(0);
+    if admin_balance < 100_000_000 {
+        base.airdrop(&admin.pubkey(), 1_000_000_000).await?;
+    }
+
+    let system: Pubkey = "11111111111111111111111111111111".parse()?;
+    let program_data =
+        Pubkey::find_program_address(&[dlp.as_ref()], &LOADER_V3.parse()?).0;
+    let init_vault = Instruction {
+        program_id: dlp,
+        accounts: vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new_readonly(program_data, false),
+            AccountMeta::new(*identity, false),
+            AccountMeta::new(vault, false),
+            AccountMeta::new_readonly(system, false),
+        ],
+        data: 6u64.to_le_bytes().to_vec(),
+    };
+    base.send(admin, &[init_vault]).await?;
+    base.account(&vault)
+        .await?
+        .ok_or_else(|| "validator-fees-vault not created on base".into())
+        .map(|_| ())
+}
+
 pub async fn private_er(
     base: &BaseCtx,
     options: ErOptions,
@@ -445,9 +499,14 @@ pub async fn private_er(
     let dir = stack_dir();
     fs::create_dir_all(&dir)?;
     let er_bin = find_er_bin()?;
-    let identity = Keypair::try_from(&TEST_IDENTITY_KEYPAIR[..])
-        .map_err(|e| format!("bad TEST_IDENTITY_KEYPAIR: {e}"))?;
+    let identity = Keypair::new();
+    let admin_bytes = read_state()
+        .ok_or("no shared stack state — boot the shared stack first")?
+        .dlp_admin;
+    let dlp_admin = Keypair::try_from(&admin_bytes[..])
+        .map_err(|e| format!("corrupt state.json: bad dlp_admin: {e}"))?;
     ensure_identity_funded(base, &identity.pubkey()).await?;
+    ensure_fees_vault(base, &identity.pubkey(), &dlp_admin).await?;
 
     let (rpc_port, ws_port) = free_port_pair()?;
     let metrics_port = free_port()?;
@@ -533,21 +592,51 @@ where
     }
 }
 
+async fn ensure_cloned_programs(dir: &Path) -> Result<Vec<(String, PathBuf)>> {
+    let cache = dir.join("cloned-programs");
+    fs::create_dir_all(&cache)?;
+    let url = std::env::var(CLONE_URL_ENV)
+        .unwrap_or_else(|_| DEFAULT_CLONE_URL.to_owned());
+    let api = Api::with_timeout(url.clone(), Duration::from_secs(30));
+    let loader: Pubkey = LOADER_V3.parse()?;
+    let mut programs = Vec::new();
+    for (id, name) in [(DLP_ID, "dlp.so"), (MDP_ID, "mdp.so")] {
+        let path = cache.join(name);
+        let program: Pubkey = id.parse()?;
+        let program_data =
+            Pubkey::find_program_address(&[program.as_ref()], &loader).0;
+        match api.get_account(&program_data).await {
+            Ok(Some(account)) if account.data.len() > PROGRAM_DATA_HEADER => {
+                fs::write(&path, &account.data[PROGRAM_DATA_HEADER..])?;
+                eprintln!(
+                    "[redsuite] cloned {name} from {url} ({} bytes)",
+                    account.data.len() - PROGRAM_DATA_HEADER,
+                );
+            }
+            outcome => {
+                if path.exists() {
+                    eprintln!(
+                        "[redsuite] warning: refreshing {name} from {url} \
+                         failed ({outcome:?}) — using the cached copy"
+                    );
+                } else {
+                    return Err(format!(
+                        "cannot clone {name} from {url} and no cached copy \
+                         exists in {}",
+                        cache.display()
+                    )
+                    .into());
+                }
+            }
+        }
+        programs.push((id.to_owned(), path));
+    }
+    Ok(programs)
+}
+
 fn base_programs(er_bin: &Path) -> Result<Vec<(String, PathBuf)>> {
     let root = workspace_root();
     let mut programs = Vec::new();
-
-    for (id, name) in [(DLP_ID, "dlp.so"), (MDP_ID, "mdp.so")] {
-        let so = root.join("base-programs").join(name);
-        if !so.exists() {
-            return Err(format!(
-                "missing pinned base program {}",
-                so.display()
-            )
-            .into());
-        }
-        programs.push((id.to_owned(), so));
-    }
 
     match committor_so(er_bin) {
         Some(so) => programs.push((COMMITTOR_ID.to_owned(), so)),
@@ -569,37 +658,6 @@ fn base_programs(er_bin: &Path) -> Result<Vec<(String, PathBuf)>> {
         }
     }
     Ok(programs)
-}
-
-#[derive(Deserialize)]
-struct AccountFixture {
-    pubkey: String,
-}
-
-/// `base-accounts/*.json` — the ER cannot boot without them, see
-/// base-accounts/README.md.
-fn base_accounts() -> Result<Vec<(String, PathBuf)>> {
-    let dir = workspace_root().join("base-accounts");
-    let mut entries: Vec<_> = fs::read_dir(&dir)
-        .map_err(|e| format!("{}: {e}", dir.display()))?
-        .collect::<std::io::Result<Vec<_>>>()?;
-    entries.sort_by_key(|entry| entry.file_name());
-    let mut accounts = Vec::new();
-    for entry in entries {
-        let path = entry.path();
-        if path.extension().is_some_and(|ext| ext == "json") {
-            let fixture: AccountFixture =
-                json::from_str(&fs::read_to_string(&path)?)
-                    .map_err(|e| format!("{}: {e}", path.display()))?;
-            accounts.push((fixture.pubkey, path));
-        }
-    }
-    if accounts.is_empty() {
-        return Err(
-            format!("no account fixtures found in {}", dir.display()).into()
-        );
-    }
-    Ok(accounts)
 }
 
 /// Version-coupled to the ER, so taken from the ER binary's own build tree.
