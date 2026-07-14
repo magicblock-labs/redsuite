@@ -29,7 +29,7 @@ tokio = { version = "1", features = ["rt", "macros", "time", "net"] }
 tokio-tungstenite = "0.29"
 futures-util = "0.3"
 async-trait = "0.1"
-reqwest = { version = "0.12", default-features = false }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
 serde = { version = "1", features = ["derive"] }
 json = { package = "sonic-rs", version = "0.5" }

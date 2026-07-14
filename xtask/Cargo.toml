@@ -8,7 +8,3 @@ publish = false
 
 [dependencies]
 redsuite-core = { workspace = true }
-sha2 = "0.10"
-toml_edit = "0.22"
-json = { workspace = true }
-serde = { workspace = true }

@@ -44,9 +44,7 @@ reuses them. `cargo xtask stack down` stops the stack.
     redhat/                 security scenarios (adversarial, must-be-rejected)
     cli/                    the `redsuite` binary — run scenarios without cargo
     programs/               on-chain SBF programs, one per family
-    base-programs/          pinned third-party base-L1 programs (dlp, mdp) + provenance manifest
-    base-accounts/          pinned genesis account fixtures (test identity + dlp fee vaults)
-    xtask/                  cargo xtask automation (SBF builds, base-program refresh, stack control)
+    xtask/                  cargo xtask automation (SBF builds, stack control, reports)
 
 ## Writing a scenario
 
@@ -178,18 +176,6 @@ harness:
 
 ## Base-chain programs & accounts
 
-Every stack starts the base L1 with the delegation program (dlp), the domain
-registry (mdp), the committor program and all built family programs, plus the
-genesis account fixtures. Sourced by ownership:
-
-- `base-programs/` — pinned third-party artifacts (`dlp.so`, `mdp.so`);
-  provenance in `base-programs/MANIFEST.toml`. Refresh with `cargo xtask
-  refresh-base-programs <name>` (source build at the pinned rev) or
-  `… <name> --from-chain <url>` (dump the deployed bytes); `cargo xtask
-  check-base-programs` verifies integrity.
-- `base-accounts/` — the well-known test identity and the dlp fee-vault PDAs
-  derived from it.
-- `target/deploy/` — our family programs: `cargo xtask programs` (build-sbf).
-- the validator build under test — `magicblock_committor_program.so` is
-  version-coupled to the ER binary and taken from the ER binary's own build
-  tree, never vendored.
+- dlp and mdp are cloned from a live cluster
+- the ER identity and the dlp admin are fresh keypairs generated
+- `magicblock_committor_program.so` is taken from the ER binary's own build
