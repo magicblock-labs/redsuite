@@ -111,7 +111,7 @@ The harness needs two binaries:
 
 ## redline scenarios
 
-The performance tests, one file each under `redline/tests/<subsystem>/`.
+The performance tests, one file each under `redline/src/scenarios/<subsystem>/`.
 `REDSUITE_PROFILE=lite` (default) is a quick local run, `full` produces the
 real numbers.
 
@@ -131,7 +131,10 @@ aperture (RPC / websocket ingress):
   and memory the whole time. Anything left behind is a leak.
 - `rpc_capacity_blast` — fires transactions as fast as the client can push
   for a few seconds and records how many per second the validator accepted.
-- `high_cu` — meant to stress execution with compute-heavy transactions
+- `high_cu` — stresses execution: the same rate of transactions, once with a
+  trivial amount of work per transaction and once with a heavy one (a hash
+  computed over and over, close to the compute limit). Reading the final hash
+  back off the accounts proves the validator really did the work.
 
 scheduler:
 
