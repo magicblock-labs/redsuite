@@ -68,7 +68,18 @@ pub mod build {
         seed: u8,
         authority: Pubkey,
     ) -> (SolanaInstruction, Pubkey) {
-        let (pda, bump) = derive_pda(base, space, seed, authority);
+        init_account_at(crate::id(), payer, base, space, seed, authority)
+    }
+
+    pub fn init_account_at(
+        program_id: Pubkey,
+        payer: Pubkey,
+        base: Pubkey,
+        space: u32,
+        seed: u8,
+        authority: Pubkey,
+    ) -> (SolanaInstruction, Pubkey) {
+        let (pda, bump) = derive_pda(&program_id, base, space, seed, authority);
         let metas = vec![
             AccountMeta::new(payer, true),
             AccountMeta::new(pda, false),
@@ -81,7 +92,9 @@ pub mod build {
             bump,
             authority,
         };
-        (with_bincode(&ix, metas), pda)
+        let mut ix = with_bincode(&ix, metas);
+        ix.program_id = program_id;
+        (ix, pda)
     }
 
     pub fn delegate(
@@ -91,8 +104,19 @@ pub mod build {
         seed: u8,
         authority: Pubkey,
     ) -> SolanaInstruction {
+        delegate_at(crate::id(), payer, pda, base, seed, authority)
+    }
+
+    pub fn delegate_at(
+        program_id: Pubkey,
+        payer: Pubkey,
+        pda: Pubkey,
+        base: Pubkey,
+        seed: u8,
+        authority: Pubkey,
+    ) -> SolanaInstruction {
         let accounts =
-            sdk::delegate_args::DelegateAccounts::new(pda, crate::id());
+            sdk::delegate_args::DelegateAccounts::new(pda, program_id);
         let m = sdk::delegate_args::DelegateAccountMetas::from(accounts);
         let metas = vec![
             AccountMeta::new(payer, true),
@@ -105,7 +129,10 @@ pub mod build {
             m.system_program,
             AccountMeta::new_readonly(base, false),
         ];
-        with_bincode(&Instruction::Delegate { seed, authority }, metas)
+        let mut ix =
+            with_bincode(&Instruction::Delegate { seed, authority }, metas);
+        ix.program_id = program_id;
+        ix
     }
 
     pub fn simple_byte_set(id: u64, accounts: &[Pubkey]) -> SolanaInstruction {
@@ -122,14 +149,26 @@ pub mod build {
         iters: u32,
         accounts: &[Pubkey],
     ) -> SolanaInstruction {
+        expensive_hash_compute_at(crate::id(), id, init, iters, accounts)
+    }
+
+    pub fn expensive_hash_compute_at(
+        program_id: Pubkey,
+        id: u64,
+        init: Pubkey,
+        iters: u32,
+        accounts: &[Pubkey],
+    ) -> SolanaInstruction {
         let metas = accounts
             .iter()
             .map(|&pk| AccountMeta::new(pk, false))
             .collect();
-        with_bincode(
+        let mut ix = with_bincode(
             &Instruction::ExpensiveHashCompute { id, init, iters },
             metas,
-        )
+        );
+        ix.program_id = program_id;
+        ix
     }
 
     pub fn multi_account_read(
@@ -297,7 +336,7 @@ mod tests {
         };
         assert_eq!((space, seed), (256, 3));
         assert_eq!(
-            crate::utils::derive_pda(base, 256, 3, authority),
+            crate::utils::derive_pda(&crate::ID, base, 256, 3, authority),
             (pda, bump)
         );
     }

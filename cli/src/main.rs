@@ -21,6 +21,7 @@ registry![
     ("redline/ws_fanout_threshold", redline::scenarios::aperture::ws_fanout_threshold::WsFanoutThreshold),
     ("redline/ws_conn_capacity", redline::scenarios::aperture::ws_conn_capacity::WsConnCapacity),
     ("redline/hot_account_cliff", redline::scenarios::scheduler::hot_account_cliff::HotAccountCliff),
+    ("redline/executor_saturation", redline::scenarios::scheduler::executor_saturation::ExecutorSaturation),
     ("redline/clone_lru_churn", redline::scenarios::chainlink::clone_lru_churn::CloneLruChurn),
     ("redline/ensure_gate_stall", redline::scenarios::chainlink::ensure_gate_stall::EnsureGateStall),
     ("redline/cold_hydration_tail", redline::scenarios::chainlink::cold_hydration_tail::ColdHydrationTail),

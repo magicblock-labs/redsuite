@@ -47,6 +47,30 @@ const FAMILY_PROGRAMS: &[(&str, &str)] = &[
     ),
 ];
 
+// Extra genesis copies of redline_program.so under derived addresses, so
+// scenarios can spread identical load across distinct program ids.
+const REDLINE_ALIAS_COUNT: usize = 8;
+
+pub fn redline_alias_ids(count: usize) -> Vec<Pubkey> {
+    assert!(
+        count <= REDLINE_ALIAS_COUNT,
+        "only {REDLINE_ALIAS_COUNT} redline aliases are loaded at base boot"
+    );
+    let redline_id: Pubkey = FAMILY_PROGRAMS[0]
+        .0
+        .parse()
+        .expect("redline program id parses");
+    (0..count)
+        .map(|index| {
+            Pubkey::find_program_address(
+                &[b"redsuite-alias", &[index as u8]],
+                &redline_id,
+            )
+            .0
+        })
+        .collect()
+}
+
 const CLONE_URL_ENV: &str = "REDSUITE_CLONE_URL";
 const DEFAULT_CLONE_URL: &str = "https://api.mainnet-beta.solana.com";
 const LOADER_V3: &str = "BPFLoaderUpgradeab1e11111111111111111111111";
@@ -230,6 +254,9 @@ async fn boot() -> Result<StackState> {
             .arg(dlp_admin.pubkey().to_string());
     }
     for (id, so) in base_programs(&er_bin)? {
+        for alias in redline_aliases_of(&so) {
+            cmd.arg("--bpf-program").arg(alias.to_string()).arg(&so);
+        }
         cmd.arg("--bpf-program").arg(id).arg(so);
     }
     eprintln!("[redsuite] booting base L1 on 127.0.0.1:{base_rpc_port} …");
@@ -658,6 +685,17 @@ fn base_programs(er_bin: &Path) -> Result<Vec<(String, PathBuf)>> {
         }
     }
     Ok(programs)
+}
+
+fn redline_aliases_of(so: &Path) -> Vec<Pubkey> {
+    if so
+        .file_name()
+        .is_some_and(|name| name == "redline_program.so")
+    {
+        redline_alias_ids(REDLINE_ALIAS_COUNT)
+    } else {
+        Vec::new()
+    }
 }
 
 /// Version-coupled to the ER, so taken from the ER binary's own build tree.

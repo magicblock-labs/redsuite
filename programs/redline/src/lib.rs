@@ -30,7 +30,7 @@ pub mod layout {
 }
 
 fn process_instruction(
-    _program_id: &Pubkey,
+    program_id: &Pubkey,
     accounts: &[AccountInfo],
     instruction_data: &[u8],
 ) -> ProgramResult {
@@ -40,7 +40,7 @@ fn process_instruction(
         let (disc, data) =
             instruction_data.split_at(EXTERNAL_UNDELEGATE_DISCRIMINATOR.len());
         if disc == EXTERNAL_UNDELEGATE_DISCRIMINATOR {
-            return undelegate(accounts, data);
+            return undelegate(program_id, accounts, data);
         }
     }
 
@@ -57,7 +57,7 @@ fn process_instruction(
             seed,
             bump,
             authority,
-        } => init_account(&mut iter, space, seed, bump, authority)?,
+        } => init_account(program_id, &mut iter, space, seed, bump, authority)?,
         Instruction::Delegate { seed, authority } => {
             delegate_account(accounts, seed, authority)?
         }

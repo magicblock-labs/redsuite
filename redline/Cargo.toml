@@ -68,6 +68,10 @@ name = "hot_account_cliff"
 path = "tests/scheduler/hot_account_cliff.rs"
 
 [[test]]
+name = "executor_saturation"
+path = "tests/scheduler/executor_saturation.rs"
+
+[[test]]
 name = "storage_prodsize_sustain"
 path = "tests/storage/storage_prodsize_sustain.rs"
 

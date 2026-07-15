@@ -114,6 +114,25 @@ pub async fn init_delegated_accounts_batched(
     space: u32,
     authority: Pubkey,
 ) -> Result<Vec<Pubkey>> {
+    init_delegated_accounts_batched_at(
+        program::id(),
+        base,
+        payers,
+        count,
+        space,
+        authority,
+    )
+    .await
+}
+
+pub async fn init_delegated_accounts_batched_at(
+    program_id: Pubkey,
+    base: &impl ChainCtx,
+    payers: &[Keypair],
+    count: usize,
+    space: u32,
+    authority: Pubkey,
+) -> Result<Vec<Pubkey>> {
     if payers.is_empty() {
         return Err("at least one prep payer is required".into());
     }
@@ -136,14 +155,17 @@ pub async fn init_delegated_accounts_batched(
                 let mut pending = Vec::new();
                 for account_index in first_index..last_index {
                     let seed = (account_index - first_index) as u8;
-                    let (init, pda) = program::instruction::build::init_account(
-                        payer.pubkey(),
-                        payer.pubkey(),
-                        space,
-                        seed,
-                        authority,
-                    );
-                    let delegate = program::instruction::build::delegate(
+                    let (init, pda) =
+                        program::instruction::build::init_account_at(
+                            program_id,
+                            payer.pubkey(),
+                            payer.pubkey(),
+                            space,
+                            seed,
+                            authority,
+                        );
+                    let delegate = program::instruction::build::delegate_at(
+                        program_id,
                         payer.pubkey(),
                         pda,
                         payer.pubkey(),

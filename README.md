@@ -138,6 +138,9 @@ scheduler:
 
 - `hot_account_cliff` — sends a fixed transaction rate at fewer and fewer
   accounts (32 down to 4) so they all fight over the same account locks.
+- `executor_saturation` — pre-signs a large pile of transactions and fires
+  them all at once, spread over many independent accounts and several copies
+  of the test program.
 
 chainlink (account cloning / subscriptions):
 

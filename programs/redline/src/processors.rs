@@ -50,6 +50,7 @@ fn verify_account_owner(
 }
 
 pub fn init_account(
+    program_id: &Pubkey,
     iter: &mut std::slice::Iter<AccountInfo>,
     space: u32,
     seed: u8,
@@ -66,7 +67,7 @@ pub fn init_account(
 
     create_pda(
         pda,
-        &crate::ID,
+        program_id,
         space as usize,
         &[&seeds],
         next_account_info(iter)?,
@@ -343,7 +344,11 @@ pub fn close_account(
     Ok(())
 }
 
-pub fn undelegate(accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+pub fn undelegate(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+) -> ProgramResult {
     let iter = &mut accounts.iter();
     let delegated_account = next_account_info(iter)?;
     let buffer = next_account_info(iter)?;
@@ -358,7 +363,7 @@ pub fn undelegate(accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
 
     undelegate_account(
         delegated_account,
-        &crate::ID,
+        program_id,
         buffer,
         payer,
         system_program,

@@ -8,7 +8,7 @@
 mod stack;
 
 pub use stack::{
-    current_state, down, er_bin_path, private_er, shared, stack_dir, status,
-    workspace_root, ErOptions, PrivateEr, StackState, COMMITTOR_ID, DLP_ID,
-    MDP_ID,
+    current_state, down, er_bin_path, private_er, redline_alias_ids, shared,
+    stack_dir, status, workspace_root, ErOptions, PrivateEr, StackState,
+    COMMITTOR_ID, DLP_ID, MDP_ID,
 };
