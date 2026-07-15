@@ -5,10 +5,12 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
-[dev-dependencies]
-redsuite-core = { workspace = true }
-tokio = { workspace = true }
+[dependencies]
 async-trait = { workspace = true }
+tokio = { workspace = true }
+redsuite-core = { workspace = true }
+
+[dev-dependencies]
 
 [[test]]
 name = "illegal_writable"

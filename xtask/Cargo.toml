@@ -7,5 +7,4 @@ authors.workspace = true
 publish = false
 
 [dependencies]
-json = { workspace = true }
-serde = { workspace = true }
+redsuite-core = { workspace = true }

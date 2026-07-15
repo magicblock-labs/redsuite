@@ -42,14 +42,43 @@ reuses them. `cargo xtask stack down` stops the stack.
     redline/                performance scenarios (load)
     redshift/               correctness scenarios (observed state vs expected model)
     redhat/                 security scenarios (adversarial, must-be-rejected)
+    cli/                    the `redsuite` binary — run scenarios without cargo
     programs/               on-chain SBF programs, one per family
     xtask/                  cargo xtask automation (SBF builds, stack control, reports)
 
 ## Writing a scenario
 
-One file per scenario under `<family>/tests/`, one `Scenario` impl, one
-`#[tokio::test]` calling `run_scenario` — the harness owns process spawning,
-ports, funding and teardown. See `redshift/tests/commit_roundtrip.rs`.
+Scenarios live in the family libraries under `<family>/src/scenarios/
+<subsystem>/<name>.rs`: one `Scenario` impl each — the harness owns process
+spawning, ports, funding and teardown. See
+`redshift/src/scenarios/committor/commit_roundtrip.rs`.
+
+Each scenario is reachable two ways, and a new one needs both:
+
+- a test shim in `<family>/tests/<subsystem>/<name>.rs` (four lines, calling
+  `run_scenario`) plus its `[[test]]` entry in the family `Cargo.toml`, so it
+  runs under `cargo test` / `cargo nextest`;
+- an entry in the registry in `cli/src/main.rs`, so it runs under the
+  `redsuite` binary.
+
+## The redsuite binary
+
+The whole suite also builds into one executable, which is what CI and
+benchmark hosts use — no cargo, no checkout of the tests:
+
+    cargo build --release -p redsuite
+
+    redsuite list                             # every scenario
+    redsuite run redline/high_cu              # one scenario (short names work too)
+    redsuite run redline --profile full       # a whole family
+    redsuite run all                          # everything, sequentially
+    redsuite stack status                     # ports, pids, health
+    redsuite stack down                       # stop the shared stack
+    redsuite report compare                   # diff the latest two runs
+
+It still needs `solana-test-validator` on PATH and the ER binary under test
+(`MAGICBLOCK_VALIDATOR_BIN`), and it reads the fixtures and built programs from
+the workspace — set `REDSUITE_ROOT` when running it outside a checkout.
 
 ## Running
 
@@ -80,7 +109,7 @@ The harness needs two binaries:
 
 ## redline scenarios
 
-The performance tests, one file each under `redline/tests/<subsystem>/`.
+The performance tests, one file each under `redline/src/scenarios/<subsystem>/`.
 `REDSUITE_PROFILE=lite` (default) is a quick local run, `full` produces the
 real numbers.
 
@@ -100,7 +129,10 @@ aperture (RPC / websocket ingress):
   and memory the whole time. Anything left behind is a leak.
 - `rpc_capacity_blast` — fires transactions as fast as the client can push
   for a few seconds and records how many per second the validator accepted.
-- `high_cu` — meant to stress execution with compute-heavy transactions
+- `high_cu` — stresses execution: the same rate of transactions, once with a
+  trivial amount of work per transaction and once with a heavy one (a hash
+  computed over and over, close to the compute limit). Reading the final hash
+  back off the accounts proves the validator really did the work.
 
 scheduler:
 

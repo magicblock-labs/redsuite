@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use async_trait::async_trait;
 
 use crate::{
@@ -23,10 +25,12 @@ async fn run_inner(scenario: impl Scenario) -> ScenarioReport {
     let (base, er) = topology::shared().await.unwrap_or_else(|e| {
         panic!("failed to bring up the shared base+ER stack: {e}")
     });
+    let started = Instant::now();
     let report = scenario
         .run(&base, &er)
         .await
         .unwrap_or_else(|e| panic!("scenario {} failed: {e}", scenario.name()));
+    let report = report.metric("wall seconds", started.elapsed().as_secs_f64());
     eprintln!("[redsuite] {}: passed={}", report.scenario, report.passed);
     if !report.config.is_empty() {
         let knobs: Vec<String> = report

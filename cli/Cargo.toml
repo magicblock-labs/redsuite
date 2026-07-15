@@ -1,0 +1,17 @@
+[package]
+name = "redsuite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "redsuite"
+path = "src/main.rs"
+
+[dependencies]
+redsuite-core = { workspace = true }
+redline = { workspace = true }
+redshift = { workspace = true }
+redhat = { workspace = true }
+tokio = { workspace = true }

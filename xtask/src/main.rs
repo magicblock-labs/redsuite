@@ -1,12 +1,12 @@
-mod report;
-
 use std::{
-    env, fs,
+    env,
     path::{Path, PathBuf},
     process::{exit, Command},
 };
 
-type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+use redsuite_core::{report, topology};
+
+type Result<T> = redsuite_core::Result<T>;
 
 const FAMILY_PROGRAMS: &[&str] = &["redline", "redshift", "redhat"];
 
@@ -34,8 +34,8 @@ fn run() -> Result<()> {
     match arg(0) {
         Some("programs") => programs(),
         Some("stack") => match arg(1) {
-            Some("status") => stack_status(),
-            Some("down") => stack_down(),
+            Some("status") => topology::status(),
+            Some("down") => topology::down(),
             _ => usage(),
         },
         Some("report") => match arg(1) {
@@ -106,117 +106,5 @@ fn programs() -> Result<()> {
                 .arg(root().join(format!("programs/{program}/Cargo.toml"))),
         )?;
     }
-    Ok(())
-}
-
-/// Subset of redsuite-core's `StackState` (topology/stack.rs); serde
-/// ignores the rest.
-#[derive(json::Deserialize)]
-struct StackState {
-    base_rpc_port: u16,
-    base_pid: u32,
-    base_bin: String,
-    er_rpc_port: u16,
-    er_metrics_port: u16,
-    er_pid: u32,
-    er_bin: String,
-    er_identity: String,
-}
-
-fn stack_state_path() -> PathBuf {
-    root().join("target/redsuite-stack/state.json")
-}
-
-fn read_stack_state() -> Result<Option<StackState>> {
-    let path = stack_state_path();
-    if !path.exists() {
-        return Ok(None);
-    }
-    let state = json::from_str(&fs::read_to_string(&path)?)
-        .map_err(|e| format!("{}: {e}", path.display()))?;
-    Ok(Some(state))
-}
-
-/// PID alive and still the recorded binary (guards against PID reuse).
-fn proc_matches(pid: u32, bin: &str) -> bool {
-    fs::read(format!("/proc/{pid}/cmdline"))
-        .map(|cmdline| String::from_utf8_lossy(&cmdline).contains(bin))
-        .unwrap_or(false)
-}
-
-fn rpc_listening(port: u16) -> bool {
-    use std::net::{SocketAddr, TcpStream};
-    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
-    TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(500))
-        .is_ok()
-}
-
-fn stack_status() -> Result<()> {
-    let Some(state) = read_stack_state()? else {
-        println!(
-            "no shared stack ({} absent) — the first scenario test boots it",
-            stack_state_path().display()
-        );
-        return Ok(());
-    };
-    let describe = |name: &str, pid: u32, bin: &str, port: u16| {
-        let proc_state = if proc_matches(pid, bin) {
-            "running"
-        } else {
-            "DEAD"
-        };
-        let rpc_state = if rpc_listening(port) {
-            "rpc up"
-        } else {
-            "rpc DOWN"
-        };
-        println!("{name:5} pid {pid:<8} {proc_state:8} 127.0.0.1:{port:<6} {rpc_state}   ({bin})");
-    };
-    describe("base", state.base_pid, &state.base_bin, state.base_rpc_port);
-    describe("er", state.er_pid, &state.er_bin, state.er_rpc_port);
-    println!("er identity   {}", state.er_identity);
-    println!(
-        "er metrics    http://127.0.0.1:{}/metrics",
-        state.er_metrics_port
-    );
-    println!(
-        "logs          {}",
-        root().join("target/redsuite-stack").display()
-    );
-    Ok(())
-}
-
-fn stack_down() -> Result<()> {
-    let Some(state) = read_stack_state()? else {
-        println!("no shared stack to stop");
-        return Ok(());
-    };
-    let procs = [
-        ("er", state.er_pid, state.er_bin.as_str()),
-        ("base", state.base_pid, state.base_bin.as_str()),
-    ];
-    for (name, pid, bin) in procs {
-        if proc_matches(pid, bin) {
-            println!("stopping {name} (pid {pid})");
-            let _ = Command::new("kill").arg(pid.to_string()).status();
-        }
-    }
-    let deadline =
-        std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while std::time::Instant::now() < deadline
-        && procs.iter().any(|(_, pid, bin)| proc_matches(*pid, bin))
-    {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    for (name, pid, bin) in procs {
-        if proc_matches(pid, bin) {
-            println!("killing {name} (pid {pid}) — did not exit in time");
-            let _ = Command::new("kill")
-                .args(["-KILL", &pid.to_string()])
-                .status();
-        }
-    }
-    fs::remove_file(stack_state_path())?;
-    println!("stack down");
     Ok(())
 }
