@@ -61,10 +61,33 @@ impl ProducedLedger {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct AccountRecv {
     pub count: u64,
-    pub max_id: u64,
+    seen: Vec<u64>,
+}
+
+impl AccountRecv {
+    fn mark(&mut self, index: usize, capacity: usize) -> bool {
+        if self.seen.is_empty() {
+            self.seen = vec![0u64; capacity.div_ceil(64)];
+        }
+        let word = index / 64;
+        let bit = 1u64 << (index % 64);
+        if self.seen[word] & bit != 0 {
+            return false;
+        }
+        self.seen[word] |= bit;
+        self.count += 1;
+        true
+    }
+
+    fn has(&self, index: usize) -> bool {
+        self.seen
+            .get(index / 64)
+            .map(|word| word & (1u64 << (index % 64)) != 0)
+            .unwrap_or(false)
+    }
 }
 
 #[derive(Debug)]
@@ -207,19 +230,39 @@ impl SubscriberPool {
         }
     }
 
-    pub fn missing_final(&self, final_ids: &HashMap<Pubkey, u64>) -> usize {
+    pub fn incomplete(&self, expected: &ExpectedWrites) -> usize {
         self.states
             .iter()
             .map(|state| {
                 let state = state.lock().unwrap();
-                final_ids
+                expected
                     .iter()
-                    .filter(|(account, final_id)| {
+                    .filter(|(account, write_ids)| {
                         state
                             .by_account
                             .get(account)
-                            .map(|recv| recv.max_id < **final_id)
+                            .map(|recv| (recv.count as usize) < write_ids.len())
                             .unwrap_or(true)
+                    })
+                    .count()
+            })
+            .sum()
+    }
+
+    pub fn missing_final(&self, expected: &ExpectedWrites) -> usize {
+        self.states
+            .iter()
+            .map(|state| {
+                let state = state.lock().unwrap();
+                expected
+                    .iter()
+                    .filter(|(account, write_ids)| {
+                        !write_ids.is_empty()
+                            && !state
+                                .by_account
+                                .get(account)
+                                .map(|recv| recv.has(write_ids.len() - 1))
+                                .unwrap_or(false)
                     })
                     .count()
             })
@@ -228,12 +271,12 @@ impl SubscriberPool {
 
     pub async fn await_final(
         &self,
-        final_ids: &HashMap<Pubkey, u64>,
+        expected: &ExpectedWrites,
         timeout: Duration,
     ) -> usize {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            let missing = self.missing_final(final_ids);
+            let missing = self.missing_final(expected);
             if missing == 0 || tokio::time::Instant::now() >= deadline {
                 return missing;
             }
@@ -368,24 +411,19 @@ async fn run_connection(
                         else {
                             continue;
                         };
-                        let expected_here = expected
-                            .get(&account)
-                            .map(|write_ids| {
-                                write_ids.binary_search(&id).is_ok()
-                            })
-                            .unwrap_or(false);
-                        if !expected_here {
+                        let Some(write_ids) = expected.get(&account) else {
                             continue;
-                        }
+                        };
+                        let Ok(index) = write_ids.binary_search(&id) else {
+                            continue;
+                        };
                         {
                             let mut state = state.lock().unwrap();
                             let recv =
                                 state.by_account.entry(account).or_default();
-                            if id <= recv.max_id {
+                            if !recv.mark(index, write_ids.len()) {
                                 continue;
                             }
-                            recv.count += 1;
-                            recv.max_id = id;
                             state.received += 1;
                             if lag_micros > threshold_micros {
                                 state.over_threshold += 1;
