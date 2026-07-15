@@ -2,17 +2,18 @@ use std::{collections::HashMap, rc::Rc, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use instruction::Instruction;
+use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
     assert::poll_until,
     prep, report,
-    runner::{drive, RunConfig},
+    runner::{drive_threads, RunOutcome, ThreadRunConfig},
     stats::ObservationsStats,
     transport::subpool::{
         ConnReport, ExpectedWrites, ProducedLedger, SubscriberPool,
     },
-    BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
-    TxSender,
+    BaseCtx, ChainCtx, ErClient, ErCtx, MetricsDelta, Result, Scenario,
+    ScenarioReport, TxSender,
 };
 
 const PREP_PAYER_LAMPORTS: u64 = 4_000_000_000;
@@ -27,8 +28,9 @@ struct Profile {
     name: &'static str,
     payers: usize,
     accounts: usize,
-    ladder: [usize; 3],
+    ladder: &'static [usize],
     subscriber_threads: usize,
+    threads: usize,
     warmup: u64,
     iterations: u64,
     rate: u32,
@@ -39,8 +41,9 @@ const LITE: Profile = Profile {
     name: "lite",
     payers: 8,
     accounts: 16,
-    ladder: [2, 4, 8],
+    ladder: &[2, 4, 8],
     subscriber_threads: 4,
+    threads: 2,
     warmup: 100,
     iterations: 600,
     rate: 200,
@@ -51,12 +54,13 @@ const FULL: Profile = Profile {
     name: "full",
     payers: 32,
     accounts: 64,
-    ladder: [16, 32, 64],
-    subscriber_threads: 8,
-    warmup: 1_000,
-    iterations: 15_000,
-    rate: 1_000,
-    concurrency: 256,
+    ladder: &[16, 32, 64],
+    subscriber_threads: 16,
+    threads: 8,
+    warmup: 10_000,
+    iterations: 100_000,
+    rate: 10_000,
+    concurrency: 2_048,
 };
 
 fn profile() -> &'static Profile {
@@ -96,13 +100,40 @@ fn cell_expected_writes(
     expected
 }
 
-fn final_ids_of(expected: &ExpectedWrites) -> HashMap<Pubkey, u64> {
-    expected
-        .iter()
-        .filter_map(|(account, write_ids)| {
-            write_ids.last().map(|final_id| (*account, *final_id))
-        })
-        .collect()
+fn drive_cell(
+    er_rpc_url: String,
+    config: ThreadRunConfig,
+    id_offset: u64,
+    pool: Arc<Vec<Pubkey>>,
+    payer_bytes: Arc<Vec<[u8; 64]>>,
+    produced: Option<Arc<ProducedLedger>>,
+) -> RunOutcome {
+    let threads = config.threads;
+    let factory = move |thread_index: usize| {
+        let client = ErClient::new(er_rpc_url.clone());
+        let senders: Vec<TxSender> = payer_bytes
+            .iter()
+            .enumerate()
+            .filter(|(payer_index, _)| payer_index % threads == thread_index)
+            .map(|(_, bytes)| {
+                let payer = Keypair::try_from(&bytes[..])
+                    .expect("payer bytes round-trip");
+                client.sender(Rc::new(payer))
+            })
+            .collect();
+        let pool = pool.clone();
+        let produced = produced.clone();
+        move |id: u64| {
+            let global_id = id_offset + id;
+            let (ix, _) = shape(&pool, global_id);
+            if let Some(ledger) = &produced {
+                ledger.record(global_id);
+            }
+            let sender = senders[(global_id as usize) % senders.len()].clone();
+            async move { sender.send(&[ix]).await.map(|_| ()) }
+        }
+    };
+    drive_threads(config, factory)
 }
 
 struct CellOutcome {
@@ -111,6 +142,7 @@ struct CellOutcome {
     failed: u64,
     achieved_tps: f64,
     missing_final: usize,
+    incomplete: usize,
     received_min: u64,
     received_max: u64,
     lag: ObservationsStats,
@@ -145,24 +177,25 @@ impl Scenario for WsFanoutThreshold {
             })
             .await;
         }
-        let senders: Vec<TxSender> = prep_payers
-            .into_iter()
-            .map(|payer| er.sender(Rc::new(payer)))
-            .collect();
+        let payer_bytes: Arc<Vec<[u8; 64]>> = Arc::new(
+            prep_payers.iter().map(|payer| payer.to_bytes()).collect(),
+        );
+        let pool: Arc<Vec<Pubkey>> = Arc::new(pool);
+        let er_rpc_url = er.api().url().to_owned();
 
-        let warmup = drive(
-            RunConfig {
+        let warmup = drive_cell(
+            er_rpc_url.clone(),
+            ThreadRunConfig {
+                threads: profile.threads,
                 iterations: profile.warmup,
                 rate: profile.rate,
                 concurrency: profile.concurrency,
             },
-            |id| {
-                let sender = senders[(id as usize) % senders.len()].clone();
-                let (ix, _) = shape(&pool, id);
-                async move { sender.send(&[ix]).await.map(|_| ()) }
-            },
-        )
-        .await;
+            0,
+            pool.clone(),
+            payer_bytes.clone(),
+            None,
+        );
         assert_eq!(
             warmup.failed, 0,
             "warmup deliveries failed: {:?}",
@@ -171,7 +204,7 @@ impl Scenario for WsFanoutThreshold {
 
         let mut id_cursor = profile.warmup;
         let mut cells: Vec<CellOutcome> = Vec::new();
-        for connections in profile.ladder {
+        for &connections in profile.ladder {
             let produced = Arc::new(ProducedLedger::new(
                 id_cursor + 1,
                 profile.iterations as usize,
@@ -196,31 +229,28 @@ impl Scenario for WsFanoutThreshold {
                 .await?;
 
             let before = er.scrape_metrics().await?;
-            let offset = id_cursor;
-            let outcome = drive(
-                RunConfig {
+            let outcome = drive_cell(
+                er_rpc_url.clone(),
+                ThreadRunConfig {
+                    threads: profile.threads,
                     iterations: profile.iterations,
                     rate: profile.rate,
                     concurrency: profile.concurrency,
                 },
-                |iteration| {
-                    let id = offset + iteration;
-                    let sender = senders[(id as usize) % senders.len()].clone();
-                    let (ix, _) = shape(&pool, id);
-                    produced.record(id);
-                    async move { sender.send(&[ix]).await.map(|_| ()) }
-                },
-            )
-            .await;
+                id_cursor,
+                pool.clone(),
+                payer_bytes.clone(),
+                Some(produced.clone()),
+            );
             assert_eq!(
                 outcome.failed, 0,
                 "ws{connections}: measured deliveries failed: {:?}",
                 outcome.first_error
             );
 
-            let final_ids = final_ids_of(&expected);
             let missing_final =
-                subscribers.await_final(&final_ids, DRAIN_TIMEOUT).await;
+                subscribers.await_final(&expected, DRAIN_TIMEOUT).await;
+            let incomplete = subscribers.incomplete(&expected);
             let after = er.scrape_metrics().await?;
             let delta = MetricsDelta::new(before, after);
             if let Some(error) = subscribers.first_error() {
@@ -253,6 +283,7 @@ impl Scenario for WsFanoutThreshold {
                 failed: outcome.failed,
                 achieved_tps: outcome.achieved_rps(),
                 missing_final,
+                incomplete,
                 received_min,
                 received_max,
                 lag,
@@ -261,7 +292,7 @@ impl Scenario for WsFanoutThreshold {
             };
             eprintln!(
                 "[redsuite] {}: ws{} — {:.0} tps, lag p50 {} us / p95 {} us / max {} us, \
-                 received {}..{} per conn ({} total), missing finals {}, >1s {}",
+                 received {}..{} per conn ({} total), missing finals {}, incomplete pairs {}, >1s {}",
                 self.name(),
                 connections,
                 cell_outcome.achieved_tps,
@@ -272,6 +303,7 @@ impl Scenario for WsFanoutThreshold {
                 received_max,
                 received_total,
                 missing_final,
+                incomplete,
                 over_threshold,
             );
 
@@ -280,6 +312,7 @@ impl Scenario for WsFanoutThreshold {
                     .setting("profile", profile.name)
                     .setting("ws connections", connections)
                     .setting("subscriber threads", profile.subscriber_threads)
+                    .setting("driver threads", profile.threads)
                     .setting(
                         "shape",
                         "read-write 3/tx (1 src + 2 dst data-copy)",
@@ -302,6 +335,7 @@ impl Scenario for WsFanoutThreshold {
                         (received_max - received_min) as f64,
                     )
                     .metric("missing final states", missing_final as f64)
+                    .metric("incomplete conn-account pairs", incomplete as f64)
                     .metric("notifications over 1s", over_threshold as f64)
                     .metric_if(
                         "validator txs in window",
@@ -341,6 +375,20 @@ impl Scenario for WsFanoutThreshold {
             baseline.connections,
             baseline.lag.quantile95
         );
+        assert_eq!(
+            baseline.missing_final, 0,
+            "INVALID: baseline ws{}: {} (connection, account) pairs never \
+             received the final produced state — silent drops at minimum \
+             fan-out",
+            baseline.connections, baseline.missing_final
+        );
+        assert_eq!(
+            baseline.received_min, baseline.received_max,
+            "INVALID: baseline ws{}: connections received unequal \
+             notification counts ({}..{}) — per-connection drops at minimum \
+             fan-out",
+            baseline.connections, baseline.received_min, baseline.received_max
+        );
 
         for cell in &cells {
             assert!(
@@ -348,23 +396,15 @@ impl Scenario for WsFanoutThreshold {
                 "INVALID: ws{} delivered nothing",
                 cell.connections
             );
-            assert_eq!(
-                cell.missing_final, 0,
-                "ws{}: {} (connection, account) pairs never received the \
-                 final produced state — silent notification drops",
-                cell.connections, cell.missing_final
-            );
-            assert_eq!(
-                cell.received_min, cell.received_max,
-                "ws{}: connections received unequal notification counts \
-                 ({}..{}) — per-connection drops",
-                cell.connections, cell.received_min, cell.received_max
-            );
         }
 
         let cliff = cells
             .iter()
-            .find(|cell| cell.lag.quantile95 >= CLIFF_P95_US)
+            .find(|cell| {
+                cell.missing_final > 0
+                    || cell.received_min != cell.received_max
+                    || cell.lag.quantile95 >= CLIFF_P95_US
+            })
             .map(|cell| cell.connections)
             .unwrap_or(0);
         eprintln!(
@@ -390,6 +430,7 @@ impl Scenario for WsFanoutThreshold {
                     .join("/"),
             )
             .setting("subscriber threads", profile.subscriber_threads)
+            .setting("driver threads", profile.threads)
             .setting("payers", profile.payers)
             .setting("accounts", profile.accounts)
             .setting("measured iters per cell", profile.iterations)
@@ -416,6 +457,10 @@ impl Scenario for WsFanoutThreshold {
                 .metric(
                     format!("{cell_name} missing finals"),
                     cell.missing_final as f64,
+                )
+                .metric(
+                    format!("{cell_name} incomplete pairs"),
+                    cell.incomplete as f64,
                 )
                 .metric(
                     format!("{cell_name} over 1s"),

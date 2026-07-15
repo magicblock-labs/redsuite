@@ -59,7 +59,7 @@ const FULL: Profile = Profile {
     threads: 8,
     warmup: 10_000,
     iterations: 100_000,
-    rate: 10_000,
+    rate: 14_000,
     concurrency: 2_048,
 };
 
