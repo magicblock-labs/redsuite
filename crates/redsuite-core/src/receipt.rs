@@ -12,6 +12,8 @@ pub const INTENT_FAILED_CODE: u32 = 0x7461_636F;
 
 pub const COMMIT_LIMIT_ERR: u32 = 0xA000_0000;
 
+pub const INTENT_TOO_LARGE_ERR: u32 = 0xA000_0002;
+
 pub const SPONSORED_COMMIT_LIMIT: u64 = 10;
 
 const LOG_MARKER: &str = "ScheduledCommitSent ";

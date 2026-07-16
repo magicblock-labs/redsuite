@@ -22,6 +22,8 @@ use crate::program::{instruction::build, DELEGATION_PROGRAM_ID};
 
 const PAYER_LAMPORTS: u64 = 5_000_000_000;
 
+const ACCOUNT_SPACE: u32 = 128;
+
 const WARMUP_COMMITS: u64 = 2;
 
 const RECEIPT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -93,6 +95,39 @@ fn commit_set(pdas: &[Pubkey], width: usize, id: u64) -> Vec<Pubkey> {
         .collect()
 }
 
+enum SchedulingOutcome {
+    Confirmed,
+    Rejected(Option<u32>),
+}
+
+async fn scheduling_outcome(
+    er_api: &Api,
+    commit_signature: &signature::Signature,
+    timeout: Duration,
+) -> redsuite_core::Result<SchedulingOutcome> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if let Some(status) =
+            er_api.get_signature_status(commit_signature).await?
+        {
+            if let Some(err) = &status.err {
+                return Ok(SchedulingOutcome::Rejected(custom_error_code(err)));
+            }
+            if status.confirmed {
+                return Ok(SchedulingOutcome::Confirmed);
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "no status for the probe commit {commit_signature} within \
+                 {timeout:?}"
+            )
+            .into());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 const ALT_PROGRAM_ID: &str = "AddressLookupTab1e1111111111111111111111111";
 const SIGNATURE_SCAN_LIMIT: usize = 1000;
 
@@ -158,13 +193,13 @@ impl Scenario for CommitWidthEnvelope {
             base,
             &payer,
             profile.pool,
-            crate::ACCOUNT_SPACE,
+            ACCOUNT_SPACE,
             er.identity(),
         )
         .await?;
         for pda in &pdas {
             poll_until(CLONE_TIMEOUT, || async {
-                matches!(er.account(pda).await, Ok(Some(acc)) if acc.data.len() == crate::ACCOUNT_SPACE as usize)
+                matches!(er.account(pda).await, Ok(Some(acc)) if acc.data.len() == ACCOUNT_SPACE as usize)
             })
             .await;
         }
@@ -353,6 +388,7 @@ impl Scenario for CommitWidthEnvelope {
                 ScenarioReport::ok(&format!("{}/w{width}", self.name()))
                     .setting("profile", profile.name)
                     .setting("width", width)
+                    .setting("account space", ACCOUNT_SPACE)
                     .setting("commits", profile.commits)
                     .setting("offered rate /s", profile.rate)
                     .setting("concurrency", profile.concurrency)
@@ -399,7 +435,9 @@ impl Scenario for CommitWidthEnvelope {
         let mut probe_settings: Vec<(String, String)> = Vec::new();
         let mut probe_metrics: Vec<(String, f64)> = Vec::new();
         if profile.probes {
-            // width 15 exceeds the no-LUT envelope but fits via ALTs
+            // width 15 exceeds the no-LUT envelope: pre-gate validators
+            // deliver it via ALTs, gate validators (>= 0.13.7) refuse it at
+            // scheduling — both are the envelope working as designed
             {
                 let accounts: Vec<Pubkey> =
                     pdas.iter().copied().take(15).collect();
@@ -410,63 +448,98 @@ impl Scenario for CommitWidthEnvelope {
                 let before = er.scrape_metrics().await?;
                 let started = Instant::now();
                 let commit_signature = sender.send(&[ix]).await?;
-                let alt_receipt = receipt::fetch_commit_receipt(
+                match scheduling_outcome(
                     er.api(),
                     &commit_signature,
-                    PROBE_RECEIPT_TIMEOUT,
+                    REJECTION_TIMEOUT,
                 )
-                .await?;
-                if let Some(message) = &alt_receipt.error_message {
-                    return Err(format!(
-                        "width-15 probe intent failed: {message}"
-                    )
-                    .into());
-                }
-                receipt::confirm_base_signatures(
-                    base.api(),
-                    &alt_receipt,
-                    BASE_CONFIRM_TIMEOUT,
-                )
-                .await?;
-                let wall = started.elapsed();
-                let delta =
-                    MetricsDelta::new(before, er.scrape_metrics().await?);
-                let flow_after = snapshot_base_flow(base.api()).await?;
-                if let Some(alt_tables_used) =
-                    delta.counter("mbv_committor_intent_alt_count_sum")
+                .await?
                 {
-                    assert!(
-                        alt_tables_used >= 1.0,
-                        "a width-15 commit should ride ALTs"
-                    );
+                    SchedulingOutcome::Rejected(code) => {
+                        assert_eq!(
+                            code,
+                            Some(receipt::INTENT_TOO_LARGE_ERR),
+                            "the width-15 probe was rejected with an \
+                             unexpected code"
+                        );
+                        eprintln!(
+                            "[redsuite] {}: probe w15: refused at scheduling \
+                             (intent size gate)",
+                            self.name()
+                        );
+                        probe_settings.push((
+                            "probe w15".to_owned(),
+                            "refused at scheduling (intent size gate)"
+                                .to_owned(),
+                        ));
+                    }
+                    SchedulingOutcome::Confirmed => {
+                        let alt_receipt = receipt::fetch_commit_receipt(
+                            er.api(),
+                            &commit_signature,
+                            PROBE_RECEIPT_TIMEOUT,
+                        )
+                        .await?;
+                        if let Some(message) = &alt_receipt.error_message {
+                            return Err(format!(
+                                "width-15 probe intent failed: {message}"
+                            )
+                            .into());
+                        }
+                        receipt::confirm_base_signatures(
+                            base.api(),
+                            &alt_receipt,
+                            BASE_CONFIRM_TIMEOUT,
+                        )
+                        .await?;
+                        let wall = started.elapsed();
+                        let delta = MetricsDelta::new(
+                            before,
+                            er.scrape_metrics().await?,
+                        );
+                        let flow_after = snapshot_base_flow(base.api()).await?;
+                        if let Some(alt_tables_used) =
+                            delta.counter("mbv_committor_intent_alt_count_sum")
+                        {
+                            assert!(
+                                alt_tables_used >= 1.0,
+                                "a width-15 commit should ride ALTs"
+                            );
+                        }
+                        let alt_base_txs =
+                            flow_after.new_alt_since(&flow_before);
+                        assert!(
+                            alt_base_txs >= 1,
+                            "a width-15 commit should create/extend ALTs on \
+                             base"
+                        );
+                        eprintln!(
+                            "[redsuite] {}: probe w15: {:.1} s, {} flow + {} alt base txs",
+                            self.name(),
+                            wall.as_secs_f64(),
+                            flow_after.new_flow_since(&flow_before),
+                            alt_base_txs,
+                        );
+                        probe_settings.push((
+                            "probe w15".to_owned(),
+                            "delivered via ALTs".to_owned(),
+                        ));
+                        probe_metrics.push((
+                            "probe w15 round-trip s".to_owned(),
+                            wall.as_secs_f64(),
+                        ));
+                        probe_metrics.push((
+                            "probe w15 base flow txs".to_owned(),
+                            flow_after.new_flow_since(&flow_before) as f64,
+                        ));
+                        probe_metrics.push((
+                            "probe w15 alt base txs".to_owned(),
+                            alt_base_txs as f64,
+                        ));
+                    }
                 }
-                let alt_base_txs = flow_after.new_alt_since(&flow_before);
-                assert!(
-                    alt_base_txs >= 1,
-                    "a width-15 commit should create/extend ALTs on base"
-                );
-                eprintln!(
-                    "[redsuite] {}: probe w15: {:.1} s, {} flow + {} alt base txs",
-                    self.name(),
-                    wall.as_secs_f64(),
-                    flow_after.new_flow_since(&flow_before),
-                    alt_base_txs,
-                );
-                probe_metrics.push((
-                    "probe w15 round-trip s".to_owned(),
-                    wall.as_secs_f64(),
-                ));
-                probe_metrics.push((
-                    "probe w15 base flow txs".to_owned(),
-                    flow_after.new_flow_since(&flow_before) as f64,
-                ));
-                probe_metrics.push((
-                    "probe w15 alt base txs".to_owned(),
-                    alt_base_txs as f64,
-                ));
             }
 
-            // width 30 must fail deterministically (FailedToFit class)
             {
                 let accounts: Vec<Pubkey> =
                     pdas.iter().copied().take(30).collect();
@@ -475,47 +548,75 @@ impl Scenario for CommitWidthEnvelope {
                     build::commit_accounts(offset, payer_pubkey, &accounts);
                 let before = er.scrape_metrics().await?;
                 let commit_signature = sender.send(&[ix]).await?;
-                let receipt_outcome = receipt::fetch_commit_receipt(
+                let outcome_note = match scheduling_outcome(
                     er.api(),
                     &commit_signature,
-                    Duration::from_secs(45),
+                    REJECTION_TIMEOUT,
                 )
-                .await;
-                let delta =
-                    MetricsDelta::new(before, er.scrape_metrics().await?);
-                let failed_intents = delta
-                    .counter_all("mbv_committor_failed_intents_count")
-                    .unwrap_or(0.0);
-                let outcome_note = match receipt_outcome {
-                    Ok(fit_receipt) => {
-                        assert!(
-                            !fit_receipt.succeeded(),
-                            "a width-30 commit must exceed the fit envelope, \
-                             but the intent succeeded"
-                        );
+                .await?
+                {
+                    SchedulingOutcome::Rejected(code) => {
                         assert_eq!(
-                            fit_receipt.receipt_err_code,
-                            Some(receipt::INTENT_FAILED_CODE),
-                            "width-30 receipt should err with the \
-                             intent-failed code"
+                            code,
+                            Some(receipt::INTENT_TOO_LARGE_ERR),
+                            "the width-30 probe was rejected with an \
+                             unexpected code"
                         );
-                        format!(
-                            "intent failed as expected: {}",
-                            fit_receipt.error_message.unwrap_or_default()
-                        )
+                        "refused at scheduling (intent size gate)".to_owned()
                     }
-                    // a failed receipt tx may be unqueryable — then the
-                    // failed-intents counter must attest to the rejection
-                    Err(fetch_error) => {
-                        assert!(
-                            failed_intents >= 1.0,
-                            "width-30 probe: no failed receipt and no \
-                             failed-intent count ({fetch_error})"
-                        );
-                        format!(
-                            "no receipt ({fetch_error}); failed-intents \
-                             delta {failed_intents}"
+                    SchedulingOutcome::Confirmed => {
+                        let receipt_outcome = receipt::fetch_commit_receipt(
+                            er.api(),
+                            &commit_signature,
+                            Duration::from_secs(45),
                         )
+                        .await;
+                        let delta = MetricsDelta::new(
+                            before,
+                            er.scrape_metrics().await?,
+                        );
+                        let failed_intents = delta
+                            .counter_all("mbv_committor_failed_intents_count")
+                            .unwrap_or(0.0);
+                        probe_metrics.push((
+                            "probe w30 failed intents".to_owned(),
+                            failed_intents,
+                        ));
+                        match receipt_outcome {
+                            Ok(fit_receipt) => {
+                                assert!(
+                                    !fit_receipt.succeeded(),
+                                    "a width-30 commit must exceed the fit \
+                                     envelope, but the intent succeeded"
+                                );
+                                assert_eq!(
+                                    fit_receipt.receipt_err_code,
+                                    Some(receipt::INTENT_FAILED_CODE),
+                                    "width-30 receipt should err with the \
+                                     intent-failed code"
+                                );
+                                format!(
+                                    "intent failed as expected: {}",
+                                    fit_receipt
+                                        .error_message
+                                        .unwrap_or_default()
+                                )
+                            }
+                            // a failed receipt tx may be unqueryable — then
+                            // the failed-intents counter must attest to the
+                            // rejection
+                            Err(fetch_error) => {
+                                assert!(
+                                    failed_intents >= 1.0,
+                                    "width-30 probe: no failed receipt and \
+                                     no failed-intent count ({fetch_error})"
+                                );
+                                format!(
+                                    "no receipt ({fetch_error}); \
+                                     failed-intents delta {failed_intents}"
+                                )
+                            }
+                        }
                     }
                 };
                 eprintln!(
@@ -523,10 +624,6 @@ impl Scenario for CommitWidthEnvelope {
                     self.name()
                 );
                 probe_settings.push(("probe w30".to_owned(), outcome_note));
-                probe_metrics.push((
-                    "probe w30 failed intents".to_owned(),
-                    failed_intents,
-                ));
             }
 
             // the 11th sponsored commit on one account is rejected on-chain
@@ -538,13 +635,13 @@ impl Scenario for CommitWidthEnvelope {
                     base,
                     &probe_payer,
                     1,
-                    crate::ACCOUNT_SPACE,
+                    ACCOUNT_SPACE,
                     er.identity(),
                 )
                 .await?;
                 let probe_account = probe_pdas[0];
                 poll_until(CLONE_TIMEOUT, || async {
-                    matches!(er.account(&probe_account).await, Ok(Some(acc)) if acc.data.len() == crate::ACCOUNT_SPACE as usize)
+                    matches!(er.account(&probe_account).await, Ok(Some(acc)) if acc.data.len() == ACCOUNT_SPACE as usize)
                 })
                 .await;
                 let probe_sender = er.sender(Rc::new(probe_payer));
@@ -635,6 +732,7 @@ impl Scenario for CommitWidthEnvelope {
         let mut summary = ScenarioReport::ok(self.name())
             .setting("profile", profile.name)
             .setting("widths", widths_label.join("/"))
+            .setting("account space", ACCOUNT_SPACE)
             .setting("commits per cell", profile.commits)
             .setting("offered rate /s", profile.rate)
             .setting("concurrency", profile.concurrency)

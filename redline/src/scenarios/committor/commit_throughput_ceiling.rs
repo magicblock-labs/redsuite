@@ -19,7 +19,12 @@ use signer::Signer;
 
 use crate::program::instruction::build;
 
-const COMMIT_WIDTH: usize = 15;
+// The widest fresh-key commit the >= 0.13.7 scheduling-time intent gate
+// admits with margin (it estimates commits at full inline size; probed on
+// v0.13.7: w10 x 40 B schedules, w12 x 40 B is refused). Wide enough that
+// every intent still needs ALTs on base — the TableMania convoy trigger.
+const COMMIT_WIDTH: usize = 8;
+const ACCOUNT_SPACE: u32 = 40;
 const PAYER_LAMPORTS: u64 = 2_000_000_000;
 const PREP_PAYER_LAMPORTS: u64 = 2_000_000_000;
 const INTENT_GATE: Duration = Duration::from_secs(90);
@@ -156,7 +161,7 @@ async fn prewarm(er: &ErCtx, pool: &[Pubkey]) -> Result<()> {
     }
     for pda in pool {
         poll_until(CLONE_TIMEOUT, || async {
-            matches!(er.account(pda).await, Ok(Some(acc)) if acc.data.len() == crate::ACCOUNT_SPACE as usize)
+            matches!(er.account(pda).await, Ok(Some(acc)) if acc.data.len() == ACCOUNT_SPACE as usize)
         })
         .await;
     }
@@ -238,7 +243,7 @@ impl Scenario for CommitThroughputCeiling {
             base,
             &prep_payers,
             pool_size,
-            crate::ACCOUNT_SPACE,
+            ACCOUNT_SPACE,
             er.identity(),
         )
         .await?;
@@ -324,7 +329,7 @@ impl Scenario for CommitThroughputCeiling {
         {
             assert!(
                 alt_tables_used >= 1.0,
-                "width-15 fresh-key commits should ride ALTs"
+                "wide fresh-key commits should ride ALTs"
             );
         }
 
@@ -411,6 +416,7 @@ impl Scenario for CommitThroughputCeiling {
         let mut summary = ScenarioReport::ok(self.name())
             .setting("profile", profile.name)
             .setting("width", COMMIT_WIDTH)
+            .setting("account space", ACCOUNT_SPACE)
             .setting("fresh commits", profile.fresh_commits)
             .setting("pool", pool_size)
             .setting("offered rate /s", profile.rate)
@@ -485,7 +491,7 @@ impl CommitThroughputCeiling {
             base,
             &contrast_payers,
             CONTRAST_SETS * COMMIT_WIDTH,
-            crate::ACCOUNT_SPACE,
+            ACCOUNT_SPACE,
             er.identity(),
         )
         .await?;
@@ -576,6 +582,7 @@ impl CommitThroughputCeiling {
             ScenarioReport::ok(&format!("{}/reused", self.name()))
                 .setting("profile", profile.name)
                 .setting("width", COMMIT_WIDTH)
+                .setting("account space", ACCOUNT_SPACE)
                 .setting("commits", commits)
                 .setting("sets", CONTRAST_SETS)
                 .setting("rounds", ROUNDS)
