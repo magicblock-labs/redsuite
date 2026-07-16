@@ -30,6 +30,8 @@ use crate::{
 pub const DLP_ID: &str = "DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh";
 pub const MDP_ID: &str = "DmnRGfyyftzacFb1XadYhWF6vWqXwtQk5tbr6XgR3BA1";
 pub const COMMITTOR_ID: &str = "ComtrB2KEaWgXsW1dhr1xYL4Ht4Bjj3gXnnL6KMdABq";
+// The validator's committor (>= 0.13.7)
+const NOOP_ID: &str = "noopb9bkMVfRPU8AsbpTUg8AQkHtKwMYZiFUjNRtMmV";
 
 /// Keep in sync with `declare_id!` in `programs/*/src/lib.rs`.
 const FAMILY_PROGRAMS: &[(&str, &str)] = &[
@@ -627,7 +629,9 @@ async fn ensure_cloned_programs(dir: &Path) -> Result<Vec<(String, PathBuf)>> {
     let api = Api::with_timeout(url.clone(), Duration::from_secs(30));
     let loader: Pubkey = LOADER_V3.parse()?;
     let mut programs = Vec::new();
-    for (id, name) in [(DLP_ID, "dlp.so"), (MDP_ID, "mdp.so")] {
+    for (id, name) in
+        [(DLP_ID, "dlp.so"), (MDP_ID, "mdp.so"), (NOOP_ID, "noop.so")]
+    {
         let path = cache.join(name);
         let program: Pubkey = id.parse()?;
         let program_data =
