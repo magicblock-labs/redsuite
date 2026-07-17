@@ -51,7 +51,8 @@ reuses them. `cargo xtask stack down` stops the stack.
 Scenarios live in the family libraries under `<family>/src/scenarios/
 <subsystem>/<name>.rs`: one `Scenario` impl each — the harness owns process
 spawning, ports, funding and teardown. See
-`redshift/src/scenarios/committor/commit_roundtrip.rs`.
+`redshift/src/scenarios/harness/example.rs` — a small working scenario
+meant to be copied as the starting point.
 
 Each scenario is reachable two ways, and a new one needs both:
 
@@ -176,6 +177,61 @@ harness:
   run reports huge latency while the validator-side numbers stay flat, the
   slowness was our client, not the validator — and must never be reported
   as a validator regression.
+
+### What the test client measures
+
+| Metric                  | What it measures                                                                                                               | If it grows, it means                                                                                   |
+|-------------------------|--------------------------------------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------|
+| `delivery us`           | How long you wait for the validator to confirm it received txn. No execution yet — just acceptance.                            | The validator is struggling to receive traffic. The problem is at the entrance, before any real work.   |
+| `signature latency us`  | How long from sending until the validator confirms your transaction actually ran.                                              | The work itself got slower - scheduling, waiting for account locks, or execution.                       |
+| `account-update lag us` | How long until someone watching an account over websocket sees your change.                                                    | Something in the pipeline slowed down                                                                   |
+| `sync round-trip us`    | Cost of one isolated transaction: send it, wait for confirmation, only then send next one.                                     | The true per-transaction cost went up                                                                   |
+| `fanout lag us`         | One account changes while many clients watch it. Times how long until each watcher gets the notification.                      | Broadcasting one update to many listeners doesn't scale — the more watchers, the longer they all wait.  |
+| `churn op us`           | How long one subscribe, unsubscribe, or connection close takes.                                                                | Managing subscriptions itself became slow                                                               |
+| `cold first-touch us`   | Reading an account the validator has never seen — it must first fetch it from the base chain.                                  | Fetching accounts from the base chain got slower.                                                       |
+| `warm repeat us`        | Reading that same account again. Should be fast and stay flat — it's the control.                                              | The cache is broken. If only cold reads slow down, cloning is the problem; if warm ones do, caching is. |
+| `read latency us`       | Read speed while we force the account cache to constantly throw accounts out and re-fetch them.                                | Each evict-and-refetch cycle costs more than it used to.                                                |
+| `commit round-trip us`  | How long from "save this state to the base chain" until it's actually confirmed there.                                         | The commit pipeline is slowing down                                                                     |
+| `er delivery us`        | Just the rollup's commit time.                                                                                                 | Tells you rollup side takes longer for commit                                                           |
+| `achieved rps`          | How many transactions the client managed to send each second (`sendTransaction` calls), counted second by second over the run. | A low average means you hit a ceiling; big swings mean throughput is unstable.                          |
+
+Everything is a distribution, not an average — problems show up in the
+p95/max tail long before the average moves.
+
+### One-number verdicts per run
+
+| Metric                                              | What it measures                                                                                  | If it's off, it means                                                                                       |
+|-----------------------------------------------------|---------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------|
+| `achieved tps` vs `offered tps`                     | We *tried* to send at some rate — did we actually manage to?                                      | A gap means something saturated — and every other result was measured under less load than the test claims. |
+| `base txs per commit`                               | How many base-chain transactions one commit costs.                                                | Commits got more expensive — worse batching, or lookup tables aren't being reused.                          |
+| `fresh drain intents/s` vs `reused drain intents/s` | Commit speed for brand-new accounts (setup needed) vs already-committed ones (setup exists).      | These are two different code paths — this tells you which one regressed.                                    |
+| `cliff at ws conns`                                 | At how many websocket connections update delivery fell over.                                      | The capacity edge moved closer. 0 means we never hit an edge — good, or the test didn't push far enough.    |
+| `thrash p50 slowdown x`                             | How many times slower a typical read gets once the account cache starts thrashing.                | Going over the cache limit hurts more than it used to.                                                      |
+| `heavy/light validator avg ratio`                   | Did compute-heavy transactions take proportionally longer inside the validator than trivial ones? | A ratio near 1.0 proves the validator *didn't actually do the work*.                                        |
+| `writes produced` vs `received total`               | We caused N updates — did N notifications actually arrive?                                        | Any shortfall is the validator silently dropping messages                                                   |
+| `incomplete conn-account pairs`                     | How many watchers missed at least one update.                                                     | How widespread the dropping is.                                                                             |
+| `missing final states`                              | How many watchers never got the *last* update — they're stuck believing stale state forever.      | Clients that are permanently wrong, not just briefly behind.                                                |
+| `received per-conn min/max`                         | The best- and worst-served connection.                                                            | A big spread means drops starve specific connections instead of spreading evenly.                           |
+| `baseline fds` / `fds after churn`                  | Open file handles before vs after churning thousands of connections. They must match.             | A handle leak                                                                                               |
+| `baseline rss kb` / `rss after churn kb`            | Same check for memory.                                                                            | A memory leak.                                                                                              |
+| `validator cores`                                   | How much CPU the validator actually used during the test.                                         | Low CPU *at* a throughput ceiling means the bottleneck is a lock or a serial stage                          |
+| `top thread cores`, `busy threads`                  | How the work spread across threads.                                                               | One thread maxed out while the rest sit idle: a single-threaded bottleneck.                                 |
+
+### What the validator reports about itself (scraped from `/metrics`, counted over the test window)
+
+| Metric                                                            | What it measures                                                                                                                   | If it moves the wrong way, it means…                                                                                                                         |
+|-------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `mbv_transaction_count`, `mbv_failed_transactions_count`          | The validator's own count of transactions it ran, and how many failed.                                                             | If it didn't move at all during a load test, the test measured nothing — the run is thrown out as INVALID.                                                   |
+| `mbv_transaction_processing_time`                                 | The validator timing its own execution of each transaction.                                                                        | If this stays flat while the client's numbers grow, time is being lost *waiting in queues between stages* — the most useful disagreement in the whole suite. |
+| `mbv_ensure_accounts_time`                                        | How long transactions stood at the door waiting for their accounts to be fetched first.                                            | Account fetching is stalling admission — one missing account holds up whole transactions.                                                                    |
+| `mbv_monitored_accounts_gauge`                                    | How many accounts the validator is currently tracking.                                                                             | Used as proof: the oversubscription test really did push past the configured limit.                                                                          |
+| `mbv_evicted_accounts_count` vs `mbv_account_fetches_found_count` | Accounts thrown out of the cache vs accounts fetched back in                                                                       | If they drift apart, accounts are getting lost or fetched twice.                                                                                             |
+| `mbv_max_lock_contention_queue_size`                              | The deepest pile-up of transactions waiting behind one popular account's lock.                                                     | Traffic on hot accounts is serializing harder.                                                                                                               |
+| `mbv_committor_intents_count`, `_failed_intents_count`            | How many commits the validator processed and how many failed.                                                                      | Zero during a commit test invalidates the run.                                                                                                               |
+| `mbv_committor_intent_backlog_count`                              | How many commits are waiting in line.                                                                                              | Commits are being created faster than the workers can process them.                                                                                          |
+| `mbv_committor_executors_busy_count`                              | How many of the commit workers are busy.                                                                                           | All busy *and* the line growing: the pipeline is  saturated                                                                                                  |
+| `mbv_committor_intent_alt_count`, `_alt_preparation_time`         | How many address lookup tables each commit needs, and how long building them takes (each build waits on base-chain confirmations). | The expensive setup step of committing new accounts got even more expensive.                                                                                 |
+
 
 ## Base-chain programs & accounts
 

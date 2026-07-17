@@ -9,8 +9,16 @@ authors.workspace = true
 async-trait = { workspace = true }
 tokio = { workspace = true }
 redsuite-core = { workspace = true }
+instruction = { workspace = true }
+pubkey = { workspace = true }
+keypair = { workspace = true }
+signer = { workspace = true }
 
 [dev-dependencies]
+
+[[test]]
+name = "example"
+path = "tests/harness/example.rs"
 
 [[test]]
 name = "clone_on_access"
