@@ -28,6 +28,7 @@ registry![
     ("redline/commit_width_envelope", redline::scenarios::committor::commit_width_envelope::CommitWidthEnvelope),
     ("redline/commit_throughput_ceiling", redline::scenarios::committor::commit_throughput_ceiling::CommitThroughputCeiling),
     ("redline/storage_prodsize_sustain", redline::scenarios::storage::storage_prodsize_sustain::StorageProdsizeSustain),
+    ("redline/restart_under_load", redline::scenarios::lifecycle::restart_under_load::RestartUnderLoad),
     ("redline/protocol_boundary_selftest", redline::scenarios::harness::protocol_boundary_selftest::ProtocolBoundarySelftest),
     ("redshift/example", redshift::scenarios::harness::example::Example),
     ("redshift/clone_on_access", redshift::scenarios::chainlink::clone_on_access::CloneOnAccess),

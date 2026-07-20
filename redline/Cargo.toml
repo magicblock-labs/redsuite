@@ -76,5 +76,9 @@ name = "storage_prodsize_sustain"
 path = "tests/storage/storage_prodsize_sustain.rs"
 
 [[test]]
+name = "restart_under_load"
+path = "tests/lifecycle/restart_under_load.rs"
+
+[[test]]
 name = "protocol_boundary_selftest"
 path = "tests/harness/protocol_boundary_selftest.rs"

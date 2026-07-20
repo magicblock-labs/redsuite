@@ -11,7 +11,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     time::Duration,
 };
 
@@ -91,6 +91,8 @@ const BASE_READY_TIMEOUT: Duration = Duration::from_secs(60);
 const ER_READY_TIMEOUT: Duration = Duration::from_secs(120);
 const KILL_GRACE: Duration = Duration::from_secs(5);
 const POLL: Duration = Duration::from_millis(250);
+// Fine cadence for restart timing, where the interval is the measurement floor.
+const RESTART_POLL: Duration = Duration::from_millis(5);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StackState {
@@ -367,6 +369,7 @@ async fn boot_er(
         state.er_metrics_port,
         &dir.join("er-storage"),
         &[],
+        true,
     );
     eprintln!("[redsuite] booting ER on 127.0.0.1:{} …", state.er_rpc_port);
     let er_log = dir.join("er.log");
@@ -399,6 +402,7 @@ fn er_command(
     metrics_port: u16,
     storage_dir: &Path,
     extra_env: &[(String, String)],
+    reset: bool,
 ) -> Command {
     let mut cmd = Command::new(er_bin);
     cmd.arg("--remotes")
@@ -411,9 +415,14 @@ fn er_command(
         .arg("-k")
         .arg(identity.to_base58_string()) // throwaway test identity
         .arg("--storage")
-        .arg(storage_dir)
-        .arg("--reset")
-        .arg("--no-tui");
+        .arg(storage_dir);
+    // --reset wipes only the ledger (rocksdb) and skips replay; it preserves
+    // the accountsdb. A restart-in-place relaunch omits it so the ER reopens
+    // the on-disk ledger + accountsdb it already has.
+    if reset {
+        cmd.arg("--reset");
+    }
+    cmd.arg("--no-tui");
     // Not `-m`: the CLI overlay feeds a bare string where a MetricsConfig
     // struct is expected and the validator exits — the env path works.
     cmd.env("MBV_METRICS__ADDRESS", format!("127.0.0.1:{metrics_port}"));
@@ -433,10 +442,54 @@ pub struct ErOptions {
     pub request_timeout: Option<Duration>,
 }
 
+pub struct RestartConfig {
+    // SIGKILL instead of SIGTERM — no graceful drain (crash-recovery path).
+    pub hard_kill: bool,
+    // reset=false relaunches in place; true wipes the ledger and skips replay.
+    pub reset: bool,
+    pub ready_timeout: Duration,
+}
+
+impl Default for RestartConfig {
+    fn default() -> Self {
+        Self {
+            hard_kill: false,
+            reset: false,
+            ready_timeout: ER_READY_TIMEOUT,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RestartTiming {
+    // signal sent → old process exited (the graceful drain under load)
+    pub shutdown: Duration,
+    // relaunch → /health/primary 200 (reopen + replay the DB)
+    pub startup: Duration,
+    // signal sent → serving again
+    pub total: Duration,
+    // a graceful SIGTERM stop had to escalate to SIGKILL (it hung)
+    pub needed_sigkill: bool,
+    // clean SIGTERM shutdown is Some(0)
+    pub exit_code: Option<i32>,
+    pub exit_signal: Option<i32>,
+    pub slot_before: Option<u64>,
+    pub slot_after: Option<u64>,
+}
+
 pub struct PrivateEr {
     pid: u32,
     label: String,
+    identity: Keypair,
+    er_bin: PathBuf,
+    base_rpc_url: String,
+    base_ws_url: String,
+    rpc_port: u16,
+    metrics_port: u16,
+    env: Vec<(String, String)>,
     storage_dir: PathBuf,
+    log: PathBuf,
+    child: Option<Child>,
     ctx: ErCtx,
 }
 
@@ -452,6 +505,104 @@ impl PrivateEr {
     pub fn storage_dir(&self) -> &Path {
         &self.storage_dir
     }
+
+    // Current boot's log. After a restart the prior boot's log (with the
+    // shutdown timing lines) is at log().with_extension("log.prev").
+    pub fn log(&self) -> &Path {
+        &self.log
+    }
+
+    fn rpc_api(&self) -> Api {
+        Api::new(format!("http://127.0.0.1:{}", self.rpc_port))
+    }
+
+    pub async fn wait_ready(&self, timeout: Duration) -> Result<()> {
+        let api = self.rpc_api();
+        wait_until(
+            timeout,
+            "private ER reaching /health/primary",
+            &self.log,
+            self.pid,
+            || api.primary_ready(),
+        )
+        .await
+    }
+
+    // Stop the ER (SIGTERM, or SIGKILL if hard_kill), then relaunch it on the
+    // same storage dir, identity and ports, timing each phase. Ports are
+    // reused, so ctx() stays valid across the restart.
+    pub async fn restart(
+        &mut self,
+        config: RestartConfig,
+    ) -> Result<RestartTiming> {
+        let api = self.rpc_api();
+        let slot_before = api.get_slot().await.ok();
+        let mut child = self
+            .child
+            .take()
+            .ok_or("private ER has no running process to restart")?;
+
+        let restart_started = std::time::Instant::now();
+        send_signal(self.pid, if config.hard_kill { "-KILL" } else { "-TERM" });
+        let grace_deadline = std::time::Instant::now() + KILL_GRACE;
+        let mut needed_sigkill = false;
+        let exit_status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if !config.hard_kill
+                && !needed_sigkill
+                && std::time::Instant::now() >= grace_deadline
+            {
+                send_signal(self.pid, "-KILL");
+                needed_sigkill = true;
+            }
+            tokio::time::sleep(RESTART_POLL).await;
+        };
+        let shutdown = restart_started.elapsed();
+        let exit_code = exit_status.code();
+        let exit_signal =
+            std::os::unix::process::ExitStatusExt::signal(&exit_status);
+
+        let cmd = er_command(
+            &self.er_bin,
+            &self.identity,
+            &self.base_rpc_url,
+            &self.base_ws_url,
+            self.rpc_port,
+            self.metrics_port,
+            &self.storage_dir,
+            &self.env,
+            config.reset,
+        );
+        let launch_started = std::time::Instant::now();
+        let new_child = spawn_child(cmd, &self.log)?;
+        self.pid = new_child.id();
+        self.child = Some(new_child);
+        wait_until_every(
+            RESTART_POLL,
+            config.ready_timeout,
+            "restarted ER reaching /health/primary",
+            &self.log,
+            self.pid,
+            || api.primary_ready(),
+        )
+        .await?;
+        let startup = launch_started.elapsed();
+        let total = restart_started.elapsed();
+        let slot_after = api.get_slot().await.ok();
+
+        Ok(RestartTiming {
+            shutdown,
+            startup,
+            total,
+            needed_sigkill,
+            exit_code,
+            exit_signal,
+            slot_before,
+            slot_after,
+        })
+    }
 }
 
 impl Drop for PrivateEr {
@@ -461,6 +612,9 @@ impl Drop for PrivateEr {
             self.label, self.pid
         );
         kill_pid(self.pid);
+        if let Some(mut child) = self.child.take() {
+            let _ = child.wait();
+        }
     }
 }
 
@@ -542,21 +696,25 @@ pub async fn private_er(
     let storage_dir = dir.join(format!("er-{}", options.label));
     let _ = fs::remove_dir_all(&storage_dir);
     let log = dir.join(format!("er-{}.log", options.label));
+    let base_rpc_url = base.api().url().to_owned();
+    let base_ws_url = base.ws_url().to_owned();
     let cmd = er_command(
         &er_bin,
         &identity,
-        base.api().url(),
-        base.ws_url(),
+        &base_rpc_url,
+        &base_ws_url,
         rpc_port,
         metrics_port,
         &storage_dir,
         &options.env,
+        true,
     );
     eprintln!(
         "[redsuite] booting private ER `{}` on 127.0.0.1:{rpc_port} …",
         options.label
     );
-    let pid = spawn_detached(cmd, &log)?;
+    let child = spawn_child(cmd, &log)?;
+    let pid = child.id();
 
     let er_api = Api::new(format!("http://127.0.0.1:{rpc_port}"));
     let ready = wait_until(
@@ -582,12 +740,36 @@ pub async fn private_er(
     Ok(PrivateEr {
         pid,
         label: options.label,
+        identity,
+        er_bin,
+        base_rpc_url,
+        base_ws_url,
+        rpc_port,
+        metrics_port,
+        env: options.env,
         storage_dir,
+        log,
+        child: Some(child),
         ctx,
     })
 }
 
 async fn wait_until<F, Fut>(
+    timeout: Duration,
+    what: &str,
+    log: &Path,
+    pid: u32,
+    condition: F,
+) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    wait_until_every(POLL, timeout, what, log, pid, condition).await
+}
+
+async fn wait_until_every<F, Fut>(
+    interval: Duration,
     timeout: Duration,
     what: &str,
     log: &Path,
@@ -617,7 +799,7 @@ where
             )
             .into());
         }
-        tokio::time::sleep(POLL).await;
+        tokio::time::sleep(interval).await;
     }
 }
 
@@ -749,9 +931,9 @@ fn bin_name(path: &Path) -> String {
         .into_owned()
 }
 
-/// Fresh process group so test-runner group signals don't reap the validator;
-/// the log is truncated on each boot.
-fn spawn_detached(mut cmd: Command, log: &Path) -> Result<u32> {
+// Fresh process group so test-runner group signals don't reap the validator;
+// the prior boot's log is rotated to .log.prev.
+fn spawn_child(mut cmd: Command, log: &Path) -> Result<Child> {
     use std::os::unix::process::CommandExt;
     if log.exists() {
         let _ = fs::rename(log, log.with_extension("log.prev"));
@@ -761,13 +943,23 @@ fn spawn_detached(mut cmd: Command, log: &Path) -> Result<u32> {
         .stderr(logfile)
         .stdin(Stdio::null())
         .process_group(0);
-    let child = cmd.spawn().map_err(|e| {
+    cmd.spawn().map_err(|e| {
         format!(
             "failed to spawn {}: {e}",
             cmd.get_program().to_string_lossy()
         )
-    })?;
-    Ok(child.id())
+        .into()
+    })
+}
+
+fn spawn_detached(cmd: Command, log: &Path) -> Result<u32> {
+    Ok(spawn_child(cmd, log)?.id())
+}
+
+fn send_signal(pid: u32, signal: &str) {
+    let _ = Command::new("kill")
+        .args([signal, &pid.to_string()])
+        .status();
 }
 
 /// Boot-error cleanup: the pid is a freshly spawned child of ours, so no

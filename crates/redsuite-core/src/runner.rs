@@ -1,4 +1,9 @@
-use std::{cell::RefCell, future::Future, rc::Rc, time::Instant};
+use std::{
+    cell::{Cell, RefCell},
+    future::Future,
+    rc::Rc,
+    time::Instant,
+};
 
 use crate::{
     stats::{ObservationsStats, StreamingStats},
@@ -59,6 +64,65 @@ where
     let mut handles = Vec::with_capacity(cfg.iterations as usize);
     for id in 1..=cfg.iterations {
         let permit = rate.tick().await;
+        let fut = request(id);
+        let tally = tally.clone();
+        handles.push(tokio::task::spawn_local(async move {
+            let sent = Instant::now();
+            let result = fut.await;
+            let mut tally = tally.borrow_mut();
+            match result {
+                Ok(()) => {
+                    tally.delivery.push(sent.elapsed().as_micros() as u32);
+                    tally.delivered += 1;
+                }
+                Err(e) => {
+                    tally.failed += 1;
+                    tally.first_error.get_or_insert(e.to_string());
+                }
+            }
+            drop(permit);
+        }));
+    }
+    let rps = rate.stats();
+    for handle in handles {
+        let _ = handle.await;
+    }
+
+    let tally = Rc::try_unwrap(tally)
+        .unwrap_or_else(|_| panic!("drive tasks still hold the tally"))
+        .into_inner();
+    RunOutcome {
+        delivered: tally.delivered,
+        failed: tally.failed,
+        first_error: tally.first_error,
+        delivery: tally.delivery.finalize(false),
+        sync: None,
+        rps,
+        wall: started.elapsed(),
+    }
+}
+
+// Same open-loop pacing as `drive`, but runs until `stop` is set instead of a
+// fixed iteration count — for load that must span an externally-timed event.
+pub async fn drive_until<F, Fut>(
+    rate: u32,
+    concurrency: usize,
+    stop: Rc<Cell<bool>>,
+    mut request: F,
+) -> RunOutcome
+where
+    F: FnMut(u64) -> Fut,
+    Fut: Future<Output = Result<()>> + 'static,
+{
+    let mut rate = RateManager::new(concurrency, rate);
+    let tally = Rc::new(RefCell::new(Tally::default()));
+    let started = Instant::now();
+
+    let mut handles = Vec::new();
+    let mut id = 0u64;
+    while !stop.get() {
+        let permit = rate.tick().await;
+        id += 1;
         let fut = request(id);
         let tally = tally.clone();
         handles.push(tokio::task::spawn_local(async move {

@@ -123,6 +123,17 @@ impl TxSender {
     pub async fn send(&self, ixs: &[Instruction]) -> Result<Signature> {
         self.deliver(&self.prepare(ixs).await?).await
     }
+
+    pub async fn send_fresh(&self, ixs: &[Instruction]) -> Result<Signature> {
+        let hash = self.api.get_latest_blockhash().await?;
+        let tx = Transaction::new_signed_with_payer(
+            ixs,
+            Some(&self.payer.pubkey()),
+            &[&*self.payer],
+            hash,
+        );
+        self.api.send_transaction(&tx).await
+    }
 }
 
 pub struct ErClient {

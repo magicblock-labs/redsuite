@@ -178,6 +178,14 @@ impl Api {
         }
     }
 
+    pub async fn primary_ready(&self) -> bool {
+        let url = format!("{}/health/primary", self.url.trim_end_matches('/'));
+        matches!(
+            self.client.get(&url).send().await,
+            Ok(response) if response.status().as_u16() == 200
+        )
+    }
+
     pub async fn get_balance(&self, pk: &Pubkey) -> Result<u64> {
         let params = format!(r#"["{pk}", {{"commitment":"confirmed"}}]"#);
         let resp: WithContext<u64> = self.call("getBalance", &params).await?;

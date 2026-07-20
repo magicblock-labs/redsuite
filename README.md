@@ -170,6 +170,11 @@ storage:
   production-sized storage settings, measured as two equal back-to-back
   windows.
 
+lifecycle (restart / shutdown):
+
+- `restart_under_load` — boots a validator with a large database,
+  fills it, then restarts the process in place. Times the shutdown and startup.
+
 harness:
 
 - `protocol_boundary_selftest` — tests the test harness itself. Runs the
