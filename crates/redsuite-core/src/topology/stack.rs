@@ -356,6 +356,7 @@ async fn boot_er(
     );
     ensure_identity_funded(&base_ctx, &identity.pubkey()).await?;
     ensure_fees_vault(&base_ctx, &identity.pubkey(), dlp_admin).await?;
+    ensure_protocol_fees_vault(&base_ctx, dlp_admin).await?;
 
     // a fresh base is a new chain — prior-generation ER state is invalid
     let _ = fs::remove_dir_all(dir.join("er-storage"));
@@ -672,6 +673,41 @@ async fn ensure_fees_vault(
     base.account(&vault)
         .await?
         .ok_or_else(|| "validator-fees-vault not created on base".into())
+        .map(|_| ())
+}
+
+// Undelegation on base pays protocol fees into dlp's global fees vault; the
+// vault init is permissionless (dlp `InitProtocolFeesVault`, discriminator 5).
+async fn ensure_protocol_fees_vault(
+    base: &BaseCtx,
+    payer: &Keypair,
+) -> Result<()> {
+    let dlp: Pubkey = DLP_ID.parse()?;
+    let vault = Pubkey::find_program_address(&[b"fees-vault"], &dlp).0;
+    if base.account(&vault).await?.is_some() {
+        return Ok(());
+    }
+
+    let payer_balance =
+        base.api().get_balance(&payer.pubkey()).await.unwrap_or(0);
+    if payer_balance < 100_000_000 {
+        base.airdrop(&payer.pubkey(), 1_000_000_000).await?;
+    }
+
+    let system: Pubkey = "11111111111111111111111111111111".parse()?;
+    let init_vault = Instruction {
+        program_id: dlp,
+        accounts: vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new(vault, false),
+            AccountMeta::new_readonly(system, false),
+        ],
+        data: 5u64.to_le_bytes().to_vec(),
+    };
+    base.send(payer, &[init_vault]).await?;
+    base.account(&vault)
+        .await?
+        .ok_or_else(|| "protocol-fees-vault not created on base".into())
         .map(|_| ())
 }
 

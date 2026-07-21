@@ -9,6 +9,7 @@ authors.workspace = true
 async-trait = { workspace = true }
 tokio = { workspace = true }
 redsuite-core = { workspace = true }
+redline-program = { workspace = true }
 instruction = { workspace = true }
 pubkey = { workspace = true }
 keypair = { workspace = true }

@@ -1942,6 +1942,7 @@ name = "redshift"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "redline-program",
  "redsuite-core",
  "solana-instruction 3.4.0",
  "solana-keypair",
