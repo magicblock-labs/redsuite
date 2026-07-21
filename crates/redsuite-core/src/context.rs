@@ -40,6 +40,12 @@ pub trait ChainCtx {
         payer: &Keypair,
         ixs: &[Instruction],
     ) -> Result<Signature>;
+    async fn send_with(
+        &self,
+        payer: &Keypair,
+        cosigners: &[&Keypair],
+        ixs: &[Instruction],
+    ) -> Result<Signature>;
     async fn account(&self, pk: &Pubkey) -> Result<Option<Account>>;
     async fn airdrop(&self, pk: &Pubkey, lamports: u64) -> Result<()>;
 }
@@ -73,13 +79,16 @@ async fn send_and_confirm(
     api: &Api,
     blockhash: &BlockhashCache,
     payer: &Keypair,
+    cosigners: &[&Keypair],
     ixs: &[Instruction],
 ) -> Result<Signature> {
     let hash = blockhash.get(api).await?;
+    let mut signers = vec![payer];
+    signers.extend_from_slice(cosigners);
     let tx = Transaction::new_signed_with_payer(
         ixs,
         Some(&payer.pubkey()),
-        &[payer],
+        &signers,
         hash,
     );
     let sig = api.send_transaction(&tx).await?;
@@ -292,7 +301,16 @@ impl ChainCtx for BaseCtx {
         payer: &Keypair,
         ixs: &[Instruction],
     ) -> Result<Signature> {
-        send_and_confirm(&self.api, &self.blockhash, payer, ixs).await
+        send_and_confirm(&self.api, &self.blockhash, payer, &[], ixs).await
+    }
+    async fn send_with(
+        &self,
+        payer: &Keypair,
+        cosigners: &[&Keypair],
+        ixs: &[Instruction],
+    ) -> Result<Signature> {
+        send_and_confirm(&self.api, &self.blockhash, payer, cosigners, ixs)
+            .await
     }
     async fn account(&self, pk: &Pubkey) -> Result<Option<Account>> {
         self.api.get_account(pk).await
@@ -312,7 +330,16 @@ impl ChainCtx for ErCtx {
         payer: &Keypair,
         ixs: &[Instruction],
     ) -> Result<Signature> {
-        send_and_confirm(&self.api, &self.blockhash, payer, ixs).await
+        send_and_confirm(&self.api, &self.blockhash, payer, &[], ixs).await
+    }
+    async fn send_with(
+        &self,
+        payer: &Keypair,
+        cosigners: &[&Keypair],
+        ixs: &[Instruction],
+    ) -> Result<Signature> {
+        send_and_confirm(&self.api, &self.blockhash, payer, cosigners, ixs)
+            .await
     }
     async fn account(&self, pk: &Pubkey) -> Result<Option<Account>> {
         self.api.get_account(pk).await

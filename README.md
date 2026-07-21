@@ -238,6 +238,40 @@ p95/max tail long before the average moves.
 | `mbv_committor_intent_alt_count`, `_alt_preparation_time`         | How many address lookup tables each commit needs, and how long building them takes (each build waits on base-chain confirmations). | The expensive setup step of committing new accounts got even more expensive.                                                                                 |
 
 
+## redshift scenarios
+
+The correctness tests, one file each under `redshift/src/scenarios/<subsystem>/`.
+Ported from the validator repo's test-integration suites.
+
+chainlink (account cloning):
+
+- `clone_on_access` — writes an account on base and reads it on the ER: same
+  bytes, same owner, same balance, and later update on a base is cloned on ER. A missing
+  account is read as missing, and an ER write to a delegated account stays off
+  base until a commit.
+
+committor (ER → base commits):
+
+- `commit_roundtrip` — writes two delegated accounts on the ER, commits one
+  and checks it lands on base byte-for-byte while the other doesn't move.
+  Then commits and undelegates both — the owning program gets its accounts
+  back with the exact final bytes.
+- `claim_fees` — creates a fees vault, funds it, claims it. The lamports
+  move from the vault to the validator.
+
+harness:
+
+- `api_invariants` — reads each transaction's block timestamp three
+  different ways and checks all three agree, every time. Also registers,
+  updates and removes a validator record in the domain registry.
+
+pubsub (websocket subscriptions):
+
+- `pubsub_contracts` — subscribes to accounts, logs, programs, signatures
+  and slots, then makes transfers and checks every promised notification
+  arrives with the right content. After unsubscribing, sends more transfers
+  and checks nothing arrives.
+
 ## Base-chain programs & accounts
 
 - dlp and mdp are cloned from a live cluster

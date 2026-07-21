@@ -202,6 +202,10 @@ impl Scenario for CommitRoundtrip {
             "the receipt must list both undelegated accounts"
         );
         assert!(
+            undelegate_receipt.excluded.is_empty(),
+            "nothing was eligible for exclusion"
+        );
+        assert!(
             undelegate_receipt.requested_undelegation,
             "the receipt must record the undelegation request"
         );

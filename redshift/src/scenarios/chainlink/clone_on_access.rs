@@ -45,6 +45,12 @@ impl Scenario for CloneOnAccess {
         let clone_visibility_ms = first_access.elapsed().as_secs_f64() * 1e3;
         let plain_clone =
             er.account(&plain).await?.ok_or("plain clone vanished")?;
+        let plain_on_base =
+            base.account(&plain).await?.ok_or("plain gone on base")?;
+        assert_eq!(
+            plain_clone.lamports, plain_on_base.lamports,
+            "the ER clone must mirror the base account's lamports"
+        );
         assert_eq!(
             plain_clone.owner,
             crate::program::id(),

@@ -14,12 +14,25 @@ instruction = { workspace = true }
 pubkey = { workspace = true }
 keypair = { workspace = true }
 signer = { workspace = true }
+json = { workspace = true }
 
 [dev-dependencies]
 
 [[test]]
 name = "example"
 path = "tests/harness/example.rs"
+
+[[test]]
+name = "api_invariants"
+path = "tests/harness/api_invariants.rs"
+
+[[test]]
+name = "claim_fees"
+path = "tests/committor/claim_fees.rs"
+
+[[test]]
+name = "pubsub_contracts"
+path = "tests/pubsub/pubsub_contracts.rs"
 
 [[test]]
 name = "clone_on_access"
