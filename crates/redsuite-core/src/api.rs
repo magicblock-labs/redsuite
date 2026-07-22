@@ -67,6 +67,19 @@ struct RpcAccount {
     rent_epoch: u64,
 }
 
+fn decode_rpc_account(raw: RpcAccount) -> Result<Account> {
+    let data = base64::engine::general_purpose::STANDARD
+        .decode(&raw.data.0)
+        .map_err(|e| format!("bad base64 account data: {e}"))?;
+    Ok(Account {
+        lamports: raw.lamports,
+        data,
+        owner: Pubkey::from_str(&raw.owner)?,
+        executable: raw.executable,
+        rent_epoch: raw.rent_epoch,
+    })
+}
+
 #[derive(Deserialize)]
 struct RpcTransaction {
     slot: u64,
@@ -221,21 +234,35 @@ impl Api {
         );
         let resp: WithContext<Option<RpcAccount>> =
             self.call("getAccountInfo", &params).await?;
-        let Some(raw) = resp.value else {
-            return Ok(None);
-        };
-        let data = base64::engine::general_purpose::STANDARD
-            .decode(&raw.data.0)
-            .map_err(|e| {
-                format!("getAccountInfo: bad base64 account data: {e}")
-            })?;
-        Ok(Some(Account {
-            lamports: raw.lamports,
-            data,
-            owner: Pubkey::from_str(&raw.owner)?,
-            executable: raw.executable,
-            rent_epoch: raw.rent_epoch,
-        }))
+        resp.value.map(decode_rpc_account).transpose()
+    }
+
+    pub async fn get_multiple_accounts(
+        &self,
+        pks: &[Pubkey],
+    ) -> Result<Vec<Option<Account>>> {
+        let keys = pks
+            .iter()
+            .map(|pk| format!(r#""{pk}""#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let params = format!(
+            r#"[[{keys}], {{"encoding":"base64","commitment":"confirmed"}}]"#
+        );
+        let resp: WithContext<Vec<Option<RpcAccount>>> =
+            self.call("getMultipleAccounts", &params).await?;
+        if resp.value.len() != pks.len() {
+            return Err(format!(
+                "getMultipleAccounts: asked for {} accounts, got {}",
+                pks.len(),
+                resp.value.len()
+            )
+            .into());
+        }
+        resp.value
+            .into_iter()
+            .map(|raw| raw.map(decode_rpc_account).transpose())
+            .collect()
     }
 
     pub async fn get_latest_blockhash(&self) -> Result<Hash> {

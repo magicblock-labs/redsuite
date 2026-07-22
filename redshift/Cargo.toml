@@ -39,5 +39,21 @@ name = "clone_on_access"
 path = "tests/chainlink/clone_on_access.rs"
 
 [[test]]
+name = "account_info_semantics"
+path = "tests/chainlink/account_info_semantics.rs"
+
+[[test]]
+name = "escrow_cloning"
+path = "tests/chainlink/escrow_cloning.rs"
+
+[[test]]
+name = "parallel_cloning"
+path = "tests/chainlink/parallel_cloning.rs"
+
+[[test]]
+name = "multi_program_clone"
+path = "tests/chainlink/multi_program_clone.rs"
+
+[[test]]
 name = "commit_roundtrip"
 path = "tests/committor/commit_roundtrip.rs"

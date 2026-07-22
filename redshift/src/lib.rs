@@ -40,14 +40,26 @@ pub async fn init_delegated_account(
     seed: u8,
     authority: Pubkey,
 ) -> Result<Pubkey> {
-    let (init, pda) = program::instruction::build::init_account(
+    init_delegated_account_at(base, program::id(), payer, seed, authority).await
+}
+
+pub async fn init_delegated_account_at(
+    base: &impl ChainCtx,
+    program_id: Pubkey,
+    payer: &Keypair,
+    seed: u8,
+    authority: Pubkey,
+) -> Result<Pubkey> {
+    let (init, pda) = program::instruction::build::init_account_at(
+        program_id,
         payer.pubkey(),
         payer.pubkey(),
         ACCOUNT_SPACE,
         seed,
         authority,
     );
-    let delegate = program::instruction::build::delegate(
+    let delegate = program::instruction::build::delegate_at(
+        program_id,
         payer.pubkey(),
         pda,
         payer.pubkey(),

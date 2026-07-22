@@ -47,6 +47,9 @@ pub trait ChainCtx {
         ixs: &[Instruction],
     ) -> Result<Signature>;
     async fn account(&self, pk: &Pubkey) -> Result<Option<Account>>;
+    async fn accounts(&self, pks: &[Pubkey]) -> Result<Vec<Option<Account>>> {
+        self.api().get_multiple_accounts(pks).await
+    }
     async fn airdrop(&self, pk: &Pubkey, lamports: u64) -> Result<()>;
 }
 
