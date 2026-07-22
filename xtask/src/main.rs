@@ -16,7 +16,7 @@ usage:
   cargo xtask stack status                                     show the shared base+ER stack (booted on demand by tests)
   cargo xtask stack down                                       stop the shared stack and clear its state
   cargo xtask report list                                      list persisted scenario reports (target/redsuite-reports/)
-  cargo xtask report compare [scenario] [--strict]             diff the latest two runs per scenario; --strict fails on regressions
+  cargo xtask report compare [scenario] [--strict] [--brief]   diff the latest two runs per scenario; --strict fails on regressions, --brief shows changed metrics only
   cargo xtask report bmf [--out <path>]                        export the latest reports as Bencher Metric Format JSON
   cargo xtask fmt [--check]                                    format the workspace (nightly rustfmt, rustfmt-nightly.toml)
 ";
@@ -43,9 +43,10 @@ fn run() -> Result<()> {
             Some("compare") => {
                 let rest = &args[2..];
                 let strict = rest.iter().any(|a| a == "--strict");
+                let brief = rest.iter().any(|a| a == "--brief");
                 let filter =
                     rest.iter().find(|a| !a.starts_with("--")).cloned();
-                report::compare(filter.as_deref(), strict)
+                report::compare(filter.as_deref(), strict, brief)
             }
             Some("bmf") => match (arg(2), arg(3)) {
                 (Some("--out"), Some(path)) => report::bmf(Some(path)),
