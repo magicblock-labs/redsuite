@@ -170,7 +170,33 @@ fn pct(old: f64, new: f64) -> String {
     format!("{:+.1}%", (new - old) / old * 100.0)
 }
 
-pub fn compare(filter: Option<&str>, strict: bool) -> Result<()> {
+fn print_run_context(
+    prev_file: &str,
+    prev: &Persisted,
+    last_file: &str,
+    last: &Persisted,
+) {
+    println!("  prev: {prev_file}");
+    println!("  last: {last_file}");
+    if prev.meta.er_fingerprint == last.meta.er_fingerprint {
+        println!(
+            "  validator: same build ({}) — differences are noise or harness changes",
+            last.meta.er_version
+        );
+    } else {
+        println!("  validator: DIFFERENT builds");
+        println!(
+            "    prev: \"{}\" [{}] {}",
+            prev.meta.er_version, prev.meta.er_fingerprint, prev.meta.er_bin,
+        );
+        println!(
+            "    last: \"{}\" [{}] {}",
+            last.meta.er_version, last.meta.er_fingerprint, last.meta.er_bin,
+        );
+    }
+}
+
+pub fn compare(filter: Option<&str>, strict: bool, brief: bool) -> Result<()> {
     let all = load_all()?;
     let mut regressions = 0usize;
     let mut compared = 0usize;
@@ -189,31 +215,11 @@ pub fn compare(filter: Option<&str>, strict: bool) -> Result<()> {
         let (last_file, last) = &runs[runs.len() - 1];
         compared += 1;
 
-        println!("{scenario}");
-        println!("  prev: {prev_file}");
-        println!("  last: {last_file}");
-        if prev.meta.er_fingerprint == last.meta.er_fingerprint {
-            println!(
-                "  validator: same build ({}) — differences are noise or harness changes",
-                last.meta.er_version
-            );
-        } else {
-            println!("  validator: DIFFERENT builds");
-            println!(
-                "    prev: \"{}\" [{}] {}",
-                prev.meta.er_version,
-                prev.meta.er_fingerprint,
-                prev.meta.er_bin,
-            );
-            println!(
-                "    last: \"{}\" [{}] {}",
-                last.meta.er_version,
-                last.meta.er_fingerprint,
-                last.meta.er_bin,
-            );
-        }
-
         if prev.report.config != last.report.config {
+            println!("{scenario}");
+            if !brief {
+                print_run_context(prev_file, prev, last_file, last);
+            }
             println!("  NOT COMPARABLE — config differs:");
             let prev_cfg: BTreeMap<_, _> =
                 prev.report.config.iter().cloned().collect();
@@ -234,6 +240,8 @@ pub fn compare(filter: Option<&str>, strict: bool) -> Result<()> {
             continue;
         }
 
+        let mut rows: Vec<(Verdict, String)> = Vec::new();
+
         let prev_obs: BTreeMap<_, _> = prev
             .report
             .observations
@@ -245,21 +253,27 @@ pub fn compare(filter: Option<&str>, strict: bool) -> Result<()> {
                 continue;
             };
             let dir = direction(label);
-            let verdict =
+            let row_verdict =
                 verdict(&dir, old_stats.median as f64, new_stats.median as f64);
-            if verdict == Verdict::Regression {
+            if row_verdict == Verdict::Regression {
                 regressions += 1;
             }
-            println!(
-                "  {label:<34} median {} → {} ({})  p95 {} → {} ({})  {}",
-                old_stats.median,
-                new_stats.median,
-                pct(old_stats.median as f64, new_stats.median as f64),
-                old_stats.quantile95,
-                new_stats.quantile95,
-                pct(old_stats.quantile95 as f64, new_stats.quantile95 as f64),
-                verdict_tag(verdict),
-            );
+            rows.push((
+                row_verdict,
+                format!(
+                    "  {label:<34} median {} → {} ({})  p95 {} → {} ({})  {}",
+                    old_stats.median,
+                    new_stats.median,
+                    pct(old_stats.median as f64, new_stats.median as f64),
+                    old_stats.quantile95,
+                    new_stats.quantile95,
+                    pct(
+                        old_stats.quantile95 as f64,
+                        new_stats.quantile95 as f64
+                    ),
+                    verdict_tag(row_verdict),
+                ),
+            ));
         }
 
         let prev_metrics: BTreeMap<_, _> = prev
@@ -273,17 +287,55 @@ pub fn compare(filter: Option<&str>, strict: bool) -> Result<()> {
                 continue;
             };
             let dir = direction(label);
-            let verdict = verdict(&dir, *old_value, *new_value);
-            if verdict == Verdict::Regression {
+            let row_verdict = verdict(&dir, *old_value, *new_value);
+            if row_verdict == Verdict::Regression {
                 regressions += 1;
             }
-            println!(
-                "  {label:<34} {old_value:.1} → {new_value:.1} ({})  {}",
-                pct(*old_value, *new_value),
-                verdict_tag(verdict),
-            );
+            rows.push((
+                row_verdict,
+                format!(
+                    "  {label:<34} {old_value:.1} → {new_value:.1} ({})  {}",
+                    pct(*old_value, *new_value),
+                    verdict_tag(row_verdict),
+                ),
+            ));
         }
-        println!();
+
+        if brief {
+            let changed: Vec<&String> = rows
+                .iter()
+                .filter(|(row_verdict, _)| {
+                    matches!(
+                        row_verdict,
+                        Verdict::Regression | Verdict::Improvement
+                    )
+                })
+                .map(|(_, line)| line)
+                .collect();
+            if changed.is_empty() {
+                println!(
+                    "{scenario}: no significant changes ({} metric(s))\n",
+                    rows.len()
+                );
+            } else {
+                println!("{scenario}");
+                for line in &changed {
+                    println!("{line}");
+                }
+                let hidden = rows.len() - changed.len();
+                if hidden > 0 {
+                    println!("  ({hidden} flat/info metric(s) not shown)");
+                }
+                println!();
+            }
+        } else {
+            println!("{scenario}");
+            print_run_context(prev_file, prev, last_file, last);
+            for (_, line) in &rows {
+                println!("{line}");
+            }
+            println!();
+        }
     }
 
     if compared == 0 {

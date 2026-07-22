@@ -49,7 +49,7 @@ usage:
   redsuite stack status                        show the shared base+ER stack
   redsuite stack down                          stop the shared stack
   redsuite report list                         list persisted scenario reports
-  redsuite report compare [scenario] [--strict]  diff the latest two runs per scenario
+  redsuite report compare [scenario] [--strict] [--brief]  diff the latest two runs per scenario (--brief: changed metrics only)
   redsuite report bmf [--out <path>]           export reports as Bencher Metric Format
 
 environment:
@@ -150,8 +150,9 @@ async fn main() {
             Some("compare") => {
                 let rest = &args[2..];
                 let strict = rest.iter().any(|flag| flag == "--strict");
+                let brief = rest.iter().any(|flag| flag == "--brief");
                 let filter = rest.iter().find(|arg| !arg.starts_with("--"));
-                report::compare(filter.map(String::as_str), strict)
+                report::compare(filter.map(String::as_str), strict, brief)
             }
             Some("bmf") => match (arg(2), arg(3)) {
                 (Some("--out"), Some(path)) => report::bmf(Some(path)),
