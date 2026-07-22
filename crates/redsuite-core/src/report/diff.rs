@@ -133,14 +133,18 @@ enum Verdict {
     Info,
 }
 
-const FLAT_THRESHOLD_PCT: f64 = 25.0;
+const FLAT_FOLD_CHANGE: f64 = 2.0;
 
 fn verdict(dir: &Direction, old: f64, new: f64) -> Verdict {
     if matches!(dir, Direction::Info) || old == 0.0 {
         return Verdict::Info;
     }
-    let pct = (new - old) / old * 100.0;
-    if pct.abs() <= FLAT_THRESHOLD_PCT {
+    let fold_change = if new > old {
+        new / old
+    } else {
+        old / new.max(f64::MIN_POSITIVE)
+    };
+    if fold_change < FLAT_FOLD_CHANGE {
         return Verdict::Flat;
     }
     let worse = match dir {
@@ -158,8 +162,8 @@ fn verdict(dir: &Direction, old: f64, new: f64) -> Verdict {
 fn verdict_tag(verdict: Verdict) -> &'static str {
     match verdict {
         Verdict::Flat => "~ flat",
-        Verdict::Regression => "!! REGRESSION",
-        Verdict::Improvement => "++ improvement",
+        Verdict::Regression => "▲ worse",
+        Verdict::Improvement => "▼ better",
         Verdict::Mixed => "~ mixed",
         Verdict::Info => "",
     }
@@ -213,6 +217,12 @@ pub fn compare(filter: Option<&str>, strict: bool, brief: bool) -> Result<()> {
 
     for (scenario, runs) in &all {
         if filter.is_some_and(|wanted| !scenario.contains(wanted)) {
+            continue;
+        }
+        let has_cell_children = all
+            .keys()
+            .any(|other| other.starts_with(&format!("{scenario}/")));
+        if brief && has_cell_children {
             continue;
         }
         if runs.len() < 2 {
@@ -360,12 +370,12 @@ pub fn compare(filter: Option<&str>, strict: bool, brief: bool) -> Result<()> {
     if compared == 0 {
         println!("nothing compared — need at least two runs of a scenario");
     } else if regressions > 0 {
-        println!("{regressions} regression(s) found");
+        println!("{regressions} metric(s) worse than base");
         if strict {
-            return Err("regressions found (--strict)".into());
+            return Err("metrics worse than base (--strict)".into());
         }
     } else {
-        println!("no regressions");
+        println!("nothing worse than base");
     }
     Ok(())
 }
@@ -488,13 +498,15 @@ mod tests {
     fn verdict_thresholds() {
         let lower = Direction::Lower;
         let higher = Direction::Higher;
-        assert_eq!(verdict(&lower, 100.0, 105.0), Verdict::Flat);
-        assert_eq!(verdict(&lower, 100.0, 120.0), Verdict::Flat);
-        assert_eq!(verdict(&lower, 100.0, 150.0), Verdict::Regression);
-        assert_eq!(verdict(&lower, 100.0, 50.0), Verdict::Improvement);
-        assert_eq!(verdict(&higher, 100.0, 50.0), Verdict::Regression);
-        assert_eq!(verdict(&higher, 100.0, 150.0), Verdict::Improvement);
-        assert_eq!(verdict(&Direction::Info, 1.0, 2.0), Verdict::Info);
+        assert_eq!(verdict(&lower, 100.0, 150.0), Verdict::Flat);
+        assert_eq!(verdict(&lower, 100.0, 199.0), Verdict::Flat);
+        assert_eq!(verdict(&lower, 100.0, 51.0), Verdict::Flat);
+        assert_eq!(verdict(&lower, 100.0, 250.0), Verdict::Regression);
+        assert_eq!(verdict(&lower, 100.0, 45.0), Verdict::Improvement);
+        assert_eq!(verdict(&higher, 100.0, 45.0), Verdict::Regression);
+        assert_eq!(verdict(&higher, 100.0, 250.0), Verdict::Improvement);
+        assert_eq!(verdict(&lower, 100.0, 0.0), Verdict::Improvement);
+        assert_eq!(verdict(&Direction::Info, 1.0, 5.0), Verdict::Info);
         assert_eq!(verdict(&lower, 0.0, 5.0), Verdict::Info);
     }
 
