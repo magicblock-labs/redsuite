@@ -339,12 +339,7 @@ pub fn compare(filter: Option<&str>, strict: bool, brief: bool) -> Result<()> {
                 })
                 .map(|(_, line)| line)
                 .collect();
-            if changed.is_empty() {
-                println!(
-                    "{scenario}: no significant changes ({} metric(s))\n",
-                    rows.len()
-                );
-            } else {
+            if !changed.is_empty() {
                 println!("{scenario}");
                 for line in &changed {
                     println!("{line}");
