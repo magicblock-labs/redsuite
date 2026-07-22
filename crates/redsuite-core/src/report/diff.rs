@@ -129,10 +129,11 @@ enum Verdict {
     Flat,
     Regression,
     Improvement,
+    Mixed,
     Info,
 }
 
-const FLAT_THRESHOLD_PCT: f64 = 10.0;
+const FLAT_THRESHOLD_PCT: f64 = 25.0;
 
 fn verdict(dir: &Direction, old: f64, new: f64) -> Verdict {
     if matches!(dir, Direction::Info) || old == 0.0 {
@@ -159,7 +160,16 @@ fn verdict_tag(verdict: Verdict) -> &'static str {
         Verdict::Flat => "~ flat",
         Verdict::Regression => "!! REGRESSION",
         Verdict::Improvement => "++ improvement",
+        Verdict::Mixed => "~ mixed",
         Verdict::Info => "",
+    }
+}
+
+fn combined_verdict(median: Verdict, quantile95: Verdict) -> Verdict {
+    match (median, quantile95) {
+        (median, quantile95) if median == quantile95 => median,
+        (Verdict::Info, other) | (other, Verdict::Info) => other,
+        _ => Verdict::Mixed,
     }
 }
 
@@ -253,8 +263,15 @@ pub fn compare(filter: Option<&str>, strict: bool, brief: bool) -> Result<()> {
                 continue;
             };
             let dir = direction(label);
-            let row_verdict =
+            let median_verdict =
                 verdict(&dir, old_stats.median as f64, new_stats.median as f64);
+            let quantile95_verdict = verdict(
+                &dir,
+                old_stats.quantile95 as f64,
+                new_stats.quantile95 as f64,
+            );
+            let row_verdict =
+                combined_verdict(median_verdict, quantile95_verdict);
             if row_verdict == Verdict::Regression {
                 regressions += 1;
             }
@@ -324,7 +341,9 @@ pub fn compare(filter: Option<&str>, strict: bool, brief: bool) -> Result<()> {
                 }
                 let hidden = rows.len() - changed.len();
                 if hidden > 0 {
-                    println!("  ({hidden} flat/info metric(s) not shown)");
+                    println!(
+                        "  ({hidden} flat/mixed/info metric(s) not shown)"
+                    );
                 }
                 println!();
             }
@@ -470,12 +489,49 @@ mod tests {
         let lower = Direction::Lower;
         let higher = Direction::Higher;
         assert_eq!(verdict(&lower, 100.0, 105.0), Verdict::Flat);
+        assert_eq!(verdict(&lower, 100.0, 120.0), Verdict::Flat);
         assert_eq!(verdict(&lower, 100.0, 150.0), Verdict::Regression);
         assert_eq!(verdict(&lower, 100.0, 50.0), Verdict::Improvement);
         assert_eq!(verdict(&higher, 100.0, 50.0), Verdict::Regression);
         assert_eq!(verdict(&higher, 100.0, 150.0), Verdict::Improvement);
         assert_eq!(verdict(&Direction::Info, 1.0, 2.0), Verdict::Info);
         assert_eq!(verdict(&lower, 0.0, 5.0), Verdict::Info);
+    }
+
+    #[test]
+    fn quantile_agreement_gates_the_verdict() {
+        assert_eq!(
+            combined_verdict(Verdict::Regression, Verdict::Regression),
+            Verdict::Regression
+        );
+        assert_eq!(
+            combined_verdict(Verdict::Improvement, Verdict::Improvement),
+            Verdict::Improvement
+        );
+        assert_eq!(
+            combined_verdict(Verdict::Regression, Verdict::Flat),
+            Verdict::Mixed
+        );
+        assert_eq!(
+            combined_verdict(Verdict::Regression, Verdict::Improvement),
+            Verdict::Mixed
+        );
+        assert_eq!(
+            combined_verdict(Verdict::Improvement, Verdict::Flat),
+            Verdict::Mixed
+        );
+        assert_eq!(
+            combined_verdict(Verdict::Flat, Verdict::Flat),
+            Verdict::Flat
+        );
+        assert_eq!(
+            combined_verdict(Verdict::Info, Verdict::Regression),
+            Verdict::Regression
+        );
+        assert_eq!(
+            combined_verdict(Verdict::Info, Verdict::Info),
+            Verdict::Info
+        );
     }
 
     #[test]
