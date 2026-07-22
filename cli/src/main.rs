@@ -36,6 +36,10 @@ registry![
     ("redshift/api_invariants", redshift::scenarios::harness::api_invariants::ApiInvariants),
     ("redshift/claim_fees", redshift::scenarios::committor::claim_fees::ClaimFees),
     ("redshift/pubsub_contracts", redshift::scenarios::pubsub::pubsub_contracts::PubsubContracts),
+    ("redshift/account_info_semantics", redshift::scenarios::chainlink::account_info_semantics::AccountInfoSemantics),
+    ("redshift/escrow_cloning", redshift::scenarios::chainlink::escrow_cloning::EscrowCloning),
+    ("redshift/parallel_cloning", redshift::scenarios::chainlink::parallel_cloning::ParallelCloning),
+    ("redshift/multi_program_clone", redshift::scenarios::chainlink::multi_program_clone::MultiProgramClone),
     ("redhat/illegal_writable", redhat::scenarios::chainlink::illegal_writable::IllegalWritable),
     ("redhat/fee_payer_rules", redhat::scenarios::aperture::fee_payer_rules::FeePayerRules),
 ];

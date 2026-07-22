@@ -136,11 +136,21 @@ pub mod build {
     }
 
     pub fn simple_byte_set(id: u64, accounts: &[Pubkey]) -> SolanaInstruction {
+        simple_byte_set_at(crate::id(), id, accounts)
+    }
+
+    pub fn simple_byte_set_at(
+        program_id: Pubkey,
+        id: u64,
+        accounts: &[Pubkey],
+    ) -> SolanaInstruction {
         let metas = accounts
             .iter()
             .map(|&pk| AccountMeta::new(pk, false))
             .collect();
-        with_bincode(&Instruction::SimpleByteSet { id }, metas)
+        let mut ix = with_bincode(&Instruction::SimpleByteSet { id }, metas);
+        ix.program_id = program_id;
+        ix
     }
 
     pub fn expensive_hash_compute(
