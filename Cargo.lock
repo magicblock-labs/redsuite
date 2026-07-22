@@ -1948,6 +1948,7 @@ dependencies = [
  "solana-keypair",
  "solana-pubkey 3.0.0",
  "solana-signer",
+ "sonic-rs",
  "tokio",
 ]
 

@@ -185,6 +185,7 @@ mod tests {
     fn receipt_parses_the_v0_13_line_formats() {
         let tx = TransactionInfo {
             slot: 42,
+            block_time: None,
             err: None,
             logs: vec![
                 format!(
@@ -217,6 +218,7 @@ mod tests {
         .unwrap();
         let tx = TransactionInfo {
             slot: 43,
+            block_time: None,
             err: Some(err),
             logs: vec![
                 format!("ScheduledCommitSent payer: {}", pk(1)),
@@ -243,6 +245,7 @@ mod tests {
     fn bpf_style_prefixes_are_tolerated() {
         let tx = TransactionInfo {
             slot: 44,
+            block_time: None,
             err: None,
             logs: vec![format!(
                 "Program log: ScheduledCommitSent included: [{}]",

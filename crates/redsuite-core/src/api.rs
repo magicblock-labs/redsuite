@@ -70,6 +70,8 @@ struct RpcAccount {
 #[derive(Deserialize)]
 struct RpcTransaction {
     slot: u64,
+    #[serde(rename = "blockTime")]
+    block_time: Option<i64>,
     meta: Option<RpcTransactionMeta>,
 }
 
@@ -80,9 +82,21 @@ struct RpcTransactionMeta {
     log_messages: Option<Vec<String>>,
 }
 
+#[derive(Deserialize)]
+struct RpcBlock {
+    #[serde(rename = "blockTime")]
+    block_time: Option<i64>,
+}
+
+#[derive(Debug)]
+pub struct BlockInfo {
+    pub block_time: Option<i64>,
+}
+
 #[derive(Debug)]
 pub struct TransactionInfo {
     pub slot: u64,
+    pub block_time: Option<i64>,
     // on-chain execution error; None = the transaction succeeded
     pub err: Option<json::Value>,
     pub logs: Vec<String>,
@@ -291,9 +305,26 @@ impl Api {
             };
             TransactionInfo {
                 slot: tx.slot,
+                block_time: tx.block_time,
                 err,
                 logs,
             }
+        }))
+    }
+
+    pub async fn get_block_time(&self, slot: u64) -> Result<Option<i64>> {
+        self.call_nullable("getBlockTime", &format!("[{slot}]"))
+            .await
+    }
+
+    pub async fn get_block(&self, slot: u64) -> Result<Option<BlockInfo>> {
+        let params = format!(
+            r#"[{slot}, {{"transactionDetails":"none","rewards":false,"commitment":"confirmed","maxSupportedTransactionVersion":0}}]"#
+        );
+        let raw: Option<RpcBlock> =
+            self.call_nullable("getBlock", &params).await?;
+        Ok(raw.map(|block| BlockInfo {
+            block_time: block.block_time,
         }))
     }
 

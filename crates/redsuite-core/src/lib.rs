@@ -1,7 +1,9 @@
 pub mod api;
 pub mod assert;
 pub mod context;
+pub mod dlp;
 pub mod host;
+pub mod mdp;
 pub mod monitor;
 pub mod prep;
 pub mod receipt;
@@ -9,6 +11,7 @@ pub mod report;
 pub mod runner;
 pub mod scenario;
 pub mod stats;
+pub mod system;
 pub mod topology;
 pub mod transport;
 

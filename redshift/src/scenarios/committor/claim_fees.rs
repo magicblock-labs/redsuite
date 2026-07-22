@@ -1,0 +1,77 @@
+use async_trait::async_trait;
+use keypair::Keypair;
+use redsuite_core::{
+    dlp, prep, topology, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
+    ScenarioReport,
+};
+use signer::Signer;
+
+const TEST_FEE_LAMPORTS: u64 = 1_000_000;
+
+pub struct ClaimFees;
+
+#[async_trait(?Send)]
+impl Scenario for ClaimFees {
+    fn name(&self) -> &str {
+        "redshift/claim_fees"
+    }
+
+    async fn run(&self, base: &BaseCtx, _er: &ErCtx) -> Result<ScenarioReport> {
+        let admin_bytes = topology::current_state()
+            .ok_or("no shared stack state — boot the shared stack first")?
+            .dlp_admin;
+        let admin = Keypair::try_from(&admin_bytes[..])
+            .map_err(|e| format!("corrupt state.json: bad dlp_admin: {e}"))?;
+
+        let validator = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
+        let vault = dlp::validator_fees_vault_pda(&validator.pubkey());
+        base.send_with(
+            &validator,
+            &[&admin],
+            &[dlp::init_validator_fees_vault(
+                &validator.pubkey(),
+                &admin.pubkey(),
+                &validator.pubkey(),
+            )],
+        )
+        .await?;
+        let vault_floor = base.api().get_balance(&vault).await?;
+        assert!(vault_floor > 0, "fees vault not created on base");
+
+        base.airdrop(&vault, TEST_FEE_LAMPORTS).await?;
+        let vault_before = base.api().get_balance(&vault).await?;
+        assert!(
+            vault_before >= TEST_FEE_LAMPORTS,
+            "vault holds {vault_before}, expected at least the test fee \
+             amount {TEST_FEE_LAMPORTS}"
+        );
+
+        let claimer_before =
+            base.api().get_balance(&validator.pubkey()).await?;
+        base.send(
+            &validator,
+            &[dlp::validator_claim_fees(&validator.pubkey(), None)],
+        )
+        .await?;
+        let vault_after = base.api().get_balance(&vault).await?;
+        let claimer_after = base.api().get_balance(&validator.pubkey()).await?;
+
+        let claimed = vault_before.saturating_sub(vault_after);
+        assert!(claimed > 0, "should have claimed some fees");
+        assert!(
+            vault_after > 0,
+            "claim drained the vault below rent exemption"
+        );
+        assert!(
+            claimer_after > claimer_before,
+            "claimed fees never reached the validator: {claimer_before} -> \
+             {claimer_after}"
+        );
+
+        Ok(ScenarioReport::ok(self.name())
+            .setting("vault", vault)
+            .metric("test fee lamports", TEST_FEE_LAMPORTS as f64)
+            .metric("claimed lamports", claimed as f64)
+            .metric("vault floor lamports", vault_after as f64))
+    }
+}
