@@ -226,9 +226,6 @@ pub fn compare(filter: Option<&str>, strict: bool, brief: bool) -> Result<()> {
             continue;
         }
         if runs.len() < 2 {
-            println!(
-                "{scenario}: only one run recorded — nothing to compare\n"
-            );
             continue;
         }
         let (prev_file, prev) = &runs[runs.len() - 2];
@@ -236,27 +233,6 @@ pub fn compare(filter: Option<&str>, strict: bool, brief: bool) -> Result<()> {
         compared += 1;
 
         if prev.report.config != last.report.config {
-            println!("{scenario}");
-            if !brief {
-                print_run_context(prev_file, prev, last_file, last);
-            }
-            println!("  NOT COMPARABLE — config differs:");
-            let prev_cfg: BTreeMap<_, _> =
-                prev.report.config.iter().cloned().collect();
-            let last_cfg: BTreeMap<_, _> =
-                last.report.config.iter().cloned().collect();
-            let keys: std::collections::BTreeSet<_> =
-                prev_cfg.keys().chain(last_cfg.keys()).collect();
-            for key in keys {
-                let prev_value =
-                    prev_cfg.get(key).map(String::as_str).unwrap_or("-");
-                let last_value =
-                    last_cfg.get(key).map(String::as_str).unwrap_or("-");
-                if prev_value != last_value {
-                    println!("    {key}: {prev_value} → {last_value}");
-                }
-            }
-            println!();
             continue;
         }
 
