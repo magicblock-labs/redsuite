@@ -26,3 +26,4 @@ signer = { workspace = true }
 hash = { workspace = true }
 transaction = { workspace = true }
 bincode = { workspace = true }
+solana-loader-v4-interface = { version = "3", features = ["bincode"] }

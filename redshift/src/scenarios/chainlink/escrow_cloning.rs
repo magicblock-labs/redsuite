@@ -42,7 +42,7 @@ impl Scenario for EscrowCloning {
         );
 
         let drain_target = Keypair::new().pubkey();
-        let transfer_attempted = er
+        let transfer_result = er
             .send(
                 &escrowed.payer,
                 &[system::transfer(
@@ -51,8 +51,13 @@ impl Scenario for EscrowCloning {
                     TRANSFER_ATTEMPT,
                 )],
             )
-            .await
-            .is_ok();
+            .await;
+        assert!(
+            transfer_result.is_err(),
+            "an escrowed but non-delegated payer must not be able to fee an ER \
+             transfer on this fee-charging stack (InvalidAccountForFee — the \
+             escrow is not a fee source); got {transfer_result:?}"
+        );
 
         let after_tx = er
             .account(&escrowed.escrow)
@@ -101,7 +106,6 @@ impl Scenario for EscrowCloning {
 
         Ok(ScenarioReport::ok(self.name())
             .setting("escrow funding lamports", ESCROW_FUNDING)
-            .setting("er transfer attempt confirmed", transfer_attempted)
             .metric("escrow clone visibility ms", clone_visibility_ms))
     }
 }

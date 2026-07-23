@@ -7,9 +7,6 @@ use redsuite_core::{
 
 use crate::program::instruction::build;
 
-const ALIAS_POOL: usize = 8;
-const FIRST_ALIAS: usize = 6;
-const SECOND_ALIAS: usize = 7;
 const FIRST_WRITE: u64 = 61;
 const SECOND_WRITE: u64 = 62;
 
@@ -22,9 +19,8 @@ impl Scenario for MultiProgramClone {
     }
 
     async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
-        let aliases = topology::redline_alias_ids(ALIAS_POOL);
-        let first_program = aliases[FIRST_ALIAS];
-        let second_program = aliases[SECOND_ALIAS];
+        let [(first_program, _), (second_program, _)] =
+            topology::redline_loader_v3_pair();
 
         let payer =
             redsuite_core::prep::funded_payer(base, crate::PAYER_LAMPORTS)
@@ -45,9 +41,6 @@ impl Scenario for MultiProgramClone {
             er.identity(),
         )
         .await?;
-
-        let both_first_touch = er.account(&first_program).await?.is_none()
-            && er.account(&second_program).await?.is_none();
 
         let multi_clone_tx = Instant::now();
         er.send(
@@ -101,7 +94,7 @@ impl Scenario for MultiProgramClone {
         );
 
         Ok(ScenarioReport::ok(self.name())
-            .setting("programs first-touch", both_first_touch)
+            .setting("loaders", "v3,v3")
             .metric("two-program clone tx wall ms", multi_clone_ms))
     }
 }

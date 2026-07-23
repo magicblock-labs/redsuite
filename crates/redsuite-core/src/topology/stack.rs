@@ -15,6 +15,8 @@ use std::{
     time::Duration,
 };
 
+use account::Account;
+use base64::Engine;
 use instruction::{AccountMeta, Instruction};
 use json::{Deserialize, Serialize};
 use keypair::Keypair;
@@ -32,6 +34,11 @@ pub const MDP_ID: &str = "DmnRGfyyftzacFb1XadYhWF6vWqXwtQk5tbr6XgR3BA1";
 pub const COMMITTOR_ID: &str = "ComtrB2KEaWgXsW1dhr1xYL4Ht4Bjj3gXnnL6KMdABq";
 // The validator's committor (>= 0.13.7)
 const NOOP_ID: &str = "noopb9bkMVfRPU8AsbpTUg8AQkHtKwMYZiFUjNRtMmV";
+const MEMO_V1_ID: &str = "Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo";
+const MEMO_V2_ID: &str = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr";
+const TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+const ATA_PROGRAM_ID: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
+const EATA_PROGRAM_ID: &str = "SPLxh1LVZzEkX99H6rqYizhytLWPZVV296zyYDPagv2";
 
 /// Keep in sync with `declare_id!` in `programs/*/src/lib.rs`.
 const FAMILY_PROGRAMS: &[(&str, &str)] = &[
@@ -71,6 +78,41 @@ pub fn redline_alias_ids(count: usize) -> Vec<Pubkey> {
             .0
         })
         .collect()
+}
+
+pub fn redshift_loader_v3_target() -> (Pubkey, Pubkey) {
+    let redshift_id: Pubkey = FAMILY_PROGRAMS[1]
+        .0
+        .parse()
+        .expect("redshift program id parses");
+    let id =
+        Pubkey::find_program_address(&[b"redsuite-loader-v3"], &redshift_id).0;
+    let authority = Pubkey::find_program_address(
+        &[b"redsuite-loader-v3-auth"],
+        &redshift_id,
+    )
+    .0;
+    (id, authority)
+}
+
+pub fn redline_loader_v3_pair() -> [(Pubkey, Pubkey); 2] {
+    let redline_id: Pubkey = FAMILY_PROGRAMS[0]
+        .0
+        .parse()
+        .expect("redline program id parses");
+    [0u8, 1u8].map(|index| {
+        let id = Pubkey::find_program_address(
+            &[b"redsuite-redline-v3", &[index]],
+            &redline_id,
+        )
+        .0;
+        let authority = Pubkey::find_program_address(
+            &[b"redsuite-redline-v3-auth", &[index]],
+            &redline_id,
+        )
+        .0;
+        (id, authority)
+    })
 }
 
 const CLONE_URL_ENV: &str = "REDSUITE_CLONE_URL";
@@ -240,6 +282,7 @@ async fn boot() -> Result<StackState> {
     let identity = Keypair::new();
     let dlp_admin = Keypair::new();
     let cloned = ensure_cloned_programs(&dir).await?;
+    let cloned_accounts = ensure_cloned_accounts(&dir).await?;
 
     let mut cmd = Command::new(&base_bin);
     cmd.args(["--reset", "--log", "--bind-address", "127.0.0.1"])
@@ -256,6 +299,27 @@ async fn boot() -> Result<StackState> {
             .arg(id)
             .arg(so)
             .arg(dlp_admin.pubkey().to_string());
+    }
+    for (id, dump) in &cloned_accounts {
+        cmd.arg("--account").arg(id).arg(dump);
+    }
+    let redshift_so =
+        workspace_root().join("target/deploy/redshift_program.so");
+    if redshift_so.exists() {
+        let (v3_id, v3_authority) = redshift_loader_v3_target();
+        cmd.arg("--upgradeable-program")
+            .arg(v3_id.to_string())
+            .arg(&redshift_so)
+            .arg(v3_authority.to_string());
+    }
+    let redline_so = workspace_root().join("target/deploy/redline_program.so");
+    if redline_so.exists() {
+        for (id, authority) in redline_loader_v3_pair() {
+            cmd.arg("--upgradeable-program")
+                .arg(id.to_string())
+                .arg(&redline_so)
+                .arg(authority.to_string());
+        }
     }
     for (id, so) in base_programs(&er_bin)? {
         for alias in redline_aliases_of(&so) {
@@ -847,9 +911,13 @@ async fn ensure_cloned_programs(dir: &Path) -> Result<Vec<(String, PathBuf)>> {
     let api = Api::with_timeout(url.clone(), Duration::from_secs(30));
     let loader: Pubkey = LOADER_V3.parse()?;
     let mut programs = Vec::new();
-    for (id, name) in
-        [(DLP_ID, "dlp.so"), (MDP_ID, "mdp.so"), (NOOP_ID, "noop.so")]
-    {
+    for (id, name) in [
+        (DLP_ID, "dlp.so"),
+        (MDP_ID, "mdp.so"),
+        (NOOP_ID, "noop.so"),
+        (TOKEN_PROGRAM_ID, "spl-token.so"),
+        (EATA_PROGRAM_ID, "eata.so"),
+    ] {
         let path = cache.join(name);
         let program: Pubkey = id.parse()?;
         let program_data =
@@ -881,6 +949,64 @@ async fn ensure_cloned_programs(dir: &Path) -> Result<Vec<(String, PathBuf)>> {
         programs.push((id.to_owned(), path));
     }
     Ok(programs)
+}
+
+async fn ensure_cloned_accounts(dir: &Path) -> Result<Vec<(String, PathBuf)>> {
+    let cache = dir.join("cloned-accounts");
+    fs::create_dir_all(&cache)?;
+    let url = std::env::var(CLONE_URL_ENV)
+        .unwrap_or_else(|_| DEFAULT_CLONE_URL.to_owned());
+    let api = Api::with_timeout(url.clone(), Duration::from_secs(30));
+    let mut accounts = Vec::new();
+    for (id, name) in [
+        (MEMO_V1_ID, "memo-v1.json"),
+        (MEMO_V2_ID, "memo-v2.json"),
+        (ATA_PROGRAM_ID, "ata.json"),
+    ] {
+        let path = cache.join(name);
+        let program: Pubkey = id.parse()?;
+        match api.get_account(&program).await {
+            Ok(Some(account))
+                if account.executable && !account.data.is_empty() =>
+            {
+                fs::write(&path, account_dump_json(&program, &account))?;
+                eprintln!(
+                    "[redsuite] cloned {name} from {url} (owner {}, {} bytes)",
+                    account.owner,
+                    account.data.len(),
+                );
+            }
+            outcome => {
+                if path.exists() {
+                    eprintln!(
+                        "[redsuite] warning: refreshing {name} from {url} \
+                         failed ({outcome:?}) — using the cached copy"
+                    );
+                } else {
+                    return Err(format!(
+                        "cannot clone {name} from {url} and no cached copy \
+                         exists in {}",
+                        cache.display()
+                    )
+                    .into());
+                }
+            }
+        }
+        accounts.push((id.to_owned(), path));
+    }
+    Ok(accounts)
+}
+
+fn account_dump_json(pubkey: &Pubkey, account: &Account) -> String {
+    let data = base64::engine::general_purpose::STANDARD.encode(&account.data);
+    format!(
+        r#"{{"pubkey":"{pubkey}","account":{{"lamports":{},"data":["{data}","base64"],"owner":"{}","executable":{},"rentEpoch":{},"space":{}}}}}"#,
+        account.lamports,
+        account.owner,
+        account.executable,
+        account.rent_epoch,
+        account.data.len(),
+    )
 }
 
 fn base_programs(er_bin: &Path) -> Result<Vec<(String, PathBuf)>> {

@@ -15,6 +15,8 @@ const PROPAGATION_TIMEOUT: Duration = Duration::from_secs(15);
 const PRE_CLONE_WRITE: u64 = 41;
 const POST_CLONE_WRITE: u64 = 42;
 const ER_WRITE: u64 = 43;
+const UNDELEGATED_WRITE: u64 = 44;
+const GHOST_LAMPORTS: u64 = 500_000_000;
 
 pub struct CloneOnAccess;
 
@@ -32,6 +34,11 @@ impl Scenario for CloneOnAccess {
             er.account(&ghost).await?.is_none(),
             "an account that exists nowhere must read as absent on the ER"
         );
+        base.airdrop(&ghost, GHOST_LAMPORTS).await?;
+        poll_until(PROPAGATION_TIMEOUT, || async {
+            matches!(er.account(&ghost).await, Ok(Some(acc)) if acc.lamports == GHOST_LAMPORTS)
+        })
+        .await;
 
         let plain = crate::init_account(base, &payer, 0, er.identity()).await?;
         base.send(&payer, &[build::simple_byte_set(PRE_CLONE_WRITE, &[plain])])
@@ -73,6 +80,17 @@ impl Scenario for CloneOnAccess {
         })
         .await;
         let propagation_ms = mutation_confirmed.elapsed().as_secs_f64() * 1e3;
+
+        let undelegated_write = er
+            .send(
+                &payer,
+                &[build::simple_byte_set(UNDELEGATED_WRITE, &[plain])],
+            )
+            .await;
+        assert!(
+            undelegated_write.is_err(),
+            "the ER must reject a write to an undelegated clone, got {undelegated_write:?}"
+        );
 
         let delegated =
             crate::init_delegated_account(base, &payer, 1, er.identity())

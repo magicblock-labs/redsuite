@@ -24,6 +24,7 @@ redline = { path = "redline" }
 redshift = { path = "redshift" }
 redhat = { path = "redhat" }
 redline-program = { path = "programs/redline" }
+redshift-program = { path = "programs/redshift" }
 
 tokio = { version = "1", features = ["rt", "macros", "time", "net"] }
 tokio-tungstenite = "0.29"
@@ -40,7 +41,7 @@ borsh = "1.5"
 sha2 = "0.10"
 # Same dep shape as the validator's test-integration workspace (the proven pair
 # against the vendored base-programs/dlp.so — see MANIFEST.toml).
-sdk = { package = "ephemeral-rollups-sdk", version = "0.14", default-features = false, features = ["modular-sdk"] }
+sdk = { package = "ephemeral-rollups-sdk", version = "0.16.2", default-features = false, features = ["modular-sdk"] }
 
 pubkey = { package = "solana-pubkey", version = "3" }
 hash = { package = "solana-hash", version = "3" }

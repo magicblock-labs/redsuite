@@ -10,6 +10,8 @@ async-trait = { workspace = true }
 tokio = { workspace = true }
 redsuite-core = { workspace = true }
 redline-program = { workspace = true }
+redshift-program = { workspace = true, features = ["no-entrypoint"] }
+dlp-api = { package = "magicblock-delegation-program-api", version = "3.1.0", features = ["encryption"] }
 instruction = { workspace = true }
 pubkey = { workspace = true }
 keypair = { workspace = true }
@@ -53,6 +55,14 @@ path = "tests/chainlink/parallel_cloning.rs"
 [[test]]
 name = "multi_program_clone"
 path = "tests/chainlink/multi_program_clone.rs"
+
+[[test]]
+name = "loader_matrix"
+path = "tests/chainlink/loader_matrix.rs"
+
+[[test]]
+name = "post_delegation_token_transfer"
+path = "tests/chainlink/post_delegation_token_transfer.rs"
 
 [[test]]
 name = "commit_roundtrip"

@@ -16,6 +16,7 @@ const BASE_STATE_TIMEOUT: Duration = Duration::from_secs(20);
 const UNDELEGATE_TIMEOUT: Duration = Duration::from_secs(30);
 const FIRST_WRITE: u64 = 21;
 const SECOND_WRITE: u64 = 22;
+const LOCKOUT_WRITE: u64 = 23;
 
 pub struct CommitRoundtrip;
 
@@ -159,17 +160,18 @@ impl Scenario for CommitRoundtrip {
 
         er.send(&payer, &[build::simple_byte_set(SECOND_WRITE, &accounts)])
             .await?;
-        let final_state = er
+        let committed_final = er
             .account(&committed)
             .await?
-            .ok_or("er copy vanished before the undelegating commit")?
-            .data;
-        let final_sibling_state = er
+            .ok_or("er copy vanished before the undelegating commit")?;
+        let sibling_final = er
             .account(&sibling)
             .await?
-            .ok_or("sibling er copy vanished before the undelegating commit")?
-            .data;
-        assert_eq!(crate::written_id(&final_state), Some(SECOND_WRITE));
+            .ok_or("sibling er copy vanished before the undelegating commit")?;
+        assert_eq!(
+            crate::written_id(&committed_final.data),
+            Some(SECOND_WRITE)
+        );
 
         let undelegate_started = Instant::now();
         let undelegate_signature = er
@@ -220,8 +222,8 @@ impl Scenario for CommitRoundtrip {
         )
         .await?;
 
-        for (pda, expected_data) in
-            [(committed, &final_state), (sibling, &final_sibling_state)]
+        for (pda, expected) in
+            [(committed, &committed_final), (sibling, &sibling_final)]
         {
             let undelegate_deadline =
                 tokio::time::Instant::now() + UNDELEGATE_TIMEOUT;
@@ -230,7 +232,8 @@ impl Scenario for CommitRoundtrip {
                 if matches!(
                     &on_base,
                     Some(acc) if acc.owner == crate::program::id()
-                        && &acc.data == expected_data
+                        && acc.data == expected.data
+                        && acc.lamports == expected.lamports
                 ) {
                     break;
                 }
@@ -238,17 +241,20 @@ impl Scenario for CommitRoundtrip {
                     let observed = on_base
                         .map(|acc| {
                             format!(
-                                "owner {} data[..48] {:02x?}",
+                                "owner {} lamports {} data[..48] {:02x?}",
                                 acc.owner,
+                                acc.lamports,
                                 &acc.data[..48.min(acc.data.len())]
                             )
                         })
                         .unwrap_or_else(|| "absent".to_owned());
                     return Err(format!(
-                        "{pda} never undelegated on base; expected owner {} \
+                        "{pda} never undelegated on base with matching \
+                         owner/data/lamports; expected owner {} lamports {} \
                          data[..48] {:02x?}, observed {observed}",
                         crate::program::id(),
-                        &expected_data[..48]
+                        expected.lamports,
+                        &expected.data[..48]
                     )
                     .into());
                 }
@@ -257,9 +263,34 @@ impl Scenario for CommitRoundtrip {
         }
         let undelegate_roundtrip_s = undelegate_started.elapsed().as_secs_f64();
 
+        poll_until(UNDELEGATE_TIMEOUT, || async {
+            matches!(
+                er.account(&committed).await,
+                Ok(Some(clone)) if clone.owner == crate::program::id()
+            )
+        })
+        .await;
+        let write_after_undelegate = er
+            .send(
+                &payer,
+                &[build::simple_byte_set(LOCKOUT_WRITE, &[committed])],
+            )
+            .await;
+        assert!(
+            write_after_undelegate.is_err(),
+            "the ER copy of an undelegated account must reject writes \
+             (locked out after undelegation), got {write_after_undelegate:?}"
+        );
+
         Ok(ScenarioReport::ok(self.name())
             .setting("account space", crate::ACCOUNT_SPACE)
             .setting("accounts", accounts.len())
+            .setting("commit base sigs", commit_receipt.base_signatures.len())
+            .setting(
+                "undelegate base sigs",
+                undelegate_receipt.base_signatures.len(),
+            )
+            .setting("commit id", commit_receipt.commit_id.unwrap_or_default())
             .metric("clone visibility ms", clone_visibility_ms)
             .metric("commit roundtrip s", commit_roundtrip_s)
             .metric("commit-undelegate roundtrip s", undelegate_roundtrip_s))

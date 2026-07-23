@@ -8,5 +8,9 @@ authors.workspace = true
 [lib]
 crate-type = ["cdylib", "lib"]
 
+[features]
+upgraded = []
+no-entrypoint = []
+
 [dependencies]
 solana-program = { workspace = true }

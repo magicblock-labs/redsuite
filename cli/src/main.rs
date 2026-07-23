@@ -40,6 +40,8 @@ registry![
     ("redshift/escrow_cloning", redshift::scenarios::chainlink::escrow_cloning::EscrowCloning),
     ("redshift/parallel_cloning", redshift::scenarios::chainlink::parallel_cloning::ParallelCloning),
     ("redshift/multi_program_clone", redshift::scenarios::chainlink::multi_program_clone::MultiProgramClone),
+    ("redshift/loader_matrix", redshift::scenarios::chainlink::loader_matrix::LoaderMatrix),
+    ("redshift/post_delegation_token_transfer", redshift::scenarios::chainlink::post_delegation_token_transfer::PostDelegationTokenTransfer),
     ("redhat/illegal_writable", redhat::scenarios::chainlink::illegal_writable::IllegalWritable),
     ("redhat/fee_payer_rules", redhat::scenarios::aperture::fee_payer_rules::FeePayerRules),
 ];

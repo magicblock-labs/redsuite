@@ -13,6 +13,7 @@ use signer::Signer;
 const ACCOUNT_LAMPORTS: u64 = 1_000_000_000;
 const TRANSFER_LAMPORTS: u64 = 10_000;
 const SEQUENTIAL_TRANSFERS: u64 = 10;
+const LOGS_TRANSFERS: usize = 5;
 const EVENT_TIMEOUT: Duration = Duration::from_secs(10);
 const EVENT_POLL: Duration = Duration::from_millis(20);
 const RAW_FIRST_TIMEOUT: Duration = Duration::from_secs(3);
@@ -155,26 +156,29 @@ impl Scenario for PubsubContracts {
                 |event| event_lamports(event) == Some(expected),
             )
             .await?;
-            for event in events.events(account1_key) {
-                let lamports = event_lamports(&event).unwrap_or_else(|| {
-                    panic!(
-                        "account 1 notification without lamports: \
-                             {event:?}"
-                    )
-                });
-                let drained_so_far = ACCOUNT_LAMPORTS.checked_sub(lamports);
-                let valid = drained_so_far.is_some_and(|amount| {
-                    amount % TRANSFER_LAMPORTS == 0
-                        && amount <= sent * TRANSFER_LAMPORTS
-                });
-                assert!(
-                    valid,
-                    "unexpected sequential account 1 lamports in {event:?}"
-                );
-            }
         }
         let drained =
             ACCOUNT_LAMPORTS - SEQUENTIAL_TRANSFERS * TRANSFER_LAMPORTS;
+
+        let mut previous = ACCOUNT_LAMPORTS;
+        for event in events.events(account1_key) {
+            let lamports = event_lamports(&event).unwrap_or_else(|| {
+                panic!("account 1 notification without lamports: {event:?}")
+            });
+            assert!(
+                lamports == previous
+                    || previous.checked_sub(TRANSFER_LAMPORTS)
+                        == Some(lamports),
+                "out-of-order account 1 notification {lamports}: neither the \
+                 previous {previous} nor one step down (a replaying validator \
+                 that resent a stale balance would fail here)"
+            );
+            previous = lamports;
+        }
+        assert_eq!(
+            previous, drained,
+            "the last account 1 notification must show the fully drained balance"
+        );
 
         let logs_all_key = events.logs_subscribe_all().await?;
         let mentions1_key =
@@ -184,34 +188,41 @@ impl Scenario for PubsubContracts {
         let program_key = events.program_subscribe(&system_program).await?;
         events.await_subscribed(6, Duration::from_secs(5)).await?;
 
-        let logs_signature = transfer(
-            &sender,
-            &account1_pubkey,
-            &account2_pubkey,
-            TRANSFER_LAMPORTS,
-        )
-        .await?;
-        sent += 1;
-        for (key, what) in [
-            (logs_all_key, "logs(all) entry"),
-            (mentions1_key, "logs mentions(account1) entry"),
-            (mentions2_key, "logs mentions(account2) entry"),
-        ] {
-            let event = await_event_where(&events, key, what, |event| {
-                event_signature(event).as_deref()
-                    == Some(logs_signature.as_str())
-            })
-            .await?;
-            assert!(
-                event.get("value").get("err").is_null(),
-                "{what} carries an error: {event:?}"
+        let mut logs_signatures = Vec::with_capacity(LOGS_TRANSFERS);
+        for _ in 0..LOGS_TRANSFERS {
+            logs_signatures.push(
+                transfer(
+                    &sender,
+                    &account1_pubkey,
+                    &account2_pubkey,
+                    TRANSFER_LAMPORTS,
+                )
+                .await?,
             );
-            let log_count = event
-                .get("value")
-                .get("logs")
-                .as_array()
-                .map_or(0, |logs| logs.len());
-            assert!(log_count > 0, "{what} has no log lines: {event:?}");
+            sent += 1;
+        }
+        for logs_signature in &logs_signatures {
+            for (key, what) in [
+                (logs_all_key, "logs(all) entry"),
+                (mentions1_key, "logs mentions(account1) entry"),
+                (mentions2_key, "logs mentions(account2) entry"),
+            ] {
+                let event = await_event_where(&events, key, what, |event| {
+                    event_signature(event).as_deref()
+                        == Some(logs_signature.as_str())
+                })
+                .await?;
+                assert!(
+                    event.get("value").get("err").is_null(),
+                    "{what} carries an error: {event:?}"
+                );
+                let log_count = event
+                    .get("value")
+                    .get("logs")
+                    .as_array()
+                    .map_or(0, |logs| logs.len());
+                assert!(log_count > 0, "{what} has no log lines: {event:?}");
+            }
         }
         let expected1 = ACCOUNT_LAMPORTS - sent * TRANSFER_LAMPORTS;
         let expected2 = ACCOUNT_LAMPORTS + sent * TRANSFER_LAMPORTS;
@@ -395,6 +406,17 @@ impl Scenario for PubsubContracts {
             raw.next_notification(RAW_SILENCE_TIMEOUT).await?.is_none(),
             "slot notifications continued after unsubscribe"
         );
+
+        let unsent = sender
+            .prepare(&[system::transfer(
+                &account1_pubkey,
+                &account2_pubkey,
+                9_999,
+            )])
+            .await?;
+        let unsent_signature = unsent.signatures[0].to_string();
+        let signature_sub = raw.signature_subscribe(&unsent_signature).await?;
+        raw.signature_unsubscribe(signature_sub).await?;
         raw.close().await?;
 
         Ok(ScenarioReport::ok(self.name())

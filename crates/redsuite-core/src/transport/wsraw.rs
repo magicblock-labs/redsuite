@@ -148,6 +148,18 @@ impl RawWs {
         self.unsubscribe("slotUnsubscribe", subid).await
     }
 
+    pub async fn signature_subscribe(
+        &mut self,
+        signature: &str,
+    ) -> Result<u64> {
+        let params = format!(r#"["{signature}",{{"commitment":"confirmed"}}]"#);
+        self.subscribe("signatureSubscribe", &params).await
+    }
+
+    pub async fn signature_unsubscribe(&mut self, subid: u64) -> Result<bool> {
+        self.unsubscribe("signatureUnsubscribe", subid).await
+    }
+
     pub async fn next_notification(
         &mut self,
         timeout: Duration,

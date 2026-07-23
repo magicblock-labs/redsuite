@@ -107,5 +107,23 @@ fn programs() -> Result<()> {
                 .arg(root().join(format!("programs/{program}/Cargo.toml"))),
         )?;
     }
+    build_redshift_upgraded()?;
+    Ok(())
+}
+
+fn build_redshift_upgraded() -> Result<()> {
+    let out_dir = root().join("target/deploy/redshift-upgraded");
+    run_cmd(
+        "cargo build-sbf (redshift upgraded)",
+        Command::new("cargo")
+            .args(["build-sbf", "--manifest-path"])
+            .arg(root().join("programs/redshift/Cargo.toml"))
+            .args(["--features", "upgraded", "--sbf-out-dir"])
+            .arg(&out_dir),
+    )?;
+    let built = out_dir.join("redshift_program.so");
+    let staged = root().join("target/deploy/redshift_program_upgraded.so");
+    std::fs::copy(&built, &staged)
+        .map_err(|err| format!("staging the upgraded redshift .so: {err}"))?;
     Ok(())
 }
