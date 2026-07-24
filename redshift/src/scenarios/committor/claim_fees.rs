@@ -1,8 +1,6 @@
 use async_trait::async_trait;
-use keypair::Keypair;
 use redsuite_core::{
-    dlp, prep, topology, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
-    ScenarioReport,
+    dlp, topology, BaseCtx, ChainCtx, ErCtx, Result, Scenario, ScenarioReport,
 };
 use signer::Signer;
 
@@ -17,26 +15,14 @@ impl Scenario for ClaimFees {
     }
 
     async fn run(&self, base: &BaseCtx, _er: &ErCtx) -> Result<ScenarioReport> {
-        let admin_bytes = topology::current_state()
-            .ok_or("no shared stack state — boot the shared stack first")?
-            .dlp_admin;
-        let admin = Keypair::try_from(&admin_bytes[..])
-            .map_err(|e| format!("corrupt state.json: bad dlp_admin: {e}"))?;
-
-        let validator = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
+        let validator = topology::er_identity_keypair()?;
         let vault = dlp::validator_fees_vault_pda(&validator.pubkey());
-        base.send_with(
-            &validator,
-            &[&admin],
-            &[dlp::init_validator_fees_vault(
-                &validator.pubkey(),
-                &admin.pubkey(),
-                &validator.pubkey(),
-            )],
-        )
-        .await?;
-        let vault_floor = base.api().get_balance(&vault).await?;
-        assert!(vault_floor > 0, "fees vault not created on base");
+        let vault_at_boot = base.api().get_balance(&vault).await?;
+        assert!(
+            vault_at_boot > 0,
+            "validator-fees-vault absent on base — it should have been \
+             injected at genesis"
+        );
 
         base.airdrop(&vault, TEST_FEE_LAMPORTS).await?;
         let vault_before = base.api().get_balance(&vault).await?;
