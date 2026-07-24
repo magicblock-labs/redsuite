@@ -107,23 +107,37 @@ fn programs() -> Result<()> {
                 .arg(root().join(format!("programs/{program}/Cargo.toml"))),
         )?;
     }
-    build_redshift_upgraded()?;
+    build_redshift_variant("slim", &[], "redshift_program_slim.so")?;
+    build_redshift_variant(
+        "slim-upgraded",
+        &["upgraded"],
+        "redshift_program_slim_upgraded.so",
+    )?;
     Ok(())
 }
 
-fn build_redshift_upgraded() -> Result<()> {
-    let out_dir = root().join("target/deploy/redshift-upgraded");
-    run_cmd(
-        "cargo build-sbf (redshift upgraded)",
-        Command::new("cargo")
-            .args(["build-sbf", "--manifest-path"])
-            .arg(root().join("programs/redshift/Cargo.toml"))
-            .args(["--features", "upgraded", "--sbf-out-dir"])
-            .arg(&out_dir),
-    )?;
+// The slim variants do not include the schedulecommit module or its sdk
+// dependencies. The loader_matrix v4 cell deploys these small binaries,
+// because a large redeploy wedges the clone of the program in the ER.
+fn build_redshift_variant(
+    label: &str,
+    features: &[&str],
+    staged_name: &str,
+) -> Result<()> {
+    let out_dir = root().join(format!("target/deploy/redshift-{label}"));
+    let mut command = Command::new("cargo");
+    command
+        .args(["build-sbf", "--manifest-path"])
+        .arg(root().join("programs/redshift/Cargo.toml"))
+        .arg("--no-default-features");
+    if !features.is_empty() {
+        command.args(["--features", &features.join(",")]);
+    }
+    command.arg("--sbf-out-dir").arg(&out_dir);
+    run_cmd(&format!("cargo build-sbf (redshift {label})"), &mut command)?;
     let built = out_dir.join("redshift_program.so");
-    let staged = root().join("target/deploy/redshift_program_upgraded.so");
+    let staged = root().join("target/deploy").join(staged_name);
     std::fs::copy(&built, &staged)
-        .map_err(|err| format!("staging the upgraded redshift .so: {err}"))?;
+        .map_err(|err| format!("staging {staged_name}: {err}"))?;
     Ok(())
 }

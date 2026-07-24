@@ -9,8 +9,13 @@ authors.workspace = true
 crate-type = ["cdylib", "lib"]
 
 [features]
+default = ["schedulecommit"]
+schedulecommit = ["dep:borsh", "dep:sdk", "dep:solana-sdk-ids"]
 upgraded = []
 no-entrypoint = []
 
 [dependencies]
+borsh = { workspace = true, optional = true }
+sdk = { workspace = true, optional = true }
 solana-program = { workspace = true }
+solana-sdk-ids = { version = "3", optional = true }

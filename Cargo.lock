@@ -2219,6 +2219,7 @@ name = "redshift"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "borsh 1.7.0",
  "magicblock-delegation-program-api",
  "redline-program",
  "redshift-program",
@@ -2235,7 +2236,10 @@ dependencies = [
 name = "redshift-program"
 version = "0.1.0"
 dependencies = [
+ "borsh 1.7.0",
+ "ephemeral-rollups-sdk",
  "solana-program 3.0.0",
+ "solana-sdk-ids 3.1.0",
 ]
 
 [[package]]

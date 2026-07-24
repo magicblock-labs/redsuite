@@ -7,6 +7,7 @@ authors.workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
+borsh = { workspace = true }
 tokio = { workspace = true }
 redsuite-core = { workspace = true }
 redline-program = { workspace = true }
@@ -67,3 +68,7 @@ path = "tests/chainlink/post_delegation_token_transfer.rs"
 [[test]]
 name = "commit_roundtrip"
 path = "tests/committor/commit_roundtrip.rs"
+
+[[test]]
+name = "commits"
+path = "tests/committor/commits.rs"

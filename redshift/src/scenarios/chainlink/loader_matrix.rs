@@ -77,12 +77,15 @@ impl Scenario for LoaderMatrix {
         );
 
         let root = topology::workspace_root().join("target/deploy");
-        let base_bytes = std::fs::read(root.join("redshift_program.so"))
-            .map_err(|err| format!("reading the base redshift .so: {err}"))?;
-        let upgraded_bytes = std::fs::read(
-            root.join("redshift_program_upgraded.so"),
-        )
-        .map_err(|err| format!("reading the upgraded redshift .so: {err}"))?;
+        let base_bytes = std::fs::read(root.join("redshift_program_slim.so"))
+            .map_err(|err| {
+            format!("reading the slim redshift .so: {err}")
+        })?;
+        let upgraded_bytes =
+            std::fs::read(root.join("redshift_program_slim_upgraded.so"))
+                .map_err(|err| {
+                    format!("reading the slim upgraded redshift .so: {err}")
+                })?;
 
         let authority = prep::funded_payer(base, V4_AUTHORITY_FUNDING).await?;
         let program = Keypair::new();

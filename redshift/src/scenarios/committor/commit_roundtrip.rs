@@ -281,6 +281,24 @@ impl Scenario for CommitRoundtrip {
             "the ER copy of an undelegated account must reject writes \
              (locked out after undelegation), got {write_after_undelegate:?}"
         );
+        let lockout_error =
+            format!("{:?}", write_after_undelegate.unwrap_err());
+        let lockout_rejection = [
+            "InvalidWritableAccount",
+            "ExternalAccountDataModified",
+            "ProgramFailedToComplete",
+            "InvalidAccountForFee",
+        ]
+        .into_iter()
+        .find(|code| lockout_error.contains(code))
+        .ok_or_else(|| {
+            format!(
+                "expected InvalidWritableAccount, ExternalAccountDataModified \
+                 or ProgramFailedToComplete (the upstream set) or \
+                 InvalidAccountForFee (the fee-model adaptation) for the \
+                 lockout write, got {lockout_error}"
+            )
+        })?;
 
         Ok(ScenarioReport::ok(self.name())
             .setting("account space", crate::ACCOUNT_SPACE)
@@ -291,6 +309,7 @@ impl Scenario for CommitRoundtrip {
                 undelegate_receipt.base_signatures.len(),
             )
             .setting("commit id", commit_receipt.commit_id.unwrap_or_default())
+            .setting("lockout rejection", lockout_rejection)
             .metric("clone visibility ms", clone_visibility_ms)
             .metric("commit roundtrip s", commit_roundtrip_s)
             .metric("commit-undelegate roundtrip s", undelegate_roundtrip_s))
