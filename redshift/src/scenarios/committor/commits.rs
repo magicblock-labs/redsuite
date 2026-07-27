@@ -186,6 +186,13 @@ impl Scenario for Commits {
         let (foreign_player, foreign_pda) =
             init_delegated_committee(base, &payer, other_validator.pubkey())
                 .await?;
+        poll_until(CLONE_TIMEOUT, || async {
+            matches!(
+                er.account(&foreign_pda).await,
+                Ok(Some(clone)) if clone.data.len() == MainAccount::SIZE
+            )
+        })
+        .await;
         let illegal_commit = er
             .send(
                 &outsider_payer,
@@ -219,6 +226,13 @@ impl Scenario for Commits {
         let (undelegate_player, undelegate_pda) =
             init_delegated_committee(base, &payer, other_validator.pubkey())
                 .await?;
+        poll_until(CLONE_TIMEOUT, || async {
+            matches!(
+                er.account(&undelegate_pda).await,
+                Ok(Some(clone)) if clone.data.len() == MainAccount::SIZE
+            )
+        })
+        .await;
         let illegal_undelegate = er
             .send(
                 &outsider_payer,

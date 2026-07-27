@@ -17,15 +17,17 @@ declare_id!("AijneHkXJVVWyimuwfSJdrJktARZu2WiMaZBqHsq7CS5");
 pub mod schedulecommit {
     use borsh::{BorshDeserialize, BorshSerialize};
     use sdk::{
+        consts::DELEGATION_PROGRAM_ID,
         cpi::{
             delegate_account, undelegate_account, DelegateAccounts,
             DelegateConfig,
         },
         ephem::{
-            commit_accounts, commit_and_undelegate_accounts,
+            commit_accounts, commit_and_undelegate_accounts, CallHandler,
             FoldableIntentBuilder, MagicIntentBundleBuilder,
         },
         utils::create_pda,
+        ActionArgs, ShortAccountMeta,
     };
     use solana_program::{
         account_info::{next_account_info, AccountInfo},
@@ -35,13 +37,21 @@ pub mod schedulecommit {
         program::{invoke, invoke_signed},
         program_error::ProgramError,
         pubkey::Pubkey,
+        rent::Rent,
+        sysvar::Sysvar,
     };
 
     pub const FAIL_UNDELEGATION_COUNT: u64 = u64::MAX - 1;
     pub const PDA_SEED: &[u8] = b"magic_schedule_commit";
+    pub const ORDER_BOOK_SEED: &[u8] = b"order_book";
+    pub const ORDER_BOOK_INIT_SIZE: usize = 10 * 1024;
 
     const MAGIC_SCHEDULE_COMMIT_TAG: u32 = 1;
     const MAGIC_SCHEDULE_COMMIT_AND_UNDELEGATE_TAG: u32 = 2;
+    const DLP_REQUEST_UNDELEGATION_TAG: u64 = 26;
+    const ORDER_BOOK_HEADER_SIZE: usize = 8;
+    const ORDER_LEVEL_SIZE: usize = 16;
+    const SYSTEM_TRANSFER_TAG: u32 = 2;
 
     #[derive(BorshSerialize, BorshDeserialize, Debug, PartialEq, Eq, Clone)]
     pub struct MainAccount {
@@ -76,6 +86,40 @@ pub mod schedulecommit {
         pub has_magic_vault: bool,
     }
 
+    #[derive(
+        BorshSerialize,
+        BorshDeserialize,
+        Debug,
+        Clone,
+        Copy,
+        Default,
+        PartialEq,
+        Eq,
+    )]
+    pub struct OrderLevel {
+        pub price: u64,
+        pub size: u64,
+    }
+
+    #[derive(BorshSerialize, BorshDeserialize, Debug, Clone, Default)]
+    pub struct BookUpdate {
+        pub bids: Vec<OrderLevel>,
+        pub asks: Vec<OrderLevel>,
+    }
+
+    #[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+    pub struct DelegateOrderBookArgs {
+        pub commit_frequency_ms: u32,
+        pub book_manager: Pubkey,
+        pub validator: Option<Pubkey>,
+    }
+
+    #[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+    pub struct ScheduleCommitWithOrderBookArgs {
+        pub players: Vec<Pubkey>,
+        pub with_actions: bool,
+    }
+
     #[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
     pub enum ScheduleCommitInstruction {
         Init,
@@ -86,6 +130,79 @@ pub mod schedulecommit {
         ScheduleCommitAndUndelegateCpiTwice(Vec<Pubkey>),
         IncreaseCount,
         SetCount(u64),
+        InitOrderBook,
+        GrowOrderBook(u64),
+        DelegateOrderBook(DelegateOrderBookArgs),
+        UpdateOrderBook(BookUpdate),
+        ScheduleCommitWithVaultAndOrderBookCpi(ScheduleCommitWithOrderBookArgs),
+        ScheduleCommitForOrderBook(ScheduleCommitType),
+        RequestUndelegationCpi(Pubkey),
+    }
+
+    fn book_lens(data: &[u8]) -> Option<(usize, usize, usize)> {
+        if data.len() < ORDER_BOOK_HEADER_SIZE {
+            return None;
+        }
+        let capacity = (data.len() - ORDER_BOOK_HEADER_SIZE) / ORDER_LEVEL_SIZE;
+        let bids = u32::from_le_bytes(data[0..4].try_into().ok()?) as usize;
+        let asks = u32::from_le_bytes(data[4..8].try_into().ok()?) as usize;
+        (bids + asks <= capacity).then_some((bids, asks, capacity))
+    }
+
+    fn write_level(data: &mut [u8], index: usize, level: &OrderLevel) {
+        let offset = ORDER_BOOK_HEADER_SIZE + index * ORDER_LEVEL_SIZE;
+        data[offset..offset + 8].copy_from_slice(&level.price.to_le_bytes());
+        data[offset + 8..offset + 16]
+            .copy_from_slice(&level.size.to_le_bytes());
+    }
+
+    fn read_level(data: &[u8], index: usize) -> OrderLevel {
+        let offset = ORDER_BOOK_HEADER_SIZE + index * ORDER_LEVEL_SIZE;
+        OrderLevel {
+            price: u64::from_le_bytes(
+                data[offset..offset + 8].try_into().unwrap(),
+            ),
+            size: u64::from_le_bytes(
+                data[offset + 8..offset + 16].try_into().unwrap(),
+            ),
+        }
+    }
+
+    pub fn order_book_apply(
+        data: &mut [u8],
+        update: &BookUpdate,
+    ) -> Result<(), ProgramError> {
+        let (bids_len, asks_len, capacity) =
+            book_lens(data).ok_or(ProgramError::InvalidAccountData)?;
+        let mut remaining = capacity - bids_len - asks_len;
+        if update.bids.len() <= remaining {
+            for (position, level) in update.bids.iter().enumerate() {
+                write_level(data, bids_len + position, level);
+            }
+            let new_bids = (bids_len + update.bids.len()) as u32;
+            data[0..4].copy_from_slice(&new_bids.to_le_bytes());
+            remaining -= update.bids.len();
+        }
+        if update.asks.len() <= remaining {
+            let new_asks = asks_len + update.asks.len();
+            for (position, level) in update.asks.iter().rev().enumerate() {
+                write_level(data, capacity - new_asks + position, level);
+            }
+            data[4..8].copy_from_slice(&(new_asks as u32).to_le_bytes());
+        }
+        Ok(())
+    }
+
+    pub fn order_book_view(
+        data: &[u8],
+    ) -> Option<(Vec<OrderLevel>, Vec<OrderLevel>)> {
+        let (bids_len, asks_len, capacity) = book_lens(data)?;
+        let bids = (0..bids_len).map(|index| read_level(data, index)).collect();
+        let asks = (0..asks_len)
+            .rev()
+            .map(|index| read_level(data, capacity - asks_len + index))
+            .collect();
+        Some((bids, asks))
     }
 
     #[derive(BorshSerialize, BorshDeserialize, Debug, Clone, Copy)]
@@ -233,7 +350,279 @@ pub mod schedulecommit {
             }
             IncreaseCount => process_increase_count(accounts),
             SetCount(value) => process_set_count(accounts, value),
+            InitOrderBook => process_init_order_book(accounts),
+            GrowOrderBook(additional_space) => {
+                process_grow_order_book(accounts, additional_space)
+            }
+            DelegateOrderBook(args) => {
+                process_delegate_order_book(accounts, args)
+            }
+            UpdateOrderBook(update) => {
+                process_update_order_book(accounts, &update)
+            }
+            ScheduleCommitWithVaultAndOrderBookCpi(args) => {
+                process_commit_with_vault_and_order_book(accounts, &args)
+            }
+            ScheduleCommitForOrderBook(commit_type) => {
+                process_commit_for_order_book(accounts, commit_type)
+            }
+            RequestUndelegationCpi(player) => {
+                process_request_undelegation_cpi(accounts, &player)
+            }
         }
+    }
+
+    fn process_init_order_book(accounts: &[AccountInfo]) -> ProgramResult {
+        let [payer, book_manager, order_book, system_program] = accounts else {
+            return Err(ProgramError::NotEnoughAccountKeys);
+        };
+        if !payer.is_signer {
+            return Err(ProgramError::MissingRequiredSignature);
+        }
+
+        let (expected_pda, bump) = order_book_pda_and_bump(book_manager.key);
+        if order_book.key != &expected_pda {
+            msg!(
+                "the order book PDA {} is not correct for manager {}",
+                order_book.key,
+                book_manager.key
+            );
+            return Err(ProgramError::InvalidSeeds);
+        }
+
+        let bump_slice = [bump];
+        let seeds: [&[u8]; 3] =
+            [ORDER_BOOK_SEED, book_manager.key.as_ref(), &bump_slice];
+        create_pda(
+            order_book,
+            &crate::ID,
+            ORDER_BOOK_INIT_SIZE,
+            &[&seeds],
+            system_program,
+            payer,
+            true,
+        )
+    }
+
+    fn process_grow_order_book(
+        accounts: &[AccountInfo],
+        additional_space: u64,
+    ) -> ProgramResult {
+        let [payer, book_manager, order_book, system_program] = accounts else {
+            return Err(ProgramError::NotEnoughAccountKeys);
+        };
+        if !payer.is_signer {
+            return Err(ProgramError::MissingRequiredSignature);
+        }
+
+        let (expected_pda, _) = order_book_pda_and_bump(book_manager.key);
+        if order_book.key != &expected_pda {
+            return Err(ProgramError::InvalidSeeds);
+        }
+
+        let new_size = order_book.data_len() + additional_space as usize;
+        let required = Rent::get()?.minimum_balance(new_size);
+        let current = order_book.lamports();
+        if current < required {
+            let mut data = SYSTEM_TRANSFER_TAG.to_le_bytes().to_vec();
+            data.extend_from_slice(&(required - current).to_le_bytes());
+            let transfer = Instruction {
+                program_id: *system_program.key,
+                accounts: vec![
+                    AccountMeta::new(*payer.key, true),
+                    AccountMeta::new(*order_book.key, false),
+                ],
+                data,
+            };
+            invoke(
+                &transfer,
+                &[payer.clone(), order_book.clone(), system_program.clone()],
+            )?;
+        }
+
+        order_book.resize(new_size)?;
+        Ok(())
+    }
+
+    fn process_delegate_order_book(
+        accounts: &[AccountInfo],
+        args: DelegateOrderBookArgs,
+    ) -> ProgramResult {
+        let [payer, order_book, owner_program, buffer, delegation_record, delegation_metadata, delegation_program, system_program] =
+            accounts
+        else {
+            return Err(ProgramError::NotEnoughAccountKeys);
+        };
+
+        let seeds: [&[u8]; 2] = [ORDER_BOOK_SEED, args.book_manager.as_ref()];
+        delegate_account(
+            DelegateAccounts {
+                payer,
+                pda: order_book,
+                owner_program,
+                buffer,
+                delegation_record,
+                delegation_metadata,
+                delegation_program,
+                system_program,
+            },
+            &seeds,
+            DelegateConfig {
+                commit_frequency_ms: args.commit_frequency_ms,
+                validator: args.validator,
+            },
+        )?;
+        Ok(())
+    }
+
+    fn process_update_order_book(
+        accounts: &[AccountInfo],
+        update: &BookUpdate,
+    ) -> ProgramResult {
+        let iter = &mut accounts.iter();
+        let payer = next_account_info(iter)?;
+        let order_book = next_account_info(iter)?;
+        if !payer.is_signer {
+            return Err(ProgramError::MissingRequiredSignature);
+        }
+        order_book_apply(&mut order_book.try_borrow_mut_data()?, update)
+    }
+
+    fn process_commit_with_vault_and_order_book(
+        accounts: &[AccountInfo],
+        args: &ScheduleCommitWithOrderBookArgs,
+    ) -> ProgramResult {
+        let iter = &mut accounts.iter();
+        let payer = next_account_info(iter)?;
+        let magic_context = next_account_info(iter)?;
+        let magic_program = next_account_info(iter)?;
+        let magic_fee_vault = next_account_info(iter)?;
+        let order_book = next_account_info(iter)?;
+        let committees: Vec<_> = iter.cloned().collect();
+
+        if committees.len() != args.players.len() {
+            msg!(
+                "players {} != committees {}",
+                args.players.len(),
+                committees.len()
+            );
+            return Err(ProgramError::InvalidArgument);
+        }
+
+        let mut builder = MagicIntentBundleBuilder::new(
+            payer.clone(),
+            magic_context.clone(),
+            magic_program.clone(),
+        )
+        .magic_fee_vault(magic_fee_vault.clone())
+        .commit(&committees);
+
+        if args.with_actions {
+            let update =
+                ScheduleCommitInstruction::UpdateOrderBook(BookUpdate {
+                    bids: vec![OrderLevel {
+                        price: 100,
+                        size: 10,
+                    }],
+                    asks: vec![],
+                });
+            let mut update_data = vec![crate::SCHEDULE_COMMIT_TAG];
+            update_data.extend(
+                borsh::to_vec(&update)
+                    .map_err(|_| ProgramError::InvalidInstructionData)?,
+            );
+            let call_handler = CallHandler {
+                args: ActionArgs {
+                    data: update_data,
+                    escrow_index: 1,
+                },
+                compute_units: 50_000,
+                escrow_authority: payer.clone(),
+                destination_program: crate::ID,
+                accounts: vec![ShortAccountMeta {
+                    pubkey: *order_book.key,
+                    is_writable: true,
+                }],
+            };
+            builder = builder.add_post_commit_actions([call_handler]);
+        }
+
+        builder.build_and_invoke()
+    }
+
+    fn process_commit_for_order_book(
+        accounts: &[AccountInfo],
+        commit_type: ScheduleCommitType,
+    ) -> ProgramResult {
+        let [payer, order_book, magic_context, magic_program] = accounts else {
+            return Err(ProgramError::NotEnoughAccountKeys);
+        };
+        if !payer.is_signer {
+            return Err(ProgramError::MissingRequiredSignature);
+        }
+
+        commit_type.invoke_commit(
+            payer,
+            vec![order_book],
+            magic_context,
+            magic_program,
+            None,
+        )
+    }
+
+    fn process_request_undelegation_cpi(
+        accounts: &[AccountInfo],
+        player: &Pubkey,
+    ) -> ProgramResult {
+        let [payer, delegated_account, owner_program, undelegation_request, delegation_record, delegation_metadata, system_program, delegation_program] =
+            accounts
+        else {
+            return Err(ProgramError::NotEnoughAccountKeys);
+        };
+        if !payer.is_signer {
+            return Err(ProgramError::MissingRequiredSignature);
+        }
+        if owner_program.key != &crate::ID
+            || delegation_program.key != &DELEGATION_PROGRAM_ID
+        {
+            return Err(ProgramError::InvalidArgument);
+        }
+
+        let (expected_pda, bump) = pda_and_bump(player);
+        if delegated_account.key != &expected_pda {
+            return Err(ProgramError::InvalidSeeds);
+        }
+
+        let instruction = Instruction {
+            program_id: *delegation_program.key,
+            accounts: vec![
+                AccountMeta::new(*payer.key, true),
+                AccountMeta::new_readonly(*delegated_account.key, true),
+                AccountMeta::new_readonly(*owner_program.key, false),
+                AccountMeta::new(*undelegation_request.key, false),
+                AccountMeta::new_readonly(*delegation_record.key, false),
+                AccountMeta::new(*delegation_metadata.key, false),
+                AccountMeta::new_readonly(*system_program.key, false),
+            ],
+            data: DLP_REQUEST_UNDELEGATION_TAG.to_le_bytes().to_vec(),
+        };
+
+        let bump_slice = [bump];
+        let seeds: [&[u8]; 3] = [PDA_SEED, player.as_ref(), &bump_slice];
+        invoke_signed(
+            &instruction,
+            &[
+                payer.clone(),
+                delegated_account.clone(),
+                owner_program.clone(),
+                undelegation_request.clone(),
+                delegation_record.clone(),
+                delegation_metadata.clone(),
+                system_program.clone(),
+                delegation_program.clone(),
+            ],
+            &[&seeds],
+        )
     }
 
     fn process_init(
@@ -555,6 +944,8 @@ pub mod schedulecommit {
                     return Err(ProgramError::Custom(111));
                 }
             }
+        } else if book_lens(&data).is_none() {
+            msg!("the undelegated data is not a valid order book");
         }
         Ok(())
     }
@@ -563,9 +954,18 @@ pub mod schedulecommit {
         Pubkey::find_program_address(&[PDA_SEED, player.as_ref()], &crate::ID)
     }
 
+    pub fn order_book_pda_and_bump(book_manager: &Pubkey) -> (Pubkey, u8) {
+        Pubkey::find_program_address(
+            &[ORDER_BOOK_SEED, book_manager.as_ref()],
+            &crate::ID,
+        )
+    }
+
     pub mod build {
-        use sdk::consts::{MAGIC_CONTEXT_ID, MAGIC_PROGRAM_ID};
-        use sdk::delegate_args::{DelegateAccountMetas, DelegateAccounts};
+        use sdk::{
+            consts::{MAGIC_CONTEXT_ID, MAGIC_PROGRAM_ID},
+            delegate_args::{DelegateAccountMetas, DelegateAccounts},
+        };
         use solana_sdk_ids::system_program;
 
         use super::*;
@@ -713,6 +1113,164 @@ pub mod schedulecommit {
             with_tag(
                 &ScheduleCommitInstruction::SetCount(value),
                 vec![AccountMeta::new(pda, false)],
+            )
+        }
+
+        pub fn init_order_book(
+            payer: Pubkey,
+            book_manager: Pubkey,
+        ) -> (Instruction, Pubkey) {
+            let (pda, _) = order_book_pda_and_bump(&book_manager);
+            let metas = vec![
+                AccountMeta::new(payer, true),
+                AccountMeta::new_readonly(book_manager, true),
+                AccountMeta::new(pda, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ];
+            (
+                with_tag(&ScheduleCommitInstruction::InitOrderBook, metas),
+                pda,
+            )
+        }
+
+        pub fn grow_order_book(
+            payer: Pubkey,
+            book_manager: Pubkey,
+            additional_space: u64,
+        ) -> Instruction {
+            let (pda, _) = order_book_pda_and_bump(&book_manager);
+            let metas = vec![
+                AccountMeta::new(payer, true),
+                AccountMeta::new_readonly(book_manager, false),
+                AccountMeta::new(pda, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ];
+            with_tag(
+                &ScheduleCommitInstruction::GrowOrderBook(additional_space),
+                metas,
+            )
+        }
+
+        pub fn delegate_order_book(
+            payer: Pubkey,
+            book_manager: Pubkey,
+            commit_frequency_ms: u32,
+            validator: Option<Pubkey>,
+        ) -> Instruction {
+            let (pda, _) = order_book_pda_and_bump(&book_manager);
+            let delegate_accounts = DelegateAccounts::new(pda, crate::id());
+            let delegate_metas = DelegateAccountMetas::from(delegate_accounts);
+            let metas = vec![
+                AccountMeta::new(payer, true),
+                delegate_metas.delegated_account,
+                delegate_metas.owner_program,
+                delegate_metas.delegate_buffer,
+                delegate_metas.delegation_record,
+                delegate_metas.delegation_metadata,
+                delegate_metas.delegation_program,
+                delegate_metas.system_program,
+            ];
+            with_tag(
+                &ScheduleCommitInstruction::DelegateOrderBook(
+                    DelegateOrderBookArgs {
+                        commit_frequency_ms,
+                        book_manager,
+                        validator,
+                    },
+                ),
+                metas,
+            )
+        }
+
+        pub fn update_order_book(
+            payer: Pubkey,
+            book_manager: Pubkey,
+            update: BookUpdate,
+        ) -> Instruction {
+            let (pda, _) = order_book_pda_and_bump(&book_manager);
+            let metas = vec![
+                AccountMeta::new(payer, true),
+                AccountMeta::new(pda, false),
+            ];
+            with_tag(&ScheduleCommitInstruction::UpdateOrderBook(update), metas)
+        }
+
+        pub fn schedule_commit_for_order_book(
+            payer: Pubkey,
+            book_manager: Pubkey,
+            commit_type: ScheduleCommitType,
+        ) -> Instruction {
+            let (pda, _) = order_book_pda_and_bump(&book_manager);
+            let metas = vec![
+                AccountMeta::new(payer, true),
+                AccountMeta::new(pda, false),
+                AccountMeta::new(MAGIC_CONTEXT_ID, false),
+                AccountMeta::new_readonly(MAGIC_PROGRAM_ID, false),
+            ];
+            with_tag(
+                &ScheduleCommitInstruction::ScheduleCommitForOrderBook(
+                    commit_type,
+                ),
+                metas,
+            )
+        }
+
+        pub fn schedule_commit_with_vault_and_order_book(
+            payer: Pubkey,
+            magic_fee_vault: Pubkey,
+            book_manager: Pubkey,
+            players: Vec<Pubkey>,
+            with_actions: bool,
+        ) -> Instruction {
+            let (book, _) = order_book_pda_and_bump(&book_manager);
+            let mut metas = vec![
+                AccountMeta::new(payer, true),
+                AccountMeta::new(MAGIC_CONTEXT_ID, false),
+                AccountMeta::new_readonly(MAGIC_PROGRAM_ID, false),
+                AccountMeta::new(magic_fee_vault, false),
+                AccountMeta::new_readonly(book, false),
+            ];
+            metas.extend(players.iter().map(|player| {
+                let (pda, _) = pda_and_bump(player);
+                AccountMeta::new(pda, false)
+            }));
+            with_tag(
+                &ScheduleCommitInstruction::ScheduleCommitWithVaultAndOrderBookCpi(
+                    ScheduleCommitWithOrderBookArgs {
+                        players,
+                        with_actions,
+                    },
+                ),
+                metas,
+            )
+        }
+
+        pub fn request_undelegation(
+            payer: Pubkey,
+            player: Pubkey,
+        ) -> Instruction {
+            let (pda, _) = pda_and_bump(&player);
+            let delegate_accounts = DelegateAccounts::new(pda, crate::id());
+            let (request, _) = Pubkey::find_program_address(
+                &[b"undelegation-request", pda.as_ref()],
+                &DELEGATION_PROGRAM_ID,
+            );
+            let metas = vec![
+                AccountMeta::new(payer, true),
+                AccountMeta::new_readonly(pda, false),
+                AccountMeta::new_readonly(crate::id(), false),
+                AccountMeta::new(request, false),
+                AccountMeta::new_readonly(
+                    delegate_accounts.delegation_record,
+                    false,
+                ),
+                AccountMeta::new(delegate_accounts.delegation_metadata, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+                AccountMeta::new_readonly(DELEGATION_PROGRAM_ID, false),
+            ];
+            with_tag(
+                &ScheduleCommitInstruction::RequestUndelegationCpi(player),
+                metas,
             )
         }
     }

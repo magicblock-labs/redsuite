@@ -16,8 +16,10 @@ dlp-api = { package = "magicblock-delegation-program-api", version = "3.1.0", fe
 instruction = { workspace = true }
 pubkey = { workspace = true }
 keypair = { workspace = true }
+signature = { workspace = true }
 signer = { workspace = true }
 json = { workspace = true }
+rand = { workspace = true }
 
 [dev-dependencies]
 
@@ -72,3 +74,7 @@ path = "tests/committor/commit_roundtrip.rs"
 [[test]]
 name = "commits"
 path = "tests/committor/commits.rs"
+
+[[test]]
+name = "commit_and_undelegate"
+path = "tests/committor/commit_and_undelegate.rs"

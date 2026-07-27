@@ -34,6 +34,7 @@ registry![
     ("redshift/clone_on_access", redshift::scenarios::chainlink::clone_on_access::CloneOnAccess),
     ("redshift/commit_roundtrip", redshift::scenarios::committor::commit_roundtrip::CommitRoundtrip),
     ("redshift/commits", redshift::scenarios::committor::commits::Commits),
+    ("redshift/commit_and_undelegate", redshift::scenarios::committor::commit_and_undelegate::CommitAndUndelegate),
     ("redshift/api_invariants", redshift::scenarios::harness::api_invariants::ApiInvariants),
     ("redshift/claim_fees", redshift::scenarios::committor::claim_fees::ClaimFees),
     ("redshift/pubsub_contracts", redshift::scenarios::pubsub::pubsub_contracts::PubsubContracts),

@@ -270,9 +270,16 @@ impl Scenario for CommitRoundtrip {
             )
         })
         .await;
+        let lockout_payer = prep::delegated_payer(
+            base,
+            &payer,
+            er.identity(),
+            crate::PAYER_LAMPORTS,
+        )
+        .await?;
         let write_after_undelegate = er
             .send(
-                &payer,
+                &lockout_payer,
                 &[build::simple_byte_set(LOCKOUT_WRITE, &[committed])],
             )
             .await;
@@ -287,15 +294,13 @@ impl Scenario for CommitRoundtrip {
             "InvalidWritableAccount",
             "ExternalAccountDataModified",
             "ProgramFailedToComplete",
-            "InvalidAccountForFee",
         ]
         .into_iter()
         .find(|code| lockout_error.contains(code))
         .ok_or_else(|| {
             format!(
                 "expected InvalidWritableAccount, ExternalAccountDataModified \
-                 or ProgramFailedToComplete (the upstream set) or \
-                 InvalidAccountForFee (the fee-model adaptation) for the \
+                 or ProgramFailedToComplete (the upstream set) for the \
                  lockout write, got {lockout_error}"
             )
         })?;
