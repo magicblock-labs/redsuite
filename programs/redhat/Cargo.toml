@@ -8,5 +8,11 @@ authors.workspace = true
 [lib]
 crate-type = ["cdylib", "lib"]
 
+[features]
+default = []
+no-entrypoint = []
+
 [dependencies]
+borsh = { workspace = true }
+redshift-program = { workspace = true, features = ["no-entrypoint"] }
 solana-program = { workspace = true }

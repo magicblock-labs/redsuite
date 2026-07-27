@@ -2164,7 +2164,14 @@ name = "redhat"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "borsh 1.7.0",
+ "redhat-program",
+ "redshift-program",
  "redsuite-core",
+ "solana-instruction 3.4.0",
+ "solana-keypair",
+ "solana-pubkey 3.0.0",
+ "solana-signer",
  "tokio",
 ]
 
@@ -2172,6 +2179,8 @@ dependencies = [
 name = "redhat-program"
 version = "0.1.0"
 dependencies = [
+ "borsh 1.7.0",
+ "redshift-program",
  "solana-program 3.0.0",
 ]
 

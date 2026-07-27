@@ -7,8 +7,15 @@ authors.workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
+borsh = { workspace = true }
 tokio = { workspace = true }
 redsuite-core = { workspace = true }
+redshift-program = { workspace = true, features = ["no-entrypoint"] }
+redhat-program = { workspace = true, features = ["no-entrypoint"] }
+instruction = { workspace = true }
+pubkey = { workspace = true }
+keypair = { workspace = true }
+signer = { workspace = true }
 
 [dev-dependencies]
 

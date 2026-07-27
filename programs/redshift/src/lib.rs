@@ -986,6 +986,39 @@ pub mod schedulecommit {
             }
         }
 
+        pub fn magic_program_id() -> Pubkey {
+            MAGIC_PROGRAM_ID
+        }
+
+        pub fn magic_context_id() -> Pubkey {
+            MAGIC_CONTEXT_ID
+        }
+
+        // The raw magic-program ScheduleCommit (tag 1). The committees are
+        // marked writable so the ER clones them. Used by the security
+        // scenarios to bypass the owning program.
+        pub fn direct_schedule_commit(
+            payer: Pubkey,
+            magic_fee_vault: Option<Pubkey>,
+            committees: &[Pubkey],
+        ) -> Instruction {
+            let mut metas = vec![
+                AccountMeta::new(payer, true),
+                AccountMeta::new(MAGIC_CONTEXT_ID, false),
+            ];
+            if let Some(vault) = magic_fee_vault {
+                metas.push(AccountMeta::new(vault, false));
+            }
+            metas.extend(
+                committees.iter().map(|key| AccountMeta::new(*key, false)),
+            );
+            Instruction {
+                program_id: MAGIC_PROGRAM_ID,
+                accounts: metas,
+                data: 1u32.to_le_bytes().to_vec(),
+            }
+        }
+
         pub fn init_account(
             payer: Pubkey,
             player: Pubkey,
