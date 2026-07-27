@@ -1074,6 +1074,36 @@ pub mod schedulecommit {
             )
         }
 
+        pub fn schedule_commit_with_vault(
+            payer: Pubkey,
+            magic_fee_vault: Option<Pubkey>,
+            players: Vec<Pubkey>,
+            undelegate: bool,
+        ) -> Instruction {
+            let mut metas = vec![
+                AccountMeta::new(payer, true),
+                AccountMeta::new(MAGIC_CONTEXT_ID, false),
+                AccountMeta::new_readonly(MAGIC_PROGRAM_ID, false),
+            ];
+            if let Some(vault) = magic_fee_vault {
+                metas.push(AccountMeta::new(vault, false));
+            }
+            metas.extend(players.iter().map(|player| {
+                let (pda, _) = pda_and_bump(player);
+                AccountMeta::new(pda, false)
+            }));
+            with_tag(
+                &ScheduleCommitInstruction::ScheduleCommitWithVaultCpi(
+                    ScheduleCommitCpiWithVaultArgs {
+                        has_magic_vault: magic_fee_vault.is_some(),
+                        players,
+                        undelegate,
+                    },
+                ),
+                metas,
+            )
+        }
+
         pub fn schedule_commit_and_undelegate_mod_after(
             payer: Pubkey,
             players: Vec<Pubkey>,

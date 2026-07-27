@@ -35,6 +35,7 @@ registry![
     ("redshift/commit_roundtrip", redshift::scenarios::committor::commit_roundtrip::CommitRoundtrip),
     ("redshift/commits", redshift::scenarios::committor::commits::Commits),
     ("redshift/commit_and_undelegate", redshift::scenarios::committor::commit_and_undelegate::CommitAndUndelegate),
+    ("redshift/commit_limit_and_fees", redshift::scenarios::committor::commit_limit_and_fees::CommitLimitAndFees),
     ("redshift/api_invariants", redshift::scenarios::harness::api_invariants::ApiInvariants),
     ("redshift/claim_fees", redshift::scenarios::committor::claim_fees::ClaimFees),
     ("redshift/pubsub_contracts", redshift::scenarios::pubsub::pubsub_contracts::PubsubContracts),

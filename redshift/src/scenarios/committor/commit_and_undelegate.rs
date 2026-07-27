@@ -3,7 +3,6 @@ use std::{rc::Rc, time::Duration};
 use async_trait::async_trait;
 use borsh::BorshDeserialize;
 use keypair::Keypair;
-use pubkey::Pubkey;
 use rand::{
     rngs::{OsRng, StdRng},
     Rng, RngCore, SeedableRng,
@@ -22,12 +21,10 @@ use crate::program::DELEGATION_PROGRAM_ID;
 
 const CLONE_TIMEOUT: Duration = Duration::from_secs(15);
 const RECEIPT_TIMEOUT: Duration = Duration::from_secs(30);
-const BASE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(20);
 const BASE_STATE_TIMEOUT: Duration = Duration::from_secs(30);
 const ER_WRITE_TIMEOUT: Duration = Duration::from_secs(20);
 const REDELEGATE_SETTLE: Duration = Duration::from_secs(2);
 const ROLLBACK_SETTLE: Duration = Duration::from_millis(1500);
-const COMMIT_FREQUENCY_MS: u32 = 1_000_000_000;
 const MOD_AFTER_REFUSAL: &str =
     "instruction modified data of an account it does not own";
 const TWICE_REFUSAL: &str =
@@ -39,52 +36,6 @@ const WRITE_REJECTIONS: [&str; 3] = [
 ];
 
 pub struct CommitAndUndelegate;
-
-struct Committee {
-    player: Keypair,
-    pda: Pubkey,
-}
-
-async fn init_delegated_committees(
-    base: &BaseCtx,
-    payer: &Keypair,
-    validator: Pubkey,
-    count: usize,
-) -> Result<Vec<Committee>> {
-    let mut committees = Vec::with_capacity(count);
-    for _ in 0..count {
-        let player = Keypair::new();
-        let (init, pda) = build::init_account(payer.pubkey(), player.pubkey());
-        let delegate = build::delegate_cpi(
-            payer.pubkey(),
-            player.pubkey(),
-            COMMIT_FREQUENCY_MS,
-            Some(validator),
-        );
-        base.send_with(payer, &[&player], &[init, delegate]).await?;
-        let on_base = base.account(&pda).await?.ok_or(
-            "the committee pda is not on base after init and delegate",
-        )?;
-        assert_eq!(
-            on_base.owner, DELEGATION_PROGRAM_ID,
-            "dlp must own a delegated committee on base"
-        );
-        committees.push(Committee { player, pda });
-    }
-    Ok(committees)
-}
-
-async fn await_er_clones(er: &ErCtx, committees: &[Committee]) {
-    for committee in committees {
-        poll_until(CLONE_TIMEOUT, || async {
-            matches!(
-                er.account(&committee.pda).await,
-                Ok(Some(clone)) if clone.data.len() == MainAccount::SIZE
-            )
-        })
-        .await;
-    }
-}
 
 fn decoded_count(data: &[u8]) -> Result<u64> {
     Ok(MainAccount::try_from_slice(data)?.count)
@@ -100,44 +51,6 @@ fn rejection_code(error_text: &str) -> Result<&'static str> {
         })
 }
 
-async fn assert_commit_receipt(
-    base: &BaseCtx,
-    er: &ErCtx,
-    signature: &signature::Signature,
-    expected: &[Pubkey],
-    expect_undelegation: bool,
-) -> Result<receipt::CommitReceipt> {
-    let commit_receipt =
-        receipt::fetch_commit_receipt(er.api(), signature, RECEIPT_TIMEOUT)
-            .await?;
-    if let Some(message) = &commit_receipt.error_message {
-        return Err(format!("the commit intent failed: {message}").into());
-    }
-    let mut included = commit_receipt.included.clone();
-    included.sort();
-    let mut expected = expected.to_vec();
-    expected.sort();
-    assert_eq!(
-        included, expected,
-        "the receipt must list exactly the committed accounts"
-    );
-    assert!(
-        commit_receipt.excluded.is_empty(),
-        "the receipt must exclude no accounts"
-    );
-    assert_eq!(
-        commit_receipt.requested_undelegation, expect_undelegation,
-        "the receipt undelegation flag must match the commit type"
-    );
-    receipt::confirm_base_signatures(
-        base.api(),
-        &commit_receipt,
-        BASE_CONFIRM_TIMEOUT,
-    )
-    .await?;
-    Ok(commit_receipt)
-}
-
 struct LifecycleOutcome {
     er_lockout: &'static str,
     base_frozen: &'static str,
@@ -151,9 +64,14 @@ async fn commit_undelegate_lifecycle(
     base_negative_payer: &Keypair,
     count: usize,
 ) -> Result<LifecycleOutcome> {
-    let committees =
-        init_delegated_committees(base, payer, er.identity(), count).await?;
-    await_er_clones(er, &committees).await;
+    let committees = crate::init_schedulecommit_committees(
+        base,
+        payer,
+        er.identity(),
+        count,
+    )
+    .await?;
+    crate::await_committee_clones(er, &committees).await;
     let players: Vec<_> =
         committees.iter().map(|c| c.player.pubkey()).collect();
     let pdas: Vec<_> = committees.iter().map(|c| c.pda).collect();
@@ -185,7 +103,7 @@ async fn commit_undelegate_lifecycle(
     }
 
     let commit_receipt =
-        assert_commit_receipt(base, er, &signature, &pdas, true).await?;
+        crate::assert_commit_receipt(base, er, &signature, &pdas, true).await?;
     assert_eq!(
         commit_receipt.base_signatures.len(),
         1,
@@ -242,7 +160,7 @@ async fn commit_undelegate_lifecycle(
             build::delegate_cpi(
                 payer.pubkey(),
                 *player,
-                COMMIT_FREQUENCY_MS,
+                crate::COMMIT_FREQUENCY_MS,
                 Some(er.identity()),
             )
         })
@@ -346,7 +264,7 @@ async fn order_book_cell(
     let delegate = build::delegate_order_book(
         payer.pubkey(),
         manager.pubkey(),
-        COMMIT_FREQUENCY_MS,
+        crate::COMMIT_FREQUENCY_MS,
         Some(er.identity()),
     );
     base.send_with(payer, &[&manager], &[init, delegate])
@@ -391,9 +309,14 @@ async fn order_book_cell(
         )
         .await?;
 
-    let commit_receipt =
-        assert_commit_receipt(base, er, &signature, &[book], undelegates)
-            .await?;
+    let commit_receipt = crate::assert_commit_receipt(
+        base,
+        er,
+        &signature,
+        &[book],
+        undelegates,
+    )
+    .await?;
 
     let on_er = er
         .account(&book)
@@ -528,10 +451,14 @@ impl Scenario for CommitAndUndelegate {
         }
 
         for count in [1usize, 2] {
-            let committees =
-                init_delegated_committees(base, &payer, er.identity(), count)
-                    .await?;
-            await_er_clones(er, &committees).await;
+            let committees = crate::init_schedulecommit_committees(
+                base,
+                &payer,
+                er.identity(),
+                count,
+            )
+            .await?;
+            crate::await_committee_clones(er, &committees).await;
             let players: Vec<_> =
                 committees.iter().map(|c| c.player.pubkey()).collect();
             rejected_intent_cell(
@@ -558,10 +485,14 @@ impl Scenario for CommitAndUndelegate {
         }
 
         {
-            let committees =
-                init_delegated_committees(base, &payer, er.identity(), 2)
-                    .await?;
-            await_er_clones(er, &committees).await;
+            let committees = crate::init_schedulecommit_committees(
+                base,
+                &payer,
+                er.identity(),
+                2,
+            )
+            .await?;
+            crate::await_committee_clones(er, &committees).await;
             let players: Vec<_> =
                 committees.iter().map(|c| c.player.pubkey()).collect();
             rejected_intent_cell(
@@ -577,10 +508,14 @@ impl Scenario for CommitAndUndelegate {
         }
 
         {
-            let committees =
-                init_delegated_committees(base, &payer, er.identity(), 1)
-                    .await?;
-            await_er_clones(er, &committees).await;
+            let committees = crate::init_schedulecommit_committees(
+                base,
+                &payer,
+                er.identity(),
+                1,
+            )
+            .await?;
+            crate::await_committee_clones(er, &committees).await;
             let player = committees[0].player.pubkey();
             let pda = committees[0].pda;
 
@@ -612,7 +547,8 @@ impl Scenario for CommitAndUndelegate {
                     )],
                 )
                 .await?;
-            assert_commit_receipt(base, er, &signature, &[pda], true).await?;
+            crate::assert_commit_receipt(base, er, &signature, &[pda], true)
+                .await?;
 
             poll_until(BASE_STATE_TIMEOUT, || async {
                 matches!(
@@ -646,6 +582,6 @@ impl Scenario for CommitAndUndelegate {
             report = report.setting("failed undelegation lockout", lockout);
         }
 
-        Ok(report.setting("commit frequency ms", COMMIT_FREQUENCY_MS))
+        Ok(report.setting("commit frequency ms", crate::COMMIT_FREQUENCY_MS))
     }
 }

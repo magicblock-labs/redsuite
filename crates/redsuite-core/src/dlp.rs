@@ -61,6 +61,14 @@ pub fn validator_fees_vault_pda(validator: &Pubkey) -> Pubkey {
     .0
 }
 
+pub fn magic_fee_vault_pda(validator: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(
+        &[b"magic-fee-vault", validator.as_ref()],
+        &dlp_id(),
+    )
+    .0
+}
+
 fn dlp_programdata_pda() -> Pubkey {
     let loader: Pubkey = UPGRADEABLE_LOADER_ID
         .parse()
@@ -143,15 +151,24 @@ pub fn top_up_ephemeral_balance(
     lamports: u64,
     index: u8,
 ) -> Instruction {
-    let escrow = ephemeral_balance_pda(payer, index);
+    top_up_ephemeral_balance_for(payer, payer, lamports, index)
+}
+
+pub fn top_up_ephemeral_balance_for(
+    funder: &Pubkey,
+    beneficiary: &Pubkey,
+    lamports: u64,
+    index: u8,
+) -> Instruction {
+    let escrow = ephemeral_balance_pda(beneficiary, index);
     let mut data = 9u64.to_le_bytes().to_vec();
     data.extend_from_slice(&lamports.to_le_bytes());
     data.push(index);
     Instruction {
         program_id: dlp_id(),
         accounts: vec![
-            AccountMeta::new(*payer, true),
-            AccountMeta::new_readonly(*payer, false),
+            AccountMeta::new(*funder, true),
+            AccountMeta::new_readonly(*beneficiary, false),
             AccountMeta::new(escrow, false),
             AccountMeta::new_readonly(system_id(), false),
         ],
@@ -164,7 +181,16 @@ pub fn delegate_ephemeral_balance(
     validator: &Pubkey,
     index: u8,
 ) -> Instruction {
-    let escrow = ephemeral_balance_pda(payer, index);
+    delegate_ephemeral_balance_for(payer, payer, validator, index)
+}
+
+pub fn delegate_ephemeral_balance_for(
+    funder: &Pubkey,
+    beneficiary: &Pubkey,
+    validator: &Pubkey,
+    index: u8,
+) -> Instruction {
+    let escrow = ephemeral_balance_pda(beneficiary, index);
     let system = system_id();
     let commit_frequency_ms = 0u32;
     let seeds_count = 0u32;
@@ -177,8 +203,8 @@ pub fn delegate_ephemeral_balance(
     Instruction {
         program_id: dlp_id(),
         accounts: vec![
-            AccountMeta::new(*payer, true),
-            AccountMeta::new_readonly(*payer, true),
+            AccountMeta::new(*funder, true),
+            AccountMeta::new_readonly(*beneficiary, true),
             AccountMeta::new(escrow, false),
             AccountMeta::new(delegate_buffer_pda(&escrow, &system), false),
             AccountMeta::new(delegation_record_pda(&escrow), false),
