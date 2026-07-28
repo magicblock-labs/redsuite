@@ -513,12 +513,43 @@ fn er_command(
     extra_env: &[(String, String)],
     reset: bool,
 ) -> Command {
+    er_command_with_lifecycle(
+        er_bin,
+        identity,
+        base_rpc_url,
+        base_ws_url,
+        listen_port,
+        metrics_port,
+        storage_dir,
+        extra_env,
+        reset,
+        "ephemeral",
+    )
+}
+
+// An offline validator serves its restored ledger with no base chain; it
+// gets no --remotes.
+#[allow(clippy::too_many_arguments)]
+fn er_command_with_lifecycle(
+    er_bin: &Path,
+    identity: &Keypair,
+    base_rpc_url: &str,
+    base_ws_url: &str,
+    listen_port: u16,
+    metrics_port: u16,
+    storage_dir: &Path,
+    extra_env: &[(String, String)],
+    reset: bool,
+    lifecycle: &str,
+) -> Command {
     let mut cmd = Command::new(er_bin);
-    cmd.arg("--remotes")
-        .arg(base_rpc_url)
-        .arg("--remotes")
-        .arg(base_ws_url)
-        .args(["--lifecycle", "ephemeral"])
+    if lifecycle != "offline" {
+        cmd.arg("--remotes")
+            .arg(base_rpc_url)
+            .arg("--remotes")
+            .arg(base_ws_url);
+    }
+    cmd.args(["--lifecycle", lifecycle])
         .arg("-l")
         .arg(format!("127.0.0.1:{listen_port}"))
         .arg("-k")
@@ -549,6 +580,25 @@ pub struct ErOptions {
     // e.g. ("MBV_CHAINLINK__MAX_MONITORED_ACCOUNTS", "100")
     pub env: Vec<(String, String)>,
     pub request_timeout: Option<Duration>,
+    // "ephemeral" (default) or "offline" (no base chain — ledger-restore reads)
+    pub lifecycle: String,
+    // Reuse the existing er-<label> storage dir instead of wiping it.
+    pub keep_storage: bool,
+    // Pass --reset (wipes the ledger, skips replay). A restore boot sets false.
+    pub reset: bool,
+}
+
+impl Default for ErOptions {
+    fn default() -> Self {
+        Self {
+            label: String::new(),
+            env: Vec::new(),
+            request_timeout: None,
+            lifecycle: "ephemeral".to_owned(),
+            keep_storage: false,
+            reset: true,
+        }
+    }
 }
 
 pub struct RestartConfig {
@@ -596,6 +646,7 @@ pub struct PrivateEr {
     rpc_port: u16,
     metrics_port: u16,
     env: Vec<(String, String)>,
+    lifecycle: String,
     storage_dir: PathBuf,
     log: PathBuf,
     child: Option<Child>,
@@ -637,6 +688,29 @@ impl PrivateEr {
         .await
     }
 
+    // Stop the ER without a relaunch. hard_kill=true sends SIGKILL — the
+    // crash path the ledger-restore scenarios use so nothing flushes on the
+    // way down.
+    pub async fn stop(&mut self, hard_kill: bool) -> Result<()> {
+        let mut child = self
+            .child
+            .take()
+            .ok_or("private ER has no running process to stop")?;
+        send_signal(self.pid, if hard_kill { "-KILL" } else { "-TERM" });
+        let grace_deadline = std::time::Instant::now() + KILL_GRACE;
+        let mut escalated = hard_kill;
+        loop {
+            if child.try_wait()?.is_some() {
+                return Ok(());
+            }
+            if !escalated && std::time::Instant::now() >= grace_deadline {
+                send_signal(self.pid, "-KILL");
+                escalated = true;
+            }
+            tokio::time::sleep(RESTART_POLL).await;
+        }
+    }
+
     // Stop the ER (SIGTERM, or SIGKILL if hard_kill), then relaunch it on the
     // same storage dir, identity and ports, timing each phase. Ports are
     // reused, so ctx() stays valid across the restart.
@@ -673,7 +747,7 @@ impl PrivateEr {
         let exit_signal =
             std::os::unix::process::ExitStatusExt::signal(&exit_status);
 
-        let cmd = er_command(
+        let cmd = er_command_with_lifecycle(
             &self.er_bin,
             &self.identity,
             &self.base_rpc_url,
@@ -683,6 +757,7 @@ impl PrivateEr {
             &self.storage_dir,
             &self.env,
             config.reset,
+            &self.lifecycle,
         );
         let launch_started = std::time::Instant::now();
         let new_child = spawn_child(cmd, &self.log)?;
@@ -727,15 +802,68 @@ impl Drop for PrivateEr {
     }
 }
 
+// The identity SPENDS concurrently (vault init, mdp sync), so the confirm
+// polls the ABSOLUTE funding target — an exact-increment poll can never
+// land while the balance moves under it.
 async fn ensure_identity_funded(
     base: &BaseCtx,
     identity: &pubkey::Pubkey,
 ) -> Result<()> {
-    let balance = base.api().get_balance(identity).await.unwrap_or(0);
-    if balance >= IDENTITY_FUNDING_LAMPORTS {
-        return Ok(());
+    let funded = || async {
+        base.api().get_balance(identity).await.unwrap_or(0)
+            >= IDENTITY_FUNDING_LAMPORTS
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    let mut ticks = 0u32;
+    loop {
+        if funded().await {
+            return Ok(());
+        }
+        // Re-request on a cadence — a busy freshly-booted base can drop the
+        // faucet transaction, so one request is not enough.
+        if ticks.is_multiple_of(20) {
+            let _ = base
+                .api()
+                .request_airdrop(identity, IDENTITY_FUNDING_LAMPORTS)
+                .await;
+        }
+        ticks += 1;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "the identity {identity} did not reach the funding target"
+            )
+            .into());
+        }
+        tokio::time::sleep(POLL).await;
     }
-    base.airdrop(identity, IDENTITY_FUNDING_LAMPORTS).await
+}
+
+const MAGIC_FEE_VAULT_TIMEOUT: Duration = Duration::from_secs(30);
+
+// On a fresh stack generation the shared ER creates the magic fee vault in a
+// startup-background task. A private ER that boots before the vault is on
+// base races that init, loses with "Invalid account owner", and exits.
+async fn await_magic_fee_vault(
+    base: &BaseCtx,
+    identity: &Pubkey,
+) -> Result<()> {
+    let vault = crate::dlp::magic_fee_vault_pda(identity);
+    let deadline = tokio::time::Instant::now() + MAGIC_FEE_VAULT_TIMEOUT;
+    loop {
+        if let Ok(Some(account)) = base.account(&vault).await {
+            if account.owner == crate::dlp::dlp_id() {
+                return Ok(());
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "the magic fee vault {vault} for identity {identity} is not \
+                 on base — the shared er did not create it in time"
+            )
+            .into());
+        }
+        tokio::time::sleep(POLL).await;
+    }
 }
 
 pub async fn private_er(
@@ -746,16 +874,21 @@ pub async fn private_er(
     fs::create_dir_all(&dir)?;
     let er_bin = find_er_bin()?;
     let identity = er_identity_keypair()?;
-    ensure_identity_funded(base, &identity.pubkey()).await?;
+    if options.lifecycle == "ephemeral" {
+        ensure_identity_funded(base, &identity.pubkey()).await?;
+        await_magic_fee_vault(base, &identity.pubkey()).await?;
+    }
 
     let (rpc_port, ws_port) = free_port_pair()?;
     let metrics_port = free_port()?;
     let storage_dir = dir.join(format!("er-{}", options.label));
-    let _ = fs::remove_dir_all(&storage_dir);
+    if !options.keep_storage {
+        let _ = fs::remove_dir_all(&storage_dir);
+    }
     let log = dir.join(format!("er-{}.log", options.label));
     let base_rpc_url = base.api().url().to_owned();
     let base_ws_url = base.ws_url().to_owned();
-    let cmd = er_command(
+    let cmd = er_command_with_lifecycle(
         &er_bin,
         &identity,
         &base_rpc_url,
@@ -764,7 +897,8 @@ pub async fn private_er(
         metrics_port,
         &storage_dir,
         &options.env,
-        true,
+        options.reset,
+        &options.lifecycle,
     );
     eprintln!(
         "[redsuite] booting private ER `{}` on 127.0.0.1:{rpc_port} …",
@@ -804,6 +938,7 @@ pub async fn private_er(
         rpc_port,
         metrics_port,
         env: options.env,
+        lifecycle: options.lifecycle,
         storage_dir,
         log,
         child: Some(child),

@@ -296,8 +296,14 @@ pub mod schedulecommit {
         magic_program: &'a AccountInfo<'info>,
         magic_fee_vault: Option<&'a AccountInfo<'info>>,
     ) -> ProgramResult {
+        // The payer keeps its incoming writability so a readonly crank
+        // signer can pay a crank-executed commit.
         let mut metas = vec![
-            AccountMeta::new(*payer.key, true),
+            AccountMeta {
+                pubkey: *payer.key,
+                is_signer: true,
+                is_writable: payer.is_writable,
+            },
             AccountMeta::new(*magic_context.key, false),
         ];
         if let Some(vault) = magic_fee_vault {

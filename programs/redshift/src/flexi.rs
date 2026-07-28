@@ -156,6 +156,30 @@ pub enum FlexiInstruction {
         amount: u64,
         fail: bool,
     },
+    AddUnsigned {
+        count: u8,
+    },
+    AddError {
+        count: u8,
+    },
+    ScheduleCounterTask {
+        task_id: i64,
+        execution_interval_millis: i64,
+        iterations: i64,
+        error: bool,
+        signer: bool,
+    },
+    CancelCounterTask {
+        task_id: i64,
+    },
+    Mul {
+        multiplier: u8,
+    },
+    AddAndScheduleCommit {
+        count: u8,
+        undelegate: bool,
+        has_magic_vault: bool,
+    },
 }
 
 pub fn process(accounts: &[AccountInfo], payload: &[u8]) -> ProgramResult {
@@ -225,6 +249,36 @@ pub fn process(accounts: &[AccountInfo], payload: &[u8]) -> ProgramResult {
         TransferActionHandler { amount, fail } => {
             process_transfer_action_handler(accounts, amount, fail)
         }
+        AddUnsigned { count } => process_add_unsigned(accounts, count),
+        AddError { count } => process_add_error(accounts, count),
+        ScheduleCounterTask {
+            task_id,
+            execution_interval_millis,
+            iterations,
+            error,
+            signer,
+        } => process_schedule_counter_task(
+            accounts,
+            task_id,
+            execution_interval_millis,
+            iterations,
+            error,
+            signer,
+        ),
+        CancelCounterTask { task_id } => {
+            process_cancel_counter_task(accounts, task_id)
+        }
+        Mul { multiplier } => process_mul(accounts, multiplier),
+        AddAndScheduleCommit {
+            count,
+            undelegate,
+            has_magic_vault,
+        } => process_add_and_schedule_commit(
+            accounts,
+            count,
+            undelegate,
+            has_magic_vault,
+        ),
     }
 }
 
@@ -834,6 +888,142 @@ pub fn process_transfer_callback(
     Ok(())
 }
 
+fn process_add_unsigned(accounts: &[AccountInfo], count: u8) -> ProgramResult {
+    let iter = &mut accounts.iter();
+    let counter = next_account_info(iter)?;
+    add(counter, count)
+}
+
+fn process_mul(accounts: &[AccountInfo], multiplier: u8) -> ProgramResult {
+    let iter = &mut accounts.iter();
+    let _payer = next_account_info(iter)?;
+    let counter = next_account_info(iter)?;
+    let mut state = FlexiCounter::try_from_slice(&counter.data.borrow())?;
+    state.count *= multiplier as u64;
+    state.updates += 1;
+    let size = counter.data_len();
+    let data = to_vec(&state)?;
+    counter.data.borrow_mut()[..size].copy_from_slice(&data);
+    Ok(())
+}
+
+fn process_add_error(_accounts: &[AccountInfo], _count: u8) -> ProgramResult {
+    Err(ProgramError::Custom(0))
+}
+
+fn process_schedule_counter_task(
+    accounts: &[AccountInfo],
+    task_id: i64,
+    execution_interval_millis: i64,
+    iterations: i64,
+    error: bool,
+    signer: bool,
+) -> ProgramResult {
+    use magic_api::{
+        args::ScheduleTaskArgs, instruction::MagicBlockInstruction,
+    };
+
+    let [magic_program, payer, counter] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+    let (expected_pda, bump) = FlexiCounter::pda_and_bump(payer.key);
+    if counter.key != &expected_pda {
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    let task_instruction = match (error, signer) {
+        (true, _) => build::add_error(*payer.key, 1),
+        (false, true) => build::add(*payer.key, 1),
+        _ => build::add_unsigned(*payer.key, 1),
+    };
+    let data = bincode::serialize(&MagicBlockInstruction::ScheduleTask(
+        ScheduleTaskArgs {
+            task_id,
+            execution_interval_millis,
+            iterations,
+            instructions: vec![task_instruction],
+        },
+    ))
+    .map_err(|_| ProgramError::InvalidArgument)?;
+
+    let instruction = Instruction::new_with_bytes(
+        *magic_program.key,
+        &data,
+        vec![
+            AccountMeta::new(*payer.key, true),
+            AccountMeta::new(*counter.key, true),
+        ],
+    );
+
+    let bump_slice = [bump];
+    let seeds: [&[u8]; 4] = [
+        crate::ID.as_ref(),
+        FLEXI_SEED,
+        payer.key.as_ref(),
+        &bump_slice,
+    ];
+    invoke_signed(&instruction, &[payer.clone(), counter.clone()], &[&seeds])
+}
+
+fn process_add_and_schedule_commit(
+    accounts: &[AccountInfo],
+    count: u8,
+    undelegate: bool,
+    has_magic_vault: bool,
+) -> ProgramResult {
+    use sdk::ephem::{commit_accounts, commit_and_undelegate_accounts};
+
+    let iter = &mut accounts.iter();
+    let payer = next_account_info(iter)?;
+    let counter = next_account_info(iter)?;
+    let magic_context = next_account_info(iter)?;
+    let magic_program = next_account_info(iter)?;
+    let magic_fee_vault = if has_magic_vault {
+        Some(next_account_info(iter)?)
+    } else {
+        None
+    };
+
+    add(counter, count)?;
+    if undelegate {
+        commit_and_undelegate_accounts(
+            payer,
+            vec![counter],
+            magic_context,
+            magic_program,
+            magic_fee_vault,
+        )
+    } else {
+        commit_accounts(
+            payer,
+            vec![counter],
+            magic_context,
+            magic_program,
+            magic_fee_vault,
+        )
+    }
+}
+
+fn process_cancel_counter_task(
+    accounts: &[AccountInfo],
+    task_id: i64,
+) -> ProgramResult {
+    use magic_api::instruction::MagicBlockInstruction;
+
+    let [magic_program, payer] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+    let data =
+        bincode::serialize(&MagicBlockInstruction::CancelTask { task_id })
+            .map_err(|_| ProgramError::InvalidArgument)?;
+    let instruction = Instruction::new_with_bytes(
+        *magic_program.key,
+        &data,
+        vec![AccountMeta::new(*payer.key, true)],
+    );
+    invoke(&instruction, std::slice::from_ref(payer))
+}
+
 pub mod build {
     use sdk::{
         consts::{MAGIC_CONTEXT_ID, MAGIC_PROGRAM_ID},
@@ -910,6 +1100,140 @@ pub mod build {
             AccountMeta::new(pda, false),
         ];
         with_tag(&FlexiInstruction::Add { count }, metas)
+    }
+
+    pub fn mul(payer: Pubkey, multiplier: u8) -> Instruction {
+        let (pda, _) = FlexiCounter::pda_and_bump(&payer);
+        let metas = vec![
+            AccountMeta::new_readonly(payer, true),
+            AccountMeta::new(pda, false),
+        ];
+        with_tag(&FlexiInstruction::Mul { multiplier }, metas)
+    }
+
+    pub fn add_and_schedule_commit(
+        payer: Pubkey,
+        count: u8,
+        undelegate: bool,
+        magic_fee_vault: Option<Pubkey>,
+    ) -> Instruction {
+        let (pda, _) = FlexiCounter::pda_and_bump(&payer);
+        let mut metas = vec![
+            AccountMeta::new(payer, true),
+            AccountMeta::new(pda, false),
+            AccountMeta::new(MAGIC_CONTEXT_ID, false),
+            AccountMeta::new_readonly(MAGIC_PROGRAM_ID, false),
+        ];
+        if let Some(vault) = magic_fee_vault {
+            metas.push(AccountMeta::new(vault, false));
+        }
+        with_tag(
+            &FlexiInstruction::AddAndScheduleCommit {
+                count,
+                undelegate,
+                has_magic_vault: magic_fee_vault.is_some(),
+            },
+            metas,
+        )
+    }
+
+    pub fn add_unsigned(payer: Pubkey, count: u8) -> Instruction {
+        let (pda, _) = FlexiCounter::pda_and_bump(&payer);
+        with_tag(
+            &FlexiInstruction::AddUnsigned { count },
+            vec![AccountMeta::new(pda, false)],
+        )
+    }
+
+    pub fn add_error(payer: Pubkey, count: u8) -> Instruction {
+        let (pda, _) = FlexiCounter::pda_and_bump(&payer);
+        with_tag(
+            &FlexiInstruction::AddError { count },
+            vec![AccountMeta::new(pda, false)],
+        )
+    }
+
+    pub fn crank_signer_pda(authority: &Pubkey) -> Pubkey {
+        Pubkey::find_program_address(
+            &[magic_api::pda::CRANK_SEED, authority.as_ref()],
+            &magic_api::CRANK_PROGRAM_ID,
+        )
+        .0
+    }
+
+    // The task instruction the crank runs with the per-authority crank
+    // signer PDA as its only signer.
+    pub fn add_unsigned_with_crank(payer: Pubkey, count: u8) -> Instruction {
+        let (pda, _) = FlexiCounter::pda_and_bump(&payer);
+        with_tag(
+            &FlexiInstruction::AddUnsigned { count },
+            vec![
+                AccountMeta::new(pda, false),
+                AccountMeta::new_readonly(crank_signer_pda(&payer), true),
+            ],
+        )
+    }
+
+    pub fn schedule_counter_task(
+        payer: Pubkey,
+        task_id: i64,
+        execution_interval_millis: i64,
+        iterations: i64,
+        error: bool,
+        signer: bool,
+    ) -> Instruction {
+        let (pda, _) = FlexiCounter::pda_and_bump(&payer);
+        let metas = vec![
+            AccountMeta::new_readonly(MAGIC_PROGRAM_ID, false),
+            AccountMeta::new(payer, true),
+            AccountMeta::new(pda, false),
+        ];
+        with_tag(
+            &FlexiInstruction::ScheduleCounterTask {
+                task_id,
+                execution_interval_millis,
+                iterations,
+                error,
+                signer,
+            },
+            metas,
+        )
+    }
+
+    pub fn cancel_counter_task(payer: Pubkey, task_id: i64) -> Instruction {
+        let metas = vec![
+            AccountMeta::new_readonly(MAGIC_PROGRAM_ID, false),
+            AccountMeta::new(payer, true),
+        ];
+        with_tag(&FlexiInstruction::CancelCounterTask { task_id }, metas)
+    }
+
+    // The raw magic-program ScheduleTask with caller-supplied task
+    // instructions, for tasks the flexi Schedule variant cannot express.
+    pub fn schedule_task_direct(
+        authority: Pubkey,
+        task_id: i64,
+        execution_interval_millis: i64,
+        iterations: i64,
+        instructions: Vec<Instruction>,
+    ) -> Instruction {
+        use magic_api::{
+            args::ScheduleTaskArgs, instruction::MagicBlockInstruction,
+        };
+        let data = bincode::serialize(&MagicBlockInstruction::ScheduleTask(
+            ScheduleTaskArgs {
+                task_id,
+                execution_interval_millis,
+                iterations,
+                instructions,
+            },
+        ))
+        .expect("schedule task serialization cannot fail");
+        Instruction {
+            program_id: MAGIC_PROGRAM_ID,
+            accounts: vec![AccountMeta::new(authority, true)],
+            data,
+        }
     }
 
     fn intent_prefix(destination: Pubkey) -> Vec<AccountMeta> {

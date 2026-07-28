@@ -20,6 +20,9 @@ signature = { workspace = true }
 signer = { workspace = true }
 json = { workspace = true }
 rand = { workspace = true }
+rusqlite = { workspace = true }
+
+sdk = { workspace = true, features = ["spl", "modular-sdk"] }
 
 [dev-dependencies]
 
@@ -68,6 +71,11 @@ name = "post_delegation_token_transfer"
 path = "tests/chainlink/post_delegation_token_transfer.rs"
 
 [[test]]
+name = "aml_gate"
+path = "tests/chainlink/aml_gate.rs"
+
+
+[[test]]
 name = "commit_roundtrip"
 path = "tests/committor/commit_roundtrip.rs"
 
@@ -86,3 +94,19 @@ path = "tests/committor/commit_limit_and_fees.rs"
 [[test]]
 name = "intent_flows"
 path = "tests/committor/intent_flows.rs"
+
+[[test]]
+name = "config_gates"
+path = "tests/harness/config_gates.rs"
+
+[[test]]
+name = "task_scheduler"
+path = "tests/scheduler/task_scheduler.rs"
+
+[[test]]
+name = "ledger_restore_basics"
+path = "tests/lifecycle/ledger_restore_basics.rs"
+
+[[test]]
+name = "ledger_restore_chain"
+path = "tests/lifecycle/ledger_restore_chain.rs"

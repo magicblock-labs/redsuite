@@ -106,6 +106,7 @@ async fn burst_cell(
             label: label.to_owned(),
             env: Vec::new(),
             request_timeout: Some(REQUEST_TIMEOUT),
+            ..Default::default()
         },
     )
     .await?;
@@ -206,6 +207,7 @@ impl Scenario for ColdHydrationTail {
                 label: "s7-touch".to_owned(),
                 env: Vec::new(),
                 request_timeout: Some(REQUEST_TIMEOUT),
+                ..Default::default()
             },
         )
         .await?;

@@ -38,6 +38,7 @@ json = { package = "sonic-rs", version = "0.5" }
 rand = "0.8"
 base64 = "0.22"
 bincode = "1.3"
+rusqlite = { version = "0.37.0", features = ["bundled"] }
 borsh = "1.5"
 sha2 = "0.10"
 # Same dep shape as the validator's test-integration workspace (the proven pair
