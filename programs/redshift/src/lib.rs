@@ -14,6 +14,9 @@ solana_program::entrypoint!(process_instruction);
 declare_id!("AijneHkXJVVWyimuwfSJdrJktARZu2WiMaZBqHsq7CS5");
 
 #[cfg(feature = "schedulecommit")]
+pub mod flexi;
+
+#[cfg(feature = "schedulecommit")]
 pub mod schedulecommit {
     use borsh::{BorshDeserialize, BorshSerialize};
     use sdk::{
@@ -944,6 +947,10 @@ pub mod schedulecommit {
                     return Err(ProgramError::Custom(111));
                 }
             }
+        } else if crate::flexi::undelegate_label_poison(&data) {
+            return Err(ProgramError::Custom(
+                crate::flexi::FAIL_UNDELEGATION_CODE,
+            ));
         } else if book_lens(&data).is_none() {
             msg!("the undelegated data is not a valid order book");
         }
@@ -1341,6 +1348,7 @@ pub mod schedulecommit {
 
 const LOG_MSG_TAG: u8 = 4;
 pub const SCHEDULE_COMMIT_TAG: u8 = 5;
+pub const FLEXI_TAG: u8 = 6;
 
 #[cfg(feature = "upgraded")]
 const LOG_MSG_SUFFIX: &str = " upgraded";
@@ -1355,12 +1363,15 @@ pub fn process_instruction(
 ) -> ProgramResult {
     #[cfg(feature = "schedulecommit")]
     if instruction_data.len() >= EXTERNAL_UNDELEGATE_DISCRIMINATOR.len() {
-        let (discriminator, seeds_data) =
+        let (discriminator, rest) =
             instruction_data.split_at(EXTERNAL_UNDELEGATE_DISCRIMINATOR.len());
         if discriminator == EXTERNAL_UNDELEGATE_DISCRIMINATOR {
             return schedulecommit::process_undelegate_request(
-                program_id, accounts, seeds_data,
+                program_id, accounts, rest,
             );
+        }
+        if discriminator == flexi::TRANSFER_CALLBACK_DISCRIMINATOR {
+            return flexi::process_transfer_callback(accounts, rest);
         }
     }
 
@@ -1375,6 +1386,8 @@ pub fn process_instruction(
         Some((&SCHEDULE_COMMIT_TAG, payload)) => {
             schedulecommit::process(program_id, accounts, payload)
         }
+        #[cfg(feature = "schedulecommit")]
+        Some((&FLEXI_TAG, payload)) => flexi::process(accounts, payload),
         _ => Ok(()),
     }
 }

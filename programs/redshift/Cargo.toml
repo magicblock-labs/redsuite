@@ -10,7 +10,7 @@ crate-type = ["cdylib", "lib"]
 
 [features]
 default = ["schedulecommit"]
-schedulecommit = ["dep:borsh", "dep:sdk", "dep:solana-sdk-ids"]
+schedulecommit = ["dep:borsh", "dep:sdk", "dep:solana-sdk-ids", "dep:magic-api", "dep:bincode"]
 upgraded = []
 no-entrypoint = []
 
@@ -19,3 +19,5 @@ borsh = { workspace = true, optional = true }
 sdk = { workspace = true, optional = true }
 solana-program = { workspace = true }
 solana-sdk-ids = { version = "3", optional = true }
+magic-api = { package = "magicblock-magic-program-api", version = "0.10.1", default-features = false, optional = true }
+bincode = { workspace = true, optional = true }

@@ -82,3 +82,7 @@ path = "tests/committor/commit_and_undelegate.rs"
 [[test]]
 name = "commit_limit_and_fees"
 path = "tests/committor/commit_limit_and_fees.rs"
+
+[[test]]
+name = "intent_flows"
+path = "tests/committor/intent_flows.rs"

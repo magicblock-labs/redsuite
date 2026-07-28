@@ -2247,8 +2247,10 @@ dependencies = [
 name = "redshift-program"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "borsh 1.7.0",
  "ephemeral-rollups-sdk",
+ "magicblock-magic-program-api",
  "solana-program 3.0.0",
  "solana-sdk-ids 3.1.0",
 ]
