@@ -23,7 +23,7 @@ rand = { workspace = true }
 rusqlite = { workspace = true }
 
 sdk = { workspace = true, features = ["spl", "modular-sdk"] }
-solana-address-lookup-table-interface = { version = "3.0", features = ["bincode"] }
+solana-address-lookup-table-interface = { version = "3.0", features = ["bincode", "bytemuck"] }
 
 [dev-dependencies]
 
