@@ -2284,6 +2284,7 @@ dependencies = [
  "redshift-program",
  "redsuite-core",
  "rusqlite",
+ "solana-address-lookup-table-interface 3.1.0",
  "solana-instruction 3.4.0",
  "solana-keypair",
  "solana-pubkey 3.0.0",
@@ -2956,7 +2957,12 @@ version = "3.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "115b4f773acc4f3f3cb986b0d335e9845c0368c82b0940410935bc11ae065578"
 dependencies = [
+ "bincode",
+ "serde",
+ "serde_derive",
  "solana-clock 3.1.1",
+ "solana-instruction 3.4.0",
+ "solana-instruction-error",
  "solana-pubkey 4.2.0",
  "solana-sdk-ids 3.1.0",
  "solana-slot-hashes 3.1.0",

@@ -23,6 +23,7 @@ rand = { workspace = true }
 rusqlite = { workspace = true }
 
 sdk = { workspace = true, features = ["spl", "modular-sdk"] }
+solana-address-lookup-table-interface = { version = "3.0", features = ["bincode"] }
 
 [dev-dependencies]
 
@@ -94,6 +95,11 @@ path = "tests/committor/commit_limit_and_fees.rs"
 [[test]]
 name = "intent_flows"
 path = "tests/committor/intent_flows.rs"
+
+[[test]]
+name = "table_mania"
+path = "tests/committor/table_mania.rs"
+
 
 [[test]]
 name = "config_gates"

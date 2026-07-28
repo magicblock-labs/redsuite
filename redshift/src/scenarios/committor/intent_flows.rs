@@ -337,6 +337,174 @@ async fn transfer_intent_cell(
     Ok((paid, before - after))
 }
 
+async fn flow_basic_and_repeat(base: &BaseCtx, er: &ErCtx) -> Result<()> {
+    let actor = setup_actor(base, er, LABEL).await?;
+    add(er, &actor, 101).await?;
+    assert_eq!(
+        er_count(er, &actor).await?,
+        101,
+        "ephem count before intent"
+    );
+    schedule_intent(base, er, &[&actor], None).await?;
+    await_base_count(base, &actor.counter, 101).await?;
+
+    add(er, &actor, 2).await?;
+    schedule_intent(base, er, &[&actor], None).await?;
+    await_base_count(base, &actor.counter, 103).await?;
+    Ok(())
+}
+
+async fn flow_commit_and_undelegate(
+    base: &BaseCtx,
+    er: &ErCtx,
+) -> Result<Pubkey> {
+    let undelegated = setup_actor(base, er, LABEL).await?;
+    add(er, &undelegated, 101).await?;
+    schedule_intent(base, er, &[&undelegated], Some(vec![-100])).await?;
+    await_base_count(base, &undelegated.counter, 1).await?;
+    await_undelegated_on_er(er, &undelegated.counter).await?;
+    base_owner(base, &undelegated.counter).await
+}
+
+async fn flow_single_undelegation(base: &BaseCtx, er: &ErCtx) -> Result<()> {
+    let single = setup_actor(base, er, LABEL).await?;
+    add(er, &single, 100).await?;
+    schedule_intent(base, er, &[&single], Some(vec![-50])).await?;
+    await_base_count(base, &single.counter, 50).await?;
+    await_undelegated_on_er(er, &single.counter).await?;
+    Ok(())
+}
+
+async fn flow_two_payer(base: &BaseCtx, er: &ErCtx) -> Result<()> {
+    let first = setup_actor(base, er, LABEL).await?;
+    let second = setup_actor(base, er, LABEL).await?;
+    add(er, &first, 100).await?;
+    add(er, &second, 200).await?;
+    schedule_intent(base, er, &[&first, &second], Some(vec![-50, 25])).await?;
+    await_base_count(base, &first.counter, 50).await?;
+    await_base_count(base, &second.counter, 225).await?;
+    await_undelegated_on_er(er, &first.counter).await?;
+    await_undelegated_on_er(er, &second.counter).await?;
+    Ok(())
+}
+
+async fn flow_bundle_mixed(base: &BaseCtx, er: &ErCtx) -> Result<()> {
+    let bundle_a = setup_actor(base, er, LABEL).await?;
+    let bundle_b = setup_actor(base, er, LABEL).await?;
+    let bundle_c = setup_actor(base, er, LABEL).await?;
+    add(er, &bundle_a, 50).await?;
+    add(er, &bundle_b, 75).await?;
+    add(er, &bundle_c, 100).await?;
+    schedule_bundle(base, er, &[&bundle_a, &bundle_b], &[&bundle_c], vec![-10])
+        .await?;
+    await_base_count(base, &bundle_a.counter, 50).await?;
+    await_base_count(base, &bundle_b.counter, 75).await?;
+    await_base_count(base, &bundle_c.counter, 90).await?;
+    assert_eq!(
+        base_owner(base, &bundle_a.counter).await?,
+        dlp_id(),
+        "a commit-only bundle member stays delegated"
+    );
+    assert_eq!(
+        base_owner(base, &bundle_b.counter).await?,
+        dlp_id(),
+        "a commit-only bundle member stays delegated"
+    );
+    await_undelegated_on_er(er, &bundle_c.counter).await?;
+    Ok(())
+}
+
+async fn flow_bundle_commit_only(base: &BaseCtx, er: &ErCtx) -> Result<()> {
+    let only_a = setup_actor(base, er, LABEL).await?;
+    let only_b = setup_actor(base, er, LABEL).await?;
+    add(er, &only_a, 42).await?;
+    add(er, &only_b, 88).await?;
+    schedule_bundle(base, er, &[&only_a, &only_b], &[], vec![]).await?;
+    await_base_count(base, &only_a.counter, 42).await?;
+    await_base_count(base, &only_b.counter, 88).await?;
+    assert_eq!(
+        base_owner(base, &only_a.counter).await?,
+        dlp_id(),
+        "a commit-only bundle member stays delegated"
+    );
+    assert_eq!(
+        base_owner(base, &only_b.counter).await?,
+        dlp_id(),
+        "a commit-only bundle member stays delegated"
+    );
+    Ok(())
+}
+
+async fn flow_bundle_undelegate_only(base: &BaseCtx, er: &ErCtx) -> Result<()> {
+    let und_a = setup_actor(base, er, LABEL).await?;
+    let und_b = setup_actor(base, er, LABEL).await?;
+    add(er, &und_a, 200).await?;
+    add(er, &und_b, 250).await?;
+    schedule_bundle(base, er, &[], &[&und_a, &und_b], vec![50, -100]).await?;
+    await_base_count(base, &und_a.counter, 250).await?;
+    await_base_count(base, &und_b.counter, 150).await?;
+    await_undelegated_on_er(er, &und_a.counter).await?;
+    await_undelegated_on_er(er, &und_b.counter).await?;
+    Ok(())
+}
+
+async fn flow_bundle_commit_and_finalize(
+    base: &BaseCtx,
+    er: &ErCtx,
+) -> Result<()> {
+    let commit_actor = setup_actor(base, er, LABEL).await?;
+    let finalize_actor = setup_actor(base, er, LABEL).await?;
+    add(er, &commit_actor, 31).await?;
+    add(er, &finalize_actor, 47).await?;
+    let finalize_ix = build::create_intent_bundle_commit_and_finalize(
+        commit_actor.pubkey(),
+        &[commit_actor.pubkey()],
+        &[finalize_actor.pubkey()],
+    );
+    let finalize_sig = er.send(&commit_actor.payer, &[finalize_ix]).await?;
+    confirm_intent(base, er, &finalize_sig).await?;
+    await_base_count(base, &commit_actor.counter, 31).await?;
+    await_base_count(base, &finalize_actor.counter, 47).await?;
+    assert_eq!(
+        base_owner(base, &commit_actor.counter).await?,
+        dlp_id(),
+        "commit keeps the account delegated"
+    );
+    assert_eq!(
+        base_owner(base, &finalize_actor.counter).await?,
+        dlp_id(),
+        "commit-finalize keeps the account delegated"
+    );
+    Ok(())
+}
+
+async fn flow_transfer_intents(base: &BaseCtx, er: &ErCtx) -> Result<()> {
+    let funder = prep::funded_payer(base, AIRDROP).await?;
+    let (success_paid, success_charged) =
+        transfer_intent_cell(base, er, &funder, false).await?;
+    assert_eq!(
+        success_paid, TRANSFER_AMOUNT,
+        "a successful transfer intent must pay the destination"
+    );
+    assert_eq!(
+        success_charged,
+        TRANSFER_AMOUNT + TRANSFER_FEES,
+        "the payer must be charged the amount plus both fees"
+    );
+
+    let (fail_paid, fail_charged) =
+        transfer_intent_cell(base, er, &funder, true).await?;
+    assert_eq!(
+        fail_paid, 0,
+        "a failed transfer intent must not pay the destination"
+    );
+    assert_eq!(
+        fail_charged, TRANSFER_FEES,
+        "the callback must refund the amount, leaving only the fees"
+    );
+    Ok(())
+}
+
 #[async_trait(?Send)]
 impl Scenario for IntentFlows {
     fn name(&self) -> &str {
@@ -344,162 +512,17 @@ impl Scenario for IntentFlows {
     }
 
     async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
-        // basic — single commit-only intent lands the counter on base.
-        let actor = setup_actor(base, er, LABEL).await?;
-        add(er, &actor, 101).await?;
-        assert_eq!(
-            er_count(er, &actor).await?,
-            101,
-            "ephem count before intent"
-        );
-        schedule_intent(base, er, &[&actor], None).await?;
-        await_base_count(base, &actor.counter, 101).await?;
-
-        // 2 commits — a second commit-only intent from the same account.
-        add(er, &actor, 2).await?;
-        schedule_intent(base, er, &[&actor], None).await?;
-        await_base_count(base, &actor.counter, 103).await?;
-
-        // commit + undelegate — the undelegate handler applies the diff on
-        // base, both actions pay PRIZE, and the ER releases the account.
-        let undelegated = setup_actor(base, er, LABEL).await?;
-        add(er, &undelegated, 101).await?;
-        schedule_intent(base, er, &[&undelegated], Some(vec![-100])).await?;
-        await_base_count(base, &undelegated.counter, 1).await?;
-        await_undelegated_on_er(er, &undelegated.counter).await?;
-        let undelegate_owner = base_owner(base, &undelegated.counter).await?;
-
-        // 1-payer intent with undelegation (regression for N=1).
-        let single = setup_actor(base, er, LABEL).await?;
-        add(er, &single, 100).await?;
-        schedule_intent(base, er, &[&single], Some(vec![-50])).await?;
-        await_base_count(base, &single.counter, 50).await?;
-        await_undelegated_on_er(er, &single.counter).await?;
-
-        // 2-payer intent, per-committee diffs, one ephem tx signed by both.
-        let first = setup_actor(base, er, LABEL).await?;
-        let second = setup_actor(base, er, LABEL).await?;
-        add(er, &first, 100).await?;
-        add(er, &second, 200).await?;
-        schedule_intent(base, er, &[&first, &second], Some(vec![-50, 25]))
-            .await?;
-        await_base_count(base, &first.counter, 50).await?;
-        await_base_count(base, &second.counter, 225).await?;
-        await_undelegated_on_er(er, &first.counter).await?;
-        await_undelegated_on_er(er, &second.counter).await?;
-
-        // intent bundle — commit-only (2) AND commit-and-undelegate (1) in one
-        // bundle; commit-only members stay delegated on base.
-        let bundle_a = setup_actor(base, er, LABEL).await?;
-        let bundle_b = setup_actor(base, er, LABEL).await?;
-        let bundle_c = setup_actor(base, er, LABEL).await?;
-        add(er, &bundle_a, 50).await?;
-        add(er, &bundle_b, 75).await?;
-        add(er, &bundle_c, 100).await?;
-        schedule_bundle(
-            base,
-            er,
-            &[&bundle_a, &bundle_b],
-            &[&bundle_c],
-            vec![-10],
-        )
-        .await?;
-        await_base_count(base, &bundle_a.counter, 50).await?;
-        await_base_count(base, &bundle_b.counter, 75).await?;
-        await_base_count(base, &bundle_c.counter, 90).await?;
-        assert_eq!(
-            base_owner(base, &bundle_a.counter).await?,
-            dlp_id(),
-            "a commit-only bundle member stays delegated"
-        );
-        assert_eq!(
-            base_owner(base, &bundle_b.counter).await?,
-            dlp_id(),
-            "a commit-only bundle member stays delegated"
-        );
-        await_undelegated_on_er(er, &bundle_c.counter).await?;
-
-        // intent bundle — commit-only members only.
-        let only_a = setup_actor(base, er, LABEL).await?;
-        let only_b = setup_actor(base, er, LABEL).await?;
-        add(er, &only_a, 42).await?;
-        add(er, &only_b, 88).await?;
-        schedule_bundle(base, er, &[&only_a, &only_b], &[], vec![]).await?;
-        await_base_count(base, &only_a.counter, 42).await?;
-        await_base_count(base, &only_b.counter, 88).await?;
-        assert_eq!(
-            base_owner(base, &only_a.counter).await?,
-            dlp_id(),
-            "a commit-only bundle member stays delegated"
-        );
-        assert_eq!(
-            base_owner(base, &only_b.counter).await?,
-            dlp_id(),
-            "a commit-only bundle member stays delegated"
-        );
-
-        // intent bundle — commit-and-undelegate members only, per-payer diffs.
-        let und_a = setup_actor(base, er, LABEL).await?;
-        let und_b = setup_actor(base, er, LABEL).await?;
-        add(er, &und_a, 200).await?;
-        add(er, &und_b, 250).await?;
-        schedule_bundle(base, er, &[], &[&und_a, &und_b], vec![50, -100])
-            .await?;
-        await_base_count(base, &und_a.counter, 250).await?;
-        await_base_count(base, &und_b.counter, 150).await?;
-        await_undelegated_on_er(er, &und_a.counter).await?;
-        await_undelegated_on_er(er, &und_b.counter).await?;
-
-        // intent bundle — Commit + CommitFinalize (finalize commits without
-        // undelegating; both members stay delegated on base). Signed by the
-        // commit payer only.
-        let commit_actor = setup_actor(base, er, LABEL).await?;
-        let finalize_actor = setup_actor(base, er, LABEL).await?;
-        add(er, &commit_actor, 31).await?;
-        add(er, &finalize_actor, 47).await?;
-        let finalize_ix = build::create_intent_bundle_commit_and_finalize(
-            commit_actor.pubkey(),
-            &[commit_actor.pubkey()],
-            &[finalize_actor.pubkey()],
-        );
-        let finalize_sig = er.send(&commit_actor.payer, &[finalize_ix]).await?;
-        confirm_intent(base, er, &finalize_sig).await?;
-        await_base_count(base, &commit_actor.counter, 31).await?;
-        await_base_count(base, &finalize_actor.counter, 47).await?;
-        assert_eq!(
-            base_owner(base, &commit_actor.counter).await?,
-            dlp_id(),
-            "commit keeps the account delegated"
-        );
-        assert_eq!(
-            base_owner(base, &finalize_actor.counter).await?,
-            dlp_id(),
-            "commit-finalize keeps the account delegated"
-        );
-
-        let funder = prep::funded_payer(base, AIRDROP).await?;
-        let (success_paid, success_charged) =
-            transfer_intent_cell(base, er, &funder, false).await?;
-        assert_eq!(
-            success_paid, TRANSFER_AMOUNT,
-            "a successful transfer intent must pay the destination"
-        );
-        assert_eq!(
-            success_charged,
-            TRANSFER_AMOUNT + TRANSFER_FEES,
-            "the payer must be charged the amount plus both fees"
-        );
-
-        let (fail_paid, fail_charged) =
-            transfer_intent_cell(base, er, &funder, true).await?;
-        assert_eq!(
-            fail_paid, 0,
-            "a failed transfer intent must not pay the destination"
-        );
-        assert_eq!(
-            fail_charged, TRANSFER_FEES,
-            "the callback must refund the amount, leaving only the fees"
-        );
+        let (_, undelegate_owner, _, _, _, _, _, _, _) = tokio::try_join!(
+            flow_basic_and_repeat(base, er),
+            flow_commit_and_undelegate(base, er),
+            flow_single_undelegation(base, er),
+            flow_two_payer(base, er),
+            flow_bundle_mixed(base, er),
+            flow_bundle_commit_only(base, er),
+            flow_bundle_undelegate_only(base, er),
+            flow_bundle_commit_and_finalize(base, er),
+            flow_transfer_intents(base, er),
+        )?;
 
         Ok(ScenarioReport::ok(self.name())
             .setting("prize lamports", PRIZE)

@@ -386,6 +386,178 @@ async fn rejected_intent_cell(
     Ok(())
 }
 
+async fn test_lifecycle_cell(
+    base: &BaseCtx,
+    er: &ErCtx,
+    count: usize,
+) -> Result<LifecycleOutcome> {
+    let payer = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
+    let er_fee_payer = prep::delegated_payer(
+        base,
+        &payer,
+        er.identity(),
+        crate::PAYER_LAMPORTS,
+    )
+    .await?;
+    let base_negative_payer =
+        prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
+
+    commit_undelegate_lifecycle(
+        base,
+        er,
+        &payer,
+        &er_fee_payer,
+        &base_negative_payer,
+        count,
+    )
+    .await
+}
+
+async fn test_order_book_cell(
+    base: &BaseCtx,
+    er: &ErCtx,
+    commit_type: ScheduleCommitType,
+    undelegates: bool,
+    seed: u64,
+) -> Result<usize> {
+    let payer = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
+    order_book_cell(base, er, &payer, commit_type, undelegates, seed).await
+}
+
+async fn test_mod_after_rejection(
+    base: &BaseCtx,
+    er: &ErCtx,
+    count: usize,
+) -> Result<()> {
+    let payer = Rc::new(prep::funded_payer(base, crate::PAYER_LAMPORTS).await?);
+    let committees = crate::init_schedulecommit_committees(
+        base,
+        &payer,
+        er.identity(),
+        count,
+    )
+    .await?;
+    crate::await_committee_clones(er, &committees).await;
+    let players: Vec<_> =
+        committees.iter().map(|c| c.player.pubkey()).collect();
+    rejected_intent_cell(
+        er,
+        &payer,
+        build::schedule_commit_and_undelegate_mod_after(
+            payer.pubkey(),
+            players,
+        ),
+        MOD_AFTER_REFUSAL,
+    )
+    .await?;
+    for committee in &committees {
+        let on_er = er
+            .account(&committee.pda)
+            .await?
+            .ok_or("the er clone is gone after the failed tx")?;
+        assert_eq!(
+            decoded_count(&on_er.data)?,
+            0,
+            "a failed tx must not modify the committee"
+        );
+    }
+    Ok(())
+}
+
+async fn test_twice_rejection(base: &BaseCtx, er: &ErCtx) -> Result<()> {
+    let payer = Rc::new(prep::funded_payer(base, crate::PAYER_LAMPORTS).await?);
+    let committees =
+        crate::init_schedulecommit_committees(base, &payer, er.identity(), 2)
+            .await?;
+    crate::await_committee_clones(er, &committees).await;
+    let players: Vec<_> =
+        committees.iter().map(|c| c.player.pubkey()).collect();
+    rejected_intent_cell(
+        er,
+        &payer,
+        build::schedule_commit_and_undelegate_twice(payer.pubkey(), players),
+        TWICE_REFUSAL,
+    )
+    .await
+}
+
+async fn test_failed_undelegation_lockout(
+    base: &BaseCtx,
+    er: &ErCtx,
+) -> Result<&'static str> {
+    let payer = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
+    let er_fee_payer = prep::delegated_payer(
+        base,
+        &payer,
+        er.identity(),
+        crate::PAYER_LAMPORTS,
+    )
+    .await?;
+
+    let committees =
+        crate::init_schedulecommit_committees(base, &payer, er.identity(), 1)
+            .await?;
+    crate::await_committee_clones(er, &committees).await;
+    let player = committees[0].player.pubkey();
+    let pda = committees[0].pda;
+
+    er.send(&payer, &[build::set_count(player, FAIL_UNDELEGATION_COUNT)])
+        .await?;
+    let on_er = er
+        .account(&pda)
+        .await?
+        .ok_or("the er clone is not present after set_count")?;
+    assert_eq!(
+        decoded_count(&on_er.data)?,
+        FAIL_UNDELEGATION_COUNT,
+        "the poison count on the ephemeral"
+    );
+
+    let signature = er
+        .send(
+            &payer,
+            &[build::schedule_commit_cpi(
+                payer.pubkey(),
+                vec![player],
+                false,
+                false,
+                ScheduleCommitType::CommitFinalizeAndUndelegate,
+                true,
+            )],
+        )
+        .await?;
+    crate::assert_commit_receipt(base, er, &signature, &[pda], true).await?;
+
+    poll_until(BASE_STATE_TIMEOUT, || async {
+        matches!(
+            base.account(&pda).await,
+            Ok(Some(acc))
+                if decoded_count(&acc.data).ok()
+                    == Some(FAIL_UNDELEGATION_COUNT)
+        )
+    })
+    .await;
+    let on_base = base
+        .account(&pda)
+        .await?
+        .ok_or("the pda is not on base after the patched commit")?;
+    assert_eq!(
+        on_base.owner, DELEGATION_PROGRAM_ID,
+        "a failed undelegation must leave the account delegated on \
+         base"
+    );
+
+    let attempt = er
+        .send(&er_fee_payer, &[build::set_count(player, 2222)])
+        .await;
+    assert!(
+        attempt.is_err(),
+        "the ephemeral must reject writes after the undelegation \
+         request even when the base undelegation failed"
+    );
+    rejection_code(&format!("{:?}", attempt.unwrap_err()))
+}
+
 #[async_trait(?Send)]
 impl Scenario for CommitAndUndelegate {
     fn name(&self) -> &str {
@@ -393,195 +565,53 @@ impl Scenario for CommitAndUndelegate {
     }
 
     async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
-        let payer =
-            Rc::new(prep::funded_payer(base, crate::PAYER_LAMPORTS).await?);
-        let er_fee_payer = prep::delegated_payer(
-            base,
-            &payer,
-            er.identity(),
-            crate::PAYER_LAMPORTS,
-        )
-        .await?;
-        let base_negative_payer =
-            prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
-        let mut report = ScenarioReport::ok(self.name());
+        let seed_commit = OsRng.next_u64();
+        let seed_undelegate = OsRng.next_u64();
 
-        for count in [1usize, 2] {
-            let outcome = commit_undelegate_lifecycle(
+        let (
+            lifecycle_1,
+            lifecycle_2,
+            sigs_commit,
+            sigs_undelegate,
+            _,
+            _,
+            _,
+            failed_undelegation_lockout,
+        ) = tokio::try_join!(
+            test_lifecycle_cell(base, er, 1),
+            test_lifecycle_cell(base, er, 2),
+            test_order_book_cell(
                 base,
                 er,
-                &payer,
-                &er_fee_payer,
-                &base_negative_payer,
-                count,
-            )
-            .await?;
-            report = report
-                .setting(
-                    format!("{count}-account er lockout rejection"),
-                    outcome.er_lockout,
-                )
-                .setting(
-                    format!("{count}-account base frozen rejection"),
-                    outcome.base_frozen,
-                );
-        }
-
-        for (commit_type, undelegates, label) in [
-            (ScheduleCommitType::CommitFinalize, false, "commit book"),
-            (
+                ScheduleCommitType::CommitFinalize,
+                false,
+                seed_commit
+            ),
+            test_order_book_cell(
+                base,
+                er,
                 ScheduleCommitType::CommitFinalizeAndUndelegate,
                 true,
-                "undelegate book",
+                seed_undelegate
             ),
-        ] {
-            let seed = OsRng.next_u64();
-            let base_signatures = order_book_cell(
-                base,
-                er,
-                &payer,
-                commit_type,
-                undelegates,
-                seed,
-            )
-            .await?;
-            report = report
-                .setting(format!("{label} seed"), seed)
-                .setting(format!("{label} base sigs"), base_signatures);
-        }
+            test_mod_after_rejection(base, er, 1),
+            test_mod_after_rejection(base, er, 2),
+            test_twice_rejection(base, er),
+            test_failed_undelegation_lockout(base, er),
+        )?;
 
-        for count in [1usize, 2] {
-            let committees = crate::init_schedulecommit_committees(
-                base,
-                &payer,
-                er.identity(),
-                count,
-            )
-            .await?;
-            crate::await_committee_clones(er, &committees).await;
-            let players: Vec<_> =
-                committees.iter().map(|c| c.player.pubkey()).collect();
-            rejected_intent_cell(
-                er,
-                &payer,
-                build::schedule_commit_and_undelegate_mod_after(
-                    payer.pubkey(),
-                    players,
-                ),
-                MOD_AFTER_REFUSAL,
-            )
-            .await?;
-            for committee in &committees {
-                let on_er = er
-                    .account(&committee.pda)
-                    .await?
-                    .ok_or("the er clone is gone after the failed tx")?;
-                assert_eq!(
-                    decoded_count(&on_er.data)?,
-                    0,
-                    "a failed tx must not modify the committee"
-                );
-            }
-        }
+        let report = ScenarioReport::ok(self.name())
+            .setting("1-account er lockout rejection", lifecycle_1.er_lockout)
+            .setting("1-account base frozen rejection", lifecycle_1.base_frozen)
+            .setting("2-account er lockout rejection", lifecycle_2.er_lockout)
+            .setting("2-account base frozen rejection", lifecycle_2.base_frozen)
+            .setting("commit book seed", seed_commit)
+            .setting("commit book base sigs", sigs_commit)
+            .setting("undelegate book seed", seed_undelegate)
+            .setting("undelegate book base sigs", sigs_undelegate)
+            .setting("failed undelegation lockout", failed_undelegation_lockout)
+            .setting("commit frequency ms", crate::COMMIT_FREQUENCY_MS);
 
-        {
-            let committees = crate::init_schedulecommit_committees(
-                base,
-                &payer,
-                er.identity(),
-                2,
-            )
-            .await?;
-            crate::await_committee_clones(er, &committees).await;
-            let players: Vec<_> =
-                committees.iter().map(|c| c.player.pubkey()).collect();
-            rejected_intent_cell(
-                er,
-                &payer,
-                build::schedule_commit_and_undelegate_twice(
-                    payer.pubkey(),
-                    players,
-                ),
-                TWICE_REFUSAL,
-            )
-            .await?;
-        }
-
-        {
-            let committees = crate::init_schedulecommit_committees(
-                base,
-                &payer,
-                er.identity(),
-                1,
-            )
-            .await?;
-            crate::await_committee_clones(er, &committees).await;
-            let player = committees[0].player.pubkey();
-            let pda = committees[0].pda;
-
-            er.send(
-                &payer,
-                &[build::set_count(player, FAIL_UNDELEGATION_COUNT)],
-            )
-            .await?;
-            let on_er = er
-                .account(&pda)
-                .await?
-                .ok_or("the er clone is not present after set_count")?;
-            assert_eq!(
-                decoded_count(&on_er.data)?,
-                FAIL_UNDELEGATION_COUNT,
-                "the poison count on the ephemeral"
-            );
-
-            let signature = er
-                .send(
-                    &payer,
-                    &[build::schedule_commit_cpi(
-                        payer.pubkey(),
-                        vec![player],
-                        false,
-                        false,
-                        ScheduleCommitType::CommitFinalizeAndUndelegate,
-                        true,
-                    )],
-                )
-                .await?;
-            crate::assert_commit_receipt(base, er, &signature, &[pda], true)
-                .await?;
-
-            poll_until(BASE_STATE_TIMEOUT, || async {
-                matches!(
-                    base.account(&pda).await,
-                    Ok(Some(acc))
-                        if decoded_count(&acc.data).ok()
-                            == Some(FAIL_UNDELEGATION_COUNT)
-                )
-            })
-            .await;
-            let on_base = base
-                .account(&pda)
-                .await?
-                .ok_or("the pda is not on base after the patched commit")?;
-            assert_eq!(
-                on_base.owner, DELEGATION_PROGRAM_ID,
-                "a failed undelegation must leave the account delegated on \
-                 base"
-            );
-
-            let attempt = er
-                .send(&er_fee_payer, &[build::set_count(player, 2222)])
-                .await;
-            assert!(
-                attempt.is_err(),
-                "the ephemeral must reject writes after the undelegation \
-                 request even when the base undelegation failed"
-            );
-            let lockout =
-                rejection_code(&format!("{:?}", attempt.unwrap_err()))?;
-            report = report.setting("failed undelegation lockout", lockout);
-        }
-
-        Ok(report.setting("commit frequency ms", crate::COMMIT_FREQUENCY_MS))
+        Ok(report)
     }
 }
