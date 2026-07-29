@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use keypair::Keypair;
 use redsuite_core::{
-    assert::poll_until, prep, system, BaseCtx, ChainCtx, ErCtx, Result,
+    assert::poll_until, dlp, prep, system, BaseCtx, ChainCtx, ErCtx, Result,
     Scenario, ScenarioReport,
 };
 use signer::Signer;
@@ -13,6 +13,8 @@ const FREEZE_SETTLE: Duration = Duration::from_millis(800);
 const ESCROW_FUNDING: u64 = 2_000_000_000;
 const TRANSFER_ATTEMPT: u64 = 500_000_000;
 const CHAIN_TOPUP: u64 = 1_000_000_000;
+const EXECUTED_TRANSFER: u64 = 300_000_000;
+const RENT_EXEMPT: u64 = 890_880;
 
 pub struct EscrowCloning;
 
@@ -54,9 +56,10 @@ impl Scenario for EscrowCloning {
             .await;
         assert!(
             transfer_result.is_err(),
-            "an escrowed but non-delegated payer must not be able to fee an ER \
-             transfer on this fee-charging stack (InvalidAccountForFee — the \
-             escrow is not a fee source); got {transfer_result:?}"
+            "the access gate must reject a transfer that moves lamports out \
+             of a non-delegated payer wallet (InvalidAccountForFee even at \
+             base fee 0 — the escrow is never consulted as a fee source); \
+             got {transfer_result:?}"
         );
 
         let after_tx = er
@@ -104,8 +107,94 @@ impl Scenario for EscrowCloning {
             "the chain top-up must exist on base for the freeze assert to mean anything"
         );
 
+        // executed-transfer cell — a wallet-delegated escrowed payer CAN
+        // spend on the ER, and the executed transfer still leaves the escrow
+        // untouched (the freeze assert with a transaction that actually ran).
+        let funder = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
+        let spender =
+            prep::escrowed_payer(base, er.identity(), ESCROW_FUNDING).await?;
+        let delegate_spender = [
+            system::assign(&spender.payer.pubkey(), &dlp::dlp_id()),
+            dlp::delegate_account(
+                &funder.pubkey(),
+                &spender.payer.pubkey(),
+                &er.identity(),
+            ),
+        ];
+        base.send_with(&funder, &[&spender.payer], &delegate_spender)
+            .await?;
+
+        let receiver = Keypair::new();
+        base.airdrop(&receiver.pubkey(), RENT_EXEMPT).await?;
+        let delegate_receiver = [
+            system::assign(&receiver.pubkey(), &dlp::dlp_id()),
+            dlp::delegate_account(
+                &funder.pubkey(),
+                &receiver.pubkey(),
+                &er.identity(),
+            ),
+        ];
+        base.send_with(&funder, &[&receiver], &delegate_receiver)
+            .await?;
+        poll_until(CLONE_TIMEOUT, || async {
+            matches!(
+                er.api().get_balance(&receiver.pubkey()).await,
+                Ok(balance) if balance == RENT_EXEMPT
+            )
+        })
+        .await;
+
+        poll_until(CLONE_TIMEOUT, || async {
+            matches!(er.account(&spender.escrow).await, Ok(Some(_)))
+        })
+        .await;
+        let spender_escrow_before = er
+            .account(&spender.escrow)
+            .await?
+            .ok_or("the spender escrow clone vanished")?;
+        let wallet_before =
+            er.api().get_balance(&spender.payer.pubkey()).await?;
+
+        er.send(
+            &spender.payer,
+            &[system::transfer(
+                &spender.payer.pubkey(),
+                &receiver.pubkey(),
+                EXECUTED_TRANSFER,
+            )],
+        )
+        .await?;
+        poll_until(CLONE_TIMEOUT, || async {
+            matches!(
+                er.api().get_balance(&receiver.pubkey()).await,
+                Ok(balance) if balance == RENT_EXEMPT + EXECUTED_TRANSFER
+            )
+        })
+        .await;
+        let wallet_after =
+            er.api().get_balance(&spender.payer.pubkey()).await?;
+        assert_eq!(
+            wallet_after,
+            wallet_before - EXECUTED_TRANSFER,
+            "the delegated wallet must pay exactly the transfer amount at \
+             base fee 0"
+        );
+        let spender_escrow_after = er
+            .account(&spender.escrow)
+            .await?
+            .ok_or("the spender escrow clone vanished after the transfer")?;
+        assert_eq!(
+            spender_escrow_after.lamports, spender_escrow_before.lamports,
+            "an EXECUTED er transfer must not move escrow lamports"
+        );
+        assert_eq!(
+            spender_escrow_after.data, spender_escrow_before.data,
+            "an EXECUTED er transfer must not touch escrow data"
+        );
+
         Ok(ScenarioReport::ok(self.name())
             .setting("escrow funding lamports", ESCROW_FUNDING)
+            .setting("executed transfer lamports", EXECUTED_TRANSFER)
             .metric("escrow clone visibility ms", clone_visibility_ms))
     }
 }

@@ -1,10 +1,14 @@
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use dlp_api::{
+    args::CommitStateArgs,
+    instruction_builder::{commit_state, finalize, undelegate},
+};
 use keypair::Keypair;
 use redsuite_core::{
-    assert::poll_until, prep, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
-    ScenarioReport,
+    assert::poll_until, dlp, prep, system, topology, BaseCtx, ChainCtx, ErCtx,
+    Result, Scenario, ScenarioReport,
 };
 use signer::Signer;
 
@@ -17,6 +21,10 @@ const POST_CLONE_WRITE: u64 = 42;
 const ER_WRITE: u64 = 43;
 const UNDELEGATED_WRITE: u64 = 44;
 const GHOST_LAMPORTS: u64 = 500_000_000;
+const WALLET_LAMPORTS: u64 = 1_000_000_000;
+const CYCLE_SPEND: u64 = 1_000;
+const CONTINUITY_WINDOW: Duration = Duration::from_secs(2);
+const CONTINUITY_STEP: Duration = Duration::from_millis(50);
 
 pub struct CloneOnAccess;
 
@@ -139,8 +147,94 @@ impl Scenario for CloneOnAccess {
             "ER writes must not reach the base copy without an explicit commit"
         );
 
+        // redelegation continuity — undelegate + redelegate-to-us composed
+        // in ONE base transaction (validator-signed dlp undelegate, then
+        // assign + delegate) must never interrupt the er clone.
+        let wallet = Keypair::new();
+        base.airdrop(&wallet.pubkey(), WALLET_LAMPORTS).await?;
+        let delegate_setup = [
+            system::assign(&wallet.pubkey(), &dlp::dlp_id()),
+            dlp::delegate_account(
+                &payer.pubkey(),
+                &wallet.pubkey(),
+                &er.identity(),
+            ),
+        ];
+        base.send_with(&payer, &[&wallet], &delegate_setup).await?;
+        poll_until(CLONE_TIMEOUT, || async {
+            matches!(
+                er.api().get_balance(&wallet.pubkey()).await,
+                Ok(balance) if balance == WALLET_LAMPORTS
+            )
+        })
+        .await;
+
+        let identity = topology::er_identity_keypair()?;
+        let cycle = [
+            commit_state(
+                er.identity(),
+                wallet.pubkey(),
+                system::system_id(),
+                CommitStateArgs {
+                    nonce: 1,
+                    lamports: WALLET_LAMPORTS,
+                    allow_undelegation: true,
+                    data: vec![],
+                },
+            ),
+            finalize(er.identity(), wallet.pubkey()),
+            undelegate(
+                er.identity(),
+                wallet.pubkey(),
+                system::system_id(),
+                payer.pubkey(),
+            ),
+            system::assign(&wallet.pubkey(), &dlp::dlp_id()),
+            dlp::delegate_account(
+                &payer.pubkey(),
+                &wallet.pubkey(),
+                &er.identity(),
+            ),
+        ];
+        base.send_with(&payer, &[&identity, &wallet], &cycle)
+            .await?;
+
+        let continuity_deadline = Instant::now() + CONTINUITY_WINDOW;
+        while Instant::now() < continuity_deadline {
+            assert!(
+                er.account(&wallet.pubkey()).await?.is_some(),
+                "the er clone must survive a one-transaction undelegate + \
+                 redelegate"
+            );
+            tokio::time::sleep(CONTINUITY_STEP).await;
+        }
+        let wallet_on_base = base
+            .account(&wallet.pubkey())
+            .await?
+            .ok_or("the cycled wallet vanished on base")?;
+        assert_eq!(
+            wallet_on_base.owner,
+            dlp::dlp_id(),
+            "the wallet must be delegated again on base after the cycle"
+        );
+        assert_eq!(
+            er.api().get_balance(&wallet.pubkey()).await?,
+            WALLET_LAMPORTS,
+            "the er clone balance must be intact after the cycle"
+        );
+        er.send(
+            &wallet,
+            &[system::transfer(
+                &wallet.pubkey(),
+                &wallet.pubkey(),
+                CYCLE_SPEND,
+            )],
+        )
+        .await?;
+
         Ok(ScenarioReport::ok(self.name())
             .setting("account space", crate::ACCOUNT_SPACE)
+            .setting("redelegation continuity window ms", 2_000u64)
             .metric("fresh clone visibility ms", clone_visibility_ms)
             .metric("base-to-er propagation ms", propagation_ms))
     }

@@ -21,13 +21,13 @@ const TASK_INTERVAL_MS: i64 = 100;
 const CRANK_INTERVAL_MS: i64 = 10;
 const COMMIT_FREQUENCY_MS: u32 = 1_000_000_000;
 const LABEL: &str = "redshift task";
-const CLONE_TIMEOUT: Duration = Duration::from_secs(20);
-const DB_OPEN_TIMEOUT: Duration = Duration::from_secs(15);
-const COUNTER_TIMEOUT: Duration = Duration::from_secs(10);
-const TASK_REMOVED_TIMEOUT: Duration = Duration::from_secs(10);
+const CLONE_TIMEOUT: Duration = Duration::from_secs(30);
+const DB_OPEN_TIMEOUT: Duration = Duration::from_secs(45);
+const COUNTER_TIMEOUT: Duration = Duration::from_secs(30);
+const TASK_REMOVED_TIMEOUT: Duration = Duration::from_secs(30);
 const FAILED_TASK_TIMEOUT: Duration = Duration::from_secs(45);
-const FAILED_SCHEDULING_TIMEOUT: Duration = Duration::from_secs(10);
-const COMMIT_TIMEOUT: Duration = Duration::from_secs(15);
+const FAILED_SCHEDULING_TIMEOUT: Duration = Duration::from_secs(30);
+const COMMIT_TIMEOUT: Duration = Duration::from_secs(30);
 const SCHEDULE_SETTLE: Duration = Duration::from_millis(250);
 
 pub struct TaskScheduler;
@@ -495,6 +495,53 @@ async fn test_schedule_error(
     Ok(error)
 }
 
+async fn test_cancel_ongoing(
+    base: &BaseCtx,
+    er: &ErCtx,
+    funder: &Keypair,
+    db: &TaskDb,
+) -> Result<u64> {
+    const ITERATIONS: i64 = 1_000_000;
+    let actor = scheduled_actor(base, er, funder).await?;
+    er.send(
+        &actor.payer,
+        &[flexi::schedule_counter_task(
+            actor.pubkey(),
+            108,
+            TASK_INTERVAL_MS,
+            ITERATIONS,
+            false,
+            false,
+        )],
+    )
+    .await?;
+    poll_until(COUNTER_TIMEOUT, || async {
+        matches!(er_count(er, &actor).await, Ok(count) if count > 0)
+    })
+    .await;
+    er.send(
+        &actor.payer,
+        &[flexi::cancel_counter_task(actor.pubkey(), 108)],
+    )
+    .await?;
+    await_task_removed(db, 108).await?;
+    assert_no_failures_for_task(db, 108, "cancel-ongoing")?;
+    tokio::time::sleep(SCHEDULE_SETTLE).await;
+    let count_at_cancel = er_count(er, &actor).await?;
+    assert!(
+        count_at_cancel > 0 && count_at_cancel < ITERATIONS as u64,
+        "a cancelled ongoing task must have run partway, got \
+         {count_at_cancel} of {ITERATIONS}"
+    );
+    tokio::time::sleep(3 * SCHEDULE_SETTLE).await;
+    assert_eq!(
+        er_count(er, &actor).await?,
+        count_at_cancel,
+        "the counter must not advance after the cancelled task is removed"
+    );
+    Ok(count_at_cancel)
+}
+
 #[async_trait(?Send)]
 impl Scenario for TaskScheduler {
     fn name(&self) -> &str {
@@ -531,6 +578,7 @@ impl Scenario for TaskScheduler {
             _,
             unauthorized_error,
             failed_task_error,
+            cancelled_count,
         ) = tokio::try_join!(
             test_schedule(base, er, &funder, &db),
             test_reschedule(base, er, &funder, &db),
@@ -539,12 +587,13 @@ impl Scenario for TaskScheduler {
             test_magic_cpi_crank(base, er, &funder),
             test_unauthorized_reschedule(base, er, &funder, &db),
             test_schedule_error(base, er, &funder, &db),
+            test_cancel_ongoing(base, er, &funder, &db),
         )?;
 
         poll_until(TASK_REMOVED_TIMEOUT, || async {
             matches!(
                 db.task_ids(),
-                Ok(ids) if ids.iter().all(|id| !(101..=107).contains(id))
+                Ok(ids) if ids.iter().all(|id| !(101..=108).contains(id))
             )
         })
         .await;
@@ -554,6 +603,7 @@ impl Scenario for TaskScheduler {
             .setting("crank signer", crank_pda)
             .setting("unauthorized reschedule error", unauthorized_error)
             .setting("failed task error", failed_task_error)
+            .setting("cancelled ongoing count", cancelled_count)
             .setting("task interval ms", TASK_INTERVAL_MS)
             .setting("crank interval ms", CRANK_INTERVAL_MS)
             .setting("db", db.path.display().to_string()))

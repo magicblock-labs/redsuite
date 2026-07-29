@@ -21,6 +21,7 @@ const TX_TIMEOUT: Duration = Duration::from_secs(20);
 const COMMIT_FREQUENCY_MS: u32 = 1_000_000_000;
 const LABEL_ONE: &str = "counter of payer 1";
 const LABEL_TWO: &str = "counter of payer 2";
+const LABEL_FRESH: &str = "counter of the fresh authority";
 
 pub struct LedgerRestoreBasics;
 
@@ -402,11 +403,96 @@ impl Scenario for LedgerRestoreBasics {
                 report.setting(format!("{label} sender lamports"), expected);
         }
 
-        // NOTE: the upstream new-validator-authority restore (test 14) is not
-        // ported. A fresh identity needs a validator-fees-vault on base, and
-        // only the dlp admin can create it — the mainnet-cloned dlp keeps its
-        // real authority, so no local key qualifies. See the incr-28 identity
-        // rework in redshift.md.
+        // new authority — the full write -> kill -> restore cycle works for
+        // an identity that has never validated before (upstream 14; the
+        // pool-injected fees vault replaces upstream's genesis accounts). The
+        // reader boots against the live base like upstream's does — a cloned
+        // program does NOT survive an offline restore (probed 2026-07-29:
+        // the account vanishes without a remote to re-clone from), so the
+        // program assert is presence + byte equality, not ledger provenance.
+        {
+            let mut writer =
+                boot_writer(base, "restore-fresh-authority").await?;
+            let identity = writer.ctx().identity();
+            let vault = dlp::validator_fees_vault_pda(&identity);
+            let vault_on_base = base
+                .account(&vault)
+                .await?
+                .ok_or("the fresh identity has no fees vault on base")?;
+            assert_eq!(
+                vault_on_base.owner,
+                dlp::dlp_id(),
+                "the pool-injected fees vault must be dlp-owned"
+            );
+            let actor =
+                counter_actor(base, writer.ctx(), &funder, LABEL_FRESH).await?;
+            let er = writer.ctx();
+            er.send(&actor.payer, &[flexi::add(actor.payer.pubkey(), 7)])
+                .await?;
+            let expected = FlexiCounter {
+                count: 7,
+                updates: 1,
+                label: LABEL_FRESH.to_owned(),
+            };
+            assert_counter(er, &actor.counter, &expected, "written").await?;
+            let program = er
+                .account(&redshift_program::id())
+                .await?
+                .ok_or("the redshift program did not clone into the er")?;
+            assert!(
+                program.executable,
+                "the cloned program must present as executable"
+            );
+            advance_slots(er, PERSIST_SLOTS).await?;
+            writer.stop(true).await?;
+            drop(writer);
+
+            let reader = boot_reader(
+                base,
+                "restore-fresh-authority",
+                "ephemeral",
+                false,
+                vec![],
+            )
+            .await?;
+            let er = reader.ctx();
+            assert_counter(er, &actor.counter, &expected, "restored").await?;
+            poll_until(CLONE_TIMEOUT, || async {
+                matches!(er.account(&redshift_program::id()).await, Ok(Some(_)))
+            })
+            .await;
+            let restored_program =
+                er.account(&redshift_program::id())
+                    .await?
+                    .ok_or("the cloned program vanished in the restore")?;
+            assert!(
+                restored_program.executable,
+                "the restored program must stay executable"
+            );
+            assert_eq!(
+                restored_program.owner, program.owner,
+                "the restored program owner"
+            );
+            assert_eq!(
+                restored_program.data.len(),
+                program.data.len(),
+                "the restored program size"
+            );
+            // the first 48 bytes are the LoaderV4State header, whose deploy
+            // slot is re-stamped on every clone
+            assert_eq!(
+                restored_program.data[48..],
+                program.data[48..],
+                "the restored program bytecode"
+            );
+            report = report
+                .setting("fresh authority", identity)
+                .setting(
+                    "fresh authority vault lamports",
+                    vault_on_base.lamports,
+                )
+                .setting("restored program owner", restored_program.owner);
+        }
 
         Ok(report.setting("persist slots", PERSIST_SLOTS))
     }

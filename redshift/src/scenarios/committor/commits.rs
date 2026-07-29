@@ -155,6 +155,14 @@ impl Scenario for Commits {
                      got {commit_error}"
                 )
             })?;
+        if commit_rejection == "MissingAccount" {
+            eprintln!(
+                "[redsuite] {}: warning: the foreign commit was rejected \
+                 with MissingAccount; upstream 01_commits asserts \
+                 IllegalOwner exactly",
+                self.name()
+            );
+        }
 
         let undelegate = crate::init_schedulecommit_committees(
             base,
@@ -195,6 +203,14 @@ impl Scenario for Commits {
                      {undelegate_pda}, got {undelegate_error}"
                 )
             })?;
+        if undelegate_rejection == "MissingAccount" {
+            eprintln!(
+                "[redsuite] {}: warning: the foreign undelegation was \
+                 rejected with MissingAccount; upstream 01_commits asserts \
+                 ReadonlyDataModified exactly",
+                self.name()
+            );
+        }
 
         Ok(report
             .setting("commit frequency ms", crate::COMMIT_FREQUENCY_MS)

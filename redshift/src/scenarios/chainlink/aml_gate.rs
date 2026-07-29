@@ -38,6 +38,7 @@ const SHUTTLE_ID: u32 = 0;
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
 const QUERY_TIMEOUT: Duration = Duration::from_secs(15);
 const UNDELEGATION_TIMEOUT: Duration = Duration::from_secs(20);
+const MERGE_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct MockRangeServer {
     base_url: String,
@@ -172,28 +173,42 @@ impl Scenario for AmlGate {
     async fn run(&self, base: &BaseCtx, _er: &ErCtx) -> Result<ScenarioReport> {
         let report = ScenarioReport::ok(self.name());
 
-        // Test Case 1: High-risk owner (score = 9) -> post-delegation merge blocked -> auto-undelegated
-        let (high_risk_queries, owner_risky_pk) =
-            run_risk_case(base, 9, false, "aml-risky").await?;
+        // High-risk owner (score 9): the merge is blocked, no tokens move,
+        // and the shuttle ATA is undelegated on base.
+        let risky = run_risk_case(base, 9, false, "aml-risky").await?;
 
-        // Test Case 2: Low-risk owner (score = 1) -> post-delegation merge allowed -> stays delegated
-        let (low_risk_queries, owner_low_pk) =
-            run_risk_case(base, 1, true, "aml-low-risk").await?;
+        // Low-risk owner (score 1): the merge executes and the shuttle
+        // tokens land in the destination on the er.
+        let low = run_risk_case(base, 1, true, "aml-low-risk").await?;
 
         Ok(report
-            .setting("high-risk owner", owner_risky_pk)
-            .setting("high-risk queries", high_risk_queries)
-            .setting("low-risk owner", owner_low_pk)
-            .setting("low-risk queries", low_risk_queries))
+            .setting("high-risk owner", risky.owner)
+            .setting("high-risk queries", risky.queries)
+            .setting("high-risk merge", risky.merge_error)
+            .setting("high-risk destination tokens", risky.destination_tokens)
+            .setting("high-risk record at end", risky.record_at_end)
+            .setting("low-risk owner", low.owner)
+            .setting("low-risk queries", low.queries)
+            .setting("low-risk merge", low.merge_error)
+            .setting("low-risk destination tokens", low.destination_tokens)
+            .setting("low-risk record at end", low.record_at_end))
     }
+}
+
+struct RiskCaseOutcome {
+    queries: usize,
+    owner: Pubkey,
+    merge_error: String,
+    destination_tokens: u64,
+    record_at_end: bool,
 }
 
 async fn run_risk_case(
     base: &BaseCtx,
     owner_risk: u64,
-    _expect_allowed: bool,
+    expect_allowed: bool,
     label: &str,
-) -> Result<(usize, Pubkey)> {
+) -> Result<RiskCaseOutcome> {
     let mut server = MockRangeServer::start()?;
     let owner = Keypair::new();
     let owner_pk = owner.pubkey();
@@ -280,17 +295,11 @@ async fn run_risk_case(
 
     let fees_vault =
         dlp_api::pda::validator_fees_vault_pda_from_validator(&er_identity);
-    if base.account(&fees_vault).await?.is_none() {
-        let admin = topology::er_identity_keypair()?;
-        let init_fees_ix =
-            dlp_api::instruction_builder::init_validator_fees_vault(
-                fee_payer.pubkey(),
-                admin.pubkey(),
-                er_identity,
-            );
-        base.send_with(&fee_payer, &[&admin], &[init_fees_ix])
-            .await?;
-    }
+    assert!(
+        base.account(&fees_vault).await?.is_some(),
+        "the private ER identity {er_identity} has no validator fees vault on \
+         base — genesis did not supply one for this pool slot"
+    );
 
     let er_ctx = private.ctx();
     let _ = er_ctx.account(&source_ata).await;
@@ -327,23 +336,130 @@ async fn run_risk_case(
         "Range risk server did not check shuttle owner"
     );
 
-    // 6. Verify undelegation completes on base
-    poll_until(UNDELEGATION_TIMEOUT, || async {
-        !delegation_record_exists(base, &shuttle_ata)
-            .await
-            .unwrap_or(true)
-    })
-    .await;
-    assert!(
-        !delegation_record_exists(base, &shuttle_ata).await?,
-        "shuttle ATA delegation record was not undelegated on base chain"
-    );
+    // 6. Verify the gate decision through the merge itself: an allowed merge
+    // moves the shuttle tokens into the destination on the er, a blocked
+    // merge moves nothing and the shuttle ATA is undelegated on base.
+    // Delegation-record persistence is NOT a discriminator for the allowed
+    // side on this stack — record it as an observation only.
+    // 6. Verify the gate decision through the merge ATTEMPT: an allowed
+    // owner gets the merge executed on the er (one er transaction that
+    // references both the shuttle ATA and the destination), a blocked owner
+    // gets the action dropped — no such transaction exists — and the shuttle
+    // ATA is undelegated on base. The merge's OUTCOME is version-adaptive:
+    // the mainnet-deployed eATA build differs from the build upstream tests
+    // against, and under the mainnet pairing the attempt fails with
+    // IllegalOwner, which routes the account into the same
+    // failing-action-undelegates path. Delegation-record persistence is
+    // therefore NOT a discriminator for the allowed side — the attempt is.
+    let (merge_error, destination_tokens) = if expect_allowed {
+        poll_until(MERGE_TIMEOUT, || async {
+            matches!(
+                merge_attempt(er_ctx, &shuttle_ata, &destination_ata).await,
+                Ok(Some(_))
+            )
+        })
+        .await;
+        let attempt = merge_attempt(er_ctx, &shuttle_ata, &destination_ata)
+            .await?
+            .ok_or("the merge attempt vanished after the poll")?;
+        let tokens = if attempt.is_none() {
+            poll_until(MERGE_TIMEOUT, || async {
+                matches!(
+                    er_token_amount(er_ctx, &destination_ata).await,
+                    Ok(amount) if amount == SHUTTLE_AMOUNT
+                )
+            })
+            .await;
+            let amount = er_token_amount(er_ctx, &destination_ata).await?;
+            assert_eq!(
+                amount, SHUTTLE_AMOUNT,
+                "an executed merge must move the shuttle tokens to the \
+                 destination"
+            );
+            amount
+        } else {
+            let amount = er_token_amount(er_ctx, &destination_ata).await?;
+            assert_eq!(
+                amount, 0,
+                "a failed merge attempt must not move the shuttle tokens"
+            );
+            amount
+        };
+        (attempt.unwrap_or_else(|| "none".to_owned()), tokens)
+    } else {
+        poll_until(UNDELEGATION_TIMEOUT, || async {
+            !delegation_record_exists(base, &shuttle_ata)
+                .await
+                .unwrap_or(true)
+        })
+        .await;
+        assert!(
+            !delegation_record_exists(base, &shuttle_ata).await?,
+            "the high-risk shuttle ATA must be undelegated on base"
+        );
+        assert!(
+            merge_attempt(er_ctx, &shuttle_ata, &destination_ata)
+                .await?
+                .is_none(),
+            "a blocked owner must not get a merge attempt on the er"
+        );
+        let amount = er_token_amount(er_ctx, &destination_ata).await?;
+        assert_eq!(
+            amount, 0,
+            "the blocked merge must not move the shuttle tokens"
+        );
+        ("blocked".to_owned(), amount)
+    };
+    let record_at_end = delegation_record_exists(base, &shuttle_ata).await?;
 
     let queries = server.request_count();
     private.stop(true).await?;
     server.stop();
 
-    Ok((queries, owner_pk))
+    Ok(RiskCaseOutcome {
+        queries,
+        owner: owner_pk,
+        merge_error,
+        destination_tokens,
+        record_at_end,
+    })
+}
+
+// The merge attempt is the er transaction that references both the shuttle
+// ATA and the destination. Outer None = no attempt; Some(None) = the attempt
+// succeeded; Some(Some(text)) = the attempt failed with that error.
+async fn merge_attempt(
+    er: &ErCtx,
+    shuttle_ata: &Pubkey,
+    destination_ata: &Pubkey,
+) -> Result<Option<Option<String>>> {
+    let shuttle_signatures =
+        er.api().get_signatures_for_address(shuttle_ata, 10).await?;
+    let destination_signatures = er
+        .api()
+        .get_signatures_for_address(destination_ata, 10)
+        .await?;
+    let Some(shared) = shuttle_signatures
+        .iter()
+        .find(|signature| destination_signatures.contains(signature))
+    else {
+        return Ok(None);
+    };
+    let tx = er
+        .api()
+        .await_transaction(&shared.parse()?, Duration::from_secs(5))
+        .await?;
+    Ok(Some(tx.err.map(|err| format!("{err:?}"))))
+}
+
+async fn er_token_amount(er: &ErCtx, ata: &Pubkey) -> Result<u64> {
+    let Some(account) = er.account(ata).await? else {
+        return Ok(0);
+    };
+    if account.data.len() < 72 {
+        return Ok(0);
+    }
+    Ok(u64::from_le_bytes(account.data[64..72].try_into()?))
 }
 
 fn token_program() -> Pubkey {

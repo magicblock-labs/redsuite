@@ -29,6 +29,9 @@ const AIRDROP: u64 = 2_000_000_000;
 const SOURCE_BALANCE: u64 = 200;
 const DESTINATION_BALANCE: u64 = 100;
 const TRANSFER_AMOUNT: u64 = 100;
+const PLAIN_BALANCE: u64 = 70;
+const FOREIGN_BALANCE: u64 = 40;
+const FAILING_AMOUNT: u64 = 1_000_000;
 const TOKEN_AMOUNT_OFFSET: usize = 64;
 const PROJECTION_TIMEOUT: Duration = Duration::from_secs(20);
 const ACTION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -174,6 +177,138 @@ impl Scenario for PostDelegationTokenTransfer {
         })
         .await;
 
+        // negative: an ATA with NO eATA must clone as the plain chain
+        // account, never a projection.
+        let plain_owner = Keypair::new().pubkey();
+        let plain_ata = derive_ata(&plain_owner, &mint_key);
+        base.send_with(
+            &fee_payer,
+            &[&source_authority],
+            &[
+                create_ata_idempotent(
+                    &fee_payer.pubkey(),
+                    &plain_owner,
+                    &mint_key,
+                ),
+                mint_to(&mint_key, &plain_ata, &source, PLAIN_BALANCE),
+            ],
+        )
+        .await?;
+        poll_until(PROJECTION_TIMEOUT, || async {
+            token_balance(er, &plain_ata).await.is_some()
+        })
+        .await;
+        assert_eq!(
+            token_balance(er, &plain_ata).await,
+            Some(PLAIN_BALANCE),
+            "an ATA without an eATA must present its chain balance on the er"
+        );
+
+        // negative: an eATA delegated to a FOREIGN validator must not be
+        // substituted — the er presents the drained chain ATA, not the eATA.
+        let foreign_validator = Keypair::new().pubkey();
+        let foreign_authority = Keypair::new();
+        let foreign = foreign_authority.pubkey();
+        let foreign_ata = derive_ata(&foreign, &mint_key);
+        base.send_with(
+            &fee_payer,
+            &[&source_authority],
+            &[
+                create_ata_idempotent(&fee_payer.pubkey(), &foreign, &mint_key),
+                mint_to(&mint_key, &foreign_ata, &source, FOREIGN_BALANCE),
+                initialize_eata(&fee_payer.pubkey(), &foreign, &mint_key),
+            ],
+        )
+        .await?;
+        base.send_with(
+            &fee_payer,
+            &[&foreign_authority],
+            &[deposit_spl_tokens(&foreign, &mint_key, FOREIGN_BALANCE)],
+        )
+        .await?;
+        base.send(
+            &fee_payer,
+            &[delegate_eata_to(
+                &fee_payer.pubkey(),
+                &foreign,
+                &mint_key,
+                &foreign_validator,
+            )],
+        )
+        .await?;
+        assert_eq!(
+            token_balance(base, &foreign_ata).await,
+            Some(0),
+            "the foreign user's chain ATA must be drained into the vault"
+        );
+        poll_until(PROJECTION_TIMEOUT, || async {
+            token_balance(er, &foreign_ata).await.is_some()
+        })
+        .await;
+        assert_eq!(
+            token_balance(er, &foreign_ata).await,
+            Some(0),
+            "an eATA delegated to a foreign validator must not substitute — \
+             the er must present the drained chain ATA"
+        );
+
+        // failing post-delegation action — an action that cannot execute
+        // must route the freshly delegated account into scheduled
+        // undelegation (ownership returns to system on base).
+        let failing_account = Keypair::new();
+        base.airdrop(&failing_account.pubkey(), AIRDROP).await?;
+        let failing_action = spl_transfer(
+            &source_ata,
+            &destination_ata,
+            &source,
+            FAILING_AMOUNT,
+        );
+        let failing_delegate = delegate_with_actions(
+            fee_payer.pubkey(),
+            failing_account.pubkey(),
+            None,
+            DelegateArgs {
+                commit_frequency_ms: u32::MAX,
+                seeds: vec![],
+                validator: Some(er.identity()),
+            },
+            vec![failing_action.cleartext()],
+        );
+        base.send_with(
+            &fee_payer,
+            &[&failing_account],
+            &[system::assign(&failing_account.pubkey(), &dlp::dlp_id())],
+        )
+        .await?;
+        base.send_with(
+            &fee_payer,
+            &[&failing_account, &source_authority],
+            &[failing_delegate],
+        )
+        .await?;
+        poll_until(ACTION_TIMEOUT, || async {
+            matches!(
+                base.account(&failing_account.pubkey()).await,
+                Ok(Some(account)) if account.owner == system::system_id()
+            )
+        })
+        .await;
+        let failing_on_base = base
+            .account(&failing_account.pubkey())
+            .await?
+            .ok_or("the failing-action account vanished on base")?;
+        assert_eq!(
+            failing_on_base.owner,
+            system::system_id(),
+            "a failing post-delegation action must undelegate the account \
+             back to its system owner"
+        );
+        assert_eq!(
+            token_balance(er, &source_ata).await,
+            Some(SOURCE_BALANCE - TRANSFER_AMOUNT),
+            "the failing action must not move tokens"
+        );
+
         Ok(ScenarioReport::ok(self.name())
             .setting("mint decimals", 0u64)
             .setting("transfer amount", TRANSFER_AMOUNT)
@@ -186,7 +321,9 @@ impl Scenario for PostDelegationTokenTransfer {
                 token_balance(er, &destination_ata)
                     .await
                     .unwrap_or_default(),
-            ))
+            )
+            .setting("plain ata on er", PLAIN_BALANCE)
+            .setting("foreign-delegated ata on er", 0u64))
     }
 }
 
@@ -355,9 +492,18 @@ fn delegate_eata(
     mint: &Pubkey,
     er: &ErCtx,
 ) -> Instruction {
+    delegate_eata_to(payer, user, mint, &er.identity())
+}
+
+fn delegate_eata_to(
+    payer: &Pubkey,
+    user: &Pubkey,
+    mint: &Pubkey,
+    validator: &Pubkey,
+) -> Instruction {
     let eata = derive_eata(user, mint);
     let mut data = vec![4u8];
-    data.extend_from_slice(er.identity().as_ref());
+    data.extend_from_slice(validator.as_ref());
     Instruction {
         program_id: eata_program(),
         accounts: vec![
