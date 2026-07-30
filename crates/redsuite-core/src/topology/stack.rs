@@ -545,6 +545,7 @@ async fn boot_er(
         &format!("ws://127.0.0.1:{}", state.base_ws_port),
         state.er_rpc_port,
         state.er_metrics_port,
+        er_ports.single()?,
         &dir.join("er-storage"),
         &[],
         true,
@@ -579,6 +580,7 @@ fn er_command(
     base_ws_url: &str,
     listen_port: u16,
     metrics_port: u16,
+    replication_port: u16,
     storage_dir: &Path,
     extra_env: &[(String, String)],
     reset: bool,
@@ -590,6 +592,7 @@ fn er_command(
         base_ws_url,
         listen_port,
         metrics_port,
+        replication_port,
         storage_dir,
         extra_env,
         reset,
@@ -599,6 +602,11 @@ fn er_command(
 
 // An offline validator serves its restored ledger with no base chain; it
 // gets no --remotes.
+//
+// The engine-integration validator keeps only --remotes / --lifecycle / -l on
+// the command line. Identity, storage and reset moved into the MBV_ config
+// tree: figment strips the prefix, splits on `__` and turns the remaining `_`
+// into `-`, so MBV_ENGINE__LEDGER__DIRECTORY sets engine.ledger.directory.
 #[allow(clippy::too_many_arguments)]
 fn er_command_with_lifecycle(
     er_bin: &Path,
@@ -607,6 +615,7 @@ fn er_command_with_lifecycle(
     base_ws_url: &str,
     listen_port: u16,
     metrics_port: u16,
+    replication_port: u16,
     storage_dir: &Path,
     extra_env: &[(String, String)],
     reset: bool,
@@ -621,20 +630,19 @@ fn er_command_with_lifecycle(
     }
     cmd.args(["--lifecycle", lifecycle])
         .arg("-l")
-        .arg(format!("127.0.0.1:{listen_port}"))
-        .arg("-k")
-        .arg(identity.to_base58_string()) // throwaway test identity
-        .arg("--storage")
-        .arg(storage_dir);
-    // --reset wipes only the ledger (rocksdb) and skips replay; it preserves
-    // the accountsdb. A restart-in-place relaunch omits it so the ER reopens
-    // the on-disk ledger + accountsdb it already has.
-    if reset {
-        cmd.arg("--reset");
-    }
-    cmd.arg("--no-tui");
-    // Not `-m`: the CLI overlay feeds a bare string where a MetricsConfig
-    // struct is expected and the validator exits — the env path works.
+        .arg(format!("127.0.0.1:{listen_port}"));
+    cmd.env("MBV_ENGINE__AUTHORITY__LOCAL", identity.to_base58_string());
+    cmd.env("MBV_ENGINE__LEDGER__DIRECTORY", storage_dir);
+    cmd.env(
+        "MBV_ENGINE__ACCOUNTSDB__DIRECTORY",
+        storage_dir.join("accountsdb"),
+    );
+    // concurrent ERs collide unless each gets its own replication port
+    cmd.env(
+        "MBV_ENGINE__REPLICATION__BIND_ADDRESS",
+        format!("127.0.0.1:{replication_port}"),
+    );
+    cmd.env("MBV_LEDGER__RESET", reset.to_string());
     cmd.env("MBV_METRICS__ADDRESS", format!("127.0.0.1:{metrics_port}"));
     for (key, value) in extra_env {
         cmd.env(key, value);
@@ -715,6 +723,7 @@ pub struct PrivateEr {
     base_ws_url: String,
     rpc_port: u16,
     metrics_port: u16,
+    replication_port: u16,
     env: Vec<(String, String)>,
     lifecycle: String,
     storage_dir: PathBuf,
@@ -824,6 +833,7 @@ impl PrivateEr {
             &self.base_ws_url,
             self.rpc_port,
             self.metrics_port,
+            self.replication_port,
             &self.storage_dir,
             &self.env,
             config.reset,
@@ -951,6 +961,7 @@ pub async fn private_er(
     let mut ports = PortLease::default();
     let (rpc_port, ws_port) = ports.pair()?;
     let metrics_port = ports.single()?;
+    let replication_port = ports.single()?;
     let storage_dir = dir.join(format!("er-{}", options.label));
     if !options.keep_storage {
         let _ = fs::remove_dir_all(&storage_dir);
@@ -965,6 +976,7 @@ pub async fn private_er(
         &base_ws_url,
         rpc_port,
         metrics_port,
+        replication_port,
         &storage_dir,
         &options.env,
         options.reset,
@@ -1015,6 +1027,7 @@ pub async fn private_er(
         base_ws_url,
         rpc_port,
         metrics_port,
+        replication_port,
         env: options.env,
         lifecycle: options.lifecycle,
         storage_dir,

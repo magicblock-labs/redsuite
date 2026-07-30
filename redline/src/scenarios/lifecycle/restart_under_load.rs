@@ -293,17 +293,10 @@ impl Scenario for RestartUnderLoad {
             base,
             topology::ErOptions {
                 label: "restart-under-load".to_owned(),
-                env: vec![
-                    (
-                        "MBV_ACCOUNTSDB__DATABASE_SIZE".to_owned(),
-                        profile.database_size.to_string(),
-                    ),
-                    (
-                        "MBV_ACCOUNTSDB__INDEX_SIZE".to_owned(),
-                        profile.index_size.to_string(),
-                    ),
-                    ("MBV_LEDGER__BLOCK_TIME".to_owned(), "50ms".to_owned()),
-                ],
+                env: vec![(
+                    "MBV_ENGINE__BLOCKSTORE__BLOCKTIME".to_owned(),
+                    "50ms".to_owned(),
+                )],
                 request_timeout: None,
                 ..Default::default()
             },

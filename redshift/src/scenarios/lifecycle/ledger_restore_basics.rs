@@ -372,10 +372,10 @@ impl Scenario for LedgerRestoreBasics {
             drop(writer);
 
             let env = if reset {
-                vec![
-                    ("MBV_ACCOUNTSDB__RESET".to_owned(), "true".to_owned()),
-                    ("MBV_TASK_SCHEDULER__RESET".to_owned(), "true".to_owned()),
-                ]
+                vec![(
+                    "MBV_TASK_SCHEDULER__RESET".to_owned(),
+                    "true".to_owned(),
+                )]
             } else {
                 vec![]
             };
