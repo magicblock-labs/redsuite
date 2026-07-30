@@ -11,6 +11,7 @@ use pubkey::Pubkey;
 use redsuite_core::{
     assert::poll_until,
     host, prep,
+    profile::select as select_profile,
     runner::{drive, drive_until, RunConfig, RunOutcome},
     topology::{self, RestartConfig, RestartTiming},
     BaseCtx, ChainCtx, ErCtx, Result, Scenario, ScenarioReport, TxSender,
@@ -72,15 +73,11 @@ const DEEP: Profile = Profile {
     index_size: 512 * 1024 * 1024,
 };
 
-fn profile() -> &'static Profile {
-    match std::env::var("REDSUITE_PROFILE") {
-        Ok(name) if name == "full" => &FULL,
-        Ok(name) if name == "deep" => &DEEP,
-        Ok(name) if name == "lite" => &LITE,
-        Ok(name) => {
-            panic!("unknown REDSUITE_PROFILE `{name}` (lite|full|deep)")
-        }
-        Err(_) => &LITE,
+fn profile(scenario: &str) -> &'static Profile {
+    match select_profile(scenario, &["lite", "full", "deep"]) {
+        "deep" => &DEEP,
+        "full" => &FULL,
+        _ => &LITE,
     }
 }
 
@@ -287,7 +284,7 @@ impl Scenario for RestartUnderLoad {
     }
 
     async fn run(&self, base: &BaseCtx, _er: &ErCtx) -> Result<ScenarioReport> {
-        let profile = profile();
+        let profile = profile(self.name());
         let prep_payers =
             prep::funded_payers(base, profile.payers, PREP_PAYER_LAMPORTS)
                 .await?;

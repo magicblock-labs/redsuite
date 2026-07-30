@@ -8,7 +8,9 @@ use async_trait::async_trait;
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    prep, report,
+    prep,
+    profile::select as select_profile,
+    report,
     runner::{drive, RunConfig},
     stats::{ObservationsStats, StreamingStats},
     topology, BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario,
@@ -55,12 +57,10 @@ const FULL: Profile = Profile {
     prep_payers: 8,
 };
 
-fn profile() -> &'static Profile {
-    match std::env::var("REDSUITE_PROFILE") {
-        Ok(name) if name == "full" => &FULL,
-        Ok(name) if name == "lite" => &LITE,
-        Ok(name) => panic!("unknown REDSUITE_PROFILE `{name}` (lite|full)"),
-        Err(_) => &LITE,
+fn profile(scenario: &str) -> &'static Profile {
+    match select_profile(scenario, &["lite", "full"]) {
+        "full" => &FULL,
+        _ => &LITE,
     }
 }
 
@@ -185,7 +185,7 @@ impl Scenario for ColdHydrationTail {
     }
 
     async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
-        let profile = profile();
+        let profile = profile(self.name());
         let prep_payers =
             prep::funded_payers(base, profile.prep_payers, PREP_PAYER_LAMPORTS)
                 .await?;

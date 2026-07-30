@@ -10,7 +10,9 @@ use pubkey::Pubkey;
 use redsuite_core::{
     api::custom_error_code,
     assert::poll_until,
-    prep, receipt, report,
+    prep,
+    profile::select as select_profile,
+    receipt, report,
     runner::{drive, RunConfig},
     stats::StreamingStats,
     topology, Api, BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario,
@@ -63,12 +65,10 @@ const FULL: Profile = Profile {
     probes: true,
 };
 
-fn profile() -> &'static Profile {
-    match std::env::var("REDSUITE_PROFILE") {
-        Ok(name) if name == "full" => &FULL,
-        Ok(name) if name == "lite" => &LITE,
-        Ok(name) => panic!("unknown REDSUITE_PROFILE `{name}` (lite|full)"),
-        Err(_) => &LITE,
+fn profile(scenario: &str) -> &'static Profile {
+    match select_profile(scenario, &["lite", "full"]) {
+        "full" => &FULL,
+        _ => &LITE,
     }
 }
 
@@ -128,7 +128,6 @@ async fn scheduling_outcome(
     }
 }
 
-const ALT_PROGRAM_ID: &str = "AddressLookupTab1e1111111111111111111111111";
 const SIGNATURE_SCAN_LIMIT: usize = 1000;
 
 struct BaseFlowSnapshot {
@@ -150,8 +149,7 @@ async fn snapshot_base_flow(base_api: &Api) -> Result<BaseFlowSnapshot> {
     let committor_program: Pubkey = topology::COMMITTOR_ID
         .parse()
         .expect("pinned committor program id parses");
-    let alt_program: Pubkey =
-        ALT_PROGRAM_ID.parse().expect("alt program id parses");
+    let alt_program: Pubkey = sdk_ids::address_lookup_table::ID;
     let mut flow = HashSet::new();
     flow.extend(
         base_api
@@ -186,7 +184,7 @@ impl Scenario for CommitWidthEnvelope {
     }
 
     async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
-        let profile = profile();
+        let profile = profile(self.name());
         let payer = prep::funded_payer(base, PAYER_LAMPORTS).await?;
         let payer_pubkey = payer.pubkey();
         let pdas = crate::init_delegated_accounts(

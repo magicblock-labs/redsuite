@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use redsuite_core::{
     assert::poll_until,
     prep,
+    profile::select as select_profile,
     runner::{drive, drive_closed, RunConfig},
     transport::ws::{AccountUpdates, SignatureConfirmations},
     BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
@@ -58,15 +59,11 @@ const SOAK: Profile = Profile {
     concurrency: 256,
 };
 
-fn profile() -> &'static Profile {
-    match std::env::var("REDSUITE_PROFILE") {
-        Ok(name) if name == "full" => &FULL,
-        Ok(name) if name == "soak" => &SOAK,
-        Ok(name) if name == "lite" => &LITE,
-        Ok(name) => {
-            panic!("unknown REDSUITE_PROFILE `{name}` (lite|full|soak)")
-        }
-        Err(_) => &LITE,
+fn profile(scenario: &str) -> &'static Profile {
+    match select_profile(scenario, &["lite", "full", "soak"]) {
+        "soak" => &SOAK,
+        "full" => &FULL,
+        _ => &LITE,
     }
 }
 
@@ -92,7 +89,7 @@ impl Scenario for WarmIngress {
     }
 
     async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
-        let profile = profile();
+        let profile = profile(self.name());
         let payers =
             prep::funded_payers(base, profile.payers, PAYER_LAMPORTS).await?;
         let pdas = crate::init_delegated_accounts(

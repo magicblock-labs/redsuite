@@ -5,7 +5,9 @@ use futures_util::future::join_all;
 use pubkey::Pubkey;
 use redsuite_core::{
     assert::poll_until,
-    prep, report,
+    prep,
+    profile::select as select_profile,
+    report,
     runner::{drive, RunConfig},
     topology, BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario,
     ScenarioReport,
@@ -79,12 +81,10 @@ const FULL: Profile = Profile {
     concurrency: 64,
 };
 
-fn profile() -> &'static Profile {
-    match std::env::var("REDSUITE_PROFILE") {
-        Ok(name) if name == "full" => &FULL,
-        Ok(name) if name == "lite" => &LITE,
-        Ok(name) => panic!("unknown REDSUITE_PROFILE `{name}` (lite|full)"),
-        Err(_) => &LITE,
+fn profile(scenario: &str) -> &'static Profile {
+    match select_profile(scenario, &["lite", "full"]) {
+        "full" => &FULL,
+        _ => &LITE,
     }
 }
 
@@ -144,7 +144,7 @@ impl Scenario for CloneLruChurn {
     }
 
     async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
-        let profile = profile();
+        let profile = profile(self.name());
         let prep_payers =
             prep::funded_payers(base, profile.prep_payers, PREP_PAYER_LAMPORTS)
                 .await?;

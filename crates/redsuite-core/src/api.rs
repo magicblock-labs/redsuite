@@ -1,6 +1,3 @@
-//! Public-API client. Interim JSON-RPC subset until the redline engine port
-//! (pooled transports, WebSocket subscriptions).
-
 use std::{collections::HashMap, str::FromStr, time::Duration};
 
 use account::Account;
@@ -153,8 +150,6 @@ impl Api {
         &self.url
     }
 
-    /// Raw JSON-RPC call; `params` is the literal JSON params array, e.g.
-    /// `["4Nd1…", {"encoding":"base64"}]`.
     pub async fn call<T: DeserializeOwned>(
         &self,
         method: &str,
@@ -399,7 +394,6 @@ pub fn custom_error_code(err: &json::Value) -> Option<u32> {
         .and_then(|code| u32::try_from(code).ok())
 }
 
-/// Snapshot of the ER's Prometheus `/metrics` endpoint.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Metrics(pub HashMap<String, f64>);
 
@@ -425,8 +419,6 @@ impl Metrics {
         }
     }
 
-    /// Keys are stored both with their label set (`mbv_x{a="b"}`) and bare
-    /// (`mbv_x`, last sample wins).
     pub fn parse(text: &str) -> Self {
         let mut map = HashMap::new();
         for line in text.lines() {

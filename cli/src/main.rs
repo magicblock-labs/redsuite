@@ -1,4 +1,15 @@
-use redsuite_core::{report, run_scenario, topology, Result, ScenarioReport};
+use futures_util::StreamExt;
+use redsuite_core::{
+    profile, report, run_scenario, topology, Result, ScenarioReport,
+};
+
+const PRIVATE_ER_MARKERS: &[&str] = &[
+    "aml_gate",
+    "config_gates",
+    "ledger_restore",
+    "task_scheduler",
+];
+const PRIVATE_ER_CONCURRENCY: usize = 2;
 
 macro_rules! registry {
     ($(($name:literal, $scenario:path)),* $(,)?) => {
@@ -50,6 +61,8 @@ registry![
     ("redshift/multi_program_clone", redshift::scenarios::chainlink::multi_program_clone::MultiProgramClone),
     ("redshift/loader_matrix", redshift::scenarios::chainlink::loader_matrix::LoaderMatrix),
     ("redshift/post_delegation_token_transfer", redshift::scenarios::chainlink::post_delegation_token_transfer::PostDelegationTokenTransfer),
+    ("redshift/aml_gate", redshift::scenarios::chainlink::aml_gate::AmlGate),
+    ("redshift/table_mania", redshift::scenarios::committor::table_mania::TableManiaScenario),
     ("redhat/illegal_writable", redhat::scenarios::chainlink::illegal_writable::IllegalWritable),
     ("redhat/fee_payer_rules", redhat::scenarios::aperture::fee_payer_rules::FeePayerRules),
 ];
@@ -57,7 +70,7 @@ registry![
 const USAGE: &str = "\
 usage:
   redsuite list [family]                       list scenarios (family: redline|redshift|redhat)
-  redsuite run <scenario|family|all> [opts]    run scenarios sequentially
+  redsuite run <scenario|family|all> [opts]    run scenarios (benchmarks last, alone)
       --profile <lite|full|soak|deep>          scenario profile (default lite)
       --loop <open|closed>                     S1 loop mode
   redsuite stack status                        show the shared base+ER stack
@@ -100,6 +113,31 @@ fn selected(target: &str) -> Vec<&'static str> {
     }
 }
 
+fn is_private_er(name: &str) -> bool {
+    PRIVATE_ER_MARKERS
+        .iter()
+        .any(|marker| name.contains(marker))
+}
+
+async fn run_lane(names: Vec<&'static str>, limit: usize) -> Result<()> {
+    if names.is_empty() {
+        return Ok(());
+    }
+    let limit = limit.clamp(1, names.len());
+    let mut running = futures_util::stream::iter(names)
+        .map(|name| async move {
+            eprintln!("[redsuite] starting {name}");
+            (name, run_one(name).await)
+        })
+        .buffer_unordered(limit);
+    while let Some((name, report)) = running.next().await {
+        report.ok_or_else(|| {
+            format!("scenario `{name}` vanished from the registry")
+        })?;
+    }
+    Ok(())
+}
+
 async fn run(args: &[String]) -> Result<()> {
     let Some(target) = args.first() else { usage() };
 
@@ -107,7 +145,16 @@ async fn run(args: &[String]) -> Result<()> {
     while let Some(flag) = options.next() {
         let value = options.next().unwrap_or_else(|| usage());
         match flag.as_str() {
-            "--profile" => std::env::set_var("REDSUITE_PROFILE", value),
+            "--profile" => {
+                if !profile::is_known(value) {
+                    return Err(format!(
+                        "unknown profile `{value}` (expected {})",
+                        profile::ALL.join("|")
+                    )
+                    .into());
+                }
+                std::env::set_var("REDSUITE_PROFILE", value)
+            }
             "--loop" => std::env::set_var("REDSUITE_LOOP", value),
             _ => usage(),
         }
@@ -121,16 +168,41 @@ async fn run(args: &[String]) -> Result<()> {
         .into());
     }
 
-    // Scenarios drive one shared stack and record performance numbers: a
-    // co-tenant run contends for the box and corrupts them. Never parallel.
-    for name in &scenarios {
-        eprintln!("[redsuite] running {name}");
-        run_one(name).await.ok_or_else(|| {
-            format!("scenario `{name}` vanished from the registry")
-        })?;
+    let total_scenarios = scenarios.len();
+    let (benchmarks, functional): (Vec<_>, Vec<_>) = scenarios
+        .into_iter()
+        .partition(|name| name.starts_with("redline/"));
+    let (private_er, shared): (Vec<_>, Vec<_>) =
+        functional.into_iter().partition(|name| is_private_er(name));
+
+    if !shared.is_empty() || !private_er.is_empty() {
+        eprintln!(
+            "[redsuite] running {} shared-stack and {} private-ER scenarios \
+             in parallel",
+            shared.len(),
+            private_er.len()
+        );
+        let shared_count = shared.len();
+        let (shared_outcome, private_outcome) = futures_util::future::join(
+            run_lane(shared, shared_count),
+            run_lane(private_er, PRIVATE_ER_CONCURRENCY),
+        )
+        .await;
+        shared_outcome?;
+        private_outcome?;
     }
-    if scenarios.len() > 1 {
-        eprintln!("[redsuite] {} scenarios passed", scenarios.len());
+
+    // Benchmarks run last and alone
+    if !benchmarks.is_empty() {
+        eprintln!(
+            "[redsuite] running {} benchmark scenarios sequentially",
+            benchmarks.len()
+        );
+        run_lane(benchmarks, 1).await?;
+    }
+
+    if total_scenarios > 1 {
+        eprintln!("[redsuite] {total_scenarios} scenarios passed");
     }
     Ok(())
 }
@@ -143,7 +215,7 @@ fn list(family: Option<&str>) {
     }
 }
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let arg = |index: usize| args.get(index).map(String::as_str);

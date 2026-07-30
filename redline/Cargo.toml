@@ -15,6 +15,7 @@ instruction = { workspace = true }
 pubkey = { workspace = true }
 keypair = { workspace = true }
 signer = { workspace = true }
+sdk-ids = { workspace = true }
 signature = { workspace = true }
 
 [dev-dependencies]

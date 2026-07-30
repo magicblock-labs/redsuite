@@ -1,5 +1,3 @@
-//! Read back persisted scenario reports: list, diff two runs, export BMF.
-
 use std::{collections::BTreeMap, fs, path::PathBuf};
 
 use json::{Deserialize, Serialize};

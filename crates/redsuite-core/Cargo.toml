@@ -23,6 +23,7 @@ signature = { workspace = true }
 instruction = { workspace = true }
 account = { workspace = true }
 signer = { workspace = true }
+sdk-ids = { workspace = true }
 hash = { workspace = true }
 transaction = { workspace = true }
 bincode = { workspace = true }

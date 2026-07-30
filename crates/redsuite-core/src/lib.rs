@@ -7,6 +7,7 @@ pub mod loader_v4;
 pub mod mdp;
 pub mod monitor;
 pub mod prep;
+pub mod profile;
 pub mod receipt;
 pub mod report;
 pub mod runner;

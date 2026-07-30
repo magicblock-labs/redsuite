@@ -1,5 +1,3 @@
-//! Hand-built magic-domain-program instructions and the ErRecord byte layout.
-
 use instruction::{AccountMeta, Instruction};
 use pubkey::Pubkey;
 

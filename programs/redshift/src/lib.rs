@@ -1,5 +1,3 @@
-//! Correctness-fixture program (counter-style state the redshift scenarios assert on).
-
 #![allow(unexpected_cfgs)]
 
 #[cfg(feature = "schedulecommit")]

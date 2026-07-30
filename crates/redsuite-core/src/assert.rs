@@ -2,7 +2,6 @@ use std::{future::Future, time::Duration};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
-/// Polls `condition` until it returns true; panics once `timeout` elapses.
 pub async fn poll_until<F, Fut>(timeout: Duration, mut condition: F)
 where
     F: FnMut() -> Fut,

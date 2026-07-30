@@ -1,15 +1,9 @@
-//! Topology harness: spawn the base L1 and the ER on dynamically allocated
-//! ports, with a readiness gate covering the ER's startup checks (identity
-//! funding, fee-vault init, mdp registration).
-//!
-//! One shared boot-once stack serves all scenarios (see `stack`); private
-//! per-scenario topologies come back with the restart/ledger-restore family.
-
 mod stack;
 
 pub use stack::{
-    current_state, down, er_bin_path, er_identity_keypair, private_er,
-    redline_alias_ids, redline_loader_v3_pair, redshift_loader_v3_target,
-    shared, stack_dir, status, workspace_root, ErOptions, PrivateEr,
-    RestartConfig, RestartTiming, StackState, COMMITTOR_ID, DLP_ID, MDP_ID,
+    current_state, down, er_bin_path, er_identity_keypair, identity_for_label,
+    private_er, redline_alias_ids, redline_loader_v3_pair,
+    redshift_loader_v3_target, shared, stack_dir, status, workspace_root,
+    ErOptions, PrivateEr, RestartConfig, RestartTiming, StackState,
+    COMMITTOR_ID, DLP_ID, MDP_ID,
 };

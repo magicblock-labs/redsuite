@@ -1,14 +1,5 @@
-//! The shared stack: one base L1 + one ER, booted by the first scenario that
-//! needs it, reused by every scenario in every run until `cargo xtask stack
-//! down` (an unhealthy stack is killed and rebooted transparently).
-//!
-//! nextest runs each test in its own process, so reuse is coordinated across
-//! processes: `state.json` records ports + PIDs, an exclusive flock
-//! serializes `shared()`, and validators are spawned into their own process
-//! group to outlive the tests. Isolation comes from fresh keypairs, not
-//! fresh chains; future restart scenarios must use private topologies.
-
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -43,7 +34,6 @@ const CLONED_UPGRADEABLE_PROGRAMS: &[&str] =
 const CLONED_LEGACY_PROGRAMS: &[&str] =
     &[MEMO_V1_ID, MEMO_V2_ID, ATA_PROGRAM_ID];
 
-/// Keep in sync with `declare_id!` in `programs/*/src/lib.rs`.
 const FAMILY_PROGRAMS: &[(&str, &str)] = &[
     (
         "3JnJ727jWEmPVU8qfXwtH63sCNDX7nMgsLbg8qy8aaPX",
@@ -136,6 +126,10 @@ pub fn er_identity_keypair() -> Result<Keypair> {
 const VAULT_SPACE: usize = 8;
 const VAULT_LAMPORTS: u64 = 10_000_000;
 
+const IDENTITY_POOL_SIZE: usize = 32;
+const POOL_MAP_FILE: &str = "identity-pool.json";
+const POOL_LOCK_FILE: &str = "identity-pool.lock";
+
 fn vault_dump_json(vault: &Pubkey) -> String {
     let data =
         base64::engine::general_purpose::STANDARD.encode([0u8; VAULT_SPACE]);
@@ -144,11 +138,69 @@ fn vault_dump_json(vault: &Pubkey) -> String {
     )
 }
 
+fn write_vault_dump(dir: &Path, identity: &Pubkey) -> Result<()> {
+    let vault = crate::dlp::validator_fees_vault_pda(identity);
+    fs::write(dir.join(format!("{vault}.json")), vault_dump_json(&vault))?;
+    Ok(())
+}
+
+pub fn identity_for_label(label: &str) -> Result<Keypair> {
+    let state = read_state()
+        .ok_or("no shared stack state — boot the shared stack first")?;
+    if state.er_identity_pool.is_empty() {
+        return Err("this stack predates per-ER identities — run \
+                    `redsuite stack down` and boot it again"
+            .into());
+    }
+    let dir = stack_dir();
+    let _guard = PoolLock::acquire(&dir)?;
+    let map_path = dir.join(POOL_MAP_FILE);
+    let mut assignments: BTreeMap<String, usize> =
+        fs::read_to_string(&map_path)
+            .ok()
+            .and_then(|raw| json::from_str(&raw).ok())
+            .unwrap_or_default();
+
+    let slot = match assignments.get(label) {
+        Some(slot) => *slot,
+        None => {
+            let slot = assignments.len();
+            if slot >= state.er_identity_pool.len() {
+                return Err(format!(
+                    "the stack reserved {} private-ER identities and all are \
+                     bound; raise IDENTITY_POOL_SIZE and boot a fresh stack",
+                    state.er_identity_pool.len()
+                )
+                .into());
+            }
+            assignments.insert(label.to_owned(), slot);
+            fs::write(&map_path, json::to_string(&assignments)?)?;
+            slot
+        }
+    };
+    Keypair::try_from(&state.er_identity_pool[slot][..]).map_err(|e| {
+        format!("corrupt state.json: bad pool identity {slot}: {e}").into()
+    })
+}
+
+struct PoolLock(#[allow(dead_code)] fs::File);
+
+impl PoolLock {
+    fn acquire(dir: &Path) -> Result<Self> {
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join(POOL_LOCK_FILE))?;
+        file.lock()?;
+        Ok(Self(file))
+    }
+}
+
 const BASE_BIN: &str = "solana-test-validator";
 const ER_BIN: &str = "magicblock-validator";
 const ER_BIN_ENV: &str = "MAGICBLOCK_VALIDATOR_BIN";
 
-/// ER startup gate: identity must hold ≥ 5 SOL on the base. Fund with headroom.
 const IDENTITY_FUNDING_LAMPORTS: u64 = 20 * 1_000_000_000;
 
 const BASE_LEDGER_SHREDS: &str = "200000";
@@ -166,7 +218,6 @@ pub struct StackState {
     pub base_faucet_port: u16,
     pub base_gossip_port: u16,
     pub base_pid: u32,
-    /// Binary file name — guards recorded PIDs against PID reuse.
     pub base_bin: String,
     pub er_rpc_port: u16,
     pub er_ws_port: u16,
@@ -175,6 +226,7 @@ pub struct StackState {
     pub er_bin: String,
     pub er_identity: String,
     pub er_identity_keypair: Vec<u8>,
+    pub er_identity_pool: Vec<Vec<u8>>,
     pub clone_url: String,
 }
 
@@ -258,17 +310,12 @@ fn contexts(state: &StackState) -> Result<(BaseCtx, ErCtx)> {
     Ok((base, er))
 }
 
-/// Reuse-path liveness: PID alive *and* still the recorded binary (guards
-/// against PID recycling; only sound after the exec is known to be done).
 fn proc_matches(pid: u32, bin: &str) -> bool {
     fs::read(format!("/proc/{pid}/cmdline"))
         .map(|cmdline| String::from_utf8_lossy(&cmdline).contains(bin))
         .unwrap_or(false)
 }
 
-/// Boot-path liveness: existence + non-zombie. Right after `spawn()` the
-/// cmdline may still show the parent image (exec not done), and recycling is
-/// impossible while we hold the child un-reaped.
 fn proc_running(pid: u32) -> bool {
     let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
         return false;
@@ -297,18 +344,29 @@ async fn boot() -> Result<StackState> {
     let base_bin = find_base_bin()?;
     let er_bin = find_er_bin()?;
 
-    let (base_rpc_port, base_ws_port) = free_port_pair()?;
-    let base_faucet_port = free_port()?;
-    let base_gossip_port = free_port()?;
-    let (er_rpc_port, er_ws_port) = free_port_pair()?;
-    let er_metrics_port = free_port()?;
+    let mut base_ports = PortLease::default();
+    let (base_rpc_port, base_ws_port) = base_ports.pair()?;
+    let base_faucet_port = base_ports.single()?;
+    let base_gossip_port = base_ports.single()?;
+    let mut er_ports = PortLease::default();
+    let (er_rpc_port, er_ws_port) = er_ports.pair()?;
+    let er_metrics_port = er_ports.single()?;
 
     let identity = Keypair::new();
+    let identity_pool: Vec<Keypair> =
+        (0..IDENTITY_POOL_SIZE).map(|_| Keypair::new()).collect();
     let clone_url = std::env::var(CLONE_URL_ENV)
         .unwrap_or_else(|_| DEFAULT_CLONE_URL.to_owned());
-    let fees_vault = crate::dlp::validator_fees_vault_pda(&identity.pubkey());
-    let vault_dump = dir.join("validator-fees-vault.json");
-    fs::write(&vault_dump, vault_dump_json(&fees_vault))?;
+
+    let genesis_accounts = dir.join("genesis-accounts");
+    let _ = fs::remove_dir_all(&genesis_accounts);
+    fs::create_dir_all(&genesis_accounts)?;
+    write_vault_dump(&genesis_accounts, &identity.pubkey())?;
+    for reserved in &identity_pool {
+        write_vault_dump(&genesis_accounts, &reserved.pubkey())?;
+    }
+    let _ = fs::remove_file(dir.join(POOL_MAP_FILE));
+    let _ = fs::remove_file(dir.join(POOL_LOCK_FILE));
 
     let mut cmd = Command::new(&base_bin);
     cmd.args(["--reset", "--log", "--bind-address", "127.0.0.1"])
@@ -319,9 +377,7 @@ async fn boot() -> Result<StackState> {
         .args(["--faucet-port", &base_faucet_port.to_string()])
         .args(["--gossip-port", &base_gossip_port.to_string()])
         .args(["--url", &clone_url]);
-    cmd.arg("--account")
-        .arg(fees_vault.to_string())
-        .arg(&vault_dump);
+    cmd.arg("--account-dir").arg(&genesis_accounts);
     for id in CLONED_ACCOUNTS {
         cmd.arg("--clone").arg(id);
     }
@@ -360,6 +416,7 @@ async fn boot() -> Result<StackState> {
          (cloning from {clone_url}) …"
     );
     let base_log = dir.join("base.log");
+    base_ports.release();
     let base_pid = spawn_detached(cmd, &base_log)?;
 
     let state = StackState {
@@ -376,10 +433,16 @@ async fn boot() -> Result<StackState> {
         er_bin: bin_name(&er_bin),
         er_identity: identity.pubkey().to_string(),
         er_identity_keypair: identity.to_bytes().to_vec(),
+        er_identity_pool: identity_pool
+            .iter()
+            .map(|reserved| reserved.to_bytes().to_vec())
+            .collect(),
         clone_url,
     };
 
-    match boot_er(&dir, &er_bin, &identity, &state, &base_log).await {
+    match boot_er(&dir, &er_bin, &identity, &state, &base_log, &mut er_ports)
+        .await
+    {
         Ok(er_pid) => {
             let state = StackState { er_pid, ..state };
             write_state(&state)?;
@@ -408,6 +471,7 @@ async fn boot_er(
     identity: &Keypair,
     state: &StackState,
     base_log: &Path,
+    er_ports: &mut PortLease,
 ) -> Result<u32> {
     let base_rpc_url = format!("http://127.0.0.1:{}", state.base_rpc_port);
 
@@ -454,6 +518,11 @@ async fn boot_er(
     for id in CLONED_ACCOUNTS {
         required.push(id.parse()?);
     }
+    for reserved in &state.er_identity_pool {
+        let reserved = Keypair::try_from(&reserved[..])
+            .map_err(|e| format!("corrupt pool identity: {e}"))?;
+        required.push(crate::dlp::validator_fees_vault_pda(&reserved.pubkey()));
+    }
     for account in required {
         if base_ctx.account(&account).await?.is_none() {
             return Err(format!(
@@ -482,6 +551,7 @@ async fn boot_er(
     );
     eprintln!("[redsuite] booting ER on 127.0.0.1:{} …", state.er_rpc_port);
     let er_log = dir.join("er.log");
+    er_ports.release();
     let er_pid = spawn_detached(cmd, &er_log)?;
 
     let er_api = Api::new(format!("http://127.0.0.1:{}", state.er_rpc_port));
@@ -858,7 +928,7 @@ async fn await_magic_fee_vault(
         if tokio::time::Instant::now() >= deadline {
             return Err(format!(
                 "the magic fee vault {vault} for identity {identity} is not \
-                 on base — the shared er did not create it in time"
+                 on base — the er did not create it in time"
             )
             .into());
         }
@@ -873,14 +943,14 @@ pub async fn private_er(
     let dir = stack_dir();
     fs::create_dir_all(&dir)?;
     let er_bin = find_er_bin()?;
-    let identity = er_identity_keypair()?;
+    let identity = identity_for_label(&options.label)?;
     if options.lifecycle == "ephemeral" {
         ensure_identity_funded(base, &identity.pubkey()).await?;
-        await_magic_fee_vault(base, &identity.pubkey()).await?;
     }
 
-    let (rpc_port, ws_port) = free_port_pair()?;
-    let metrics_port = free_port()?;
+    let mut ports = PortLease::default();
+    let (rpc_port, ws_port) = ports.pair()?;
+    let metrics_port = ports.single()?;
     let storage_dir = dir.join(format!("er-{}", options.label));
     if !options.keep_storage {
         let _ = fs::remove_dir_all(&storage_dir);
@@ -904,6 +974,7 @@ pub async fn private_er(
         "[redsuite] booting private ER `{}` on 127.0.0.1:{rpc_port} …",
         options.label
     );
+    ports.release();
     let child = spawn_child(cmd, &log)?;
     let pid = child.id();
 
@@ -919,6 +990,13 @@ pub async fn private_er(
     if let Err(e) = ready {
         kill_pid(pid);
         return Err(e);
+    }
+
+    if options.lifecycle == "ephemeral" {
+        if let Err(e) = await_magic_fee_vault(base, &identity.pubkey()).await {
+            kill_pid(pid);
+            return Err(e);
+        }
     }
 
     let ctx = ErCtx::new_with_timeout(
@@ -1032,7 +1110,6 @@ fn redline_aliases_of(so: &Path) -> Vec<Pubkey> {
     }
 }
 
-/// Version-coupled to the ER, so taken from the ER binary's own build tree.
 fn committor_so(er_bin: &Path) -> Option<PathBuf> {
     let deploy = er_bin
         .parent()?
@@ -1110,8 +1187,6 @@ fn send_signal(pid: u32, signal: &str) {
         .status();
 }
 
-/// Boot-error cleanup: the pid is a freshly spawned child of ours, so no
-/// cmdline gating (which would race the exec).
 fn kill_pid(pid: u32) {
     if pid == 0 || !proc_running(pid) {
         return;
@@ -1164,30 +1239,47 @@ fn tail(path: &Path, lines: usize) -> String {
     all[all.len().saturating_sub(lines)..].join("\n")
 }
 
-fn free_port() -> Result<u16> {
-    Ok(std::net::TcpListener::bind(("127.0.0.1", 0))?
-        .local_addr()?
-        .port())
+#[derive(Default)]
+struct PortLease {
+    holders: Vec<std::net::TcpListener>,
 }
 
-/// Adjacent pair — both validators hardwire WS = RPC + 1.
-fn free_port_pair() -> Result<(u16, u16)> {
-    for _ in 0..64 {
+impl PortLease {
+    fn single(&mut self) -> Result<u16> {
         let holder = std::net::TcpListener::bind(("127.0.0.1", 0))?;
         let port = holder.local_addr()?.port();
-        if port == u16::MAX {
-            continue;
-        }
-        if std::net::TcpListener::bind(("127.0.0.1", port + 1)).is_ok() {
-            return Ok((port, port + 1));
-        }
+        self.holders.push(holder);
+        Ok(port)
     }
-    Err("could not find two adjacent free ports".into())
+
+    fn pair(&mut self) -> Result<(u16, u16)> {
+        let mut rejected = Vec::new();
+        for _ in 0..64 {
+            let first = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+            let port = first.local_addr()?.port();
+            if port == u16::MAX {
+                rejected.push(first);
+                continue;
+            }
+            match std::net::TcpListener::bind(("127.0.0.1", port + 1)) {
+                Ok(second) => {
+                    self.holders.push(first);
+                    self.holders.push(second);
+                    return Ok((port, port + 1));
+                }
+                Err(_) => rejected.push(first),
+            }
+        }
+        Err("could not find two adjacent free ports".into())
+    }
+
+    fn release(&mut self) {
+        self.holders.clear();
+    }
 }
 
 struct LockGuard(#[allow(dead_code)] std::fs::File);
 
-/// Exclusive advisory flock; released when the guard drops.
 async fn acquire_lock(path: PathBuf) -> Result<LockGuard> {
     let file = tokio::task::spawn_blocking(
         move || -> std::io::Result<std::fs::File> {

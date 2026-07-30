@@ -1,5 +1,3 @@
-//! Adaptive rate pacer + concurrency cap, ported from redline's bencher.
-
 use std::{
     sync::Arc,
     time::{Duration, Instant},

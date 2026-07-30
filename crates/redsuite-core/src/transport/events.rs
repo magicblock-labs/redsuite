@@ -1,5 +1,3 @@
-//! Notification-collecting WS client for logs / program / slot subscriptions.
-
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,

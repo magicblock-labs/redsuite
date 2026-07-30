@@ -38,12 +38,6 @@ impl Actor {
     }
 }
 
-fn dlp_id() -> Pubkey {
-    "DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh"
-        .parse()
-        .expect("dlp id")
-}
-
 fn decode(data: &[u8]) -> Result<FlexiCounter> {
     Ok(FlexiCounter::try_decode(data)?)
 }
@@ -79,7 +73,7 @@ async fn setup_actor(base: &BaseCtx, er: &ErCtx, label: &str) -> Result<Actor> {
         .ok_or("the counter is not on base after delegate")?;
     assert_eq!(
         on_base.owner,
-        dlp_id(),
+        dlp::dlp_id(),
         "dlp must own the delegated counter"
     );
 
@@ -210,7 +204,7 @@ async fn await_undelegated_on_er(er: &ErCtx, counter: &Pubkey) -> Result<()> {
     poll_until(STATE_TIMEOUT, || async {
         matches!(
             er.account(counter).await,
-            Ok(Some(acc)) if acc.owner != dlp_id()
+            Ok(Some(acc)) if acc.owner != dlp::dlp_id()
         )
     })
     .await;
@@ -402,12 +396,12 @@ async fn flow_bundle_mixed(base: &BaseCtx, er: &ErCtx) -> Result<()> {
     await_base_count(base, &bundle_c.counter, 90).await?;
     assert_eq!(
         base_owner(base, &bundle_a.counter).await?,
-        dlp_id(),
+        dlp::dlp_id(),
         "a commit-only bundle member stays delegated"
     );
     assert_eq!(
         base_owner(base, &bundle_b.counter).await?,
-        dlp_id(),
+        dlp::dlp_id(),
         "a commit-only bundle member stays delegated"
     );
     await_undelegated_on_er(er, &bundle_c.counter).await?;
@@ -424,12 +418,12 @@ async fn flow_bundle_commit_only(base: &BaseCtx, er: &ErCtx) -> Result<()> {
     await_base_count(base, &only_b.counter, 88).await?;
     assert_eq!(
         base_owner(base, &only_a.counter).await?,
-        dlp_id(),
+        dlp::dlp_id(),
         "a commit-only bundle member stays delegated"
     );
     assert_eq!(
         base_owner(base, &only_b.counter).await?,
-        dlp_id(),
+        dlp::dlp_id(),
         "a commit-only bundle member stays delegated"
     );
     Ok(())
@@ -467,12 +461,12 @@ async fn flow_bundle_commit_and_finalize(
     await_base_count(base, &finalize_actor.counter, 47).await?;
     assert_eq!(
         base_owner(base, &commit_actor.counter).await?,
-        dlp_id(),
+        dlp::dlp_id(),
         "commit keeps the account delegated"
     );
     assert_eq!(
         base_owner(base, &finalize_actor.counter).await?,
-        dlp_id(),
+        dlp::dlp_id(),
         "commit-finalize keeps the account delegated"
     );
     Ok(())

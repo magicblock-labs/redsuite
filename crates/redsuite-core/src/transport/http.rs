@@ -1,14 +1,9 @@
-//! Interim HTTP shim over `reqwest` (plain HTTP, no TLS features) until
-//! redline's pooled transport is ported in its place.
-
 use std::time::Duration;
 
 use crate::Result;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Kept per-`Api`, never global: a reqwest client's connections are tied to
-/// the tokio runtime that drove them, and every `#[tokio::test]` has its own.
 pub fn client() -> reqwest::Client {
     client_with_timeout(REQUEST_TIMEOUT)
 }

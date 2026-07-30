@@ -31,7 +31,7 @@ One-time setup:
 Then, in this repo:
 
     cargo xtask programs      # build the family SBF programs
-    cargo test --workspace    # or: cargo nextest run
+    cargo nextest run         # run everything
 
 The first test boots the base + ER; every other test — and every later run —
 reuses them. `cargo xtask stack down` stops the stack.
@@ -49,10 +49,9 @@ reuses them. `cargo xtask stack down` stops the stack.
 ## Writing a scenario
 
 Scenarios live in the family libraries under `<family>/src/scenarios/
-<subsystem>/<name>.rs`: one `Scenario` impl each — the harness owns process
-spawning, ports, funding and teardown. See
-`redshift/src/scenarios/harness/example.rs` — a small working scenario
-meant to be copied as the starting point.
+<subsystem>/<name>.rs`: one `Scenario` impl each, exported from the
+subsystem's `mod.rs`. The harness owns process spawning, ports, funding and
+teardown. See `redshift/src/scenarios/harness/example.rs`.
 
 Each scenario is reachable two ways, and a new one needs both:
 
@@ -72,14 +71,18 @@ benchmark hosts use — no cargo, no checkout of the tests:
     redsuite list                             # every scenario
     redsuite run redline/high_cu              # one scenario (short names work too)
     redsuite run redline --profile full       # a whole family
-    redsuite run all                          # everything, sequentially
+    redsuite run all                          # everything (redline last, alone)
     redsuite stack status                     # ports, pids, health
     redsuite stack down                       # stop the shared stack
     redsuite report compare                   # diff the latest two runs
 
 It still needs `solana-test-validator` on PATH and the ER binary under test
-(`MAGICBLOCK_VALIDATOR_BIN`), and it reads the fixtures and built programs from
-the workspace — set `REDSUITE_ROOT` when running it outside a checkout.
+(`MAGICBLOCK_VALIDATOR_BIN`), and it reads the built programs from the
+workspace. Set `REDSUITE_ROOT` when it runs outside a checkout.
+
+`run all` uses three lanes: every shared-stack scenario at once, at most two
+private-ER scenarios beside them, then the redline family last and alone.
+Benchmarks must never share the box, so keep that last lane exclusive.
 
 ## Running
 
@@ -87,26 +90,43 @@ the workspace — set `REDSUITE_ROOT` when running it outside a checkout.
     cargo nextest run -p redline                            # one family
     cargo nextest run                                       # everything
 
-(plain `cargo test` works identically; cargo-nextest is not required)
+Use cargo-nextest. The concurrency limits live in `.config/nextest.toml`:
+private-ER scenarios run two at a time, and the redline family runs alone.
+`cargo test` ignores those limits, so it can start a benchmark next to a
+neighbour that spoils it. Run one suite invocation at a time either way.
 
 All scenarios share **one boot-once stack**: the first test to need it boots
 base + ER on dynamically allocated ports and leaves them running; every later
 test — in the same run or the next — health-checks and reuses them. A dead or
 unhealthy stack is killed and rebooted transparently. Coordination lives in
-`target/redsuite-stack/` (`state.json`, a cross-process flock, logs, ledgers).
+`target/redsuite-stack/` (`state.json`, `identity-pool.json`, a cross-process
+flock, `genesis-accounts/`, logs, ledgers).
 
     cargo xtask stack status    # ports, pids, health, log locations
     cargo xtask stack down      # stop the stack and clear its state
 
-Scenario isolation comes from fresh keypairs, not fresh chains — state left
-behind by earlier runs is invisible to new scenarios. Scenarios that must
-kill/restart validators (ledger-restore) will get private topologies and must
-not run against the shared stack.
+Scenario isolation comes from fresh keypairs, not fresh chains.
+Scenarios that kill a validator, restart one, or need their own config boot a private ER instead
+(`ledger_restore_*`, `task_scheduler`, `config_gates`, `aml_gate`). Each takes
+its own identity from a 32-slot pool minted at genesis, so private ERs never
+collide with the shared one.
 
 The harness needs two binaries:
 
 - base — `solana-test-validator` on PATH;
 - ER — `$MAGICBLOCK_VALIDATOR_BIN`, else `magicblock-validator` on PATH.
+
+## Environment
+
+| variable | what |
+|---|---|
+| `MAGICBLOCK_VALIDATOR_BIN` | the ER binary under test; else `magicblock-validator` on PATH |
+| `REDSUITE_ROOT` | workspace root, when the `redsuite` binary runs outside a checkout |
+| `REDSUITE_CLONE_URL` | where a cold boot clones base programs from; defaults to mainnet-beta |
+| `REDSUITE_PROFILE` | `lite` (default) or `full` |
+
+A cold boot clones its base programs from `REDSUITE_CLONE_URL`, so the first
+boot needs that endpoint. A warm stack does not, and neither does a rerun.
 
 ## redline scenarios
 
@@ -249,6 +269,31 @@ chainlink (account cloning):
   bytes, same owner, same balance, and later update on a base is cloned on ER. A missing
   account is read as missing, and an ER write to a delegated account stays off
   base until a commit.
+- `account_info_semantics` — query ER for an account that has never
+  existed, for ordinary funded wallets, and for an escrow payer, first
+  one account at a time and then in mixed batches. Every balance has to match
+  the base chain exactly, a top-up on base has to show through on the next ER
+  read, and an account that does not exist has to be considered as missing.
+- `parallel_cloning` — funds ten wallets on base and then reads all ten for
+  the first time at once, through five overlapping requests. The validator is
+  cloning ten accounts it has never seen.
+- `multi_program_clone` — sends one transaction that calls two programs the ER
+  has never seen. The validator has to fetch both program accounts and both of
+  their program-data accounts together before it can execute anything
+- `loader_matrix` — exercises all four BPF loaders in one run: memo v1 and
+  memo v2 cloned from mainnet with their original loaders intact, the redshift
+  fixture preloaded as an upgradeable v3 program, and a fourth copy that the
+  scenario deploys from scratch, calls, and then upgrades to a second build.
+- `escrow_cloning` — creates an escrowed payer, lets the ER clone the escrow
+  once, then tops that escrow up on base. Delegated escrow belongs to the ER, and base-side changes to it 
+  are not reflected on ER.
+- `post_delegation_token_transfer` — attaches an SPL transfer to a delegation,
+  so the validator runs that transfer the moment the account lands on
+  the ER. It also checks the projection that makes this work.
+- `aml_gate` — screens the owner of an incoming token account against a risk
+  API before the tokens are merged. An owner scored above the threshold never
+  gets a merge: no transaction goes near the destination, and the account is
+  handed back undelegated.
 
 committor (ER → base commits):
 
@@ -256,14 +301,69 @@ committor (ER → base commits):
   and checks it lands on base byte-for-byte while the other doesn't move.
   Then commits and undelegates both — the owning program gets its accounts
   back with the exact final bytes.
-- `claim_fees` — creates a fees vault, funds it, claims it. The lamports
-  move from the vault to the validator.
+- `commits` — commits one delegated account, then two of them together, and
+  checks that the receipt names exactly the accounts that were committed and
+  that a single base transaction carried them. Then it reaches for an account
+  delegated to a *different* validator: this ER owns neither the state nor
+  the right to release it, so committing it and undelegating it must both be
+  rejected.
+- `commit_and_undelegate` — walks the whole round trip and then back again:
+  commit, undelegate, write to the account on base so that the program owns
+  it once more, and delegate it a second time. Along the way it pushes a 10 KB
+  order book through the same pipeline to check that large state is preserved
+  byte-for-byte, and it files one undelegation so the owning program refuses
+  it. The account then keeps its committed state but stays delegated, which is
+  the failure mode worth knowing about.
+- `commit_limit_and_fees` — commits the same account until it runs into the
+  free limit, where the next plain commit is refused but a commit-and-undelegate
+  still gets through. Past the higher paid limit the commit succeeds for a
+  charge, and the exact lamports are paid by the payer and turn up in the validator's
+  vault. It closes by offering an intent with too many accounts, which the
+  validator has to reject while it is still being scheduled.
+- `intent_flows` — schedules intents one at a time and in bundles, each
+  carrying handlers that run on base once the commit has landed and pay out of
+  the payer's escrow.
+- `claim_fees` — funds the validator's own fee vault on base and then claims
+  it, signed by the validator itself. The lamports land on the identity and the
+  vault is left sitting at its rent-exempt floor.
+- `table_mania` — drives the base chain's address lookup table program, the
+  one the committor uses when a commit outgrows a single transaction.
+  Creates a table, extends it to the 256-key cap, decodes the account and
+  requires the stored keys to match what was put in, then refuses the key that
+  would overflow it and deactivates the table.
 
 harness:
 
 - `api_invariants` — reads each transaction's block timestamp three
   different ways and checks all three agree, every time. Also registers,
   updates and removes a validator record in the domain registry.
+- `config_gates` — boots two private ERs: one whose allow list contains
+  a single program, and one with no list at all. The restricted validator has
+  to clone the program it was instructed. Neither of them may create a lookup table on base,
+  at startup or while cloning.
+- `example` — the template from *Writing a scenario*.
+
+lifecycle (kill and restore):
+
+- `ledger_restore_basics` — writes to a private ER, kills it, brings
+  it back on the same ledger and reads everything back. It does that six times
+  with a different payload each time: an empty ledger, plain transfers, counter
+  programs, block timestamps, the two resume strategies (replay the ledger, or
+  reset and re-clone), and a validator identity that has never run before.
+  Restored state has to match what was written, down to signatures and times.
+- `ledger_restore_chain` — the same kill-and-restore cycle, now with payloads
+  that reach the base chain: delegated accounts, an account already committed,
+  transfers either side of an account flush, and a scheduled task that has to
+  carry on cranking once the validator is back.
+
+scheduler:
+
+- `task_scheduler` — schedules tasks on a private ER and watches the
+  crank work through them: a short repeating task that finishes and clears its
+  row, one cancelled halfway through, one rescheduled by its owner, one that
+  fails until its retries run out, and one that a second authority tries to
+  steal. The counters on the ER and the task database on disk both have to
+  tell the same story.
 
 pubsub (websocket subscriptions):
 
@@ -272,8 +372,32 @@ pubsub (websocket subscriptions):
   arrives with the right content. After unsubscribing, sends more transfers
   and checks nothing arrives.
 
+## redhat scenarios
+
+The security tests, one file each under `redhat/src/scenarios/<subsystem>/`.
+Each one performs an attack and requires the platform to refuse it.
+
+chainlink:
+
+- `illegal_writable` — tries four ways to commit accounts the caller has no
+  claim to: straight from a wallet, the same call buried between two innocent
+  transfers, and two variants routed through a second program that calls the
+  real owner first to look legitimate. Every one has to fail, the validator has
+  to say why in its logs, and the accounts have to be exactly as they were on
+  base once the dust settles.
+
+aperture:
+
+- `fee_payer_rules` — takes the fee rule from both sides. A delegated payer is
+  allowed to commit itself, and that commit has to reach base. A payer that is
+  not delegated may not pay ER fees at all, so its transaction is turned
+  away before anything runs.
+
 ## Base-chain programs & accounts
 
-- dlp and mdp are cloned from a live cluster
-- the ER identity and the dlp admin are fresh keypairs generated
-- `magicblock_committor_program.so` is taken from the ER binary's own build
+- dlp, mdp, SPL Token, both ATA programs and memo v1/v2 are cloned from
+  `REDSUITE_CLONE_URL` when the base chain starts. dlp keeps its real mainnet
+  upgrade authority, so no local key is its admin, and dlp calls that need the
+  admin cannot be tested.
+- ER identities are random keypairs
+- `magicblock_committor_program.so` is taken from the ER binary's own build.

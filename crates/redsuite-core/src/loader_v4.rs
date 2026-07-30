@@ -1,5 +1,3 @@
-//! LoaderV4 program deployment: create → set length → write chunks → deploy.
-
 use keypair::Keypair;
 use pubkey::Pubkey;
 use signer::Signer;
@@ -12,9 +10,7 @@ const DEPLOY_LAMPORTS: u64 = 10 * 1_000_000_000;
 const LENGTH_HEADROOM: u32 = 1024;
 
 pub fn loader_v4_id() -> Pubkey {
-    "LoaderV411111111111111111111111111111111111"
-        .parse()
-        .expect("loader v4 id")
+    sdk_ids::loader_v4::ID
 }
 
 pub async fn deploy_program(

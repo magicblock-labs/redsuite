@@ -10,7 +10,9 @@ use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
     assert::poll_until,
-    host, prep, report,
+    host, prep,
+    profile::select as select_profile,
+    report,
     runner::{drive, RunConfig, RunOutcome},
     stats::ObservationsStats,
     topology, BaseCtx, ChainCtx, ErClient, ErCtx, MetricsDelta, Result,
@@ -70,12 +72,10 @@ const FULL: Profile = Profile {
     concurrency: 2_048,
 };
 
-fn profile() -> &'static Profile {
-    match std::env::var("REDSUITE_PROFILE") {
-        Ok(name) if name == "full" => &FULL,
-        Ok(name) if name == "lite" => &LITE,
-        Ok(name) => panic!("unknown REDSUITE_PROFILE `{name}` (lite|full)"),
-        Err(_) => &LITE,
+fn profile(scenario: &str) -> &'static Profile {
+    match select_profile(scenario, &["lite", "full"]) {
+        "full" => &FULL,
+        _ => &LITE,
     }
 }
 
@@ -83,9 +83,7 @@ fn compute_unit_limit(limit: u32) -> Instruction {
     let mut data = vec![2u8];
     data.extend_from_slice(&limit.to_le_bytes());
     Instruction {
-        program_id: "ComputeBudget111111111111111111111111111111"
-            .parse()
-            .expect("compute budget id parses"),
+        program_id: sdk_ids::compute_budget::ID,
         accounts: Vec::new(),
         data,
     }
@@ -341,7 +339,7 @@ impl Scenario for ExecutorSaturation {
     }
 
     async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
-        let profile = profile();
+        let profile = profile(self.name());
         let programs: Arc<Vec<Pubkey>> =
             Arc::new(topology::redline_alias_ids(profile.programs));
         for program in programs.iter() {

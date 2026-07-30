@@ -1,12 +1,8 @@
-//! Hand-built dlp instructions and PDAs for the ephemeral-balance escrow.
-
 use instruction::{AccountMeta, Instruction};
 use pubkey::Pubkey;
 
 use crate::{system::system_id, topology::DLP_ID};
 
-const UPGRADEABLE_LOADER_ID: &str =
-    "BPFLoaderUpgradeab1e11111111111111111111111";
 const BORSH_OPTION_NONE: u8 = 0;
 const BORSH_OPTION_SOME: u8 = 1;
 
@@ -70,10 +66,11 @@ pub fn magic_fee_vault_pda(validator: &Pubkey) -> Pubkey {
 }
 
 fn dlp_programdata_pda() -> Pubkey {
-    let loader: Pubkey = UPGRADEABLE_LOADER_ID
-        .parse()
-        .expect("upgradeable loader id");
-    Pubkey::find_program_address(&[dlp_id().as_ref()], &loader).0
+    Pubkey::find_program_address(
+        &[dlp_id().as_ref()],
+        &sdk_ids::bpf_loader_upgradeable::ID,
+    )
+    .0
 }
 
 pub fn delegate_account(

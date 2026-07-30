@@ -1,8 +1,3 @@
-//! S4 `sched_hot_account_cliff` — scheduler intake under hot-account
-//! contention. Few hot accounts serialize execution; the campaign measured a
-//! client-latency cliff between 16 and 8 hot accounts at ~13.5k delivered
-//! RPS (15 ms → 170–280 ms).
-
 use std::{rc::Rc, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
@@ -10,7 +5,9 @@ use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
     assert::poll_until,
-    prep, report,
+    prep,
+    profile::select as select_profile,
+    report,
     runner::{drive_threads, RunOutcome, ThreadRunConfig},
     BaseCtx, ChainCtx, ErClient, ErCtx, MetricsDelta, Result, Scenario,
     ScenarioReport, TxSender,
@@ -63,12 +60,10 @@ const FULL: Profile = Profile {
     concurrency: 2_048,
 };
 
-fn profile() -> &'static Profile {
-    match std::env::var("REDSUITE_PROFILE") {
-        Ok(name) if name == "full" => &FULL,
-        Ok(name) if name == "lite" => &LITE,
-        Ok(name) => panic!("unknown REDSUITE_PROFILE `{name}` (lite|full)"),
-        Err(_) => &LITE,
+fn profile(scenario: &str) -> &'static Profile {
+    match select_profile(scenario, &["lite", "full"]) {
+        "full" => &FULL,
+        _ => &LITE,
     }
 }
 
@@ -140,7 +135,7 @@ impl Scenario for HotAccountCliff {
     }
 
     async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
-        let profile = profile();
+        let profile = profile(self.name());
         let pool = *profile.cells.iter().max().unwrap();
         let payers =
             prep::funded_payers(base, profile.payers, PAYER_LAMPORTS).await?;

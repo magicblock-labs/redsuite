@@ -8,13 +8,16 @@ use redsuite_core::{
     Result, Scenario, ScenarioReport,
 };
 use signer::Signer;
+use solana_address_lookup_table_interface::instruction::create_lookup_table;
 
-const ALT_PROGRAM_ID: &str = "AddressLookupTab1e1111111111111111111111111";
 const PROGRAM_CLONE_TIMEOUT: Duration = Duration::from_secs(20);
 const BLOCKED_SETTLE: Duration = Duration::from_secs(2);
 const ALT_SETTLE: Duration = Duration::from_secs(1);
 const COMMIT_FREQUENCY_MS: u32 = 1_000_000_000;
 const LABEL: &str = "redshift config";
+const OPEN_ER_LABEL: &str = "cfg-none";
+const RESTRICTED_ER_LABEL: &str = "cfg-allow";
+const SIGNATURE_WINDOW: usize = 50;
 
 pub struct ConfigGates;
 
@@ -34,14 +37,35 @@ fn allowed_programs_env(program: &Pubkey) -> String {
     format!("[{{id=[{bytes}]}}]")
 }
 
-fn alt_id() -> Pubkey {
-    ALT_PROGRAM_ID.parse().expect("alt program id")
+async fn identity_signatures(
+    base: &BaseCtx,
+    identity: &Pubkey,
+) -> Result<Vec<String>> {
+    base.api()
+        .get_signatures_for_address(identity, SIGNATURE_WINDOW)
+        .await
 }
 
-async fn latest_alt_signature(base: &BaseCtx) -> Result<Option<String>> {
-    let signatures =
-        base.api().get_signatures_for_address(&alt_id(), 1).await?;
-    Ok(signatures.into_iter().next())
+async fn alt_transactions_since(
+    base: &BaseCtx,
+    identity: &Pubkey,
+    baseline: &[String],
+) -> Result<Vec<String>> {
+    let alt_program = sdk_ids::address_lookup_table::ID.to_string();
+    let mut found = Vec::new();
+    for signature in identity_signatures(base, identity).await? {
+        if baseline.contains(&signature) {
+            continue;
+        }
+        let Some(tx) = base.api().get_transaction(&signature.parse()?).await?
+        else {
+            continue;
+        };
+        if tx.logs.iter().any(|line| line.contains(&alt_program)) {
+            found.push(signature);
+        }
+    }
+    Ok(found)
 }
 
 async fn await_program_clone(er: &ErCtx, program: &Pubkey) -> Result<()> {
@@ -125,7 +149,7 @@ impl Scenario for ConfigGates {
             let restricted = topology::private_er(
                 base,
                 topology::ErOptions {
-                    label: "cfg-allow".to_owned(),
+                    label: RESTRICTED_ER_LABEL.to_owned(),
                     env: vec![(
                         "MBV_CHAINLINK__ALLOWED_PROGRAMS".to_owned(),
                         allowed_programs_env(&allowed),
@@ -139,11 +163,14 @@ impl Scenario for ConfigGates {
             assert_program_blocked(restricted.ctx(), &blocked).await?;
         }
 
-        let alt_before = latest_alt_signature(base).await?;
+        let open_identity = topology::identity_for_label(OPEN_ER_LABEL)?;
+        let open_pubkey = open_identity.pubkey();
+        let baseline = identity_signatures(base, &open_pubkey).await?;
+
         let open = topology::private_er(
             base,
             topology::ErOptions {
-                label: "cfg-none".to_owned(),
+                label: OPEN_ER_LABEL.to_owned(),
                 env: vec![],
                 request_timeout: None,
                 ..Default::default()
@@ -151,10 +178,12 @@ impl Scenario for ConfigGates {
         )
         .await?;
 
-        let alt_after_start = latest_alt_signature(base).await?;
-        assert_eq!(
-            alt_after_start, alt_before,
-            "the er start must not send lookup table transactions on base"
+        let after_start =
+            alt_transactions_since(base, &open_pubkey, &baseline).await?;
+        assert!(
+            after_start.is_empty(),
+            "the er start must not send lookup table transactions on base, \
+             got {after_start:?}"
         );
 
         await_program_clone(open.ctx(), &allowed).await?;
@@ -163,19 +192,33 @@ impl Scenario for ConfigGates {
         let counter = delegate_and_clone_counter(base, open.ctx()).await?;
 
         tokio::time::sleep(ALT_SETTLE).await;
-        let alt_after_clone = latest_alt_signature(base).await?;
+        let after_clone =
+            alt_transactions_since(base, &open_pubkey, &baseline).await?;
+        assert!(
+            after_clone.is_empty(),
+            "cloning must not send lookup table transactions on base, got \
+             {after_clone:?}"
+        );
+        drop(open);
+
+        let recent_slot = base.api().get_slot().await?;
+        let (create_ix, table) =
+            create_lookup_table(open_pubkey, open_pubkey, recent_slot);
+        base.send(&open_identity, &[create_ix]).await?;
+        let control =
+            alt_transactions_since(base, &open_pubkey, &baseline).await?;
         assert_eq!(
-            alt_after_clone, alt_before,
-            "cloning must not send lookup table transactions on base"
+            control.len(),
+            1,
+            "the lookup table detector must see the one table this identity \
+             created, got {control:?}"
         );
 
         Ok(ScenarioReport::ok(self.name())
             .setting("allowed program", allowed)
             .setting("blocked program", blocked)
             .setting("cloned counter", counter)
-            .setting(
-                "alt signature before",
-                alt_before.unwrap_or_else(|| "none".to_owned()),
-            ))
+            .setting("open er identity", open_pubkey)
+            .setting("control lookup table", table))
     }
 }

@@ -1,7 +1,3 @@
-//! Statistical aggregation for benchmark observations: Welford's algorithm
-//! for mean/variance, reservoir sampling for percentiles — O(1) memory over
-//! millions of latency measurements.
-
 use std::collections::HashMap;
 
 use json::{Deserialize, Serialize};
@@ -140,15 +136,10 @@ mod tests {
 #[derive(Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct BenchStatistics {
-    /// The configuration used for the benchmark.
     pub configuration: json::Value,
-    /// Statistics per RPC-based benchmark mode.
     pub request_stats: HashMap<String, ObservationsStats>,
-    /// Latency for receiving signature confirmations.
     pub signature_confirmation_latency: ObservationsStats,
-    /// Latency for receiving account updates.
     pub account_update_latency: ObservationsStats,
-    /// Throughput statistics for the entire benchmark run.
     pub rps: ObservationsStats,
 }
 
@@ -165,7 +156,6 @@ pub struct ObservationsStats {
 }
 
 impl BenchStatistics {
-    /// Consolidate the reports of parallel bench instances into one.
     pub fn merge(mut stats: Vec<Self>) -> Self {
         if stats.is_empty() {
             return Self::default();
@@ -211,8 +201,6 @@ impl BenchStatistics {
 }
 
 impl ObservationsStats {
-    /// With `average` the values are averaged across instances (min-of-mins,
-    /// max-of-maxes); without it they are summed (used for RPS totals).
     pub fn merge(stats: Vec<ObservationsStats>, average: bool) -> Self {
         let total_count = if average { stats.len() } else { 1 };
         if total_count == 0 {

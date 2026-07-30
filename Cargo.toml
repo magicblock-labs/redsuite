@@ -27,7 +27,7 @@ redline-program = { path = "programs/redline" }
 redshift-program = { path = "programs/redshift" }
 redhat-program = { path = "programs/redhat" }
 
-tokio = { version = "1", features = ["rt", "macros", "time", "net"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "net"] }
 tokio-tungstenite = "0.29"
 futures-util = "0.3"
 async-trait = "0.1"
@@ -53,5 +53,6 @@ signature = { package = "solana-signature", version = "3" }
 instruction = { package = "solana-instruction", version = "3" }
 account = { package = "solana-account", version = "3" }
 signer = { package = "solana-signer", version = "3" }
+sdk-ids = { package = "solana-sdk-ids", version = "3" }
 
 solana-program = "3.0"

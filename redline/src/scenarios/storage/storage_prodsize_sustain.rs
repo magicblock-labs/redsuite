@@ -5,7 +5,9 @@ use instruction::Instruction;
 use pubkey::Pubkey;
 use redsuite_core::{
     assert::poll_until,
-    host, prep, report,
+    host, prep,
+    profile::select as select_profile,
+    report,
     runner::{drive, RunConfig, RunOutcome},
     topology, BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario,
     ScenarioReport, TxSender,
@@ -54,12 +56,10 @@ const FULL: Profile = Profile {
     frequent_superblock_slots: 400,
 };
 
-fn profile() -> &'static Profile {
-    match std::env::var("REDSUITE_PROFILE") {
-        Ok(name) if name == "full" => &FULL,
-        Ok(name) if name == "lite" => &LITE,
-        Ok(name) => panic!("unknown REDSUITE_PROFILE `{name}` (lite|full)"),
-        Err(_) => &LITE,
+fn profile(scenario: &str) -> &'static Profile {
+    match select_profile(scenario, &["lite", "full"]) {
+        "full" => &FULL,
+        _ => &LITE,
     }
 }
 
@@ -131,7 +131,7 @@ impl Scenario for StorageProdsizeSustain {
     }
 
     async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
-        let profile = profile();
+        let profile = profile(self.name());
         let prep_payers =
             prep::funded_payers(base, profile.payers, PREP_PAYER_LAMPORTS)
                 .await?;

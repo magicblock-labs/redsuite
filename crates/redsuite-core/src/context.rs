@@ -1,5 +1,3 @@
-//! The black-box facade scenarios drive: one context per chain in the topology.
-
 use std::{
     cell::RefCell,
     rc::Rc,

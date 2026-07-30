@@ -1,12 +1,8 @@
-//! Hand-built system-program instructions.
-
 use instruction::{AccountMeta, Instruction};
 use pubkey::Pubkey;
 
 pub fn system_id() -> Pubkey {
-    "11111111111111111111111111111111"
-        .parse()
-        .expect("system program id")
+    sdk_ids::system_program::ID
 }
 
 pub fn create_account(
