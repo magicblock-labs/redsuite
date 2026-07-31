@@ -376,13 +376,32 @@ async fn rejected_intent_cell(
         "the refusal must name '{refusal}', got: {observed}"
     );
 
-    let sent_signature = receipt::receipt_signature_in_logs(&tx.logs)
-        .ok_or("the failed tx logs carry no ScheduledCommitSent signature")?;
-    tokio::time::sleep(ROLLBACK_SETTLE).await;
-    assert!(
-        er.api().get_transaction(&sent_signature).await?.is_none(),
-        "a failed transaction must not schedule a commit"
-    );
+    match receipt::receipt_signature_in_logs(&tx.logs) {
+        Some(sent_signature) => {
+            tokio::time::sleep(ROLLBACK_SETTLE).await;
+            assert!(
+                er.api().get_transaction(&sent_signature).await?.is_none(),
+                "a failed transaction must not schedule a commit"
+            );
+        }
+        None => {
+            if let Some(commit_id) = receipt::commit_id_in_logs(&tx.logs) {
+                tokio::time::sleep(ROLLBACK_SETTLE).await;
+                let mut inspected = std::collections::HashSet::new();
+                let receipt = receipt::find_receipt_by_id(
+                    er.api(),
+                    commit_id,
+                    &mut inspected,
+                )
+                .await?;
+                assert!(
+                    receipt.is_none(),
+                    "a failed transaction must not schedule a commit \
+                     (found a receipt for id {commit_id})"
+                );
+            }
+        }
+    }
     Ok(())
 }
 

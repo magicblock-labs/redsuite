@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{collections::HashSet, time::Duration};
 
 use pubkey::Pubkey;
 use signature::Signature;
@@ -7,6 +7,14 @@ use crate::{
     api::{custom_error_code, Api, TransactionInfo},
     Result,
 };
+
+const MAGIC_PROGRAM: &str = "Magic11111111111111111111111111111111111111";
+
+const SCHEDULE_ID_MARKER: &str = "Scheduled commit with ID: ";
+
+const RECEIPT_SCAN_LIMIT: usize = 64;
+
+const RECEIPT_POLL: Duration = Duration::from_millis(200);
 
 pub const INTENT_FAILED_CODE: u32 = 0x7461_636F;
 
@@ -50,6 +58,14 @@ pub fn receipt_signature_in_logs(logs: &[String]) -> Option<Signature> {
     logs.iter().find_map(|line| {
         let rest = strip_program_prefix(line)
             .strip_prefix("ScheduledCommitSent signature: ")?;
+        rest.trim().parse().ok()
+    })
+}
+
+pub fn commit_id_in_logs(logs: &[String]) -> Option<u64> {
+    logs.iter().find_map(|line| {
+        let rest =
+            strip_program_prefix(line).strip_prefix(SCHEDULE_ID_MARKER)?;
         rest.trim().parse().ok()
     })
 }
@@ -125,15 +141,73 @@ pub async fn fetch_commit_receipt(
         )
         .into());
     }
-    let receipt_signature = receipt_signature_in_logs(&commit_tx.logs)
-        .ok_or_else(|| {
-            format!(
-            "commit tx {commit_signature} logs carry no ScheduledCommitSent \
-             signature — was a commit actually scheduled?"
+    if let Some(receipt_signature) = receipt_signature_in_logs(&commit_tx.logs)
+    {
+        let receipt_tx =
+            er.await_transaction(&receipt_signature, timeout).await?;
+        return Ok(parse_receipt(receipt_signature, &receipt_tx));
+    }
+    let commit_id = commit_id_in_logs(&commit_tx.logs).ok_or_else(|| {
+        format!(
+            "commit tx {commit_signature} logs carry neither a \
+                 ScheduledCommitSent signature nor a scheduled commit id — \
+                 was a commit actually scheduled?"
         )
-        })?;
-    let receipt_tx = er.await_transaction(&receipt_signature, timeout).await?;
-    Ok(parse_receipt(receipt_signature, &receipt_tx))
+    })?;
+    await_receipt_by_id(er, commit_id, timeout).await
+}
+
+// One pass over recent Magic-program transactions; `inspected` skips
+// signatures already fetched by an earlier pass.
+pub async fn find_receipt_by_id(
+    er: &Api,
+    commit_id: u64,
+    inspected: &mut HashSet<String>,
+) -> Result<Option<CommitReceipt>> {
+    let magic_program: Pubkey = MAGIC_PROGRAM.parse()?;
+    let candidates = er
+        .get_signatures_for_address(&magic_program, RECEIPT_SCAN_LIMIT)
+        .await?;
+    for signature_text in candidates {
+        if !inspected.insert(signature_text.clone()) {
+            continue;
+        }
+        let Ok(signature) = signature_text.parse::<Signature>() else {
+            continue;
+        };
+        let Some(tx) = er.get_transaction(&signature).await? else {
+            continue;
+        };
+        let receipt = parse_receipt(signature, &tx);
+        if receipt.commit_id == Some(commit_id) {
+            return Ok(Some(receipt));
+        }
+    }
+    Ok(None)
+}
+
+async fn await_receipt_by_id(
+    er: &Api,
+    commit_id: u64,
+    timeout: Duration,
+) -> Result<CommitReceipt> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut inspected = HashSet::new();
+    loop {
+        if let Some(receipt) =
+            find_receipt_by_id(er, commit_id, &mut inspected).await?
+        {
+            return Ok(receipt);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "no ScheduledCommitSent receipt for commit id {commit_id} \
+                 within {timeout:?}"
+            )
+            .into());
+        }
+        tokio::time::sleep(RECEIPT_POLL).await;
+    }
 }
 
 pub async fn confirm_base_signatures(
@@ -179,6 +253,16 @@ mod tests {
         ];
         assert_eq!(receipt_signature_in_logs(&logs), Some(sig(9)));
         assert_eq!(receipt_signature_in_logs(&[]), None);
+    }
+
+    #[test]
+    fn schedule_log_names_the_intent_id() {
+        let logs = vec![
+            "Program log: Scheduled commit with ID: 42".to_owned(),
+            "Scheduled commit with ID: 7".to_owned(),
+        ];
+        assert_eq!(commit_id_in_logs(&logs), Some(42));
+        assert_eq!(commit_id_in_logs(&[]), None);
     }
 
     #[test]

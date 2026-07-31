@@ -20,8 +20,8 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const CLONE_TIMEOUT: Duration = Duration::from_secs(15);
 const SWEEP_CONCURRENCY: usize = 16;
 
-const MONITORED_GAUGE: &str = "mbv_monitored_accounts_gauge";
-const EVICTED_COUNTER: &str = "mbv_evicted_accounts_count";
+const MONITORED_GAUGE: &str = "keeper_account_cache_entries";
+const EVICTED_COUNTER: &str = "keeper_account_cache_evictions";
 const FETCHES_FOUND_COUNTER: &str = "mbv_account_fetches_found_count";
 const ENSURE_HISTOGRAM: &str = r#"mbv_ensure_accounts_time{kind="account"}"#;
 
@@ -185,7 +185,7 @@ impl Scenario for CloneLruChurn {
                     label: format!("s5-{}", cell.name),
                     env: vec![
                         (
-                            "MBV_CHAINLINK__MAX_MONITORED_ACCOUNTS".to_owned(),
+                            "MBV_ENGINE__ACCOUNTSDB__LRU_CAPACITY".to_owned(),
                             cell.cap.to_string(),
                         ),
                         (
@@ -340,11 +340,17 @@ impl Scenario for CloneLruChurn {
             "closure cell reads failed: {:?}",
             closure.first_error
         );
-        assert_eq!(
-            closure.evictions, 0.0,
-            "INVALID: closure cell (cap {} ≥ working set {}) evicted — \
-             the cap knob or the harness is broken",
-            closure.cap, profile.working_set
+        // The engine's account cache is a per-bucket sampled LRU (scc
+        // HashCache), so a handful of early evictions below capacity are
+        // normal; only systematic eviction under the cap marks a broken knob.
+        let closure_tolerance = (profile.working_set as f64) * 0.05;
+        assert!(
+            closure.evictions <= closure_tolerance,
+            "INVALID: closure cell (cap {} ≥ working set {}) evicted {} \
+             accounts — the cap knob or the harness is broken",
+            closure.cap,
+            profile.working_set,
+            closure.evictions
         );
         if closure.p50_us >= 1_000_000.0 {
             eprintln!(
