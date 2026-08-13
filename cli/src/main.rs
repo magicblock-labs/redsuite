@@ -2,7 +2,7 @@ mod catalog;
 
 use futures_util::StreamExt;
 use redsuite_core::{
-    catalog::{Family, ScenarioEntry, Topology},
+    catalog::{Lane, ScenarioEntry},
     profile, report, topology, Result,
 };
 
@@ -119,10 +119,10 @@ async fn run(args: &[String]) -> Result<()> {
     let total_scenarios = scenarios.len();
     let (benchmarks, functional): (Vec<_>, Vec<_>) = scenarios
         .into_iter()
-        .partition(|entry| entry.family == Family::Redline);
+        .partition(|entry| entry.lane() == Lane::Exclusive);
     let (private_er, shared): (Vec<_>, Vec<_>) = functional
         .into_iter()
-        .partition(|entry| entry.topology == Topology::PrivateEr);
+        .partition(|entry| entry.lane() == Lane::PrivateEr);
 
     if !shared.is_empty() || !private_er.is_empty() {
         eprintln!(
@@ -206,7 +206,6 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use redsuite_core::catalog::Resource;
 
     #[test]
     fn profile_sets_gate_by_membership() {
@@ -266,18 +265,6 @@ mod tests {
         })
     }
 
-    fn expected_group(entry: &ScenarioEntry) -> Option<&'static str> {
-        if entry.family == Family::Redline
-            || entry.resources.contains(&Resource::BaseAlt)
-        {
-            return Some("benchmarks");
-        }
-        if entry.topology == Topology::PrivateEr {
-            return Some("private-er");
-        }
-        None
-    }
-
     #[test]
     fn nextest_groups_match_the_catalog() {
         let overrides = nextest_overrides();
@@ -292,7 +279,7 @@ mod tests {
                 .map(|(_, group)| group.as_str());
             assert_eq!(
                 configured,
-                expected_group(entry),
+                entry.nextest_group(),
                 "scenario {} sits in the wrong nextest group",
                 entry.name()
             );

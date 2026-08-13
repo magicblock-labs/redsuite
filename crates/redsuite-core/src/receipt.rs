@@ -186,6 +186,7 @@ mod tests {
         let tx = TransactionInfo {
             slot: 42,
             block_time: None,
+            lookup_tables: 0,
             err: None,
             logs: vec![
                 format!(
@@ -219,6 +220,7 @@ mod tests {
         let tx = TransactionInfo {
             slot: 43,
             block_time: None,
+            lookup_tables: 0,
             err: Some(err),
             logs: vec![
                 format!("ScheduledCommitSent payer: {}", pk(1)),
@@ -246,6 +248,7 @@ mod tests {
         let tx = TransactionInfo {
             slot: 44,
             block_time: None,
+            lookup_tables: 0,
             err: None,
             logs: vec![format!(
                 "Program log: ScheduledCommitSent included: [{}]",

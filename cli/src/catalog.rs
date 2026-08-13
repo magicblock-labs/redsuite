@@ -9,82 +9,82 @@ pub mod redline {
         family: Redline,
         simple_load => aperture::simple_load::SimpleLoad {
             topology: Topology::Shared,
-            resources: [Resource::Er],
+            resources: [Resource::Er, Resource::HostExclusive],
             fixtures: [Fixture::RedlineProgram],
         },
         rpc_warm_ingress => aperture::rpc_warm_ingress::WarmIngress {
             topology: Topology::Shared,
-            resources: [Resource::Er],
+            resources: [Resource::Er, Resource::HostExclusive],
             fixtures: [Fixture::RedlineProgram],
         },
         rpc_capacity_blast => aperture::rpc_capacity_blast::RpcCapacityBlast {
             topology: Topology::Shared,
-            resources: [Resource::Er],
+            resources: [Resource::Er, Resource::HostExclusive],
             fixtures: [Fixture::RedlineProgram],
         },
         high_cu => aperture::high_cu::HighCu {
             topology: Topology::Shared,
-            resources: [Resource::Er],
+            resources: [Resource::Er, Resource::HostExclusive],
             fixtures: [Fixture::RedlineProgram],
         },
         ws_fanout_threshold => aperture::ws_fanout_threshold::WsFanoutThreshold {
             topology: Topology::Shared,
-            resources: [Resource::Er],
+            resources: [Resource::Er, Resource::HostExclusive],
             fixtures: [Fixture::RedlineProgram],
         },
         ws_conn_capacity => aperture::ws_conn_capacity::WsConnCapacity {
             topology: Topology::Shared,
-            resources: [Resource::Er],
+            resources: [Resource::Er, Resource::HostExclusive],
             fixtures: [],
         },
         hot_account_cliff => scheduler::hot_account_cliff::HotAccountCliff {
             topology: Topology::Shared,
-            resources: [Resource::Er],
+            resources: [Resource::Er, Resource::HostExclusive],
             fixtures: [Fixture::RedlineProgram],
         },
         executor_saturation => scheduler::executor_saturation::ExecutorSaturation {
             topology: Topology::Shared,
-            resources: [Resource::Er],
+            resources: [Resource::Er, Resource::HostExclusive],
             fixtures: [Fixture::RedlineProgram],
         },
         clone_lru_churn => chainlink::clone_lru_churn::CloneLruChurn {
             topology: Topology::Shared,
-            resources: [Resource::Er],
+            resources: [Resource::Er, Resource::HostExclusive],
             fixtures: [Fixture::RedlineProgram],
         },
         ensure_gate_stall => chainlink::ensure_gate_stall::EnsureGateStall {
             topology: Topology::Shared,
-            resources: [Resource::Er],
+            resources: [Resource::Er, Resource::HostExclusive],
             fixtures: [Fixture::RedlineProgram],
         },
         cold_hydration_tail => chainlink::cold_hydration_tail::ColdHydrationTail {
             topology: Topology::Shared,
-            resources: [Resource::Er],
+            resources: [Resource::Er, Resource::HostExclusive],
             fixtures: [Fixture::RedlineProgram],
         },
         commit_width_envelope => committor::commit_width_envelope::CommitWidthEnvelope {
             topology: Topology::Shared,
-            resources: [Resource::Er],
+            resources: [Resource::Er, Resource::HostExclusive],
             fixtures: [Fixture::RedlineProgram],
         },
         commit_throughput_ceiling => committor::commit_throughput_ceiling::CommitThroughputCeiling {
             topology: Topology::Shared,
-            resources: [Resource::Er],
+            resources: [Resource::Er, Resource::HostExclusive],
             fixtures: [Fixture::RedlineProgram],
         },
         storage_prodsize_sustain => storage::storage_prodsize_sustain::StorageProdsizeSustain {
             topology: Topology::Shared,
-            resources: [Resource::Er],
+            resources: [Resource::Er, Resource::HostExclusive],
             fixtures: [Fixture::RedlineProgram],
         },
         restart_under_load => lifecycle::restart_under_load::RestartUnderLoad {
             topology: Topology::Shared,
-            resources: [Resource::Er],
+            resources: [Resource::Er, Resource::HostExclusive],
             fixtures: [Fixture::RedlineProgram],
         },
         protocol_boundary_selftest => harness::protocol_boundary_selftest::ProtocolBoundarySelftest {
             topology: Topology::Shared,
-            resources: [Resource::Er],
+            resources: [Resource::Er, Resource::HostExclusive],
             fixtures: [Fixture::RedlineProgram],
         },
     }
@@ -134,7 +134,7 @@ pub mod redshift {
         },
         config_gates => harness::config_gates::ConfigGates {
             topology: Topology::PrivateEr,
-            resources: [Resource::Er, Resource::BaseAlt],
+            resources: [Resource::Er],
             fixtures: [Fixture::RedshiftProgram],
         },
         task_scheduler => scheduler::task_scheduler::TaskScheduler {
@@ -204,7 +204,7 @@ pub mod redshift {
         },
         table_mania => committor::table_mania::TableManiaScenario {
             topology: Topology::Shared,
-            resources: [Resource::Er, Resource::BaseAlt],
+            resources: [Resource::Er],
             fixtures: [],
         },
     }
