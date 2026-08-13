@@ -53,13 +53,20 @@ Scenarios live in the family libraries under `<family>/src/scenarios/
 subsystem's `mod.rs`. The harness owns process spawning, ports, funding and
 teardown. See `redshift/src/scenarios/harness/example.rs`.
 
-Each scenario is reachable two ways, and a new one needs both:
+Registration is one declaration: an entry in the catalog
+(`cli/src/catalog.rs`, one `scenario_catalog!` block per family). The entry
+names the scenario's short name, its runner type, and its metadata
+(topology, resources, fixtures, and optionally profiles). From that one
+entry the macro generates both ways to run the scenario: a `#[tokio::test]`
+function (so it runs under `cargo nextest`, named
+`catalog::<family>::<short_name>`) and a catalog record the `redsuite`
+binary dispatches from. Unit tests check the catalog against the `Scenario`
+impls and against the nextest groups, so a wrong or missing entry fails
+before anything boots.
 
-- a test shim in `<family>/tests/<subsystem>/<name>.rs` (four lines, calling
-  `run_scenario`) plus its `[[test]]` entry in the family `Cargo.toml`, so it
-  runs under `cargo test` / `cargo nextest`;
-- an entry in the registry in `cli/src/main.rs`, so it runs under the
-  `redsuite` binary.
+`profiles` defaults to every profile; write it only to narrow. `redsuite
+run` reads it before booting anything and skips a scenario whose profile
+set excludes the requested profile.
 
 ## The redsuite binary
 
@@ -86,9 +93,9 @@ Benchmarks must never share the box, so keep that last lane exclusive.
 
 ## Running
 
-    cargo nextest run -p redshift --test commit_roundtrip   # one scenario
-    cargo nextest run -p redline                            # one family
-    cargo nextest run                                       # everything
+    cargo nextest run commit_roundtrip               # one scenario
+    cargo nextest run -E 'test(catalog::redline::)'  # one family
+    cargo nextest run                                # everything
 
 Use cargo-nextest. The concurrency limits live in `.config/nextest.toml`:
 private-ER scenarios run two at a time, and the redline family runs alone.

@@ -1,5 +1,6 @@
 pub mod api;
 pub mod assert;
+pub mod catalog;
 pub mod context;
 pub mod dlp;
 pub mod host;

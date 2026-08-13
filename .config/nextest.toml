@@ -20,7 +20,7 @@ private-er = { max-threads = 2 }
 benchmarks = { max-threads = 1 }
 
 [[profile.default.overrides]]
-filter = "package(redline) or test(table_mania) or test(config_gates)"
+filter = "test(catalog::redline::) or test(table_mania) or test(config_gates)"
 test-group = "benchmarks"
 
 [[profile.default.overrides]]

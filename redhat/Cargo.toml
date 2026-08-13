@@ -18,11 +18,3 @@ keypair = { workspace = true }
 signer = { workspace = true }
 
 [dev-dependencies]
-
-[[test]]
-name = "illegal_writable"
-path = "tests/chainlink/illegal_writable.rs"
-
-[[test]]
-name = "fee_payer_rules"
-path = "tests/aperture/fee_payer_rules.rs"
