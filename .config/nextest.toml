@@ -8,21 +8,20 @@
 # conflict on state — each takes its own identity from the genesis pool, its own
 # storage directory, and its own ports.
 #
-# The `benchmarks` group serves two duties. redline scenarios stay alone so they
-# are not measured against each other. table_mania and config_gates join them
-# because redline/commit_width_envelope asserts that NO lookup-table transaction
-# appears on the whole base chain during its commit window, and those two are the
-# only scenarios that create lookup tables there (table_mania by subject,
-# config_gates for its detector control). That assert needs an exclusive base;
-# until it is scoped, mutual exclusion is the only correct arrangement.
+# The `benchmarks` group holds the redline scenarios, one at a time, so
+# performance numbers are never measured beside other work. Membership comes
+# from catalog claims, not names: the `nextest_groups_match_the_catalog` unit
+# test in the cli crate derives the expected group from each entry (the
+# HostExclusive resource, the PrivateEr topology) and fails when these
+# filters disagree with the catalog.
 [test-groups]
 private-er = { max-threads = 2 }
 benchmarks = { max-threads = 1 }
 
 [[profile.default.overrides]]
-filter = "test(catalog::redline::) or test(table_mania) or test(config_gates)"
+filter = "test(catalog::redline::)"
 test-group = "benchmarks"
 
 [[profile.default.overrides]]
-filter = "test(aml_gate) or test(ledger_restore) or test(task_scheduler)"
+filter = "test(aml_gate) or test(config_gates) or test(ledger_restore) or test(task_scheduler)"
 test-group = "private-er"

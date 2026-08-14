@@ -77,6 +77,7 @@ struct CellTally {
     er_delivery: StreamingStats,
     round_trip: StreamingStats,
     base_signatures: usize,
+    base_txs: Vec<signature::Signature>,
     included_mismatch: usize,
 }
 
@@ -175,6 +176,22 @@ async fn snapshot_base_flow(base_api: &Api) -> Result<BaseFlowSnapshot> {
     Ok(BaseFlowSnapshot { flow, alt })
 }
 
+async fn own_lookup_table_txs(
+    base_api: &Api,
+    signatures: &[signature::Signature],
+) -> Result<usize> {
+    let mut with_lookups = 0;
+    for chain_signature in signatures {
+        let tx = base_api
+            .await_transaction(chain_signature, BASE_CONFIRM_TIMEOUT)
+            .await?;
+        if tx.lookup_tables > 0 {
+            with_lookups += 1;
+        }
+    }
+    Ok(with_lookups)
+}
+
 pub struct CommitWidthEnvelope;
 
 #[async_trait(?Send)]
@@ -252,6 +269,9 @@ impl Scenario for CommitWidthEnvelope {
                         tally.round_trip.push(round_trip_us);
                         tally.base_signatures +=
                             commit_receipt.base_signatures.len();
+                        tally
+                            .base_txs
+                            .extend(commit_receipt.base_signatures.iter());
                         let mut reported = commit_receipt.included.clone();
                         reported.sort();
                         let mut expected = accounts;
@@ -329,16 +349,7 @@ impl Scenario for CommitWidthEnvelope {
             let alt_tables_used = delta
                 .counter("mbv_committor_intent_alt_count_sum")
                 .unwrap_or(0.0);
-            assert_eq!(
-                alt_tables_used, 0.0,
-                "w{width} must stay on the no-LUT path"
-            );
-
             let alt_base_txs = flow_after.new_alt_since(&flow_before);
-            assert_eq!(
-                alt_base_txs, 0,
-                "w{width}: ALT create/extend txs appeared on base"
-            );
             let backlog = delta
                 .gauge("mbv_committor_intent_backlog_count")
                 .unwrap_or(0.0);
@@ -353,6 +364,12 @@ impl Scenario for CommitWidthEnvelope {
             assert_eq!(
                 tally.included_mismatch, 0,
                 "w{width}: receipts listed unexpected committed accounts"
+            );
+            let own_alt_txs =
+                own_lookup_table_txs(base.api(), &tally.base_txs).await?;
+            assert_eq!(
+                own_alt_txs, 0,
+                "w{width}: own commit txs must stay on the no-LUT path"
             );
             let round_trip = tally.round_trip.finalize(false);
             let er_delivery = tally.er_delivery.finalize(false);
@@ -399,6 +416,8 @@ impl Scenario for CommitWidthEnvelope {
                         "receipt base txs per commit",
                         receipt_txs_per_commit,
                     )
+                    .metric("window alt intents", alt_tables_used)
+                    .metric("window alt base txs", alt_base_txs as f64)
                     .metric(
                         "achieved commits /s",
                         profile.commits as f64 / outcome.wall.as_secs_f64(),
@@ -496,20 +515,17 @@ impl Scenario for CommitWidthEnvelope {
                             er.scrape_metrics().await?,
                         );
                         let flow_after = snapshot_base_flow(base.api()).await?;
-                        if let Some(alt_tables_used) =
-                            delta.counter("mbv_committor_intent_alt_count_sum")
-                        {
-                            assert!(
-                                alt_tables_used >= 1.0,
-                                "a width-15 commit should ride ALTs"
-                            );
-                        }
                         let alt_base_txs =
                             flow_after.new_alt_since(&flow_before);
+                        let own_alt_txs = own_lookup_table_txs(
+                            base.api(),
+                            &alt_receipt.base_signatures,
+                        )
+                        .await?;
                         assert!(
-                            alt_base_txs >= 1,
-                            "a width-15 commit should create/extend ALTs on \
-                             base"
+                            own_alt_txs >= 1,
+                            "the width-15 commit's own base txs must load a \
+                             lookup table"
                         );
                         eprintln!(
                             "[redsuite] {}: probe w15: {:.1} s, {} flow + {} alt base txs",
@@ -534,6 +550,18 @@ impl Scenario for CommitWidthEnvelope {
                             "probe w15 alt base txs".to_owned(),
                             alt_base_txs as f64,
                         ));
+                        probe_metrics.push((
+                            "probe w15 own alt txs".to_owned(),
+                            own_alt_txs as f64,
+                        ));
+                        if let Some(window_alt_intents) =
+                            delta.counter("mbv_committor_intent_alt_count_sum")
+                        {
+                            probe_metrics.push((
+                                "probe w15 window alt intents".to_owned(),
+                                window_alt_intents,
+                            ));
+                        }
                     }
                 }
             }

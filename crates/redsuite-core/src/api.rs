@@ -83,6 +83,18 @@ struct RpcTransaction {
     #[serde(rename = "blockTime")]
     block_time: Option<i64>,
     meta: Option<RpcTransactionMeta>,
+    transaction: Option<RpcTransactionBody>,
+}
+
+#[derive(Deserialize)]
+struct RpcTransactionBody {
+    message: RpcTransactionMessage,
+}
+
+#[derive(Deserialize)]
+struct RpcTransactionMessage {
+    #[serde(rename = "addressTableLookups")]
+    address_table_lookups: Option<Vec<json::Value>>,
 }
 
 #[derive(Deserialize)]
@@ -110,6 +122,9 @@ pub struct TransactionInfo {
     // on-chain execution error; None = the transaction succeeded
     pub err: Option<json::Value>,
     pub logs: Vec<String>,
+    // lookup tables the transaction message loads addresses through;
+    // 0 for legacy transactions
+    pub lookup_tables: usize,
 }
 
 #[derive(Debug)]
@@ -325,11 +340,17 @@ impl Api {
                 Some(meta) => (meta.err, meta.log_messages.unwrap_or_default()),
                 None => (None, Vec::new()),
             };
+            let lookup_tables = tx
+                .transaction
+                .and_then(|body| body.message.address_table_lookups)
+                .map(|lookups| lookups.len())
+                .unwrap_or(0);
             TransactionInfo {
                 slot: tx.slot,
                 block_time: tx.block_time,
                 err,
                 logs,
+                lookup_tables,
             }
         }))
     }

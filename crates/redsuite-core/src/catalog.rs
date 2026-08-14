@@ -30,7 +30,14 @@ pub enum Topology {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Resource {
     Er,
-    BaseAlt,
+    HostExclusive,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Lane {
+    Exclusive,
+    PrivateEr,
+    Shared,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -66,6 +73,24 @@ pub struct ScenarioEntry {
 impl ScenarioEntry {
     pub fn name(&self) -> String {
         format!("{}/{}", self.family.prefix(), self.short_name)
+    }
+
+    pub fn lane(&self) -> Lane {
+        if self.resources.contains(&Resource::HostExclusive) {
+            Lane::Exclusive
+        } else if self.topology == Topology::PrivateEr {
+            Lane::PrivateEr
+        } else {
+            Lane::Shared
+        }
+    }
+
+    pub fn nextest_group(&self) -> Option<&'static str> {
+        match self.lane() {
+            Lane::Exclusive => Some("benchmarks"),
+            Lane::PrivateEr => Some("private-er"),
+            Lane::Shared => None,
+        }
     }
 }
 
