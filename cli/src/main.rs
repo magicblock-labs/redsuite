@@ -159,7 +159,10 @@ async fn run(args: &[String]) -> Result<()> {
         records.iter().filter(|record| !record.passed()).collect();
     if !failed.is_empty() {
         for record in &failed {
-            eprintln!("[redsuite] FAILED {}", record.name);
+            match record.failure() {
+                Some(failure) => eprintln!("[redsuite] FAILED {failure}"),
+                None => eprintln!("[redsuite] FAILED {}", record.name),
+            }
         }
         return Err(format!(
             "{} of {total_scenarios} scenarios failed",

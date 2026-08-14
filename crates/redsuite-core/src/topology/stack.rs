@@ -923,6 +923,7 @@ impl Drop for PrivateEr {
         kill_pid(self.pid);
         if let Some(mut child) = self.child.take() {
             let _ = child.wait();
+            self.record.mark_finished();
         }
     }
 }

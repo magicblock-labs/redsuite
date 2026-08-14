@@ -159,8 +159,13 @@ macro_rules! scenario_catalog {
                     &[$($fixture),*]
                 )
                 .await;
-                if let Some(failure) = record.failure() {
-                    panic!("{failure}");
+                if !record.passed() {
+                    panic!(
+                        "{}",
+                        record.failure().unwrap_or_else(|| format!(
+                            "{} did not pass", record.name
+                        ))
+                    );
                 }
             }
         )*
