@@ -3,6 +3,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    rc::Rc,
     time::Duration,
 };
 
@@ -15,6 +16,8 @@ use signer::Signer;
 use crate::{
     api::Api,
     context::{BaseCtx, ChainCtx, ErCtx},
+    host::proc_running,
+    resources::ResourceRecord,
     Result,
 };
 
@@ -275,29 +278,67 @@ pub async fn shared() -> Result<(BaseCtx, ErCtx)> {
     fs::create_dir_all(&dir)?;
     let _lock = acquire_lock(dir.join("lock")).await?;
 
-    let state = match read_state() {
-        Some(state) if alive(&state) && healthy(&state).await => {
+    let state = ensure_base().await?;
+    let state = ensure_er(state).await?;
+    contexts(&state)
+}
+
+pub async fn base_only() -> Result<BaseCtx> {
+    let dir = stack_dir();
+    fs::create_dir_all(&dir)?;
+    let _lock = acquire_lock(dir.join("lock")).await?;
+
+    let state = ensure_base().await?;
+    Ok(base_ctx(&state))
+}
+
+async fn ensure_base() -> Result<StackState> {
+    match read_state() {
+        Some(state)
+            if proc_matches(state.base_pid, &state.base_bin)
+                && base_healthy(&state).await =>
+        {
             eprintln!(
-                "[redsuite] reusing shared stack: base 127.0.0.1:{}, er 127.0.0.1:{}",
-                state.base_rpc_port, state.er_rpc_port
+                "[redsuite] reusing base L1 on 127.0.0.1:{}",
+                state.base_rpc_port
             );
-            state
+            Ok(state)
         }
         stale => {
             if let Some(stale) = stale {
                 kill_stack(&stale);
             }
-            boot().await?
+            boot_base().await
         }
-    };
-    contexts(&state)
+    }
+}
+
+async fn ensure_er(state: StackState) -> Result<StackState> {
+    if state.er_pid != 0 {
+        if proc_matches(state.er_pid, &state.er_bin) && er_healthy(&state).await
+        {
+            eprintln!(
+                "[redsuite] reusing shared ER on 127.0.0.1:{}",
+                state.er_rpc_port
+            );
+            return Ok(state);
+        }
+        kill_stack(&state);
+        let state = boot_base().await?;
+        return attach_er(state).await;
+    }
+    attach_er(state).await
+}
+
+fn base_ctx(state: &StackState) -> BaseCtx {
+    BaseCtx::new(
+        format!("http://127.0.0.1:{}", state.base_rpc_port),
+        format!("ws://127.0.0.1:{}", state.base_ws_port),
+    )
 }
 
 fn contexts(state: &StackState) -> Result<(BaseCtx, ErCtx)> {
-    let base = BaseCtx::new(
-        format!("http://127.0.0.1:{}", state.base_rpc_port),
-        format!("ws://127.0.0.1:{}", state.base_ws_port),
-    );
+    let base = base_ctx(state);
     let er = ErCtx::new(
         format!("http://127.0.0.1:{}", state.er_rpc_port),
         format!("ws://127.0.0.1:{}", state.er_ws_port),
@@ -316,30 +357,17 @@ fn proc_matches(pid: u32, bin: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn proc_running(pid: u32) -> bool {
-    let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
-        return false;
-    };
-    // `pid (comm) S …` — comm may contain anything, so find the last ')'.
-    let state = stat
-        .rfind(')')
-        .and_then(|paren_at| stat[paren_at + 1..].trim_start().chars().next());
-    !matches!(state, Some('Z') | None)
-}
-
-fn alive(state: &StackState) -> bool {
-    proc_matches(state.base_pid, &state.base_bin)
-        && proc_matches(state.er_pid, &state.er_bin)
-}
-
-async fn healthy(state: &StackState) -> bool {
+async fn base_healthy(state: &StackState) -> bool {
     let base = Api::new(format!("http://127.0.0.1:{}", state.base_rpc_port));
-    let er = Api::new(format!("http://127.0.0.1:{}", state.er_rpc_port));
     matches!(base.get_health().await.as_deref(), Ok("ok"))
-        && er.server_alive().await
 }
 
-async fn boot() -> Result<StackState> {
+async fn er_healthy(state: &StackState) -> bool {
+    let er = Api::new(format!("http://127.0.0.1:{}", state.er_rpc_port));
+    er.server_alive().await
+}
+
+async fn boot_base() -> Result<StackState> {
     let dir = stack_dir();
     let base_bin = find_base_bin()?;
     let er_bin = find_er_bin()?;
@@ -348,9 +376,6 @@ async fn boot() -> Result<StackState> {
     let (base_rpc_port, base_ws_port) = base_ports.pair()?;
     let base_faucet_port = base_ports.single()?;
     let base_gossip_port = base_ports.single()?;
-    let mut er_ports = PortLease::default();
-    let (er_rpc_port, er_ws_port) = er_ports.pair()?;
-    let er_metrics_port = er_ports.single()?;
 
     let identity = Keypair::new();
     let identity_pool: Vec<Keypair> =
@@ -426,10 +451,10 @@ async fn boot() -> Result<StackState> {
         base_gossip_port,
         base_pid,
         base_bin: bin_name(&base_bin),
-        er_rpc_port,
-        er_ws_port,
-        er_metrics_port,
-        er_pid: 0, // patched below once the ER is spawned
+        er_rpc_port: 0,
+        er_ws_port: 0,
+        er_metrics_port: 0,
+        er_pid: 0,
         er_bin: bin_name(&er_bin),
         er_identity: identity.pubkey().to_string(),
         er_identity_keypair: identity.to_bytes().to_vec(),
@@ -440,43 +465,25 @@ async fn boot() -> Result<StackState> {
         clone_url,
     };
 
-    match boot_er(&dir, &er_bin, &identity, &state, &base_log, &mut er_ports)
-        .await
-    {
-        Ok(er_pid) => {
-            let state = StackState { er_pid, ..state };
+    match await_base_ready(&state, &base_log).await {
+        Ok(()) => {
             write_state(&state)?;
             eprintln!(
-                "[redsuite] stack up: base 127.0.0.1:{} (ws {}), er 127.0.0.1:{} (ws {}, metrics {}), identity {}",
-                state.base_rpc_port,
-                state.base_ws_port,
-                state.er_rpc_port,
-                state.er_ws_port,
-                state.er_metrics_port,
-                state.er_identity,
+                "[redsuite] base up: 127.0.0.1:{} (ws {}), identity {}",
+                state.base_rpc_port, state.base_ws_port, state.er_identity,
             );
             Ok(state)
         }
         Err(e) => {
-            // No state.json yet; boot_er reaped the ER, the base is ours.
-            kill_pid(state.base_pid);
+            kill_pid(base_pid);
             Err(e)
         }
     }
 }
 
-async fn boot_er(
-    dir: &Path,
-    er_bin: &Path,
-    identity: &Keypair,
-    state: &StackState,
-    base_log: &Path,
-    er_ports: &mut PortLease,
-) -> Result<u32> {
-    let base_rpc_url = format!("http://127.0.0.1:{}", state.base_rpc_port);
-
-    // The ER dials the base WS first and exits if it cannot connect.
-    let base_api = Api::new(base_rpc_url.clone());
+async fn await_base_ready(state: &StackState, base_log: &Path) -> Result<()> {
+    let base_api =
+        Api::new(format!("http://127.0.0.1:{}", state.base_rpc_port));
     wait_until(
         BASE_READY_TIMEOUT,
         "base L1 RPC healthy",
@@ -485,6 +492,7 @@ async fn boot_er(
         || async { matches!(base_api.get_health().await.as_deref(), Ok("ok")) },
     )
     .await?;
+    // The ER dials the base WS first and exits if it cannot connect.
     wait_until(
         Duration::from_secs(15),
         "base L1 WS listening",
@@ -508,13 +516,10 @@ async fn boot_er(
     )
     .await?;
 
-    let base_ctx = BaseCtx::new(
-        base_rpc_url,
-        format!("ws://127.0.0.1:{}", state.base_ws_port),
-    );
-    ensure_identity_funded(&base_ctx, &identity.pubkey()).await?;
-    let mut required =
-        vec![crate::dlp::validator_fees_vault_pda(&identity.pubkey())];
+    let base = base_ctx(state);
+    let mut required = vec![crate::dlp::validator_fees_vault_pda(
+        &state.er_identity.parse()?,
+    )];
     for id in CLONED_ACCOUNTS {
         required.push(id.parse()?);
     }
@@ -524,7 +529,7 @@ async fn boot_er(
         required.push(crate::dlp::validator_fees_vault_pda(&reserved.pubkey()));
     }
     for account in required {
-        if base_ctx.account(&account).await?.is_none() {
+        if base.account(&account).await?.is_none() {
             return Err(format!(
                 "account {account} missing on the freshly booted base — \
                  genesis injection or the clone from {} failed; check \
@@ -534,27 +539,43 @@ async fn boot_er(
             .into());
         }
     }
+    Ok(())
+}
+
+async fn attach_er(state: StackState) -> Result<StackState> {
+    let dir = stack_dir();
+    let er_bin = find_er_bin()?;
+    let identity =
+        Keypair::try_from(&state.er_identity_keypair[..]).map_err(|e| {
+            format!("corrupt state.json: bad er_identity_keypair: {e}")
+        })?;
+    let base = base_ctx(&state);
+    ensure_identity_funded(&base, &identity.pubkey()).await?;
+
+    let mut er_ports = PortLease::default();
+    let (er_rpc_port, er_ws_port) = er_ports.pair()?;
+    let er_metrics_port = er_ports.single()?;
 
     // a fresh base is a new chain — prior-generation ER state is invalid
     let _ = fs::remove_dir_all(dir.join("er-storage"));
 
     let cmd = er_command(
-        er_bin,
-        identity,
+        &er_bin,
+        &identity,
         &format!("http://127.0.0.1:{}", state.base_rpc_port),
         &format!("ws://127.0.0.1:{}", state.base_ws_port),
-        state.er_rpc_port,
-        state.er_metrics_port,
+        er_rpc_port,
+        er_metrics_port,
         &dir.join("er-storage"),
         &[],
         true,
     );
-    eprintln!("[redsuite] booting ER on 127.0.0.1:{} …", state.er_rpc_port);
+    eprintln!("[redsuite] booting ER on 127.0.0.1:{er_rpc_port} …");
     let er_log = dir.join("er.log");
     er_ports.release();
     let er_pid = spawn_detached(cmd, &er_log)?;
 
-    let er_api = Api::new(format!("http://127.0.0.1:{}", state.er_rpc_port));
+    let er_api = Api::new(format!("http://127.0.0.1:{er_rpc_port}"));
     let ready = wait_until(
         ER_READY_TIMEOUT,
         "ER RPC answering",
@@ -568,7 +589,25 @@ async fn boot_er(
         return Err(e);
     }
 
-    Ok(er_pid)
+    let state = StackState {
+        er_rpc_port,
+        er_ws_port,
+        er_metrics_port,
+        er_pid,
+        er_bin: bin_name(&er_bin),
+        ..state
+    };
+    write_state(&state)?;
+    eprintln!(
+        "[redsuite] stack up: base 127.0.0.1:{} (ws {}), er 127.0.0.1:{} (ws {}, metrics {}), identity {}",
+        state.base_rpc_port,
+        state.base_ws_port,
+        state.er_rpc_port,
+        state.er_ws_port,
+        state.er_metrics_port,
+        state.er_identity,
+    );
+    Ok(state)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -721,6 +760,7 @@ pub struct PrivateEr {
     log: PathBuf,
     child: Option<Child>,
     ctx: ErCtx,
+    record: Rc<ResourceRecord>,
 }
 
 impl PrivateEr {
@@ -771,6 +811,7 @@ impl PrivateEr {
         let mut escalated = hard_kill;
         loop {
             if child.try_wait()?.is_some() {
+                self.record.mark_finished();
                 return Ok(());
             }
             if !escalated && std::time::Instant::now() >= grace_deadline {
@@ -779,6 +820,16 @@ impl PrivateEr {
             }
             tokio::time::sleep(RESTART_POLL).await;
         }
+    }
+
+    // The explicit teardown path: a graceful stop whose failure lands in the
+    // run's teardown audit, not only in the caller's return value.
+    pub async fn finish(mut self) -> Result<()> {
+        let outcome = self.stop(false).await;
+        if let Err(error) = &outcome {
+            self.record.record_finish_error(error.to_string());
+        }
+        outcome
     }
 
     // Stop the ER (SIGTERM, or SIGKILL if hard_kill), then relaunch it on the
@@ -833,6 +884,7 @@ impl PrivateEr {
         let new_child = spawn_child(cmd, &self.log)?;
         self.pid = new_child.id();
         self.child = Some(new_child);
+        self.record.relaunched(self.pid);
         wait_until_every(
             RESTART_POLL,
             config.ready_timeout,
@@ -861,6 +913,9 @@ impl PrivateEr {
 
 impl Drop for PrivateEr {
     fn drop(&mut self) {
+        if self.child.is_none() && !proc_running(self.pid) {
+            return;
+        }
         eprintln!(
             "[redsuite] stopping private ER `{}` (pid {})",
             self.label, self.pid
@@ -977,6 +1032,7 @@ pub async fn private_er(
     ports.release();
     let child = spawn_child(cmd, &log)?;
     let pid = child.id();
+    let record = base.resources().register(&options.label, pid);
 
     let er_api = Api::new(format!("http://127.0.0.1:{rpc_port}"));
     let ready = wait_until(
@@ -1021,6 +1077,7 @@ pub async fn private_er(
         log,
         child: Some(child),
         ctx,
+        record,
     })
 }
 
@@ -1325,12 +1382,16 @@ pub fn status() -> Result<()> {
         println!("{name:5} pid {pid:<8} {proc_state:8} 127.0.0.1:{port:<6} {rpc_state}   ({bin})");
     };
     describe("base", state.base_pid, &state.base_bin, state.base_rpc_port);
-    describe("er", state.er_pid, &state.er_bin, state.er_rpc_port);
+    if state.er_pid == 0 {
+        println!("er    not booted — the first shared-stack scenario boots it");
+    } else {
+        describe("er", state.er_pid, &state.er_bin, state.er_rpc_port);
+        println!(
+            "er metrics    http://127.0.0.1:{}/metrics",
+            state.er_metrics_port
+        );
+    }
     println!("er identity   {}", state.er_identity);
-    println!(
-        "er metrics    http://127.0.0.1:{}/metrics",
-        state.er_metrics_port
-    );
     println!("logs          {}", stack_dir().display());
     Ok(())
 }

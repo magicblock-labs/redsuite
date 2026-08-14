@@ -11,6 +11,7 @@ pub mod prep;
 pub mod profile;
 pub mod receipt;
 pub mod report;
+mod resources;
 pub mod runner;
 pub mod scenario;
 pub mod stats;
@@ -21,7 +22,10 @@ pub mod transport;
 pub use api::{Api, Metrics, MetricsDelta};
 pub use context::{BaseCtx, ChainCtx, ErClient, ErCtx, TxSender};
 pub use report::ScenarioReport;
-pub use scenario::{run_scenario, Scenario};
+pub use scenario::{
+    run_private_er_scenario, run_shared_scenario, Phase, PhaseOutcome,
+    PrivateErScenario, RunError, RunRecord, Scenario, ScenarioOutcome,
+};
 
 pub type DynError = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, DynError>;

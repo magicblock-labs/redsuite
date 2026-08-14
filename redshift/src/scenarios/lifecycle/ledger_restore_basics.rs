@@ -6,7 +6,7 @@ use pubkey::Pubkey;
 use redshift_program::flexi::{build as flexi, FlexiCounter};
 use redsuite_core::{
     assert::poll_until, dlp, prep, system, topology, BaseCtx, ChainCtx, ErCtx,
-    Result, Scenario, ScenarioReport,
+    PrivateErScenario, Result, ScenarioReport,
 };
 use signature::Signature;
 use signer::Signer;
@@ -190,12 +190,12 @@ async fn assert_counter(
 }
 
 #[async_trait(?Send)]
-impl Scenario for LedgerRestoreBasics {
+impl PrivateErScenario for LedgerRestoreBasics {
     fn name(&self) -> &str {
         "redshift/ledger_restore_basics"
     }
 
-    async fn run(&self, base: &BaseCtx, _er: &ErCtx) -> Result<ScenarioReport> {
+    async fn run(&self, base: &BaseCtx) -> Result<ScenarioReport> {
         let funder = prep::funded_payer(base, 10 * SOL).await?;
         let mut report = ScenarioReport::ok(self.name());
 

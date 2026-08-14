@@ -16,7 +16,7 @@ use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
     assert::poll_until, prep, system, topology, BaseCtx, ChainCtx, ErCtx,
-    Result, Scenario, ScenarioReport,
+    PrivateErScenario, Result, ScenarioReport,
 };
 use sdk::spl::{
     builders::{
@@ -165,12 +165,12 @@ impl Drop for MockRangeServer {
 pub struct AmlGate;
 
 #[async_trait(?Send)]
-impl Scenario for AmlGate {
+impl PrivateErScenario for AmlGate {
     fn name(&self) -> &str {
         "redshift/aml_gate"
     }
 
-    async fn run(&self, base: &BaseCtx, _er: &ErCtx) -> Result<ScenarioReport> {
+    async fn run(&self, base: &BaseCtx) -> Result<ScenarioReport> {
         let report = ScenarioReport::ok(self.name());
 
         // High-risk owner (score 9): the merge is blocked, no tokens move,

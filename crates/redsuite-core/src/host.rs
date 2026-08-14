@@ -4,6 +4,17 @@ use crate::Result;
 
 const CLOCK_TICKS_PER_SEC: f64 = 100.0;
 
+pub fn proc_running(pid: u32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    // `pid (comm) S …` — comm may contain anything, so find the last ')'.
+    let state = stat
+        .rfind(')')
+        .and_then(|paren_at| stat[paren_at + 1..].trim_start().chars().next());
+    !matches!(state, Some('Z') | None)
+}
+
 pub struct CpuSample {
     taken: Instant,
     process_ticks: u64,

@@ -12,7 +12,7 @@ use redshift_program::{
 };
 use redsuite_core::{
     assert::poll_until, dlp, prep, system, topology, BaseCtx, ChainCtx, ErCtx,
-    Result, Scenario, ScenarioReport,
+    PrivateErScenario, Result, ScenarioReport,
 };
 use rusqlite::Connection;
 use signer::Signer;
@@ -543,12 +543,12 @@ async fn test_cancel_ongoing(
 }
 
 #[async_trait(?Send)]
-impl Scenario for TaskScheduler {
+impl PrivateErScenario for TaskScheduler {
     fn name(&self) -> &str {
         "redshift/task_scheduler"
     }
 
-    async fn run(&self, base: &BaseCtx, _er: &ErCtx) -> Result<ScenarioReport> {
+    async fn run(&self, base: &BaseCtx) -> Result<ScenarioReport> {
         let private = topology::private_er(
             base,
             topology::ErOptions {

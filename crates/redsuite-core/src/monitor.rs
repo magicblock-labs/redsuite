@@ -61,7 +61,7 @@ pub struct SteadyStateMonitor {
 }
 
 impl SteadyStateMonitor {
-    // Requires a LocalSet (run_scenario provides one). Scrape failures skip
+    // Requires a LocalSet (the scenario executor provides one). Scrape failures skip
     // the sample rather than killing the monitor.
     pub fn start(metrics_url: String, spec: MonitorSpec) -> Self {
         let stop = Rc::new(Cell::new(false));
