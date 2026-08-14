@@ -3,7 +3,7 @@ mod catalog;
 use futures_util::StreamExt;
 use redsuite_core::{
     catalog::{Lane, ScenarioEntry},
-    profile, report, topology, Result,
+    profile, report, topology, Result, RunRecord,
 };
 
 const FAMILIES: &[&[ScenarioEntry]] = &[
@@ -53,18 +53,22 @@ fn selected(target: &str) -> Vec<&'static ScenarioEntry> {
         .collect()
 }
 
-async fn run_lane(scenarios: Vec<&'static ScenarioEntry>, limit: usize) {
+async fn run_lane(
+    scenarios: Vec<&'static ScenarioEntry>,
+    limit: usize,
+) -> Vec<RunRecord> {
     if scenarios.is_empty() {
-        return;
+        return Vec::new();
     }
     let limit = limit.clamp(1, scenarios.len());
-    let mut running = futures_util::stream::iter(scenarios)
+    futures_util::stream::iter(scenarios)
         .map(|entry| async move {
             eprintln!("[redsuite] starting {}", entry.name());
             (entry.run)().await
         })
-        .buffer_unordered(limit);
-    while running.next().await.is_some() {}
+        .buffer_unordered(limit)
+        .collect()
+        .await
 }
 
 async fn run(args: &[String]) -> Result<()> {
@@ -124,6 +128,7 @@ async fn run(args: &[String]) -> Result<()> {
         .into_iter()
         .partition(|entry| entry.lane() == Lane::PrivateEr);
 
+    let mut records = Vec::new();
     if !shared.is_empty() || !private_er.is_empty() {
         eprintln!(
             "[redsuite] running {} shared-stack and {} private-ER scenarios \
@@ -132,11 +137,13 @@ async fn run(args: &[String]) -> Result<()> {
             private_er.len()
         );
         let shared_count = shared.len();
-        futures_util::future::join(
+        let (mut from_shared, mut from_private) = futures_util::future::join(
             run_lane(shared, shared_count),
             run_lane(private_er, PRIVATE_ER_CONCURRENCY),
         )
         .await;
+        records.append(&mut from_shared);
+        records.append(&mut from_private);
     }
 
     // Benchmarks run last and alone
@@ -145,9 +152,24 @@ async fn run(args: &[String]) -> Result<()> {
             "[redsuite] running {} benchmark scenarios sequentially",
             benchmarks.len()
         );
-        run_lane(benchmarks, 1).await;
+        records.append(&mut run_lane(benchmarks, 1).await);
     }
 
+    let failed: Vec<&RunRecord> =
+        records.iter().filter(|record| !record.passed()).collect();
+    if !failed.is_empty() {
+        for record in &failed {
+            match record.failure() {
+                Some(failure) => eprintln!("[redsuite] FAILED {failure}"),
+                None => eprintln!("[redsuite] FAILED {}", record.name),
+            }
+        }
+        return Err(format!(
+            "{} of {total_scenarios} scenarios failed",
+            failed.len()
+        )
+        .into());
+    }
     if total_scenarios > 1 {
         eprintln!("[redsuite] {total_scenarios} scenarios passed");
     }

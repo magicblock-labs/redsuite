@@ -9,7 +9,11 @@ use std::{
 pub use diff::{bmf, compare, list};
 use json::{Deserialize, Serialize};
 
-use crate::{stats::ObservationsStats, topology, Result};
+use crate::{
+    scenario::{RunRecord, ScenarioOutcome},
+    stats::ObservationsStats,
+    topology, Result,
+};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ScenarioReport {
@@ -28,6 +32,13 @@ impl ScenarioReport {
             config: Vec::new(),
             observations: Vec::new(),
             metrics: Vec::new(),
+        }
+    }
+
+    pub fn failed(name: &str) -> Self {
+        Self {
+            passed: false,
+            ..Self::ok(name)
         }
     }
 
@@ -78,6 +89,14 @@ pub struct RunMeta {
 pub struct PersistedReport {
     pub meta: RunMeta,
     pub report: ScenarioReport,
+    #[serde(default)]
+    pub failures: Vec<PersistedFailure>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PersistedFailure {
+    pub phase: String,
+    pub message: String,
 }
 
 pub fn reports_dir() -> PathBuf {
@@ -85,6 +104,47 @@ pub fn reports_dir() -> PathBuf {
 }
 
 pub fn persist(report: &ScenarioReport) -> Result<PathBuf> {
+    write_report(report, &[])
+}
+
+pub fn persist_run(record: &RunRecord) -> Result<PathBuf> {
+    let failures = run_failures(record);
+
+    let fallback;
+    let report = match &record.scenario {
+        ScenarioOutcome::Passed(report) => report,
+        ScenarioOutcome::Failed(_) | ScenarioOutcome::NotReached => {
+            fallback = ScenarioReport::failed(&record.name)
+                .metric_if("wall seconds", record.wall_seconds);
+            &fallback
+        }
+    };
+    write_report(report, &failures)
+}
+
+fn run_failures(record: &RunRecord) -> Vec<PersistedFailure> {
+    let mut failures = Vec::new();
+    if let ScenarioOutcome::Failed(error) = &record.scenario {
+        failures.push(PersistedFailure {
+            phase: "scenario".to_owned(),
+            message: error.to_string(),
+        });
+    }
+    for outcome in &record.phases {
+        if let Some(error) = &outcome.error {
+            failures.push(PersistedFailure {
+                phase: outcome.phase.name().to_owned(),
+                message: error.error().to_string(),
+            });
+        }
+    }
+    failures
+}
+
+fn write_report(
+    report: &ScenarioReport,
+    failures: &[PersistedFailure],
+) -> Result<PathBuf> {
     let meta = run_meta();
     let dir = reports_dir();
     fs::create_dir_all(&dir)?;
@@ -93,10 +153,13 @@ pub fn persist(report: &ScenarioReport) -> Result<PathBuf> {
     struct Doc<'a> {
         meta: &'a RunMeta,
         report: &'a ScenarioReport,
+        #[serde(skip_serializing_if = "<[_]>::is_empty")]
+        failures: &'a [PersistedFailure],
     }
     let body = json::to_string_pretty(&Doc {
         meta: &meta,
         report,
+        failures,
     })?;
 
     let slug = report.scenario.replace(['/', ' '], "-");
@@ -209,12 +272,89 @@ mod tests {
                 er_fingerprint: "123-456".into(),
             },
             report,
+            failures: vec![PersistedFailure {
+                phase: "teardown".into(),
+                message: "private ER `x` is still running".into(),
+            }],
         };
         let text = json::to_string(&doc).unwrap();
         let back: PersistedReport = json::from_str(&text).unwrap();
         assert_eq!(back.report.scenario, "redline/some_scenario");
         assert_eq!(back.report.config[0].1, "200");
         assert_eq!(back.meta.er_fingerprint, "123-456");
+        assert_eq!(back.failures[0].phase, "teardown");
+    }
+
+    #[test]
+    fn run_failures_keep_the_primary_first_and_tag_their_phase() {
+        use crate::scenario::{Phase, PhaseOutcome, RunError, RunRecord};
+
+        let record = RunRecord {
+            name: "redshift/example".into(),
+            phases: vec![
+                PhaseOutcome {
+                    phase: Phase::Preflight,
+                    error: None,
+                },
+                PhaseOutcome {
+                    phase: Phase::Topology,
+                    error: None,
+                },
+                PhaseOutcome {
+                    phase: Phase::Teardown,
+                    error: Some(RunError::Teardown(
+                        "private ER `x` is still running".into(),
+                    )),
+                },
+            ],
+            scenario: ScenarioOutcome::Failed("assert blew up".into()),
+            wall_seconds: Some(1.5),
+        };
+
+        let failures = run_failures(&record);
+        assert_eq!(failures.len(), 2);
+        assert_eq!(failures[0].phase, "scenario");
+        assert_eq!(failures[0].message, "assert blew up");
+        assert_eq!(failures[1].phase, "teardown");
+
+        assert!(!record.passed());
+        let failure = record.failure().unwrap();
+        assert!(failure.starts_with("redshift/example: scenario failed"));
+        assert!(failure.contains("also: teardown failed"));
+    }
+
+    #[test]
+    fn setup_failures_alone_fail_the_record() {
+        use crate::scenario::{Phase, PhaseOutcome, RunError, RunRecord};
+
+        let record = RunRecord {
+            name: "redshift/example".into(),
+            phases: vec![PhaseOutcome {
+                phase: Phase::Topology,
+                error: Some(RunError::Topology(
+                    "base never got healthy".into(),
+                )),
+            }],
+            scenario: ScenarioOutcome::NotReached,
+            wall_seconds: None,
+        };
+
+        let failures = run_failures(&record);
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].phase, "topology");
+        assert!(!record.passed());
+        assert!(record
+            .failure()
+            .unwrap()
+            .contains("topology failed: base never got healthy"));
+    }
+
+    #[test]
+    fn documents_without_failures_still_parse() {
+        let text = r#"{"meta":{"recorded_at":"20260708T120000Z","er_bin":"x","er_version":"y","er_fingerprint":"z"},"report":{"scenario":"redshift/example","passed":true,"config":[],"observations":[],"metrics":[]}}"#;
+        let back: PersistedReport = json::from_str(text).unwrap();
+        assert!(back.failures.is_empty());
+        assert!(back.report.passed);
     }
 
     #[test]

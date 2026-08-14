@@ -5,7 +5,7 @@ use pubkey::Pubkey;
 use redshift_program::flexi::{build, FlexiCounter};
 use redsuite_core::{
     assert::poll_until, dlp, prep, system, topology, BaseCtx, ChainCtx, ErCtx,
-    Result, Scenario, ScenarioReport,
+    PrivateErScenario, Result, ScenarioReport,
 };
 use signer::Signer;
 use solana_address_lookup_table_interface::instruction::create_lookup_table;
@@ -136,32 +136,31 @@ async fn delegate_and_clone_counter(
 }
 
 #[async_trait(?Send)]
-impl Scenario for ConfigGates {
+impl PrivateErScenario for ConfigGates {
     fn name(&self) -> &str {
         "redshift/config_gates"
     }
 
-    async fn run(&self, base: &BaseCtx, _er: &ErCtx) -> Result<ScenarioReport> {
+    async fn run(&self, base: &BaseCtx) -> Result<ScenarioReport> {
         let allowed = redshift_program::id();
         let blocked = committor_id();
 
-        {
-            let restricted = topology::private_er(
-                base,
-                topology::ErOptions {
-                    label: RESTRICTED_ER_LABEL.to_owned(),
-                    env: vec![(
-                        "MBV_CHAINLINK__ALLOWED_PROGRAMS".to_owned(),
-                        allowed_programs_env(&allowed),
-                    )],
-                    request_timeout: None,
-                    ..Default::default()
-                },
-            )
-            .await?;
-            await_program_clone(restricted.ctx(), &allowed).await?;
-            assert_program_blocked(restricted.ctx(), &blocked).await?;
-        }
+        let restricted = topology::private_er(
+            base,
+            topology::ErOptions {
+                label: RESTRICTED_ER_LABEL.to_owned(),
+                env: vec![(
+                    "MBV_CHAINLINK__ALLOWED_PROGRAMS".to_owned(),
+                    allowed_programs_env(&allowed),
+                )],
+                request_timeout: None,
+                ..Default::default()
+            },
+        )
+        .await?;
+        await_program_clone(restricted.ctx(), &allowed).await?;
+        assert_program_blocked(restricted.ctx(), &blocked).await?;
+        restricted.finish().await?;
 
         let open_identity = topology::identity_for_label(OPEN_ER_LABEL)?;
         let open_pubkey = open_identity.pubkey();
@@ -199,7 +198,7 @@ impl Scenario for ConfigGates {
             "cloning must not send lookup table transactions on base, got \
              {after_clone:?}"
         );
-        drop(open);
+        open.finish().await?;
 
         let recent_slot = base.api().get_slot().await?;
         let (create_ix, table) =

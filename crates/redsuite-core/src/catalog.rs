@@ -2,7 +2,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::profile;
-use crate::report::ScenarioReport;
+use crate::scenario::RunRecord;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Family {
@@ -47,6 +47,16 @@ pub enum Fixture {
     RedhatProgram,
 }
 
+impl Fixture {
+    pub const fn so_name(self) -> &'static str {
+        match self {
+            Fixture::RedlineProgram => "redline_program.so",
+            Fixture::RedshiftProgram => "redshift_program.so",
+            Fixture::RedhatProgram => "redhat_program.so",
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ProfileSet(pub &'static [&'static str]);
 
@@ -58,7 +68,7 @@ impl ProfileSet {
     }
 }
 
-pub type ScenarioFuture = Pin<Box<dyn Future<Output = ScenarioReport>>>;
+pub type ScenarioFuture = Pin<Box<dyn Future<Output = RunRecord>>>;
 
 pub struct ScenarioEntry {
     pub family: Family,
@@ -102,11 +112,23 @@ macro_rules! scenario_catalog {
     (@profiles $profiles:expr) => {
         $profiles
     };
+    (@execute Shared, $scenario:expr, $fixtures:expr) => {
+        $crate::run_shared_scenario($scenario, $fixtures)
+    };
+    (@execute PrivateEr, $scenario:expr, $fixtures:expr) => {
+        $crate::run_private_er_scenario($scenario, $fixtures)
+    };
+    (@name Shared, $scenario:expr) => {
+        $crate::Scenario::name(&$scenario)
+    };
+    (@name PrivateEr, $scenario:expr) => {
+        $crate::PrivateErScenario::name(&$scenario)
+    };
     (
         family: $family:ident,
         $($short_name:ident => $($segment:ident)::+ {
             $(profiles: $profiles:expr,)?
-            topology: $topology:expr,
+            topology: $topology:ident,
             resources: [$($resource:expr),* $(,)?],
             fixtures: [$($fixture:expr),* $(,)?] $(,)?
         }),* $(,)?
@@ -116,12 +138,13 @@ macro_rules! scenario_catalog {
                 family: $crate::catalog::Family::$family,
                 short_name: stringify!($short_name),
                 profiles: $crate::scenario_catalog!(@profiles $($profiles)?),
-                topology: $topology,
+                topology: $crate::catalog::Topology::$topology,
                 resources: &[$($resource),*],
                 fixtures: &[$($fixture),*],
                 run: || {
-                    Box::pin($crate::run_scenario(
+                    Box::pin($crate::scenario_catalog!(@execute $topology,
                         scenarios::$($segment)::+,
+                        &[$($fixture),*]
                     ))
                 },
             },)*
@@ -131,17 +154,30 @@ macro_rules! scenario_catalog {
             #[cfg(test)]
             #[tokio::test]
             async fn $short_name() {
-                $crate::run_scenario(scenarios::$($segment)::+).await;
+                let record = $crate::scenario_catalog!(@execute $topology,
+                    scenarios::$($segment)::+,
+                    &[$($fixture),*]
+                )
+                .await;
+                if !record.passed() {
+                    panic!(
+                        "{}",
+                        record.failure().unwrap_or_else(|| format!(
+                            "{} did not pass", record.name
+                        ))
+                    );
+                }
             }
         )*
 
         #[cfg(test)]
         #[test]
         fn catalog_names_match_the_scenarios() {
-            use $crate::Scenario as _;
             $(
                 assert_eq!(
-                    scenarios::$($segment)::+.name(),
+                    $crate::scenario_catalog!(
+                        @name $topology, scenarios::$($segment)::+
+                    ),
                     format!(
                         "{}/{}",
                         $crate::catalog::Family::$family.prefix(),
