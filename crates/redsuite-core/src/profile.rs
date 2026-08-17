@@ -62,9 +62,9 @@ impl LoopMode {
 }
 
 // The run's frontend inputs, parsed and validated once. The CLI builds it
-// from arguments (environment as fallback); nextest-spawned tests build it
-// from the environment in the executor's preflight phase — scenario code
-// never reads the variables.
+// from arguments (environment as fallback); nextest-spawned tests parse it
+// from the environment before calling the executor, which records a bad
+// value as a preflight failure — scenario code never reads the variables.
 #[derive(Clone, Copy, Debug)]
 pub struct ExecutionConfig {
     pub profile: Profile,
