@@ -6,7 +6,7 @@ use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
     check, check_eq, prep,
-    profile::select as select_profile,
+    profile::{self, ProfileValues},
     report,
     runner::{drive_threads, RunOutcome, ThreadRunConfig},
     stats::ObservationsStats,
@@ -64,12 +64,12 @@ const FULL: Profile = Profile {
     concurrency: 2_048,
 };
 
-fn profile(scenario: &str) -> &'static Profile {
-    match select_profile(scenario, &["lite", "full"]) {
-        "full" => &FULL,
-        _ => &LITE,
-    }
-}
+const PROFILES: ProfileValues<Profile> = ProfileValues {
+    lite: LITE,
+    full: FULL,
+    soak: None,
+    deep: None,
+};
 
 fn shape(pool: &[Pubkey], id: u64) -> (Instruction, [Pubkey; 2]) {
     use crate::program::instruction::build;
@@ -158,7 +158,8 @@ impl Scenario for WsFanoutThreshold {
     }
 
     async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
-        let profile = profile(self.name());
+        let (profile, _) =
+            profile::select(self.name(), base.config(), &PROFILES);
         let prep_payers =
             prep::funded_payers(base, profile.payers, PREP_PAYER_LAMPORTS)
                 .await?;

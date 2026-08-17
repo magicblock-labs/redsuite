@@ -9,7 +9,7 @@ use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
     check_eq, prep,
-    profile::select as select_profile,
+    profile::{self, ProfileValues},
     report,
     runner::{drive, RunConfig},
     stats::{ObservationsStats, StreamingStats},
@@ -57,12 +57,12 @@ const FULL: Profile = Profile {
     prep_payers: 8,
 };
 
-fn profile(scenario: &str) -> &'static Profile {
-    match select_profile(scenario, &["lite", "full"]) {
-        "full" => &FULL,
-        _ => &LITE,
-    }
-}
+const PROFILES: ProfileValues<Profile> = ProfileValues {
+    lite: LITE,
+    full: FULL,
+    soak: None,
+    deep: None,
+};
 
 async fn touch_pass(er: &ErCtx, pool: &[Pubkey]) -> Result<ObservationsStats> {
     let mut latencies = StreamingStats::new();
@@ -185,7 +185,8 @@ impl Scenario for ColdHydrationTail {
     }
 
     async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
-        let profile = profile(self.name());
+        let (profile, _) =
+            profile::select(self.name(), base.config(), &PROFILES);
         let prep_payers =
             prep::funded_payers(base, profile.prep_payers, PREP_PAYER_LAMPORTS)
                 .await?;

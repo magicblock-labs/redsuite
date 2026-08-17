@@ -1,6 +1,9 @@
 use std::{future::Future, pin::Pin};
 
-use crate::{profile, scenario::RunRecord};
+use crate::{
+    profile::{self, ExecutionConfig},
+    scenario::RunRecord,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Family {
@@ -75,7 +78,7 @@ pub struct ScenarioEntry {
     pub topology: Topology,
     pub resources: &'static [Resource],
     pub fixtures: &'static [Fixture],
-    pub run: fn() -> ScenarioFuture,
+    pub run: fn(ExecutionConfig) -> ScenarioFuture,
 }
 
 impl ScenarioEntry {
@@ -110,11 +113,11 @@ macro_rules! scenario_catalog {
     (@profiles $profiles:expr) => {
         $profiles
     };
-    (@execute Shared, $scenario:expr, $fixtures:expr) => {
-        $crate::run_shared_scenario($scenario, $fixtures)
+    (@execute Shared, $scenario:expr, $fixtures:expr, $config:expr) => {
+        $crate::run_shared_scenario($scenario, $fixtures, $config)
     };
-    (@execute PrivateEr, $scenario:expr, $fixtures:expr) => {
-        $crate::run_private_er_scenario($scenario, $fixtures)
+    (@execute PrivateEr, $scenario:expr, $fixtures:expr, $config:expr) => {
+        $crate::run_private_er_scenario($scenario, $fixtures, $config)
     };
     (@name Shared, $scenario:expr) => {
         $crate::Scenario::name(&$scenario)
@@ -139,10 +142,11 @@ macro_rules! scenario_catalog {
                 topology: $crate::catalog::Topology::$topology,
                 resources: &[$($resource),*],
                 fixtures: &[$($fixture),*],
-                run: || {
+                run: |config| {
                     Box::pin($crate::scenario_catalog!(@execute $topology,
                         scenarios::$($segment)::+,
-                        &[$($fixture),*]
+                        &[$($fixture),*],
+                        ::core::result::Result::Ok(config)
                     ))
                 },
             },)*
@@ -154,7 +158,8 @@ macro_rules! scenario_catalog {
             async fn $short_name() {
                 let record = $crate::scenario_catalog!(@execute $topology,
                     scenarios::$($segment)::+,
-                    &[$($fixture),*]
+                    &[$($fixture),*],
+                    $crate::profile::ExecutionConfig::from_env()
                 )
                 .await;
                 if !record.passed() {

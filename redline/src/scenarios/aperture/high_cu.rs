@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use pubkey::Pubkey;
 use redsuite_core::{
     check, check_eq, prep,
-    profile::select as select_profile,
+    profile::{self, ProfileValues},
     report,
     runner::{drive, RunConfig, RunOutcome},
     transport::ws::{AccountUpdates, UpdateOutcome},
@@ -59,12 +59,12 @@ const FULL: Profile = Profile {
     concurrency: 256,
 };
 
-fn profile(scenario: &str) -> &'static Profile {
-    match select_profile(scenario, &["lite", "full"]) {
-        "full" => &FULL,
-        _ => &LITE,
-    }
-}
+const PROFILES: ProfileValues<Profile> = ProfileValues {
+    lite: LITE,
+    full: FULL,
+    soak: None,
+    deep: None,
+};
 
 fn consumed_cus(logs: &[String]) -> Option<f64> {
     logs.iter().find_map(|line| {
@@ -268,7 +268,8 @@ impl Scenario for HighCu {
     }
 
     async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
-        let profile = profile(self.name());
+        let (profile, _) =
+            profile::select(self.name(), base.config(), &PROFILES);
         let payers =
             prep::funded_payers(base, profile.payers, PAYER_LAMPORTS).await?;
         let pdas = crate::init_delegated_accounts(

@@ -11,7 +11,7 @@ use redsuite_core::{
     check, check_eq,
     monitor::{MonitorSpec, SteadyStateMonitor},
     prep,
-    profile::select as select_profile,
+    profile::{self, ProfileValues},
     receipt, report,
     runner::{drive, RunConfig},
     BaseCtx, ChainCtx, CheckError, ErCtx, MetricsDelta, Result, Scenario,
@@ -94,13 +94,12 @@ const DEEP: Profile = Profile {
     deep_backlog: true,
 };
 
-fn profile(scenario: &str) -> &'static Profile {
-    match select_profile(scenario, &["lite", "full", "deep"]) {
-        "deep" => &DEEP,
-        "full" => &FULL,
-        _ => &LITE,
-    }
-}
+const PROFILES: ProfileValues<Profile> = ProfileValues {
+    lite: LITE,
+    full: FULL,
+    soak: None,
+    deep: Some(DEEP),
+};
 
 async fn deliver_commits(
     sender: &redsuite_core::TxSender,
@@ -242,7 +241,8 @@ impl Scenario for CommitThroughputCeiling {
     }
 
     async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
-        let profile = profile(self.name());
+        let (profile, _) =
+            profile::select(self.name(), base.config(), &PROFILES);
         let pool_size = profile.fresh_commits as usize * COMMIT_WIDTH;
 
         let prep_payers =
@@ -506,7 +506,8 @@ impl CommitThroughputCeiling {
     ) -> Result<ScenarioReport> {
         const CONTRAST_SETS: usize = 30;
         const ROUNDS: u64 = 3;
-        let profile = profile(self.name());
+        let (profile, _) =
+            profile::select(self.name(), base.config(), &PROFILES);
         let commits: u64 = ROUNDS * CONTRAST_SETS as u64;
         let contrast_payers =
             prep::funded_payers(base, 4, PREP_PAYER_LAMPORTS).await?;

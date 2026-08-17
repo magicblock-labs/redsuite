@@ -17,6 +17,7 @@ use crate::{
     api::Api,
     context::{BaseCtx, ChainCtx, ErCtx},
     host::proc_running,
+    profile::ExecutionConfig,
     resources::ResourceRecord,
     Result,
 };
@@ -273,26 +274,26 @@ fn write_state(state: &StackState) -> Result<()> {
     Ok(())
 }
 
-pub async fn shared() -> Result<(BaseCtx, ErCtx)> {
+pub async fn shared(config: ExecutionConfig) -> Result<(BaseCtx, ErCtx)> {
     let dir = stack_dir();
     fs::create_dir_all(&dir)?;
     let _lock = acquire_lock(dir.join("lock")).await?;
 
-    let state = ensure_base().await?;
-    let state = ensure_er(state).await?;
-    contexts(&state)
+    let state = ensure_base(config).await?;
+    let state = ensure_er(state, config).await?;
+    contexts(&state, config)
 }
 
-pub async fn base_only() -> Result<BaseCtx> {
+pub async fn base_only(config: ExecutionConfig) -> Result<BaseCtx> {
     let dir = stack_dir();
     fs::create_dir_all(&dir)?;
     let _lock = acquire_lock(dir.join("lock")).await?;
 
-    let state = ensure_base().await?;
-    Ok(base_ctx(&state))
+    let state = ensure_base(config).await?;
+    Ok(base_ctx(&state, config))
 }
 
-async fn ensure_base() -> Result<StackState> {
+async fn ensure_base(config: ExecutionConfig) -> Result<StackState> {
     match read_state() {
         Some(state)
             if proc_matches(state.base_pid, &state.base_bin)
@@ -308,12 +309,15 @@ async fn ensure_base() -> Result<StackState> {
             if let Some(stale) = stale {
                 kill_stack(&stale);
             }
-            boot_base().await
+            boot_base(config).await
         }
     }
 }
 
-async fn ensure_er(state: StackState) -> Result<StackState> {
+async fn ensure_er(
+    state: StackState,
+    config: ExecutionConfig,
+) -> Result<StackState> {
     if state.er_pid != 0 {
         if proc_matches(state.er_pid, &state.er_bin) && er_healthy(&state).await
         {
@@ -324,21 +328,25 @@ async fn ensure_er(state: StackState) -> Result<StackState> {
             return Ok(state);
         }
         kill_stack(&state);
-        let state = boot_base().await?;
-        return attach_er(state).await;
+        let state = boot_base(config).await?;
+        return attach_er(state, config).await;
     }
-    attach_er(state).await
+    attach_er(state, config).await
 }
 
-fn base_ctx(state: &StackState) -> BaseCtx {
+fn base_ctx(state: &StackState, config: ExecutionConfig) -> BaseCtx {
     BaseCtx::new(
         format!("http://127.0.0.1:{}", state.base_rpc_port),
         format!("ws://127.0.0.1:{}", state.base_ws_port),
+        config,
     )
 }
 
-fn contexts(state: &StackState) -> Result<(BaseCtx, ErCtx)> {
-    let base = base_ctx(state);
+fn contexts(
+    state: &StackState,
+    config: ExecutionConfig,
+) -> Result<(BaseCtx, ErCtx)> {
+    let base = base_ctx(state, config);
     let er = ErCtx::new(
         format!("http://127.0.0.1:{}", state.er_rpc_port),
         format!("ws://127.0.0.1:{}", state.er_ws_port),
@@ -367,7 +375,7 @@ async fn er_healthy(state: &StackState) -> bool {
     er.server_alive().await
 }
 
-async fn boot_base() -> Result<StackState> {
+async fn boot_base(config: ExecutionConfig) -> Result<StackState> {
     let dir = stack_dir();
     let base_bin = find_base_bin()?;
     let er_bin = find_er_bin()?;
@@ -465,7 +473,7 @@ async fn boot_base() -> Result<StackState> {
         clone_url,
     };
 
-    match await_base_ready(&state, &base_log).await {
+    match await_base_ready(&state, &base_log, config).await {
         Ok(()) => {
             write_state(&state)?;
             eprintln!(
@@ -481,7 +489,11 @@ async fn boot_base() -> Result<StackState> {
     }
 }
 
-async fn await_base_ready(state: &StackState, base_log: &Path) -> Result<()> {
+async fn await_base_ready(
+    state: &StackState,
+    base_log: &Path,
+    config: ExecutionConfig,
+) -> Result<()> {
     let base_api =
         Api::new(format!("http://127.0.0.1:{}", state.base_rpc_port));
     wait_until(
@@ -516,7 +528,7 @@ async fn await_base_ready(state: &StackState, base_log: &Path) -> Result<()> {
     )
     .await?;
 
-    let base = base_ctx(state);
+    let base = base_ctx(state, config);
     let mut required = vec![crate::dlp::validator_fees_vault_pda(
         &state.er_identity.parse()?,
     )];
@@ -542,14 +554,17 @@ async fn await_base_ready(state: &StackState, base_log: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn attach_er(state: StackState) -> Result<StackState> {
+async fn attach_er(
+    state: StackState,
+    config: ExecutionConfig,
+) -> Result<StackState> {
     let dir = stack_dir();
     let er_bin = find_er_bin()?;
     let identity =
         Keypair::try_from(&state.er_identity_keypair[..]).map_err(|e| {
             format!("corrupt state.json: bad er_identity_keypair: {e}")
         })?;
-    let base = base_ctx(&state);
+    let base = base_ctx(&state, config);
     ensure_identity_funded(&base, &identity.pubkey()).await?;
 
     let mut er_ports = PortLease::default();

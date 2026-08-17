@@ -5,7 +5,7 @@ use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
     check, check_eq, prep,
-    profile::select as select_profile,
+    profile::{self, ProfileValues},
     report,
     runner::{drive_threads, RunOutcome, ThreadRunConfig},
     BaseCtx, ChainCtx, ErClient, ErCtx, MetricsDelta, Result, Scenario,
@@ -59,12 +59,12 @@ const FULL: Profile = Profile {
     concurrency: 2_048,
 };
 
-fn profile(scenario: &str) -> &'static Profile {
-    match select_profile(scenario, &["lite", "full"]) {
-        "full" => &FULL,
-        _ => &LITE,
-    }
-}
+const PROFILES: ProfileValues<Profile> = ProfileValues {
+    lite: LITE,
+    full: FULL,
+    soak: None,
+    deep: None,
+};
 
 fn drive_cell(
     er_rpc_url: String,
@@ -139,7 +139,8 @@ impl Scenario for HotAccountCliff {
     }
 
     async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
-        let profile = profile(self.name());
+        let (profile, _) =
+            profile::select(self.name(), base.config(), &PROFILES);
         let pool = *profile.cells.iter().max().unwrap();
         let payers =
             prep::funded_payers(base, profile.payers, PAYER_LAMPORTS).await?;

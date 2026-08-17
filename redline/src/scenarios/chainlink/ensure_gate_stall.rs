@@ -8,7 +8,7 @@ use futures_util::future::join_all;
 use pubkey::Pubkey;
 use redsuite_core::{
     check, check_eq, prep,
-    profile::select as select_profile,
+    profile::{self, ProfileValues},
     report,
     runner::{drive, RunConfig},
     topology, BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario,
@@ -69,12 +69,12 @@ const FULL: Profile = Profile {
     concurrency: 64,
 };
 
-fn profile(scenario: &str) -> &'static Profile {
-    match select_profile(scenario, &["lite", "full"]) {
-        "full" => &FULL,
-        _ => &LITE,
-    }
-}
+const PROFILES: ProfileValues<Profile> = ProfileValues {
+    lite: LITE,
+    full: FULL,
+    soak: None,
+    deep: None,
+};
 
 fn sample_accounts(pool: &[Pubkey], seed: u64, width: usize) -> Vec<Pubkey> {
     let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
@@ -140,7 +140,8 @@ impl Scenario for EnsureGateStall {
     }
 
     async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
-        let profile = profile(self.name());
+        let (profile, _) =
+            profile::select(self.name(), base.config(), &PROFILES);
         let prep_payers =
             prep::funded_payers(base, profile.prep_payers, PREP_PAYER_LAMPORTS)
                 .await?;

@@ -3,7 +3,8 @@ mod catalog;
 use futures_util::StreamExt;
 use redsuite_core::{
     catalog::{Lane, ScenarioEntry},
-    profile, report, topology, Result, RunRecord,
+    profile::{self, ExecutionConfig, LoopMode, Profile},
+    report, topology, Result, RunRecord,
 };
 
 const FAMILIES: &[&[ScenarioEntry]] = &[
@@ -56,6 +57,7 @@ fn selected(target: &str) -> Vec<&'static ScenarioEntry> {
 async fn run_lane(
     scenarios: Vec<&'static ScenarioEntry>,
     limit: usize,
+    config: ExecutionConfig,
 ) -> Vec<RunRecord> {
     if scenarios.is_empty() {
         return Vec::new();
@@ -64,7 +66,7 @@ async fn run_lane(
     futures_util::stream::iter(scenarios)
         .map(|entry| async move {
             eprintln!("[redsuite] starting {}", entry.name());
-            (entry.run)().await
+            (entry.run)(config).await
         })
         .buffer_unordered(limit)
         .collect()
@@ -74,21 +76,26 @@ async fn run_lane(
 async fn run(args: &[String]) -> Result<()> {
     let Some(target) = args.first() else { usage() };
 
+    let mut config = ExecutionConfig::from_env()?;
     let mut options = args[1..].iter();
     while let Some(flag) = options.next() {
         let value = options.next().unwrap_or_else(|| usage());
         match flag.as_str() {
             "--profile" => {
-                if !profile::is_known(value) {
-                    return Err(format!(
+                config.profile = Profile::parse(value).ok_or_else(|| {
+                    format!(
                         "unknown profile `{value}` (expected {})",
                         profile::ALL.join("|")
                     )
-                    .into());
-                }
-                std::env::set_var("REDSUITE_PROFILE", value)
+                })?
             }
-            "--loop" => std::env::set_var("REDSUITE_LOOP", value),
+            "--loop" => {
+                config.loop_mode = LoopMode::parse(value).ok_or_else(|| {
+                    format!(
+                        "unknown loop mode `{value}` (expected open|closed)"
+                    )
+                })?
+            }
             _ => usage(),
         }
     }
@@ -101,11 +108,10 @@ async fn run(args: &[String]) -> Result<()> {
         .into());
     }
 
-    let requested_profile =
-        std::env::var("REDSUITE_PROFILE").unwrap_or_else(|_| "lite".to_owned());
+    let requested_profile = config.profile.name();
     let (scenarios, unsupported): (Vec<_>, Vec<_>) = scenarios
         .into_iter()
-        .partition(|entry| entry.profiles.contains(&requested_profile));
+        .partition(|entry| entry.profiles.contains(requested_profile));
     for entry in unsupported {
         eprintln!(
             "[redsuite] skipping {}: profile {requested_profile} is not in \
@@ -138,8 +144,8 @@ async fn run(args: &[String]) -> Result<()> {
         );
         let shared_count = shared.len();
         let (mut from_shared, mut from_private) = futures_util::future::join(
-            run_lane(shared, shared_count),
-            run_lane(private_er, PRIVATE_ER_CONCURRENCY),
+            run_lane(shared, shared_count, config),
+            run_lane(private_er, PRIVATE_ER_CONCURRENCY, config),
         )
         .await;
         records.append(&mut from_shared);
@@ -152,7 +158,7 @@ async fn run(args: &[String]) -> Result<()> {
             "[redsuite] running {} benchmark scenarios sequentially",
             benchmarks.len()
         );
-        records.append(&mut run_lane(benchmarks, 1).await);
+        records.append(&mut run_lane(benchmarks, 1, config).await);
     }
 
     let failed: Vec<&RunRecord> =

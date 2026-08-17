@@ -5,7 +5,7 @@ use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
     check, check_eq, prep,
-    profile::select as select_profile,
+    profile::{self, ProfileValues},
     runner::{drive_threads, ThreadRunConfig},
     BaseCtx, ChainCtx, ErClient, ErCtx, MetricsDelta, Result, Scenario,
     ScenarioReport, TxSender,
@@ -47,12 +47,12 @@ const FULL: Profile = Profile {
     concurrency: 2_048,
 };
 
-fn profile(scenario: &str) -> &'static Profile {
-    match select_profile(scenario, &["lite", "full"]) {
-        "full" => &FULL,
-        _ => &LITE,
-    }
-}
+const PROFILES: ProfileValues<Profile> = ProfileValues {
+    lite: LITE,
+    full: FULL,
+    soak: None,
+    deep: None,
+};
 
 pub struct RpcCapacityBlast;
 
@@ -63,7 +63,8 @@ impl Scenario for RpcCapacityBlast {
     }
 
     async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
-        let profile = profile(self.name());
+        let (profile, _) =
+            profile::select(self.name(), base.config(), &PROFILES);
         let prep_payers =
             prep::funded_payers(base, profile.payers, PREP_PAYER_LAMPORTS)
                 .await?;

@@ -10,7 +10,7 @@ use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
     check, check_eq, host, prep,
-    profile::select as select_profile,
+    profile::{self, ProfileValues},
     report,
     runner::{drive, RunConfig, RunOutcome},
     stats::ObservationsStats,
@@ -71,12 +71,12 @@ const FULL: Profile = Profile {
     concurrency: 2_048,
 };
 
-fn profile(scenario: &str) -> &'static Profile {
-    match select_profile(scenario, &["lite", "full"]) {
-        "full" => &FULL,
-        _ => &LITE,
-    }
-}
+const PROFILES: ProfileValues<Profile> = ProfileValues {
+    lite: LITE,
+    full: FULL,
+    soak: None,
+    deep: None,
+};
 
 fn compute_unit_limit(limit: u32) -> Instruction {
     let mut data = vec![2u8];
@@ -334,7 +334,8 @@ impl Scenario for ExecutorSaturation {
     }
 
     async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
-        let profile = profile(self.name());
+        let (profile, _) =
+            profile::select(self.name(), base.config(), &PROFILES);
         let programs: Arc<Vec<Pubkey>> =
             Arc::new(topology::redline_alias_ids(profile.programs));
         for program in programs.iter() {

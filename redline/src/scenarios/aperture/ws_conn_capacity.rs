@@ -5,7 +5,7 @@ use futures_util::future::join_all;
 use pubkey::Pubkey;
 use redsuite_core::{
     check, check_eq, host,
-    profile::select as select_profile,
+    profile::{self, ProfileValues},
     runner::{drive, RunConfig},
     topology,
     transport::wsraw::RawWs,
@@ -38,12 +38,12 @@ const FULL: Profile = Profile {
     churn_concurrency: 200,
 };
 
-fn profile(scenario: &str) -> &'static Profile {
-    match select_profile(scenario, &["lite", "full"]) {
-        "full" => &FULL,
-        _ => &LITE,
-    }
-}
+const PROFILES: ProfileValues<Profile> = ProfileValues {
+    lite: LITE,
+    full: FULL,
+    soak: None,
+    deep: None,
+};
 
 async fn open_connections(url: &str, count: usize) -> Result<Vec<RawWs>> {
     let mut connections = Vec::with_capacity(count);
@@ -92,7 +92,8 @@ impl Scenario for WsConnCapacity {
     }
 
     async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
-        let profile = profile(self.name());
+        let (profile, _) =
+            profile::select(self.name(), base.config(), &PROFILES);
         let shared_account: Pubkey = er.identity();
         let private = topology::private_er(
             base,
