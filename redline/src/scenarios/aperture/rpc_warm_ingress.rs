@@ -3,7 +3,7 @@ use std::{rc::Rc, time::Duration};
 use async_trait::async_trait;
 use redsuite_core::{
     check, check_eq, prep,
-    profile::select as select_profile,
+    profile::{self, LoopMode, ProfileValues},
     runner::{drive, drive_closed, RunConfig},
     transport::ws::{AccountUpdates, SignatureConfirmations},
     BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
@@ -58,26 +58,12 @@ const SOAK: Profile = Profile {
     concurrency: 256,
 };
 
-fn profile(scenario: &str) -> &'static Profile {
-    match select_profile(scenario, &["lite", "full", "soak"]) {
-        "soak" => &SOAK,
-        "full" => &FULL,
-        _ => &LITE,
-    }
-}
-
-// Open loop (default): the rate permit is released on delivery — sustained
-// pressure.
-// Closed loop: held until every confirmation for the id arrives —
-// true round-trip under backpressure.
-fn loop_mode() -> &'static str {
-    match std::env::var("REDSUITE_LOOP") {
-        Ok(mode) if mode == "closed" => "closed",
-        Ok(mode) if mode == "open" => "open",
-        Ok(mode) => panic!("unknown REDSUITE_LOOP `{mode}` (open|closed)"),
-        Err(_) => "open",
-    }
-}
+const PROFILES: ProfileValues<Profile> = ProfileValues {
+    lite: LITE,
+    full: FULL,
+    soak: Some(SOAK),
+    deep: None,
+};
 
 pub struct WarmIngress;
 
@@ -88,7 +74,8 @@ impl Scenario for WarmIngress {
     }
 
     async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
-        let profile = profile(self.name());
+        let (profile, _) =
+            profile::select(self.name(), base.config(), &PROFILES);
         let payers =
             prep::funded_payers(base, profile.payers, PAYER_LAMPORTS).await?;
         let pdas = crate::init_delegated_accounts(
@@ -204,8 +191,11 @@ impl Scenario for WarmIngress {
             rate: profile.rate,
             concurrency: profile.concurrency,
         };
-        let mode = loop_mode();
-        let outcome = if mode == "closed" {
+        // Open loop (default): the rate permit is released on delivery —
+        // sustained pressure. Closed loop: held until every confirmation
+        // for the id arrives — true round-trip under backpressure.
+        let mode = base.config().loop_mode;
+        let outcome = if mode == LoopMode::Closed {
             drive_closed(cfg, request, sync).await
         } else {
             drive(cfg, request).await
@@ -292,7 +282,7 @@ impl Scenario for WarmIngress {
         let mut report = ScenarioReport::ok(self.name())
             .setting("profile", profile.name)
             .setting("shape", "read-write 3/tx (1 src + 2 dst data-copy)")
-            .setting("loop", mode)
+            .setting("loop", mode.name())
             .setting("confirm timeout s", CONFIRM_TIMEOUT.as_secs())
             .setting("payers", profile.payers)
             .setting("accounts", profile.accounts)

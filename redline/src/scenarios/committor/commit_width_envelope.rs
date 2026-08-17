@@ -10,7 +10,7 @@ use pubkey::Pubkey;
 use redsuite_core::{
     api::custom_error_code,
     check, check_eq, prep,
-    profile::select as select_profile,
+    profile::{self, ProfileValues},
     receipt, report,
     runner::{drive, RunConfig},
     stats::StreamingStats,
@@ -64,12 +64,12 @@ const FULL: Profile = Profile {
     probes: true,
 };
 
-fn profile(scenario: &str) -> &'static Profile {
-    match select_profile(scenario, &["lite", "full"]) {
-        "full" => &FULL,
-        _ => &LITE,
-    }
-}
+const PROFILES: ProfileValues<Profile> = ProfileValues {
+    lite: LITE,
+    full: FULL,
+    soak: None,
+    deep: None,
+};
 
 #[derive(Default)]
 struct CellTally {
@@ -200,7 +200,8 @@ impl Scenario for CommitWidthEnvelope {
     }
 
     async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
-        let profile = profile(self.name());
+        let (profile, _) =
+            profile::select(self.name(), base.config(), &PROFILES);
         let payer = prep::funded_payer(base, PAYER_LAMPORTS).await?;
         let payer_pubkey = payer.pubkey();
         let pdas = crate::init_delegated_accounts(

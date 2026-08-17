@@ -16,6 +16,7 @@ use transaction::Transaction;
 
 use crate::{
     api::{self, Api, Metrics},
+    profile::ExecutionConfig,
     resources::Resources,
     Result,
 };
@@ -178,20 +179,30 @@ pub struct BaseCtx {
     ws_url: String,
     blockhash: Rc<BlockhashCache>,
     resources: Rc<Resources>,
+    config: ExecutionConfig,
 }
 
 impl BaseCtx {
-    pub(crate) fn new(rpc_url: String, ws_url: String) -> Self {
+    pub(crate) fn new(
+        rpc_url: String,
+        ws_url: String,
+        config: ExecutionConfig,
+    ) -> Self {
         Self {
             api: Api::new(rpc_url),
             ws_url,
             blockhash: Rc::new(BlockhashCache::new(BASE_BLOCKHASH_TTL)),
             resources: Rc::new(Resources::default()),
+            config,
         }
     }
 
     pub(crate) fn resources(&self) -> Rc<Resources> {
         self.resources.clone()
+    }
+
+    pub fn config(&self) -> ExecutionConfig {
+        self.config
     }
 
     pub fn ws_url(&self) -> &str {

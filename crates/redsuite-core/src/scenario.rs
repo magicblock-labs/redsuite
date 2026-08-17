@@ -9,6 +9,7 @@ use crate::{
     catalog::Fixture,
     check::CheckError,
     context::{BaseCtx, ErCtx},
+    profile::ExecutionConfig,
     report::ScenarioReport,
     resources::Resources,
     topology, DynError, Result,
@@ -174,6 +175,7 @@ impl RunRecord {
 pub async fn run_shared_scenario(
     scenario: impl Scenario,
     fixtures: &[Fixture],
+    config: Result<ExecutionConfig>,
 ) -> RunRecord {
     // A LocalSet so contexts and transports can spawn_local background work
     // (WS readers) on the test's current-thread runtime.
@@ -181,9 +183,13 @@ pub async fn run_shared_scenario(
     local
         .run_until(async {
             let name = scenario.name().to_owned();
-            execute(name, fixtures, topology::shared, |(base, er)| async move {
-                scenario.run(&base, &er).await
-            })
+            execute(
+                name,
+                fixtures,
+                config,
+                topology::shared,
+                |(base, er)| async move { scenario.run(&base, &er).await },
+            )
             .await
         })
         .await
@@ -192,14 +198,19 @@ pub async fn run_shared_scenario(
 pub async fn run_private_er_scenario(
     scenario: impl PrivateErScenario,
     fixtures: &[Fixture],
+    config: Result<ExecutionConfig>,
 ) -> RunRecord {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
             let name = scenario.name().to_owned();
-            execute(name, fixtures, topology::base_only, |base| async move {
-                scenario.run(&base).await
-            })
+            execute(
+                name,
+                fixtures,
+                config,
+                topology::base_only,
+                |base| async move { scenario.run(&base).await },
+            )
             .await
         })
         .await
@@ -226,7 +237,8 @@ impl ProvidesResources for (BaseCtx, ErCtx) {
 async fn execute<Provisioned, ProvisionFut, Body, BodyFut>(
     name: String,
     fixtures: &[Fixture],
-    provision: impl FnOnce() -> ProvisionFut,
+    config: Result<ExecutionConfig>,
+    provision: impl FnOnce(ExecutionConfig) -> ProvisionFut,
     body: Body,
 ) -> RunRecord
 where
@@ -237,6 +249,14 @@ where
 {
     let mut record = RunRecord::new(name);
 
+    let config = match config {
+        Ok(config) => config,
+        Err(error) => {
+            record.phase_failed(RunError::Preflight(error));
+            conclude(&mut record);
+            return record;
+        }
+    };
     if let Err(error) = preflight(fixtures) {
         record.phase_failed(RunError::Preflight(error));
         conclude(&mut record);
@@ -244,7 +264,7 @@ where
     }
     record.phase_ok(Phase::Preflight);
 
-    let provisioned = match provision().await {
+    let provisioned = match provision(config).await {
         Ok(provisioned) => {
             record.phase_ok(Phase::Topology);
             provisioned
