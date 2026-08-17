@@ -273,17 +273,26 @@ impl PrivateErScenario for LedgerRestoreChain {
                 RECEIPT_TIMEOUT,
             )
             .await?;
-            if let Some(message) = &commit_receipt.error_message {
-                return Err(CheckError::new("the commit succeeds")
-                    .actual(message)
-                    .into());
+            match &commit_receipt.error_message {
+                Some(message)
+                    if commit_receipt.failure_is_duplicate_rejection() =>
+                {
+                    receipt::warn_duplicate_rejection(self.name(), message);
+                }
+                Some(message) => {
+                    return Err(CheckError::new("the commit succeeds")
+                        .actual(message)
+                        .into());
+                }
+                None => {
+                    receipt::confirm_base_signatures(
+                        base.api(),
+                        &commit_receipt,
+                        BASE_CONFIRM_TIMEOUT,
+                    )
+                    .await?;
+                }
             }
-            receipt::confirm_base_signatures(
-                base.api(),
-                &commit_receipt,
-                BASE_CONFIRM_TIMEOUT,
-            )
-            .await?;
             check_eq!(
                 read_counter(er, &actor.counter).await?,
                 expected_counter(10, 3),

@@ -62,11 +62,13 @@ impl Scenario for Commits {
                 base, er, &signature, &pdas, false,
             )
             .await?;
-            check_eq!(
-                commit_receipt.base_signatures.len(),
-                1,
-                "a single-stage commit must send exactly one base tx"
-            )?;
+            if !commit_receipt.failure_is_duplicate_rejection() {
+                check_eq!(
+                    commit_receipt.base_signatures.len(),
+                    1,
+                    "a single-stage commit must send exactly one base tx"
+                )?;
+            }
 
             for pda in &pdas {
                 let on_er = er

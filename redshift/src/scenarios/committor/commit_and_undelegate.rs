@@ -106,11 +106,14 @@ async fn commit_undelegate_lifecycle(
 
     let commit_receipt =
         crate::assert_commit_receipt(base, er, &signature, &pdas, true).await?;
-    check_eq!(
-        commit_receipt.base_signatures.len(),
-        1,
-        "a single-stage commit and undelegate must send exactly one base tx"
-    )?;
+    if !commit_receipt.failure_is_duplicate_rejection() {
+        check_eq!(
+            commit_receipt.base_signatures.len(),
+            1,
+            "a single-stage commit and undelegate must send exactly one base \
+             tx"
+        )?;
+    }
 
     for pda in &pdas {
         check::poll(

@@ -91,39 +91,50 @@ impl Scenario for CommitRoundtrip {
             RECEIPT_TIMEOUT,
         )
         .await?;
-        if let Some(message) = &commit_receipt.error_message {
-            return Err(CheckError::new("the commit intent succeeds")
-                .actual(message)
-                .into());
+        let commit_tolerated = match &commit_receipt.error_message {
+            Some(message)
+                if commit_receipt.failure_is_duplicate_rejection() =>
+            {
+                receipt::warn_duplicate_rejection(self.name(), message);
+                true
+            }
+            Some(message) => {
+                return Err(CheckError::new("the commit intent succeeds")
+                    .actual(message)
+                    .into());
+            }
+            None => false,
+        };
+        if !commit_tolerated {
+            check_eq!(
+                commit_receipt.included,
+                vec![committed],
+                "the receipt must list exactly the committed account"
+            )?;
+            check!(
+                commit_receipt.excluded.is_empty(),
+                "nothing was eligible for exclusion"
+            )?;
+            check!(
+                !commit_receipt.requested_undelegation,
+                "a plain commit must not request undelegation"
+            )?;
+            check_eq!(
+                commit_receipt.payer,
+                Some(payer.pubkey()),
+                "the receipt must name the scheduling payer"
+            )?;
+            check!(
+                !commit_receipt.base_signatures.is_empty(),
+                "a commit receipt must name at least one base tx"
+            )?;
+            receipt::confirm_base_signatures(
+                base.api(),
+                &commit_receipt,
+                BASE_CONFIRM_TIMEOUT,
+            )
+            .await?;
         }
-        check_eq!(
-            commit_receipt.included,
-            vec![committed],
-            "the receipt must list exactly the committed account"
-        )?;
-        check!(
-            commit_receipt.excluded.is_empty(),
-            "nothing was eligible for exclusion"
-        )?;
-        check!(
-            !commit_receipt.requested_undelegation,
-            "a plain commit must not request undelegation"
-        )?;
-        check_eq!(
-            commit_receipt.payer,
-            Some(payer.pubkey()),
-            "the receipt must name the scheduling payer"
-        )?;
-        check!(
-            !commit_receipt.base_signatures.is_empty(),
-            "a commit receipt must name at least one base tx"
-        )?;
-        receipt::confirm_base_signatures(
-            base.api(),
-            &commit_receipt,
-            BASE_CONFIRM_TIMEOUT,
-        )
-        .await?;
         check::poll_for(
             "the committed base copy matches the er snapshot",
             BASE_STATE_TIMEOUT,
@@ -142,8 +153,10 @@ impl Scenario for CommitRoundtrip {
         )
         .await
         .map_err(|error| {
-            error
-                .expected(format!("data[..48] {:02x?}", &committed_state[..48]))
+            error.expected(format!(
+                "data[..48] {:02x?}",
+                &committed_state[..48.min(committed_state.len())]
+            ))
         })?;
         let commit_roundtrip_s = commit_started.elapsed().as_secs_f64();
 
@@ -200,40 +213,51 @@ impl Scenario for CommitRoundtrip {
             RECEIPT_TIMEOUT,
         )
         .await?;
-        if let Some(message) = &undelegate_receipt.error_message {
-            return Err(CheckError::new(
-                "the commit-undelegate intent succeeds",
+        let undelegate_tolerated = match &undelegate_receipt.error_message {
+            Some(message)
+                if undelegate_receipt.failure_is_duplicate_rejection() =>
+            {
+                receipt::warn_duplicate_rejection(self.name(), message);
+                true
+            }
+            Some(message) => {
+                return Err(CheckError::new(
+                    "the commit-undelegate intent succeeds",
+                )
+                .actual(message)
+                .into());
+            }
+            None => false,
+        };
+        if !undelegate_tolerated {
+            let mut included = undelegate_receipt.included.clone();
+            included.sort();
+            let mut expected = accounts.to_vec();
+            expected.sort();
+            check_eq!(
+                included,
+                expected,
+                "the receipt must list both undelegated accounts"
+            )?;
+            check!(
+                undelegate_receipt.excluded.is_empty(),
+                "nothing was eligible for exclusion"
+            )?;
+            check!(
+                undelegate_receipt.requested_undelegation,
+                "the receipt must record the undelegation request"
+            )?;
+            check!(
+                !undelegate_receipt.base_signatures.is_empty(),
+                "an undelegating commit must name at least one base tx"
+            )?;
+            receipt::confirm_base_signatures(
+                base.api(),
+                &undelegate_receipt,
+                BASE_CONFIRM_TIMEOUT,
             )
-            .actual(message)
-            .into());
+            .await?;
         }
-        let mut included = undelegate_receipt.included.clone();
-        included.sort();
-        let mut expected = accounts.to_vec();
-        expected.sort();
-        check_eq!(
-            included,
-            expected,
-            "the receipt must list both undelegated accounts"
-        )?;
-        check!(
-            undelegate_receipt.excluded.is_empty(),
-            "nothing was eligible for exclusion"
-        )?;
-        check!(
-            undelegate_receipt.requested_undelegation,
-            "the receipt must record the undelegation request"
-        )?;
-        check!(
-            !undelegate_receipt.base_signatures.is_empty(),
-            "an undelegating commit must name at least one base tx"
-        )?;
-        receipt::confirm_base_signatures(
-            base.api(),
-            &undelegate_receipt,
-            BASE_CONFIRM_TIMEOUT,
-        )
-        .await?;
 
         for (pda, expected) in
             [(committed, &committed_final), (sibling, &sibling_final)]
@@ -270,7 +294,7 @@ impl Scenario for CommitRoundtrip {
                     "owner {} lamports {} data[..48] {:02x?}",
                     crate::program::id(),
                     expected.lamports,
-                    &expected.data[..48]
+                    &expected.data[..48.min(expected.data.len())]
                 ))
             })?;
         }

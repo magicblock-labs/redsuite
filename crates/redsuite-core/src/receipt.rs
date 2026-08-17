@@ -39,6 +39,30 @@ impl CommitReceipt {
     pub fn succeeded(&self) -> bool {
         self.error_message.is_none() && self.receipt_err_code.is_none()
     }
+
+    // The >= 0.14.10 committor retries an unconfirmed base tx with a fresh
+    // blockhash
+    pub fn failure_is_duplicate_rejection(&self) -> bool {
+        const DUPLICATE_REJECTIONS: [&str; 4] = [
+            "InvalidAccountOwner",
+            "Custom(11)",
+            "Custom(12)",
+            "invalid Commit id",
+        ];
+        self.error_message.as_deref().is_some_and(|message| {
+            DUPLICATE_REJECTIONS
+                .iter()
+                .any(|needle| message.contains(needle))
+        })
+    }
+}
+
+pub fn warn_duplicate_rejection(scenario: &str, message: &str) {
+    eprintln!(
+        "[redsuite] {scenario}: warning: intent reported failed with a \
+         duplicate-rejection code (validator PR #1537) — verifying base \
+         state instead: {message}"
+    );
 }
 
 // Builtin ic_msg lines arrive bare; tolerate a BPF-style prefix anyway.

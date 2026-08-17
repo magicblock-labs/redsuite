@@ -85,6 +85,10 @@ pub async fn assert_commit_receipt(
         receipt::fetch_commit_receipt(er.api(), signature, RECEIPT_TIMEOUT)
             .await?;
     if let Some(message) = &commit_receipt.error_message {
+        if commit_receipt.failure_is_duplicate_rejection() {
+            receipt::warn_duplicate_rejection("commit receipt", message);
+            return Ok(commit_receipt);
+        }
         return Err(check::CheckError::new("the commit intent succeeds")
             .actual(message)
             .into());

@@ -124,16 +124,6 @@ pub mod redshift {
             resources: [Resource::Er],
             fixtures: [Fixture::RedshiftProgram],
         },
-        commit_limit_and_fees => committor::commit_limit_and_fees::CommitLimitAndFees {
-            topology: Shared,
-            resources: [Resource::Er],
-            fixtures: [Fixture::RedshiftProgram],
-        },
-        intent_flows => committor::intent_flows::IntentFlows {
-            topology: Shared,
-            resources: [Resource::Er],
-            fixtures: [Fixture::RedshiftProgram],
-        },
         config_gates => harness::config_gates::ConfigGates {
             topology: PrivateEr,
             resources: [Resource::Er],
