@@ -5,7 +5,7 @@ use std::time::Duration;
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redshift_program::schedulecommit::{build, MainAccount};
-use redsuite_core::{assert::poll_until, BaseCtx, ChainCtx, ErCtx, Result};
+use redsuite_core::{check, check_eq, BaseCtx, ChainCtx, ErCtx, Result};
 use signer::Signer;
 
 pub const PAYER_LAMPORTS: u64 = 2_000_000_000;
@@ -40,23 +40,32 @@ pub async fn init_delegated_committees(
         let on_base = base.account(&pda).await?.ok_or(
             "the committee pda is not on base after init and delegate",
         )?;
-        assert_eq!(
-            on_base.owner, DELEGATION_PROGRAM_ID,
+        check_eq!(
+            on_base.owner,
+            DELEGATION_PROGRAM_ID,
             "dlp must own a delegated committee on base"
-        );
+        )?;
         committees.push(Committee { player, pda });
     }
     Ok(committees)
 }
 
-pub async fn await_committee_clones(er: &ErCtx, committees: &[Committee]) {
+pub async fn await_committee_clones(
+    er: &ErCtx,
+    committees: &[Committee],
+) -> Result<()> {
     for committee in committees {
-        poll_until(CLONE_TIMEOUT, || async {
-            matches!(
-                er.account(&committee.pda).await,
-                Ok(Some(clone)) if clone.data.len() == MainAccount::SIZE
-            )
-        })
-        .await;
+        check::poll(
+            &format!("the ER clones committee {}", committee.pda),
+            CLONE_TIMEOUT,
+            || async {
+                matches!(
+                    er.account(&committee.pda).await,
+                    Ok(Some(clone)) if clone.data.len() == MainAccount::SIZE
+                )
+            },
+        )
+        .await?;
     }
+    Ok(())
 }

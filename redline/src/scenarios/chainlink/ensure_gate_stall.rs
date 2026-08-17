@@ -7,8 +7,7 @@ use async_trait::async_trait;
 use futures_util::future::join_all;
 use pubkey::Pubkey;
 use redsuite_core::{
-    assert::poll_until,
-    prep,
+    check, check_eq, prep,
     profile::select as select_profile,
     report,
     runner::{drive, RunConfig},
@@ -98,10 +97,14 @@ async fn prewarm(er: &ErCtx, pool: &[Pubkey]) -> Result<()> {
         let _ = join_all(touches).await;
     }
     for pda in pool {
-        poll_until(CLONE_TIMEOUT, || async {
-            matches!(er.account(pda).await, Ok(Some(acc)) if acc.data.len() == ACCOUNT_SPACE as usize)
-        })
-        .await;
+        check::poll(
+            &format!("the ER clones the pool account {pda}"),
+            CLONE_TIMEOUT,
+            || async {
+                matches!(er.account(pda).await, Ok(Some(acc)) if acc.data.len() == ACCOUNT_SPACE as usize)
+            },
+        )
+        .await?;
     }
     Ok(())
 }
@@ -302,11 +305,12 @@ impl Scenario for EnsureGateStall {
         let healthy = &cells[0];
         let thrash = &cells[1];
 
-        assert_eq!(
-            healthy.failed, 0,
+        check_eq!(
+            healthy.failed,
+            0,
             "healthy cell requests failed: {:?}",
             healthy.first_error
-        );
+        )?;
         if healthy.p50_us >= 1_000_000.0 {
             eprintln!(
                 "[redsuite] {}: warning: healthy cell p50 {:.0} us left the \
@@ -325,19 +329,20 @@ impl Scenario for EnsureGateStall {
             }
         }
 
-        assert_eq!(
-            healthy.evictions, 0.0,
+        check_eq!(
+            healthy.evictions,
+            0.0,
             "healthy cell (cap ≥ working set) must not evict"
-        );
+        )?;
 
-        assert!(
+        check!(
             thrash.delivered > 0,
             "INVALID: the thrash cell delivered nothing"
-        );
-        assert!(
+        )?;
+        check!(
             thrash.evictions > 0.0,
             "INVALID: no evictions — the cap knob did not engage"
-        );
+        )?;
 
         let slowdown = if healthy.p50_us > 0.0 {
             thrash.p50_us / healthy.p50_us

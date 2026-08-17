@@ -5,7 +5,7 @@ use instruction::{AccountMeta, Instruction};
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    assert::poll_until, prep, stats::StreamingStats, BaseCtx, ChainCtx, ErCtx,
+    check, prep, stats::StreamingStats, BaseCtx, ChainCtx, CheckError, ErCtx,
     Result, Scenario, ScenarioReport,
 };
 use signer::Signer;
@@ -43,20 +43,25 @@ impl Scenario for Example {
             .await?
             .ok_or("recipient never appeared on base")?;
         if on_base.lamports != expected {
-            return Err(format!(
-                "base holds {} lamports, expected {expected}",
-                on_base.lamports
+            return Err(CheckError::new(
+                "the base recipient holds the delivered lamports",
             )
+            .expected(expected.to_string())
+            .actual(on_base.lamports.to_string())
             .into());
         }
 
-        poll_until(Duration::from_secs(15), || async {
-            matches!(
-                er.account(&recipient).await,
-                Ok(Some(cloned)) if cloned.lamports == expected
-            )
-        })
-        .await;
+        check::poll(
+            "the er clones the recipient at the delivered balance",
+            Duration::from_secs(15),
+            || async {
+                matches!(
+                    er.account(&recipient).await,
+                    Ok(Some(cloned)) if cloned.lamports == expected
+                )
+            },
+        )
+        .await?;
 
         let metrics = er.scrape_metrics().await?;
 

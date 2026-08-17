@@ -5,8 +5,8 @@ use keypair::Keypair;
 use pubkey::Pubkey;
 use redshift_program::flexi::{build as flexi, FlexiCounter};
 use redsuite_core::{
-    assert::poll_until, dlp, prep, receipt, system, topology, BaseCtx,
-    ChainCtx, ErCtx, PrivateErScenario, Result, ScenarioReport,
+    check, check_eq, dlp, prep, receipt, system, topology, BaseCtx, ChainCtx,
+    CheckError, ErCtx, PrivateErScenario, Result, ScenarioReport,
 };
 use signer::Signer;
 
@@ -26,10 +26,14 @@ pub struct LedgerRestoreChain;
 
 async fn advance_slots(er: &ErCtx, count: u64) -> Result<u64> {
     let target = er.api().get_slot().await? + count;
-    poll_until(SLOT_TIMEOUT, || async {
-        matches!(er.api().get_slot().await, Ok(slot) if slot >= target)
-    })
-    .await;
+    check::poll(
+        &format!("the er reaches slot {target}"),
+        SLOT_TIMEOUT,
+        || async {
+            matches!(er.api().get_slot().await, Ok(slot) if slot >= target)
+        },
+    )
+    .await?;
     er.api().get_slot().await
 }
 
@@ -88,13 +92,17 @@ async fn await_er_balance(
     account: &Pubkey,
     expected: u64,
 ) -> Result<()> {
-    poll_until(CLONE_TIMEOUT, || async {
-        matches!(
-            er.api().get_balance(account).await,
-            Ok(balance) if balance == expected
-        )
-    })
-    .await;
+    check::poll(
+        &format!("the er balance of {account} reaches {expected}"),
+        CLONE_TIMEOUT,
+        || async {
+            matches!(
+                er.api().get_balance(account).await,
+                Ok(balance) if balance == expected
+            )
+        },
+    )
+    .await?;
     Ok(())
 }
 
@@ -129,13 +137,17 @@ async fn counter_actor(
         ),
     ];
     base.send_with(funder, &[&payer], &setup).await?;
-    poll_until(CLONE_TIMEOUT, || async {
-        matches!(
-            er.account(&counter).await,
-            Ok(Some(clone)) if !clone.data.is_empty()
-        )
-    })
-    .await;
+    check::poll(
+        "the er clones the delegated counter",
+        CLONE_TIMEOUT,
+        || async {
+            matches!(
+                er.account(&counter).await,
+                Ok(Some(clone)) if !clone.data.is_empty()
+            )
+        },
+    )
+    .await?;
     Ok(CounterActor { payer, counter })
 }
 
@@ -160,13 +172,17 @@ async fn await_counter_state(
     counter: &Pubkey,
     expected: &FlexiCounter,
 ) -> Result<()> {
-    poll_until(RESTORE_TIMEOUT, || async {
-        matches!(
-            read_counter(er, counter).await,
-            Ok(state) if &state == expected
-        )
-    })
-    .await;
+    check::poll(
+        &format!("the restored counter reaches {expected:?}"),
+        RESTORE_TIMEOUT,
+        || async {
+            matches!(
+                read_counter(er, counter).await,
+                Ok(state) if &state == expected
+            )
+        },
+    )
+    .await?;
     Ok(())
 }
 
@@ -200,11 +216,11 @@ impl PrivateErScenario for LedgerRestoreChain {
                 .ctx()
                 .send(&actor.payer, &[flexi::add(actor.payer.pubkey(), 3)])
                 .await?;
-            assert_eq!(
+            check_eq!(
                 read_counter(writer.ctx(), &actor.counter).await?,
                 expected_counter(3, 1),
                 "the written counter state"
-            );
+            )?;
             advance_slots(writer.ctx(), PERSIST_SLOTS).await?;
             writer.stop(true).await?;
             drop(writer);
@@ -228,18 +244,18 @@ impl PrivateErScenario for LedgerRestoreChain {
                 .await?;
             er.send(&actor.payer, &[flexi::mul(actor.payer.pubkey(), 2)])
                 .await?;
-            assert_eq!(
+            check_eq!(
                 read_counter(er, &actor.counter).await?,
                 expected_counter(6, 2),
                 "the pre-commit counter state"
-            );
+            )?;
             advance_slots(er, PERSIST_SLOTS).await?;
 
             let vault = dlp::magic_fee_vault_pda(&er.identity());
-            assert!(
+            check!(
                 er.account(&vault).await?.is_some(),
                 "the magic fee vault must be on the er"
-            );
+            )?;
             let signature = er
                 .send(
                     &actor.payer,
@@ -257,29 +273,44 @@ impl PrivateErScenario for LedgerRestoreChain {
                 RECEIPT_TIMEOUT,
             )
             .await?;
-            if let Some(message) = &commit_receipt.error_message {
-                return Err(format!("the commit failed: {message}").into());
+            match &commit_receipt.error_message {
+                Some(message)
+                    if commit_receipt.failure_is_duplicate_rejection() =>
+                {
+                    receipt::warn_duplicate_rejection(self.name(), message);
+                }
+                Some(message) => {
+                    return Err(CheckError::new("the commit succeeds")
+                        .actual(message)
+                        .into());
+                }
+                None => {
+                    receipt::confirm_base_signatures(
+                        base.api(),
+                        &commit_receipt,
+                        BASE_CONFIRM_TIMEOUT,
+                    )
+                    .await?;
+                }
             }
-            receipt::confirm_base_signatures(
-                base.api(),
-                &commit_receipt,
-                BASE_CONFIRM_TIMEOUT,
-            )
-            .await?;
-            assert_eq!(
+            check_eq!(
                 read_counter(er, &actor.counter).await?,
                 expected_counter(10, 3),
                 "the ephem counter state after the commit"
-            );
-            poll_until(RESTORE_TIMEOUT, || async {
-                matches!(
-                    base.account(&actor.counter).await,
-                    Ok(Some(acc))
-                        if FlexiCounter::try_decode(&acc.data).ok()
-                            == Some(expected_counter(10, 3))
-                )
-            })
-            .await;
+            )?;
+            check::poll(
+                "the committed counter state lands on base",
+                RESTORE_TIMEOUT,
+                || async {
+                    matches!(
+                        base.account(&actor.counter).await,
+                        Ok(Some(acc))
+                            if FlexiCounter::try_decode(&acc.data).ok()
+                                == Some(expected_counter(10, 3))
+                    )
+                },
+            )
+            .await?;
             let written_signatures =
                 chain_signature_count(base, &actor.counter).await?;
             advance_slots(er, PERSIST_SLOTS).await?;
@@ -297,18 +328,19 @@ impl PrivateErScenario for LedgerRestoreChain {
                 .account(&actor.counter)
                 .await?
                 .ok_or("the counter is not on base after the restore")?;
-            assert_eq!(
+            check_eq!(
                 FlexiCounter::try_decode(&on_base.data)?,
                 expected_counter(10, 3),
                 "the chain counter state after the restore"
-            );
+            )?;
             advance_slots(reader.ctx(), 3).await?;
             let restored_signatures =
                 chain_signature_count(base, &actor.counter).await?;
-            assert_eq!(
-                restored_signatures, written_signatures,
+            check_eq!(
+                restored_signatures,
+                written_signatures,
                 "the replay must not send the commit to base again"
-            );
+            )?;
             report =
                 report.setting("commit chain signatures", written_signatures);
         }
@@ -372,31 +404,39 @@ impl PrivateErScenario for LedgerRestoreChain {
             advance_slots(writer.ctx(), 3).await?;
             let written =
                 read_counter(writer.ctx(), &actor.counter).await?.count;
-            assert!(
+            check!(
                 written > 0,
                 "the crank must move the counter before the kill"
-            );
+            )?;
             advance_slots(writer.ctx(), PERSIST_SLOTS).await?;
             writer.stop(true).await?;
             drop(writer);
 
             let reader = boot_reader(base, "restore-crank").await?;
             let er = reader.ctx();
-            poll_until(RESTORE_TIMEOUT, || async {
-                matches!(
-                    read_counter(er, &actor.counter).await,
-                    Ok(state) if state.count >= written
-                )
-            })
-            .await;
+            check::poll(
+                "the restored counter reaches the pre-kill count",
+                RESTORE_TIMEOUT,
+                || async {
+                    matches!(
+                        read_counter(er, &actor.counter).await,
+                        Ok(state) if state.count >= written
+                    )
+                },
+            )
+            .await?;
             let restored = read_counter(er, &actor.counter).await?.count;
-            poll_until(RESTORE_TIMEOUT, || async {
-                matches!(
-                    read_counter(er, &actor.counter).await,
-                    Ok(state) if state.count > restored
-                )
-            })
-            .await;
+            check::poll(
+                "the restored task keeps cranking past the restore point",
+                RESTORE_TIMEOUT,
+                || async {
+                    matches!(
+                        read_counter(er, &actor.counter).await,
+                        Ok(state) if state.count > restored
+                    )
+                },
+            )
+            .await?;
             report = report
                 .setting("crank count at kill", written)
                 .setting("crank count at restore", restored);

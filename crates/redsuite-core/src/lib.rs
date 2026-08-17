@@ -1,6 +1,6 @@
 pub mod api;
-pub mod assert;
 pub mod catalog;
+pub mod check;
 pub mod context;
 pub mod dlp;
 pub mod host;
@@ -20,6 +20,7 @@ pub mod topology;
 pub mod transport;
 
 pub use api::{Api, Metrics, MetricsDelta};
+pub use check::CheckError;
 pub use context::{BaseCtx, ChainCtx, ErClient, ErCtx, TxSender};
 pub use report::ScenarioReport;
 pub use scenario::{

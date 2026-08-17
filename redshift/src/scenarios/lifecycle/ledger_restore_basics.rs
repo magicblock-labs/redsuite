@@ -5,7 +5,7 @@ use keypair::Keypair;
 use pubkey::Pubkey;
 use redshift_program::flexi::{build as flexi, FlexiCounter};
 use redsuite_core::{
-    assert::poll_until, dlp, prep, system, topology, BaseCtx, ChainCtx, ErCtx,
+    check, check_eq, dlp, prep, system, topology, BaseCtx, ChainCtx, ErCtx,
     PrivateErScenario, Result, ScenarioReport,
 };
 use signature::Signature;
@@ -27,10 +27,14 @@ pub struct LedgerRestoreBasics;
 
 async fn advance_slots(er: &ErCtx, count: u64) -> Result<u64> {
     let target = er.api().get_slot().await? + count;
-    poll_until(SLOT_TIMEOUT, || async {
-        matches!(er.api().get_slot().await, Ok(slot) if slot >= target)
-    })
-    .await;
+    check::poll(
+        &format!("the er reaches slot {target}"),
+        SLOT_TIMEOUT,
+        || async {
+            matches!(er.api().get_slot().await, Ok(slot) if slot >= target)
+        },
+    )
+    .await?;
     er.api().get_slot().await
 }
 
@@ -94,13 +98,17 @@ async fn await_er_balance(
     account: &Pubkey,
     expected: u64,
 ) -> Result<()> {
-    poll_until(CLONE_TIMEOUT, || async {
-        matches!(
-            er.api().get_balance(account).await,
-            Ok(balance) if balance == expected
-        )
-    })
-    .await;
+    check::poll(
+        &format!("the er balance of {account} reaches {expected}"),
+        CLONE_TIMEOUT,
+        || async {
+            matches!(
+                er.api().get_balance(account).await,
+                Ok(balance) if balance == expected
+            )
+        },
+    )
+    .await?;
     Ok(())
 }
 
@@ -122,10 +130,10 @@ async fn block_time(er: &ErCtx, signature: &Signature) -> Result<i64> {
 
 async fn assert_restored_tx(er: &ErCtx, signature: &Signature) -> Result<()> {
     let tx = er.api().await_transaction(signature, TX_TIMEOUT).await?;
-    assert!(
+    check!(
         tx.err.is_none(),
         "a restored transaction must keep its ok status"
-    );
+    )?;
     Ok(())
 }
 
@@ -161,13 +169,17 @@ async fn counter_actor(
         ),
     ];
     base.send_with(funder, &[&payer], &setup).await?;
-    poll_until(CLONE_TIMEOUT, || async {
-        matches!(
-            er.account(&counter).await,
-            Ok(Some(clone)) if !clone.data.is_empty()
-        )
-    })
-    .await;
+    check::poll(
+        "the er clones the delegated counter",
+        CLONE_TIMEOUT,
+        || async {
+            matches!(
+                er.account(&counter).await,
+                Ok(Some(clone)) if !clone.data.is_empty()
+            )
+        },
+    )
+    .await?;
     Ok(CounterActor { payer, counter })
 }
 
@@ -181,11 +193,11 @@ async fn assert_counter(
         .account(counter)
         .await?
         .ok_or("the counter account is missing")?;
-    assert_eq!(
+    check_eq!(
         &FlexiCounter::try_decode(&account.data)?,
         expected,
         "the {side} counter state"
-    );
+    )?;
     Ok(())
 }
 
@@ -267,20 +279,21 @@ impl PrivateErScenario for LedgerRestoreBasics {
             let er = reader.ctx();
             for wallet in &wallets {
                 let balance = er.api().get_balance(&wallet.pubkey()).await?;
-                assert_eq!(
+                check_eq!(
                     balance,
                     RENT_EXEMPT + SOL,
                     "a restored wallet balance"
-                );
+                )?;
             }
             for signature in &signatures {
                 assert_restored_tx(er, signature).await?;
             }
             let restored_time = block_time(er, &signatures[3]).await?;
-            assert_eq!(
-                restored_time, written_time,
+            check_eq!(
+                restored_time,
+                written_time,
                 "the restored block time must match the written block time"
-            );
+            )?;
             report = report.setting("restored block time", restored_time);
         }
 
@@ -384,21 +397,21 @@ impl PrivateErScenario for LedgerRestoreBasics {
             let er = reader.ctx();
             if !reset {
                 let restored_slot = er.api().get_slot().await?;
-                assert!(
+                check!(
                     restored_slot >= saved_slot,
                     "a replay restore must resume at or past the written \
                      slot: {restored_slot} < {saved_slot}"
-                );
+                )?;
             }
             let expected = if reset { 1_111_111 } else { 1_111_011 };
             await_er_balance(er, &sender.pubkey(), expected).await?;
             let restored_tx = er.api().get_transaction(&signature).await?;
-            assert_eq!(
+            check_eq!(
                 restored_tx.is_none(),
                 reset,
                 "a reset restore must drop the transaction and a replay \
                  restore must keep it"
-            );
+            )?;
             report =
                 report.setting(format!("{label} sender lamports"), expected);
         }
@@ -419,11 +432,11 @@ impl PrivateErScenario for LedgerRestoreBasics {
                 .account(&vault)
                 .await?
                 .ok_or("the fresh identity has no fees vault on base")?;
-            assert_eq!(
+            check_eq!(
                 vault_on_base.owner,
                 dlp::dlp_id(),
                 "the pool-injected fees vault must be dlp-owned"
-            );
+            )?;
             let actor =
                 counter_actor(base, writer.ctx(), &funder, LABEL_FRESH).await?;
             let er = writer.ctx();
@@ -439,10 +452,10 @@ impl PrivateErScenario for LedgerRestoreBasics {
                 .account(&redshift_program::id())
                 .await?
                 .ok_or("the redshift program did not clone into the er")?;
-            assert!(
+            check!(
                 program.executable,
                 "the cloned program must present as executable"
-            );
+            )?;
             advance_slots(er, PERSIST_SLOTS).await?;
             writer.stop(true).await?;
             drop(writer);
@@ -457,34 +470,42 @@ impl PrivateErScenario for LedgerRestoreBasics {
             .await?;
             let er = reader.ctx();
             assert_counter(er, &actor.counter, &expected, "restored").await?;
-            poll_until(CLONE_TIMEOUT, || async {
-                matches!(er.account(&redshift_program::id()).await, Ok(Some(_)))
-            })
-            .await;
+            check::poll(
+                "the reader re-clones the redshift program",
+                CLONE_TIMEOUT,
+                || async {
+                    matches!(
+                        er.account(&redshift_program::id()).await,
+                        Ok(Some(_))
+                    )
+                },
+            )
+            .await?;
             let restored_program =
                 er.account(&redshift_program::id())
                     .await?
                     .ok_or("the cloned program vanished in the restore")?;
-            assert!(
+            check!(
                 restored_program.executable,
                 "the restored program must stay executable"
-            );
-            assert_eq!(
-                restored_program.owner, program.owner,
+            )?;
+            check_eq!(
+                restored_program.owner,
+                program.owner,
                 "the restored program owner"
-            );
-            assert_eq!(
+            )?;
+            check_eq!(
                 restored_program.data.len(),
                 program.data.len(),
                 "the restored program size"
-            );
+            )?;
             // the first 48 bytes are the LoaderV4State header, whose deploy
             // slot is re-stamped on every clone
-            assert_eq!(
+            check_eq!(
                 restored_program.data[48..],
                 program.data[48..],
                 "the restored program bytecode"
-            );
+            )?;
             report = report
                 .setting("fresh authority", identity)
                 .setting(

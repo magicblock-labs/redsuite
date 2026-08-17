@@ -1,9 +1,13 @@
-use std::{future::Future, rc::Rc, time::Instant};
+use std::{
+    any::Any, future::Future, panic::AssertUnwindSafe, rc::Rc, time::Instant,
+};
 
 use async_trait::async_trait;
+use futures_util::FutureExt;
 
 use crate::{
     catalog::Fixture,
+    check::CheckError,
     context::{BaseCtx, ErCtx},
     report::ScenarioReport,
     resources::Resources,
@@ -90,7 +94,23 @@ pub struct PhaseOutcome {
 pub enum ScenarioOutcome {
     Passed(ScenarioReport),
     Failed(DynError),
+    Panicked(String),
     NotReached,
+}
+
+// A failed check is scenario evidence; every other error is infrastructure.
+pub fn failed_check(error: &DynError) -> Option<&CheckError> {
+    error.downcast_ref::<CheckError>()
+}
+
+fn panic_message(payload: Box<dyn Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_owned()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_owned()
+    }
 }
 
 #[derive(Debug)]
@@ -129,8 +149,15 @@ impl RunRecord {
 
     pub fn failure(&self) -> Option<String> {
         let mut lines = Vec::new();
-        if let ScenarioOutcome::Failed(error) = &self.scenario {
-            lines.push(format!("scenario failed: {error}"));
+        match &self.scenario {
+            ScenarioOutcome::Failed(error) => match failed_check(error) {
+                Some(check) => lines.push(format!("check failed: {check}")),
+                None => lines.push(format!("scenario failed: {error}")),
+            },
+            ScenarioOutcome::Panicked(message) => {
+                lines.push(format!("scenario panicked: {message}"))
+            }
+            ScenarioOutcome::Passed(_) | ScenarioOutcome::NotReached => {}
         }
         for outcome in &self.phases {
             if let Some(error) = &outcome.error {
@@ -231,15 +258,18 @@ where
 
     let resources = provisioned.resources();
     let started = Instant::now();
-    let outcome = body(provisioned).await;
+    // catch_unwind so an internal-invariant panic still reaches the teardown
+    // audit and the persisted report instead of aborting sibling scenarios
+    let outcome = AssertUnwindSafe(body(provisioned)).catch_unwind().await;
     let wall_seconds = started.elapsed().as_secs_f64();
     let teardown_errors = resources.audit();
     record.wall_seconds = Some(wall_seconds);
     record.scenario = match outcome {
-        Ok(report) => {
+        Ok(Ok(report)) => {
             ScenarioOutcome::Passed(report.metric("wall seconds", wall_seconds))
         }
-        Err(error) => ScenarioOutcome::Failed(error),
+        Ok(Err(error)) => ScenarioOutcome::Failed(error),
+        Err(payload) => ScenarioOutcome::Panicked(panic_message(payload)),
     };
 
     if teardown_errors.is_empty() {
@@ -293,8 +323,20 @@ fn conclude(record: &mut RunRecord) {
                 eprintln!("[redsuite]   {label}: {value}");
             }
         }
-        ScenarioOutcome::Failed(error) => {
-            eprintln!("[redsuite] {}: scenario failed: {error}", record.name)
+        ScenarioOutcome::Failed(error) => match failed_check(error) {
+            Some(check) => {
+                eprintln!("[redsuite] {}: check failed: {check}", record.name)
+            }
+            None => eprintln!(
+                "[redsuite] {}: scenario failed: {error}",
+                record.name
+            ),
+        },
+        ScenarioOutcome::Panicked(message) => {
+            eprintln!(
+                "[redsuite] {}: scenario panicked: {message}",
+                record.name
+            )
         }
         ScenarioOutcome::NotReached => {
             eprintln!("[redsuite] {}: not run", record.name)
@@ -315,5 +357,26 @@ fn conclude(record: &mut RunRecord) {
             eprintln!("[redsuite]   {error}");
             record.phase_failed(error);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn panic_payloads_keep_their_message() {
+        let caught = std::panic::catch_unwind(|| panic!("boom {}", 7));
+        assert_eq!(panic_message(caught.unwrap_err()), "boom 7");
+        let caught = std::panic::catch_unwind(|| panic!("plain"));
+        assert_eq!(panic_message(caught.unwrap_err()), "plain");
+    }
+
+    #[test]
+    fn check_errors_classify_apart_from_plain_errors() {
+        let check: DynError = Box::new(CheckError::new("the clone lands"));
+        let plain: DynError = "connection refused".into();
+        assert!(failed_check(&check).is_some());
+        assert!(failed_check(&plain).is_none());
     }
 }

@@ -5,8 +5,8 @@ use instruction::{AccountMeta, Instruction};
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    loader_v4, prep, topology, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
-    ScenarioReport,
+    check, check_eq, loader_v4, prep, topology, BaseCtx, ChainCtx, CheckError,
+    ErCtx, Result, Scenario, ScenarioReport,
 };
 use signer::Signer;
 
@@ -41,21 +41,23 @@ impl Scenario for LoaderMatrix {
         let memo_v2: Pubkey = MEMO_V2_ID.parse()?;
 
         invoke_until(er, payer, memo_v1, &memo_data, vec![], |_| true).await?;
-        assert!(
+        check!(
             er.account(&memo_v1).await?.is_some(),
             "memo v1 (LoaderV1) must be cloned into the ER after invocation"
-        );
+        )?;
 
         invoke_until(er, payer, memo_v2, &memo_data, vec![], has_memo).await?;
         let (v2_authority, v2_status) = loader_v4_state(er, &memo_v2).await?;
-        assert_eq!(
-            v2_status, LOADER_V4_STATUS_DEPLOYED,
+        check_eq!(
+            v2_status,
+            LOADER_V4_STATUS_DEPLOYED,
             "the cloned memo v2 must normalize to a Deployed LoaderV4 program"
-        );
-        assert_eq!(
-            v2_authority, memo_v2,
+        )?;
+        check_eq!(
+            v2_authority,
+            memo_v2,
             "a v1/v2 clone normalizes its authority to the program id itself"
-        );
+        )?;
 
         let (v3_id, v3_authority) = topology::redshift_loader_v3_target();
         let v3_logs =
@@ -63,18 +65,20 @@ impl Scenario for LoaderMatrix {
                 .await?;
         let (cloned_v3_authority, v3_status) =
             loader_v4_state(er, &v3_id).await?;
-        assert_eq!(
-            v3_status, LOADER_V4_STATUS_DEPLOYED,
+        check_eq!(
+            v3_status,
+            LOADER_V4_STATUS_DEPLOYED,
             "the cloned v3 program must be a Deployed LoaderV4 program"
-        );
-        assert_eq!(
-            cloned_v3_authority, v3_authority,
+        )?;
+        check_eq!(
+            cloned_v3_authority,
+            v3_authority,
             "the v3 upgrade authority must survive the clone into the ER"
-        );
-        assert!(
+        )?;
+        check!(
             v3_logs.iter().any(|line| line.contains("LogMsg:")),
             "the v3 program invocation must emit its LogMsg line"
-        );
+        )?;
 
         let root = topology::workspace_root().join("target/deploy");
         let base_bytes = std::fs::read(root.join("redshift_program_slim.so"))
@@ -103,23 +107,24 @@ impl Scenario for LoaderMatrix {
             has_log_msg,
         )
         .await?;
-        assert!(
+        check!(
             v4_logs
                 .iter()
                 .any(|line| line.contains("LogMsg:") && !line.contains("upgraded")),
             "the freshly deployed v4 program must log without the upgrade suffix"
-        );
+        )?;
         let (v4_authority, v4_status) =
             loader_v4_state(er, &program.pubkey()).await?;
-        assert_eq!(
-            v4_status, LOADER_V4_STATUS_DEPLOYED,
+        check_eq!(
+            v4_status,
+            LOADER_V4_STATUS_DEPLOYED,
             "the deployed v4 program must clone as a Deployed LoaderV4 program"
-        );
-        assert_eq!(
+        )?;
+        check_eq!(
             v4_authority,
             authority.pubkey(),
             "the v4 deploy authority must survive the clone into the ER"
-        );
+        )?;
 
         loader_v4::deploy_program(base, &authority, &program, &upgraded_bytes)
             .await?;
@@ -128,15 +133,16 @@ impl Scenario for LoaderMatrix {
         let upgrade_pickup_s = upgrade_started.elapsed().as_secs_f64();
         let (upgraded_authority, upgraded_status) =
             loader_v4_state(er, &program.pubkey()).await?;
-        assert_eq!(
-            upgraded_status, LOADER_V4_STATUS_DEPLOYED,
+        check_eq!(
+            upgraded_status,
+            LOADER_V4_STATUS_DEPLOYED,
             "the upgraded v4 program must stay a Deployed LoaderV4 program"
-        );
-        assert_eq!(
+        )?;
+        check_eq!(
             upgraded_authority,
             authority.pubkey(),
             "the v4 authority must survive the upgrade"
-        );
+        )?;
 
         Ok(ScenarioReport::ok(self.name())
             .setting("loaders", "v1,v2,v3,v4")
@@ -173,9 +179,13 @@ async fn loader_v4_state(
     let account = er
         .account(program)
         .await?
-        .ok_or("program not present in the ER")?;
+        .ok_or_else(|| CheckError::new("program not present in the ER"))?;
     if account.data.len() < 48 {
-        return Err("program account too small for a LoaderV4 header".into());
+        return Err(CheckError::new(
+            "program account too small for a LoaderV4 header",
+        )
+        .actual(format!("{} bytes", account.data.len()))
+        .into());
     }
     let authority = Pubkey::try_from(&account.data[8..40])
         .map_err(|_| "bad authority bytes in LoaderV4 header")?;
@@ -197,6 +207,7 @@ async fn invoke_until(
 ) -> Result<Vec<String>> {
     let deadline = Instant::now() + INVOKE_TIMEOUT;
     let mut attempt = 0u64;
+    let mut last_logs = Vec::new();
     loop {
         attempt += 1;
         let ix = Instruction {
@@ -215,20 +226,23 @@ async fn invoke_until(
                 if accept(&logs) {
                     return Ok(logs);
                 }
+                last_logs = logs;
             }
             Err(err) => {
                 if Instant::now() >= deadline {
-                    return Err(format!(
-                        "invoke of {program} never succeeded: {err}"
-                    )
+                    return Err(CheckError::new(format!(
+                        "invoke of {program} never succeeded"
+                    ))
+                    .caused_by(err)
                     .into());
                 }
             }
         }
         if Instant::now() >= deadline {
-            return Err(format!(
+            return Err(CheckError::new(format!(
                 "invoke of {program} never met its log condition"
-            )
+            ))
+            .actual(format!("{last_logs:?}"))
             .into());
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -263,7 +277,10 @@ async fn invoke_until_upgraded(
             }
         }
         if Instant::now() >= deadline {
-            return Err("the ER never picked up the v4 upgrade".into());
+            return Err(CheckError::new(
+                "the ER never picked up the v4 upgrade",
+            )
+            .into());
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }

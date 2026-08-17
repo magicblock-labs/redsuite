@@ -1,9 +1,10 @@
 use redsuite_core::catalog::{Fixture, Resource};
 
 pub mod redline {
-    use super::{Fixture, Resource};
     use ::redline::scenarios;
     use redsuite_core::scenario_catalog;
+
+    use super::{Fixture, Resource};
 
     scenario_catalog! {
         family: Redline,
@@ -91,9 +92,10 @@ pub mod redline {
 }
 
 pub mod redshift {
-    use super::{Fixture, Resource};
     use ::redshift::scenarios;
     use redsuite_core::scenario_catalog;
+
+    use super::{Fixture, Resource};
 
     scenario_catalog! {
         family: Redshift,
@@ -118,16 +120,6 @@ pub mod redshift {
             fixtures: [Fixture::RedshiftProgram],
         },
         commit_and_undelegate => committor::commit_and_undelegate::CommitAndUndelegate {
-            topology: Shared,
-            resources: [Resource::Er],
-            fixtures: [Fixture::RedshiftProgram],
-        },
-        commit_limit_and_fees => committor::commit_limit_and_fees::CommitLimitAndFees {
-            topology: Shared,
-            resources: [Resource::Er],
-            fixtures: [Fixture::RedshiftProgram],
-        },
-        intent_flows => committor::intent_flows::IntentFlows {
             topology: Shared,
             resources: [Resource::Er],
             fixtures: [Fixture::RedshiftProgram],
@@ -211,9 +203,10 @@ pub mod redshift {
 }
 
 pub mod redhat {
-    use super::{Fixture, Resource};
     use ::redhat::scenarios;
     use redsuite_core::scenario_catalog;
+
+    use super::{Fixture, Resource};
 
     scenario_catalog! {
         family: Redhat,

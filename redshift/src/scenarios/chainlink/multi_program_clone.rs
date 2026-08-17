@@ -2,7 +2,8 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use redsuite_core::{
-    topology, BaseCtx, ChainCtx, ErCtx, Result, Scenario, ScenarioReport,
+    check, check_eq, topology, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
+    ScenarioReport,
 };
 
 use crate::program::instruction::build;
@@ -64,34 +65,34 @@ impl Scenario for MultiProgramClone {
         for (program, label) in
             [(first_program, "first"), (second_program, "second")]
         {
-            let clone = er.account(&program).await?.unwrap_or_else(|| {
-                panic!(
+            let clone = er.account(&program).await?.ok_or_else(|| {
+                check::CheckError::new(format!(
                     "the {label} program must be cloned to the ER after the tx"
-                )
-            });
-            assert!(
+                ))
+            })?;
+            check!(
                 clone.executable,
                 "the {label} cloned program must be executable on the ER"
-            );
+            )?;
         }
         let first_clone = er
             .account(&first_pda)
             .await?
             .ok_or("first program's account missing on the ER")?;
-        assert_eq!(
+        check_eq!(
             crate::written_id(&first_clone.data),
             Some(FIRST_WRITE),
             "the first program must have executed its write"
-        );
+        )?;
         let second_clone = er
             .account(&second_pda)
             .await?
             .ok_or("second program's account missing on the ER")?;
-        assert_eq!(
+        check_eq!(
             crate::written_id(&second_clone.data),
             Some(SECOND_WRITE),
             "the second program must have executed its write"
-        );
+        )?;
 
         Ok(ScenarioReport::ok(self.name())
             .setting("loaders", "v3,v3")

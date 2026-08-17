@@ -4,8 +4,7 @@ use async_trait::async_trait;
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    assert::poll_until,
-    prep,
+    check, check_eq, prep,
     profile::select as select_profile,
     report,
     runner::{drive_threads, RunOutcome, ThreadRunConfig},
@@ -109,14 +108,19 @@ fn drive_cell(
     drive_threads(config, factory)
 }
 
-async fn drain_intake(er: &ErCtx, target: f64) {
-    poll_until(DRAIN_TIMEOUT, || async {
-        matches!(
-            er.scrape_metrics().await.ok().and_then(|metrics| metrics.get(TX_COUNT)),
-            Some(count) if count >= target
-        )
-    })
-    .await;
+async fn drain_intake(er: &ErCtx, target: f64) -> Result<()> {
+    check::poll(
+        &format!("the validator transaction count reaches {target:.0}"),
+        DRAIN_TIMEOUT,
+        || async {
+            matches!(
+                er.scrape_metrics().await.ok().and_then(|metrics| metrics.get(TX_COUNT)),
+                Some(count) if count >= target
+            )
+        },
+    )
+    .await?;
+    Ok(())
 }
 
 struct CellResult {
@@ -148,10 +152,14 @@ impl Scenario for HotAccountCliff {
         )
         .await?;
         for pda in &pdas {
-            poll_until(Duration::from_secs(15), || async {
-                matches!(er.account(pda).await, Ok(Some(acc)) if acc.data.len() == crate::ACCOUNT_SPACE as usize)
-            })
-            .await;
+            check::poll(
+                &format!("the ER clones the delegated pda {pda}"),
+                Duration::from_secs(15),
+                || async {
+                    matches!(er.account(pda).await, Ok(Some(acc)) if acc.data.len() == crate::ACCOUNT_SPACE as usize)
+                },
+            )
+            .await?;
         }
         let payer_bytes: Arc<Vec<[u8; 64]>> =
             Arc::new(payers.iter().map(|payer| payer.to_bytes()).collect());
@@ -176,14 +184,15 @@ impl Scenario for HotAccountCliff {
                 hot_set.clone(),
                 payer_bytes.clone(),
             );
-            assert_eq!(
-                warm.failed, 0,
+            check_eq!(
+                warm.failed,
+                0,
                 "hot{hot} warmup failed: {:?}",
                 warm.first_error
-            );
+            )?;
             offset += profile.warmup;
             if let Some(seen) = count_before_warmup {
-                drain_intake(er, seen + profile.warmup as f64).await;
+                drain_intake(er, seen + profile.warmup as f64).await?;
             }
 
             let before = er.scrape_metrics().await?;
@@ -200,22 +209,24 @@ impl Scenario for HotAccountCliff {
                 payer_bytes.clone(),
             );
             offset += profile.iterations;
-            assert_eq!(
-                outcome.failed, 0,
+            check_eq!(
+                outcome.failed,
+                0,
                 "hot{hot} deliveries failed: {:?}",
                 outcome.first_error
-            );
+            )?;
             if let Some(seen) = before.get(TX_COUNT) {
-                drain_intake(er, seen + profile.iterations as f64).await;
+                drain_intake(er, seen + profile.iterations as f64).await?;
             }
             let after = er.scrape_metrics().await?;
             let delta = MetricsDelta::new(before, after);
             if let Some(failed) = delta.counter("mbv_failed_transactions_count")
             {
-                assert_eq!(
-                    failed, 0.0,
+                check_eq!(
+                    failed,
+                    0.0,
                     "hot{hot}: transactions failed on the validator"
-                );
+                )?;
             }
 
             let cell = CellResult {

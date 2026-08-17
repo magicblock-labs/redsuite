@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    BaseCtx, ChainCtx, ErCtx, Result, Scenario, ScenarioReport,
+    check, check_eq, BaseCtx, ChainCtx, ErCtx, Result, Scenario, ScenarioReport,
 };
 use signer::Signer;
 
@@ -39,30 +39,46 @@ impl Scenario for ParallelCloning {
         let batch_a = batch_a?;
         let batch_b = batch_b?;
         let batch_c = batch_c?;
-        assert_eq!(batch_a.len(), 3);
-        assert_eq!(batch_b.len(), 2);
-        assert_eq!(batch_c.len(), 3);
+        check_eq!(
+            batch_a.len(),
+            3,
+            "the first concurrent batch must return one entry per wallet"
+        )?;
+        check_eq!(
+            batch_b.len(),
+            2,
+            "the second concurrent batch must return one entry per wallet"
+        )?;
+        check_eq!(
+            batch_c.len(),
+            3,
+            "the third concurrent batch must return one entry per wallet"
+        )?;
         for (index, entry) in batch_a
             .iter()
             .chain(batch_b.iter())
             .chain(batch_c.iter())
             .enumerate()
         {
-            let clone = entry.as_ref().unwrap_or_else(|| {
-                panic!("concurrent batch entry {index} came back None")
-            });
-            assert_eq!(
-                clone.lamports, WALLET_LAMPORTS,
+            let clone = entry.as_ref().ok_or_else(|| {
+                check::CheckError::new(format!(
+                    "concurrent batch entry {index} came back None"
+                ))
+            })?;
+            check_eq!(
+                clone.lamports,
+                WALLET_LAMPORTS,
                 "every concurrently cloned wallet must show its airdrop"
-            );
+            )?;
         }
         for single in [single_a?, single_b?] {
             let clone =
                 single.ok_or("concurrent single fetch came back None")?;
-            assert_eq!(
-                clone.lamports, WALLET_LAMPORTS,
+            check_eq!(
+                clone.lamports,
+                WALLET_LAMPORTS,
                 "concurrent single fetches must show the airdrop"
-            );
+            )?;
         }
 
         Ok(ScenarioReport::ok(self.name())

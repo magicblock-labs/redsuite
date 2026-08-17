@@ -2,8 +2,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use redsuite_core::{
-    assert::poll_until,
-    prep,
+    check, check_eq, prep,
     stats::StreamingStats,
     transport::{rate::RateManager, ws::AccountUpdates},
     BaseCtx, ChainCtx, ErCtx, Result, Scenario, ScenarioReport,
@@ -38,14 +37,19 @@ impl Scenario for SimpleLoad {
 
         for pda in &pdas {
             let on_base = base.account(pda).await?.ok_or("pda not on base")?;
-            assert_eq!(
-                on_base.owner, DELEGATION_PROGRAM_ID,
+            check_eq!(
+                on_base.owner,
+                DELEGATION_PROGRAM_ID,
                 "delegated pda must be dlp-owned on base"
-            );
-            poll_until(Duration::from_secs(15), || async {
-                matches!(er.account(pda).await, Ok(Some(acc)) if acc.data.len() == crate::ACCOUNT_SPACE as usize)
-            })
-            .await;
+            )?;
+            check::poll(
+                &format!("the ER clones the delegated pda {pda}"),
+                Duration::from_secs(15),
+                || async {
+                    matches!(er.account(pda).await, Ok(Some(acc)) if acc.data.len() == crate::ACCOUNT_SPACE as usize)
+                },
+            )
+            .await?;
         }
 
         let updates =
@@ -83,17 +87,17 @@ impl Scenario for SimpleLoad {
             let on_er = er.account(pda).await?.ok_or("pda not on er")?;
             let id_bytes = &on_er.data
                 [layout::ID_OFFSET..layout::ID_OFFSET + layout::ID_SIZE];
-            assert_eq!(
+            check_eq!(
                 id_bytes,
                 last_id.to_le_bytes(),
                 "er copy must hold the last id written to pda {i}"
-            );
+            )?;
 
             let on_base = base.account(pda).await?.ok_or("pda gone on base")?;
-            assert!(
+            check!(
                 on_base.data[layout::DATA_OFFSET..].iter().all(|&b| b == 0),
                 "base copy must stay untouched until an explicit commit"
-            );
+            )?;
         }
 
         Ok(ScenarioReport::ok(self.name())

@@ -12,8 +12,8 @@ use redshift_program::schedulecommit::{
     ScheduleCommitType, FAIL_UNDELEGATION_COUNT, ORDER_BOOK_INIT_SIZE,
 };
 use redsuite_core::{
-    assert::poll_until, prep, receipt, BaseCtx, ChainCtx, ErCtx, Result,
-    Scenario, ScenarioReport,
+    check, check_eq, prep, receipt, BaseCtx, ChainCtx, CheckError, ErCtx,
+    Result, Scenario, ScenarioReport,
 };
 use signer::Signer;
 
@@ -46,7 +46,9 @@ fn rejection_code(error_text: &str) -> Result<&'static str> {
         .into_iter()
         .find(|code| error_text.contains(code))
         .ok_or_else(|| {
-            format!("expected one of {WRITE_REJECTIONS:?}, got {error_text}")
+            CheckError::new("the rejection uses a known write-rejection code")
+                .expected(format!("one of {WRITE_REJECTIONS:?}"))
+                .actual(error_text)
                 .into()
         })
 }
@@ -71,7 +73,7 @@ async fn commit_undelegate_lifecycle(
         count,
     )
     .await?;
-    crate::await_committee_clones(er, &committees).await;
+    crate::await_committee_clones(er, &committees).await?;
     let players: Vec<_> =
         committees.iter().map(|c| c.player.pubkey()).collect();
     let pdas: Vec<_> = committees.iter().map(|c| c.pda).collect();
@@ -95,47 +97,54 @@ async fn commit_undelegate_lifecycle(
         let attempt = er
             .send(er_fee_payer, &[build::increase_count(*player)])
             .await;
-        assert!(
+        check!(
             attempt.is_err(),
             "an er write must be rejected after undelegation is requested"
-        );
+        )?;
         er_lockout = rejection_code(&format!("{:?}", attempt.unwrap_err()))?;
     }
 
     let commit_receipt =
         crate::assert_commit_receipt(base, er, &signature, &pdas, true).await?;
-    assert_eq!(
-        commit_receipt.base_signatures.len(),
-        1,
-        "a single-stage commit and undelegate must send exactly one base tx"
-    );
+    if !commit_receipt.failure_is_duplicate_rejection() {
+        check_eq!(
+            commit_receipt.base_signatures.len(),
+            1,
+            "a single-stage commit and undelegate must send exactly one base \
+             tx"
+        )?;
+    }
 
     for pda in &pdas {
-        poll_until(BASE_STATE_TIMEOUT, || async {
-            matches!(
-                base.account(pda).await,
-                Ok(Some(acc)) if acc.owner == redshift_program::id()
-            )
-        })
-        .await;
+        check::poll(
+            &format!("{pda} returns to its program owner on base"),
+            BASE_STATE_TIMEOUT,
+            || async {
+                matches!(
+                    base.account(pda).await,
+                    Ok(Some(acc)) if acc.owner == redshift_program::id()
+                )
+            },
+        )
+        .await?;
         let on_base = base
             .account(pda)
             .await?
             .ok_or("the pda is not on base after the undelegation")?;
-        assert_eq!(
+        check_eq!(
             decoded_count(&on_base.data)?,
             1,
             "base count after the commit and undelegate"
-        );
+        )?;
         let on_er = er
             .account(pda)
             .await?
             .ok_or("the er clone is not present after the undelegation")?;
-        assert_eq!(
+        check_eq!(
             decoded_count(&on_er.data)?,
             1,
             "ephem count after the commit and undelegate"
-        );
+        )?;
     }
 
     for player in &players {
@@ -146,11 +155,11 @@ async fn commit_undelegate_lifecycle(
             .account(pda)
             .await?
             .ok_or("the pda is not on base after the chain write")?;
-        assert_eq!(
+        check_eq!(
             decoded_count(&on_base.data)?,
             2,
             "an undelegated account must accept chain writes"
-        );
+        )?;
     }
 
     tokio::time::sleep(REDELEGATE_SETTLE).await;
@@ -171,10 +180,11 @@ async fn commit_undelegate_lifecycle(
             .account(pda)
             .await?
             .ok_or("the pda is not on base after the redelegation")?;
-        assert_eq!(
-            on_base.owner, DELEGATION_PROGRAM_ID,
+        check_eq!(
+            on_base.owner,
+            DELEGATION_PROGRAM_ID,
             "dlp must own a redelegated committee on base"
-        );
+        )?;
     }
 
     let mut base_frozen = "";
@@ -182,32 +192,39 @@ async fn commit_undelegate_lifecycle(
         let attempt = base
             .send(base_negative_payer, &[build::increase_count(*player)])
             .await;
-        assert!(
+        check!(
             attempt.is_err(),
             "a chain write must be rejected after the redelegation"
-        );
+        )?;
         base_frozen = rejection_code(&format!("{:?}", attempt.unwrap_err()))?;
     }
 
     for committee in &committees {
-        poll_until(ER_WRITE_TIMEOUT, || async {
-            er.send(
-                er_fee_payer,
-                &[build::increase_count(committee.player.pubkey())],
-            )
-            .await
-            .is_ok()
-        })
-        .await;
+        check::poll(
+            &format!(
+                "the er accepts writes to {} after the redelegation",
+                committee.pda
+            ),
+            ER_WRITE_TIMEOUT,
+            || async {
+                er.send(
+                    er_fee_payer,
+                    &[build::increase_count(committee.player.pubkey())],
+                )
+                .await
+                .is_ok()
+            },
+        )
+        .await?;
         let on_er = er
             .account(&committee.pda)
             .await?
             .ok_or("the er clone is not present after the redelegation")?;
-        assert_eq!(
+        check_eq!(
             decoded_count(&on_er.data)?,
             3,
             "ephem count after the redelegated write"
-        );
+        )?;
     }
 
     Ok(LifecycleOutcome {
@@ -233,22 +250,26 @@ fn random_book_update(seed: u64) -> BookUpdate {
     BookUpdate { bids, asks }
 }
 
-fn assert_book_matches(
+fn check_book_matches(
     data: &[u8],
     update: &BookUpdate,
     seed: u64,
     side: &str,
-) {
-    let (bids, asks) = order_book_view(data)
-        .unwrap_or_else(|| panic!("{side}: the order book data is not valid"));
-    assert_eq!(
-        bids, update.bids,
+) -> Result<()> {
+    let (bids, asks) = order_book_view(data).ok_or_else(|| {
+        CheckError::new(format!("{side}: the order book data is not valid"))
+    })?;
+    check_eq!(
+        bids,
+        update.bids,
         "{side}: the bids must match the update (seed {seed})"
-    );
-    assert_eq!(
-        asks, update.asks,
+    )?;
+    check_eq!(
+        asks,
+        update.asks,
         "{side}: the asks must match the update (seed {seed})"
-    );
+    )?;
+    Ok(())
 }
 
 async fn order_book_cell(
@@ -273,22 +294,27 @@ async fn order_book_cell(
         .account(&book)
         .await?
         .ok_or("the order book is not on base after init and delegate")?;
-    assert_eq!(
-        on_base.owner, DELEGATION_PROGRAM_ID,
+    check_eq!(
+        on_base.owner,
+        DELEGATION_PROGRAM_ID,
         "dlp must own the delegated order book on base"
-    );
-    assert_eq!(
+    )?;
+    check_eq!(
         on_base.data.len(),
         ORDER_BOOK_INIT_SIZE,
         "the order book size on base"
-    );
-    poll_until(CLONE_TIMEOUT, || async {
-        matches!(
-            er.account(&book).await,
-            Ok(Some(clone)) if clone.data.len() == ORDER_BOOK_INIT_SIZE
-        )
-    })
-    .await;
+    )?;
+    check::poll(
+        "the ER clones the delegated order book",
+        CLONE_TIMEOUT,
+        || async {
+            matches!(
+                er.account(&book).await,
+                Ok(Some(clone)) if clone.data.len() == ORDER_BOOK_INIT_SIZE
+            )
+        },
+    )
+    .await?;
 
     let update = random_book_update(seed);
     let signature = er
@@ -322,33 +348,38 @@ async fn order_book_cell(
         .account(&book)
         .await?
         .ok_or("the order book clone is not present after the commit")?;
-    assert_book_matches(&on_er.data, &update, seed, "ephem");
+    check_book_matches(&on_er.data, &update, seed, "ephem")?;
 
     let expected_owner = if undelegates {
         redshift_program::id()
     } else {
         DELEGATION_PROGRAM_ID
     };
-    poll_until(BASE_STATE_TIMEOUT, || async {
-        match base.account(&book).await {
-            Ok(Some(acc)) => {
-                acc.owner == expected_owner
-                    && order_book_view(&acc.data)
-                        .is_some_and(|(bids, _)| bids == update.bids)
+    check::poll(
+        "the committed order book lands on base with its expected owner",
+        BASE_STATE_TIMEOUT,
+        || async {
+            match base.account(&book).await {
+                Ok(Some(acc)) => {
+                    acc.owner == expected_owner
+                        && order_book_view(&acc.data)
+                            .is_some_and(|(bids, _)| bids == update.bids)
+                }
+                _ => false,
             }
-            _ => false,
-        }
-    })
-    .await;
+        },
+    )
+    .await?;
     let on_base = base
         .account(&book)
         .await?
         .ok_or("the order book is not on base after the commit")?;
-    assert_book_matches(&on_base.data, &update, seed, "base");
-    assert_eq!(
-        on_base.owner, expected_owner,
+    check_book_matches(&on_base.data, &update, seed, "base")?;
+    check_eq!(
+        on_base.owner,
+        expected_owner,
         "the order book owner on base after the commit (seed {seed})"
-    );
+    )?;
 
     Ok(commit_receipt.base_signatures.len())
 }
@@ -365,24 +396,24 @@ async fn rejected_intent_cell(
         .api()
         .await_transaction(&signature, RECEIPT_TIMEOUT)
         .await?;
-    assert!(
+    check!(
         tx.err.is_some(),
         "the transaction must fail on the ephemeral"
-    );
+    )?;
     let observed =
         format!("{}\n{:?}", tx.logs.join("\n"), tx.err.as_ref().unwrap());
-    assert!(
+    check!(
         observed.contains(refusal),
         "the refusal must name '{refusal}', got: {observed}"
-    );
+    )?;
 
     let sent_signature = receipt::receipt_signature_in_logs(&tx.logs)
         .ok_or("the failed tx logs carry no ScheduledCommitSent signature")?;
     tokio::time::sleep(ROLLBACK_SETTLE).await;
-    assert!(
+    check!(
         er.api().get_transaction(&sent_signature).await?.is_none(),
         "a failed transaction must not schedule a commit"
-    );
+    )?;
     Ok(())
 }
 
@@ -437,7 +468,7 @@ async fn test_mod_after_rejection(
         count,
     )
     .await?;
-    crate::await_committee_clones(er, &committees).await;
+    crate::await_committee_clones(er, &committees).await?;
     let players: Vec<_> =
         committees.iter().map(|c| c.player.pubkey()).collect();
     rejected_intent_cell(
@@ -455,11 +486,11 @@ async fn test_mod_after_rejection(
             .account(&committee.pda)
             .await?
             .ok_or("the er clone is gone after the failed tx")?;
-        assert_eq!(
+        check_eq!(
             decoded_count(&on_er.data)?,
             0,
             "a failed tx must not modify the committee"
-        );
+        )?;
     }
     Ok(())
 }
@@ -469,7 +500,7 @@ async fn test_twice_rejection(base: &BaseCtx, er: &ErCtx) -> Result<()> {
     let committees =
         crate::init_schedulecommit_committees(base, &payer, er.identity(), 2)
             .await?;
-    crate::await_committee_clones(er, &committees).await;
+    crate::await_committee_clones(er, &committees).await?;
     let players: Vec<_> =
         committees.iter().map(|c| c.player.pubkey()).collect();
     rejected_intent_cell(
@@ -497,7 +528,7 @@ async fn test_failed_undelegation_lockout(
     let committees =
         crate::init_schedulecommit_committees(base, &payer, er.identity(), 1)
             .await?;
-    crate::await_committee_clones(er, &committees).await;
+    crate::await_committee_clones(er, &committees).await?;
     let player = committees[0].player.pubkey();
     let pda = committees[0].pda;
 
@@ -507,11 +538,11 @@ async fn test_failed_undelegation_lockout(
         .account(&pda)
         .await?
         .ok_or("the er clone is not present after set_count")?;
-    assert_eq!(
+    check_eq!(
         decoded_count(&on_er.data)?,
         FAIL_UNDELEGATION_COUNT,
         "the poison count on the ephemeral"
-    );
+    )?;
 
     let signature = er
         .send(
@@ -528,33 +559,38 @@ async fn test_failed_undelegation_lockout(
         .await?;
     crate::assert_commit_receipt(base, er, &signature, &[pda], true).await?;
 
-    poll_until(BASE_STATE_TIMEOUT, || async {
-        matches!(
-            base.account(&pda).await,
-            Ok(Some(acc))
-                if decoded_count(&acc.data).ok()
-                    == Some(FAIL_UNDELEGATION_COUNT)
-        )
-    })
-    .await;
+    check::poll(
+        "the poison count lands on base after the patched commit",
+        BASE_STATE_TIMEOUT,
+        || async {
+            matches!(
+                base.account(&pda).await,
+                Ok(Some(acc))
+                    if decoded_count(&acc.data).ok()
+                        == Some(FAIL_UNDELEGATION_COUNT)
+            )
+        },
+    )
+    .await?;
     let on_base = base
         .account(&pda)
         .await?
         .ok_or("the pda is not on base after the patched commit")?;
-    assert_eq!(
-        on_base.owner, DELEGATION_PROGRAM_ID,
+    check_eq!(
+        on_base.owner,
+        DELEGATION_PROGRAM_ID,
         "a failed undelegation must leave the account delegated on \
          base"
-    );
+    )?;
 
     let attempt = er
         .send(&er_fee_payer, &[build::set_count(player, 2222)])
         .await;
-    assert!(
+    check!(
         attempt.is_err(),
         "the ephemeral must reject writes after the undelegation \
          request even when the base undelegation failed"
-    );
+    )?;
     rejection_code(&format!("{:?}", attempt.unwrap_err()))
 }
 

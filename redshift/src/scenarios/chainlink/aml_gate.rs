@@ -15,7 +15,7 @@ use instruction::{AccountMeta, Instruction};
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    assert::poll_until, prep, system, topology, BaseCtx, ChainCtx, ErCtx,
+    check, check_eq, prep, system, topology, BaseCtx, ChainCtx, ErCtx,
     PrivateErScenario, Result, ScenarioReport,
 };
 use sdk::spl::{
@@ -295,11 +295,11 @@ async fn run_risk_case(
 
     let fees_vault =
         dlp_api::pda::validator_fees_vault_pda_from_validator(&er_identity);
-    assert!(
+    check!(
         base.account(&fees_vault).await?.is_some(),
         "the private ER identity {er_identity} has no validator fees vault on \
          base — genesis did not supply one for this pool slot"
-    );
+    )?;
 
     let er_ctx = private.ctx();
     let _ = er_ctx.account(&source_ata).await;
@@ -320,21 +320,25 @@ async fn run_risk_case(
     base.send_with(&fee_payer, &[&owner], &[shuttle_ix]).await?;
 
     // Verify shuttle ATA delegation record exists on base chain
-    assert!(
+    check!(
         delegation_record_exists(base, &shuttle_ata).await?,
         "shuttle ATA delegation record was not created on base chain"
-    );
+    )?;
 
     // 5. Wait for Range risk server query
-    poll_until(QUERY_TIMEOUT, || async {
-        server.request_count() > 0
-            && server.requested_addresses().contains(&owner_pk.to_string())
-    })
-    .await;
-    assert!(
+    check::poll(
+        "the Range risk server receives the shuttle owner query",
+        QUERY_TIMEOUT,
+        || async {
+            server.request_count() > 0
+                && server.requested_addresses().contains(&owner_pk.to_string())
+        },
+    )
+    .await?;
+    check!(
         server.requested_addresses().contains(&owner_pk.to_string()),
         "Range risk server did not check shuttle owner"
-    );
+    )?;
 
     // 6. Verify the gate decision through the merge itself: an allowed merge
     // moves the shuttle tokens into the destination on the er, a blocked
@@ -352,62 +356,79 @@ async fn run_risk_case(
     // failing-action-undelegates path. Delegation-record persistence is
     // therefore NOT a discriminator for the allowed side — the attempt is.
     let (merge_error, destination_tokens) = if expect_allowed {
-        poll_until(MERGE_TIMEOUT, || async {
-            matches!(
-                merge_attempt(er_ctx, &shuttle_ata, &destination_ata).await,
-                Ok(Some(_))
-            )
-        })
-        .await;
+        check::poll(
+            "a merge attempt referencing the shuttle and destination \
+             appears on the er",
+            MERGE_TIMEOUT,
+            || async {
+                matches!(
+                    merge_attempt(er_ctx, &shuttle_ata, &destination_ata).await,
+                    Ok(Some(_))
+                )
+            },
+        )
+        .await?;
         let attempt = merge_attempt(er_ctx, &shuttle_ata, &destination_ata)
             .await?
             .ok_or("the merge attempt vanished after the poll")?;
         let tokens = if attempt.is_none() {
-            poll_until(MERGE_TIMEOUT, || async {
-                matches!(
-                    er_token_amount(er_ctx, &destination_ata).await,
-                    Ok(amount) if amount == SHUTTLE_AMOUNT
-                )
-            })
-            .await;
+            check::poll(
+                "the executed merge lands the shuttle tokens in the \
+                 destination",
+                MERGE_TIMEOUT,
+                || async {
+                    matches!(
+                        er_token_amount(er_ctx, &destination_ata).await,
+                        Ok(amount) if amount == SHUTTLE_AMOUNT
+                    )
+                },
+            )
+            .await?;
             let amount = er_token_amount(er_ctx, &destination_ata).await?;
-            assert_eq!(
-                amount, SHUTTLE_AMOUNT,
+            check_eq!(
+                amount,
+                SHUTTLE_AMOUNT,
                 "an executed merge must move the shuttle tokens to the \
                  destination"
-            );
+            )?;
             amount
         } else {
             let amount = er_token_amount(er_ctx, &destination_ata).await?;
-            assert_eq!(
-                amount, 0,
+            check_eq!(
+                amount,
+                0,
                 "a failed merge attempt must not move the shuttle tokens"
-            );
+            )?;
             amount
         };
         (attempt.unwrap_or_else(|| "none".to_owned()), tokens)
     } else {
-        poll_until(UNDELEGATION_TIMEOUT, || async {
-            !delegation_record_exists(base, &shuttle_ata)
-                .await
-                .unwrap_or(true)
-        })
-        .await;
-        assert!(
+        check::poll(
+            "the high-risk shuttle ATA undelegates on base",
+            UNDELEGATION_TIMEOUT,
+            || async {
+                !delegation_record_exists(base, &shuttle_ata)
+                    .await
+                    .unwrap_or(true)
+            },
+        )
+        .await?;
+        check!(
             !delegation_record_exists(base, &shuttle_ata).await?,
             "the high-risk shuttle ATA must be undelegated on base"
-        );
-        assert!(
+        )?;
+        check!(
             merge_attempt(er_ctx, &shuttle_ata, &destination_ata)
                 .await?
                 .is_none(),
             "a blocked owner must not get a merge attempt on the er"
-        );
+        )?;
         let amount = er_token_amount(er_ctx, &destination_ata).await?;
-        assert_eq!(
-            amount, 0,
+        check_eq!(
+            amount,
+            0,
             "the blocked merge must not move the shuttle tokens"
-        );
+        )?;
         ("blocked".to_owned(), amount)
     };
     let record_at_end = delegation_record_exists(base, &shuttle_ata).await?;

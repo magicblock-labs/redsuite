@@ -6,8 +6,8 @@ use std::{
 use async_trait::async_trait;
 use keypair::Keypair;
 use redsuite_core::{
-    mdp, prep, system, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
-    ScenarioReport,
+    check, check_eq, mdp, prep, system, BaseCtx, ChainCtx, CheckError, ErCtx,
+    Result, Scenario, ScenarioReport,
 };
 use signer::Signer;
 
@@ -58,66 +58,70 @@ impl Scenario for ApiInvariants {
                 .api()
                 .await_transaction(&signature, Duration::from_secs(5))
                 .await?;
-            assert!(
+            check!(
                 confirmed.err.is_none(),
                 "iteration {iteration}: ER transfer failed: {:?}",
                 confirmed.err
-            );
+            )?;
             let tx_slot = confirmed.slot;
 
             let settle_deadline =
                 tokio::time::Instant::now() + LEDGER_SETTLE_TIMEOUT;
             while er.api().get_slot().await? < tx_slot + LEDGER_SETTLE_SLOTS {
-                assert!(
+                check!(
                     tokio::time::Instant::now() < settle_deadline,
                     "iteration {iteration}: ER slot never reached {} within \
                      {LEDGER_SETTLE_TIMEOUT:?}",
                     tx_slot + LEDGER_SETTLE_SLOTS
-                );
+                )?;
                 tokio::time::sleep(SLOT_POLL).await;
             }
 
-            let ledger_timestamp = er
-                .api()
-                .get_block_time(tx_slot)
-                .await?
-                .unwrap_or_else(|| {
-                    panic!("iteration {iteration}: getBlockTime(slot {tx_slot}) returned null")
-                });
-            let block = er.api().get_block(tx_slot).await?.unwrap_or_else(|| {
-                panic!("iteration {iteration}: getBlock(slot {tx_slot}) returned null")
-            });
+            let ledger_timestamp =
+                er.api().get_block_time(tx_slot).await?.ok_or_else(|| {
+                    CheckError::new(format!(
+                        "iteration {iteration}: getBlockTime(slot {tx_slot}) \
+                         returned null"
+                    ))
+                })?;
+            let block =
+                er.api().get_block(tx_slot).await?.ok_or_else(|| {
+                    CheckError::new(format!(
+                        "iteration {iteration}: getBlock(slot {tx_slot}) \
+                         returned null"
+                    ))
+                })?;
             let settled_tx = er
                 .api()
                 .get_transaction(&signature)
                 .await?
                 .ok_or("settled transaction vanished from the ledger")?;
 
-            assert_eq!(
+            check_eq!(
                 block.block_time,
                 Some(ledger_timestamp),
                 "iteration {iteration}: getBlock.blockTime diverges from \
                  getBlockTime for slot {tx_slot}"
-            );
-            assert_eq!(
+            )?;
+            check_eq!(
                 settled_tx.block_time,
                 Some(ledger_timestamp),
                 "iteration {iteration}: getTransaction.blockTime diverges \
                  from getBlockTime for slot {tx_slot}"
-            );
-            assert!(
+            )?;
+            check!(
                 ledger_timestamp > 0,
                 "iteration {iteration}: timestamp should be positive"
-            );
+            )?;
             let now_unix_seconds = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("system clock before unix epoch")
                 .as_secs() as i64;
-            assert!(
+            check!(
                 ledger_timestamp <= now_unix_seconds,
                 "iteration {iteration}: timestamp {ledger_timestamp} is in \
                  the future (now {now_unix_seconds})"
-            );
+            )?;
         }
 
         let validator = Keypair::new();
@@ -140,16 +144,16 @@ impl Scenario for ApiInvariants {
             .account(&record_pda)
             .await?
             .ok_or("domain record missing after register")?;
-        assert_eq!(
+        check_eq!(
             registered.owner,
             mdp::mdp_id(),
             "domain record not owned by mdp"
-        );
-        assert_eq!(
+        )?;
+        check_eq!(
             registered.data,
             record.encode(),
             "registered record bytes diverge from the submitted record"
-        );
+        )?;
 
         let mut mutated = record.clone();
         mutated.status = mdp::STATUS_DRAINING;
@@ -160,23 +164,23 @@ impl Scenario for ApiInvariants {
             .account(&record_pda)
             .await?
             .ok_or("domain record missing after sync")?;
-        assert_eq!(
+        check_eq!(
             synced.data,
             mutated.encode(),
             "synced record bytes diverge from the mutated record"
-        );
-        assert!(
+        )?;
+        check!(
             synced.data.len() > registered.data.len(),
             "sync with a longer addr should have grown the record account"
-        );
+        )?;
 
         base.send(&validator, &[mdp::unregister(&validator.pubkey())])
             .await?;
         let unregistered = base.account(&record_pda).await?;
-        assert!(
+        check!(
             unregistered.is_none(),
             "domain record still present after unregister"
-        );
+        )?;
 
         Ok(ScenarioReport::ok(self.name())
             .setting("clock iterations", CLOCK_ITERATIONS)

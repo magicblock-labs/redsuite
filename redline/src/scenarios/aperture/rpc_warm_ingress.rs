@@ -2,8 +2,7 @@ use std::{rc::Rc, time::Duration};
 
 use async_trait::async_trait;
 use redsuite_core::{
-    assert::poll_until,
-    prep,
+    check, check_eq, prep,
     profile::select as select_profile,
     runner::{drive, drive_closed, RunConfig},
     transport::ws::{AccountUpdates, SignatureConfirmations},
@@ -101,10 +100,14 @@ impl Scenario for WarmIngress {
         )
         .await?;
         for pda in &pdas {
-            poll_until(Duration::from_secs(15), || async {
-                matches!(er.account(pda).await, Ok(Some(acc)) if acc.data.len() == crate::ACCOUNT_SPACE as usize)
-            })
-            .await;
+            check::poll(
+                &format!("the ER clones the delegated pda {pda}"),
+                Duration::from_secs(15),
+                || async {
+                    matches!(er.account(pda).await, Ok(Some(acc)) if acc.data.len() == crate::ACCOUNT_SPACE as usize)
+                },
+            )
+            .await?;
         }
 
         let senders: Vec<TxSender> = payers
@@ -141,11 +144,12 @@ impl Scenario for WarmIngress {
             },
         )
         .await;
-        assert_eq!(
-            warmup.failed, 0,
+        check_eq!(
+            warmup.failed,
+            0,
             "warmup deliveries failed: {:?}",
             warmup.first_error
-        );
+        )?;
 
         let updates = Rc::new(
             AccountUpdates::connect(er.ws_url(), crate::account_update_id)
@@ -206,11 +210,12 @@ impl Scenario for WarmIngress {
         } else {
             drive(cfg, request).await
         };
-        assert_eq!(
-            outcome.failed, 0,
+        check_eq!(
+            outcome.failed,
+            0,
             "measured iterations failed: {:?}",
             outcome.first_error
-        );
+        )?;
 
         // open loop drains here; a closed loop has already settled per id
         sigs.await_all(CONFIRM_TIMEOUT).await?;
@@ -224,37 +229,40 @@ impl Scenario for WarmIngress {
         // the no-op gate (our load provably hit the validator) and the
         // nothing-failed-on-chain invariant
         if let Some(processed) = delta.counter("mbv_transaction_count") {
-            assert!(
+            check!(
                 processed >= profile.iterations as f64,
                 "validator processed {processed} txs in the measured window, \
                  expected at least {}",
                 profile.iterations
-            );
+            )?;
         }
         if let Some(failed) = delta.counter("mbv_failed_transactions_count") {
-            assert_eq!(failed, 0.0, "transactions failed on the validator");
+            check_eq!(failed, 0.0, "transactions failed on the validator")?;
         }
 
         let update_outcome = updates.finalize();
-        assert_eq!(
+        check_eq!(
             update_outcome.observed + update_outcome.superseded,
             profile.iterations as usize,
             "every tracked write must be observed or superseded"
-        );
+        )?;
         let sig_outcome = sigs.finalize();
-        assert_eq!(
-            sig_outcome.failed, 0,
+        check_eq!(
+            sig_outcome.failed,
+            0,
             "transactions failed on-chain: {:?}",
             sig_outcome.first_failure
-        );
-        assert_eq!(
-            sig_outcome.unconfirmed, 0,
+        )?;
+        check_eq!(
+            sig_outcome.unconfirmed,
+            0,
             "signatures unconfirmed after {CONFIRM_TIMEOUT:?}"
-        );
-        assert_eq!(
-            sig_outcome.confirmed, profile.iterations as usize,
+        )?;
+        check_eq!(
+            sig_outcome.confirmed,
+            profile.iterations as usize,
             "every measured tx must confirm"
-        );
+        )?;
 
         for (idx, pda) in pdas.iter().enumerate() {
             let len = pdas.len() as u64;
@@ -274,11 +282,11 @@ impl Scenario for WarmIngress {
             let on_er = er.account(pda).await?.ok_or("pda not on er")?;
             let id_bytes = &on_er.data
                 [layout::ID_OFFSET..layout::ID_OFFSET + layout::ID_SIZE];
-            assert_eq!(
+            check_eq!(
                 id_bytes,
                 last_id.to_le_bytes(),
                 "er copy must hold the last id written to pda {idx}"
-            );
+            )?;
         }
 
         let mut report = ScenarioReport::ok(self.name())

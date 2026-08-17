@@ -4,9 +4,10 @@ use async_trait::async_trait;
 use json::{JsonContainerTrait, JsonValueTrait};
 use pubkey::Pubkey;
 use redsuite_core::{
-    prep, system,
+    check, check_eq, prep, system,
     transport::{events::EventSubscriptions, wsraw::RawWs},
-    BaseCtx, ChainCtx, ErCtx, Result, Scenario, ScenarioReport, TxSender,
+    BaseCtx, ChainCtx, CheckError, ErCtx, Result, Scenario, ScenarioReport,
+    TxSender,
 };
 use signer::Signer;
 
@@ -36,10 +37,11 @@ async fn await_event_where(
             return Ok(event);
         }
         if tokio::time::Instant::now() >= deadline {
-            return Err(format!(
-                "timed out waiting for {what} ({EVENT_TIMEOUT:?}); saw {:?}",
-                events.events(key)
-            )
+            return Err(CheckError::new(format!(
+                "timed out waiting for {what}"
+            ))
+            .actual(format!("{:?}", events.events(key)))
+            .context("waited", format!("{EVENT_TIMEOUT:?}"))
             .into());
         }
         tokio::time::sleep(EVENT_POLL).await;
@@ -124,19 +126,19 @@ impl Scenario for PubsubContracts {
         .await?;
         for event in events.events(account1_key) {
             let lamports = event_lamports(&event);
-            assert!(
+            check!(
                 lamports == Some(ACCOUNT_LAMPORTS)
                     || lamports == Some(ACCOUNT_LAMPORTS - TRANSFER_LAMPORTS),
                 "unexpected account 1 lamports in {event:?}"
-            );
+            )?;
         }
         for event in events.events(account2_key) {
             let lamports = event_lamports(&event);
-            assert!(
+            check!(
                 lamports == Some(ACCOUNT_LAMPORTS)
                     || lamports == Some(ACCOUNT_LAMPORTS + TRANSFER_LAMPORTS),
                 "unexpected account 2 lamports in {event:?}"
-            );
+            )?;
         }
 
         while sent < SEQUENTIAL_TRANSFERS {
@@ -162,23 +164,26 @@ impl Scenario for PubsubContracts {
 
         let mut previous = ACCOUNT_LAMPORTS;
         for event in events.events(account1_key) {
-            let lamports = event_lamports(&event).unwrap_or_else(|| {
-                panic!("account 1 notification without lamports: {event:?}")
-            });
-            assert!(
+            let lamports = event_lamports(&event).ok_or_else(|| {
+                CheckError::new(format!(
+                    "account 1 notification without lamports: {event:?}"
+                ))
+            })?;
+            check!(
                 lamports == previous
                     || previous.checked_sub(TRANSFER_LAMPORTS)
                         == Some(lamports),
                 "out-of-order account 1 notification {lamports}: neither the \
                  previous {previous} nor one step down (a replaying validator \
                  that resent a stale balance would fail here)"
-            );
+            )?;
             previous = lamports;
         }
-        assert_eq!(
-            previous, drained,
+        check_eq!(
+            previous,
+            drained,
             "the last account 1 notification must show the fully drained balance"
-        );
+        )?;
 
         let logs_all_key = events.logs_subscribe_all().await?;
         let mentions1_key =
@@ -212,16 +217,16 @@ impl Scenario for PubsubContracts {
                         == Some(logs_signature.as_str())
                 })
                 .await?;
-                assert!(
+                check!(
                     event.get("value").get("err").is_null(),
                     "{what} carries an error: {event:?}"
-                );
+                )?;
                 let log_count = event
                     .get("value")
                     .get("logs")
                     .as_array()
                     .map_or(0, |logs| logs.len());
-                assert!(log_count > 0, "{what} has no log lines: {event:?}");
+                check!(log_count > 0, "{what} has no log lines: {event:?}")?;
             }
         }
         let expected1 = ACCOUNT_LAMPORTS - sent * TRANSFER_LAMPORTS;
@@ -258,7 +263,9 @@ impl Scenario for PubsubContracts {
         sender.deliver(&immediate_tx).await?;
         tokio::time::timeout(EVENT_TIMEOUT, confirmations.await_id(1))
             .await
-            .map_err(|_| "signature notification never fired")??;
+            .map_err(|_| {
+                CheckError::new("signature notification never fired")
+            })??;
 
         let delayed_signature = sender
             .send_fresh(&[system::transfer(
@@ -275,18 +282,22 @@ impl Scenario for PubsubContracts {
         tokio::time::timeout(EVENT_TIMEOUT, confirmations.await_id(2))
             .await
             .map_err(|_| {
-                "delayed signature subscription never fired for an \
-                 already-confirmed signature"
+                CheckError::new(
+                    "delayed signature subscription never fired for an \
+                     already-confirmed signature",
+                )
             })??;
         let confirmation_outcome = confirmations.finalize();
-        assert_eq!(
-            confirmation_outcome.confirmed, 2,
+        check_eq!(
+            confirmation_outcome.confirmed,
+            2,
             "expected both signature notifications: {confirmation_outcome:?}"
-        );
-        assert_eq!(
-            confirmation_outcome.failed, 0,
+        )?;
+        check_eq!(
+            confirmation_outcome.failed,
+            0,
             "signature notifications carried errors: {confirmation_outcome:?}"
-        );
+        )?;
 
         let slot_key = events.slot_subscribe().await?;
         events.await_subscribed(7, Duration::from_secs(5)).await?;
@@ -294,14 +305,16 @@ impl Scenario for PubsubContracts {
         let slot_events = events.events(slot_key);
         let mut last_slot = 0u64;
         for event in &slot_events {
-            let slot = event.get("slot").as_u64().unwrap_or_else(|| {
-                panic!("slot event without a slot field: {event:?}")
-            });
-            assert!(
+            let slot = event.get("slot").as_u64().ok_or_else(|| {
+                CheckError::new(format!(
+                    "slot event without a slot field: {event:?}"
+                ))
+            })?;
+            check!(
                 slot > last_slot,
                 "slot sequence not strictly increasing: {slot} after \
                  {last_slot}"
-            );
+            )?;
             last_slot = slot;
         }
         events.finalize();
@@ -316,11 +329,14 @@ impl Scenario for PubsubContracts {
             TRANSFER_LAMPORTS,
         )
         .await?;
-        assert!(
+        check!(
             raw.next_notification(RAW_FIRST_TIMEOUT).await?.is_some(),
             "no account notification before unsubscribe"
-        );
-        assert!(raw.account_unsubscribe(account_sub).await?);
+        )?;
+        check!(
+            raw.account_unsubscribe(account_sub).await?,
+            "the account unsubscribe must return true"
+        )?;
         while raw.next_notification(RAW_DRAIN_TIMEOUT).await?.is_some() {}
         let after_account_unsub = sender
             .send_fresh(&[system::transfer(
@@ -332,10 +348,10 @@ impl Scenario for PubsubContracts {
         er.api()
             .await_transaction(&after_account_unsub, Duration::from_secs(5))
             .await?;
-        assert!(
+        check!(
             raw.next_notification(RAW_SILENCE_TIMEOUT).await?.is_none(),
             "account notifications continued after unsubscribe"
-        );
+        )?;
 
         let logs_sub = raw.logs_subscribe_mentions(&account1_pubkey).await?;
         transfer(
@@ -345,11 +361,14 @@ impl Scenario for PubsubContracts {
             TRANSFER_LAMPORTS,
         )
         .await?;
-        assert!(
+        check!(
             raw.next_notification(RAW_FIRST_TIMEOUT).await?.is_some(),
             "no logs notification before unsubscribe"
-        );
-        assert!(raw.logs_unsubscribe(logs_sub).await?);
+        )?;
+        check!(
+            raw.logs_unsubscribe(logs_sub).await?,
+            "the logs unsubscribe must return true"
+        )?;
         while raw.next_notification(RAW_DRAIN_TIMEOUT).await?.is_some() {}
         let after_logs_unsub = sender
             .send_fresh(&[system::transfer(
@@ -361,10 +380,10 @@ impl Scenario for PubsubContracts {
         er.api()
             .await_transaction(&after_logs_unsub, Duration::from_secs(5))
             .await?;
-        assert!(
+        check!(
             raw.next_notification(RAW_SILENCE_TIMEOUT).await?.is_none(),
             "logs notifications continued after unsubscribe"
-        );
+        )?;
 
         let program_sub = raw.program_subscribe(&system_program).await?;
         transfer(
@@ -374,11 +393,14 @@ impl Scenario for PubsubContracts {
             TRANSFER_LAMPORTS,
         )
         .await?;
-        assert!(
+        check!(
             raw.next_notification(RAW_FIRST_TIMEOUT).await?.is_some(),
             "no program notification before unsubscribe"
-        );
-        assert!(raw.program_unsubscribe(program_sub).await?);
+        )?;
+        check!(
+            raw.program_unsubscribe(program_sub).await?,
+            "the program unsubscribe must return true"
+        )?;
         while raw.next_notification(RAW_DRAIN_TIMEOUT).await?.is_some() {}
         let after_program_unsub = sender
             .send_fresh(&[system::transfer(
@@ -390,22 +412,25 @@ impl Scenario for PubsubContracts {
         er.api()
             .await_transaction(&after_program_unsub, Duration::from_secs(5))
             .await?;
-        assert!(
+        check!(
             raw.next_notification(RAW_SILENCE_TIMEOUT).await?.is_none(),
             "program notifications continued after unsubscribe"
-        );
+        )?;
 
         let slot_sub = raw.slot_subscribe().await?;
-        assert!(
+        check!(
             raw.next_notification(RAW_FIRST_TIMEOUT).await?.is_some(),
             "no slot notification before unsubscribe"
-        );
-        assert!(raw.slot_unsubscribe(slot_sub).await?);
+        )?;
+        check!(
+            raw.slot_unsubscribe(slot_sub).await?,
+            "the slot unsubscribe must return true"
+        )?;
         while raw.next_notification(RAW_DRAIN_TIMEOUT).await?.is_some() {}
-        assert!(
+        check!(
             raw.next_notification(RAW_SILENCE_TIMEOUT).await?.is_none(),
             "slot notifications continued after unsubscribe"
-        );
+        )?;
 
         let unsent = sender
             .prepare(&[system::transfer(

@@ -5,6 +5,7 @@ use signature::Signature;
 
 use crate::{
     api::{custom_error_code, Api, TransactionInfo},
+    check::CheckError,
     Result,
 };
 
@@ -38,6 +39,30 @@ impl CommitReceipt {
     pub fn succeeded(&self) -> bool {
         self.error_message.is_none() && self.receipt_err_code.is_none()
     }
+
+    // The >= 0.14.10 committor retries an unconfirmed base tx with a fresh
+    // blockhash
+    pub fn failure_is_duplicate_rejection(&self) -> bool {
+        const DUPLICATE_REJECTIONS: [&str; 4] = [
+            "InvalidAccountOwner",
+            "Custom(11)",
+            "Custom(12)",
+            "invalid Commit id",
+        ];
+        self.error_message.as_deref().is_some_and(|message| {
+            DUPLICATE_REJECTIONS
+                .iter()
+                .any(|needle| message.contains(needle))
+        })
+    }
+}
+
+pub fn warn_duplicate_rejection(scenario: &str, message: &str) {
+    eprintln!(
+        "[redsuite] {scenario}: warning: intent reported failed with a \
+         duplicate-rejection code (validator PR #1537) — verifying base \
+         state instead: {message}"
+    );
 }
 
 // Builtin ic_msg lines arrive bare; tolerate a BPF-style prefix anyway.
@@ -120,17 +145,19 @@ pub async fn fetch_commit_receipt(
         .await_transaction(commit_signature, SCHEDULE_FETCH_TIMEOUT)
         .await?;
     if let Some(err) = &commit_tx.err {
-        return Err(format!(
-            "commit tx {commit_signature} failed on-chain: {err:?}"
-        )
+        return Err(CheckError::new(format!(
+            "commit tx {commit_signature} succeeds on the ER"
+        ))
+        .actual(format!("failed on-chain: {err:?}"))
         .into());
     }
     let receipt_signature = receipt_signature_in_logs(&commit_tx.logs)
         .ok_or_else(|| {
-            format!(
-            "commit tx {commit_signature} logs carry no ScheduledCommitSent \
-             signature — was a commit actually scheduled?"
-        )
+            CheckError::new(format!(
+                "commit tx {commit_signature} logs carry no \
+                 ScheduledCommitSent signature — was a commit actually \
+                 scheduled?"
+            ))
         })?;
     let receipt_tx = er.await_transaction(&receipt_signature, timeout).await?;
     Ok(parse_receipt(receipt_signature, &receipt_tx))
@@ -145,11 +172,17 @@ pub async fn confirm_base_signatures(
         let base_tx = base
             .await_transaction(chain_signature, timeout)
             .await
-            .map_err(|e| format!("base commit tx {chain_signature}: {e}"))?;
+            .map_err(|error| {
+                CheckError::new(format!(
+                    "base commit tx {chain_signature} lands on base"
+                ))
+                .caused_by(error)
+            })?;
         if let Some(err) = &base_tx.err {
-            return Err(format!(
-                "base commit tx {chain_signature} failed on-chain: {err:?}"
-            )
+            return Err(CheckError::new(format!(
+                "base commit tx {chain_signature} succeeds on base"
+            ))
+            .actual(format!("failed on-chain: {err:?}"))
             .into());
         }
     }

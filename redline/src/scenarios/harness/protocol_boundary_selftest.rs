@@ -5,8 +5,7 @@ use instruction::Instruction;
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    assert::poll_until,
-    prep,
+    check, check_eq, prep,
     profile::select as select_profile,
     report,
     runner::{drive_threads, RunOutcome, ThreadRunConfig},
@@ -134,10 +133,14 @@ impl Scenario for ProtocolBoundarySelftest {
             .await?,
         );
         for pda in pool.iter() {
-            poll_until(CLONE_TIMEOUT, || async {
-                matches!(er.account(pda).await, Ok(Some(acc)) if acc.data.len() == crate::ACCOUNT_SPACE as usize)
-            })
-            .await;
+            check::poll(
+                &format!("the ER clones the delegated pda {pda}"),
+                CLONE_TIMEOUT,
+                || async {
+                    matches!(er.account(pda).await, Ok(Some(acc)) if acc.data.len() == crate::ACCOUNT_SPACE as usize)
+                },
+            )
+            .await?;
         }
         let payer_bytes: Arc<Vec<[u8; 64]>> = Arc::new(
             prep_payers.iter().map(|payer| payer.to_bytes()).collect(),
@@ -156,11 +159,12 @@ impl Scenario for ProtocolBoundarySelftest {
             pool.clone(),
             payer_bytes.clone(),
         );
-        assert_eq!(
-            warmup.failed, 0,
+        check_eq!(
+            warmup.failed,
+            0,
             "warmup deliveries failed: {:?}",
             warmup.first_error
-        );
+        )?;
 
         let mut id_offset = profile.warmup;
         let mut cells: Vec<CellOutcome> = Vec::new();
@@ -202,11 +206,13 @@ impl Scenario for ProtocolBoundarySelftest {
                     .map(|us| format!("{us:.1} us"))
                     .unwrap_or_else(|| "n/a".to_owned()),
             );
-            assert_eq!(
-                cell.outcome.failed, 0,
+            check_eq!(
+                cell.outcome.failed,
+                0,
                 "threads={}: deliveries failed: {:?}",
-                cell.threads, cell.outcome.first_error
-            );
+                cell.threads,
+                cell.outcome.first_error
+            )?;
 
             let cell_report = ScenarioReport::ok(&format!(
                 "{}/threads{threads}",
