@@ -7,7 +7,7 @@ use dlp_api::{
 };
 use keypair::Keypair;
 use redsuite_core::{
-    assert::poll_until, dlp, prep, system, topology, BaseCtx, ChainCtx, ErCtx,
+    check, check_eq, dlp, prep, system, topology, BaseCtx, ChainCtx, ErCtx,
     Result, Scenario, ScenarioReport,
 };
 use signer::Signer;
@@ -38,44 +38,54 @@ impl Scenario for CloneOnAccess {
         let payer = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
 
         let ghost = Keypair::new().pubkey();
-        assert!(
+        check!(
             er.account(&ghost).await?.is_none(),
             "an account that exists nowhere must read as absent on the ER"
-        );
+        )?;
         base.airdrop(&ghost, GHOST_LAMPORTS).await?;
-        poll_until(PROPAGATION_TIMEOUT, || async {
-            matches!(er.account(&ghost).await, Ok(Some(acc)) if acc.lamports == GHOST_LAMPORTS)
-        })
-        .await;
+        check::poll(
+            "the base airdrop invalidates the ER's negative cache for the \
+             ghost",
+            PROPAGATION_TIMEOUT,
+            || async {
+                matches!(er.account(&ghost).await, Ok(Some(acc)) if acc.lamports == GHOST_LAMPORTS)
+            },
+        )
+        .await?;
 
         let plain = crate::init_account(base, &payer, 0, er.identity()).await?;
         base.send(&payer, &[build::simple_byte_set(PRE_CLONE_WRITE, &[plain])])
             .await?;
 
         let first_access = Instant::now();
-        poll_until(CLONE_TIMEOUT, || async {
-            matches!(er.account(&plain).await, Ok(Some(clone)) if clone.data.len() == crate::ACCOUNT_SPACE as usize)
-        })
-        .await;
+        check::poll(
+            "the ER clones the plain account on first access",
+            CLONE_TIMEOUT,
+            || async {
+                matches!(er.account(&plain).await, Ok(Some(clone)) if clone.data.len() == crate::ACCOUNT_SPACE as usize)
+            },
+        )
+        .await?;
         let clone_visibility_ms = first_access.elapsed().as_secs_f64() * 1e3;
         let plain_clone =
             er.account(&plain).await?.ok_or("plain clone vanished")?;
         let plain_on_base =
             base.account(&plain).await?.ok_or("plain gone on base")?;
-        assert_eq!(
-            plain_clone.lamports, plain_on_base.lamports,
+        check_eq!(
+            plain_clone.lamports,
+            plain_on_base.lamports,
             "the ER clone must mirror the base account's lamports"
-        );
-        assert_eq!(
+        )?;
+        check_eq!(
             plain_clone.owner,
             crate::program::id(),
             "an undelegated clone must keep its base owner"
-        );
-        assert_eq!(
+        )?;
+        check_eq!(
             crate::written_id(&plain_clone.data),
             Some(PRE_CLONE_WRITE),
             "the first ER access must observe the state written on base before cloning"
-        );
+        )?;
 
         base.send(
             &payer,
@@ -83,10 +93,14 @@ impl Scenario for CloneOnAccess {
         )
         .await?;
         let mutation_confirmed = Instant::now();
-        poll_until(PROPAGATION_TIMEOUT, || async {
-            matches!(er.account(&plain).await, Ok(Some(clone)) if crate::written_id(&clone.data) == Some(POST_CLONE_WRITE))
-        })
-        .await;
+        check::poll(
+            "the base write propagates to the existing ER clone",
+            PROPAGATION_TIMEOUT,
+            || async {
+                matches!(er.account(&plain).await, Ok(Some(clone)) if crate::written_id(&clone.data) == Some(POST_CLONE_WRITE))
+            },
+        )
+        .await?;
         let propagation_ms = mutation_confirmed.elapsed().as_secs_f64() * 1e3;
 
         let undelegated_write = er
@@ -95,10 +109,10 @@ impl Scenario for CloneOnAccess {
                 &[build::simple_byte_set(UNDELEGATED_WRITE, &[plain])],
             )
             .await;
-        assert!(
+        check!(
             undelegated_write.is_err(),
             "the ER must reject a write to an undelegated clone, got {undelegated_write:?}"
-        );
+        )?;
 
         let delegated =
             crate::init_delegated_account(base, &payer, 1, er.identity())
@@ -107,23 +121,28 @@ impl Scenario for CloneOnAccess {
             .account(&delegated)
             .await?
             .ok_or("delegated pda missing on base")?;
-        assert_eq!(
-            delegated_on_base.owner, DELEGATION_PROGRAM_ID,
+        check_eq!(
+            delegated_on_base.owner,
+            DELEGATION_PROGRAM_ID,
             "a delegated pda must be dlp-owned on base"
-        );
-        poll_until(CLONE_TIMEOUT, || async {
-            matches!(er.account(&delegated).await, Ok(Some(clone)) if clone.data.len() == crate::ACCOUNT_SPACE as usize)
-        })
-        .await;
+        )?;
+        check::poll(
+            "the ER clones the delegated account",
+            CLONE_TIMEOUT,
+            || async {
+                matches!(er.account(&delegated).await, Ok(Some(clone)) if clone.data.len() == crate::ACCOUNT_SPACE as usize)
+            },
+        )
+        .await?;
         let delegated_clone = er
             .account(&delegated)
             .await?
             .ok_or("delegated clone vanished")?;
-        assert_eq!(
+        check_eq!(
             delegated_clone.owner,
             crate::program::id(),
             "the ER must present a delegated account as owned by its program"
-        );
+        )?;
 
         er.send(&payer, &[build::simple_byte_set(ER_WRITE, &[delegated])])
             .await?;
@@ -131,21 +150,21 @@ impl Scenario for CloneOnAccess {
             .account(&delegated)
             .await?
             .ok_or("delegated clone vanished after the ER write")?;
-        assert_eq!(
+        check_eq!(
             crate::written_id(&after_er_write.data),
             Some(ER_WRITE),
             "the ER copy of a delegated account must accept program writes"
-        );
+        )?;
         let base_copy = base
             .account(&delegated)
             .await?
             .ok_or("delegated pda gone on base")?;
-        assert!(
+        check!(
             base_copy.data[layout::DATA_OFFSET..]
                 .iter()
                 .all(|&byte| byte == 0),
             "ER writes must not reach the base copy without an explicit commit"
-        );
+        )?;
 
         // redelegation continuity — undelegate + redelegate-to-us composed
         // in ONE base transaction (validator-signed dlp undelegate, then
@@ -161,13 +180,17 @@ impl Scenario for CloneOnAccess {
             ),
         ];
         base.send_with(&payer, &[&wallet], &delegate_setup).await?;
-        poll_until(CLONE_TIMEOUT, || async {
-            matches!(
-                er.api().get_balance(&wallet.pubkey()).await,
-                Ok(balance) if balance == WALLET_LAMPORTS
-            )
-        })
-        .await;
+        check::poll(
+            "the ER clones the delegated wallet at full balance",
+            CLONE_TIMEOUT,
+            || async {
+                matches!(
+                    er.api().get_balance(&wallet.pubkey()).await,
+                    Ok(balance) if balance == WALLET_LAMPORTS
+                )
+            },
+        )
+        .await?;
 
         let identity = topology::er_identity_keypair()?;
         let cycle = [
@@ -201,27 +224,27 @@ impl Scenario for CloneOnAccess {
 
         let continuity_deadline = Instant::now() + CONTINUITY_WINDOW;
         while Instant::now() < continuity_deadline {
-            assert!(
+            check!(
                 er.account(&wallet.pubkey()).await?.is_some(),
                 "the er clone must survive a one-transaction undelegate + \
                  redelegate"
-            );
+            )?;
             tokio::time::sleep(CONTINUITY_STEP).await;
         }
         let wallet_on_base = base
             .account(&wallet.pubkey())
             .await?
             .ok_or("the cycled wallet vanished on base")?;
-        assert_eq!(
+        check_eq!(
             wallet_on_base.owner,
             dlp::dlp_id(),
             "the wallet must be delegated again on base after the cycle"
-        );
-        assert_eq!(
+        )?;
+        check_eq!(
             er.api().get_balance(&wallet.pubkey()).await?,
             WALLET_LAMPORTS,
             "the er clone balance must be intact after the cycle"
-        );
+        )?;
         er.send(
             &wallet,
             &[system::transfer(

@@ -4,8 +4,7 @@ use async_trait::async_trait;
 use futures_util::future::join_all;
 use pubkey::Pubkey;
 use redsuite_core::{
-    assert::poll_until,
-    prep,
+    check, check_eq, prep,
     profile::select as select_profile,
     report,
     runner::{drive, RunConfig},
@@ -103,14 +102,19 @@ async fn sweep(er: &ErCtx, pool: &[Pubkey]) {
     }
 }
 
-async fn prewarm_resident(er: &ErCtx, pool: &[Pubkey]) {
+async fn prewarm_resident(er: &ErCtx, pool: &[Pubkey]) -> Result<()> {
     sweep(er, pool).await;
     for account in pool {
-        poll_until(CLONE_TIMEOUT, || async {
-            matches!(er.account(account).await, Ok(Some(acc)) if acc.data.len() == ACCOUNT_SPACE as usize)
-        })
-        .await;
+        check::poll(
+            &format!("the ER clones the pool account {account}"),
+            CLONE_TIMEOUT,
+            || async {
+                matches!(er.account(account).await, Ok(Some(acc)) if acc.data.len() == ACCOUNT_SPACE as usize)
+            },
+        )
+        .await?;
     }
+    Ok(())
 }
 
 struct Cell {
@@ -201,7 +205,7 @@ impl Scenario for CloneLruChurn {
             let cell_er = private.ctx();
             let sweep_started = Instant::now();
             if cell.closure {
-                prewarm_resident(cell_er, &pool).await;
+                prewarm_resident(cell_er, &pool).await?;
             } else {
                 sweep(cell_er, &pool).await;
             }
@@ -232,11 +236,13 @@ impl Scenario for CloneLruChurn {
                 request.clone(),
             )
             .await;
-            assert_eq!(
-                warmup.failed, 0,
+            check_eq!(
+                warmup.failed,
+                0,
                 "{}: warmup reads failed: {:?}",
-                cell.name, warmup.first_error
-            );
+                cell.name,
+                warmup.first_error
+            )?;
 
             let before = cell_er.scrape_metrics().await?;
             let offset = profile.warmup;
@@ -335,17 +341,20 @@ impl Scenario for CloneLruChurn {
         }
 
         let closure = &cells[0];
-        assert_eq!(
-            closure.failed, 0,
+        check_eq!(
+            closure.failed,
+            0,
             "closure cell reads failed: {:?}",
             closure.first_error
-        );
-        assert_eq!(
-            closure.evictions, 0.0,
+        )?;
+        check_eq!(
+            closure.evictions,
+            0.0,
             "INVALID: closure cell (cap {} ≥ working set {}) evicted — \
              the cap knob or the harness is broken",
-            closure.cap, profile.working_set
-        );
+            closure.cap,
+            profile.working_set
+        )?;
         if closure.p50_us >= 1_000_000.0 {
             eprintln!(
                 "[redsuite] {}: warning: closure cell p50 {:.0} us left the \
@@ -356,31 +365,31 @@ impl Scenario for CloneLruChurn {
         }
 
         for churn_cell in &cells[1..] {
-            assert!(
+            check!(
                 churn_cell.delivered > 0,
                 "INVALID: {} delivered nothing",
                 churn_cell.name
-            );
-            assert!(
+            )?;
+            check!(
                 churn_cell.evictions > 0.0,
                 "{}: no evictions with cap {} < working set {} — \
                  churn did not engage",
                 churn_cell.name,
                 churn_cell.cap,
                 profile.working_set
-            );
+            )?;
             if let Some(fetches_found) = churn_cell.fetches_found {
                 let deviation = (fetches_found - churn_cell.evictions).abs();
                 let tolerance = (churn_cell.evictions * 0.15)
                     .max(profile.concurrency as f64);
-                assert!(
+                check!(
                     deviation <= tolerance,
                     "{}: {} refetches vs {} evictions — evict/reload left \
                      lockstep",
                     churn_cell.name,
                     fetches_found,
                     churn_cell.evictions
-                );
+                )?;
             }
         }
 

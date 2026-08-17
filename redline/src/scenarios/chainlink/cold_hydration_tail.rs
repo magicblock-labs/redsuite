@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    prep,
+    check_eq, prep,
     profile::select as select_profile,
     report,
     runner::{drive, RunConfig},
@@ -321,11 +321,12 @@ impl Scenario for ColdHydrationTail {
                     .map(|seconds| format!("{seconds:.6} s"))
                     .unwrap_or_else(|| "n/a".to_owned()),
             );
-            assert_eq!(
-                outcome.failed, 0,
+            check_eq!(
+                outcome.failed,
+                0,
                 "{cell_name}: deliveries failed: {:?}",
                 outcome.first_error
-            );
+            )?;
         }
         if warm_deps.slow > cold_deps.slow {
             eprintln!(

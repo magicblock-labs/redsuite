@@ -7,14 +7,13 @@ use std::{
 use async_trait::async_trait;
 use pubkey::Pubkey;
 use redsuite_core::{
-    assert::poll_until,
-    prep,
+    check, check_eq, prep,
     profile::select as select_profile,
     report,
     runner::{drive, RunConfig, RunOutcome},
     transport::ws::{AccountUpdates, UpdateOutcome},
-    BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
-    TxSender,
+    BaseCtx, ChainCtx, CheckError, ErCtx, MetricsDelta, Result, Scenario,
+    ScenarioReport, TxSender,
 };
 use signature::Signature;
 
@@ -95,14 +94,19 @@ impl Cell {
     }
 }
 
-async fn drain_processed(er: &ErCtx, target: f64) {
-    poll_until(DRAIN_TIMEOUT, || async {
-        matches!(
-            er.scrape_metrics().await.ok().and_then(|metrics| metrics.get(TX_COUNT)),
-            Some(count) if count >= target
-        )
-    })
-    .await;
+async fn drain_processed(er: &ErCtx, target: f64) -> Result<()> {
+    check::poll(
+        &format!("the validator transaction count reaches {target}"),
+        DRAIN_TIMEOUT,
+        || async {
+            matches!(
+                er.scrape_metrics().await.ok().and_then(|metrics| metrics.get(TX_COUNT)),
+                Some(count) if count >= target
+            )
+        },
+    )
+    .await?;
+    Ok(())
 }
 
 async fn run_cell(
@@ -136,13 +140,14 @@ async fn run_cell(
         warmup_request,
     )
     .await;
-    assert_eq!(
-        warm.failed, 0,
+    check_eq!(
+        warm.failed,
+        0,
         "{label} warmup deliveries failed: {:?}",
         warm.first_error
-    );
+    )?;
     if let Some(seen) = count_before_warmup {
-        drain_processed(er, seen + profile.warmup as f64).await;
+        drain_processed(er, seen + profile.warmup as f64).await?;
     }
 
     let updates = Rc::new(
@@ -187,14 +192,15 @@ async fn run_cell(
         request,
     )
     .await;
-    assert_eq!(
-        outcome.failed, 0,
+    check_eq!(
+        outcome.failed,
+        0,
         "{label} measured deliveries failed: {:?}",
         outcome.first_error
-    );
+    )?;
     let drain_started = Instant::now();
     if let Some(seen) = before.get(TX_COUNT) {
-        drain_processed(er, seen + profile.iterations as f64).await;
+        drain_processed(er, seen + profile.iterations as f64).await?;
     }
     let drain = drain_started.elapsed();
 
@@ -207,37 +213,37 @@ async fn run_cell(
         .api()
         .await_transaction(&probe_sig, PROBE_TIMEOUT)
         .await?;
-    assert!(
+    check!(
         probe_tx.err.is_none(),
         "{label} probe tx failed on-chain (sha256 iters {iters} over the \
          compute budget?): {:?}\nlogs: {:#?}",
         probe_tx.err,
         probe_tx.logs
-    );
+    )?;
     let probe_cus = consumed_cus(&probe_tx.logs).ok_or_else(|| {
-        format!(
-            "{label} probe logs carry no `consumed .. compute units` line: \
-             {:#?}",
-            probe_tx.logs
-        )
+        CheckError::new(format!(
+            "{label} probe logs carry no `consumed .. compute units` line"
+        ))
+        .actual(format!("{:#?}", probe_tx.logs))
     })?;
 
     updates.await_settled(SETTLE_TIMEOUT).await?;
     let after = er.scrape_metrics().await?;
     let delta = MetricsDelta::new(before, after);
     if let Some(failed) = delta.counter("mbv_failed_transactions_count") {
-        assert_eq!(
-            failed, 0.0,
+        check_eq!(
+            failed,
+            0.0,
             "{label}: transactions failed on the validator"
-        );
+        )?;
     }
     let update_outcome = updates.finalize();
-    assert_eq!(
+    check_eq!(
         update_outcome.observed + update_outcome.superseded,
         profile.iterations as usize,
         "{label}: every tracked write must be observed or superseded — \
          missing updates mean transactions executed without writing"
-    );
+    )?;
 
     Ok(Cell {
         label,
@@ -274,10 +280,14 @@ impl Scenario for HighCu {
         )
         .await?;
         for pda in &pdas {
-            poll_until(Duration::from_secs(15), || async {
-                matches!(er.account(pda).await, Ok(Some(acc)) if acc.data.len() == crate::ACCOUNT_SPACE as usize)
-            })
-            .await;
+            check::poll(
+                &format!("the ER clones the delegated pda {pda}"),
+                Duration::from_secs(15),
+                || async {
+                    matches!(er.account(pda).await, Ok(Some(acc)) if acc.data.len() == crate::ACCOUNT_SPACE as usize)
+                },
+            )
+            .await?;
         }
         let senders: Vec<TxSender> = payers
             .into_iter()
@@ -359,30 +369,31 @@ impl Scenario for HighCu {
             let on_er = er.account(pda).await?.ok_or("pda not on er")?;
             let id_bytes = &on_er.data
                 [layout::ID_OFFSET..layout::ID_OFFSET + layout::ID_SIZE];
-            assert_eq!(
+            check_eq!(
                 id_bytes,
                 last_id.to_le_bytes(),
                 "er copy must hold the last id written to pda {index}"
-            );
+            )?;
             let hash_bytes = &on_er.data
                 [layout::HASH_OFFSET..layout::HASH_OFFSET + layout::HASH_SIZE];
-            assert_eq!(
-                hash_bytes, expected_hash,
+            check_eq!(
+                hash_bytes,
+                expected_hash,
                 "pda {index} must hold the full {HEAVY_ITERS}-iteration hash \
                  chain"
-            );
+            )?;
         }
 
         let light = &cells[0];
         let heavy = &cells[1];
         let cu_ratio = heavy.probe_cus / light.probe_cus;
-        assert!(
+        check!(
             cu_ratio >= CU_CONTRAST_FLOOR,
             "heavy cell consumed {:.0} cus per tx vs light {:.0} — not the \
              >= {CU_CONTRAST_FLOOR}x compute contrast this scenario is about",
             heavy.probe_cus,
             light.probe_cus,
-        );
+        )?;
         let validator_avg_ratio =
             match (light.validator_avg_us, heavy.validator_avg_us) {
                 (Some(light_avg), Some(heavy_avg)) if light_avg > 0.0 => {

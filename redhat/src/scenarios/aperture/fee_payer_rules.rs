@@ -3,8 +3,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use redshift_program::schedulecommit::build;
 use redsuite_core::{
-    dlp, prep, receipt, system, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
-    ScenarioReport,
+    check, dlp, prep, receipt, system, BaseCtx, ChainCtx, CheckError, ErCtx,
+    Result, Scenario, ScenarioReport,
 };
 use signer::Signer;
 
@@ -34,10 +34,10 @@ impl Scenario for FeePayerRules {
         )
         .await?;
         let vault = dlp::magic_fee_vault_pda(&er.identity());
-        assert!(
+        check!(
             er.account(&vault).await?.is_some(),
             "the magic fee vault for the booted er identity must exist"
-        );
+        )?;
 
         let signature = er
             .send(
@@ -56,16 +56,17 @@ impl Scenario for FeePayerRules {
         )
         .await?;
         if let Some(message) = &commit_receipt.error_message {
-            return Err(format!(
-                "the mapped-signing self-commit failed: {message}"
+            return Err(CheckError::new(
+                "the mapped-signing self-commit succeeds",
             )
+            .actual(message)
             .into());
         }
-        assert!(
+        check!(
             commit_receipt.included.contains(&delegated_payer.pubkey()),
             "the mapped-signing payer must commit itself, receipt included {:?}",
             commit_receipt.included
-        );
+        )?;
         receipt::confirm_base_signatures(
             base.api(),
             &commit_receipt,
@@ -86,17 +87,17 @@ impl Scenario for FeePayerRules {
                 &[system::transfer(&outsider.pubkey(), &outsider.pubkey(), 1)],
             )
             .await;
-        assert!(
+        check!(
             fee_only.is_err(),
             "a non-delegated payer must not pay ER fees for a tx touching no \
              delegated account"
-        );
+        )?;
         let fee_error = format!("{:?}", fee_only.unwrap_err());
-        assert!(
+        check!(
             fee_error.contains("InvalidAccountForFee"),
             "expected InvalidAccountForFee for the non-delegated payer, got \
              {fee_error}"
-        );
+        )?;
 
         Ok(ScenarioReport::ok(self.name())
             .setting("magic fee vault", vault)

@@ -7,7 +7,7 @@ use pubkey::Pubkey;
 pub use redline_program as program;
 use redshift_program::schedulecommit::{build, MainAccount};
 use redsuite_core::{
-    assert::poll_until, receipt, BaseCtx, ChainCtx, ErCtx, Result,
+    check, check_eq, receipt, BaseCtx, ChainCtx, ErCtx, Result,
 };
 use signer::Signer;
 
@@ -44,26 +44,34 @@ pub async fn init_schedulecommit_committees(
         let on_base = base.account(&pda).await?.ok_or(
             "the committee pda is not on base after init and delegate",
         )?;
-        assert_eq!(
+        check_eq!(
             on_base.owner,
             program::DELEGATION_PROGRAM_ID,
             "dlp must own a delegated committee on base"
-        );
+        )?;
         committees.push(Committee { player, pda });
     }
     Ok(committees)
 }
 
-pub async fn await_committee_clones(er: &ErCtx, committees: &[Committee]) {
+pub async fn await_committee_clones(
+    er: &ErCtx,
+    committees: &[Committee],
+) -> Result<()> {
     for committee in committees {
-        poll_until(COMMITTEE_CLONE_TIMEOUT, || async {
-            matches!(
-                er.account(&committee.pda).await,
-                Ok(Some(clone)) if clone.data.len() == MainAccount::SIZE
-            )
-        })
-        .await;
+        check::poll(
+            &format!("the ER clones committee {}", committee.pda),
+            COMMITTEE_CLONE_TIMEOUT,
+            || async {
+                matches!(
+                    er.account(&committee.pda).await,
+                    Ok(Some(clone)) if clone.data.len() == MainAccount::SIZE
+                )
+            },
+        )
+        .await?;
     }
+    Ok(())
 }
 
 pub async fn assert_commit_receipt(
@@ -77,24 +85,28 @@ pub async fn assert_commit_receipt(
         receipt::fetch_commit_receipt(er.api(), signature, RECEIPT_TIMEOUT)
             .await?;
     if let Some(message) = &commit_receipt.error_message {
-        return Err(format!("the commit intent failed: {message}").into());
+        return Err(check::CheckError::new("the commit intent succeeds")
+            .actual(message)
+            .into());
     }
     let mut included = commit_receipt.included.clone();
     included.sort();
     let mut expected = expected.to_vec();
     expected.sort();
-    assert_eq!(
-        included, expected,
+    check_eq!(
+        included,
+        expected,
         "the receipt must list exactly the committed accounts"
-    );
-    assert!(
+    )?;
+    check!(
         commit_receipt.excluded.is_empty(),
         "the receipt must exclude no accounts"
-    );
-    assert_eq!(
-        commit_receipt.requested_undelegation, expect_undelegation,
+    )?;
+    check_eq!(
+        commit_receipt.requested_undelegation,
+        expect_undelegation,
         "the receipt undelegation flag must match the commit type"
-    );
+    )?;
     receipt::confirm_base_signatures(
         base.api(),
         &commit_receipt,

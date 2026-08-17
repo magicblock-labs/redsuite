@@ -5,7 +5,8 @@ use instruction::Instruction;
 use keypair::Keypair;
 use redshift_program::schedulecommit::{build, ScheduleCommitType};
 use redsuite_core::{
-    prep, system, BaseCtx, ChainCtx, ErCtx, Result, Scenario, ScenarioReport,
+    check, check_eq, prep, system, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
+    ScenarioReport,
 };
 use signer::Signer;
 
@@ -30,17 +31,17 @@ async fn refused(
         .api()
         .await_transaction(&signature, RECEIPT_TIMEOUT)
         .await?;
-    assert!(
+    check!(
         tx.err.is_some(),
         "the attack must fail on-chain, got {tx:?}"
-    );
+    )?;
     let observed =
         format!("{}\n{:?}", tx.logs.join("\n"), tx.err.as_ref().unwrap());
     for needle in needles {
-        assert!(
+        check!(
             observed.contains(needle),
             "the refusal must name '{needle}', got: {observed}"
-        );
+        )?;
     }
     Ok(())
 }
@@ -56,7 +57,7 @@ impl Scenario for IllegalWritable {
         let committees =
             crate::init_delegated_committees(base, &funder, er.identity(), 2)
                 .await?;
-        crate::await_committee_clones(er, &committees).await;
+        crate::await_committee_clones(er, &committees).await?;
         let players: Vec<_> =
             committees.iter().map(|c| c.player.pubkey()).collect();
         let pdas: Vec<_> = committees.iter().map(|c| c.pda).collect();
@@ -138,11 +139,11 @@ impl Scenario for IllegalWritable {
                 .account(pda)
                 .await?
                 .ok_or("the committee pda vanished from base")?;
-            assert_eq!(
+            check_eq!(
                 on_base.owner,
                 crate::DELEGATION_PROGRAM_ID,
                 "a refused attack must leave the committee delegated"
-            );
+            )?;
         }
 
         Ok(ScenarioReport::ok(self.name())

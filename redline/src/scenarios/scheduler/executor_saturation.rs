@@ -9,14 +9,13 @@ use instruction::Instruction;
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    assert::poll_until,
-    host, prep,
+    check, check_eq, host, prep,
     profile::select as select_profile,
     report,
     runner::{drive, RunConfig, RunOutcome},
     stats::ObservationsStats,
-    topology, BaseCtx, ChainCtx, ErClient, ErCtx, MetricsDelta, Result,
-    Scenario, ScenarioReport, TxSender,
+    topology, BaseCtx, ChainCtx, CheckError, ErClient, ErCtx, MetricsDelta,
+    Result, Scenario, ScenarioReport, TxSender,
 };
 use signature::Signature;
 
@@ -292,21 +291,17 @@ fn drive_cell_burst(
 
 async fn drain_processed(er: &ErCtx, target: f64) -> Result<Duration> {
     let started = Instant::now();
-    poll_until(DRAIN_TIMEOUT, || async {
-        matches!(
-            er.scrape_metrics().await.ok().and_then(|metrics| metrics.get(TX_COUNT)),
-            Some(count) if count >= target
-        )
-    })
-    .await;
-    let drained = er.scrape_metrics().await?.get(TX_COUNT).unwrap_or(0.0);
-    if drained < target {
-        return Err(format!(
-            "intake never drained: {drained:.0} < {target:.0} after \
-             {DRAIN_TIMEOUT:?}"
-        )
-        .into());
-    }
+    check::poll(
+        &format!("the validator transaction count reaches {target:.0}"),
+        DRAIN_TIMEOUT,
+        || async {
+            matches!(
+                er.scrape_metrics().await.ok().and_then(|metrics| metrics.get(TX_COUNT)),
+                Some(count) if count >= target
+            )
+        },
+    )
+    .await?;
     Ok(started.elapsed())
 }
 
@@ -369,10 +364,14 @@ impl Scenario for ExecutorSaturation {
             )
             .await?;
             for pda in &pool {
-                poll_until(CLONE_TIMEOUT, || async {
-                    matches!(er.account(pda).await, Ok(Some(acc)) if acc.data.len() == crate::ACCOUNT_SPACE as usize)
-                })
-                .await;
+                check::poll(
+                    &format!("the ER clones the delegated pda {pda}"),
+                    CLONE_TIMEOUT,
+                    || async {
+                        matches!(er.account(pda).await, Ok(Some(acc)) if acc.data.len() == crate::ACCOUNT_SPACE as usize)
+                    },
+                )
+                .await?;
             }
             pools.push(pool);
         }
@@ -408,11 +407,12 @@ impl Scenario for ExecutorSaturation {
             false,
             Arc::new(OnceLock::new()),
         );
-        assert_eq!(
-            warm.outcome.failed, 0,
+        check_eq!(
+            warm.outcome.failed,
+            0,
             "warmup deliveries failed: {:?}",
             warm.outcome.first_error
-        );
+        )?;
         if let Some(seen) = count_before_warmup {
             drain_processed(er, seen + profile.warmup as f64).await?;
         }
@@ -444,11 +444,12 @@ impl Scenario for ExecutorSaturation {
             );
             let outcome = burst.outcome;
             offset += profile.iterations;
-            assert_eq!(
-                outcome.failed, 0,
+            check_eq!(
+                outcome.failed,
+                0,
                 "{label}: measured deliveries failed: {:?}",
                 outcome.first_error
-            );
+            )?;
             let drain = match before.get(TX_COUNT) {
                 Some(seen) => {
                     drain_processed(er, seen + profile.iterations as f64)
@@ -466,19 +467,19 @@ impl Scenario for ExecutorSaturation {
                 .api()
                 .await_transaction(&probe_sig, PROBE_TIMEOUT)
                 .await?;
-            assert!(
+            check!(
                 probe_tx.err.is_none(),
                 "{label}: probe tx failed on-chain (sha256 iters {iters} \
                  over the compute budget?): {:?}\nlogs: {:#?}",
                 probe_tx.err,
                 probe_tx.logs
-            );
+            )?;
             let probe_cus = consumed_cus(&probe_tx.logs).ok_or_else(|| {
-                format!(
+                CheckError::new(format!(
                     "{label}: probe logs carry no `consumed .. compute \
-                     units` line: {:#?}",
-                    probe_tx.logs
-                )
+                     units` line"
+                ))
+                .actual(format!("{:#?}", probe_tx.logs))
             })?;
 
             let thread_cores = cpu_after.thread_cores_since(&cpu_before);
@@ -569,25 +570,26 @@ impl Scenario for ExecutorSaturation {
                 let on_er = er.account(pda).await?.ok_or("pda not on er")?;
                 let hash_bytes = &on_er.data[layout::HASH_OFFSET
                     ..layout::HASH_OFFSET + layout::HASH_SIZE];
-                assert_eq!(
-                    hash_bytes, expected_hash,
+                check_eq!(
+                    hash_bytes,
+                    expected_hash,
                     "program {program_index} pda {pda_index} must hold the \
                      {}-iteration hash chain — heavy work was not executed",
                     profile.heavy_iters
-                );
+                )?;
             }
         }
 
         let light = &cells[0];
         let heavy = &cells[1];
         let cu_ratio = heavy.probe_cus / light.probe_cus;
-        assert!(
+        check!(
             cu_ratio >= CU_CONTRAST_FLOOR,
             "heavy cell consumed {:.0} cus per tx vs light {:.0} — not the \
              >= {CU_CONTRAST_FLOOR}x compute contrast this scenario is about",
             heavy.probe_cus,
             light.probe_cus,
-        );
+        )?;
 
         let mut summary = ScenarioReport::ok(self.name())
             .setting("profile", profile.name)

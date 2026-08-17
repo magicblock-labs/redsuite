@@ -14,7 +14,7 @@ use instruction::{AccountMeta, Instruction};
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    assert::poll_until, dlp, prep, system, BaseCtx, ChainCtx, ErCtx, Result,
+    check, check_eq, dlp, prep, system, BaseCtx, ChainCtx, ErCtx, Result,
     Scenario, ScenarioReport,
 };
 use signer::Signer;
@@ -121,22 +121,26 @@ impl Scenario for PostDelegationTokenTransfer {
         )
         .await?;
 
-        poll_until(PROJECTION_TIMEOUT, || async {
-            token_balance(er, &source_ata).await == Some(SOURCE_BALANCE)
-                && token_balance(er, &destination_ata).await
-                    == Some(DESTINATION_BALANCE)
-        })
-        .await;
-        assert_eq!(
+        check::poll(
+            "the er projects the deposited eATA balances onto both ATAs",
+            PROJECTION_TIMEOUT,
+            || async {
+                token_balance(er, &source_ata).await == Some(SOURCE_BALANCE)
+                    && token_balance(er, &destination_ata).await
+                        == Some(DESTINATION_BALANCE)
+            },
+        )
+        .await?;
+        check_eq!(
             token_balance(base, &source_ata).await,
             Some(0),
             "the source ATA on chain must be drained into the vault"
-        );
-        assert_eq!(
+        )?;
+        check_eq!(
             token_balance(base, &destination_ata).await,
             Some(0),
             "the destination ATA on chain must be drained into the vault"
-        );
+        )?;
 
         let transfer_action = spl_transfer(
             &source_ata,
@@ -169,13 +173,17 @@ impl Scenario for PostDelegationTokenTransfer {
         )
         .await?;
 
-        poll_until(ACTION_TIMEOUT, || async {
-            token_balance(er, &source_ata).await
-                == Some(SOURCE_BALANCE - TRANSFER_AMOUNT)
-                && token_balance(er, &destination_ata).await
-                    == Some(DESTINATION_BALANCE + TRANSFER_AMOUNT)
-        })
-        .await;
+        check::poll(
+            "the post-delegation transfer action moves the tokens on the er",
+            ACTION_TIMEOUT,
+            || async {
+                token_balance(er, &source_ata).await
+                    == Some(SOURCE_BALANCE - TRANSFER_AMOUNT)
+                    && token_balance(er, &destination_ata).await
+                        == Some(DESTINATION_BALANCE + TRANSFER_AMOUNT)
+            },
+        )
+        .await?;
 
         // negative: an ATA with NO eATA must clone as the plain chain
         // account, never a projection.
@@ -194,15 +202,17 @@ impl Scenario for PostDelegationTokenTransfer {
             ],
         )
         .await?;
-        poll_until(PROJECTION_TIMEOUT, || async {
-            token_balance(er, &plain_ata).await.is_some()
-        })
-        .await;
-        assert_eq!(
+        check::poll(
+            "the er clones the eATA-less plain ATA",
+            PROJECTION_TIMEOUT,
+            || async { token_balance(er, &plain_ata).await.is_some() },
+        )
+        .await?;
+        check_eq!(
             token_balance(er, &plain_ata).await,
             Some(PLAIN_BALANCE),
             "an ATA without an eATA must present its chain balance on the er"
-        );
+        )?;
 
         // negative: an eATA delegated to a FOREIGN validator must not be
         // substituted — the er presents the drained chain ATA, not the eATA.
@@ -236,21 +246,23 @@ impl Scenario for PostDelegationTokenTransfer {
             )],
         )
         .await?;
-        assert_eq!(
+        check_eq!(
             token_balance(base, &foreign_ata).await,
             Some(0),
             "the foreign user's chain ATA must be drained into the vault"
-        );
-        poll_until(PROJECTION_TIMEOUT, || async {
-            token_balance(er, &foreign_ata).await.is_some()
-        })
-        .await;
-        assert_eq!(
+        )?;
+        check::poll(
+            "the er clones the foreign-delegated ATA",
+            PROJECTION_TIMEOUT,
+            || async { token_balance(er, &foreign_ata).await.is_some() },
+        )
+        .await?;
+        check_eq!(
             token_balance(er, &foreign_ata).await,
             Some(0),
             "an eATA delegated to a foreign validator must not substitute — \
              the er must present the drained chain ATA"
-        );
+        )?;
 
         // failing post-delegation action — an action that cannot execute
         // must route the freshly delegated account into scheduled
@@ -286,28 +298,32 @@ impl Scenario for PostDelegationTokenTransfer {
             &[failing_delegate],
         )
         .await?;
-        poll_until(ACTION_TIMEOUT, || async {
-            matches!(
-                base.account(&failing_account.pubkey()).await,
-                Ok(Some(account)) if account.owner == system::system_id()
-            )
-        })
-        .await;
+        check::poll(
+            "the failing action returns base ownership to the system program",
+            ACTION_TIMEOUT,
+            || async {
+                matches!(
+                    base.account(&failing_account.pubkey()).await,
+                    Ok(Some(account)) if account.owner == system::system_id()
+                )
+            },
+        )
+        .await?;
         let failing_on_base = base
             .account(&failing_account.pubkey())
             .await?
             .ok_or("the failing-action account vanished on base")?;
-        assert_eq!(
+        check_eq!(
             failing_on_base.owner,
             system::system_id(),
             "a failing post-delegation action must undelegate the account \
              back to its system owner"
-        );
-        assert_eq!(
+        )?;
+        check_eq!(
             token_balance(er, &source_ata).await,
             Some(SOURCE_BALANCE - TRANSFER_AMOUNT),
             "the failing action must not move tokens"
-        );
+        )?;
 
         Ok(ScenarioReport::ok(self.name())
             .setting("mint decimals", 0u64)

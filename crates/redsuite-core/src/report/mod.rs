@@ -10,9 +10,9 @@ pub use diff::{bmf, compare, list};
 use json::{Deserialize, Serialize};
 
 use crate::{
-    scenario::{RunRecord, ScenarioOutcome},
+    scenario::{failed_check, RunRecord, ScenarioOutcome},
     stats::ObservationsStats,
-    topology, Result,
+    topology, DynError, Result,
 };
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -96,7 +96,28 @@ pub struct PersistedReport {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PersistedFailure {
     pub phase: String,
+    #[serde(default)]
+    pub kind: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context: Vec<(String, String)>,
+}
+
+impl PersistedFailure {
+    fn new(phase: &str, kind: &str, message: impl Into<String>) -> Self {
+        Self {
+            phase: phase.to_owned(),
+            kind: kind.to_owned(),
+            message: message.into(),
+            expected: None,
+            actual: None,
+            context: Vec::new(),
+        }
+    }
 }
 
 pub fn reports_dir() -> PathBuf {
@@ -113,7 +134,9 @@ pub fn persist_run(record: &RunRecord) -> Result<PathBuf> {
     let fallback;
     let report = match &record.scenario {
         ScenarioOutcome::Passed(report) => report,
-        ScenarioOutcome::Failed(_) | ScenarioOutcome::NotReached => {
+        ScenarioOutcome::Failed(_)
+        | ScenarioOutcome::Panicked(_)
+        | ScenarioOutcome::NotReached => {
             fallback = ScenarioReport::failed(&record.name)
                 .metric_if("wall seconds", record.wall_seconds);
             &fallback
@@ -124,21 +147,41 @@ pub fn persist_run(record: &RunRecord) -> Result<PathBuf> {
 
 fn run_failures(record: &RunRecord) -> Vec<PersistedFailure> {
     let mut failures = Vec::new();
-    if let ScenarioOutcome::Failed(error) = &record.scenario {
-        failures.push(PersistedFailure {
-            phase: "scenario".to_owned(),
-            message: error.to_string(),
-        });
+    match &record.scenario {
+        ScenarioOutcome::Failed(error) => {
+            failures.push(scenario_failure(error))
+        }
+        ScenarioOutcome::Panicked(message) => {
+            failures.push(PersistedFailure::new("scenario", "panic", message))
+        }
+        ScenarioOutcome::Passed(_) | ScenarioOutcome::NotReached => {}
     }
     for outcome in &record.phases {
         if let Some(error) = &outcome.error {
-            failures.push(PersistedFailure {
-                phase: outcome.phase.name().to_owned(),
-                message: error.error().to_string(),
-            });
+            failures.push(PersistedFailure::new(
+                outcome.phase.name(),
+                "infrastructure",
+                error.error().to_string(),
+            ));
         }
     }
     failures
+}
+
+fn scenario_failure(error: &DynError) -> PersistedFailure {
+    match failed_check(error) {
+        Some(check) => PersistedFailure {
+            expected: check.expected.clone(),
+            actual: check.actual.clone(),
+            context: check.context.clone(),
+            ..PersistedFailure::new("scenario", "check", &check.check)
+        },
+        None => PersistedFailure::new(
+            "scenario",
+            "infrastructure",
+            error.to_string(),
+        ),
+    }
 }
 
 fn write_report(
@@ -272,10 +315,11 @@ mod tests {
                 er_fingerprint: "123-456".into(),
             },
             report,
-            failures: vec![PersistedFailure {
-                phase: "teardown".into(),
-                message: "private ER `x` is still running".into(),
-            }],
+            failures: vec![PersistedFailure::new(
+                "teardown",
+                "infrastructure",
+                "private ER `x` is still running",
+            )],
         };
         let text = json::to_string(&doc).unwrap();
         let back: PersistedReport = json::from_str(&text).unwrap();
@@ -283,6 +327,46 @@ mod tests {
         assert_eq!(back.report.config[0].1, "200");
         assert_eq!(back.meta.er_fingerprint, "123-456");
         assert_eq!(back.failures[0].phase, "teardown");
+        assert_eq!(back.failures[0].kind, "infrastructure");
+    }
+
+    #[test]
+    fn a_failed_check_persists_its_evidence() {
+        let error: DynError = Box::new(
+            crate::check::CheckError::new("the clone matches base")
+                .expected("128 bytes")
+                .actual("0 bytes")
+                .context("account", "abc123"),
+        );
+        let record = RunRecord {
+            name: "redshift/example".into(),
+            phases: Vec::new(),
+            scenario: ScenarioOutcome::Failed(error),
+            wall_seconds: Some(1.0),
+        };
+        let failures = run_failures(&record);
+        assert_eq!(failures[0].kind, "check");
+        assert_eq!(failures[0].message, "the clone matches base");
+        assert_eq!(failures[0].expected.as_deref(), Some("128 bytes"));
+        assert_eq!(failures[0].actual.as_deref(), Some("0 bytes"));
+        assert_eq!(failures[0].context[0].0, "account");
+        assert!(record.failure().unwrap().contains("check failed"));
+    }
+
+    #[test]
+    fn a_panic_is_classified_apart_from_checks_and_errors() {
+        let record = RunRecord {
+            name: "redshift/example".into(),
+            phases: Vec::new(),
+            scenario: ScenarioOutcome::Panicked("index out of bounds".into()),
+            wall_seconds: Some(1.0),
+        };
+        let failures = run_failures(&record);
+        assert_eq!(failures[0].phase, "scenario");
+        assert_eq!(failures[0].kind, "panic");
+        assert_eq!(failures[0].message, "index out of bounds");
+        assert!(!record.passed());
+        assert!(record.failure().unwrap().contains("scenario panicked"));
     }
 
     #[test]

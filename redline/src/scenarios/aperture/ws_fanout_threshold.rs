@@ -5,8 +5,7 @@ use instruction::Instruction;
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    assert::poll_until,
-    prep,
+    check, check_eq, prep,
     profile::select as select_profile,
     report,
     runner::{drive_threads, RunOutcome, ThreadRunConfig},
@@ -172,10 +171,14 @@ impl Scenario for WsFanoutThreshold {
         )
         .await?;
         for pda in &pool {
-            poll_until(CLONE_TIMEOUT, || async {
-                matches!(er.account(pda).await, Ok(Some(acc)) if acc.data.len() == crate::ACCOUNT_SPACE as usize)
-            })
-            .await;
+            check::poll(
+                &format!("the ER clones the delegated pda {pda}"),
+                CLONE_TIMEOUT,
+                || async {
+                    matches!(er.account(pda).await, Ok(Some(acc)) if acc.data.len() == crate::ACCOUNT_SPACE as usize)
+                },
+            )
+            .await?;
         }
         let payer_bytes: Arc<Vec<[u8; 64]>> = Arc::new(
             prep_payers.iter().map(|payer| payer.to_bytes()).collect(),
@@ -196,11 +199,12 @@ impl Scenario for WsFanoutThreshold {
             payer_bytes.clone(),
             None,
         );
-        assert_eq!(
-            warmup.failed, 0,
+        check_eq!(
+            warmup.failed,
+            0,
             "warmup deliveries failed: {:?}",
             warmup.first_error
-        );
+        )?;
 
         let mut id_cursor = profile.warmup;
         let mut cells: Vec<CellOutcome> = Vec::new();
@@ -242,11 +246,12 @@ impl Scenario for WsFanoutThreshold {
                 payer_bytes.clone(),
                 Some(produced.clone()),
             );
-            assert_eq!(
-                outcome.failed, 0,
+            check_eq!(
+                outcome.failed,
+                0,
                 "ws{connections}: measured deliveries failed: {:?}",
                 outcome.first_error
-            );
+            )?;
 
             let missing_final =
                 subscribers.await_final(&expected, DRAIN_TIMEOUT).await;
@@ -254,7 +259,10 @@ impl Scenario for WsFanoutThreshold {
             let after = er.scrape_metrics().await?;
             let delta = MetricsDelta::new(before, after);
             if let Some(error) = subscribers.first_error() {
-                panic!("ws{connections}: subscriber pool failed: {error}");
+                return Err(format!(
+                    "ws{connections}: subscriber pool failed: {error}"
+                )
+                .into());
             }
             let conn_reports: Vec<ConnReport> = subscribers.finalize();
 
@@ -358,10 +366,11 @@ impl Scenario for WsFanoutThreshold {
             if let Some(failed_txs) =
                 delta.counter("mbv_failed_transactions_count")
             {
-                assert_eq!(
-                    failed_txs, 0.0,
+                check_eq!(
+                    failed_txs,
+                    0.0,
                     "ws{connections}: transactions failed on the validator"
-                );
+                )?;
             }
             cells.push(cell_outcome);
             id_cursor += profile.iterations;
@@ -398,11 +407,11 @@ impl Scenario for WsFanoutThreshold {
         }
 
         for cell in &cells {
-            assert!(
+            check!(
                 cell.delivered > 0,
                 "INVALID: ws{} delivered nothing",
                 cell.connections
-            );
+            )?;
         }
 
         let cliff = cells

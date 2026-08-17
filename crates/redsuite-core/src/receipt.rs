@@ -5,6 +5,7 @@ use signature::Signature;
 
 use crate::{
     api::{custom_error_code, Api, TransactionInfo},
+    check::CheckError,
     Result,
 };
 
@@ -120,17 +121,19 @@ pub async fn fetch_commit_receipt(
         .await_transaction(commit_signature, SCHEDULE_FETCH_TIMEOUT)
         .await?;
     if let Some(err) = &commit_tx.err {
-        return Err(format!(
-            "commit tx {commit_signature} failed on-chain: {err:?}"
-        )
+        return Err(CheckError::new(format!(
+            "commit tx {commit_signature} succeeds on the ER"
+        ))
+        .actual(format!("failed on-chain: {err:?}"))
         .into());
     }
     let receipt_signature = receipt_signature_in_logs(&commit_tx.logs)
         .ok_or_else(|| {
-            format!(
-            "commit tx {commit_signature} logs carry no ScheduledCommitSent \
-             signature — was a commit actually scheduled?"
-        )
+            CheckError::new(format!(
+                "commit tx {commit_signature} logs carry no \
+                 ScheduledCommitSent signature — was a commit actually \
+                 scheduled?"
+            ))
         })?;
     let receipt_tx = er.await_transaction(&receipt_signature, timeout).await?;
     Ok(parse_receipt(receipt_signature, &receipt_tx))
@@ -145,11 +148,17 @@ pub async fn confirm_base_signatures(
         let base_tx = base
             .await_transaction(chain_signature, timeout)
             .await
-            .map_err(|e| format!("base commit tx {chain_signature}: {e}"))?;
+            .map_err(|error| {
+                CheckError::new(format!(
+                    "base commit tx {chain_signature} lands on base"
+                ))
+                .caused_by(error)
+            })?;
         if let Some(err) = &base_tx.err {
-            return Err(format!(
-                "base commit tx {chain_signature} failed on-chain: {err:?}"
-            )
+            return Err(CheckError::new(format!(
+                "base commit tx {chain_signature} succeeds on base"
+            ))
+            .actual(format!("failed on-chain: {err:?}"))
             .into());
         }
     }

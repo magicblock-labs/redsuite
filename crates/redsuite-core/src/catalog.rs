@@ -1,8 +1,6 @@
-use std::future::Future;
-use std::pin::Pin;
+use std::{future::Future, pin::Pin};
 
-use crate::profile;
-use crate::scenario::RunRecord;
+use crate::{profile, scenario::RunRecord};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Family {

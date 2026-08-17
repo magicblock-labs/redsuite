@@ -4,8 +4,7 @@ use async_trait::async_trait;
 use instruction::Instruction;
 use pubkey::Pubkey;
 use redsuite_core::{
-    assert::poll_until,
-    host, prep,
+    check, check_eq, host, prep,
     profile::select as select_profile,
     report,
     runner::{drive, RunConfig, RunOutcome},
@@ -186,10 +185,14 @@ impl Scenario for StorageProdsizeSustain {
             .await?;
             let cell_er = private.ctx();
             for pda in &pool {
-                poll_until(CLONE_TIMEOUT, || async {
-                    matches!(cell_er.account(pda).await, Ok(Some(acc)) if acc.data.len() == crate::ACCOUNT_SPACE as usize)
-                })
-                .await;
+                check::poll(
+                    &format!("the ER clones the delegated pda {pda}"),
+                    CLONE_TIMEOUT,
+                    || async {
+                        matches!(cell_er.account(pda).await, Ok(Some(acc)) if acc.data.len() == crate::ACCOUNT_SPACE as usize)
+                    },
+                )
+                .await?;
             }
             let senders: Vec<TxSender> = payers
                 .iter()
@@ -210,11 +213,12 @@ impl Scenario for StorageProdsizeSustain {
                 },
             )
             .await;
-            assert_eq!(
-                fill.failed, 0,
+            check_eq!(
+                fill.failed,
+                0,
                 "{cell_name}: fill deliveries failed: {:?}",
                 fill.first_error
-            );
+            )?;
             let fill_growth_bytes =
                 host::dir_size_bytes(private.storage_dir())?
                     .saturating_sub(storage_at_boot);
@@ -320,17 +324,19 @@ impl Scenario for StorageProdsizeSustain {
         }
 
         for cell in &cells {
-            assert!(
+            check!(
                 cell.fill_growth_bytes > 0,
                 "INVALID: {}: the fill phase did not grow the storage",
                 cell.name
-            );
+            )?;
             for window in &cell.windows {
-                assert_eq!(
-                    window.outcome.failed, 0,
+                check_eq!(
+                    window.outcome.failed,
+                    0,
                     "{}: measured deliveries failed: {:?}",
-                    cell.name, window.outcome.first_error
-                );
+                    cell.name,
+                    window.outcome.first_error
+                )?;
             }
             let p50_a = cell.windows[0].outcome.delivery.median.max(1) as f64;
             let p50_b = cell.windows[1].outcome.delivery.median as f64;

@@ -9,8 +9,7 @@ use instruction::Instruction;
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    assert::poll_until,
-    host, prep,
+    check, check_eq, host, prep,
     profile::select as select_profile,
     runner::{drive, drive_until, RunConfig, RunOutcome},
     topology::{self, RestartConfig, RestartTiming},
@@ -321,10 +320,14 @@ impl Scenario for RestartUnderLoad {
         )
         .await?;
         for pda in &pool {
-            poll_until(CLONE_TIMEOUT, || async {
-                matches!(cell_er.account(pda).await, Ok(Some(acc)) if acc.data.len() == crate::ACCOUNT_SPACE as usize)
-            })
-            .await;
+            check::poll(
+                &format!("the ER clones the delegated pda {pda}"),
+                CLONE_TIMEOUT,
+                || async {
+                    matches!(cell_er.account(pda).await, Ok(Some(acc)) if acc.data.len() == crate::ACCOUNT_SPACE as usize)
+                },
+            )
+            .await?;
         }
         let pool = Rc::new(pool);
 
@@ -349,11 +352,12 @@ impl Scenario for RestartUnderLoad {
             },
         )
         .await;
-        assert_eq!(
-            fill.failed, 0,
+        check_eq!(
+            fill.failed,
+            0,
             "fill deliveries failed: {:?}",
             fill.first_error
-        );
+        )?;
         let db_size_at_restart = host::dir_size_bytes(private.storage_dir())?;
         let fill_growth = db_size_at_restart.saturating_sub(storage_at_boot);
 
@@ -387,37 +391,37 @@ impl Scenario for RestartUnderLoad {
         )
         .await?;
 
-        assert!(
+        check!(
             fill_growth > 0,
             "INVALID: the fill phase did not grow the on-disk database"
-        );
-        assert!(
+        )?;
+        check!(
             graceful.load.delivered > 0,
             "INVALID: no load was delivered before the graceful restart"
-        );
+        )?;
         if let (Some(before), Some(after)) =
             (graceful.timing.slot_before, graceful.timing.slot_after)
         {
-            assert!(
+            check!(
                 after >= before / 2,
                 "INVALID: post-restart slot {after} collapsed from {before} — \
                  the ER did not reopen its database"
-            );
+            )?;
         }
 
-        assert!(
+        check!(
             !graceful.timing.needed_sigkill,
             "graceful restart: the ER did not exit on SIGTERM within the grace \
              window and had to be SIGKILLed"
-        );
-        assert_eq!(
+        )?;
+        check_eq!(
             graceful.timing.exit_code,
             Some(0),
             "graceful restart: SIGTERM did not produce a clean exit \
              (code {:?}, signal {:?})",
             graceful.timing.exit_code,
             graceful.timing.exit_signal,
-        );
+        )?;
 
         let mut report = ScenarioReport::ok(self.name())
             .setting("profile", profile.name)

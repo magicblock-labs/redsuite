@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use pubkey::Pubkey;
 use redshift_program::flexi::{build, FlexiCounter};
 use redsuite_core::{
-    assert::poll_until, dlp, prep, system, topology, BaseCtx, ChainCtx, ErCtx,
+    check, check_eq, dlp, prep, system, topology, BaseCtx, ChainCtx, ErCtx,
     PrivateErScenario, Result, ScenarioReport,
 };
 use signer::Signer;
@@ -69,25 +69,29 @@ async fn alt_transactions_since(
 }
 
 async fn await_program_clone(er: &ErCtx, program: &Pubkey) -> Result<()> {
-    poll_until(PROGRAM_CLONE_TIMEOUT, || async {
-        matches!(er.account(program).await, Ok(Some(clone)) if clone.executable)
-    })
-    .await;
+    check::poll(
+        &format!("the er clones the program {program} as executable"),
+        PROGRAM_CLONE_TIMEOUT,
+        || async {
+            matches!(er.account(program).await, Ok(Some(clone)) if clone.executable)
+        },
+    )
+    .await?;
     Ok(())
 }
 
 async fn assert_program_blocked(er: &ErCtx, program: &Pubkey) -> Result<()> {
     let first = er.account(program).await?;
-    assert!(
+    check!(
         first.is_none(),
         "the blocked program must not be on the er before the settle"
-    );
+    )?;
     tokio::time::sleep(BLOCKED_SETTLE).await;
     let second = er.account(program).await?;
-    assert!(
+    check!(
         second.is_none(),
         "the restricted er must not clone the blocked program"
-    );
+    )?;
     Ok(())
 }
 
@@ -127,11 +131,11 @@ async fn delegate_and_clone_counter(
         .account(&counter)
         .await?
         .ok_or("the counter clone is missing on the er after the add")?;
-    assert_eq!(
+    check_eq!(
         FlexiCounter::try_decode(&clone.data)?.count,
         1,
         "the er clone must show the add"
-    );
+    )?;
     Ok(counter)
 }
 
@@ -179,11 +183,11 @@ impl PrivateErScenario for ConfigGates {
 
         let after_start =
             alt_transactions_since(base, &open_pubkey, &baseline).await?;
-        assert!(
+        check!(
             after_start.is_empty(),
             "the er start must not send lookup table transactions on base, \
              got {after_start:?}"
-        );
+        )?;
 
         await_program_clone(open.ctx(), &allowed).await?;
         await_program_clone(open.ctx(), &blocked).await?;
@@ -193,11 +197,11 @@ impl PrivateErScenario for ConfigGates {
         tokio::time::sleep(ALT_SETTLE).await;
         let after_clone =
             alt_transactions_since(base, &open_pubkey, &baseline).await?;
-        assert!(
+        check!(
             after_clone.is_empty(),
             "cloning must not send lookup table transactions on base, got \
              {after_clone:?}"
-        );
+        )?;
         open.finish().await?;
 
         let recent_slot = base.api().get_slot().await?;
@@ -206,12 +210,12 @@ impl PrivateErScenario for ConfigGates {
         base.send(&open_identity, &[create_ix]).await?;
         let control =
             alt_transactions_since(base, &open_pubkey, &baseline).await?;
-        assert_eq!(
+        check_eq!(
             control.len(),
             1,
             "the lookup table detector must see the one table this identity \
              created, got {control:?}"
-        );
+        )?;
 
         Ok(ScenarioReport::ok(self.name())
             .setting("allowed program", allowed)

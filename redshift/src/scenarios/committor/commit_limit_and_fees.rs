@@ -8,10 +8,9 @@ use redshift_program::schedulecommit::{
     build, order_book_view, ScheduleCommitType,
 };
 use redsuite_core::{
-    assert::poll_until,
-    dlp, prep,
+    check, check_eq, dlp, prep,
     receipt::{COMMIT_LIMIT_ERR, INTENT_TOO_LARGE_ERR, SPONSORED_COMMIT_LIMIT},
-    BaseCtx, ChainCtx, ErCtx, Result, Scenario, ScenarioReport,
+    BaseCtx, ChainCtx, CheckError, ErCtx, Result, Scenario, ScenarioReport,
 };
 use signer::Signer;
 
@@ -38,12 +37,15 @@ fn assert_error_code(
     code: u32,
     context: &str,
 ) -> Result<()> {
-    assert!(attempt.is_err(), "{context} must fail");
+    check!(attempt.is_err(), "{context} must fail")?;
     let text = format!("{:?}", attempt.unwrap_err());
     if !text.contains(&code.to_string()) {
-        return Err(
-            format!("{context}: expected Custom({code}), got {text}").into()
-        );
+        return Err(CheckError::new(format!(
+            "{context} is refused with the expected code"
+        ))
+        .expected(format!("Custom({code})"))
+        .actual(text)
+        .into());
     }
     Ok(())
 }
@@ -57,7 +59,7 @@ async fn test_sponsored_quota(base: &BaseCtx, er: &ErCtx) -> Result<()> {
     let committees =
         crate::init_schedulecommit_committees(base, &payer, er.identity(), 2)
             .await?;
-    crate::await_committee_clones(er, &committees).await;
+    crate::await_committee_clones(er, &committees).await?;
     let players: Vec<_> =
         committees.iter().map(|c| c.player.pubkey()).collect();
     let pdas: Vec<_> = committees.iter().map(|c| c.pda).collect();
@@ -117,13 +119,17 @@ async fn test_sponsored_quota(base: &BaseCtx, er: &ErCtx) -> Result<()> {
         .await?;
     crate::assert_commit_receipt(base, er, &signature, &[pdas[1]], true)
         .await?;
-    poll_until(BASE_STATE_TIMEOUT, || async {
-        matches!(
-            base.account(&pdas[1]).await,
-            Ok(Some(acc)) if acc.owner == redshift_program::id()
-        )
-    })
-    .await;
+    check::poll(
+        "the undelegated committee returns to its program owner on base",
+        BASE_STATE_TIMEOUT,
+        || async {
+            matches!(
+                base.account(&pdas[1]).await,
+                Ok(Some(acc)) if acc.owner == redshift_program::id()
+            )
+        },
+    )
+    .await?;
     Ok(())
 }
 
@@ -137,15 +143,15 @@ async fn test_fee_vault_quota(base: &BaseCtx, er: &ErCtx) -> Result<()> {
     )
     .await?;
     let vault = dlp::magic_fee_vault_pda(&er.identity());
-    assert!(
+    check!(
         er.account(&vault).await?.is_some(),
         "the magic fee vault for the booted er identity must exist"
-    );
+    )?;
 
     let vault_committees =
         crate::init_schedulecommit_committees(base, &payer, er.identity(), 3)
             .await?;
-    crate::await_committee_clones(er, &vault_committees).await;
+    crate::await_committee_clones(er, &vault_committees).await?;
     let missing_vault = &vault_committees[0];
     let within_limit = &vault_committees[1];
     let charged = &vault_committees[2];
@@ -186,16 +192,16 @@ async fn test_fee_vault_quota(base: &BaseCtx, er: &ErCtx) -> Result<()> {
             )],
         )
         .await;
-    assert!(
+    check!(
         vault_absent.is_err(),
         "an escrowed payer without the fee vault must fail"
-    );
+    )?;
     let vault_absent_error = format!("{:?}", vault_absent.unwrap_err());
-    assert!(
+    check!(
         vault_absent_error.contains("MissingAccount"),
         "expected MissingAccount for the vault-absent commit, got \
          {vault_absent_error}"
-    );
+    )?;
 
     let payer_before = er_balance(er, &vault_payer.pubkey()).await?;
     let vault_before = er_balance(er, &vault).await?;
@@ -218,16 +224,16 @@ async fn test_fee_vault_quota(base: &BaseCtx, er: &ErCtx) -> Result<()> {
         false,
     )
     .await?;
-    assert_eq!(
+    check_eq!(
         er_balance(er, &vault_payer.pubkey()).await?,
         payer_before,
         "the payer balance must not change within the actual commit limit"
-    );
-    assert_eq!(
+    )?;
+    check_eq!(
         er_balance(er, &vault).await?,
         vault_before,
         "the vault balance must not change within the actual commit limit"
-    );
+    )?;
 
     let payer_before = er_balance(er, &vault_payer.pubkey()).await?;
     let vault_before = er_balance(er, &vault).await?;
@@ -244,17 +250,17 @@ async fn test_fee_vault_quota(base: &BaseCtx, er: &ErCtx) -> Result<()> {
         .await?;
     crate::assert_commit_receipt(base, er, &signature, &[charged.pda], false)
         .await?;
-    assert_eq!(
+    check_eq!(
         er_balance(er, &vault_payer.pubkey()).await?,
         payer_before - COMMIT_FEE_LAMPORTS,
         "the payer must pay the commit fee past the actual commit limit"
-    );
-    assert_eq!(
+    )?;
+    check_eq!(
         er_balance(er, &vault).await?,
         vault_before + COMMIT_FEE_LAMPORTS,
         "the vault must receive the commit fee past the actual commit \
          limit"
-    );
+    )?;
 
     let manager = Keypair::new();
     let (init_book, book) =
@@ -276,23 +282,27 @@ async fn test_fee_vault_quota(base: &BaseCtx, er: &ErCtx) -> Result<()> {
         .await?;
     crate::assert_commit_receipt(base, er, &signature, &[charged.pda], false)
         .await?;
-    assert_eq!(
+    check_eq!(
         er_balance(er, &vault_payer.pubkey()).await?,
         payer_before - COMMIT_FEE_LAMPORTS - ACTION_FEE_LAMPORTS,
         "the payer must pay the commit fee and the action fee"
-    );
-    assert_eq!(
+    )?;
+    check_eq!(
         er_balance(er, &vault).await?,
         vault_before + COMMIT_FEE_LAMPORTS + ACTION_FEE_LAMPORTS,
         "the vault must receive the commit fee and the action fee"
-    );
-    poll_until(ACTION_TIMEOUT, || async {
-        matches!(
-            base.api().get_signatures_for_address(&book, 5).await,
-            Ok(sigs) if sigs.len() >= 2
-        )
-    })
-    .await;
+    )?;
+    check::poll(
+        "the post-commit action transaction reaches the order book on base",
+        ACTION_TIMEOUT,
+        || async {
+            matches!(
+                base.api().get_signatures_for_address(&book, 5).await,
+                Ok(sigs) if sigs.len() >= 2
+            )
+        },
+    )
+    .await?;
     let book_signatures =
         base.api().get_signatures_for_address(&book, 5).await?;
     let action_signature: signature::Signature = book_signatures[0].parse()?;
@@ -300,33 +310,33 @@ async fn test_fee_vault_quota(base: &BaseCtx, er: &ErCtx) -> Result<()> {
         .api()
         .await_transaction(&action_signature, ACTION_TIMEOUT)
         .await?;
-    assert!(
+    check!(
         action_tx.err.is_some(),
         "the order book action tx must fail on base (the call-handler \
          convention signs the escrow LAST while the handler wants a \
          signer FIRST)"
-    );
+    )?;
     let action_logs = action_tx.logs.join("\n");
-    assert!(
+    check!(
         action_logs.contains("missing required signature"),
         "the action must fail on the handler signer check, got: \
          {action_logs}"
-    );
+    )?;
     let book_on_base = base
         .account(&book)
         .await?
         .ok_or("the order book is not on base after the action")?;
-    assert_eq!(
+    check_eq!(
         book_on_base.owner,
         redshift_program::id(),
         "the post-commit action target stays a plain chain account"
-    );
+    )?;
     let (bids, asks) = order_book_view(&book_on_base.data)
         .ok_or("the order book data is not valid")?;
-    assert!(
+    check!(
         bids.is_empty() && asks.is_empty(),
         "the refused action must not change the order book"
-    );
+    )?;
     Ok(())
 }
 
@@ -339,7 +349,7 @@ async fn test_size_budget_limits(base: &BaseCtx, er: &ErCtx) -> Result<()> {
         FITTING_ACCOUNTS,
     )
     .await?;
-    crate::await_committee_clones(er, &fitting).await;
+    crate::await_committee_clones(er, &fitting).await?;
     let fitting_players: Vec<_> =
         fitting.iter().map(|c| c.player.pubkey()).collect();
     let fitting_pdas: Vec<_> = fitting.iter().map(|c| c.pda).collect();
@@ -359,13 +369,17 @@ async fn test_size_budget_limits(base: &BaseCtx, er: &ErCtx) -> Result<()> {
     crate::assert_commit_receipt(base, er, &signature, &fitting_pdas, true)
         .await?;
     for pda in &fitting_pdas {
-        poll_until(BASE_STATE_TIMEOUT, || async {
-            matches!(
-                base.account(pda).await,
-                Ok(Some(acc)) if acc.owner == redshift_program::id()
-            )
-        })
-        .await;
+        check::poll(
+            &format!("{pda} returns to its program owner on base"),
+            BASE_STATE_TIMEOUT,
+            || async {
+                matches!(
+                    base.account(pda).await,
+                    Ok(Some(acc)) if acc.owner == redshift_program::id()
+                )
+            },
+        )
+        .await?;
     }
 
     let refused = crate::init_schedulecommit_committees(
@@ -375,7 +389,7 @@ async fn test_size_budget_limits(base: &BaseCtx, er: &ErCtx) -> Result<()> {
         REFUSED_ACCOUNTS,
     )
     .await?;
-    crate::await_committee_clones(er, &refused).await;
+    crate::await_committee_clones(er, &refused).await?;
     let refused_players: Vec<_> =
         refused.iter().map(|c| c.player.pubkey()).collect();
     let too_large = er

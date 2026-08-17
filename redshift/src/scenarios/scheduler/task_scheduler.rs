@@ -11,7 +11,7 @@ use redshift_program::{
     },
 };
 use redsuite_core::{
-    assert::poll_until, dlp, prep, system, topology, BaseCtx, ChainCtx, ErCtx,
+    check, check_eq, dlp, prep, system, topology, BaseCtx, ChainCtx, ErCtx,
     PrivateErScenario, Result, ScenarioReport,
 };
 use rusqlite::Connection;
@@ -136,13 +136,17 @@ async fn scheduled_actor(
     ];
     base.send_with(funder, &[&payer], &delegate_setup).await?;
 
-    poll_until(CLONE_TIMEOUT, || async {
-        matches!(
-            er.account(&counter).await,
-            Ok(Some(clone)) if !clone.data.is_empty()
-        )
-    })
-    .await;
+    check::poll(
+        "the er clones the scheduled actor's counter",
+        CLONE_TIMEOUT,
+        || async {
+            matches!(
+                er.account(&counter).await,
+                Ok(Some(clone)) if !clone.data.is_empty()
+            )
+        },
+    )
+    .await?;
     Ok(Actor { payer, counter })
 }
 
@@ -159,18 +163,24 @@ async fn await_er_count(
     actor: &Actor,
     expected: u64,
 ) -> Result<()> {
-    poll_until(COUNTER_TIMEOUT, || async {
-        matches!(er_count(er, actor).await, Ok(count) if count == expected)
-    })
-    .await;
+    check::poll(
+        &format!("the er counter reaches {expected}"),
+        COUNTER_TIMEOUT,
+        || async {
+            matches!(er_count(er, actor).await, Ok(count) if count == expected)
+        },
+    )
+    .await?;
     Ok(())
 }
 
 async fn await_task_removed(db: &TaskDb, task_id: i64) -> Result<()> {
-    poll_until(TASK_REMOVED_TIMEOUT, || async {
-        matches!(db.task(task_id), Ok(None))
-    })
-    .await;
+    check::poll(
+        &format!("task {task_id} is removed from the scheduler db"),
+        TASK_REMOVED_TIMEOUT,
+        || async { matches!(db.task(task_id), Ok(None)) },
+    )
+    .await?;
     Ok(())
 }
 
@@ -181,16 +191,16 @@ fn assert_no_failures_for_task(
 ) -> Result<()> {
     let failed_tasks = db.failed_tasks()?;
     let failed_schedulings = db.failed_schedulings()?;
-    assert!(
+    check!(
         !failed_tasks.iter().any(|(id, _)| *id == Some(task_id)),
         "{context}: task {task_id} must not produce failed_tasks"
-    );
-    assert!(
+    )?;
+    check!(
         !failed_schedulings
             .iter()
             .any(|(id, _)| *id == Some(task_id)),
         "{context}: task {task_id} must not produce failed_schedulings"
-    );
+    )?;
     Ok(())
 }
 
@@ -286,15 +296,15 @@ async fn test_signed_refusal(
             )],
         )
         .await;
-    assert!(
+    check!(
         attempt.is_err(),
         "a task instruction with a payer signer must be refused"
-    );
+    )?;
     let signed_error = format!("{:?}", attempt.unwrap_err());
-    assert!(
+    check!(
         signed_error.contains("MissingRequiredSignature"),
         "the refusal must name MissingRequiredSignature, got {signed_error}"
-    );
+    )?;
     Ok(signed_error)
 }
 
@@ -334,7 +344,7 @@ async fn test_magic_cpi_crank(
     let committees =
         crate::init_schedulecommit_committees(base, funder, er.identity(), 1)
             .await?;
-    crate::await_committee_clones(er, &committees).await;
+    crate::await_committee_clones(er, &committees).await?;
     let player = committees[0].player.pubkey();
     let committee = committees[0].pda;
 
@@ -360,16 +370,20 @@ async fn test_magic_cpi_crank(
         )],
     )
     .await?;
-    poll_until(COMMIT_TIMEOUT, || async {
-        matches!(
-            base.account(&committee).await,
-            Ok(Some(acc))
-                if MainAccount::try_from_slice(&acc.data)
-                    .map(|state| state.count)
-                    .ok() == Some(1)
-        )
-    })
-    .await;
+    check::poll(
+        "the crank-driven commit lands the count on base",
+        COMMIT_TIMEOUT,
+        || async {
+            matches!(
+                base.account(&committee).await,
+                Ok(Some(acc))
+                    if MainAccount::try_from_slice(&acc.data)
+                        .map(|state| state.count)
+                        .ok() == Some(1)
+            )
+        },
+    )
+    .await?;
     Ok(())
 }
 
@@ -407,39 +421,44 @@ async fn test_unauthorized_reschedule(
     )
     .await?;
 
-    poll_until(FAILED_SCHEDULING_TIMEOUT, || async {
-        matches!(
-            db.failed_schedulings(),
-            Ok(rows) if rows.iter().any(|(id, _)| *id == Some(106))
-        )
-    })
-    .await;
+    check::poll(
+        "a failed_scheduling row appears for task 106",
+        FAILED_SCHEDULING_TIMEOUT,
+        || async {
+            matches!(
+                db.failed_schedulings(),
+                Ok(rows) if rows.iter().any(|(id, _)| *id == Some(106))
+            )
+        },
+    )
+    .await?;
     let rows = db.failed_schedulings()?;
     let (_, error) = rows
         .into_iter()
         .find(|(id, _)| *id == Some(106))
         .ok_or("no failed scheduling row for task 106")?;
-    assert!(
+    check!(
         error.contains("UnauthorizedReplacing"),
         "the refusal must name UnauthorizedReplacing, got {error}"
-    );
+    )?;
 
     let task = db
         .task(106)?
         .ok_or("the original task is gone after the reschedule")?;
-    assert_eq!(
+    check_eq!(
         task.authority,
         owner.pubkey().to_string(),
         "the original authority must keep the task"
-    );
-    assert_eq!(
-        task.execution_interval_millis, TASK_INTERVAL_MS,
+    )?;
+    check_eq!(
+        task.execution_interval_millis,
+        TASK_INTERVAL_MS,
         "the original interval must survive the reschedule"
-    );
-    assert!(
+    )?;
+    check!(
         task.executions_left > 0,
         "the original task must keep executions"
-    );
+    )?;
 
     er.send(
         &owner.payer,
@@ -469,24 +488,28 @@ async fn test_schedule_error(
         )],
     )
     .await?;
-    poll_until(FAILED_TASK_TIMEOUT, || async {
-        matches!(
-            db.failed_tasks(),
-            Ok(rows) if rows.iter().any(|(id, _)| *id == Some(107))
-        )
-    })
-    .await;
+    check::poll(
+        "a failed_tasks row appears for task 107",
+        FAILED_TASK_TIMEOUT,
+        || async {
+            matches!(
+                db.failed_tasks(),
+                Ok(rows) if rows.iter().any(|(id, _)| *id == Some(107))
+            )
+        },
+    )
+    .await?;
     let rows = db.failed_tasks()?;
     let (_, error) = rows
         .into_iter()
         .find(|(id, _)| *id == Some(107))
         .ok_or("no failed task row for task 107")?;
     await_task_removed(db, 107).await?;
-    assert_eq!(
+    check_eq!(
         er_count(er, &actor).await?,
         0,
         "a failing task must not move the counter"
-    );
+    )?;
     er.send(
         &actor.payer,
         &[flexi::cancel_counter_task(actor.pubkey(), 107)],
@@ -515,10 +538,14 @@ async fn test_cancel_ongoing(
         )],
     )
     .await?;
-    poll_until(COUNTER_TIMEOUT, || async {
-        matches!(er_count(er, &actor).await, Ok(count) if count > 0)
-    })
-    .await;
+    check::poll(
+        "the ongoing task advances the counter",
+        COUNTER_TIMEOUT,
+        || async {
+            matches!(er_count(er, &actor).await, Ok(count) if count > 0)
+        },
+    )
+    .await?;
     er.send(
         &actor.payer,
         &[flexi::cancel_counter_task(actor.pubkey(), 108)],
@@ -528,17 +555,17 @@ async fn test_cancel_ongoing(
     assert_no_failures_for_task(db, 108, "cancel-ongoing")?;
     tokio::time::sleep(SCHEDULE_SETTLE).await;
     let count_at_cancel = er_count(er, &actor).await?;
-    assert!(
+    check!(
         count_at_cancel > 0 && count_at_cancel < ITERATIONS as u64,
         "a cancelled ongoing task must have run partway, got \
          {count_at_cancel} of {ITERATIONS}"
-    );
+    )?;
     tokio::time::sleep(3 * SCHEDULE_SETTLE).await;
-    assert_eq!(
+    check_eq!(
         er_count(er, &actor).await?,
         count_at_cancel,
         "the counter must not advance after the cancelled task is removed"
-    );
+    )?;
     Ok(count_at_cancel)
 }
 
@@ -568,7 +595,10 @@ impl PrivateErScenario for TaskScheduler {
         };
         let funder = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
 
-        poll_until(DB_OPEN_TIMEOUT, || async { db.task_ids().is_ok() }).await;
+        check::poll("the task scheduler db opens", DB_OPEN_TIMEOUT, || async {
+            db.task_ids().is_ok()
+        })
+        .await?;
 
         let (
             _,
@@ -590,13 +620,17 @@ impl PrivateErScenario for TaskScheduler {
             test_cancel_ongoing(base, er, &funder, &db),
         )?;
 
-        poll_until(TASK_REMOVED_TIMEOUT, || async {
-            matches!(
-                db.task_ids(),
-                Ok(ids) if ids.iter().all(|id| !(101..=108).contains(id))
-            )
-        })
-        .await;
+        check::poll(
+            "all scenario task ids leave the scheduler db",
+            TASK_REMOVED_TIMEOUT,
+            || async {
+                matches!(
+                    db.task_ids(),
+                    Ok(ids) if ids.iter().all(|id| !(101..=108).contains(id))
+                )
+            },
+        )
+        .await?;
 
         Ok(ScenarioReport::ok(self.name())
             .setting("signed task refusal", signed_error)

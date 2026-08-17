@@ -9,14 +9,13 @@ use async_trait::async_trait;
 use pubkey::Pubkey;
 use redsuite_core::{
     api::custom_error_code,
-    assert::poll_until,
-    prep,
+    check, check_eq, prep,
     profile::select as select_profile,
     receipt, report,
     runner::{drive, RunConfig},
     stats::StreamingStats,
-    topology, Api, BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario,
-    ScenarioReport,
+    topology, Api, BaseCtx, ChainCtx, CheckError, ErCtx, MetricsDelta, Result,
+    Scenario, ScenarioReport,
 };
 use signer::Signer;
 
@@ -119,10 +118,10 @@ async fn scheduling_outcome(
             }
         }
         if tokio::time::Instant::now() >= deadline {
-            return Err(format!(
+            return Err(CheckError::new(format!(
                 "no status for the probe commit {commit_signature} within \
                  {timeout:?}"
-            )
+            ))
             .into());
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -213,10 +212,14 @@ impl Scenario for CommitWidthEnvelope {
         )
         .await?;
         for pda in &pdas {
-            poll_until(CLONE_TIMEOUT, || async {
-                matches!(er.account(pda).await, Ok(Some(acc)) if acc.data.len() == ACCOUNT_SPACE as usize)
-            })
-            .await;
+            check::poll(
+                &format!("the ER clones the delegated pda {pda}"),
+                CLONE_TIMEOUT,
+                || async {
+                    matches!(er.account(pda).await, Ok(Some(acc)) if acc.data.len() == ACCOUNT_SPACE as usize)
+                },
+            )
+            .await?;
         }
         let sender = er.sender(Rc::new(payer));
 
@@ -252,9 +255,10 @@ impl Scenario for CommitWidthEnvelope {
                         )
                         .await?;
                         if let Some(message) = &commit_receipt.error_message {
-                            return Err(format!(
-                                "commit {id} intent failed: {message}"
-                            )
+                            return Err(CheckError::new(format!(
+                                "commit {id} intent succeeds"
+                            ))
+                            .actual(message)
                             .into());
                         }
                         let round_trip_us =
@@ -298,11 +302,12 @@ impl Scenario for CommitWidthEnvelope {
             )
             .await;
             offset += WARMUP_COMMITS;
-            assert_eq!(
-                warmup.failed, 0,
+            check_eq!(
+                warmup.failed,
+                0,
                 "w{width} warmup commits failed: {:?}",
                 warmup.first_error
-            );
+            )?;
             // post-apply buffer closes can trail the receipt — let warmup
             // stragglers land before the base-flow snapshot
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -320,11 +325,12 @@ impl Scenario for CommitWidthEnvelope {
             )
             .await;
             offset += profile.commits;
-            assert_eq!(
-                outcome.failed, 0,
+            check_eq!(
+                outcome.failed,
+                0,
                 "w{width} commits failed: {:?}",
                 outcome.first_error
-            );
+            )?;
             tokio::time::sleep(Duration::from_secs(1)).await;
             let after = er.scrape_metrics().await?;
             let flow_after = snapshot_base_flow(base.api()).await?;
@@ -332,20 +338,21 @@ impl Scenario for CommitWidthEnvelope {
 
             if let Some(intents) = delta.counter("mbv_committor_intents_count")
             {
-                assert!(
+                check!(
                     intents >= profile.commits as f64,
                     "w{width}: only {intents} intents in the measured window, \
                      expected at least {}",
                     profile.commits
-                );
+                )?;
             }
             let failed_intents = delta
                 .counter_all("mbv_committor_failed_intents_count")
                 .unwrap_or(0.0);
-            assert_eq!(
-                failed_intents, 0.0,
+            check_eq!(
+                failed_intents,
+                0.0,
                 "w{width}: {failed_intents} intents failed"
-            );
+            )?;
             let alt_tables_used = delta
                 .counter("mbv_committor_intent_alt_count_sum")
                 .unwrap_or(0.0);
@@ -353,37 +360,41 @@ impl Scenario for CommitWidthEnvelope {
             let backlog = delta
                 .gauge("mbv_committor_intent_backlog_count")
                 .unwrap_or(0.0);
-            assert_eq!(
-                backlog, 0.0,
+            check_eq!(
+                backlog,
+                0.0,
                 "w{width}: intent backlog not drained at window close"
-            );
+            )?;
 
             let tally = Rc::try_unwrap(tally)
                 .unwrap_or_else(|_| panic!("commit tasks still hold the tally"))
                 .into_inner();
-            assert_eq!(
-                tally.included_mismatch, 0,
+            check_eq!(
+                tally.included_mismatch,
+                0,
                 "w{width}: receipts listed unexpected committed accounts"
-            );
+            )?;
             let own_alt_txs =
                 own_lookup_table_txs(base.api(), &tally.base_txs).await?;
-            assert_eq!(
-                own_alt_txs, 0,
+            check_eq!(
+                own_alt_txs,
+                0,
                 "w{width}: own commit txs must stay on the no-LUT path"
-            );
+            )?;
             let round_trip = tally.round_trip.finalize(false);
             let er_delivery = tally.er_delivery.finalize(false);
-            assert_eq!(
-                round_trip.count, profile.commits as usize,
+            check_eq!(
+                round_trip.count,
+                profile.commits as usize,
                 "w{width}: not every commit produced a receipt round-trip"
-            );
+            )?;
 
             let receipt_txs_per_commit =
                 tally.base_signatures as f64 / profile.commits as f64;
-            assert!(
+            check!(
                 receipt_txs_per_commit >= 1.0,
                 "w{width}: commits averaged fewer than one base tx"
-            );
+            )?;
             let flow_txs_per_commit = flow_after.new_flow_since(&flow_before)
                 as f64
                 / profile.commits as f64;
@@ -473,12 +484,12 @@ impl Scenario for CommitWidthEnvelope {
                 .await?
                 {
                     SchedulingOutcome::Rejected(code) => {
-                        assert_eq!(
+                        check_eq!(
                             code,
                             Some(receipt::INTENT_TOO_LARGE_ERR),
                             "the width-15 probe was rejected with an \
                              unexpected code"
-                        );
+                        )?;
                         eprintln!(
                             "[redsuite] {}: probe w15: refused at scheduling \
                              (intent size gate)",
@@ -498,9 +509,10 @@ impl Scenario for CommitWidthEnvelope {
                         )
                         .await?;
                         if let Some(message) = &alt_receipt.error_message {
-                            return Err(format!(
-                                "width-15 probe intent failed: {message}"
+                            return Err(CheckError::new(
+                                "the width-15 probe intent succeeds",
                             )
+                            .actual(message)
                             .into());
                         }
                         receipt::confirm_base_signatures(
@@ -522,11 +534,11 @@ impl Scenario for CommitWidthEnvelope {
                             &alt_receipt.base_signatures,
                         )
                         .await?;
-                        assert!(
+                        check!(
                             own_alt_txs >= 1,
                             "the width-15 commit's own base txs must load a \
                              lookup table"
-                        );
+                        )?;
                         eprintln!(
                             "[redsuite] {}: probe w15: {:.1} s, {} flow + {} alt base txs",
                             self.name(),
@@ -582,12 +594,12 @@ impl Scenario for CommitWidthEnvelope {
                 .await?
                 {
                     SchedulingOutcome::Rejected(code) => {
-                        assert_eq!(
+                        check_eq!(
                             code,
                             Some(receipt::INTENT_TOO_LARGE_ERR),
                             "the width-30 probe was rejected with an \
                              unexpected code"
-                        );
+                        )?;
                         "refused at scheduling (intent size gate)".to_owned()
                     }
                     SchedulingOutcome::Confirmed => {
@@ -610,17 +622,17 @@ impl Scenario for CommitWidthEnvelope {
                         ));
                         match receipt_outcome {
                             Ok(fit_receipt) => {
-                                assert!(
+                                check!(
                                     !fit_receipt.succeeded(),
                                     "a width-30 commit must exceed the fit \
                                      envelope, but the intent succeeded"
-                                );
-                                assert_eq!(
+                                )?;
+                                check_eq!(
                                     fit_receipt.receipt_err_code,
                                     Some(receipt::INTENT_FAILED_CODE),
                                     "width-30 receipt should err with the \
                                      intent-failed code"
-                                );
+                                )?;
                                 format!(
                                     "intent failed as expected: {}",
                                     fit_receipt
@@ -632,11 +644,11 @@ impl Scenario for CommitWidthEnvelope {
                             // the failed-intents counter must attest to the
                             // rejection
                             Err(fetch_error) => {
-                                assert!(
+                                check!(
                                     failed_intents >= 1.0,
                                     "width-30 probe: no failed receipt and \
                                      no failed-intent count ({fetch_error})"
-                                );
+                                )?;
                                 format!(
                                     "no receipt ({fetch_error}); \
                                      failed-intents delta {failed_intents}"
@@ -666,10 +678,14 @@ impl Scenario for CommitWidthEnvelope {
                 )
                 .await?;
                 let probe_account = probe_pdas[0];
-                poll_until(CLONE_TIMEOUT, || async {
-                    matches!(er.account(&probe_account).await, Ok(Some(acc)) if acc.data.len() == ACCOUNT_SPACE as usize)
-                })
-                .await;
+                check::poll(
+                    "the ER clones the commit-limit probe account",
+                    CLONE_TIMEOUT,
+                    || async {
+                        matches!(er.account(&probe_account).await, Ok(Some(acc)) if acc.data.len() == ACCOUNT_SPACE as usize)
+                    },
+                )
+                .await?;
                 let probe_sender = er.sender(Rc::new(probe_payer));
                 for commit_round in 1..=receipt::SPONSORED_COMMIT_LIMIT {
                     offset += 1;
@@ -686,11 +702,11 @@ impl Scenario for CommitWidthEnvelope {
                     )
                     .await?;
                     if let Some(message) = &limit_receipt.error_message {
-                        return Err(format!(
-                            "sponsored commit {commit_round}/{} failed \
-                             early: {message}",
+                        return Err(CheckError::new(format!(
+                            "sponsored commit {commit_round}/{} succeeds",
                             receipt::SPONSORED_COMMIT_LIMIT
-                        )
+                        ))
+                        .actual(message)
                         .into());
                     }
                 }
@@ -714,28 +730,28 @@ impl Scenario for CommitWidthEnvelope {
                             break custom_error_code(err);
                         }
                         if status.confirmed {
-                            return Err(format!(
+                            return Err(CheckError::new(format!(
                                 "commit {} past the sponsored allowance \
                                  unexpectedly succeeded",
                                 receipt::SPONSORED_COMMIT_LIMIT + 1
-                            )
+                            ))
                             .into());
                         }
                     }
                     if tokio::time::Instant::now() >= deadline {
-                        return Err(format!(
+                        return Err(CheckError::new(format!(
                             "no status for the over-limit commit within \
                              {REJECTION_TIMEOUT:?}"
-                        )
+                        ))
                         .into());
                     }
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 };
-                assert_eq!(
+                check_eq!(
                     rejection_code,
                     Some(receipt::COMMIT_LIMIT_ERR),
                     "expected the sponsored commit-limit rejection code"
-                );
+                )?;
                 let outcome_note = format!(
                     "commit {} rejected with 0x{:08X}",
                     receipt::SPONSORED_COMMIT_LIMIT + 1,

@@ -2,8 +2,8 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use redsuite_core::{
-    assert::poll_until, prep, receipt, BaseCtx, ChainCtx, ErCtx, Result,
-    Scenario, ScenarioReport,
+    check, check_eq, prep, receipt, BaseCtx, ChainCtx, CheckError, ErCtx,
+    Result, Scenario, ScenarioReport,
 };
 use signer::Signer;
 
@@ -40,14 +40,19 @@ impl Scenario for CommitRoundtrip {
         for pda in &accounts {
             let on_base =
                 base.account(pda).await?.ok_or("pda missing on base")?;
-            assert_eq!(
-                on_base.owner, DELEGATION_PROGRAM_ID,
+            check_eq!(
+                on_base.owner,
+                DELEGATION_PROGRAM_ID,
                 "a delegated pda must be dlp-owned on base"
-            );
-            poll_until(CLONE_TIMEOUT, || async {
-                matches!(er.account(pda).await, Ok(Some(clone)) if clone.data.len() == crate::ACCOUNT_SPACE as usize)
-            })
-            .await;
+            )?;
+            check::poll(
+                &format!("the ER clones the delegated pda {pda}"),
+                CLONE_TIMEOUT,
+                || async {
+                    matches!(er.account(pda).await, Ok(Some(clone)) if clone.data.len() == crate::ACCOUNT_SPACE as usize)
+                },
+            )
+            .await?;
         }
         let clone_visibility_ms = clone_started.elapsed().as_secs_f64() * 1e3;
 
@@ -58,15 +63,19 @@ impl Scenario for CommitRoundtrip {
             .await?
             .ok_or("er copy vanished after the write")?
             .data;
-        assert_eq!(crate::written_id(&committed_state), Some(FIRST_WRITE));
+        check_eq!(
+            crate::written_id(&committed_state),
+            Some(FIRST_WRITE),
+            "the er write must land before the commit"
+        )?;
         for pda in &accounts {
             let on_base = base.account(pda).await?.ok_or("pda gone on base")?;
-            assert!(
+            check!(
                 on_base.data[layout::DATA_OFFSET..]
                     .iter()
                     .all(|&byte| byte == 0),
                 "base copies must stay untouched before the commit"
-            );
+            )?;
         }
 
         let commit_started = Instant::now();
@@ -83,80 +92,80 @@ impl Scenario for CommitRoundtrip {
         )
         .await?;
         if let Some(message) = &commit_receipt.error_message {
-            return Err(format!("commit intent failed: {message}").into());
+            return Err(CheckError::new("the commit intent succeeds")
+                .actual(message)
+                .into());
         }
-        assert_eq!(
+        check_eq!(
             commit_receipt.included,
             vec![committed],
             "the receipt must list exactly the committed account"
-        );
-        assert!(
+        )?;
+        check!(
             commit_receipt.excluded.is_empty(),
             "nothing was eligible for exclusion"
-        );
-        assert!(
+        )?;
+        check!(
             !commit_receipt.requested_undelegation,
             "a plain commit must not request undelegation"
-        );
-        assert_eq!(
+        )?;
+        check_eq!(
             commit_receipt.payer,
             Some(payer.pubkey()),
             "the receipt must name the scheduling payer"
-        );
-        assert!(
+        )?;
+        check!(
             !commit_receipt.base_signatures.is_empty(),
             "a commit receipt must name at least one base tx"
-        );
+        )?;
         receipt::confirm_base_signatures(
             base.api(),
             &commit_receipt,
             BASE_CONFIRM_TIMEOUT,
         )
         .await?;
-        let state_deadline = tokio::time::Instant::now() + BASE_STATE_TIMEOUT;
-        loop {
-            let on_base = base.account(&committed).await?;
-            if matches!(&on_base, Some(acc) if acc.data == committed_state) {
-                break;
-            }
-            if tokio::time::Instant::now() >= state_deadline {
-                let observed = on_base
-                    .map(|acc| {
-                        format!(
-                            "owner {} data[..48] {:02x?}",
-                            acc.owner,
-                            &acc.data[..48.min(acc.data.len())]
-                        )
-                    })
-                    .unwrap_or_else(|| "absent".to_owned());
-                return Err(format!(
-                    "base state never matched; expected data[..48] {:02x?}, observed {observed}",
-                    &committed_state[..48]
-                )
-                .into());
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
+        check::poll_for(
+            "the committed base copy matches the er snapshot",
+            BASE_STATE_TIMEOUT,
+            || async {
+                match base.account(&committed).await {
+                    Ok(Some(acc)) if acc.data == committed_state => Ok(()),
+                    Ok(Some(acc)) => Err(format!(
+                        "owner {} data[..48] {:02x?}",
+                        acc.owner,
+                        &acc.data[..48.min(acc.data.len())]
+                    )),
+                    Ok(None) => Err("absent".to_owned()),
+                    Err(error) => Err(format!("read failed: {error}")),
+                }
+            },
+        )
+        .await
+        .map_err(|error| {
+            error
+                .expected(format!("data[..48] {:02x?}", &committed_state[..48]))
+        })?;
         let commit_roundtrip_s = commit_started.elapsed().as_secs_f64();
 
         let committed_on_base = base
             .account(&committed)
             .await?
             .ok_or("committed pda gone on base")?;
-        assert_eq!(
-            committed_on_base.owner, DELEGATION_PROGRAM_ID,
+        check_eq!(
+            committed_on_base.owner,
+            DELEGATION_PROGRAM_ID,
             "a commit without undelegation must leave the pda delegated"
-        );
+        )?;
         let sibling_on_base = base
             .account(&sibling)
             .await?
             .ok_or("sibling pda gone on base")?;
-        assert!(
+        check!(
             sibling_on_base.data[layout::DATA_OFFSET..]
                 .iter()
                 .all(|&byte| byte == 0),
             "committing one account must not touch its sibling on base"
-        );
+        )?;
 
         er.send(&payer, &[build::simple_byte_set(SECOND_WRITE, &accounts)])
             .await?;
@@ -168,10 +177,11 @@ impl Scenario for CommitRoundtrip {
             .account(&sibling)
             .await?
             .ok_or("sibling er copy vanished before the undelegating commit")?;
-        assert_eq!(
+        check_eq!(
             crate::written_id(&committed_final.data),
-            Some(SECOND_WRITE)
-        );
+            Some(SECOND_WRITE),
+            "the second er write must land before the undelegating commit"
+        )?;
 
         let undelegate_started = Instant::now();
         let undelegate_signature = er
@@ -191,30 +201,33 @@ impl Scenario for CommitRoundtrip {
         )
         .await?;
         if let Some(message) = &undelegate_receipt.error_message {
-            return Err(
-                format!("commit-undelegate intent failed: {message}").into()
-            );
+            return Err(CheckError::new(
+                "the commit-undelegate intent succeeds",
+            )
+            .actual(message)
+            .into());
         }
         let mut included = undelegate_receipt.included.clone();
         included.sort();
         let mut expected = accounts.to_vec();
         expected.sort();
-        assert_eq!(
-            included, expected,
+        check_eq!(
+            included,
+            expected,
             "the receipt must list both undelegated accounts"
-        );
-        assert!(
+        )?;
+        check!(
             undelegate_receipt.excluded.is_empty(),
             "nothing was eligible for exclusion"
-        );
-        assert!(
+        )?;
+        check!(
             undelegate_receipt.requested_undelegation,
             "the receipt must record the undelegation request"
-        );
-        assert!(
+        )?;
+        check!(
             !undelegate_receipt.base_signatures.is_empty(),
             "an undelegating commit must name at least one base tx"
-        );
+        )?;
         receipt::confirm_base_signatures(
             base.api(),
             &undelegate_receipt,
@@ -225,51 +238,55 @@ impl Scenario for CommitRoundtrip {
         for (pda, expected) in
             [(committed, &committed_final), (sibling, &sibling_final)]
         {
-            let undelegate_deadline =
-                tokio::time::Instant::now() + UNDELEGATE_TIMEOUT;
-            loop {
-                let on_base = base.account(&pda).await?;
-                if matches!(
-                    &on_base,
-                    Some(acc) if acc.owner == crate::program::id()
-                        && acc.data == expected.data
-                        && acc.lamports == expected.lamports
-                ) {
-                    break;
-                }
-                if tokio::time::Instant::now() >= undelegate_deadline {
-                    let observed = on_base
-                        .map(|acc| {
-                            format!(
-                                "owner {} lamports {} data[..48] {:02x?}",
-                                acc.owner,
-                                acc.lamports,
-                                &acc.data[..48.min(acc.data.len())]
-                            )
-                        })
-                        .unwrap_or_else(|| "absent".to_owned());
-                    return Err(format!(
-                        "{pda} never undelegated on base with matching \
-                         owner/data/lamports; expected owner {} lamports {} \
-                         data[..48] {:02x?}, observed {observed}",
-                        crate::program::id(),
-                        expected.lamports,
-                        &expected.data[..48]
-                    )
-                    .into());
-                }
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
+            check::poll_for(
+                &format!(
+                    "{pda} undelegates on base with matching \
+                     owner/data/lamports"
+                ),
+                UNDELEGATE_TIMEOUT,
+                || async {
+                    match base.account(&pda).await {
+                        Ok(Some(acc))
+                            if acc.owner == crate::program::id()
+                                && acc.data == expected.data
+                                && acc.lamports == expected.lamports =>
+                        {
+                            Ok(())
+                        }
+                        Ok(Some(acc)) => Err(format!(
+                            "owner {} lamports {} data[..48] {:02x?}",
+                            acc.owner,
+                            acc.lamports,
+                            &acc.data[..48.min(acc.data.len())]
+                        )),
+                        Ok(None) => Err("absent".to_owned()),
+                        Err(error) => Err(format!("read failed: {error}")),
+                    }
+                },
+            )
+            .await
+            .map_err(|error| {
+                error.expected(format!(
+                    "owner {} lamports {} data[..48] {:02x?}",
+                    crate::program::id(),
+                    expected.lamports,
+                    &expected.data[..48]
+                ))
+            })?;
         }
         let undelegate_roundtrip_s = undelegate_started.elapsed().as_secs_f64();
 
-        poll_until(UNDELEGATE_TIMEOUT, || async {
-            matches!(
-                er.account(&committed).await,
-                Ok(Some(clone)) if clone.owner == crate::program::id()
-            )
-        })
-        .await;
+        check::poll(
+            "the er re-clones the undelegated account with its base owner",
+            UNDELEGATE_TIMEOUT,
+            || async {
+                matches!(
+                    er.account(&committed).await,
+                    Ok(Some(clone)) if clone.owner == crate::program::id()
+                )
+            },
+        )
+        .await?;
         let lockout_payer = prep::delegated_payer(
             base,
             &payer,
@@ -283,11 +300,11 @@ impl Scenario for CommitRoundtrip {
                 &[build::simple_byte_set(LOCKOUT_WRITE, &[committed])],
             )
             .await;
-        assert!(
+        check!(
             write_after_undelegate.is_err(),
             "the ER copy of an undelegated account must reject writes \
              (locked out after undelegation), got {write_after_undelegate:?}"
-        );
+        )?;
         let lockout_error =
             format!("{:?}", write_after_undelegate.unwrap_err());
         let lockout_rejection = [
@@ -298,11 +315,14 @@ impl Scenario for CommitRoundtrip {
         .into_iter()
         .find(|code| lockout_error.contains(code))
         .ok_or_else(|| {
-            format!(
-                "expected InvalidWritableAccount, ExternalAccountDataModified \
-                 or ProgramFailedToComplete (the upstream set) for the \
-                 lockout write, got {lockout_error}"
+            CheckError::new(
+                "the lockout write is rejected with an upstream code",
             )
+            .expected(
+                "InvalidWritableAccount, ExternalAccountDataModified or \
+                 ProgramFailedToComplete",
+            )
+            .actual(&lockout_error)
         })?;
 
         Ok(ScenarioReport::ok(self.name())

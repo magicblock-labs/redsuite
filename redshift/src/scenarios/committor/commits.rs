@@ -7,8 +7,8 @@ use redshift_program::schedulecommit::{
     build, MainAccount, ScheduleCommitType,
 };
 use redsuite_core::{
-    assert::poll_until, prep, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
-    ScenarioReport,
+    check, check_eq, prep, BaseCtx, ChainCtx, CheckError, ErCtx, Result,
+    Scenario, ScenarioReport,
 };
 use signer::Signer;
 
@@ -40,7 +40,7 @@ impl Scenario for Commits {
                 committee_count,
             )
             .await?;
-            crate::await_committee_clones(er, &committees).await;
+            crate::await_committee_clones(er, &committees).await?;
             let players: Vec<_> =
                 committees.iter().map(|c| c.player.pubkey()).collect();
             let pdas: Vec<_> = committees.iter().map(|c| c.pda).collect();
@@ -62,43 +62,48 @@ impl Scenario for Commits {
                 base, er, &signature, &pdas, false,
             )
             .await?;
-            assert_eq!(
+            check_eq!(
                 commit_receipt.base_signatures.len(),
                 1,
                 "a single-stage commit must send exactly one base tx"
-            );
+            )?;
 
             for pda in &pdas {
                 let on_er = er
                     .account(pda)
                     .await?
                     .ok_or("the er clone is not present after the commit")?;
-                assert_eq!(
+                check_eq!(
                     decoded_count(&on_er.data)?,
                     1,
                     "ephem count after the commit"
-                );
-                poll_until(BASE_STATE_TIMEOUT, || async {
-                    matches!(
-                        base.account(pda).await,
-                        Ok(Some(acc))
-                            if decoded_count(&acc.data).ok() == Some(1)
-                    )
-                })
-                .await;
+                )?;
+                check::poll(
+                    &format!("the committed count lands on base for {pda}"),
+                    BASE_STATE_TIMEOUT,
+                    || async {
+                        matches!(
+                            base.account(pda).await,
+                            Ok(Some(acc))
+                                if decoded_count(&acc.data).ok() == Some(1)
+                        )
+                    },
+                )
+                .await?;
                 let on_base = base
                     .account(pda)
                     .await?
                     .ok_or("the pda is not on base after the commit")?;
-                assert_eq!(
+                check_eq!(
                     decoded_count(&on_base.data)?,
                     1,
                     "base count after the commit"
-                );
-                assert_eq!(
-                    on_base.owner, DELEGATION_PROGRAM_ID,
+                )?;
+                check_eq!(
+                    on_base.owner,
+                    DELEGATION_PROGRAM_ID,
                     "a plain commit must leave the committee delegated"
-                );
+                )?;
             }
 
             report = report.setting(
@@ -123,7 +128,7 @@ impl Scenario for Commits {
             1,
         )
         .await?;
-        crate::await_committee_clones(er, &foreign).await;
+        crate::await_committee_clones(er, &foreign).await?;
         let (foreign_player, foreign_pda) =
             (foreign[0].player.pubkey(), foreign[0].pda);
         let illegal_commit = er
@@ -139,21 +144,25 @@ impl Scenario for Commits {
                 )],
             )
             .await;
-        assert!(
+        check!(
             illegal_commit.is_err(),
             "a commit for an account that is delegated to another validator \
              must fail"
-        );
+        )?;
         let commit_error = format!("{:?}", illegal_commit.unwrap_err());
         let commit_rejection = ["IllegalOwner", "MissingAccount"]
             .into_iter()
             .find(|code| commit_error.contains(code))
             .ok_or_else(|| {
-                format!(
-                    "expected IllegalOwner (upstream) or MissingAccount \
-                     (observed on this validator build) for {foreign_pda}, \
-                     got {commit_error}"
+                CheckError::new(format!(
+                    "the foreign commit for {foreign_pda} is rejected with a \
+                     known code"
+                ))
+                .expected(
+                    "IllegalOwner (upstream) or MissingAccount (observed on \
+                     this validator build)",
                 )
+                .actual(&commit_error)
             })?;
         if commit_rejection == "MissingAccount" {
             eprintln!(
@@ -171,7 +180,7 @@ impl Scenario for Commits {
             1,
         )
         .await?;
-        crate::await_committee_clones(er, &undelegate).await;
+        crate::await_committee_clones(er, &undelegate).await?;
         let (undelegate_player, undelegate_pda) =
             (undelegate[0].player.pubkey(), undelegate[0].pda);
         let illegal_undelegate = er
@@ -187,21 +196,25 @@ impl Scenario for Commits {
                 )],
             )
             .await;
-        assert!(
+        check!(
             illegal_undelegate.is_err(),
             "an undelegation for an account that is delegated to another \
              validator must fail"
-        );
+        )?;
         let undelegate_error = format!("{:?}", illegal_undelegate.unwrap_err());
         let undelegate_rejection = ["ReadonlyDataModified", "MissingAccount"]
             .into_iter()
             .find(|code| undelegate_error.contains(code))
             .ok_or_else(|| {
-                format!(
-                    "expected ReadonlyDataModified (upstream) or \
-                     MissingAccount (observed on this validator build) for \
-                     {undelegate_pda}, got {undelegate_error}"
+                CheckError::new(format!(
+                    "the foreign undelegation for {undelegate_pda} is \
+                     rejected with a known code"
+                ))
+                .expected(
+                    "ReadonlyDataModified (upstream) or MissingAccount \
+                     (observed on this validator build)",
                 )
+                .actual(&undelegate_error)
             })?;
         if undelegate_rejection == "MissingAccount" {
             eprintln!(

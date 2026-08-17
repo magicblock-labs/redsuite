@@ -7,8 +7,8 @@ use redshift_program::flexi::{
     build, FlexiCounter, FAIL_UNDELEGATION_LABEL, PRIZE,
 };
 use redsuite_core::{
-    assert::poll_until, dlp, prep, receipt, system, BaseCtx, ChainCtx, ErCtx,
-    Result, Scenario, ScenarioReport,
+    check, check_eq, dlp, prep, receipt, system, BaseCtx, ChainCtx, CheckError,
+    ErCtx, Result, Scenario, ScenarioReport,
 };
 use signer::Signer;
 
@@ -71,19 +71,23 @@ async fn setup_actor(base: &BaseCtx, er: &ErCtx, label: &str) -> Result<Actor> {
         .account(&counter)
         .await?
         .ok_or("the counter is not on base after delegate")?;
-    assert_eq!(
+    check_eq!(
         on_base.owner,
         dlp::dlp_id(),
         "dlp must own the delegated counter"
-    );
+    )?;
 
-    poll_until(CLONE_TIMEOUT, || async {
-        matches!(
-            er.account(&counter).await,
-            Ok(Some(clone)) if !clone.data.is_empty()
-        )
-    })
-    .await;
+    check::poll(
+        "the ER clones the delegated counter",
+        CLONE_TIMEOUT,
+        || async {
+            matches!(
+                er.account(&counter).await,
+                Ok(Some(clone)) if !clone.data.is_empty()
+            )
+        },
+    )
+    .await?;
     Ok(Actor { payer, counter })
 }
 
@@ -104,7 +108,7 @@ async fn add(er: &ErCtx, actor: &Actor, count: u8) -> Result<()> {
             .ok_or("the counter clone is missing on the er")?
             .data,
     )?;
-    assert_eq!(
+    check_eq!(
         after,
         FlexiCounter {
             count: before.count + count as u64,
@@ -112,7 +116,7 @@ async fn add(er: &ErCtx, actor: &Actor, count: u8) -> Result<()> {
             label: before.label,
         },
         "the add must increase the count and the updates fields"
-    );
+    )?;
     Ok(())
 }
 
@@ -148,15 +152,20 @@ async fn schedule_intent(
     let undelegating = counter_diffs.is_some();
     let multiplier = if undelegating { 2 } else { 1 };
     let expected = multiplier * actors.len() as u64 * PRIZE;
-    poll_until(STATE_TIMEOUT, || async {
-        base.api().get_balance(&destination).await.unwrap_or(0) == expected
-    })
-    .await;
+    check::poll(
+        "the intent payout reaches the destination on base",
+        STATE_TIMEOUT,
+        || async {
+            base.api().get_balance(&destination).await.unwrap_or(0) == expected
+        },
+    )
+    .await?;
     let paid = base.api().get_balance(&destination).await?;
-    assert_eq!(
-        paid, expected,
+    check_eq!(
+        paid,
+        expected,
         "the destination must receive {multiplier}x PRIZE per payer"
-    );
+    )?;
     Ok(destination)
 }
 
@@ -169,7 +178,9 @@ async fn confirm_intent(
         receipt::fetch_commit_receipt(er.api(), signature, RECEIPT_TIMEOUT)
             .await?;
     if let Some(message) = &commit_receipt.error_message {
-        return Err(format!("the intent failed: {message}").into());
+        return Err(CheckError::new("the intent succeeds")
+            .actual(message)
+            .into());
     }
     receipt::confirm_base_signatures(
         base.api(),
@@ -185,29 +196,37 @@ async fn await_base_count(
     counter: &Pubkey,
     expected: u64,
 ) -> Result<()> {
-    poll_until(STATE_TIMEOUT, || async {
-        matches!(
-            base.account(counter).await,
-            Ok(Some(acc)) if decode(&acc.data).ok().map(|c| c.count) == Some(expected)
-        )
-    })
-    .await;
+    check::poll(
+        &format!("the base counter {counter} reaches {expected}"),
+        STATE_TIMEOUT,
+        || async {
+            matches!(
+                base.account(counter).await,
+                Ok(Some(acc)) if decode(&acc.data).ok().map(|c| c.count) == Some(expected)
+            )
+        },
+    )
+    .await?;
     let on_base = base
         .account(counter)
         .await?
         .ok_or("the counter is not on base")?;
-    assert_eq!(decode(&on_base.data)?.count, expected, "base counter");
+    check_eq!(decode(&on_base.data)?.count, expected, "base counter")?;
     Ok(())
 }
 
 async fn await_undelegated_on_er(er: &ErCtx, counter: &Pubkey) -> Result<()> {
-    poll_until(STATE_TIMEOUT, || async {
-        matches!(
-            er.account(counter).await,
-            Ok(Some(acc)) if acc.owner != dlp::dlp_id()
-        )
-    })
-    .await;
+    check::poll(
+        &format!("the er clone of {counter} leaves dlp ownership"),
+        STATE_TIMEOUT,
+        || async {
+            matches!(
+                er.account(counter).await,
+                Ok(Some(acc)) if acc.owner != dlp::dlp_id()
+            )
+        },
+    )
+    .await?;
     Ok(())
 }
 
@@ -252,15 +271,19 @@ async fn schedule_bundle(
 
     let expected =
         (commit_only.len() as u64 + 2 * undelegate.len() as u64) * PRIZE;
-    poll_until(STATE_TIMEOUT, || async {
-        base.api().get_balance(&destination).await.unwrap_or(0) == expected
-    })
-    .await;
-    assert_eq!(
+    check::poll(
+        "the bundle payout reaches the destination on base",
+        STATE_TIMEOUT,
+        || async {
+            base.api().get_balance(&destination).await.unwrap_or(0) == expected
+        },
+    )
+    .await?;
+    check_eq!(
         base.api().get_balance(&destination).await?,
         expected,
         "the bundle destination payout"
-    );
+    )?;
     Ok(())
 }
 
@@ -283,10 +306,10 @@ async fn transfer_intent_cell(
         .await?;
 
     let vault = dlp::magic_fee_vault_pda(&er.identity());
-    assert!(
+    check!(
         er.account(&vault).await?.is_some(),
         "the magic fee vault for the booted er identity must exist"
-    );
+    )?;
 
     let destination = Keypair::new().pubkey();
     let before = er.api().get_balance(&actor.pubkey()).await?;
@@ -311,21 +334,25 @@ async fn transfer_intent_cell(
     } else {
         TRANSFER_AMOUNT + TRANSFER_FEES
     };
-    poll_until(STATE_TIMEOUT, || async {
-        let paid = base
-            .api()
-            .get_balance(&destination)
-            .await
-            .unwrap_or(u64::MAX);
-        let after = er
-            .api()
-            .get_balance(&actor.pubkey())
-            .await
-            .unwrap_or(u64::MAX);
-        paid == expected_paid
-            && before.checked_sub(after) == Some(expected_charged)
-    })
-    .await;
+    check::poll(
+        "the transfer intent settles the destination and payer balances",
+        STATE_TIMEOUT,
+        || async {
+            let paid = base
+                .api()
+                .get_balance(&destination)
+                .await
+                .unwrap_or(u64::MAX);
+            let after = er
+                .api()
+                .get_balance(&actor.pubkey())
+                .await
+                .unwrap_or(u64::MAX);
+            paid == expected_paid
+                && before.checked_sub(after) == Some(expected_charged)
+        },
+    )
+    .await?;
     let paid = base.api().get_balance(&destination).await?;
     let after = er.api().get_balance(&actor.pubkey()).await?;
     Ok((paid, before - after))
@@ -334,11 +361,11 @@ async fn transfer_intent_cell(
 async fn flow_basic_and_repeat(base: &BaseCtx, er: &ErCtx) -> Result<()> {
     let actor = setup_actor(base, er, LABEL).await?;
     add(er, &actor, 101).await?;
-    assert_eq!(
+    check_eq!(
         er_count(er, &actor).await?,
         101,
         "ephem count before intent"
-    );
+    )?;
     schedule_intent(base, er, &[&actor], None).await?;
     await_base_count(base, &actor.counter, 101).await?;
 
@@ -394,16 +421,16 @@ async fn flow_bundle_mixed(base: &BaseCtx, er: &ErCtx) -> Result<()> {
     await_base_count(base, &bundle_a.counter, 50).await?;
     await_base_count(base, &bundle_b.counter, 75).await?;
     await_base_count(base, &bundle_c.counter, 90).await?;
-    assert_eq!(
+    check_eq!(
         base_owner(base, &bundle_a.counter).await?,
         dlp::dlp_id(),
         "a commit-only bundle member stays delegated"
-    );
-    assert_eq!(
+    )?;
+    check_eq!(
         base_owner(base, &bundle_b.counter).await?,
         dlp::dlp_id(),
         "a commit-only bundle member stays delegated"
-    );
+    )?;
     await_undelegated_on_er(er, &bundle_c.counter).await?;
     Ok(())
 }
@@ -416,16 +443,16 @@ async fn flow_bundle_commit_only(base: &BaseCtx, er: &ErCtx) -> Result<()> {
     schedule_bundle(base, er, &[&only_a, &only_b], &[], vec![]).await?;
     await_base_count(base, &only_a.counter, 42).await?;
     await_base_count(base, &only_b.counter, 88).await?;
-    assert_eq!(
+    check_eq!(
         base_owner(base, &only_a.counter).await?,
         dlp::dlp_id(),
         "a commit-only bundle member stays delegated"
-    );
-    assert_eq!(
+    )?;
+    check_eq!(
         base_owner(base, &only_b.counter).await?,
         dlp::dlp_id(),
         "a commit-only bundle member stays delegated"
-    );
+    )?;
     Ok(())
 }
 
@@ -459,16 +486,16 @@ async fn flow_bundle_commit_and_finalize(
     confirm_intent(base, er, &finalize_sig).await?;
     await_base_count(base, &commit_actor.counter, 31).await?;
     await_base_count(base, &finalize_actor.counter, 47).await?;
-    assert_eq!(
+    check_eq!(
         base_owner(base, &commit_actor.counter).await?,
         dlp::dlp_id(),
         "commit keeps the account delegated"
-    );
-    assert_eq!(
+    )?;
+    check_eq!(
         base_owner(base, &finalize_actor.counter).await?,
         dlp::dlp_id(),
         "commit-finalize keeps the account delegated"
-    );
+    )?;
     Ok(())
 }
 
@@ -476,26 +503,29 @@ async fn flow_transfer_intents(base: &BaseCtx, er: &ErCtx) -> Result<()> {
     let funder = prep::funded_payer(base, AIRDROP).await?;
     let (success_paid, success_charged) =
         transfer_intent_cell(base, er, &funder, false).await?;
-    assert_eq!(
-        success_paid, TRANSFER_AMOUNT,
+    check_eq!(
+        success_paid,
+        TRANSFER_AMOUNT,
         "a successful transfer intent must pay the destination"
-    );
-    assert_eq!(
+    )?;
+    check_eq!(
         success_charged,
         TRANSFER_AMOUNT + TRANSFER_FEES,
         "the payer must be charged the amount plus both fees"
-    );
+    )?;
 
     let (fail_paid, fail_charged) =
         transfer_intent_cell(base, er, &funder, true).await?;
-    assert_eq!(
-        fail_paid, 0,
+    check_eq!(
+        fail_paid,
+        0,
         "a failed transfer intent must not pay the destination"
-    );
-    assert_eq!(
-        fail_charged, TRANSFER_FEES,
+    )?;
+    check_eq!(
+        fail_charged,
+        TRANSFER_FEES,
         "the callback must refund the amount, leaving only the fees"
-    );
+    )?;
     Ok(())
 }
 

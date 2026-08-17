@@ -8,13 +8,14 @@ use async_trait::async_trait;
 use futures_util::future::join_all;
 use pubkey::Pubkey;
 use redsuite_core::{
-    assert::poll_until,
+    check, check_eq,
     monitor::{MonitorSpec, SteadyStateMonitor},
     prep,
     profile::select as select_profile,
     receipt, report,
     runner::{drive, RunConfig},
-    BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
+    BaseCtx, ChainCtx, CheckError, ErCtx, MetricsDelta, Result, Scenario,
+    ScenarioReport,
 };
 use signature::Signature;
 use signer::Signer;
@@ -158,28 +159,39 @@ async fn prewarm(er: &ErCtx, pool: &[Pubkey]) -> Result<()> {
         let _ = join_all(touches).await;
     }
     for pda in pool {
-        poll_until(CLONE_TIMEOUT, || async {
-            matches!(er.account(pda).await, Ok(Some(acc)) if acc.data.len() == ACCOUNT_SPACE as usize)
-        })
-        .await;
+        check::poll(
+            &format!("the ER clones the delegated pda {pda}"),
+            CLONE_TIMEOUT,
+            || async {
+                matches!(er.account(pda).await, Ok(Some(acc)) if acc.data.len() == ACCOUNT_SPACE as usize)
+            },
+        )
+        .await?;
     }
     Ok(())
 }
 
-async fn quiesce_committor(er: &ErCtx) {
-    poll_until(QUIESCE_TIMEOUT, || async {
-        match er.scrape_metrics().await {
-            Ok(metrics) => {
-                let backlog = metrics.value_sum(BACKLOG_GAUGE).unwrap_or(0.0);
-                let intents = metrics.value_sum(INTENTS_COUNTER).unwrap_or(0.0);
-                let executed =
-                    metrics.value_sum(EXECUTED_COUNTER).unwrap_or(0.0);
-                backlog == 0.0 && intents <= executed
+async fn quiesce_committor(er: &ErCtx) -> Result<()> {
+    check::poll(
+        "the committor drains its backlog before the measured window",
+        QUIESCE_TIMEOUT,
+        || async {
+            match er.scrape_metrics().await {
+                Ok(metrics) => {
+                    let backlog =
+                        metrics.value_sum(BACKLOG_GAUGE).unwrap_or(0.0);
+                    let intents =
+                        metrics.value_sum(INTENTS_COUNTER).unwrap_or(0.0);
+                    let executed =
+                        metrics.value_sum(EXECUTED_COUNTER).unwrap_or(0.0);
+                    backlog == 0.0 && intents <= executed
+                }
+                Err(_) => false,
             }
-            Err(_) => false,
-        }
-    })
-    .await;
+        },
+    )
+    .await?;
+    Ok(())
 }
 
 struct DrainResult {
@@ -263,7 +275,7 @@ impl Scenario for CommitThroughputCeiling {
             .map(|window| window.to_vec())
             .collect();
 
-        quiesce_committor(er).await;
+        quiesce_committor(er).await?;
         let before = er.scrape_metrics().await?;
         let intents_before = before.value_sum(INTENTS_COUNTER).unwrap_or(0.0);
         let executed_before = before.value_sum(EXECUTED_COUNTER).unwrap_or(0.0);
@@ -291,13 +303,17 @@ impl Scenario for CommitThroughputCeiling {
 
         if before.get(INTENTS_COUNTER).is_some() {
             let target = intents_before + profile.fresh_commits as f64;
-            poll_until(INTENT_GATE, || async {
-                matches!(
-                    er.scrape_metrics().await.ok().and_then(|metrics| metrics.value_sum(INTENTS_COUNTER)),
-                    Some(count) if count >= target
-                )
-            })
-            .await;
+            check::poll(
+                &format!("the intents counter reaches {target}"),
+                INTENT_GATE,
+                || async {
+                    matches!(
+                        er.scrape_metrics().await.ok().and_then(|metrics| metrics.value_sum(INTENTS_COUNTER)),
+                        Some(count) if count >= target
+                    )
+                },
+            )
+            .await?;
         }
 
         let drain = await_drain(
@@ -312,23 +328,23 @@ impl Scenario for CommitThroughputCeiling {
         let after = er.scrape_metrics().await?;
         let delta = MetricsDelta::new(before, after);
 
-        assert!(
+        check!(
             drain.drained > 0.0,
             "INVALID: no intent drained within {:?} — the commit pipeline \
              executed nothing",
             profile.drain_cap,
-        );
+        )?;
         let failed_intents = delta
             .counter_all("mbv_committor_failed_intents_count")
             .unwrap_or(0.0);
-        assert_eq!(failed_intents, 0.0, "fresh-key intents failed");
+        check_eq!(failed_intents, 0.0, "fresh-key intents failed")?;
         if let Some(alt_tables_used) =
             delta.counter("mbv_committor_intent_alt_count_sum")
         {
-            assert!(
+            check!(
                 alt_tables_used >= 1.0,
                 "wide fresh-key commits should ride ALTs"
-            );
+            )?;
         }
 
         let drain_rate = drain.drained / span_wall.as_secs_f64();
@@ -395,9 +411,10 @@ impl Scenario for CommitThroughputCeiling {
                 )
                 .await?;
                 if let Some(message) = &commit_receipt.error_message {
-                    return Err(format!(
-                        "fresh commit {id} intent failed: {message}"
-                    )
+                    return Err(CheckError::new(format!(
+                        "fresh commit {id} intent succeeds"
+                    ))
+                    .actual(message)
                     .into());
                 }
                 receipt::confirm_base_signatures(
@@ -511,7 +528,7 @@ impl CommitThroughputCeiling {
         // warm-up round: one commit per set creates that set's ALTs
         let warmup_sets: Vec<Vec<Pubkey>> =
             (0..CONTRAST_SETS).map(set_for).collect();
-        quiesce_committor(er).await;
+        quiesce_committor(er).await?;
         let warmup_executed_before = er
             .scrape_metrics()
             .await?
@@ -534,12 +551,15 @@ impl CommitThroughputCeiling {
         )
         .await?;
         if !warmup_drain.fully_drained {
-            return Err("contrast warm-up round did not drain".into());
+            return Err(CheckError::new(
+                "contrast warm-up round did not drain",
+            )
+            .into());
         }
 
         let measured_sets: Vec<Vec<Pubkey>> =
             (0..commits as usize).map(set_for).collect();
-        quiesce_committor(er).await;
+        quiesce_committor(er).await?;
         let before = er.scrape_metrics().await?;
         let executed_before = before.value_sum(EXECUTED_COUNTER).unwrap_or(0.0);
         let span_started = Instant::now();
@@ -561,11 +581,11 @@ impl CommitThroughputCeiling {
         let failed_intents = delta
             .counter_all("mbv_committor_failed_intents_count")
             .unwrap_or(0.0);
-        assert_eq!(failed_intents, 0.0, "reused-pool intents failed");
-        assert!(
+        check_eq!(failed_intents, 0.0, "reused-pool intents failed")?;
+        check!(
             drain.drained > 0.0,
             "INVALID: the reused-pool cell drained nothing"
-        );
+        )?;
 
         let drain_rate = drain.drained / span_wall.as_secs_f64();
         let contrast_ratio = if fresh_drain_rate > 0.0 {

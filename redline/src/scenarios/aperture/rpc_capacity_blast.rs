@@ -4,8 +4,7 @@ use async_trait::async_trait;
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    assert::poll_until,
-    prep,
+    check, check_eq, prep,
     profile::select as select_profile,
     runner::{drive_threads, ThreadRunConfig},
     BaseCtx, ChainCtx, ErClient, ErCtx, MetricsDelta, Result, Scenario,
@@ -79,10 +78,14 @@ impl Scenario for RpcCapacityBlast {
             .await?,
         );
         for pda in pool.iter() {
-            poll_until(CLONE_TIMEOUT, || async {
-                matches!(er.account(pda).await, Ok(Some(acc)) if acc.data.len() == crate::ACCOUNT_SPACE as usize)
-            })
-            .await;
+            check::poll(
+                &format!("the ER clones the delegated pda {pda}"),
+                CLONE_TIMEOUT,
+                || async {
+                    matches!(er.account(pda).await, Ok(Some(acc)) if acc.data.len() == crate::ACCOUNT_SPACE as usize)
+                },
+            )
+            .await?;
         }
         let payer_bytes: Arc<Vec<[u8; 64]>> = Arc::new(
             prep_payers.iter().map(|payer| payer.to_bytes()).collect(),
@@ -153,11 +156,12 @@ impl Scenario for RpcCapacityBlast {
                 .unwrap_or_else(|| "n/a".to_owned()),
         );
 
-        assert_eq!(
-            outcome.failed, 0,
+        check_eq!(
+            outcome.failed,
+            0,
             "blast requests failed: {:?}",
             outcome.first_error
-        );
+        )?;
         if delivered_rps < CATASTROPHIC_RPS_FLOOR {
             eprintln!(
                 "[redsuite] {}: warning: delivered only {delivered_rps:.0} \
@@ -166,18 +170,19 @@ impl Scenario for RpcCapacityBlast {
             );
         }
         if let Some(processed) = delta.counter("mbv_transaction_count") {
-            assert!(
+            check!(
                 processed >= profile.requests as f64,
                 "validator processed {processed} txs, expected at least {}",
                 profile.requests
-            );
+            )?;
         }
         if let Some(failed_txs) = delta.counter("mbv_failed_transactions_count")
         {
-            assert_eq!(
-                failed_txs, 0.0,
+            check_eq!(
+                failed_txs,
+                0.0,
                 "transactions failed on the validator during the blast"
-            );
+            )?;
         }
 
         Ok(ScenarioReport::ok(self.name())

@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use redsuite_core::{
-    dlp, topology, BaseCtx, ChainCtx, ErCtx, Result, Scenario, ScenarioReport,
+    check, dlp, topology, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
+    ScenarioReport,
 };
 use signer::Signer;
 
@@ -18,19 +19,19 @@ impl Scenario for ClaimFees {
         let validator = topology::er_identity_keypair()?;
         let vault = dlp::validator_fees_vault_pda(&validator.pubkey());
         let vault_at_boot = base.api().get_balance(&vault).await?;
-        assert!(
+        check!(
             vault_at_boot > 0,
             "validator-fees-vault absent on base — it should have been \
              injected at genesis"
-        );
+        )?;
 
         base.airdrop(&vault, TEST_FEE_LAMPORTS).await?;
         let vault_before = base.api().get_balance(&vault).await?;
-        assert!(
+        check!(
             vault_before >= TEST_FEE_LAMPORTS,
             "vault holds {vault_before}, expected at least the test fee \
              amount {TEST_FEE_LAMPORTS}"
-        );
+        )?;
 
         let claimer_before =
             base.api().get_balance(&validator.pubkey()).await?;
@@ -43,16 +44,16 @@ impl Scenario for ClaimFees {
         let claimer_after = base.api().get_balance(&validator.pubkey()).await?;
 
         let claimed = vault_before.saturating_sub(vault_after);
-        assert!(claimed > 0, "should have claimed some fees");
-        assert!(
+        check!(claimed > 0, "should have claimed some fees")?;
+        check!(
             vault_after > 0,
             "claim drained the vault below rent exemption"
-        );
-        assert!(
+        )?;
+        check!(
             claimer_after > claimer_before,
             "claimed fees never reached the validator: {claimer_before} -> \
              {claimer_after}"
-        );
+        )?;
 
         Ok(ScenarioReport::ok(self.name())
             .setting("vault", vault)
