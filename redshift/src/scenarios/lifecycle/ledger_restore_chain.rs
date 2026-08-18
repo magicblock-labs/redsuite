@@ -3,7 +3,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use keypair::Keypair;
 use pubkey::Pubkey;
-use redshift_program::flexi::{build as flexi, FlexiCounter};
+use redshift_interface::flexi::{build as flexi, FlexiCounter};
 use redsuite_core::{
     check, check_eq, dlp, prep, receipt, system, topology, BaseCtx, ChainCtx,
     CheckError, ErCtx, PrivateErScenario, Result, ScenarioReport,

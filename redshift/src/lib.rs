@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use keypair::Keypair;
 use pubkey::Pubkey;
-pub use redline_program as program;
-use redshift_program::schedulecommit::{build, MainAccount};
+pub use redline_interface as program;
+use redshift_interface::schedulecommit::{build, MainAccount};
 use redsuite_core::{
     check, check_eq, receipt, BaseCtx, ChainCtx, ErCtx, Result,
 };

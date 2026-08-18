@@ -2213,8 +2213,8 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "borsh 1.7.0",
- "redhat-program",
- "redshift-program",
+ "redhat-interface",
+ "redshift-interface",
  "redsuite-core",
  "solana-instruction 3.4.0",
  "solana-keypair",
@@ -2224,11 +2224,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "redhat-interface"
+version = "0.1.0"
+dependencies = [
+ "borsh 1.7.0",
+ "redshift-interface",
+ "solana-program 3.0.0",
+]
+
+[[package]]
 name = "redhat-program"
 version = "0.1.0"
 dependencies = [
  "borsh 1.7.0",
- "redshift-program",
+ "redhat-interface",
+ "redshift-interface",
  "solana-program 3.0.0",
 ]
 
@@ -2238,7 +2248,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "futures-util",
- "redline-program",
+ "redline-interface",
  "redsuite-core",
  "solana-instruction 3.4.0",
  "solana-keypair",
@@ -2250,14 +2260,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "redline-interface"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "ephemeral-rollups-sdk",
+ "serde",
+ "sha2 0.10.9",
+ "solana-program 3.0.0",
+ "solana-pubkey 3.0.0",
+ "solana-sdk-ids 3.1.0",
+]
+
+[[package]]
 name = "redline-program"
 version = "0.1.0"
 dependencies = [
  "bincode",
  "borsh 1.7.0",
  "ephemeral-rollups-sdk",
- "serde",
- "sha2 0.10.9",
+ "redline-interface",
  "solana-program 3.0.0",
  "solana-pubkey 3.0.0",
  "solana-sdk-ids 3.1.0",
@@ -2281,8 +2303,8 @@ dependencies = [
  "ephemeral-rollups-sdk",
  "magicblock-delegation-program-api",
  "rand 0.8.6",
- "redline-program",
- "redshift-program",
+ "redline-interface",
+ "redshift-interface",
  "redsuite-core",
  "rusqlite",
  "solana-address-lookup-table-interface 3.1.0",
@@ -2297,6 +2319,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "redshift-interface"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "borsh 1.7.0",
+ "ephemeral-rollups-sdk",
+ "magicblock-magic-program-api",
+ "solana-program 3.0.0",
+ "solana-sdk-ids 3.1.0",
+]
+
+[[package]]
 name = "redshift-program"
 version = "0.1.0"
 dependencies = [
@@ -2304,6 +2338,7 @@ dependencies = [
  "borsh 1.7.0",
  "ephemeral-rollups-sdk",
  "magicblock-magic-program-api",
+ "redshift-interface",
  "solana-program 3.0.0",
  "solana-sdk-ids 3.1.0",
 ]

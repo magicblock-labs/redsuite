@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use borsh::BorshDeserialize;
 use keypair::Keypair;
 use pubkey::Pubkey;
-use redshift_program::{
+use redshift_interface::{
     flexi::{build as flexi, FlexiCounter},
     schedulecommit::{
         build as schedulecommit, MainAccount, ScheduleCommitType,

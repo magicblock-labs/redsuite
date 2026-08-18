@@ -1,0 +1,15 @@
+[package]
+name = "redline-interface"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+solana-program = { workspace = true }
+solana-sdk-ids = "3"
+pubkey = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+sha2 = { workspace = true }
+sdk = { workspace = true }

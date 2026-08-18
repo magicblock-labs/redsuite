@@ -3,7 +3,7 @@ use std::{rc::Rc, time::Duration};
 use async_trait::async_trait;
 use instruction::Instruction;
 use keypair::Keypair;
-use redshift_program::schedulecommit::{build, ScheduleCommitType};
+use redshift_interface::schedulecommit::{build, ScheduleCommitType};
 use redsuite_core::{
     check, check_eq, prep, system, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
     ScenarioReport,
@@ -97,7 +97,7 @@ impl Scenario for IllegalWritable {
         refused(
             er,
             &payer,
-            &[redhat_program::build::sibling_schedule_commit_cpis(
+            &[redhat_interface::build::sibling_schedule_commit_cpis(
                 payer.pubkey(),
                 &players,
                 &pdas,
@@ -113,7 +113,7 @@ impl Scenario for IllegalWritable {
             er,
             &payer,
             &[
-                redhat_program::build::non_cpi(payer.pubkey()),
+                redhat_interface::build::non_cpi(payer.pubkey()),
                 build::schedule_commit_cpi(
                     payer.pubkey(),
                     players.clone(),
@@ -122,7 +122,7 @@ impl Scenario for IllegalWritable {
                     ScheduleCommitType::CommitFinalize,
                     true,
                 ),
-                redhat_program::build::nested_schedule_commit_cpi(
+                redhat_interface::build::nested_schedule_commit_cpi(
                     payer.pubkey(),
                     &players,
                     &pdas,

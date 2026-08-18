@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use redshift_program::schedulecommit::build;
+use redshift_interface::schedulecommit::build;
 use redsuite_core::{
     check, dlp, prep, receipt, system, BaseCtx, ChainCtx, CheckError, ErCtx,
     Result, Scenario, ScenarioReport,

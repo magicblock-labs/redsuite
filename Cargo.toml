@@ -5,9 +5,12 @@ members = [
     "redline",
     "redshift",
     "redhat",
-    "programs/redline",
-    "programs/redshift",
-    "programs/redhat",
+    "programs/redline/interface",
+    "programs/redline/program",
+    "programs/redshift/interface",
+    "programs/redshift/program",
+    "programs/redhat/interface",
+    "programs/redhat/program",
     "xtask",
     "cli",
 ]
@@ -23,9 +26,12 @@ redsuite-core = { path = "crates/redsuite-core" }
 redline = { path = "redline" }
 redshift = { path = "redshift" }
 redhat = { path = "redhat" }
-redline-program = { path = "programs/redline" }
-redshift-program = { path = "programs/redshift" }
-redhat-program = { path = "programs/redhat" }
+redline-interface = { path = "programs/redline/interface" }
+redline-program = { path = "programs/redline/program" }
+redshift-interface = { path = "programs/redshift/interface" }
+redshift-program = { path = "programs/redshift/program" }
+redhat-interface = { path = "programs/redhat/interface" }
+redhat-program = { path = "programs/redhat/program" }
 
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "net"] }
 tokio-tungstenite = "0.29"

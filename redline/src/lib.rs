@@ -1,7 +1,7 @@
 pub mod scenarios;
 use keypair::Keypair;
 use pubkey::Pubkey;
-pub use redline_program as program;
+pub use redline_interface as program;
 use redsuite_core::{ChainCtx, DynError, Result};
 use signer::Signer;
 

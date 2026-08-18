@@ -98,13 +98,19 @@ fn run_cmd(desc: &str, cmd: &mut Command) -> Result<()> {
     Ok(())
 }
 
+const SBF_LTO: &str = "profile.release.lto=\"fat\"";
+
 fn programs() -> Result<()> {
     for program in FAMILY_PROGRAMS {
         run_cmd(
             &format!("cargo build-sbf ({program})"),
             Command::new("cargo")
                 .args(["build-sbf", "--manifest-path"])
-                .arg(root().join(format!("programs/{program}/Cargo.toml"))),
+                .arg(
+                    root()
+                        .join(format!("programs/{program}/program/Cargo.toml")),
+                )
+                .args(["--", "--config", SBF_LTO]),
         )?;
     }
     build_redshift_variant("slim", &[], "redshift_program_slim.so")?;
@@ -128,12 +134,13 @@ fn build_redshift_variant(
     let mut command = Command::new("cargo");
     command
         .args(["build-sbf", "--manifest-path"])
-        .arg(root().join("programs/redshift/Cargo.toml"))
+        .arg(root().join("programs/redshift/program/Cargo.toml"))
         .arg("--no-default-features");
     if !features.is_empty() {
         command.args(["--features", &features.join(",")]);
     }
     command.arg("--sbf-out-dir").arg(&out_dir);
+    command.args(["--", "--config", SBF_LTO]);
     run_cmd(&format!("cargo build-sbf (redshift {label})"), &mut command)?;
     let built = out_dir.join("redshift_program.so");
     let staged = root().join("target/deploy").join(staged_name);

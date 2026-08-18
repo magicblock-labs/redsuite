@@ -10,8 +10,8 @@ async-trait = { workspace = true }
 borsh = { workspace = true }
 tokio = { workspace = true }
 redsuite-core = { workspace = true }
-redshift-program = { workspace = true, features = ["no-entrypoint"] }
-redhat-program = { workspace = true, features = ["no-entrypoint"] }
+redshift-interface = { workspace = true }
+redhat-interface = { workspace = true }
 instruction = { workspace = true }
 pubkey = { workspace = true }
 keypair = { workspace = true }

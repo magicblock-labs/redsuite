@@ -3,7 +3,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use borsh::BorshDeserialize;
 use keypair::Keypair;
-use redshift_program::schedulecommit::{
+use redshift_interface::schedulecommit::{
     build, MainAccount, ScheduleCommitType,
 };
 use redsuite_core::{

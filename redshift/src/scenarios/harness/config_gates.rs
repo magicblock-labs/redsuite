@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use pubkey::Pubkey;
-use redshift_program::flexi::{build, FlexiCounter};
+use redshift_interface::flexi::{build, FlexiCounter};
 use redsuite_core::{
     check, check_eq, dlp, prep, system, topology, BaseCtx, ChainCtx, ErCtx,
     PrivateErScenario, Result, ScenarioReport,
@@ -146,7 +146,7 @@ impl PrivateErScenario for ConfigGates {
     }
 
     async fn run(&self, base: &BaseCtx) -> Result<ScenarioReport> {
-        let allowed = redshift_program::id();
+        let allowed = redshift_interface::id();
         let blocked = committor_id();
 
         let restricted = topology::private_er(
