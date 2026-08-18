@@ -206,6 +206,12 @@ async fn await_magic_fee_vault(
     }
 }
 
+fn abort_boot(mut child: Child, pid: u32, record: &Rc<ResourceRecord>) {
+    process::kill_pid(pid);
+    let _ = child.wait();
+    record.mark_finished();
+}
+
 pub async fn private_er(
     base: &BaseCtx,
     options: ErOptions,
@@ -258,13 +264,13 @@ pub async fn private_er(
     )
     .await;
     if let Err(e) = ready {
-        process::kill_pid(pid);
+        abort_boot(child, pid, &record);
         return Err(e);
     }
 
     if options.lifecycle == "ephemeral" {
         if let Err(e) = await_magic_fee_vault(base, &identity_pubkey).await {
-            process::kill_pid(pid);
+            abort_boot(child, pid, &record);
             return Err(e);
         }
     }

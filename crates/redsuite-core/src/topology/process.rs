@@ -53,6 +53,7 @@ pub(super) async fn terminate(
 ) -> Result<(ExitStatus, bool)> {
     send_signal(pid, if hard_kill { "-KILL" } else { "-TERM" });
     let grace_deadline = std::time::Instant::now() + KILL_GRACE;
+    let hard_deadline = grace_deadline + KILL_GRACE;
     let mut escalated = hard_kill;
     let mut needed_sigkill = false;
     loop {
@@ -63,6 +64,12 @@ pub(super) async fn terminate(
             send_signal(pid, "-KILL");
             escalated = true;
             needed_sigkill = true;
+        }
+        if std::time::Instant::now() >= hard_deadline {
+            return Err(format!(
+                "process {pid} did not exit within {KILL_GRACE:?} of SIGKILL"
+            )
+            .into());
         }
         tokio::time::sleep(RESTART_POLL).await;
     }
