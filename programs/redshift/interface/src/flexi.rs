@@ -136,14 +136,10 @@ pub mod build {
         instruction: &FlexiInstruction,
         metas: Vec<AccountMeta>,
     ) -> Instruction {
-        let mut data = vec![crate::FLEXI_TAG];
-        data.extend(
-            to_vec(instruction).expect("instruction serialization cannot fail"),
-        );
         Instruction {
             program_id: crate::id(),
             accounts: metas,
-            data,
+            data: tagged(instruction),
         }
     }
 

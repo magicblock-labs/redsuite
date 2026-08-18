@@ -19,6 +19,14 @@ fn prepare_buffer(index: &mut usize, target: &mut [u8], data: &[u8]) {
     *index += data.len();
 }
 
+fn require_space(len: usize, needed: usize) -> Result<(), ProgramError> {
+    if len < needed {
+        msg!("Error: account data {} is smaller than {}", len, needed);
+        return Err(ProgramError::AccountDataTooSmall);
+    }
+    Ok(())
+}
+
 fn verify_account_owner(
     signer: &AccountInfo,
     account: &AccountInfo,
@@ -37,7 +45,7 @@ fn verify_account_owner(
     let stored_owner = Pubkey::try_from(&data[..OWNER_PUBKEY_SIZE])
         .map_err(|_| ProgramError::InvalidAccountData)?;
 
-    if stored_owner != *signer.key && stored_owner != Pubkey::default() {
+    if stored_owner != *signer.key {
         msg!(
             "Error: Signer {} does not match stored owner {}",
             signer.key,
@@ -60,6 +68,7 @@ pub fn init_account(
     let payer = next_account_info(iter)?;
     let pda = next_account_info(iter)?;
     let base = next_account_info(iter)?;
+    require_space(space as usize, OWNER_PUBKEY_SIZE)?;
     let mut seeds = space.to_le_bytes().to_vec();
     seeds.push(seed);
     seeds.extend_from_slice(&authority.as_ref()[..16]);
@@ -160,6 +169,7 @@ pub fn multi_account_read(
         return Err(ProgramError::UninitializedAccount);
     }
     let mut data = pda.try_borrow_mut_data()?;
+    require_space(data.len(), DATA_OFFSET + 16)?;
     let sum = iter.clone().map(|a| a.data_len() as u64).sum::<u64>();
     let buffer = id.to_le_bytes();
     let buffer_sum = sum.to_le_bytes();
@@ -193,6 +203,7 @@ pub fn expensive_hash_compute(
             continue; // Skip uninitialized accounts
         }
         let mut data = pda.try_borrow_mut_data()?;
+        require_space(data.len(), DATA_OFFSET + 8 + hash.len())?;
         let buffer = id.to_le_bytes();
         let mut index = DATA_OFFSET;
 
@@ -238,6 +249,8 @@ pub fn account_data_copy(
 
         let src_data = src.try_borrow_data()?;
         let mut dst_data = dest.try_borrow_mut_data()?;
+        require_space(src_data.len(), DATA_OFFSET)?;
+        require_space(dst_data.len(), DATA_OFFSET + 8)?;
 
         let buffer = id.to_le_bytes();
         let mut index = DATA_OFFSET;
@@ -466,5 +479,49 @@ mod tests {
             false,
         );
         assert!(verify_account_owner(&unsigned_owner, &pda).is_err());
+
+        let mut zeroed_lamports = 1u64;
+        let mut zeroed_data = vec![0u8; 64];
+        let zeroed_key = SolPubkey::new_unique();
+        let zeroed = account_info(
+            &zeroed_key,
+            &mut zeroed_lamports,
+            &mut zeroed_data,
+            &program,
+            false,
+        );
+        let signer = account_info(
+            &owner_key,
+            &mut owner_lamports,
+            &mut owner_data,
+            &program,
+            true,
+        );
+        assert!(verify_account_owner(&signer, &zeroed).is_err());
+    }
+
+    #[test]
+    fn undersized_accounts_are_rejected_before_layout_writes() {
+        assert!(require_space(48, 48).is_ok());
+        assert_eq!(
+            require_space(47, 48),
+            Err(ProgramError::AccountDataTooSmall)
+        );
+
+        let key = SolPubkey::new_unique();
+        let program = crate::ID;
+        let mut lamports = 1_000_000u64;
+        let mut data = vec![0u8; DATA_OFFSET + 15];
+        let accounts = vec![account_info(
+            &key,
+            &mut lamports,
+            &mut data,
+            &program,
+            false,
+        )];
+        assert_eq!(
+            multi_account_read(&mut accounts.iter(), &accounts, 7),
+            Err(ProgramError::AccountDataTooSmall)
+        );
     }
 }
