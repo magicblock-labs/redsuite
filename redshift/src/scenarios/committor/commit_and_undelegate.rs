@@ -7,7 +7,7 @@ use rand::{
     rngs::{OsRng, StdRng},
     Rng, RngCore, SeedableRng,
 };
-use redshift_program::schedulecommit::{
+use redshift_interface::schedulecommit::{
     build, order_book_view, BookUpdate, MainAccount, OrderLevel,
     ScheduleCommitType, FAIL_UNDELEGATION_COUNT, ORDER_BOOK_INIT_SIZE,
 };
@@ -122,7 +122,7 @@ async fn commit_undelegate_lifecycle(
             || async {
                 matches!(
                     base.account(pda).await,
-                    Ok(Some(acc)) if acc.owner == redshift_program::id()
+                    Ok(Some(acc)) if acc.owner == redshift_interface::id()
                 )
             },
         )
@@ -351,7 +351,7 @@ async fn order_book_cell(
     check_book_matches(&on_er.data, &update, seed, "ephem")?;
 
     let expected_owner = if undelegates {
-        redshift_program::id()
+        redshift_interface::id()
     } else {
         DELEGATION_PROGRAM_ID
     };

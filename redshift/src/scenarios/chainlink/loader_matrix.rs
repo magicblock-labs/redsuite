@@ -161,7 +161,7 @@ fn memo_data(attempt: u64) -> Vec<u8> {
 }
 
 fn log_data(attempt: u64) -> Vec<u8> {
-    redshift_program::log_msg_data(&format!("probe {attempt}"))
+    redshift_interface::log_msg_data(&format!("probe {attempt}"))
 }
 
 fn has_log_msg(logs: &[String]) -> bool {

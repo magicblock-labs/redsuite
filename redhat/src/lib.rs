@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use keypair::Keypair;
 use pubkey::Pubkey;
-use redshift_program::schedulecommit::{build, MainAccount};
+use redshift_interface::schedulecommit::{build, MainAccount};
 use redsuite_core::{check, check_eq, BaseCtx, ChainCtx, ErCtx, Result};
 use signer::Signer;
 

@@ -1,18 +1,11 @@
 [package]
-name = "redhat-program"
+name = "redhat-interface"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
-[lib]
-crate-type = ["cdylib", "lib"]
-
-[features]
-default = []
-no-entrypoint = []
-
 [dependencies]
 borsh = { workspace = true }
-redshift-program = { workspace = true, features = ["no-entrypoint"] }
+redshift-interface = { workspace = true }
 solana-program = { workspace = true }

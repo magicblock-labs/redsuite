@@ -3,7 +3,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use keypair::Keypair;
 use pubkey::Pubkey;
-use redshift_program::flexi::{build as flexi, FlexiCounter};
+use redshift_interface::flexi::{build as flexi, FlexiCounter};
 use redsuite_core::{
     check, check_eq, dlp, prep, system, topology, BaseCtx, ChainCtx, ErCtx,
     PrivateErScenario, Result, ScenarioReport,
@@ -449,7 +449,7 @@ impl PrivateErScenario for LedgerRestoreBasics {
             };
             assert_counter(er, &actor.counter, &expected, "written").await?;
             let program = er
-                .account(&redshift_program::id())
+                .account(&redshift_interface::id())
                 .await?
                 .ok_or("the redshift program did not clone into the er")?;
             check!(
@@ -475,16 +475,16 @@ impl PrivateErScenario for LedgerRestoreBasics {
                 CLONE_TIMEOUT,
                 || async {
                     matches!(
-                        er.account(&redshift_program::id()).await,
+                        er.account(&redshift_interface::id()).await,
                         Ok(Some(_))
                     )
                 },
             )
             .await?;
-            let restored_program =
-                er.account(&redshift_program::id())
-                    .await?
-                    .ok_or("the cloned program vanished in the restore")?;
+            let restored_program = er
+                .account(&redshift_interface::id())
+                .await?
+                .ok_or("the cloned program vanished in the restore")?;
             check!(
                 restored_program.executable,
                 "the restored program must stay executable"

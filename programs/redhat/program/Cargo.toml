@@ -1,0 +1,15 @@
+[package]
+name = "redhat-program"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+borsh = { workspace = true }
+redhat-interface = { workspace = true }
+redshift-interface = { workspace = true }
+solana-program = { workspace = true }

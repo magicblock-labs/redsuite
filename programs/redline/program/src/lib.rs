@@ -1,11 +1,11 @@
 #![allow(unexpected_cfgs)]
 
-use instruction::Instruction;
 use processors::*;
+use redline_interface::instruction::Instruction;
+pub use redline_interface::{id, layout, utils, ID};
 use sdk::consts::EXTERNAL_UNDELEGATE_DISCRIMINATOR;
 use solana_program::{
     account_info::AccountInfo,
-    declare_id,
     entrypoint::{self, ProgramResult},
     msg,
     program_error::ProgramError,
@@ -13,21 +13,6 @@ use solana_program::{
 };
 
 entrypoint::entrypoint!(process_instruction);
-declare_id!("3JnJ727jWEmPVU8qfXwtH63sCNDX7nMgsLbg8qy8aaPX");
-
-pub use sdk::{
-    consts::DELEGATION_PROGRAM_ID,
-    delegate_args::{DelegateAccountMetas, DelegateAccounts},
-};
-
-pub mod layout {
-    pub const OWNER_PUBKEY_SIZE: usize = 32;
-    pub const DATA_OFFSET: usize = OWNER_PUBKEY_SIZE;
-    pub const ID_OFFSET: usize = DATA_OFFSET;
-    pub const ID_SIZE: usize = 8;
-    pub const HASH_OFFSET: usize = ID_OFFSET + ID_SIZE;
-    pub const HASH_SIZE: usize = 32;
-}
 
 fn process_instruction(
     program_id: &Pubkey,
@@ -84,6 +69,4 @@ fn process_instruction(
     Ok(())
 }
 
-pub mod instruction;
 mod processors;
-pub mod utils;
