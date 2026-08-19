@@ -9,6 +9,7 @@ use crate::{
     catalog::Fixture,
     check::CheckError,
     context::{BaseCtx, ErCtx},
+    manifest,
     profile::ExecutionConfig,
     report::ScenarioReport,
     resources::Resources,
@@ -94,6 +95,7 @@ pub struct PhaseOutcome {
 #[derive(Debug)]
 pub enum ScenarioOutcome {
     Passed(ScenarioReport),
+    Skipped(String),
     Failed(DynError),
     Panicked(String),
     NotReached,
@@ -144,8 +146,10 @@ impl RunRecord {
     }
 
     pub fn passed(&self) -> bool {
-        matches!(self.scenario, ScenarioOutcome::Passed(_))
-            && self.phases.iter().all(|outcome| outcome.error.is_none())
+        matches!(
+            self.scenario,
+            ScenarioOutcome::Passed(_) | ScenarioOutcome::Skipped(_)
+        ) && self.phases.iter().all(|outcome| outcome.error.is_none())
     }
 
     pub fn failure(&self) -> Option<String> {
@@ -158,7 +162,9 @@ impl RunRecord {
             ScenarioOutcome::Panicked(message) => {
                 lines.push(format!("scenario panicked: {message}"))
             }
-            ScenarioOutcome::Passed(_) | ScenarioOutcome::NotReached => {}
+            ScenarioOutcome::Passed(_)
+            | ScenarioOutcome::Skipped(_)
+            | ScenarioOutcome::NotReached => {}
         }
         for outcome in &self.phases {
             if let Some(error) = &outcome.error {
@@ -175,6 +181,7 @@ impl RunRecord {
 pub async fn run_shared_scenario(
     scenario: impl Scenario,
     fixtures: &[Fixture],
+    optional_fixtures: &[Fixture],
     config: Result<ExecutionConfig>,
 ) -> RunRecord {
     // A LocalSet so contexts and transports can spawn_local background work
@@ -186,6 +193,7 @@ pub async fn run_shared_scenario(
             execute(
                 name,
                 fixtures,
+                optional_fixtures,
                 config,
                 topology::shared,
                 |(base, er)| async move { scenario.run(&base, &er).await },
@@ -198,6 +206,7 @@ pub async fn run_shared_scenario(
 pub async fn run_private_er_scenario(
     scenario: impl PrivateErScenario,
     fixtures: &[Fixture],
+    optional_fixtures: &[Fixture],
     config: Result<ExecutionConfig>,
 ) -> RunRecord {
     let local = tokio::task::LocalSet::new();
@@ -207,6 +216,7 @@ pub async fn run_private_er_scenario(
             execute(
                 name,
                 fixtures,
+                optional_fixtures,
                 config,
                 topology::base_only,
                 |base| async move { scenario.run(&base).await },
@@ -237,6 +247,7 @@ impl ProvidesResources for (BaseCtx, ErCtx) {
 async fn execute<Provisioned, ProvisionFut, Body, BodyFut>(
     name: String,
     fixtures: &[Fixture],
+    optional_fixtures: &[Fixture],
     config: Result<ExecutionConfig>,
     provision: impl FnOnce(ExecutionConfig) -> ProvisionFut,
     body: Body,
@@ -263,6 +274,11 @@ where
         return record;
     }
     record.phase_ok(Phase::Preflight);
+    if let Some(reason) = optional_fixture_gap(optional_fixtures) {
+        record.scenario = ScenarioOutcome::Skipped(reason);
+        conclude(&mut record);
+        return record;
+    }
 
     let provisioned = match provision(config).await {
         Ok(provisioned) => {
@@ -306,19 +322,46 @@ where
 
 fn preflight(fixtures: &[Fixture]) -> Result<()> {
     topology::er_bin_path()?;
+    if !fixtures.is_empty() {
+        let manifest = manifest::load()?;
+        if let Some(warning) = manifest::revision_drift(&manifest) {
+            eprintln!("[redsuite] warning: {warning}");
+        }
+        for fixture in fixtures {
+            manifest::resolve(*fixture)?;
+        }
+    }
+    let Some(loaded) = topology::running_base_programs() else {
+        return Ok(());
+    };
+    if loaded.is_empty() {
+        return Ok(());
+    }
     for fixture in fixtures {
-        let so = topology::workspace_root()
-            .join("target/deploy")
-            .join(fixture.so_name());
-        if !so.exists() {
+        if fixture.loaded_at_base_boot()
+            && !loaded.iter().any(|name| name == fixture.so_name())
+        {
             return Err(format!(
-                "fixture {} is not built — `cargo xtask programs` builds it",
-                so.display()
+                "{} is staged, but the running base booted without it — \
+                 run `cargo xtask stack down`, then run again",
+                fixture.so_name()
             )
             .into());
         }
     }
     Ok(())
+}
+
+fn optional_fixture_gap(optional_fixtures: &[Fixture]) -> Option<String> {
+    for fixture in optional_fixtures {
+        if let Err(error) = manifest::resolve(*fixture) {
+            return Some(format!(
+                "optional fixture {} is unavailable: {error}",
+                fixture.so_name()
+            ));
+        }
+    }
+    None
 }
 
 fn conclude(record: &mut RunRecord) {
@@ -358,6 +401,9 @@ fn conclude(record: &mut RunRecord) {
                 record.name
             )
         }
+        ScenarioOutcome::Skipped(reason) => {
+            eprintln!("[redsuite] {}: skipped — {reason}", record.name)
+        }
         ScenarioOutcome::NotReached => {
             eprintln!("[redsuite] {}: not run", record.name)
         }
@@ -366,6 +412,9 @@ fn conclude(record: &mut RunRecord) {
         if let Some(error) = &outcome.error {
             eprintln!("[redsuite]   {error}");
         }
+    }
+    if matches!(record.scenario, ScenarioOutcome::Skipped(_)) {
+        return;
     }
     match crate::report::persist_run(record) {
         Ok(path) => {
@@ -398,5 +447,12 @@ mod tests {
         let plain: DynError = "connection refused".into();
         assert!(failed_check(&check).is_some());
         assert!(failed_check(&plain).is_none());
+    }
+
+    #[test]
+    fn missing_optional_fixtures_report_gap_instead_of_failing_preflight() {
+        // With an empty/missing manifest path in temp, optional_fixture_gap returns a skip reason
+        let gap = optional_fixture_gap(&[Fixture::RedlineProgram]);
+        assert!(gap.is_none() || gap.unwrap().contains("unavailable"));
     }
 }

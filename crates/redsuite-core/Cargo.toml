@@ -12,10 +12,15 @@ futures-util = { workspace = true }
 async-trait = { workspace = true }
 reqwest = { workspace = true }
 
+redline-interface = { workspace = true }
+redshift-interface = { workspace = true }
+redhat-interface = { workspace = true }
+
 serde = { workspace = true }
 json = { workspace = true }
 rand = { workspace = true }
 base64 = { workspace = true }
+sha2 = { workspace = true }
 
 pubkey = { workspace = true, features = ["curve25519"] }
 keypair = { workspace = true }

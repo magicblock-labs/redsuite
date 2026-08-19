@@ -1,5 +1,7 @@
 use std::{future::Future, pin::Pin};
 
+use pubkey::Pubkey;
+
 use crate::{
     profile::{self, ExecutionConfig},
     scenario::RunRecord,
@@ -46,14 +48,67 @@ pub enum Fixture {
     RedlineProgram,
     RedshiftProgram,
     RedhatProgram,
+    RedshiftProgramSlim,
+    RedshiftProgramSlimUpgraded,
 }
 
 impl Fixture {
+    pub const ALL: [Fixture; 5] = [
+        Fixture::RedlineProgram,
+        Fixture::RedshiftProgram,
+        Fixture::RedhatProgram,
+        Fixture::RedshiftProgramSlim,
+        Fixture::RedshiftProgramSlimUpgraded,
+    ];
+
     pub const fn so_name(self) -> &'static str {
         match self {
             Fixture::RedlineProgram => "redline_program.so",
             Fixture::RedshiftProgram => "redshift_program.so",
             Fixture::RedhatProgram => "redhat_program.so",
+            Fixture::RedshiftProgramSlim => "redshift_program_slim.so",
+            Fixture::RedshiftProgramSlimUpgraded => {
+                "redshift_program_slim_upgraded.so"
+            }
+        }
+    }
+
+    pub const fn loaded_at_base_boot(self) -> bool {
+        matches!(
+            self,
+            Fixture::RedlineProgram
+                | Fixture::RedshiftProgram
+                | Fixture::RedhatProgram
+        )
+    }
+
+    pub const fn program_id(self) -> Pubkey {
+        match self {
+            Fixture::RedlineProgram => redline_interface::ID,
+            Fixture::RedshiftProgram
+            | Fixture::RedshiftProgramSlim
+            | Fixture::RedshiftProgramSlimUpgraded => redshift_interface::ID,
+            Fixture::RedhatProgram => redhat_interface::ID,
+        }
+    }
+
+    pub const fn package(self) -> &'static str {
+        match self {
+            Fixture::RedlineProgram => "redline-program",
+            Fixture::RedshiftProgram
+            | Fixture::RedshiftProgramSlim
+            | Fixture::RedshiftProgramSlimUpgraded => "redshift-program",
+            Fixture::RedhatProgram => "redhat-program",
+        }
+    }
+
+    pub const fn features(self) -> &'static [&'static str] {
+        match self {
+            Fixture::RedlineProgram
+            | Fixture::RedshiftProgram
+            | Fixture::RedhatProgram => &["default"],
+            Fixture::RedshiftProgramSlim => &[],
+            Fixture::RedshiftProgramSlimUpgraded => &["upgraded"],
         }
     }
 }
@@ -78,6 +133,7 @@ pub struct ScenarioEntry {
     pub topology: Topology,
     pub resources: &'static [Resource],
     pub fixtures: &'static [Fixture],
+    pub optional_fixtures: &'static [Fixture],
     pub run: fn(ExecutionConfig) -> ScenarioFuture,
 }
 
@@ -113,11 +169,15 @@ macro_rules! scenario_catalog {
     (@profiles $profiles:expr) => {
         $profiles
     };
-    (@execute Shared, $scenario:expr, $fixtures:expr, $config:expr) => {
-        $crate::run_shared_scenario($scenario, $fixtures, $config)
+    (@execute Shared, $scenario:expr, $fixtures:expr, $optional:expr,
+     $config:expr) => {
+        $crate::run_shared_scenario($scenario, $fixtures, $optional, $config)
     };
-    (@execute PrivateEr, $scenario:expr, $fixtures:expr, $config:expr) => {
-        $crate::run_private_er_scenario($scenario, $fixtures, $config)
+    (@execute PrivateEr, $scenario:expr, $fixtures:expr, $optional:expr,
+     $config:expr) => {
+        $crate::run_private_er_scenario(
+            $scenario, $fixtures, $optional, $config,
+        )
     };
     (@name Shared, $scenario:expr) => {
         $crate::Scenario::name(&$scenario)
@@ -131,7 +191,9 @@ macro_rules! scenario_catalog {
             $(profiles: $profiles:expr,)?
             topology: $topology:ident,
             resources: [$($resource:expr),* $(,)?],
-            fixtures: [$($fixture:expr),* $(,)?] $(,)?
+            fixtures: [$($fixture:expr),* $(,)?]
+            $(, optional_fixtures: [$($optional:expr),* $(,)?])?
+            $(,)?
         }),* $(,)?
     ) => {
         pub const SCENARIOS: &[$crate::catalog::ScenarioEntry] = &[
@@ -142,10 +204,12 @@ macro_rules! scenario_catalog {
                 topology: $crate::catalog::Topology::$topology,
                 resources: &[$($resource),*],
                 fixtures: &[$($fixture),*],
+                optional_fixtures: &[$($($optional),*)?],
                 run: |config| {
                     Box::pin($crate::scenario_catalog!(@execute $topology,
                         scenarios::$($segment)::+,
                         &[$($fixture),*],
+                        &[$($($optional),*)?],
                         ::core::result::Result::Ok(config)
                     ))
                 },
@@ -159,6 +223,7 @@ macro_rules! scenario_catalog {
                 let record = $crate::scenario_catalog!(@execute $topology,
                     scenarios::$($segment)::+,
                     &[$($fixture),*],
+                    &[$($($optional),*)?],
                     $crate::profile::ExecutionConfig::from_env()
                 )
                 .await;
