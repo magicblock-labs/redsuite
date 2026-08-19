@@ -53,7 +53,11 @@ pub(super) async fn terminate(
 ) -> Result<(ExitStatus, bool)> {
     send_signal(pid, if hard_kill { "-KILL" } else { "-TERM" });
     let grace_deadline = std::time::Instant::now() + KILL_GRACE;
-    let hard_deadline = grace_deadline + KILL_GRACE;
+    let hard_deadline = if hard_kill {
+        grace_deadline
+    } else {
+        grace_deadline + KILL_GRACE
+    };
     let mut escalated = hard_kill;
     let mut needed_sigkill = false;
     loop {

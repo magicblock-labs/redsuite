@@ -87,11 +87,12 @@ impl PrivateEr {
     // Stop the ER without a relaunch. hard_kill=true is the crash path the
     // ledger-restore scenarios use so nothing flushes on the way down.
     pub async fn stop(&mut self, hard_kill: bool) -> Result<()> {
-        let mut child = self
+        let child = self
             .child
-            .take()
+            .as_mut()
             .ok_or("private ER has no running process to stop")?;
-        process::terminate(&mut child, self.pid, hard_kill).await?;
+        process::terminate(child, self.pid, hard_kill).await?;
+        self.child = None;
         self.record.mark_finished();
         Ok(())
     }
@@ -115,14 +116,15 @@ impl PrivateEr {
     ) -> Result<RestartTiming> {
         let api = self.rpc_api();
         let slot_before = api.get_slot().await.ok();
-        let mut child = self
+        let child = self
             .child
-            .take()
+            .as_mut()
             .ok_or("private ER has no running process to restart")?;
 
         let restart_started = std::time::Instant::now();
         let (exit_status, needed_sigkill) =
-            process::terminate(&mut child, self.pid, config.hard_kill).await?;
+            process::terminate(child, self.pid, config.hard_kill).await?;
+        self.child = None;
         let shutdown = restart_started.elapsed();
         let exit_code = exit_status.code();
         let exit_signal =
