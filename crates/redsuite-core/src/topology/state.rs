@@ -24,6 +24,7 @@ pub struct StackState {
     pub er_identity_keypair: Vec<u8>,
     pub er_identity_pool: Vec<Vec<u8>>,
     pub clone_url: String,
+    pub base_programs: Vec<String>,
 }
 
 pub fn workspace_root() -> PathBuf {

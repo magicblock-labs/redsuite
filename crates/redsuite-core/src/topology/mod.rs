@@ -13,6 +13,6 @@ pub use config::{
 };
 pub use identity::{er_identity_keypair, identity_for_label};
 pub use private::{private_er, PrivateEr, RestartTiming};
-pub use shared::{base_only, shared};
+pub use shared::{base_only, running_base_programs, shared};
 pub use state::{current_state, stack_dir, workspace_root, StackState};
 pub use status::{down, status};

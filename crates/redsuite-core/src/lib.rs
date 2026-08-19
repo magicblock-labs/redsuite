@@ -5,6 +5,7 @@ pub mod context;
 pub mod dlp;
 pub mod host;
 pub mod loader_v4;
+pub mod manifest;
 pub mod mdp;
 pub mod monitor;
 pub mod prep;

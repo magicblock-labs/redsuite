@@ -134,6 +134,11 @@ pub fn persist_run(record: &RunRecord) -> Result<PathBuf> {
     let fallback;
     let report = match &record.scenario {
         ScenarioOutcome::Passed(report) => report,
+        ScenarioOutcome::Skipped(reason) => {
+            return Err(
+                format!("skipped runs are not persisted ({reason})").into()
+            )
+        }
         ScenarioOutcome::Failed(_)
         | ScenarioOutcome::Panicked(_)
         | ScenarioOutcome::NotReached => {
@@ -154,7 +159,9 @@ fn run_failures(record: &RunRecord) -> Vec<PersistedFailure> {
         ScenarioOutcome::Panicked(message) => {
             failures.push(PersistedFailure::new("scenario", "panic", message))
         }
-        ScenarioOutcome::Passed(_) | ScenarioOutcome::NotReached => {}
+        ScenarioOutcome::Passed(_)
+        | ScenarioOutcome::Skipped(_)
+        | ScenarioOutcome::NotReached => {}
     }
     for outcome in &record.phases {
         if let Some(error) = &outcome.error {

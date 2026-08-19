@@ -51,8 +51,8 @@ sha2 = "0.10"
 # against the vendored base-programs/dlp.so — see MANIFEST.toml).
 sdk = { package = "ephemeral-rollups-sdk", version = "0.16.2", default-features = false, features = ["modular-sdk"] }
 
-pubkey = { package = "solana-pubkey", version = "3" }
-hash = { package = "solana-hash", version = "3" }
+pubkey = { package = "solana-pubkey", version = "3", features = ["serde"] }
+hash = { package = "solana-hash", version = "3", features = ["serde"] }
 transaction = { package = "solana-transaction", version = "3", features = ["bincode"] }
 keypair = { package = "solana-keypair", version = "3" }
 signature = { package = "solana-signature", version = "3" }

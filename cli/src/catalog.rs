@@ -103,6 +103,7 @@ pub mod redshift {
             topology: Shared,
             resources: [Resource::Er],
             fixtures: [],
+            optional_fixtures: [],
         },
         clone_on_access => chainlink::clone_on_access::CloneOnAccess {
             topology: Shared,
@@ -182,7 +183,11 @@ pub mod redshift {
         loader_matrix => chainlink::loader_matrix::LoaderMatrix {
             topology: Shared,
             resources: [Resource::Er],
-            fixtures: [Fixture::RedshiftProgram],
+            fixtures: [
+                Fixture::RedshiftProgram,
+                Fixture::RedshiftProgramSlim,
+                Fixture::RedshiftProgramSlimUpgraded,
+            ],
         },
         post_delegation_token_transfer => chainlink::post_delegation_token_transfer::PostDelegationTokenTransfer {
             topology: Shared,

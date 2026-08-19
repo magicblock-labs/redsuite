@@ -7,8 +7,7 @@ use std::{
 use keypair::Keypair;
 use pubkey::Pubkey;
 
-use super::state;
-use crate::Result;
+use crate::{catalog::Fixture, manifest, Result};
 
 pub const DLP_ID: &str = "DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh";
 pub const MDP_ID: &str = "DmnRGfyyftzacFb1XadYhWF6vWqXwtQk5tbr6XgR3BA1";
@@ -26,21 +25,6 @@ const CLONED_UPGRADEABLE_PROGRAMS: &[&str] =
 const CLONED_LEGACY_PROGRAMS: &[&str] =
     &[MEMO_V1_ID, MEMO_V2_ID, ATA_PROGRAM_ID];
 
-const FAMILY_PROGRAMS: &[(&str, &str)] = &[
-    (
-        "3JnJ727jWEmPVU8qfXwtH63sCNDX7nMgsLbg8qy8aaPX",
-        "redline_program.so",
-    ),
-    (
-        "AijneHkXJVVWyimuwfSJdrJktARZu2WiMaZBqHsq7CS5",
-        "redshift_program.so",
-    ),
-    (
-        "BTczL2chGpVHw25pbmMtkFAD1t7rxoa8pVbaUjsybjiq",
-        "redhat_program.so",
-    ),
-];
-
 // Extra genesis copies of redline_program.so under derived addresses, so
 // scenarios can spread identical load across distinct program ids.
 const REDLINE_ALIAS_COUNT: usize = 8;
@@ -50,15 +34,11 @@ pub fn redline_alias_ids(count: usize) -> Vec<Pubkey> {
         count <= REDLINE_ALIAS_COUNT,
         "only {REDLINE_ALIAS_COUNT} redline aliases are loaded at base boot"
     );
-    let redline_id: Pubkey = FAMILY_PROGRAMS[0]
-        .0
-        .parse()
-        .expect("redline program id parses");
     (0..count)
         .map(|index| {
             Pubkey::find_program_address(
                 &[b"redsuite-alias", &[index as u8]],
-                &redline_id,
+                &redline_interface::ID,
             )
             .0
         })
@@ -66,34 +46,29 @@ pub fn redline_alias_ids(count: usize) -> Vec<Pubkey> {
 }
 
 pub fn redshift_loader_v3_target() -> (Pubkey, Pubkey) {
-    let redshift_id: Pubkey = FAMILY_PROGRAMS[1]
-        .0
-        .parse()
-        .expect("redshift program id parses");
-    let id =
-        Pubkey::find_program_address(&[b"redsuite-loader-v3"], &redshift_id).0;
+    let id = Pubkey::find_program_address(
+        &[b"redsuite-loader-v3"],
+        &redshift_interface::ID,
+    )
+    .0;
     let authority = Pubkey::find_program_address(
         &[b"redsuite-loader-v3-auth"],
-        &redshift_id,
+        &redshift_interface::ID,
     )
     .0;
     (id, authority)
 }
 
 pub fn redline_loader_v3_pair() -> [(Pubkey, Pubkey); 2] {
-    let redline_id: Pubkey = FAMILY_PROGRAMS[0]
-        .0
-        .parse()
-        .expect("redline program id parses");
     [0u8, 1u8].map(|index| {
         let id = Pubkey::find_program_address(
             &[b"redsuite-redline-v3", &[index]],
-            &redline_id,
+            &redline_interface::ID,
         )
         .0;
         let authority = Pubkey::find_program_address(
             &[b"redsuite-redline-v3-auth", &[index]],
-            &redline_id,
+            &redline_interface::ID,
         )
         .0;
         (id, authority)
@@ -162,36 +137,47 @@ pub(super) fn bin_name(path: &Path) -> String {
         .into_owned()
 }
 
-fn base_programs(er_bin: &Path) -> Result<Vec<(String, PathBuf)>> {
-    let root = state::workspace_root();
-    let mut programs = Vec::new();
+struct StagedPrograms {
+    bpf: Vec<(String, PathBuf)>,
+    loaded_fixtures: Vec<String>,
+}
+
+fn base_programs(er_bin: &Path) -> Result<StagedPrograms> {
+    let mut bpf = Vec::new();
+    let mut loaded_fixtures = Vec::new();
 
     match committor_so(er_bin) {
-        Some(so) => programs.push((COMMITTOR_ID.to_owned(), so)),
+        Some(so) => bpf.push((COMMITTOR_ID.to_owned(), so)),
         None => eprintln!(
             "[redsuite] warning: magicblock_committor_program.so not found in the ER binary's \
              build tree (cargo build-sbf it in the validator repo) — commit scenarios will fail"
         ),
     }
 
-    for (id, name) in FAMILY_PROGRAMS {
-        let so = root.join("target/deploy").join(name);
-        if so.exists() {
-            programs.push(((*id).to_owned(), so));
-        } else {
-            eprintln!(
-                "[redsuite] warning: {name} not built (run `cargo xtask programs`) — \
-                 its family's scenarios will fail"
-            );
+    for fixture in Fixture::ALL {
+        if !fixture.loaded_at_base_boot() {
+            continue;
+        }
+        match manifest::resolve(fixture) {
+            Ok(so) => {
+                bpf.push((fixture.program_id().to_string(), so));
+                loaded_fixtures.push(fixture.so_name().to_owned());
+            }
+            Err(error) => eprintln!(
+                "[redsuite] warning: {error} — its family's scenarios will fail"
+            ),
         }
     }
-    Ok(programs)
+    Ok(StagedPrograms {
+        bpf,
+        loaded_fixtures,
+    })
 }
 
 fn redline_aliases_of(so: &Path) -> Vec<Pubkey> {
     if so
         .file_name()
-        .is_some_and(|name| name == "redline_program.so")
+        .is_some_and(|name| name == Fixture::RedlineProgram.so_name())
     {
         redline_alias_ids(REDLINE_ALIAS_COUNT)
     } else {
@@ -221,6 +207,7 @@ pub(super) struct BasePlan {
     pub(super) upgradeable_v3: Vec<(Pubkey, PathBuf, Pubkey)>,
     // (program id, .so) loaded via --bpf-program; redline gets its aliases
     pub(super) bpf_programs: Vec<(String, PathBuf)>,
+    pub(super) loaded_fixtures: Vec<String>,
 }
 
 impl BasePlan {
@@ -233,19 +220,17 @@ impl BasePlan {
         gossip_port: u16,
         clone_url: String,
     ) -> Result<Self> {
-        let deploy = state::workspace_root().join("target/deploy");
         let mut upgradeable_v3 = Vec::new();
-        let redshift_so = deploy.join("redshift_program.so");
-        if redshift_so.exists() {
+        if let Ok(redshift_so) = manifest::resolve(Fixture::RedshiftProgram) {
             let (v3_id, v3_authority) = redshift_loader_v3_target();
             upgradeable_v3.push((v3_id, redshift_so, v3_authority));
         }
-        let redline_so = deploy.join("redline_program.so");
-        if redline_so.exists() {
+        if let Ok(redline_so) = manifest::resolve(Fixture::RedlineProgram) {
             for (id, authority) in redline_loader_v3_pair() {
                 upgradeable_v3.push((id, redline_so.clone(), authority));
             }
         }
+        let staged = base_programs(er_bin)?;
         Ok(Self {
             bin,
             rpc_port,
@@ -255,7 +240,8 @@ impl BasePlan {
             genesis_accounts: stack_dir.join("genesis-accounts"),
             clone_url,
             upgradeable_v3,
-            bpf_programs: base_programs(er_bin)?,
+            bpf_programs: staged.bpf,
+            loaded_fixtures: staged.loaded_fixtures,
         })
     }
 
@@ -451,15 +437,18 @@ mod tests {
                 Pubkey::new_unique(),
             )],
             bpf_programs: vec![(
-                FAMILY_PROGRAMS[0].0.to_owned(),
+                Fixture::RedlineProgram.program_id().to_string(),
                 PathBuf::from("/tmp/redline_program.so"),
             )],
+            loaded_fixtures: vec![Fixture::RedlineProgram.so_name().to_owned()],
         };
         let args = args_of(&plan.command());
         assert!(args.contains(&"--upgradeable-program".to_owned()));
         // the redline .so loads under its id plus every alias
         let loads = args.iter().filter(|arg| *arg == "--bpf-program").count();
         assert_eq!(loads, 1 + REDLINE_ALIAS_COUNT);
-        assert!(args.contains(&FAMILY_PROGRAMS[0].0.to_owned()));
+        assert!(
+            args.contains(&Fixture::RedlineProgram.program_id().to_string())
+        );
     }
 }

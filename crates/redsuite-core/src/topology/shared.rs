@@ -22,6 +22,12 @@ pub async fn shared(config: ExecutionConfig) -> Result<(BaseCtx, ErCtx)> {
     contexts(&state, config)
 }
 
+pub fn running_base_programs() -> Option<Vec<String>> {
+    let state = state::read_state()?;
+    process::proc_matches(state.base_pid, &state.base_bin)
+        .then_some(state.base_programs)
+}
+
 pub async fn base_only(config: ExecutionConfig) -> Result<BaseCtx> {
     let dir = state::stack_dir();
     fs::create_dir_all(&dir)?;
@@ -167,6 +173,7 @@ async fn boot_base(config: ExecutionConfig) -> Result<StackState> {
             .map(|reserved| reserved.to_bytes().to_vec())
             .collect(),
         clone_url,
+        base_programs: plan.loaded_fixtures.clone(),
     };
 
     match await_base_ready(&state, &base_log, config).await {

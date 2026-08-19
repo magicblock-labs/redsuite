@@ -4,7 +4,7 @@ use std::{
     process::{exit, Command},
 };
 
-use redsuite_core::{report, topology};
+use redsuite_core::{catalog::Fixture, manifest, report, topology};
 
 type Result<T> = redsuite_core::Result<T>;
 
@@ -113,12 +113,18 @@ fn programs() -> Result<()> {
                 .args(["--", "--config", SBF_LTO]),
         )?;
     }
-    build_redshift_variant("slim", &[], "redshift_program_slim.so")?;
+    build_redshift_variant(
+        "slim",
+        &[],
+        Fixture::RedshiftProgramSlim.so_name(),
+    )?;
     build_redshift_variant(
         "slim-upgraded",
         &["upgraded"],
-        "redshift_program_slim_upgraded.so",
+        Fixture::RedshiftProgramSlimUpgraded.so_name(),
     )?;
+    let manifest_path = manifest::emit()?;
+    eprintln!("staged fixture manifest: {}", manifest_path.display());
     Ok(())
 }
 

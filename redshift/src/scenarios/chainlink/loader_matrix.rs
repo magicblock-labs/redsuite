@@ -5,8 +5,8 @@ use instruction::{AccountMeta, Instruction};
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    check, check_eq, loader_v4, prep, topology, BaseCtx, ChainCtx, CheckError,
-    ErCtx, Result, Scenario, ScenarioReport,
+    catalog::Fixture, check, check_eq, loader_v4, manifest, prep, topology,
+    BaseCtx, ChainCtx, CheckError, ErCtx, Result, Scenario, ScenarioReport,
 };
 use signer::Signer;
 
@@ -80,16 +80,17 @@ impl Scenario for LoaderMatrix {
             "the v3 program invocation must emit its LogMsg line"
         )?;
 
-        let root = topology::workspace_root().join("target/deploy");
-        let base_bytes = std::fs::read(root.join("redshift_program_slim.so"))
-            .map_err(|err| {
-            format!("reading the slim redshift .so: {err}")
-        })?;
-        let upgraded_bytes =
-            std::fs::read(root.join("redshift_program_slim_upgraded.so"))
+        let base_bytes =
+            std::fs::read(manifest::resolve(Fixture::RedshiftProgramSlim)?)
                 .map_err(|err| {
-                    format!("reading the slim upgraded redshift .so: {err}")
+                    format!("reading the slim redshift .so: {err}")
                 })?;
+        let upgraded_bytes = std::fs::read(manifest::resolve(
+            Fixture::RedshiftProgramSlimUpgraded,
+        )?)
+        .map_err(|err| {
+            format!("reading the slim upgraded redshift .so: {err}")
+        })?;
 
         let authority = prep::funded_payer(base, V4_AUTHORITY_FUNDING).await?;
         let program = Keypair::new();
