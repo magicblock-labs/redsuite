@@ -66,14 +66,9 @@ async fn commit_undelegate_lifecycle(
     base_negative_payer: &Keypair,
     count: usize,
 ) -> Result<LifecycleOutcome> {
-    let committees = crate::init_schedulecommit_committees(
-        base,
-        payer,
-        er.identity(),
-        count,
-    )
-    .await?;
-    crate::await_committee_clones(er, &committees).await?;
+    let committees =
+        prep::init_committees(base, payer, er.identity(), count).await?;
+    prep::await_committee_clones(er, &committees).await?;
     let players: Vec<_> =
         committees.iter().map(|c| c.player.pubkey()).collect();
     let pdas: Vec<_> = committees.iter().map(|c| c.pda).collect();
@@ -461,14 +456,9 @@ async fn test_mod_after_rejection(
     count: usize,
 ) -> Result<()> {
     let payer = Rc::new(prep::funded_payer(base, crate::PAYER_LAMPORTS).await?);
-    let committees = crate::init_schedulecommit_committees(
-        base,
-        &payer,
-        er.identity(),
-        count,
-    )
-    .await?;
-    crate::await_committee_clones(er, &committees).await?;
+    let committees =
+        prep::init_committees(base, &payer, er.identity(), count).await?;
+    prep::await_committee_clones(er, &committees).await?;
     let players: Vec<_> =
         committees.iter().map(|c| c.player.pubkey()).collect();
     rejected_intent_cell(
@@ -498,9 +488,8 @@ async fn test_mod_after_rejection(
 async fn test_twice_rejection(base: &BaseCtx, er: &ErCtx) -> Result<()> {
     let payer = Rc::new(prep::funded_payer(base, crate::PAYER_LAMPORTS).await?);
     let committees =
-        crate::init_schedulecommit_committees(base, &payer, er.identity(), 2)
-            .await?;
-    crate::await_committee_clones(er, &committees).await?;
+        prep::init_committees(base, &payer, er.identity(), 2).await?;
+    prep::await_committee_clones(er, &committees).await?;
     let players: Vec<_> =
         committees.iter().map(|c| c.player.pubkey()).collect();
     rejected_intent_cell(
@@ -526,9 +515,8 @@ async fn test_failed_undelegation_lockout(
     .await?;
 
     let committees =
-        crate::init_schedulecommit_committees(base, &payer, er.identity(), 1)
-            .await?;
-    crate::await_committee_clones(er, &committees).await?;
+        prep::init_committees(base, &payer, er.identity(), 1).await?;
+    prep::await_committee_clones(er, &committees).await?;
     let player = committees[0].player.pubkey();
     let pda = committees[0].pda;
 

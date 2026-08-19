@@ -5,112 +5,24 @@ use keypair::Keypair;
 use pubkey::Pubkey;
 use redshift_interface::flexi::{build as flexi, FlexiCounter};
 use redsuite_core::{
-    check, check_eq, dlp, prep, system, topology, BaseCtx, ChainCtx, ErCtx,
+    check, check_eq, dlp, prep, system, BaseCtx, ChainCtx, ErCtx,
     PrivateErScenario, Result, ScenarioReport,
 };
 use signature::Signature;
 use signer::Signer;
 
+use super::{
+    advance_slots, await_er_balance, boot_reader, boot_writer, counter_actor,
+    CLONE_TIMEOUT, PERSIST_SLOTS, SOL,
+};
+
 const RENT_EXEMPT: u64 = 890_880;
-const SOL: u64 = 1_000_000_000;
-const PERSIST_SLOTS: u64 = 11;
-const READY_TIMEOUT: Duration = Duration::from_secs(60);
-const SLOT_TIMEOUT: Duration = Duration::from_secs(30);
-const CLONE_TIMEOUT: Duration = Duration::from_secs(20);
 const TX_TIMEOUT: Duration = Duration::from_secs(20);
-const COMMIT_FREQUENCY_MS: u32 = 1_000_000_000;
 const LABEL_ONE: &str = "counter of payer 1";
 const LABEL_TWO: &str = "counter of payer 2";
 const LABEL_FRESH: &str = "counter of the fresh authority";
 
 pub struct LedgerRestoreBasics;
-
-async fn advance_slots(er: &ErCtx, count: u64) -> Result<u64> {
-    let target = er.api().get_slot().await? + count;
-    check::poll(
-        &format!("the er reaches slot {target}"),
-        SLOT_TIMEOUT,
-        || async {
-            matches!(er.api().get_slot().await, Ok(slot) if slot >= target)
-        },
-    )
-    .await?;
-    er.api().get_slot().await
-}
-
-async fn boot_writer(
-    base: &BaseCtx,
-    label: &str,
-) -> Result<topology::PrivateEr> {
-    let er = topology::private_er(
-        base,
-        topology::ErOptions {
-            label: label.to_owned(),
-            ..Default::default()
-        },
-    )
-    .await?;
-    er.wait_ready(READY_TIMEOUT).await?;
-    Ok(er)
-}
-
-async fn boot_reader(
-    base: &BaseCtx,
-    label: &str,
-    lifecycle: &str,
-    reset: bool,
-    env: Vec<(String, String)>,
-) -> Result<topology::PrivateEr> {
-    let er = topology::private_er(
-        base,
-        topology::ErOptions {
-            label: label.to_owned(),
-            lifecycle: lifecycle.to_owned(),
-            keep_storage: true,
-            reset,
-            env,
-            ..Default::default()
-        },
-    )
-    .await?;
-    er.wait_ready(READY_TIMEOUT).await?;
-    Ok(er)
-}
-
-async fn delegated_wallet(
-    base: &BaseCtx,
-    funder: &Keypair,
-    validator: Pubkey,
-    lamports: u64,
-) -> Result<Keypair> {
-    let wallet = Keypair::new();
-    base.airdrop(&wallet.pubkey(), lamports).await?;
-    let setup = [
-        system::assign(&wallet.pubkey(), &dlp::dlp_id()),
-        dlp::delegate_account(&funder.pubkey(), &wallet.pubkey(), &validator),
-    ];
-    base.send_with(funder, &[&wallet], &setup).await?;
-    Ok(wallet)
-}
-
-async fn await_er_balance(
-    er: &ErCtx,
-    account: &Pubkey,
-    expected: u64,
-) -> Result<()> {
-    check::poll(
-        &format!("the er balance of {account} reaches {expected}"),
-        CLONE_TIMEOUT,
-        || async {
-            matches!(
-                er.api().get_balance(account).await,
-                Ok(balance) if balance == expected
-            )
-        },
-    )
-    .await?;
-    Ok(())
-}
 
 async fn transfer(
     er: &ErCtx,
@@ -135,52 +47,6 @@ async fn assert_restored_tx(er: &ErCtx, signature: &Signature) -> Result<()> {
         "a restored transaction must keep its ok status"
     )?;
     Ok(())
-}
-
-struct CounterActor {
-    payer: Keypair,
-    counter: Pubkey,
-}
-
-async fn counter_actor(
-    base: &BaseCtx,
-    er: &ErCtx,
-    funder: &Keypair,
-    label: &str,
-) -> Result<CounterActor> {
-    let payer = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
-    let (init, counter) = flexi::init_counter(payer.pubkey(), label);
-    base.send(&payer, &[init]).await?;
-    base.send(
-        &payer,
-        &[flexi::delegate_counter(
-            payer.pubkey(),
-            COMMIT_FREQUENCY_MS,
-            Some(er.identity()),
-        )],
-    )
-    .await?;
-    let setup = [
-        system::assign(&payer.pubkey(), &dlp::dlp_id()),
-        dlp::delegate_account(
-            &funder.pubkey(),
-            &payer.pubkey(),
-            &er.identity(),
-        ),
-    ];
-    base.send_with(funder, &[&payer], &setup).await?;
-    check::poll(
-        "the er clones the delegated counter",
-        CLONE_TIMEOUT,
-        || async {
-            matches!(
-                er.account(&counter).await,
-                Ok(Some(clone)) if !clone.data.is_empty()
-            )
-        },
-    )
-    .await?;
-    Ok(CounterActor { payer, counter })
 }
 
 async fn assert_counter(
@@ -237,7 +103,8 @@ impl PrivateErScenario for LedgerRestoreBasics {
                 let lamports =
                     RENT_EXEMPT + if index == 0 { 5 * SOL } else { 0 };
                 wallets.push(
-                    delegated_wallet(base, &funder, identity, lamports).await?,
+                    prep::delegated_payer(base, &funder, identity, lamports)
+                        .await?,
                 );
             }
             let er = writer.ctx();
@@ -367,11 +234,13 @@ impl PrivateErScenario for LedgerRestoreBasics {
             let identity = writer.ctx().identity();
             advance_slots(writer.ctx(), 1).await?;
             let sender =
-                delegated_wallet(base, &funder, identity, 1_111_111).await?;
+                prep::delegated_payer(base, &funder, identity, 1_111_111)
+                    .await?;
             await_er_balance(writer.ctx(), &sender.pubkey(), 1_111_111).await?;
             advance_slots(writer.ctx(), 3).await?;
             let receiver =
-                delegated_wallet(base, &funder, identity, 1_000_000).await?;
+                prep::delegated_payer(base, &funder, identity, 1_000_000)
+                    .await?;
             await_er_balance(writer.ctx(), &receiver.pubkey(), 1_000_000)
                 .await?;
             let signature =

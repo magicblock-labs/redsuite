@@ -33,14 +33,14 @@ impl Scenario for Commits {
         let mut report = ScenarioReport::ok(self.name());
 
         for committee_count in [1usize, 2] {
-            let committees = crate::init_schedulecommit_committees(
+            let committees = prep::init_committees(
                 base,
                 &payer,
                 er.identity(),
                 committee_count,
             )
             .await?;
-            crate::await_committee_clones(er, &committees).await?;
+            prep::await_committee_clones(er, &committees).await?;
             let players: Vec<_> =
                 committees.iter().map(|c| c.player.pubkey()).collect();
             let pdas: Vec<_> = committees.iter().map(|c| c.pda).collect();
@@ -123,14 +123,10 @@ impl Scenario for Commits {
         .await?;
         let other_validator = Keypair::new();
 
-        let foreign = crate::init_schedulecommit_committees(
-            base,
-            &payer,
-            other_validator.pubkey(),
-            1,
-        )
-        .await?;
-        crate::await_committee_clones(er, &foreign).await?;
+        let foreign =
+            prep::init_committees(base, &payer, other_validator.pubkey(), 1)
+                .await?;
+        prep::await_committee_clones(er, &foreign).await?;
         let (foreign_player, foreign_pda) =
             (foreign[0].player.pubkey(), foreign[0].pda);
         let illegal_commit = er
@@ -175,14 +171,10 @@ impl Scenario for Commits {
             );
         }
 
-        let undelegate = crate::init_schedulecommit_committees(
-            base,
-            &payer,
-            other_validator.pubkey(),
-            1,
-        )
-        .await?;
-        crate::await_committee_clones(er, &undelegate).await?;
+        let undelegate =
+            prep::init_committees(base, &payer, other_validator.pubkey(), 1)
+                .await?;
+        prep::await_committee_clones(er, &undelegate).await?;
         let (undelegate_player, undelegate_pda) =
             (undelegate[0].player.pubkey(), undelegate[0].pda);
         let illegal_undelegate = er

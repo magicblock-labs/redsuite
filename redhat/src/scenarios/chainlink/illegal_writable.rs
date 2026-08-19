@@ -5,8 +5,8 @@ use instruction::Instruction;
 use keypair::Keypair;
 use redshift_interface::schedulecommit::{build, ScheduleCommitType};
 use redsuite_core::{
-    check, check_eq, prep, system, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
-    ScenarioReport,
+    check, check_eq, dlp, prep, system, BaseCtx, ChainCtx, ErCtx, Result,
+    Scenario, ScenarioReport,
 };
 use signer::Signer;
 
@@ -55,9 +55,8 @@ impl Scenario for IllegalWritable {
     async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
         let funder = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
         let committees =
-            crate::init_delegated_committees(base, &funder, er.identity(), 2)
-                .await?;
-        crate::await_committee_clones(er, &committees).await?;
+            prep::init_committees(base, &funder, er.identity(), 2).await?;
+        prep::await_committee_clones(er, &committees).await?;
         let players: Vec<_> =
             committees.iter().map(|c| c.player.pubkey()).collect();
         let pdas: Vec<_> = committees.iter().map(|c| c.pda).collect();
@@ -141,7 +140,7 @@ impl Scenario for IllegalWritable {
                 .ok_or("the committee pda vanished from base")?;
             check_eq!(
                 on_base.owner,
-                crate::DELEGATION_PROGRAM_ID,
+                dlp::dlp_id(),
                 "a refused attack must leave the committee delegated"
             )?;
         }

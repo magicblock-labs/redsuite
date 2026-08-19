@@ -342,9 +342,8 @@ async fn test_magic_cpi_crank(
     )
     .await?;
     let committees =
-        crate::init_schedulecommit_committees(base, funder, er.identity(), 1)
-            .await?;
-    crate::await_committee_clones(er, &committees).await?;
+        prep::init_committees(base, funder, er.identity(), 1).await?;
+    prep::await_committee_clones(er, &committees).await?;
     let player = committees[0].player.pubkey();
     let committee = committees[0].pda;
 
