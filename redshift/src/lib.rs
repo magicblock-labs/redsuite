@@ -5,7 +5,6 @@ use std::time::Duration;
 use keypair::Keypair;
 use pubkey::Pubkey;
 pub use redline_interface as program;
-use redshift_interface::schedulecommit::{build, MainAccount};
 use redsuite_core::{
     check, check_eq, receipt, BaseCtx, ChainCtx, ErCtx, Result,
 };
@@ -15,64 +14,8 @@ pub const ACCOUNT_SPACE: u32 = 128;
 pub const PAYER_LAMPORTS: u64 = 2_000_000_000;
 pub const COMMIT_FREQUENCY_MS: u32 = 1_000_000_000;
 
-const COMMITTEE_CLONE_TIMEOUT: Duration = Duration::from_secs(15);
 const RECEIPT_TIMEOUT: Duration = Duration::from_secs(30);
 const BASE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(20);
-
-pub struct Committee {
-    pub player: Keypair,
-    pub pda: Pubkey,
-}
-
-pub async fn init_schedulecommit_committees(
-    base: &BaseCtx,
-    payer: &Keypair,
-    validator: Pubkey,
-    count: usize,
-) -> Result<Vec<Committee>> {
-    let mut committees = Vec::with_capacity(count);
-    for _ in 0..count {
-        let player = Keypair::new();
-        let (init, pda) = build::init_account(payer.pubkey(), player.pubkey());
-        let delegate = build::delegate_cpi(
-            payer.pubkey(),
-            player.pubkey(),
-            COMMIT_FREQUENCY_MS,
-            Some(validator),
-        );
-        base.send_with(payer, &[&player], &[init, delegate]).await?;
-        let on_base = base.account(&pda).await?.ok_or(
-            "the committee pda is not on base after init and delegate",
-        )?;
-        check_eq!(
-            on_base.owner,
-            program::DELEGATION_PROGRAM_ID,
-            "dlp must own a delegated committee on base"
-        )?;
-        committees.push(Committee { player, pda });
-    }
-    Ok(committees)
-}
-
-pub async fn await_committee_clones(
-    er: &ErCtx,
-    committees: &[Committee],
-) -> Result<()> {
-    for committee in committees {
-        check::poll(
-            &format!("the ER clones committee {}", committee.pda),
-            COMMITTEE_CLONE_TIMEOUT,
-            || async {
-                matches!(
-                    er.account(&committee.pda).await,
-                    Ok(Some(clone)) if clone.data.len() == MainAccount::SIZE
-                )
-            },
-        )
-        .await?;
-    }
-    Ok(())
-}
 
 pub async fn assert_commit_receipt(
     base: &BaseCtx,

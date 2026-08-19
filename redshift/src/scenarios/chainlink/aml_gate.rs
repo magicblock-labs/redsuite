@@ -11,7 +11,6 @@ use std::{
 };
 
 use async_trait::async_trait;
-use instruction::{AccountMeta, Instruction};
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
@@ -27,11 +26,8 @@ use sdk::spl::{
 };
 use signer::Signer;
 
-const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
-const ATA_PROGRAM: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
+use super::spl;
 
-const MINT_LEN: u64 = 82;
-const MINT_RENT: u64 = 2_000_000;
 const AIRDROP: u64 = 2_000_000_000;
 const SHUTTLE_AMOUNT: u64 = 200;
 const SHUTTLE_ID: u32 = 0;
@@ -245,8 +241,8 @@ async fn run_risk_case(
     let recipient = Keypair::new();
     let mint = Keypair::new();
 
-    let source_ata = derive_ata(&owner_pk, &mint.pubkey());
-    let destination_ata = derive_ata(&recipient.pubkey(), &mint.pubkey());
+    let source_ata = spl::derive_ata(&owner_pk, &mint.pubkey());
+    let destination_ata = spl::derive_ata(&recipient.pubkey(), &mint.pubkey());
 
     let (shuttle_ephemeral_ata, _) =
         find_shuttle_ephemeral_ata(&owner_pk, &mint.pubkey(), SHUTTLE_ID);
@@ -258,18 +254,22 @@ async fn run_risk_case(
         system::create_account(
             &fee_payer.pubkey(),
             &mint.pubkey(),
-            MINT_RENT,
-            MINT_LEN,
-            &token_program(),
+            spl::MINT_RENT,
+            spl::MINT_LEN,
+            &spl::token_program(),
         ),
-        initialize_mint(&mint.pubkey(), &owner_pk),
-        create_ata_idempotent(&fee_payer.pubkey(), &owner_pk, &mint.pubkey()),
-        create_ata_idempotent(
+        spl::initialize_mint(&mint.pubkey(), &owner_pk),
+        spl::create_ata_idempotent(
+            &fee_payer.pubkey(),
+            &owner_pk,
+            &mint.pubkey(),
+        ),
+        spl::create_ata_idempotent(
             &fee_payer.pubkey(),
             &recipient.pubkey(),
             &mint.pubkey(),
         ),
-        mint_to(&mint.pubkey(), &source_ata, &owner_pk, SHUTTLE_AMOUNT),
+        spl::mint_to(&mint.pubkey(), &source_ata, &owner_pk, SHUTTLE_AMOUNT),
     ];
     base.send_with(&fee_payer, &[&mint, &owner], &setup_ixs)
         .await?;
@@ -474,78 +474,7 @@ async fn merge_attempt(
 }
 
 async fn er_token_amount(er: &ErCtx, ata: &Pubkey) -> Result<u64> {
-    let Some(account) = er.account(ata).await? else {
-        return Ok(0);
-    };
-    if account.data.len() < 72 {
-        return Ok(0);
-    }
-    Ok(u64::from_le_bytes(account.data[64..72].try_into()?))
-}
-
-fn token_program() -> Pubkey {
-    TOKEN_PROGRAM.parse().expect("token program id")
-}
-
-fn ata_program() -> Pubkey {
-    ATA_PROGRAM.parse().expect("ata program id")
-}
-
-fn derive_ata(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
-    Pubkey::find_program_address(
-        &[owner.as_ref(), token_program().as_ref(), mint.as_ref()],
-        &ata_program(),
-    )
-    .0
-}
-
-fn initialize_mint(mint: &Pubkey, authority: &Pubkey) -> Instruction {
-    let mut data = vec![20u8, 0u8];
-    data.extend_from_slice(authority.as_ref());
-    data.push(0);
-    Instruction {
-        program_id: token_program(),
-        accounts: vec![AccountMeta::new(*mint, false)],
-        data,
-    }
-}
-
-fn create_ata_idempotent(
-    funder: &Pubkey,
-    owner: &Pubkey,
-    mint: &Pubkey,
-) -> Instruction {
-    Instruction {
-        program_id: ata_program(),
-        accounts: vec![
-            AccountMeta::new(*funder, true),
-            AccountMeta::new(derive_ata(owner, mint), false),
-            AccountMeta::new_readonly(*owner, false),
-            AccountMeta::new_readonly(*mint, false),
-            AccountMeta::new_readonly(system::system_id(), false),
-            AccountMeta::new_readonly(token_program(), false),
-        ],
-        data: vec![1],
-    }
-}
-
-fn mint_to(
-    mint: &Pubkey,
-    destination: &Pubkey,
-    authority: &Pubkey,
-    amount: u64,
-) -> Instruction {
-    let mut data = vec![7u8];
-    data.extend_from_slice(&amount.to_le_bytes());
-    Instruction {
-        program_id: token_program(),
-        accounts: vec![
-            AccountMeta::new(*mint, false),
-            AccountMeta::new(*destination, false),
-            AccountMeta::new_readonly(*authority, true),
-        ],
-        data,
-    }
+    Ok(spl::token_balance(er, ata).await?.unwrap_or(0))
 }
 
 async fn delegation_record_exists(

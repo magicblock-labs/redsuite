@@ -19,12 +19,10 @@ use redsuite_core::{
 };
 use signer::Signer;
 
-const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
-const ATA_PROGRAM: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
+use super::spl;
+
 const EATA_PROGRAM: &str = "SPLxh1LVZzEkX99H6rqYizhytLWPZVV296zyYDPagv2";
 
-const MINT_LEN: u64 = 82;
-const MINT_RENT: u64 = 2_000_000;
 const AIRDROP: u64 = 2_000_000_000;
 const SOURCE_BALANCE: u64 = 200;
 const DESTINATION_BALANCE: u64 = 100;
@@ -32,7 +30,6 @@ const TRANSFER_AMOUNT: u64 = 100;
 const PLAIN_BALANCE: u64 = 70;
 const FOREIGN_BALANCE: u64 = 40;
 const FAILING_AMOUNT: u64 = 1_000_000;
-const TOKEN_AMOUNT_OFFSET: usize = 64;
 const PROJECTION_TIMEOUT: Duration = Duration::from_secs(20);
 const ACTION_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -56,8 +53,8 @@ impl Scenario for PostDelegationTokenTransfer {
         let mint_key = mint.pubkey();
         let source = source_authority.pubkey();
         let destination = destination_authority.pubkey();
-        let source_ata = derive_ata(&source, &mint_key);
-        let destination_ata = derive_ata(&destination, &mint_key);
+        let source_ata = spl::derive_ata(&source, &mint_key);
+        let destination_ata = spl::derive_ata(&destination, &mint_key);
 
         base.send_with(
             &fee_payer,
@@ -66,19 +63,23 @@ impl Scenario for PostDelegationTokenTransfer {
                 system::create_account(
                     &fee_payer.pubkey(),
                     &mint_key,
-                    MINT_RENT,
-                    MINT_LEN,
-                    &token_program(),
+                    spl::MINT_RENT,
+                    spl::MINT_LEN,
+                    &spl::token_program(),
                 ),
-                initialize_mint(&mint_key, &source),
-                create_ata_idempotent(&fee_payer.pubkey(), &source, &mint_key),
-                create_ata_idempotent(
+                spl::initialize_mint(&mint_key, &source),
+                spl::create_ata_idempotent(
+                    &fee_payer.pubkey(),
+                    &source,
+                    &mint_key,
+                ),
+                spl::create_ata_idempotent(
                     &fee_payer.pubkey(),
                     &destination,
                     &mint_key,
                 ),
-                mint_to(&mint_key, &source_ata, &source, SOURCE_BALANCE),
-                mint_to(
+                spl::mint_to(&mint_key, &source_ata, &source, SOURCE_BALANCE),
+                spl::mint_to(
                     &mint_key,
                     &destination_ata,
                     &source,
@@ -188,17 +189,17 @@ impl Scenario for PostDelegationTokenTransfer {
         // negative: an ATA with NO eATA must clone as the plain chain
         // account, never a projection.
         let plain_owner = Keypair::new().pubkey();
-        let plain_ata = derive_ata(&plain_owner, &mint_key);
+        let plain_ata = spl::derive_ata(&plain_owner, &mint_key);
         base.send_with(
             &fee_payer,
             &[&source_authority],
             &[
-                create_ata_idempotent(
+                spl::create_ata_idempotent(
                     &fee_payer.pubkey(),
                     &plain_owner,
                     &mint_key,
                 ),
-                mint_to(&mint_key, &plain_ata, &source, PLAIN_BALANCE),
+                spl::mint_to(&mint_key, &plain_ata, &source, PLAIN_BALANCE),
             ],
         )
         .await?;
@@ -219,13 +220,17 @@ impl Scenario for PostDelegationTokenTransfer {
         let foreign_validator = Keypair::new().pubkey();
         let foreign_authority = Keypair::new();
         let foreign = foreign_authority.pubkey();
-        let foreign_ata = derive_ata(&foreign, &mint_key);
+        let foreign_ata = spl::derive_ata(&foreign, &mint_key);
         base.send_with(
             &fee_payer,
             &[&source_authority],
             &[
-                create_ata_idempotent(&fee_payer.pubkey(), &foreign, &mint_key),
-                mint_to(&mint_key, &foreign_ata, &source, FOREIGN_BALANCE),
+                spl::create_ata_idempotent(
+                    &fee_payer.pubkey(),
+                    &foreign,
+                    &mint_key,
+                ),
+                spl::mint_to(&mint_key, &foreign_ata, &source, FOREIGN_BALANCE),
                 initialize_eata(&fee_payer.pubkey(), &foreign, &mint_key),
             ],
         )
@@ -343,24 +348,8 @@ impl Scenario for PostDelegationTokenTransfer {
     }
 }
 
-fn token_program() -> Pubkey {
-    TOKEN_PROGRAM.parse().expect("token program id")
-}
-
-fn ata_program() -> Pubkey {
-    ATA_PROGRAM.parse().expect("ata program id")
-}
-
 fn eata_program() -> Pubkey {
     EATA_PROGRAM.parse().expect("eata program id")
-}
-
-fn derive_ata(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
-    Pubkey::find_program_address(
-        &[owner.as_ref(), token_program().as_ref(), mint.as_ref()],
-        &ata_program(),
-    )
-    .0
 }
 
 fn derive_eata(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
@@ -375,36 +364,6 @@ fn derive_global_vault(mint: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(&[mint.as_ref()], &eata_program()).0
 }
 
-fn initialize_mint(mint: &Pubkey, authority: &Pubkey) -> Instruction {
-    let mut data = vec![20u8, 0u8];
-    data.extend_from_slice(authority.as_ref());
-    data.push(0);
-    Instruction {
-        program_id: token_program(),
-        accounts: vec![AccountMeta::new(*mint, false)],
-        data,
-    }
-}
-
-fn mint_to(
-    mint: &Pubkey,
-    destination: &Pubkey,
-    authority: &Pubkey,
-    amount: u64,
-) -> Instruction {
-    let mut data = vec![7u8];
-    data.extend_from_slice(&amount.to_le_bytes());
-    Instruction {
-        program_id: token_program(),
-        accounts: vec![
-            AccountMeta::new(*mint, false),
-            AccountMeta::new(*destination, false),
-            AccountMeta::new_readonly(*authority, true),
-        ],
-        data,
-    }
-}
-
 fn spl_transfer(
     source: &Pubkey,
     destination: &Pubkey,
@@ -414,32 +373,13 @@ fn spl_transfer(
     let mut data = vec![3u8];
     data.extend_from_slice(&amount.to_le_bytes());
     Instruction {
-        program_id: token_program(),
+        program_id: spl::token_program(),
         accounts: vec![
             AccountMeta::new(*source, false),
             AccountMeta::new(*destination, false),
             AccountMeta::new_readonly(*authority, true),
         ],
         data,
-    }
-}
-
-fn create_ata_idempotent(
-    funder: &Pubkey,
-    owner: &Pubkey,
-    mint: &Pubkey,
-) -> Instruction {
-    Instruction {
-        program_id: ata_program(),
-        accounts: vec![
-            AccountMeta::new(*funder, true),
-            AccountMeta::new(derive_ata(owner, mint), false),
-            AccountMeta::new_readonly(*owner, false),
-            AccountMeta::new_readonly(*mint, false),
-            AccountMeta::new_readonly(system::system_id(), false),
-            AccountMeta::new_readonly(token_program(), false),
-        ],
-        data: vec![1],
     }
 }
 
@@ -452,9 +392,9 @@ fn initialize_global_vault(payer: &Pubkey, mint: &Pubkey) -> Instruction {
             AccountMeta::new(*payer, true),
             AccountMeta::new_readonly(*mint, false),
             AccountMeta::new(derive_eata(&vault, mint), false),
-            AccountMeta::new(derive_ata(&vault, mint), false),
-            AccountMeta::new_readonly(token_program(), false),
-            AccountMeta::new_readonly(ata_program(), false),
+            AccountMeta::new(spl::derive_ata(&vault, mint), false),
+            AccountMeta::new_readonly(spl::token_program(), false),
+            AccountMeta::new_readonly(spl::ata_program(), false),
             AccountMeta::new_readonly(system::system_id(), false),
         ],
         data: vec![1],
@@ -493,10 +433,10 @@ fn deposit_spl_tokens(
             AccountMeta::new(derive_eata(user, mint), false),
             AccountMeta::new_readonly(vault, false),
             AccountMeta::new_readonly(*mint, false),
-            AccountMeta::new(derive_ata(user, mint), false),
-            AccountMeta::new(derive_ata(&vault, mint), false),
+            AccountMeta::new(spl::derive_ata(user, mint), false),
+            AccountMeta::new(spl::derive_ata(&vault, mint), false),
             AccountMeta::new_readonly(*user, true),
-            AccountMeta::new_readonly(token_program(), false),
+            AccountMeta::new_readonly(spl::token_program(), false),
         ],
         data,
     }
@@ -549,9 +489,5 @@ fn delegate_eata_to(
 }
 
 async fn token_balance(ctx: &impl ChainCtx, account: &Pubkey) -> Option<u64> {
-    let account = ctx.account(account).await.ok()??;
-    let bytes = account
-        .data
-        .get(TOKEN_AMOUNT_OFFSET..TOKEN_AMOUNT_OFFSET + 8)?;
-    Some(u64::from_le_bytes(bytes.try_into().ok()?))
+    spl::token_balance(ctx, account).await.ok().flatten()
 }

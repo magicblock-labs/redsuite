@@ -1,155 +1,26 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use keypair::Keypair;
 use pubkey::Pubkey;
 use redshift_interface::flexi::{build as flexi, FlexiCounter};
 use redsuite_core::{
-    check, check_eq, dlp, prep, receipt, system, topology, BaseCtx, ChainCtx,
-    CheckError, ErCtx, PrivateErScenario, Result, ScenarioReport,
+    check, check_eq, dlp, prep, receipt, system, BaseCtx, ChainCtx, CheckError,
+    ErCtx, PrivateErScenario, Result, ScenarioReport,
 };
 use signer::Signer;
 
-const SOL: u64 = 1_000_000_000;
-const PERSIST_SLOTS: u64 = 11;
-const READY_TIMEOUT: Duration = Duration::from_secs(60);
-const SLOT_TIMEOUT: Duration = Duration::from_secs(30);
-const CLONE_TIMEOUT: Duration = Duration::from_secs(20);
+use super::{
+    advance_slots, await_er_balance, boot_reader, boot_writer, counter_actor,
+    PERSIST_SLOTS, SOL,
+};
+
 const RESTORE_TIMEOUT: Duration = Duration::from_secs(45);
 const RECEIPT_TIMEOUT: Duration = Duration::from_secs(30);
 const BASE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(20);
-const COMMIT_FREQUENCY_MS: u32 = 1_000_000_000;
 const CRANK_TASK_ID: i64 = 108;
 const LABEL: &str = "counter of payer";
 
 pub struct LedgerRestoreChain;
-
-async fn advance_slots(er: &ErCtx, count: u64) -> Result<u64> {
-    let target = er.api().get_slot().await? + count;
-    check::poll(
-        &format!("the er reaches slot {target}"),
-        SLOT_TIMEOUT,
-        || async {
-            matches!(er.api().get_slot().await, Ok(slot) if slot >= target)
-        },
-    )
-    .await?;
-    er.api().get_slot().await
-}
-
-async fn boot_writer(
-    base: &BaseCtx,
-    label: &str,
-) -> Result<topology::PrivateEr> {
-    let er = topology::private_er(
-        base,
-        topology::ErOptions {
-            label: label.to_owned(),
-            ..Default::default()
-        },
-    )
-    .await?;
-    er.wait_ready(READY_TIMEOUT).await?;
-    Ok(er)
-}
-
-async fn boot_reader(
-    base: &BaseCtx,
-    label: &str,
-) -> Result<topology::PrivateEr> {
-    let er = topology::private_er(
-        base,
-        topology::ErOptions {
-            label: label.to_owned(),
-            keep_storage: true,
-            reset: false,
-            ..Default::default()
-        },
-    )
-    .await?;
-    er.wait_ready(READY_TIMEOUT).await?;
-    Ok(er)
-}
-
-async fn delegated_wallet(
-    base: &BaseCtx,
-    funder: &Keypair,
-    validator: Pubkey,
-    lamports: u64,
-) -> Result<Keypair> {
-    let wallet = Keypair::new();
-    base.airdrop(&wallet.pubkey(), lamports).await?;
-    let setup = [
-        system::assign(&wallet.pubkey(), &dlp::dlp_id()),
-        dlp::delegate_account(&funder.pubkey(), &wallet.pubkey(), &validator),
-    ];
-    base.send_with(funder, &[&wallet], &setup).await?;
-    Ok(wallet)
-}
-
-async fn await_er_balance(
-    er: &ErCtx,
-    account: &Pubkey,
-    expected: u64,
-) -> Result<()> {
-    check::poll(
-        &format!("the er balance of {account} reaches {expected}"),
-        CLONE_TIMEOUT,
-        || async {
-            matches!(
-                er.api().get_balance(account).await,
-                Ok(balance) if balance == expected
-            )
-        },
-    )
-    .await?;
-    Ok(())
-}
-
-struct CounterActor {
-    payer: Keypair,
-    counter: Pubkey,
-}
-
-async fn counter_actor(
-    base: &BaseCtx,
-    er: &ErCtx,
-    funder: &Keypair,
-) -> Result<CounterActor> {
-    let payer = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
-    let (init, counter) = flexi::init_counter(payer.pubkey(), LABEL);
-    base.send(&payer, &[init]).await?;
-    base.send(
-        &payer,
-        &[flexi::delegate_counter(
-            payer.pubkey(),
-            COMMIT_FREQUENCY_MS,
-            Some(er.identity()),
-        )],
-    )
-    .await?;
-    let setup = [
-        system::assign(&payer.pubkey(), &dlp::dlp_id()),
-        dlp::delegate_account(
-            &funder.pubkey(),
-            &payer.pubkey(),
-            &er.identity(),
-        ),
-    ];
-    base.send_with(funder, &[&payer], &setup).await?;
-    check::poll(
-        "the er clones the delegated counter",
-        CLONE_TIMEOUT,
-        || async {
-            matches!(
-                er.account(&counter).await,
-                Ok(Some(clone)) if !clone.data.is_empty()
-            )
-        },
-    )
-    .await?;
-    Ok(CounterActor { payer, counter })
-}
 
 fn expected_counter(count: u64, updates: u64) -> FlexiCounter {
     FlexiCounter {
@@ -211,7 +82,8 @@ impl PrivateErScenario for LedgerRestoreChain {
         // a delegated counter.
         {
             let mut writer = boot_writer(base, "restore-delegated").await?;
-            let actor = counter_actor(base, writer.ctx(), &funder).await?;
+            let actor =
+                counter_actor(base, writer.ctx(), &funder, LABEL).await?;
             writer
                 .ctx()
                 .send(&actor.payer, &[flexi::add(actor.payer.pubkey(), 3)])
@@ -225,7 +97,14 @@ impl PrivateErScenario for LedgerRestoreChain {
             writer.stop(true).await?;
             drop(writer);
 
-            let reader = boot_reader(base, "restore-delegated").await?;
+            let reader = boot_reader(
+                base,
+                "restore-delegated",
+                "ephemeral",
+                false,
+                vec![],
+            )
+            .await?;
             await_counter_state(
                 reader.ctx(),
                 &actor.counter,
@@ -238,7 +117,8 @@ impl PrivateErScenario for LedgerRestoreChain {
         // restore on both sides, and replay does not send the commit again.
         {
             let mut writer = boot_writer(base, "restore-commit").await?;
-            let actor = counter_actor(base, writer.ctx(), &funder).await?;
+            let actor =
+                counter_actor(base, writer.ctx(), &funder, LABEL).await?;
             let er = writer.ctx();
             er.send(&actor.payer, &[flexi::add(actor.payer.pubkey(), 3)])
                 .await?;
@@ -317,7 +197,9 @@ impl PrivateErScenario for LedgerRestoreChain {
             writer.stop(true).await?;
             drop(writer);
 
-            let reader = boot_reader(base, "restore-commit").await?;
+            let reader =
+                boot_reader(base, "restore-commit", "ephemeral", false, vec![])
+                    .await?;
             await_counter_state(
                 reader.ctx(),
                 &actor.counter,
@@ -352,9 +234,11 @@ impl PrivateErScenario for LedgerRestoreChain {
             let identity = writer.ctx().identity();
             advance_slots(writer.ctx(), 1).await?;
             let sender =
-                delegated_wallet(base, &funder, identity, 1_111_111).await?;
+                prep::delegated_payer(base, &funder, identity, 1_111_111)
+                    .await?;
             let receiver =
-                delegated_wallet(base, &funder, identity, 1_000_000).await?;
+                prep::delegated_payer(base, &funder, identity, 1_000_000)
+                    .await?;
             let er = writer.ctx();
             er.send(
                 &sender,
@@ -377,7 +261,9 @@ impl PrivateErScenario for LedgerRestoreChain {
             writer.stop(true).await?;
             drop(writer);
 
-            let reader = boot_reader(base, "restore-flush").await?;
+            let reader =
+                boot_reader(base, "restore-flush", "ephemeral", false, vec![])
+                    .await?;
             await_er_balance(reader.ctx(), &receiver.pubkey(), 1_111_111)
                 .await?;
         }
@@ -386,7 +272,8 @@ impl PrivateErScenario for LedgerRestoreChain {
         // keeps cranking.
         {
             let mut writer = boot_writer(base, "restore-crank").await?;
-            let actor = counter_actor(base, writer.ctx(), &funder).await?;
+            let actor =
+                counter_actor(base, writer.ctx(), &funder, LABEL).await?;
             writer
                 .ctx()
                 .send(
@@ -412,7 +299,9 @@ impl PrivateErScenario for LedgerRestoreChain {
             writer.stop(true).await?;
             drop(writer);
 
-            let reader = boot_reader(base, "restore-crank").await?;
+            let reader =
+                boot_reader(base, "restore-crank", "ephemeral", false, vec![])
+                    .await?;
             let er = reader.ctx();
             check::poll(
                 "the restored counter reaches the pre-kill count",
