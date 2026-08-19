@@ -334,9 +334,6 @@ fn preflight(fixtures: &[Fixture]) -> Result<()> {
     let Some(loaded) = topology::running_base_programs() else {
         return Ok(());
     };
-    if loaded.is_empty() {
-        return Ok(());
-    }
     for fixture in fixtures {
         if fixture.loaded_at_base_boot()
             && !loaded.iter().any(|name| name == fixture.so_name())
