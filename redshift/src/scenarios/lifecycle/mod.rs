@@ -106,7 +106,7 @@ async fn counter_actor(
         &payer,
         &[flexi::delegate_counter(
             payer.pubkey(),
-            crate::COMMIT_FREQUENCY_MS,
+            prep::COMMIT_FREQUENCY_MS,
             Some(er.identity()),
         )],
     )

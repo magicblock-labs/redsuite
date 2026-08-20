@@ -24,7 +24,7 @@ pub struct ThreadRunConfig {
     pub concurrency: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct RunOutcome {
     pub delivered: u64,
     // iterations that errored at either stage (delivery or sync)
@@ -43,6 +43,49 @@ impl RunOutcome {
     }
 }
 
+#[derive(Debug)]
+pub struct RawRunOutcome {
+    pub delivered: u64,
+    pub failed: u64,
+    pub first_error: Option<String>,
+    pub delivery: StreamingStats,
+    pub sync: Option<StreamingStats>,
+    pub rps: ObservationsStats,
+    pub wall: std::time::Duration,
+}
+
+impl RawRunOutcome {
+    pub fn merge(&mut self, other: RawRunOutcome) {
+        self.delivered += other.delivered;
+        self.failed += other.failed;
+        if self.first_error.is_none() {
+            self.first_error = other.first_error;
+        }
+        self.delivery.merge(other.delivery);
+        self.sync = match (self.sync.take(), other.sync) {
+            (Some(mut own_sync), Some(other_sync)) => {
+                own_sync.merge(other_sync);
+                Some(own_sync)
+            }
+            (own_sync, other_sync) => own_sync.or(other_sync),
+        };
+        self.rps = self.rps.add_rates(other.rps);
+        self.wall = self.wall.max(other.wall);
+    }
+
+    pub fn finalize(self) -> RunOutcome {
+        RunOutcome {
+            delivered: self.delivered,
+            failed: self.failed,
+            first_error: self.first_error,
+            delivery: self.delivery.finalize(false),
+            sync: self.sync.map(|sync| sync.finalize(false)),
+            rps: self.rps,
+            wall: self.wall,
+        }
+    }
+}
+
 #[derive(Default)]
 struct Tally {
     delivered: u64,
@@ -52,7 +95,15 @@ struct Tally {
     sync: StreamingStats,
 }
 
-pub async fn drive<F, Fut>(cfg: RunConfig, mut request: F) -> RunOutcome
+pub async fn drive<F, Fut>(cfg: RunConfig, request: F) -> RunOutcome
+where
+    F: FnMut(u64) -> Fut,
+    Fut: Future<Output = Result<()>> + 'static,
+{
+    drive_raw(cfg, request).await.finalize()
+}
+
+pub async fn drive_raw<F, Fut>(cfg: RunConfig, mut request: F) -> RawRunOutcome
 where
     F: FnMut(u64) -> Fut,
     Fut: Future<Output = Result<()>> + 'static,
@@ -91,11 +142,11 @@ where
     let tally = Rc::try_unwrap(tally)
         .unwrap_or_else(|_| panic!("drive tasks still hold the tally"))
         .into_inner();
-    RunOutcome {
+    RawRunOutcome {
         delivered: tally.delivered,
         failed: tally.failed,
         first_error: tally.first_error,
-        delivery: tally.delivery.finalize(false),
+        delivery: tally.delivery,
         sync: None,
         rps,
         wall: started.elapsed(),
@@ -197,7 +248,7 @@ where
             let local = tokio::task::LocalSet::new();
             let outcome = runtime.block_on(local.run_until(async move {
                 let mut request = factory(thread_index);
-                drive(
+                drive_raw(
                     RunConfig {
                         iterations,
                         rate,
@@ -222,34 +273,15 @@ where
     merge_outcomes(outcomes)
 }
 
-fn merge_outcomes(outcomes: Vec<RunOutcome>) -> RunOutcome {
-    let delivered = outcomes.iter().map(|outcome| outcome.delivered).sum();
-    let failed = outcomes.iter().map(|outcome| outcome.failed).sum();
-    let first_error = outcomes
-        .iter()
-        .find_map(|outcome| outcome.first_error.clone());
-    let wall = outcomes
-        .iter()
-        .map(|outcome| outcome.wall)
-        .max()
-        .unwrap_or_default();
-    let delivery = ObservationsStats::merge(
-        outcomes.iter().map(|outcome| outcome.delivery).collect(),
-        true,
-    );
-    let rps = ObservationsStats::merge(
-        outcomes.iter().map(|outcome| outcome.rps).collect(),
-        false,
-    );
-    RunOutcome {
-        delivered,
-        failed,
-        first_error,
-        delivery,
-        sync: None,
-        rps,
-        wall,
-    }
+fn merge_outcomes(outcomes: Vec<RawRunOutcome>) -> RunOutcome {
+    outcomes
+        .into_iter()
+        .reduce(|mut merged, outcome| {
+            merged.merge(outcome);
+            merged
+        })
+        .map(RawRunOutcome::finalize)
+        .unwrap_or_default()
 }
 
 pub async fn drive_closed<F, Fut, S, SFut>(

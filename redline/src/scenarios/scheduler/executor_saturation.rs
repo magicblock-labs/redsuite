@@ -12,8 +12,7 @@ use redsuite_core::{
     check, check_eq, host, prep,
     profile::{self, ProfileValues},
     report,
-    runner::{drive, RunConfig, RunOutcome},
-    stats::ObservationsStats,
+    runner::{drive_raw, RawRunOutcome, RunConfig, RunOutcome},
     topology, BaseCtx, ChainCtx, CheckError, ErClient, ErCtx, MetricsDelta,
     Result, Scenario, ScenarioReport, TxSender,
 };
@@ -223,7 +222,7 @@ fn drive_cell_burst(
                     sign_s += sign_started.elapsed().as_secs_f64();
 
                     let blast_started = Instant::now();
-                    let outcome = drive(
+                    let outcome = drive_raw(
                         RunConfig {
                             iterations: signed.len() as u64,
                             rate: u32::MAX,
@@ -248,7 +247,7 @@ fn drive_cell_burst(
     }
     drop(outcome_sender);
 
-    let mut all_outcomes: Vec<RunOutcome> = Vec::new();
+    let mut all_outcomes: Vec<RawRunOutcome> = Vec::new();
     let mut sign_s = 0.0f64;
     let mut blast_s = 0.0f64;
     while let Ok((outcomes, thread_sign_s, thread_blast_s)) =
@@ -262,26 +261,15 @@ fn drive_cell_burst(
         let _ = handle.join();
     }
 
-    let outcome = RunOutcome {
-        delivered: all_outcomes.iter().map(|outcome| outcome.delivered).sum(),
-        failed: all_outcomes.iter().map(|outcome| outcome.failed).sum(),
-        first_error: all_outcomes
-            .iter()
-            .find_map(|outcome| outcome.first_error.clone()),
-        delivery: ObservationsStats::merge(
-            all_outcomes
-                .iter()
-                .map(|outcome| outcome.delivery)
-                .collect(),
-            true,
-        ),
-        sync: None,
-        rps: ObservationsStats::merge(
-            all_outcomes.iter().map(|outcome| outcome.rps).collect(),
-            false,
-        ),
-        wall: Duration::from_secs_f64(blast_s.max(1e-9)),
-    };
+    let mut outcome = all_outcomes
+        .into_iter()
+        .reduce(|mut merged, chunk_outcome| {
+            merged.merge(chunk_outcome);
+            merged
+        })
+        .map(RawRunOutcome::finalize)
+        .unwrap_or_default();
+    outcome.wall = Duration::from_secs_f64(blast_s.max(1e-9));
     BurstOutcome {
         outcome,
         sign_s,

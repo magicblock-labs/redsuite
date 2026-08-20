@@ -13,7 +13,6 @@ use solana_address_lookup_table_interface::instruction::create_lookup_table;
 const PROGRAM_CLONE_TIMEOUT: Duration = Duration::from_secs(20);
 const BLOCKED_SETTLE: Duration = Duration::from_secs(2);
 const ALT_SETTLE: Duration = Duration::from_secs(1);
-const COMMIT_FREQUENCY_MS: u32 = 1_000_000_000;
 const LABEL: &str = "redshift config";
 const OPEN_ER_LABEL: &str = "cfg-none";
 const RESTRICTED_ER_LABEL: &str = "cfg-allow";
@@ -108,7 +107,7 @@ async fn delegate_and_clone_counter(
         &payer_ephem,
         &[build::delegate_counter(
             payer_ephem.pubkey(),
-            COMMIT_FREQUENCY_MS,
+            prep::COMMIT_FREQUENCY_MS,
             Some(er.identity()),
         )],
     )

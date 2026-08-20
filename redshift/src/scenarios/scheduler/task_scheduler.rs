@@ -19,7 +19,6 @@ use signer::Signer;
 
 const TASK_INTERVAL_MS: i64 = 100;
 const CRANK_INTERVAL_MS: i64 = 10;
-const COMMIT_FREQUENCY_MS: u32 = 1_000_000_000;
 const LABEL: &str = "redshift task";
 const CLONE_TIMEOUT: Duration = Duration::from_secs(30);
 const DB_OPEN_TIMEOUT: Duration = Duration::from_secs(45);
@@ -120,7 +119,7 @@ async fn scheduled_actor(
         &payer,
         &[flexi::delegate_counter(
             payer.pubkey(),
-            COMMIT_FREQUENCY_MS,
+            prep::COMMIT_FREQUENCY_MS,
             Some(er.identity()),
         )],
     )

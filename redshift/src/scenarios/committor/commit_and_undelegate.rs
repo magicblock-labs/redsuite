@@ -164,7 +164,7 @@ async fn commit_undelegate_lifecycle(
             build::delegate_cpi(
                 payer.pubkey(),
                 *player,
-                crate::COMMIT_FREQUENCY_MS,
+                prep::COMMIT_FREQUENCY_MS,
                 Some(er.identity()),
             )
         })
@@ -280,7 +280,7 @@ async fn order_book_cell(
     let delegate = build::delegate_order_book(
         payer.pubkey(),
         manager.pubkey(),
-        crate::COMMIT_FREQUENCY_MS,
+        prep::COMMIT_FREQUENCY_MS,
         Some(er.identity()),
     );
     base.send_with(payer, &[&manager], &[init, delegate])
@@ -634,7 +634,7 @@ impl Scenario for CommitAndUndelegate {
             .setting("undelegate book seed", seed_undelegate)
             .setting("undelegate book base sigs", sigs_undelegate)
             .setting("failed undelegation lockout", failed_undelegation_lockout)
-            .setting("commit frequency ms", crate::COMMIT_FREQUENCY_MS);
+            .setting("commit frequency ms", prep::COMMIT_FREQUENCY_MS);
 
         Ok(report)
     }

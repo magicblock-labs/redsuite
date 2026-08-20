@@ -12,7 +12,6 @@ use signer::Signer;
 
 pub const ACCOUNT_SPACE: u32 = 128;
 pub const PAYER_LAMPORTS: u64 = 2_000_000_000;
-pub const COMMIT_FREQUENCY_MS: u32 = 1_000_000_000;
 
 const RECEIPT_TIMEOUT: Duration = Duration::from_secs(30);
 const BASE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(20);
