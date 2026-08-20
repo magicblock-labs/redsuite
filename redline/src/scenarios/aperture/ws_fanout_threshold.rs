@@ -9,7 +9,7 @@ use redsuite_core::{
     profile::{self, ProfileValues},
     report,
     runner::{drive_threads, RunOutcome, ThreadRunConfig},
-    stats::ObservationsStats,
+    stats::{ObservationsStats, StreamingStats},
     transport::subpool::{
         ConnReport, ExpectedWrites, ProducedLedger, SubscriberPool,
     },
@@ -281,10 +281,11 @@ impl Scenario for WsFanoutThreshold {
                 conn_reports.iter().map(|conn| conn.received).sum();
             let over_threshold: u64 =
                 conn_reports.iter().map(|conn| conn.over_threshold).sum();
-            let lag = ObservationsStats::merge(
-                conn_reports.iter().map(|conn| conn.lag).collect(),
-                true,
-            );
+            let mut lag_stats = StreamingStats::new();
+            for conn_report in conn_reports {
+                lag_stats.merge(conn_report.lag);
+            }
+            let lag = lag_stats.finalize(false);
 
             let cell_outcome = CellOutcome {
                 connections,

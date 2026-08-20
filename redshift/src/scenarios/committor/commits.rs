@@ -220,7 +220,7 @@ impl Scenario for Commits {
         }
 
         Ok(report
-            .setting("commit frequency ms", crate::COMMIT_FREQUENCY_MS)
+            .setting("commit frequency ms", prep::COMMIT_FREQUENCY_MS)
             .setting("foreign validator", other_validator.pubkey())
             .setting("foreign commit rejection", commit_rejection)
             .setting("foreign undelegate rejection", undelegate_rejection))

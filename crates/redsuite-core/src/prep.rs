@@ -12,7 +12,7 @@ use crate::{
 };
 
 const ZERO_DATA_RENT_EXEMPT_LAMPORTS: u64 = 890_880;
-const COMMIT_FREQUENCY_MS: u32 = 1_000_000_000;
+pub const COMMIT_FREQUENCY_MS: u32 = 1_000_000_000;
 const COMMITTEE_CLONE_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub async fn funded_payer(

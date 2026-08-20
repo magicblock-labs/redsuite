@@ -14,10 +14,7 @@ use pubkey::Pubkey;
 use tokio::sync::watch;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-use crate::{
-    stats::{ObservationsStats, StreamingStats},
-    Result,
-};
+use crate::{stats::StreamingStats, Result};
 
 const AWAIT_POLL: Duration = Duration::from_millis(20);
 
@@ -94,7 +91,7 @@ impl AccountRecv {
 pub struct ConnReport {
     pub received: u64,
     pub over_threshold: u64,
-    pub lag: ObservationsStats,
+    pub lag: StreamingStats,
     pub by_account: HashMap<Pubkey, AccountRecv>,
     pub error: Option<String>,
 }
@@ -106,7 +103,7 @@ struct ConnState {
     received: u64,
     over_threshold: u64,
     by_account: HashMap<Pubkey, AccountRecv>,
-    lag_final: Option<ObservationsStats>,
+    lag: Option<StreamingStats>,
 }
 
 pub type Extractor = Arc<dyn Fn(&[u8]) -> Option<u64> + Send + Sync>;
@@ -301,7 +298,7 @@ impl SubscriberPool {
                 ConnReport {
                     received: state.received,
                     over_threshold: state.over_threshold,
-                    lag: state.lag_final.unwrap_or_default(),
+                    lag: state.lag.unwrap_or_default(),
                     by_account: state.by_account,
                     error: state.error,
                 }
@@ -445,5 +442,5 @@ async fn run_connection(
             }
         }
     }
-    state.lock().unwrap().lag_final = Some(local_lag.finalize(false));
+    state.lock().unwrap().lag = Some(local_lag);
 }

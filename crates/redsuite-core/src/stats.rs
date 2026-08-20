@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use json::{Deserialize, Serialize};
-use rand::{rngs::ThreadRng, thread_rng, Rng};
+use rand::{rngs::StdRng, Rng, SeedableRng};
 
 #[derive(Debug)]
 pub struct StreamingStats {
@@ -12,7 +12,7 @@ pub struct StreamingStats {
     max: u32,
     reservoir: Vec<u32>,
     reservoir_size: usize,
-    rng: ThreadRng,
+    rng: StdRng,
 }
 
 impl StreamingStats {
@@ -31,7 +31,7 @@ impl StreamingStats {
             max: 0,
             reservoir: Vec::with_capacity(reservoir_size),
             reservoir_size,
-            rng: thread_rng(),
+            rng: StdRng::from_entropy(),
         }
     }
 
@@ -52,6 +52,63 @@ impl StreamingStats {
                 self.reservoir[j] = value;
             }
         }
+    }
+
+    pub fn merge(&mut self, other: StreamingStats) {
+        if other.count == 0 {
+            return;
+        }
+        let own_weight = self.count as f64;
+        let other_weight = other.count as f64;
+        let combined_weight = own_weight + other_weight;
+        let delta = other.mean - self.mean;
+        self.mean += delta * other_weight / combined_weight;
+        self.m2 += other.m2
+            + delta * delta * own_weight * other_weight / combined_weight;
+        self.min = self.min.min(other.min);
+        self.max = self.max.max(other.max);
+        self.merge_reservoir(other.reservoir, other.count);
+        self.count += other.count;
+    }
+
+    fn merge_reservoir(
+        &mut self,
+        mut other_reservoir: Vec<u32>,
+        other_count: usize,
+    ) {
+        if self.reservoir.len() + other_reservoir.len() <= self.reservoir_size {
+            self.reservoir.append(&mut other_reservoir);
+            return;
+        }
+        let mut own_reservoir = std::mem::take(&mut self.reservoir);
+        let own_value_weight = self.count as f64 / own_reservoir.len() as f64;
+        let other_value_weight =
+            other_count as f64 / other_reservoir.len() as f64;
+        let mut merged = Vec::with_capacity(self.reservoir_size);
+        while merged.len() < self.reservoir_size
+            && !(own_reservoir.is_empty() && other_reservoir.is_empty())
+        {
+            let source = if own_reservoir.is_empty() {
+                &mut other_reservoir
+            } else if other_reservoir.is_empty() {
+                &mut own_reservoir
+            } else {
+                let own_remaining =
+                    own_reservoir.len() as f64 * own_value_weight;
+                let other_remaining =
+                    other_reservoir.len() as f64 * other_value_weight;
+                let draw =
+                    self.rng.gen_range(0.0..own_remaining + other_remaining);
+                if draw < own_remaining {
+                    &mut own_reservoir
+                } else {
+                    &mut other_reservoir
+                }
+            };
+            let picked = self.rng.gen_range(0..source.len());
+            merged.push(source.swap_remove(picked));
+        }
+        self.reservoir = merged;
     }
 
     pub fn finalize(mut self, invertedq: bool) -> ObservationsStats {
@@ -110,26 +167,94 @@ mod tests {
     use super::*;
 
     #[test]
-    fn merge_sums_without_overflow() {
+    fn merged_partitions_match_a_single_accumulator() {
+        let mut single = StreamingStats::new();
         let mut first = StreamingStats::new();
         let mut second = StreamingStats::new();
-        for value in [100, 200, 300] {
+        for value in [1, 1, 1, 1] {
+            single.push(value);
             first.push(value);
-            second.push(value * 2);
         }
-        let summed = ObservationsStats::merge(
-            vec![first.finalize(false), second.finalize(false)],
-            false,
-        );
-        assert_eq!(summed.count, 6);
-        assert_eq!(summed.min, 100 + 200);
-        assert_eq!(summed.max, 300 + 600);
+        single.push(100);
+        second.push(100);
 
-        let averaged = ObservationsStats::merge(
-            vec![ObservationsStats::default(), ObservationsStats::default()],
-            true,
-        );
-        assert_eq!(averaged.count, 0);
+        first.merge(second);
+        let merged = first.finalize(false);
+        let expected = single.finalize(false);
+
+        assert_eq!(merged.count, expected.count);
+        assert_eq!(merged.avg, expected.avg);
+        assert_eq!(merged.avg, 20);
+        assert_eq!(merged.median, expected.median);
+        assert_eq!(merged.quantile95, expected.quantile95);
+        assert_eq!(merged.stddev, expected.stddev);
+        assert_eq!(merged.min, expected.min);
+        assert_eq!(merged.max, expected.max);
+    }
+
+    #[test]
+    fn reservoir_merge_downsamples_to_capacity() {
+        let mut heavy = StreamingStats::with_reservoir_size(8);
+        let mut light = StreamingStats::with_reservoir_size(8);
+        for _ in 0..16 {
+            heavy.push(0);
+        }
+        for _ in 0..4 {
+            light.push(1_000);
+        }
+        heavy.merge(light);
+        assert_eq!(heavy.count, 20);
+        assert_eq!(heavy.reservoir.len(), 8);
+        let merged = heavy.finalize(false);
+        assert_eq!(merged.min, 0);
+        assert_eq!(merged.max, 1_000);
+        assert_eq!(merged.avg, 200);
+    }
+
+    #[test]
+    fn merge_into_empty_adopts_the_other_partition() {
+        let mut empty = StreamingStats::new();
+        let mut filled = StreamingStats::new();
+        for value in [5, 10, 15] {
+            filled.push(value);
+        }
+        empty.merge(filled);
+        let merged = empty.finalize(false);
+        assert_eq!(merged.count, 3);
+        assert_eq!(merged.min, 5);
+        assert_eq!(merged.max, 15);
+        assert_eq!(merged.avg, 10);
+        assert_eq!(merged.median, 10);
+    }
+
+    #[test]
+    fn rate_addition_sums_per_thread_stats() {
+        let first = ObservationsStats {
+            count: 3,
+            median: 10,
+            min: 1,
+            max: 20,
+            avg: 11,
+            quantile95: 19,
+            stddev: 2,
+        };
+        let second = ObservationsStats {
+            count: 2,
+            median: 30,
+            min: 2,
+            max: 40,
+            avg: 29,
+            quantile95: 39,
+            stddev: 3,
+        };
+        let summed = first.add_rates(second);
+        assert_eq!(summed.count, 5);
+        assert_eq!(summed.median, 40);
+        assert_eq!(summed.min, 3);
+        assert_eq!(summed.max, 60);
+        assert_eq!(summed.avg, 40);
+        assert_eq!(summed.quantile95, 58);
+        assert_eq!(summed.stddev, 5);
     }
 }
 
@@ -155,89 +280,16 @@ pub struct ObservationsStats {
     pub stddev: u32,
 }
 
-impl BenchStatistics {
-    pub fn merge(mut stats: Vec<Self>) -> Self {
-        if stats.is_empty() {
-            return Self::default();
-        }
-        let configuration =
-            std::mem::take(&mut stats.first_mut().unwrap().configuration);
-        let mut request_stats = HashMap::new();
-        let mut rps = Vec::new();
-        let mut account_update_stats = Vec::new();
-        let mut signature_confirmation_stats = Vec::new();
-
-        for s in stats {
-            for (key, value) in s.request_stats {
-                request_stats
-                    .entry(key)
-                    .or_insert_with(Vec::new)
-                    .push(value);
-            }
-            account_update_stats.push(s.account_update_latency);
-            signature_confirmation_stats.push(s.signature_confirmation_latency);
-            rps.push(s.rps);
-        }
-
-        let request_stats = request_stats
-            .into_iter()
-            .map(|(key, value)| (key, ObservationsStats::merge(value, true)))
-            .collect();
-
-        Self {
-            configuration,
-            account_update_latency: ObservationsStats::merge(
-                account_update_stats,
-                true,
-            ),
-            signature_confirmation_latency: ObservationsStats::merge(
-                signature_confirmation_stats,
-                true,
-            ),
-            request_stats,
-            rps: ObservationsStats::merge(rps, false),
-        }
-    }
-}
-
 impl ObservationsStats {
-    pub fn merge(stats: Vec<ObservationsStats>, average: bool) -> Self {
-        let total_count = if average { stats.len() } else { 1 };
-        if total_count == 0 {
-            return Self::default();
-        }
-        let initial_min = if average { u32::MAX } else { 0 };
-        let sum = stats.iter().fold(
-            (0usize, 0i32, initial_min, 0u32, 0i32, 0i32, 0u32),
-            |acc, stat| {
-                (
-                    acc.0 + stat.count,
-                    acc.1 + stat.median,
-                    if average {
-                        acc.2.min(stat.min)
-                    } else {
-                        acc.2 + stat.min
-                    },
-                    if average {
-                        acc.3.max(stat.max)
-                    } else {
-                        acc.3 + stat.max
-                    },
-                    acc.4 + stat.avg,
-                    acc.5 + stat.quantile95,
-                    acc.6 + stat.stddev,
-                )
-            },
-        );
-
-        ObservationsStats {
-            count: sum.0,
-            median: sum.1 / total_count as i32,
-            min: sum.2,
-            max: sum.3,
-            avg: sum.4 / total_count as i32,
-            quantile95: sum.5 / total_count as i32,
-            stddev: sum.6 / total_count as u32,
+    pub fn add_rates(self, other: Self) -> Self {
+        Self {
+            count: self.count + other.count,
+            median: self.median + other.median,
+            min: self.min + other.min,
+            max: self.max + other.max,
+            avg: self.avg + other.avg,
+            quantile95: self.quantile95 + other.quantile95,
+            stddev: self.stddev + other.stddev,
         }
     }
 }
