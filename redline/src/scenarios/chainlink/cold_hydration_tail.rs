@@ -11,7 +11,7 @@ use redsuite_core::{
     check_eq, prep,
     profile::{self, ProfileValues},
     report,
-    runner::{drive, RunConfig},
+    runner::{execute, RunConfig},
     stats::{ObservationsStats, StreamingStats},
     topology, BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario,
     ScenarioReport, TxSender,
@@ -152,7 +152,7 @@ async fn burst_cell(
         }
     };
     let started = Instant::now();
-    let outcome = drive(
+    let outcome = execute(
         RunConfig {
             iterations: pool.len() as u64,
             rate: pool.len() as u32,

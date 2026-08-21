@@ -6,7 +6,7 @@ use pubkey::Pubkey;
 use redsuite_core::{
     check, check_eq, prep,
     profile::{self, ProfileValues},
-    runner::{drive_threads, ThreadRunConfig},
+    runner::{execute_threaded, ThreadRunConfig},
     BaseCtx, ChainCtx, ErClient, ErCtx, MetricsDelta, Result, Scenario,
     ScenarioReport, TxSender,
 };
@@ -125,7 +125,7 @@ impl Scenario for RpcCapacityBlast {
                 }
             }
         };
-        let outcome = drive_threads(
+        let outcome = execute_threaded(
             ThreadRunConfig {
                 threads,
                 iterations: profile.requests,
@@ -133,7 +133,7 @@ impl Scenario for RpcCapacityBlast {
                 concurrency: profile.concurrency,
             },
             factory,
-        );
+        )?;
         let after = er.scrape_metrics().await?;
         let delta = MetricsDelta::new(before, after);
 

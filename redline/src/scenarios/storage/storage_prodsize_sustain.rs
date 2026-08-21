@@ -7,7 +7,7 @@ use redsuite_core::{
     check, check_eq, host, prep,
     profile::{self, ProfileValues},
     report,
-    runner::{drive, RunConfig, RunOutcome},
+    runner::{execute, RunConfig, RunOutcome},
     topology, BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario,
     ScenarioReport, TxSender,
 };
@@ -78,7 +78,7 @@ struct WindowOutcome {
     storage_growth_bytes: u64,
 }
 
-async fn drive_window(
+async fn execute_window(
     er: &ErCtx,
     storage_dir: &std::path::Path,
     senders: &[TxSender],
@@ -88,7 +88,7 @@ async fn drive_window(
 ) -> Result<WindowOutcome> {
     let storage_before = host::dir_size_bytes(storage_dir)?;
     let before = er.scrape_metrics().await?;
-    let outcome = drive(
+    let outcome = execute(
         RunConfig {
             iterations: profile.window,
             rate: profile.rate,
@@ -201,7 +201,7 @@ impl Scenario for StorageProdsizeSustain {
                 .collect();
 
             let storage_at_boot = host::dir_size_bytes(private.storage_dir())?;
-            let fill = drive(
+            let fill = execute(
                 RunConfig {
                     iterations: profile.fill,
                     rate: profile.rate,
@@ -224,7 +224,7 @@ impl Scenario for StorageProdsizeSustain {
                 host::dir_size_bytes(private.storage_dir())?
                     .saturating_sub(storage_at_boot);
 
-            let window_a = drive_window(
+            let window_a = execute_window(
                 cell_er,
                 private.storage_dir(),
                 &senders,
@@ -233,7 +233,7 @@ impl Scenario for StorageProdsizeSustain {
                 profile,
             )
             .await?;
-            let window_b = drive_window(
+            let window_b = execute_window(
                 cell_er,
                 private.storage_dir(),
                 &senders,

@@ -12,7 +12,7 @@ use redsuite_core::{
     check, check_eq, prep,
     profile::{self, ProfileValues},
     receipt, report,
-    runner::{drive, RunConfig},
+    runner::{execute, RunConfig},
     stats::StreamingStats,
     topology, Api, BaseCtx, ChainCtx, CheckError, ErCtx, MetricsDelta, Result,
     Scenario, ScenarioReport,
@@ -293,7 +293,7 @@ impl Scenario for CommitWidthEnvelope {
         let mut cells: Vec<CellSummary> = Vec::new();
         for &width in profile.widths {
             let warmup_tally = Rc::new(RefCell::new(CellTally::default()));
-            let warmup = drive(
+            let warmup = execute(
                 RunConfig {
                     iterations: WARMUP_COMMITS,
                     rate: profile.rate,
@@ -316,7 +316,7 @@ impl Scenario for CommitWidthEnvelope {
             let flow_before = snapshot_base_flow(base.api()).await?;
             let before = er.scrape_metrics().await?;
             let tally = Rc::new(RefCell::new(CellTally::default()));
-            let outcome = drive(
+            let outcome = execute(
                 RunConfig {
                     iterations: profile.commits,
                     rate: profile.rate,

@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use redsuite_core::{
     check, check_eq, prep,
     profile::{self, LoopMode, ProfileValues},
-    runner::{drive, drive_closed, RunConfig},
+    runner::{execute, execute_and_sync, RunConfig},
     transport::ws::{AccountUpdates, SignatureConfirmations},
     BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
     TxSender,
@@ -118,7 +118,7 @@ impl Scenario for WarmIngress {
             )
         };
 
-        let warmup = drive(
+        let warmup = execute(
             RunConfig {
                 iterations: profile.warmup,
                 rate: profile.rate,
@@ -196,9 +196,9 @@ impl Scenario for WarmIngress {
         // for the id arrives — true round-trip under backpressure.
         let mode = base.config().loop_mode;
         let outcome = if mode == LoopMode::Closed {
-            drive_closed(cfg, request, sync).await
+            execute_and_sync(cfg, request, sync).await
         } else {
-            drive(cfg, request).await
+            execute(cfg, request).await
         };
         check_eq!(
             outcome.failed,

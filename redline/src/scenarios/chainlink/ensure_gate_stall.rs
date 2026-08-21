@@ -10,7 +10,7 @@ use redsuite_core::{
     check, check_eq, prep,
     profile::{self, ProfileValues},
     report,
-    runner::{drive, RunConfig},
+    runner::{execute, RunConfig},
     topology, BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario,
     ScenarioReport,
 };
@@ -216,7 +216,7 @@ impl Scenario for EnsureGateStall {
                     async move { sender.send(&[ix]).await.map(|_| ()) }
                 }
             };
-            let outcome = drive(
+            let outcome = execute(
                 RunConfig {
                     iterations: cell.iterations,
                     rate: profile.rate,

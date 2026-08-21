@@ -7,7 +7,7 @@ use redsuite_core::{
     check, check_eq, prep,
     profile::{self, ProfileValues},
     report,
-    runner::{drive_threads, RunOutcome, ThreadRunConfig},
+    runner::{execute_threaded, RunOutcome, ThreadRunConfig},
     BaseCtx, ChainCtx, ErClient, ErCtx, MetricsDelta, Result, Scenario,
     ScenarioReport, TxSender,
 };
@@ -66,13 +66,13 @@ const PROFILES: ProfileValues<Profile> = ProfileValues {
     deep: None,
 };
 
-fn drive_cell(
+fn execute_cell(
     er_rpc_url: String,
     config: ThreadRunConfig,
     id_offset: u64,
     hot_set: Arc<Vec<Pubkey>>,
     payer_bytes: Arc<Vec<[u8; 64]>>,
-) -> RunOutcome {
+) -> Result<RunOutcome> {
     let threads = config.threads;
     let factory = move |thread_index: usize| {
         let client = ErClient::new(er_rpc_url.clone());
@@ -105,7 +105,7 @@ fn drive_cell(
             async move { sender.send(&[ix]).await.map(|_| ()) }
         }
     };
-    drive_threads(config, factory)
+    execute_threaded(config, factory)
 }
 
 async fn drain_intake(er: &ErCtx, target: f64) -> Result<()> {
@@ -173,7 +173,7 @@ impl Scenario for HotAccountCliff {
                 Arc::new(pdas[..hot as usize].to_vec());
 
             let count_before_warmup = er.scrape_metrics().await?.get(TX_COUNT);
-            let warm = drive_cell(
+            let warm = execute_cell(
                 er_rpc_url.clone(),
                 ThreadRunConfig {
                     threads: profile.threads,
@@ -184,7 +184,7 @@ impl Scenario for HotAccountCliff {
                 offset,
                 hot_set.clone(),
                 payer_bytes.clone(),
-            );
+            )?;
             check_eq!(
                 warm.failed,
                 0,
@@ -197,7 +197,7 @@ impl Scenario for HotAccountCliff {
             }
 
             let before = er.scrape_metrics().await?;
-            let outcome = drive_cell(
+            let outcome = execute_cell(
                 er_rpc_url.clone(),
                 ThreadRunConfig {
                     threads: profile.threads,
@@ -208,7 +208,7 @@ impl Scenario for HotAccountCliff {
                 offset,
                 hot_set.clone(),
                 payer_bytes.clone(),
-            );
+            )?;
             offset += profile.iterations;
             check_eq!(
                 outcome.failed,

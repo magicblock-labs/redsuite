@@ -11,7 +11,7 @@ use pubkey::Pubkey;
 use redsuite_core::{
     check, check_eq, host, prep,
     profile::{self, ProfileValues},
-    runner::{drive, drive_until, RunConfig, RunOutcome},
+    runner::{execute, execute_until, RunConfig, RunOutcome},
     topology::{self, RestartConfig, RestartTiming},
     BaseCtx, ChainCtx, ErCtx, Result, Scenario, ScenarioReport, TxSender,
 };
@@ -157,7 +157,7 @@ impl BackgroundLoad {
         let stop_flag = stop.clone();
         let outage = state.clone();
         let task = tokio::task::spawn_local(async move {
-            drive_until(rate, concurrency, stop_flag, |id| {
+            execute_until(rate, concurrency, stop_flag, |id| {
                 let global_id = first_id + id;
                 let sender =
                     senders[(global_id as usize) % senders.len()].clone();
@@ -339,7 +339,7 @@ impl Scenario for RestartUnderLoad {
             .collect();
 
         let storage_at_boot = host::dir_size_bytes(private.storage_dir())?;
-        let fill = drive(
+        let fill = execute(
             RunConfig {
                 iterations: profile.fill,
                 rate: profile.load_rate,
