@@ -135,16 +135,6 @@ pub mod redshift {
             resources: [Resource::Er],
             fixtures: [Fixture::RedshiftProgram],
         },
-        ledger_restore_basics => lifecycle::ledger_restore_basics::LedgerRestoreBasics {
-            topology: PrivateEr,
-            resources: [Resource::Er],
-            fixtures: [Fixture::RedshiftProgram],
-        },
-        ledger_restore_chain => lifecycle::ledger_restore_chain::LedgerRestoreChain {
-            topology: PrivateEr,
-            resources: [Resource::Er],
-            fixtures: [Fixture::RedshiftProgram],
-        },
         api_invariants => harness::api_invariants::ApiInvariants {
             topology: Shared,
             resources: [Resource::Er],

@@ -583,7 +583,6 @@ impl PrivateErScenario for TaskScheduler {
                     "true".to_owned(),
                 )],
                 request_timeout: None,
-                ..Default::default()
             },
         )
         .await?;

@@ -287,7 +287,6 @@ async fn attach_er(
         storage_dir: dir.join("er-storage"),
         env: Vec::new(),
         reset: true,
-        lifecycle: "ephemeral".to_owned(),
     };
     eprintln!("[redsuite] booting ER on 127.0.0.1:{er_rpc_port} …");
     let er_log = dir.join("er.log");

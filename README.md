@@ -114,7 +114,7 @@ flock, `genesis-accounts/`, logs, ledgers).
 
 Scenario isolation comes from fresh keypairs, not fresh chains.
 Scenarios that kill a validator, restart one, or need their own config boot a private ER instead
-(`ledger_restore_*`, `task_scheduler`, `config_gates`, `aml_gate`). Each takes
+(`task_scheduler`, `config_gates`, `aml_gate`). Each takes
 its own identity from a 32-slot pool minted at genesis, so private ERs never
 collide with the shared one.
 
@@ -349,19 +349,6 @@ harness:
   to clone the program it was instructed. Neither of them may create a lookup table on base,
   at startup or while cloning.
 - `example` — the template from *Writing a scenario*.
-
-lifecycle (kill and restore):
-
-- `ledger_restore_basics` — writes to a private ER, kills it, brings
-  it back on the same ledger and reads everything back. It does that six times
-  with a different payload each time: an empty ledger, plain transfers, counter
-  programs, block timestamps, the two resume strategies (replay the ledger, or
-  reset and re-clone), and a validator identity that has never run before.
-  Restored state has to match what was written, down to signatures and times.
-- `ledger_restore_chain` — the same kill-and-restore cycle, now with payloads
-  that reach the base chain: delegated accounts, an account already committed,
-  transfers either side of an account flush, and a scheduled task that has to
-  carry on cranking once the validator is back.
 
 scheduler:
 

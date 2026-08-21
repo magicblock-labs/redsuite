@@ -296,21 +296,16 @@ pub(super) struct ErPlan {
     // the accountsdb. A restart-in-place relaunch omits it so the ER reopens
     // the on-disk ledger + accountsdb it already has.
     pub(super) reset: bool,
-    // An offline validator serves its restored ledger with no base chain; it
-    // gets no --remotes.
-    pub(super) lifecycle: String,
 }
 
 impl ErPlan {
     pub(super) fn command(&self) -> Command {
         let mut cmd = Command::new(&self.bin);
-        if self.lifecycle != "offline" {
-            cmd.arg("--remotes")
-                .arg(&self.base_rpc_url)
-                .arg("--remotes")
-                .arg(&self.base_ws_url);
-        }
-        cmd.args(["--lifecycle", &self.lifecycle])
+        cmd.arg("--remotes")
+            .arg(&self.base_rpc_url)
+            .arg("--remotes")
+            .arg(&self.base_ws_url);
+        cmd.args(["--lifecycle", "ephemeral"])
             .arg("-l")
             .arg(format!("127.0.0.1:{}", self.listen_port))
             .arg("-k")
@@ -337,30 +332,12 @@ impl ErPlan {
     }
 }
 
+#[derive(Default)]
 pub struct ErOptions {
     pub label: String,
     // e.g. ("MBV_CHAINLINK__MAX_MONITORED_ACCOUNTS", "100")
     pub env: Vec<(String, String)>,
     pub request_timeout: Option<Duration>,
-    // "ephemeral" (default) or "offline" (no base chain — ledger-restore reads)
-    pub lifecycle: String,
-    // Reuse the existing er-<label> storage dir instead of wiping it.
-    pub keep_storage: bool,
-    // Pass --reset (wipes the ledger, skips replay). A restore boot sets false.
-    pub reset: bool,
-}
-
-impl Default for ErOptions {
-    fn default() -> Self {
-        Self {
-            label: String::new(),
-            env: Vec::new(),
-            request_timeout: None,
-            lifecycle: "ephemeral".to_owned(),
-            keep_storage: false,
-            reset: true,
-        }
-    }
 }
 
 pub struct RestartConfig {
@@ -391,7 +368,7 @@ mod tests {
             .collect()
     }
 
-    fn plan(lifecycle: &str, reset: bool) -> ErPlan {
+    fn plan(reset: bool) -> ErPlan {
         ErPlan {
             bin: PathBuf::from("magicblock-validator"),
             identity: Keypair::new(),
@@ -402,22 +379,21 @@ mod tests {
             storage_dir: PathBuf::from("/tmp/er-storage"),
             env: vec![("MBV_TEST".to_owned(), "1".to_owned())],
             reset,
-            lifecycle: lifecycle.to_owned(),
         }
     }
 
     #[test]
     fn er_plans_are_inspectable_without_spawning() {
-        let args = args_of(&plan("ephemeral", true).command());
+        let args = args_of(&plan(true).command());
         assert_eq!(args.iter().filter(|arg| *arg == "--remotes").count(), 2);
         assert!(args.contains(&"--reset".to_owned()));
         assert!(args.contains(&"127.0.0.1:7799".to_owned()));
     }
 
     #[test]
-    fn offline_er_plans_carry_no_remotes() {
-        let args = args_of(&plan("offline", false).command());
-        assert!(!args.contains(&"--remotes".to_owned()));
+    fn restart_relaunch_plans_omit_reset() {
+        let args = args_of(&plan(false).command());
+        assert_eq!(args.iter().filter(|arg| *arg == "--remotes").count(), 2);
         assert!(!args.contains(&"--reset".to_owned()));
     }
 

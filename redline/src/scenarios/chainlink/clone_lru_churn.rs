@@ -199,7 +199,6 @@ impl Scenario for CloneLruChurn {
                         ),
                     ],
                     request_timeout: Some(REQUEST_TIMEOUT),
-                    ..Default::default()
                 },
             )
             .await?;
