@@ -12,7 +12,9 @@ use redsuite_core::{
     check, check_eq, host, prep,
     profile::{self, ProfileValues},
     report,
-    runner::{drive_raw, RawRunOutcome, RunConfig, RunOutcome},
+    runner::{
+        execute_raw, panic_message, RawRunOutcome, RunConfig, RunOutcome,
+    },
     topology, BaseCtx, ChainCtx, CheckError, ErClient, ErCtx, MetricsDelta,
     Result, Scenario, ScenarioReport, TxSender,
 };
@@ -137,7 +139,7 @@ fn build_ixs(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn drive_cell_burst(
+fn execute_cell_burst(
     er_rpc_url: String,
     config: BurstConfig,
     id_offset: u64,
@@ -147,7 +149,7 @@ fn drive_cell_burst(
     iters: u32,
     raise_budget: bool,
     probe: Arc<OnceLock<Signature>>,
-) -> BurstOutcome {
+) -> Result<BurstOutcome> {
     let threads = config.threads.max(1);
     let base_iterations = config.iterations / threads as u64;
     let remainder = config.iterations % threads as u64;
@@ -222,7 +224,7 @@ fn drive_cell_burst(
                     sign_s += sign_started.elapsed().as_secs_f64();
 
                     let blast_started = Instant::now();
-                    let outcome = drive_raw(
+                    let outcome = execute_raw(
                         RunConfig {
                             iterations: signed.len() as u64,
                             rate: u32::MAX,
@@ -247,18 +249,30 @@ fn drive_cell_burst(
     }
     drop(outcome_sender);
 
+    let workers = handles.len();
+    let mut received = 0usize;
     let mut all_outcomes: Vec<RawRunOutcome> = Vec::new();
     let mut sign_s = 0.0f64;
     let mut blast_s = 0.0f64;
     while let Ok((outcomes, thread_sign_s, thread_blast_s)) =
         outcome_receiver.recv()
     {
+        received += 1;
         all_outcomes.extend(outcomes);
         sign_s = sign_s.max(thread_sign_s);
         blast_s = blast_s.max(thread_blast_s);
     }
+    let mut first_worker_panic = None;
     for handle in handles {
-        let _ = handle.join();
+        if let Err(payload) = handle.join() {
+            first_worker_panic.get_or_insert_with(|| panic_message(payload));
+        }
+    }
+    if let Some(panic) = first_worker_panic {
+        return Err(format!("driver worker thread panicked: {panic}").into());
+    }
+    if received != workers {
+        return Err("a driver worker thread stopped without an outcome".into());
     }
 
     let mut outcome = all_outcomes
@@ -270,11 +284,11 @@ fn drive_cell_burst(
         .map(RawRunOutcome::finalize)
         .unwrap_or_default();
     outcome.wall = Duration::from_secs_f64(blast_s.max(1e-9));
-    BurstOutcome {
+    Ok(BurstOutcome {
         outcome,
         sign_s,
         blast_s,
-    }
+    })
 }
 
 async fn drain_processed(er: &ErCtx, target: f64) -> Result<Duration> {
@@ -380,7 +394,7 @@ impl Scenario for ExecutorSaturation {
             .er_pid;
 
         let count_before_warmup = er.scrape_metrics().await?.get(TX_COUNT);
-        let warm = drive_cell_burst(
+        let warm = execute_cell_burst(
             er_rpc_url.clone(),
             BurstConfig {
                 threads: profile.threads,
@@ -395,7 +409,7 @@ impl Scenario for ExecutorSaturation {
             LIGHT_ITERS,
             false,
             Arc::new(OnceLock::new()),
-        );
+        )?;
         check_eq!(
             warm.outcome.failed,
             0,
@@ -415,7 +429,7 @@ impl Scenario for ExecutorSaturation {
             let probe: Arc<OnceLock<Signature>> = Arc::new(OnceLock::new());
             let before = er.scrape_metrics().await?;
             let cpu_before = host::cpu_sample(er_pid)?;
-            let burst = drive_cell_burst(
+            let burst = execute_cell_burst(
                 er_rpc_url.clone(),
                 BurstConfig {
                     threads: profile.threads,
@@ -430,7 +444,7 @@ impl Scenario for ExecutorSaturation {
                 iters,
                 raise_budget,
                 probe.clone(),
-            );
+            )?;
             let outcome = burst.outcome;
             offset += profile.iterations;
             check_eq!(

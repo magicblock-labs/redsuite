@@ -7,7 +7,7 @@ use redsuite_core::{
     check, check_eq, prep,
     profile::{self, ProfileValues},
     report,
-    runner::{drive, RunConfig},
+    runner::{execute, RunConfig},
     topology, BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario,
     ScenarioReport,
 };
@@ -228,7 +228,7 @@ impl Scenario for CloneLruChurn {
                 }
             };
 
-            let warmup = drive(
+            let warmup = execute(
                 RunConfig {
                     iterations: profile.warmup,
                     rate: profile.rate,
@@ -247,7 +247,7 @@ impl Scenario for CloneLruChurn {
 
             let before = cell_er.scrape_metrics().await?;
             let offset = profile.warmup;
-            let outcome = drive(
+            let outcome = execute(
                 RunConfig {
                     iterations: profile.iterations,
                     rate: profile.rate,

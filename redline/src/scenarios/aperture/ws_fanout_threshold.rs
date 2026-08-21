@@ -8,7 +8,7 @@ use redsuite_core::{
     check, check_eq, prep,
     profile::{self, ProfileValues},
     report,
-    runner::{drive_threads, RunOutcome, ThreadRunConfig},
+    runner::{execute_threaded, RunOutcome, ThreadRunConfig},
     stats::{ObservationsStats, StreamingStats},
     transport::subpool::{
         ConnReport, ExpectedWrites, ProducedLedger, SubscriberPool,
@@ -99,14 +99,14 @@ fn cell_expected_writes(
     expected
 }
 
-fn drive_cell(
+fn execute_cell(
     er_rpc_url: String,
     config: ThreadRunConfig,
     id_offset: u64,
     pool: Arc<Vec<Pubkey>>,
     payer_bytes: Arc<Vec<[u8; 64]>>,
     produced: Option<Arc<ProducedLedger>>,
-) -> RunOutcome {
+) -> Result<RunOutcome> {
     let threads = config.threads;
     let factory = move |thread_index: usize| {
         let client = ErClient::new(er_rpc_url.clone());
@@ -132,7 +132,7 @@ fn drive_cell(
             async move { sender.send(&[ix]).await.map(|_| ()) }
         }
     };
-    drive_threads(config, factory)
+    execute_threaded(config, factory)
 }
 
 struct CellOutcome {
@@ -187,7 +187,7 @@ impl Scenario for WsFanoutThreshold {
         let pool: Arc<Vec<Pubkey>> = Arc::new(pool);
         let er_rpc_url = er.api().url().to_owned();
 
-        let warmup = drive_cell(
+        let warmup = execute_cell(
             er_rpc_url.clone(),
             ThreadRunConfig {
                 threads: profile.threads,
@@ -199,7 +199,7 @@ impl Scenario for WsFanoutThreshold {
             pool.clone(),
             payer_bytes.clone(),
             None,
-        );
+        )?;
         check_eq!(
             warmup.failed,
             0,
@@ -234,7 +234,7 @@ impl Scenario for WsFanoutThreshold {
                 .await?;
 
             let before = er.scrape_metrics().await?;
-            let outcome = drive_cell(
+            let outcome = execute_cell(
                 er_rpc_url.clone(),
                 ThreadRunConfig {
                     threads: profile.threads,
@@ -246,7 +246,7 @@ impl Scenario for WsFanoutThreshold {
                 pool.clone(),
                 payer_bytes.clone(),
                 Some(produced.clone()),
-            );
+            )?;
             check_eq!(
                 outcome.failed,
                 0,

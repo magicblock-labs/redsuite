@@ -1,6 +1,4 @@
-use std::{
-    any::Any, future::Future, panic::AssertUnwindSafe, rc::Rc, time::Instant,
-};
+use std::{future::Future, panic::AssertUnwindSafe, rc::Rc, time::Instant};
 
 use async_trait::async_trait;
 use futures_util::FutureExt;
@@ -13,6 +11,7 @@ use crate::{
     profile::ExecutionConfig,
     report::ScenarioReport,
     resources::Resources,
+    runner::panic_message,
     topology, DynError, Result,
 };
 
@@ -104,16 +103,6 @@ pub enum ScenarioOutcome {
 // A failed check is scenario evidence; every other error is infrastructure.
 pub fn failed_check(error: &DynError) -> Option<&CheckError> {
     error.downcast_ref::<CheckError>()
-}
-
-fn panic_message(payload: Box<dyn Any + Send>) -> String {
-    if let Some(message) = payload.downcast_ref::<&str>() {
-        (*message).to_owned()
-    } else if let Some(message) = payload.downcast_ref::<String>() {
-        message.clone()
-    } else {
-        "non-string panic payload".to_owned()
-    }
 }
 
 #[derive(Debug)]
@@ -429,14 +418,6 @@ fn conclude(record: &mut RunRecord) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn panic_payloads_keep_their_message() {
-        let caught = std::panic::catch_unwind(|| panic!("boom {}", 7));
-        assert_eq!(panic_message(caught.unwrap_err()), "boom 7");
-        let caught = std::panic::catch_unwind(|| panic!("plain"));
-        assert_eq!(panic_message(caught.unwrap_err()), "plain");
-    }
 
     #[test]
     fn check_errors_classify_apart_from_plain_errors() {

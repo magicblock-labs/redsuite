@@ -6,7 +6,7 @@ use pubkey::Pubkey;
 use redsuite_core::{
     check, check_eq, host,
     profile::{self, ProfileValues},
-    runner::{drive, RunConfig},
+    runner::{execute, RunConfig},
     topology,
     transport::wsraw::RawWs,
     BaseCtx, ErCtx, Result, Scenario, ScenarioReport,
@@ -192,7 +192,7 @@ impl Scenario for WsConnCapacity {
             rungs.push(rung);
         }
 
-        let churn = drive(
+        let churn = execute(
             RunConfig {
                 iterations: profile.churn_ops,
                 rate: profile.churn_ops as u32,

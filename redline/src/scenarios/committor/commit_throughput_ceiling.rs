@@ -13,7 +13,7 @@ use redsuite_core::{
     prep,
     profile::{self, ProfileValues},
     receipt, report,
-    runner::{drive, RunConfig},
+    runner::{execute, RunConfig},
     BaseCtx, ChainCtx, CheckError, ErCtx, MetricsDelta, Result, Scenario,
     ScenarioReport,
 };
@@ -130,7 +130,7 @@ async fn deliver_commits(
             }
         }
     };
-    let outcome = drive(
+    let outcome = execute(
         RunConfig {
             iterations: sets.len() as u64,
             rate,

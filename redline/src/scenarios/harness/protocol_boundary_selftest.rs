@@ -8,7 +8,7 @@ use redsuite_core::{
     check, check_eq, prep,
     profile::{self, ProfileValues},
     report,
-    runner::{drive_threads, RunOutcome, ThreadRunConfig},
+    runner::{execute_threaded, RunOutcome, ThreadRunConfig},
     BaseCtx, ChainCtx, ErClient, ErCtx, MetricsDelta, Result, Scenario,
     ScenarioReport, TxSender,
 };
@@ -79,7 +79,7 @@ fn run_cell(
     id_offset: u64,
     pool: Arc<Vec<Pubkey>>,
     payer_bytes: Arc<Vec<[u8; 64]>>,
-) -> RunOutcome {
+) -> Result<RunOutcome> {
     let threads = config.threads;
     let factory = move |thread_index: usize| {
         let client = ErClient::new(er_rpc_url.clone());
@@ -100,7 +100,7 @@ fn run_cell(
             async move { sender.send(&[ix]).await.map(|_| ()) }
         }
     };
-    drive_threads(config, factory)
+    execute_threaded(config, factory)
 }
 
 struct CellOutcome {
@@ -159,7 +159,7 @@ impl Scenario for ProtocolBoundarySelftest {
             0,
             pool.clone(),
             payer_bytes.clone(),
-        );
+        )?;
         check_eq!(
             warmup.failed,
             0,
@@ -182,7 +182,7 @@ impl Scenario for ProtocolBoundarySelftest {
                 id_offset,
                 pool.clone(),
                 payer_bytes.clone(),
-            );
+            )?;
             let after = er.scrape_metrics().await?;
             let delta = MetricsDelta::new(before, after);
             id_offset += profile.iterations;

@@ -10,7 +10,7 @@ use redsuite_core::{
     check, check_eq, prep,
     profile::{self, ProfileValues},
     report,
-    runner::{drive, RunConfig, RunOutcome},
+    runner::{execute, RunConfig, RunOutcome},
     transport::ws::{AccountUpdates, UpdateOutcome},
     BaseCtx, ChainCtx, CheckError, ErCtx, MetricsDelta, Result, Scenario,
     ScenarioReport, TxSender,
@@ -131,7 +131,7 @@ async fn run_cell(
         async move { sender.send(&[ix]).await.map(|_| ()) }
     };
     let count_before_warmup = er.scrape_metrics().await?.get(TX_COUNT);
-    let warm = drive(
+    let warm = execute(
         RunConfig {
             iterations: profile.warmup,
             rate: profile.rate,
@@ -183,7 +183,7 @@ async fn run_cell(
         }
     };
     let before = er.scrape_metrics().await?;
-    let outcome = drive(
+    let outcome = execute(
         RunConfig {
             iterations: profile.iterations,
             rate: profile.rate,
