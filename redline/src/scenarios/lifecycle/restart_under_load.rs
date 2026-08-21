@@ -304,7 +304,6 @@ impl Scenario for RestartUnderLoad {
                     ("MBV_LEDGER__BLOCK_TIME".to_owned(), "50ms".to_owned()),
                 ],
                 request_timeout: None,
-                ..Default::default()
             },
         )
         .await?;

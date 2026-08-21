@@ -101,7 +101,6 @@ impl Scenario for WsConnCapacity {
                 label: "s3".to_owned(),
                 env: Vec::new(),
                 request_timeout: None,
-                ..Default::default()
             },
         )
         .await?;

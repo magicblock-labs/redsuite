@@ -222,16 +222,16 @@ pub async fn private_er(
     fs::create_dir_all(&dir)?;
     let er_bin = config::find_er_bin()?;
     let er_identity = identity::identity_for_label(&options.label)?;
-    if options.lifecycle == "ephemeral" {
-        identity::ensure_identity_funded(base, &er_identity.pubkey()).await?;
-    }
+    identity::ensure_identity_funded(base, &er_identity.pubkey()).await?;
 
     let mut ports = process::PortLease::default();
     let (rpc_port, ws_port) = ports.pair()?;
     let metrics_port = ports.single()?;
     let storage_dir = dir.join(format!("er-{}", options.label));
-    if !options.keep_storage {
-        let _ = fs::remove_dir_all(&storage_dir);
+    if let Err(error) = fs::remove_dir_all(&storage_dir) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            return Err(error.into());
+        }
     }
     let log = dir.join(format!("er-{}.log", options.label));
     let identity_pubkey = er_identity.pubkey();
@@ -244,8 +244,7 @@ pub async fn private_er(
         metrics_port,
         storage_dir,
         env: options.env,
-        reset: options.reset,
-        lifecycle: options.lifecycle.clone(),
+        reset: true,
     };
     eprintln!(
         "[redsuite] booting private ER `{}` on 127.0.0.1:{rpc_port} …",
@@ -270,11 +269,9 @@ pub async fn private_er(
         return Err(e);
     }
 
-    if options.lifecycle == "ephemeral" {
-        if let Err(e) = await_magic_fee_vault(base, &identity_pubkey).await {
-            abort_boot(child, pid, &record);
-            return Err(e);
-        }
+    if let Err(e) = await_magic_fee_vault(base, &identity_pubkey).await {
+        abort_boot(child, pid, &record);
+        return Err(e);
     }
 
     let ctx = ErCtx::new_with_timeout(
