@@ -228,7 +228,11 @@ pub async fn private_er(
     let (rpc_port, ws_port) = ports.pair()?;
     let metrics_port = ports.single()?;
     let storage_dir = dir.join(format!("er-{}", options.label));
-    let _ = fs::remove_dir_all(&storage_dir);
+    if let Err(error) = fs::remove_dir_all(&storage_dir) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            return Err(error.into());
+        }
+    }
     let log = dir.join(format!("er-{}.log", options.label));
     let identity_pubkey = er_identity.pubkey();
     let plan = config::ErPlan {

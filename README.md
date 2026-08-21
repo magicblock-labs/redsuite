@@ -113,10 +113,13 @@ flock, `genesis-accounts/`, logs, ledgers).
     cargo xtask stack down      # stop the stack and clear its state
 
 Scenario isolation comes from fresh keypairs, not fresh chains.
-Scenarios that kill a validator, restart one, or need their own config boot a private ER instead
-(`task_scheduler`, `config_gates`, `aml_gate`). Each takes
+Scenarios that kill a validator, restart one, or need their own config boot
+private ERs. `task_scheduler`, `config_gates`, and `aml_gate` run on one
+instead of the shared ER; `restart_under_load`, `ws_conn_capacity`,
+`clone_lru_churn`, `cold_hydration_tail`, `ensure_gate_stall`, and
+`storage_prodsize_sustain` boot theirs beside the shared stack. Each takes
 its own identity from a 32-slot pool minted at genesis, so private ERs never
-collide with the shared one.
+collide with the shared one or each other.
 
 The harness needs two binaries:
 
