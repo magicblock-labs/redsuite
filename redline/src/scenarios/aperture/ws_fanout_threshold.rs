@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use instruction::Instruction;
 use keypair::Keypair;
 use pubkey::Pubkey;
+use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, prep,
     profile::{self, ProfileValues},
@@ -333,31 +334,66 @@ impl Scenario for WsFanoutThreshold {
                     .setting("offered tps", profile.rate)
                     .setting("concurrency", profile.concurrency)
                     .setting("drain timeout s", DRAIN_TIMEOUT.as_secs())
-                    .observe("delivery us", outcome.delivery)
-                    .observe("fanout lag us", cell_outcome.lag)
-                    .metric("achieved tps", cell_outcome.achieved_tps)
-                    .metric("writes produced", (profile.iterations * 2) as f64)
-                    .metric("received total", received_total as f64)
-                    .metric("received per-conn min", received_min as f64)
-                    .metric("received per-conn max", received_max as f64)
+                    .observe("delivery us", Unit::Micros, outcome.delivery)
+                    .observe("fanout lag us", Unit::Micros, cell_outcome.lag)
+                    .metric(
+                        "achieved tps",
+                        Unit::Tps,
+                        cell_outcome.achieved_tps,
+                    )
+                    .metric(
+                        "writes produced",
+                        Unit::Count,
+                        (profile.iterations * 2) as f64,
+                    )
+                    .metric(
+                        "received total",
+                        Unit::Count,
+                        received_total as f64,
+                    )
+                    .metric(
+                        "received per-conn min",
+                        Unit::Count,
+                        received_min as f64,
+                    )
+                    .metric(
+                        "received per-conn max",
+                        Unit::Count,
+                        received_max as f64,
+                    )
                     .metric(
                         "received per-conn spread",
+                        Unit::Count,
                         (received_max - received_min) as f64,
                     )
-                    .metric("missing final states", missing_final as f64)
-                    .metric("incomplete conn-account pairs", incomplete as f64)
-                    .metric("notifications over 1s", over_threshold as f64)
+                    .metric(
+                        "missing final states",
+                        Unit::Count,
+                        missing_final as f64,
+                    )
+                    .metric(
+                        "incomplete conn-account pairs",
+                        Unit::Count,
+                        incomplete as f64,
+                    )
+                    .metric(
+                        "notifications over 1s",
+                        Unit::Count,
+                        over_threshold as f64,
+                    )
                     .metric_if(
                         "validator txs in window",
+                        Unit::Count,
                         delta.counter("mbv_transaction_count"),
                     )
                     .metric_if(
                         "validator tx processing avg us",
+                        Unit::Micros,
                         delta
                             .histogram_avg("mbv_transaction_processing_time")
                             .map(|seconds| seconds * 1e6),
                     );
-            match report::persist(&cell_report) {
+            match report::persist_cell(self.name(), &cell_report) {
                 Ok(path) => {
                     eprintln!("[redsuite]   cell report: {}", path.display())
                 }
@@ -454,10 +490,15 @@ impl Scenario for WsFanoutThreshold {
             .setting("measured iters per cell", profile.iterations)
             .setting("offered tps", profile.rate)
             .setting("concurrency", profile.concurrency)
-            .metric("cliff at ws conns (0 = none)", cliff as f64)
-            .metric("baseline missing finals", baseline.missing_final as f64)
+            .metric("cliff at ws conns (0 = none)", Unit::Count, cliff as f64)
+            .metric(
+                "baseline missing finals",
+                Unit::Count,
+                baseline.missing_final as f64,
+            )
             .metric(
                 "baseline received spread",
+                Unit::Count,
                 (baseline.received_max - baseline.received_min) as f64,
             );
         for cell in &cells {
@@ -465,35 +506,54 @@ impl Scenario for WsFanoutThreshold {
             summary = summary
                 .metric(
                     format!("{cell_name} lag p50 us"),
+                    Unit::Micros,
                     cell.lag.median as f64,
                 )
                 .metric(
                     format!("{cell_name} lag p95 us"),
+                    Unit::Micros,
                     cell.lag.quantile95 as f64,
                 )
-                .metric(format!("{cell_name} lag max us"), cell.lag.max as f64)
-                .metric(format!("{cell_name} achieved tps"), cell.achieved_tps)
+                .metric(
+                    format!("{cell_name} lag max us"),
+                    Unit::Micros,
+                    cell.lag.max as f64,
+                )
+                .metric(
+                    format!("{cell_name} achieved tps"),
+                    Unit::Tps,
+                    cell.achieved_tps,
+                )
                 .metric(
                     format!("{cell_name} received spread"),
+                    Unit::Count,
                     (cell.received_max - cell.received_min) as f64,
                 )
                 .metric(
                     format!("{cell_name} missing finals"),
+                    Unit::Count,
                     cell.missing_final as f64,
                 )
                 .metric(
                     format!("{cell_name} incomplete pairs"),
+                    Unit::Count,
                     cell.incomplete as f64,
                 )
                 .metric(
                     format!("{cell_name} over 1s"),
+                    Unit::Count,
                     cell.over_threshold as f64,
                 )
                 .metric(
                     format!("{cell_name} received total"),
+                    Unit::Count,
                     cell.received_total as f64,
                 )
-                .metric(format!("{cell_name} failed"), cell.failed as f64);
+                .metric(
+                    format!("{cell_name} failed"),
+                    Unit::Count,
+                    cell.failed as f64,
+                );
         }
         Ok(summary)
     }

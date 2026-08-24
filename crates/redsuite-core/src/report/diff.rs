@@ -1,125 +1,168 @@
-use std::{collections::BTreeMap, fs, path::PathBuf};
+use std::{collections::BTreeMap, fs};
 
-use json::{Deserialize, Serialize};
+use json::Serialize;
 
-use crate::{topology::workspace_root, Result};
+use super::{
+    store::{self, ReportStore},
+    CampaignMeta, Direction, MeasureValue, Measurement, ScenarioRun, Unit,
+};
+use crate::Result;
 
-#[derive(Deserialize)]
-struct Persisted {
-    meta: Meta,
-    report: Report,
+struct RunView<'a> {
+    stamp: String,
+    file: String,
+    meta: Option<&'a CampaignMeta>,
+    run: &'a ScenarioRun,
+    gate: Option<String>,
 }
 
-#[derive(Deserialize)]
-struct Meta {
-    // redundant with the filename prefix, kept for schema fidelity
-    #[allow(dead_code)]
-    recorded_at: String,
-    er_bin: String,
-    er_version: String,
-    er_fingerprint: String,
-}
-
-#[derive(Deserialize)]
-struct Report {
-    scenario: String,
-    passed: bool,
-    config: Vec<(String, String)>,
-    observations: Vec<(String, Stats)>,
-    metrics: Vec<(String, f64)>,
-}
-
-#[derive(Deserialize, Clone, Copy)]
-#[serde(rename_all = "kebab-case")]
-#[allow(dead_code)]
-struct Stats {
-    count: usize,
-    median: i32,
-    min: u32,
-    max: u32,
-    avg: i32,
-    quantile95: i32,
-    stddev: u32,
-}
-
-fn reports_dir() -> PathBuf {
-    workspace_root().join("target/redsuite-reports")
-}
-
-// Chronological per scenario — the timestamp prefix makes name order time order.
-fn load_all() -> Result<BTreeMap<String, Vec<(String, Persisted)>>> {
-    let dir = reports_dir();
-    let mut by_scenario: BTreeMap<String, Vec<(String, Persisted)>> =
-        BTreeMap::new();
-    let Ok(entries) = fs::read_dir(&dir) else {
-        return Ok(by_scenario);
-    };
-    let mut files: Vec<PathBuf> = entries
-        .collect::<std::io::Result<Vec<_>>>()?
-        .into_iter()
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
-        .collect();
-    files.sort();
-    for path in files {
-        let doc: Persisted = json::from_str(&fs::read_to_string(&path)?)
-            .map_err(|e| format!("{}: {e}", path.display()))?;
-        let name = path.file_name().unwrap().to_string_lossy().into_owned();
-        by_scenario
-            .entry(doc.report.scenario.clone())
-            .or_default()
-            .push((name, doc));
+fn run_gate(run: &ScenarioRun) -> Option<String> {
+    if !run.passed {
+        return Some(match run.failures.first() {
+            Some(failure) => {
+                format!("run failed ({}: {})", failure.phase, failure.message)
+            }
+            None => "run failed".to_owned(),
+        });
     }
-    Ok(by_scenario)
+    run.failures.first().map(|failure| {
+        format!("run has a {} failure: {}", failure.phase, failure.message)
+    })
+}
+
+fn timelines(report_store: &ReportStore) -> BTreeMap<String, Vec<RunView<'_>>> {
+    let mut map: BTreeMap<String, Vec<RunView>> = BTreeMap::new();
+    for legacy in &report_store.legacy {
+        map.entry(legacy.run.scenario.clone())
+            .or_default()
+            .push(RunView {
+                stamp: legacy.meta.started_at.clone(),
+                file: legacy.file.clone(),
+                meta: Some(&legacy.meta),
+                run: &legacy.run,
+                gate: run_gate(&legacy.run),
+            });
+    }
+    for campaign in &report_store.campaigns {
+        let stamp = campaign.stamp().to_owned();
+        for scenario in &campaign.scenarios {
+            map.entry(scenario.run.scenario.clone()).or_default().push(
+                RunView {
+                    stamp: stamp.clone(),
+                    file: format!("{}/{}", campaign.dir_name, scenario.file),
+                    meta: campaign.meta.as_ref(),
+                    run: &scenario.run,
+                    gate: run_gate(&scenario.run),
+                },
+            );
+            let parent_gate = run_gate(&scenario.run).map(|reason| {
+                format!(
+                    "parent {} did not pass ({reason})",
+                    scenario.run.scenario
+                )
+            });
+            for cell in &scenario.cells {
+                map.entry(cell.scenario.clone()).or_default().push(RunView {
+                    stamp: stamp.clone(),
+                    file: format!("{}/{}", campaign.dir_name, scenario.file),
+                    meta: campaign.meta.as_ref(),
+                    run: cell,
+                    gate: parent_gate.clone().or_else(|| run_gate(cell)),
+                });
+            }
+        }
+        for orphans in &campaign.orphan_cells {
+            for cell in &orphans.cells {
+                map.entry(cell.scenario.clone()).or_default().push(RunView {
+                    stamp: stamp.clone(),
+                    file: format!(
+                        "{}/{}.cells.jsonl",
+                        campaign.dir_name, orphans.parent_slug
+                    ),
+                    meta: campaign.meta.as_ref(),
+                    run: cell,
+                    gate: Some(
+                        "the parent run is absent — the scenario did not \
+                         conclude"
+                            .to_owned(),
+                    ),
+                });
+            }
+        }
+    }
+    for views in map.values_mut() {
+        views.sort_by(|left, right| left.stamp.cmp(&right.stamp));
+    }
+    map
+}
+
+fn profile_of(run: &ScenarioRun) -> &str {
+    run.config
+        .iter()
+        .find(|(key, _)| key == "profile")
+        .map(|(_, value)| value.as_str())
+        .unwrap_or("-")
 }
 
 pub fn list() -> Result<()> {
-    let all = load_all()?;
-    if all.is_empty() {
+    let report_store = store::load()?;
+    if report_store.campaigns.is_empty() && report_store.legacy.is_empty() {
         println!(
             "no reports in {} — run a scenario first",
-            reports_dir().display()
+            super::reports_dir().display()
         );
         return Ok(());
     }
-    for (scenario, runs) in &all {
-        println!("{scenario}");
-        for (file, doc) in runs {
-            let profile = doc
-                .report
-                .config
-                .iter()
-                .find(|(key, _)| key == "profile")
-                .map(|(_, value)| value.as_str())
-                .unwrap_or("-");
+    for campaign in &report_store.campaigns {
+        match &campaign.meta {
+            Some(meta) => println!(
+                "campaign {} run={} er=\"{}\" [{}]",
+                meta.started_at, meta.run, meta.er_version, meta.er_fingerprint
+            ),
+            None => println!(
+                "campaign {} (campaign.json is missing)",
+                campaign.dir_name
+            ),
+        }
+        for scenario in &campaign.scenarios {
+            let failure_note = match scenario.run.failures.len() {
+                0 => String::new(),
+                count => format!(" failures={count}"),
+            };
             println!(
-                "  {file}  passed={} profile={profile} er=\"{}\" [{}]",
-                doc.report.passed, doc.meta.er_version, doc.meta.er_fingerprint,
+                "  {}  passed={}{failure_note} profile={}",
+                scenario.run.scenario,
+                scenario.run.passed,
+                profile_of(&scenario.run),
+            );
+            for cell in &scenario.cells {
+                println!("    cell {}  passed={}", cell.scenario, cell.passed);
+            }
+        }
+        for orphans in &campaign.orphan_cells {
+            println!(
+                "  {}: cells without a concluded parent run",
+                orphans.parent_slug
+            );
+            for cell in &orphans.cells {
+                println!("    cell {}  passed={}", cell.scenario, cell.passed);
+            }
+        }
+    }
+    if !report_store.legacy.is_empty() {
+        println!("legacy reports (schema 0):");
+        for legacy in &report_store.legacy {
+            println!(
+                "  {}  passed={} profile={} er=\"{}\" [{}]",
+                legacy.file,
+                legacy.run.passed,
+                profile_of(&legacy.run),
+                legacy.meta.er_version,
+                legacy.meta.er_fingerprint,
             );
         }
     }
     Ok(())
-}
-
-#[derive(Debug, PartialEq)]
-enum Direction {
-    Lower,  // latency-like: lower is better
-    Higher, // throughput-like: higher is better
-    Info,   // counts, gauges
-}
-
-fn direction(label: &str) -> Direction {
-    let lowered = label.to_ascii_lowercase();
-    if lowered.contains("rps") || lowered.contains("tps") {
-        Direction::Higher
-    } else if lowered.ends_with(" us")
-        || lowered.contains("lag")
-        || lowered.contains("latency")
-    {
-        Direction::Lower
-    } else {
-        Direction::Info
-    }
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -133,8 +176,8 @@ enum Verdict {
 
 const FLAT_FOLD_CHANGE: f64 = 2.0;
 
-fn verdict(dir: &Direction, old: f64, new: f64) -> Verdict {
-    if matches!(dir, Direction::Info) || old == 0.0 {
+fn verdict(direction: Direction, old: f64, new: f64) -> Verdict {
+    if matches!(direction, Direction::Info) || old == 0.0 {
         return Verdict::Info;
     }
     let fold_change = if new > old {
@@ -145,9 +188,9 @@ fn verdict(dir: &Direction, old: f64, new: f64) -> Verdict {
     if fold_change < FLAT_FOLD_CHANGE {
         return Verdict::Flat;
     }
-    let worse = match dir {
-        Direction::Lower => new > old,
-        Direction::Higher => new < old,
+    let worse = match direction {
+        Direction::LowerIsBetter => new > old,
+        Direction::HigherIsBetter => new < old,
         Direction::Info => unreachable!(),
     };
     if worse {
@@ -182,42 +225,177 @@ fn pct(old: f64, new: f64) -> String {
     format!("{:+.1}%", (new - old) / old * 100.0)
 }
 
-fn print_run_context(
-    prev_file: &str,
-    prev: &Persisted,
-    last_file: &str,
-    last: &Persisted,
-) {
-    println!("  prev: {prev_file}");
-    println!("  last: {last_file}");
-    if prev.meta.er_fingerprint == last.meta.er_fingerprint {
-        println!(
-            "  validator: same build ({}) — differences are noise or harness changes",
-            last.meta.er_version
-        );
-    } else {
-        println!("  validator: DIFFERENT builds");
-        println!(
-            "    prev: \"{}\" [{}] {}",
-            prev.meta.er_version, prev.meta.er_fingerprint, prev.meta.er_bin,
-        );
-        println!(
-            "    last: \"{}\" [{}] {}",
-            last.meta.er_version, last.meta.er_fingerprint, last.meta.er_bin,
-        );
+fn pick_baseline<'view, 'store>(
+    earlier: &'view [RunView<'store>],
+    config: &[(String, String)],
+) -> Option<&'view RunView<'store>> {
+    earlier.iter().rev().find(|candidate| {
+        candidate.gate.is_none() && candidate.run.config == *config
+    })
+}
+
+fn baseline_gap_reason(
+    earlier: &[RunView],
+    config: &[(String, String)],
+) -> String {
+    let Some(nearest) = earlier.last() else {
+        return "no earlier run".to_owned();
+    };
+    match &nearest.gate {
+        Some(reason) => {
+            format!("nearest earlier run {}: {reason}", nearest.file)
+        }
+        None => format!(
+            "nearest earlier run {} used a different config ({})",
+            nearest.file,
+            config_gap(&nearest.run.config, config),
+        ),
     }
 }
 
+fn config_gap(old: &[(String, String)], new: &[(String, String)]) -> String {
+    for (key, new_value) in new {
+        match old.iter().find(|(old_key, _)| old_key == key) {
+            None => return format!("{key} is new"),
+            Some((_, old_value)) if old_value != new_value => {
+                return format!("{key}: {old_value} → {new_value}")
+            }
+            Some(_) => {}
+        }
+    }
+    for (key, _) in old {
+        if !new.iter().any(|(new_key, _)| new_key == key) {
+            return format!("{key} is gone");
+        }
+    }
+    "keys reordered".to_owned()
+}
+
+fn print_run_context(baseline: &RunView, latest: &RunView) {
+    println!("  prev: {}", baseline.file);
+    println!("  last: {}", latest.file);
+    match (baseline.meta, latest.meta) {
+        (Some(prev_meta), Some(last_meta))
+            if prev_meta.er_fingerprint == last_meta.er_fingerprint =>
+        {
+            println!(
+                "  validator: same build ({}) — differences are noise or harness changes",
+                last_meta.er_version
+            );
+        }
+        (Some(prev_meta), Some(last_meta)) => {
+            println!("  validator: DIFFERENT builds");
+            println!(
+                "    prev: \"{}\" [{}] {}",
+                prev_meta.er_version,
+                prev_meta.er_fingerprint,
+                prev_meta.er_bin,
+            );
+            println!(
+                "    last: \"{}\" [{}] {}",
+                last_meta.er_version,
+                last_meta.er_fingerprint,
+                last_meta.er_bin,
+            );
+        }
+        _ => println!("  validator: build provenance unknown"),
+    }
+}
+
+fn measurement_rows(
+    baseline: &ScenarioRun,
+    latest: &ScenarioRun,
+) -> Vec<(Verdict, String)> {
+    let previous: BTreeMap<&str, &Measurement> = baseline
+        .measurements
+        .iter()
+        .map(|measurement| (measurement.label.as_str(), measurement))
+        .collect();
+    let mut rows = Vec::new();
+    for measurement in &latest.measurements {
+        let Some(old) = previous.get(measurement.label.as_str()) else {
+            continue;
+        };
+        let label = &measurement.label;
+        if old.unit != measurement.unit {
+            rows.push((
+                Verdict::Info,
+                format!(
+                    "  {label:<34} unit changed ({:?} → {:?}) — not compared",
+                    old.unit, measurement.unit
+                ),
+            ));
+            continue;
+        }
+        match (&old.value, &measurement.value) {
+            (
+                MeasureValue::Distribution(old_stats),
+                MeasureValue::Distribution(new_stats),
+            ) => {
+                let median_verdict = verdict(
+                    measurement.direction,
+                    old_stats.median as f64,
+                    new_stats.median as f64,
+                );
+                let quantile95_verdict = verdict(
+                    measurement.direction,
+                    old_stats.quantile95 as f64,
+                    new_stats.quantile95 as f64,
+                );
+                let row_verdict =
+                    combined_verdict(median_verdict, quantile95_verdict);
+                rows.push((
+                    row_verdict,
+                    format!(
+                        "  {label:<34} median {} → {} ({})  p95 {} → {} ({})  {}",
+                        old_stats.median,
+                        new_stats.median,
+                        pct(old_stats.median as f64, new_stats.median as f64),
+                        old_stats.quantile95,
+                        new_stats.quantile95,
+                        pct(
+                            old_stats.quantile95 as f64,
+                            new_stats.quantile95 as f64
+                        ),
+                        verdict_tag(row_verdict),
+                    ),
+                ));
+            }
+            (
+                MeasureValue::Scalar(old_value),
+                MeasureValue::Scalar(new_value),
+            ) => {
+                let row_verdict =
+                    verdict(measurement.direction, *old_value, *new_value);
+                rows.push((
+                    row_verdict,
+                    format!(
+                        "  {label:<34} {old_value:.1} → {new_value:.1} ({})  {}",
+                        pct(*old_value, *new_value),
+                        verdict_tag(row_verdict),
+                    ),
+                ));
+            }
+            _ => rows.push((
+                Verdict::Info,
+                format!("  {label:<34} value shape changed — not compared"),
+            )),
+        }
+    }
+    rows
+}
+
 pub fn compare(filter: Option<&str>, strict: bool, brief: bool) -> Result<()> {
-    let all = load_all()?;
+    let report_store = store::load()?;
+    let map = timelines(&report_store);
     let mut regressions = 0usize;
     let mut compared = 0usize;
 
-    for (scenario, runs) in &all {
+    for (scenario, runs) in &map {
         if filter.is_some_and(|wanted| !scenario.contains(wanted)) {
             continue;
         }
-        let has_cell_children = all
+        let has_cell_children = map
             .keys()
             .any(|other| other.starts_with(&format!("{scenario}/")));
         if brief && has_cell_children {
@@ -226,81 +404,32 @@ pub fn compare(filter: Option<&str>, strict: bool, brief: bool) -> Result<()> {
         if runs.len() < 2 {
             continue;
         }
-        let (prev_file, prev) = &runs[runs.len() - 2];
-        let (last_file, last) = &runs[runs.len() - 1];
-        compared += 1;
-
-        if prev.report.config != last.report.config {
+        let latest = runs.last().unwrap();
+        if let Some(reason) = &latest.gate {
+            println!("{scenario}");
+            println!("  not compared: latest {}: {reason}", latest.file);
+            println!();
             continue;
         }
-
-        let mut rows: Vec<(Verdict, String)> = Vec::new();
-
-        let prev_obs: BTreeMap<_, _> = prev
-            .report
-            .observations
-            .iter()
-            .map(|(label, stats)| (label.clone(), *stats))
-            .collect();
-        for (label, new_stats) in &last.report.observations {
-            let Some(old_stats) = prev_obs.get(label) else {
-                continue;
-            };
-            let dir = direction(label);
-            let median_verdict =
-                verdict(&dir, old_stats.median as f64, new_stats.median as f64);
-            let quantile95_verdict = verdict(
-                &dir,
-                old_stats.quantile95 as f64,
-                new_stats.quantile95 as f64,
+        let earlier = &runs[..runs.len() - 1];
+        let Some(baseline) = pick_baseline(earlier, &latest.run.config) else {
+            println!("{scenario}");
+            println!(
+                "  not compared: no comparable baseline — {}",
+                baseline_gap_reason(earlier, &latest.run.config)
             );
-            let row_verdict =
-                combined_verdict(median_verdict, quantile95_verdict);
-            if row_verdict == Verdict::Regression {
-                regressions += 1;
-            }
-            rows.push((
-                row_verdict,
-                format!(
-                    "  {label:<34} median {} → {} ({})  p95 {} → {} ({})  {}",
-                    old_stats.median,
-                    new_stats.median,
-                    pct(old_stats.median as f64, new_stats.median as f64),
-                    old_stats.quantile95,
-                    new_stats.quantile95,
-                    pct(
-                        old_stats.quantile95 as f64,
-                        new_stats.quantile95 as f64
-                    ),
-                    verdict_tag(row_verdict),
-                ),
-            ));
-        }
+            println!();
+            continue;
+        };
+        compared += 1;
 
-        let prev_metrics: BTreeMap<_, _> = prev
-            .report
-            .metrics
+        let rows = measurement_rows(baseline.run, latest.run);
+        regressions += rows
             .iter()
-            .map(|(label, stats)| (label.clone(), *stats))
-            .collect();
-        for (label, new_value) in &last.report.metrics {
-            let Some(old_value) = prev_metrics.get(label) else {
-                continue;
-            };
-            let dir = direction(label);
-            let row_verdict = verdict(&dir, *old_value, *new_value);
-            if row_verdict == Verdict::Regression {
-                regressions += 1;
-            }
-            rows.push((
-                row_verdict,
-                format!(
-                    "  {label:<34} {old_value:.1} → {new_value:.1} ({})  {}",
-                    pct(*old_value, *new_value),
-                    verdict_tag(row_verdict),
-                ),
-            ));
-        }
+            .filter(|(row_verdict, _)| {
+                matches!(row_verdict, Verdict::Regression)
+            })
+            .count();
 
         if brief {
             let changed: Vec<&String> = rows
@@ -328,7 +457,7 @@ pub fn compare(filter: Option<&str>, strict: bool, brief: bool) -> Result<()> {
             }
         } else {
             println!("{scenario}");
-            print_run_context(prev_file, prev, last_file, last);
+            print_run_context(baseline, latest);
             for (_, line) in &rows {
                 println!("{line}");
             }
@@ -337,7 +466,10 @@ pub fn compare(filter: Option<&str>, strict: bool, brief: bool) -> Result<()> {
     }
 
     if compared == 0 {
-        println!("nothing compared — need at least two runs of a scenario");
+        println!(
+            "nothing compared — need at least two comparable runs of a \
+             scenario"
+        );
     } else if regressions > 0 {
         println!("{regressions} metric(s) worse than base");
         if strict {
@@ -371,19 +503,16 @@ fn slug(label: &str) -> String {
         .collect()
 }
 
-fn bmf_document(
-    latest: &BTreeMap<String, &Report>,
-) -> BTreeMap<String, BTreeMap<String, MeasureVal>> {
-    let mut doc: BTreeMap<String, BTreeMap<String, MeasureVal>> =
-        BTreeMap::new();
-    for (scenario, report) in latest {
-        for (label, stats) in &report.observations {
-            if !label.ends_with(" us") {
-                continue;
-            }
-            doc.entry(format!("{scenario}/{}", slug(label)))
-                .or_default()
-                .insert(
+fn export_run(
+    doc: &mut BTreeMap<String, BTreeMap<String, MeasureVal>>,
+    run: &ScenarioRun,
+) {
+    for measurement in &run.measurements {
+        let benchmark =
+            format!("{}/{}", run.scenario, slug(&measurement.label));
+        match (measurement.unit, &measurement.value) {
+            (Unit::Micros, MeasureValue::Distribution(stats)) => {
+                doc.entry(benchmark).or_default().insert(
                     "latency".to_owned(),
                     MeasureVal {
                         value: stats.median as f64 * 1e3,
@@ -391,49 +520,72 @@ fn bmf_document(
                         upper_value: Some(stats.max as f64 * 1e3),
                     },
                 );
-        }
-        for (label, value) in &report.metrics {
-            let lowered = label.to_ascii_lowercase();
-            if lowered.contains("tps") || lowered.contains("rps") {
-                doc.entry(format!("{scenario}/{}", slug(label)))
-                    .or_default()
-                    .insert(
-                        "throughput".to_owned(),
-                        MeasureVal {
-                            value: *value,
-                            lower_value: None,
-                            upper_value: None,
-                        },
-                    );
-            } else if label.ends_with(" us") {
-                doc.entry(format!("{scenario}/{}", slug(label)))
-                    .or_default()
-                    .insert(
-                        "latency".to_owned(),
-                        MeasureVal {
-                            value: value * 1e3,
-                            lower_value: None,
-                            upper_value: None,
-                        },
-                    );
             }
+            (Unit::Micros, MeasureValue::Scalar(value)) => {
+                doc.entry(benchmark).or_default().insert(
+                    "latency".to_owned(),
+                    MeasureVal {
+                        value: value * 1e3,
+                        lower_value: None,
+                        upper_value: None,
+                    },
+                );
+            }
+            (Unit::Tps | Unit::Rps, MeasureValue::Scalar(value)) => {
+                doc.entry(benchmark).or_default().insert(
+                    "throughput".to_owned(),
+                    MeasureVal {
+                        value: *value,
+                        lower_value: None,
+                        upper_value: None,
+                    },
+                );
+            }
+            _ => {}
         }
+    }
+}
+
+fn bmf_document(
+    campaign: &store::Campaign,
+) -> BTreeMap<String, BTreeMap<String, MeasureVal>> {
+    let mut doc: BTreeMap<String, BTreeMap<String, MeasureVal>> =
+        BTreeMap::new();
+    for scenario in &campaign.scenarios {
+        if let Some(reason) = run_gate(&scenario.run) {
+            eprintln!(
+                "[redsuite] bmf: excluded {} — {reason}",
+                scenario.run.scenario
+            );
+            continue;
+        }
+        export_run(&mut doc, &scenario.run);
+        for cell in &scenario.cells {
+            export_run(&mut doc, cell);
+        }
+    }
+    for orphans in &campaign.orphan_cells {
+        eprintln!(
+            "[redsuite] bmf: excluded {} cells — the parent run did not \
+             conclude",
+            orphans.parent_slug
+        );
     }
     doc
 }
 
 pub fn bmf(out: Option<&str>) -> Result<()> {
-    let all = load_all()?;
-    let latest: BTreeMap<String, &Report> = all
-        .iter()
-        .filter_map(|(scenario, runs)| {
-            runs.last().map(|(_, doc)| (scenario.clone(), &doc.report))
-        })
-        .collect();
-    if latest.is_empty() {
-        return Err("no reports to export — run a scenario first".into());
+    let report_store = store::load()?;
+    let Some(latest) = report_store.campaigns.last() else {
+        return Err(
+            "no campaign reports to export — run a scenario first".into()
+        );
+    };
+    let doc = bmf_document(latest);
+    if doc.is_empty() {
+        return Err("the latest campaign has no exportable measurements".into());
     }
-    let body = json::to_string_pretty(&bmf_document(&latest))?;
+    let body = json::to_string_pretty(&doc)?;
     match out {
         Some(path) => {
             fs::write(path, &body)?;
@@ -447,36 +599,49 @@ pub fn bmf(out: Option<&str>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        report::{PersistedFailure, ScenarioReport, SCHEMA_VERSION},
+        stats::ObservationsStats,
+    };
 
-    #[test]
-    fn direction_heuristic_matches_report_labels() {
-        assert_eq!(direction("delivery us"), Direction::Lower);
-        assert_eq!(direction("account-update lag us"), Direction::Lower);
-        assert_eq!(
-            direction("validator tx processing avg us"),
-            Direction::Lower
-        );
-        assert_eq!(direction("achieved tps"), Direction::Higher);
-        assert_eq!(direction("achieved rps"), Direction::Higher);
-        assert_eq!(direction("superseded"), Direction::Info);
-        assert_eq!(direction("monitored accounts (gauge)"), Direction::Info);
-        assert_eq!(direction("measured wall s"), Direction::Info);
+    fn doc_of(report: ScenarioReport) -> ScenarioRun {
+        ScenarioRun {
+            schema: SCHEMA_VERSION,
+            run: "test-run".into(),
+            scenario: report.scenario,
+            passed: report.passed,
+            config: report.config,
+            measurements: report.measurements,
+            failures: Vec::new(),
+        }
+    }
+
+    fn sample_stats() -> ObservationsStats {
+        ObservationsStats {
+            count: 400,
+            median: 8480,
+            min: 8030,
+            max: 10485,
+            avg: 8531,
+            quantile95: 9022,
+            stddev: 274,
+        }
     }
 
     #[test]
     fn verdict_thresholds() {
-        let lower = Direction::Lower;
-        let higher = Direction::Higher;
-        assert_eq!(verdict(&lower, 100.0, 150.0), Verdict::Flat);
-        assert_eq!(verdict(&lower, 100.0, 199.0), Verdict::Flat);
-        assert_eq!(verdict(&lower, 100.0, 51.0), Verdict::Flat);
-        assert_eq!(verdict(&lower, 100.0, 250.0), Verdict::Regression);
-        assert_eq!(verdict(&lower, 100.0, 45.0), Verdict::Improvement);
-        assert_eq!(verdict(&higher, 100.0, 45.0), Verdict::Regression);
-        assert_eq!(verdict(&higher, 100.0, 250.0), Verdict::Improvement);
-        assert_eq!(verdict(&lower, 100.0, 0.0), Verdict::Improvement);
-        assert_eq!(verdict(&Direction::Info, 1.0, 5.0), Verdict::Info);
-        assert_eq!(verdict(&lower, 0.0, 5.0), Verdict::Info);
+        let lower = Direction::LowerIsBetter;
+        let higher = Direction::HigherIsBetter;
+        assert_eq!(verdict(lower, 100.0, 150.0), Verdict::Flat);
+        assert_eq!(verdict(lower, 100.0, 199.0), Verdict::Flat);
+        assert_eq!(verdict(lower, 100.0, 51.0), Verdict::Flat);
+        assert_eq!(verdict(lower, 100.0, 250.0), Verdict::Regression);
+        assert_eq!(verdict(lower, 100.0, 45.0), Verdict::Improvement);
+        assert_eq!(verdict(higher, 100.0, 45.0), Verdict::Regression);
+        assert_eq!(verdict(higher, 100.0, 250.0), Verdict::Improvement);
+        assert_eq!(verdict(lower, 100.0, 0.0), Verdict::Improvement);
+        assert_eq!(verdict(Direction::Info, 1.0, 5.0), Verdict::Info);
+        assert_eq!(verdict(lower, 0.0, 5.0), Verdict::Info);
     }
 
     #[test]
@@ -516,33 +681,139 @@ mod tests {
     }
 
     #[test]
-    fn bmf_mapping() {
-        let stats = Stats {
-            count: 400,
-            median: 8480,
-            min: 8030,
-            max: 10485,
-            avg: 8531,
-            quantile95: 9022,
-            stddev: 274,
+    fn failed_runs_and_their_cells_are_gated_with_a_reason() {
+        let mut failed = doc_of(ScenarioReport::failed("redline/x"));
+        failed.failures.push(PersistedFailure {
+            phase: "scenario".into(),
+            kind: "check".into(),
+            message: "the clone matches base".into(),
+            expected: None,
+            actual: None,
+            context: Vec::new(),
+        });
+        let reason = run_gate(&failed).unwrap();
+        assert!(reason.contains("run failed"));
+        assert!(reason.contains("the clone matches base"));
+
+        let passed_with_teardown_failure = ScenarioRun {
+            failures: vec![PersistedFailure {
+                phase: "teardown".into(),
+                kind: "infrastructure".into(),
+                message: "private ER `x` is still running".into(),
+                expected: None,
+                actual: None,
+                context: Vec::new(),
+            }],
+            ..doc_of(ScenarioReport::ok("redline/y"))
         };
-        let report = Report {
-            scenario: "redline/rpc_warm_ingress".into(),
-            passed: true,
-            config: vec![],
-            observations: vec![("delivery us".into(), stats)],
-            metrics: vec![
-                ("achieved tps".into(), 198.8),
-                ("superseded".into(), 0.0),
-                ("validator tx processing avg us".into(), 7815.3),
-            ],
+        let reason = run_gate(&passed_with_teardown_failure).unwrap();
+        assert!(reason.contains("teardown"));
+
+        assert!(run_gate(&doc_of(ScenarioReport::ok("redline/z"))).is_none());
+    }
+
+    #[test]
+    fn the_baseline_skips_failed_and_reconfigured_runs() {
+        let latest_config = vec![("rate".to_owned(), "200".to_owned())];
+        let old_config = vec![("rate".to_owned(), "100".to_owned())];
+
+        let comparable =
+            doc_of(ScenarioReport::ok("redline/x").setting("rate", 200));
+        let reconfigured =
+            doc_of(ScenarioReport::ok("redline/x").setting("rate", 100));
+        let failed = doc_of(ScenarioReport::failed("redline/x"));
+
+        let view = |run: &'static ScenarioRun, stamp: &str| RunView {
+            stamp: stamp.to_owned(),
+            file: format!("{stamp}-file"),
+            meta: None,
+            run,
+            gate: run_gate(run),
         };
-        let mut latest = BTreeMap::new();
-        latest.insert(report.scenario.clone(), &report);
-        let doc = bmf_document(&latest);
+        let comparable_ref: &'static ScenarioRun =
+            Box::leak(Box::new(comparable));
+        let reconfigured_ref: &'static ScenarioRun =
+            Box::leak(Box::new(reconfigured));
+        let failed_ref: &'static ScenarioRun = Box::leak(Box::new(failed));
+
+        let earlier = vec![
+            view(comparable_ref, "a"),
+            view(reconfigured_ref, "b"),
+            view(failed_ref, "c"),
+        ];
+        let baseline = pick_baseline(&earlier, &latest_config).unwrap();
+        assert_eq!(baseline.stamp, "a");
+
+        assert!(pick_baseline(&earlier[1..], &latest_config).is_none());
+        assert!(baseline_gap_reason(&earlier[1..], &latest_config)
+            .contains("run failed"));
+        let reconfigured_reason =
+            baseline_gap_reason(&earlier[1..2], &latest_config);
+        assert!(reconfigured_reason.contains("different config"));
+        assert!(reconfigured_reason.contains("rate: 100 → 200"));
+
+        assert!(pick_baseline(&earlier, &old_config).is_some());
+    }
+
+    #[test]
+    fn rows_compare_typed_values_and_flag_unit_changes() {
+        let baseline = doc_of(
+            ScenarioReport::ok("redline/x")
+                .observe("delivery us", Unit::Micros, sample_stats())
+                .metric("achieved tps", Unit::Tps, 100.0)
+                .metric("evictions in window", Unit::Count, 4.0)
+                .metric("reshaped", Unit::Count, 1.0),
+        );
+        let latest = doc_of(
+            ScenarioReport::ok("redline/x")
+                .observe(
+                    "delivery us",
+                    Unit::Micros,
+                    ObservationsStats {
+                        median: 20_000,
+                        quantile95: 25_000,
+                        ..sample_stats()
+                    },
+                )
+                .metric("achieved tps", Unit::Tps, 30.0)
+                .metric("evictions in window", Unit::Ratio, 4.0)
+                .observe("reshaped", Unit::Count, sample_stats()),
+        );
+        let rows = measurement_rows(&baseline, &latest);
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0].0, Verdict::Regression);
+        assert_eq!(rows[1].0, Verdict::Regression);
+        assert!(rows[2].1.contains("unit changed"));
+        assert!(rows[3].1.contains("value shape changed"));
+    }
+
+    #[test]
+    fn bmf_mapping_keeps_the_v0_benchmark_names() {
+        let run = doc_of(
+            ScenarioReport::ok("redline/rpc_warm_ingress")
+                .observe("delivery us", Unit::Micros, sample_stats())
+                .metric("achieved tps", Unit::Tps, 198.8)
+                .metric("superseded", Unit::Count, 0.0)
+                .metric("validator tx processing avg us", Unit::Micros, 7815.3),
+        );
+        let campaign =
+            store::Campaign {
+                dir_name: "run-a".into(),
+                meta: None,
+                scenarios: vec![store::StoredScenario {
+                    file: "redline-rpc_warm_ingress.json".into(),
+                    run,
+                    cells: vec![doc_of(
+                        ScenarioReport::ok("redline/rpc_warm_ingress/cold")
+                            .metric("achieved rps", Unit::Rps, 55.0),
+                    )],
+                }],
+                orphan_cells: Vec::new(),
+            };
+        let doc = bmf_document(&campaign);
 
         let delivery = &doc["redline/rpc_warm_ingress/delivery"]["latency"];
-        assert_eq!(delivery.value, 8_480_000.0); // µs → ns
+        assert_eq!(delivery.value, 8_480_000.0);
         assert_eq!(delivery.lower_value, Some(8_030_000.0));
         let tps = &doc["redline/rpc_warm_ingress/achieved-tps"]["throughput"];
         assert_eq!(tps.value, 198.8);
@@ -552,7 +823,39 @@ mod tests {
                 .value
                 > 7_800_000.0
         );
-        // plain counts don't become benchmark measures
+        let cell_rps =
+            &doc["redline/rpc_warm_ingress/cold/achieved-rps"]["throughput"];
+        assert_eq!(cell_rps.value, 55.0);
         assert!(!doc.contains_key("redline/rpc_warm_ingress/superseded"));
+    }
+
+    #[test]
+    fn bmf_excludes_failed_runs_and_their_cells() {
+        let campaign = store::Campaign {
+            dir_name: "run-a".into(),
+            meta: None,
+            scenarios: vec![store::StoredScenario {
+                file: "redline-x.json".into(),
+                run: doc_of(ScenarioReport::failed("redline/x")),
+                cells: vec![doc_of(
+                    ScenarioReport::ok("redline/x/cell").metric(
+                        "achieved tps",
+                        Unit::Tps,
+                        10.0,
+                    ),
+                )],
+            }],
+            orphan_cells: vec![store::OrphanCells {
+                parent_slug: "redline-y".into(),
+                cells: vec![doc_of(
+                    ScenarioReport::ok("redline/y/cell").metric(
+                        "achieved tps",
+                        Unit::Tps,
+                        10.0,
+                    ),
+                )],
+            }],
+        };
+        assert!(bmf_document(&campaign).is_empty());
     }
 }

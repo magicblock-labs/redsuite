@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use instruction::{AccountMeta, Instruction};
 use keypair::Keypair;
 use pubkey::Pubkey;
+use redsuite_core::report::Unit;
 use redsuite_core::{
     check, prep, stats::StreamingStats, BaseCtx, ChainCtx, CheckError, ErCtx,
     Result, Scenario, ScenarioReport,
@@ -67,10 +68,11 @@ impl Scenario for Example {
 
         Ok(ScenarioReport::ok(self.name())
             .setting("transfers", TRANSFERS)
-            .observe("send+confirm us", latency.finalize(false))
-            .metric("lamports delivered", expected as f64)
+            .observe("send+confirm us", Unit::Micros, latency.finalize(false))
+            .metric("lamports delivered", Unit::Lamports, expected as f64)
             .metric_if(
                 "er monitored accounts",
+                Unit::Count,
                 metrics.get("mbv_monitored_accounts_gauge"),
             ))
     }

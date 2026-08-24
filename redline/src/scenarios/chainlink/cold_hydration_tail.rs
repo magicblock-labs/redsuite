@@ -7,6 +7,7 @@ use std::{
 use async_trait::async_trait;
 use keypair::Keypair;
 use pubkey::Pubkey;
+use redsuite_core::report::Unit;
 use redsuite_core::{
     check_eq, prep,
     profile::{self, ProfileValues},
@@ -253,14 +254,15 @@ impl Scenario for ColdHydrationTail {
                 .setting("profile", profile.name)
                 .setting("accounts", profile.cold_accounts)
                 .setting("account space", ACCOUNT_SPACE)
-                .observe("cold first-touch us", cold)
-                .observe("warm repeat us", warm)
-                .metric("collapse ratio", collapse_ratio)
+                .observe("cold first-touch us", Unit::Micros, cold)
+                .observe("warm repeat us", Unit::Micros, warm)
+                .metric("collapse ratio", Unit::Ratio, collapse_ratio)
                 .metric_if(
                     "validator ensure (account) avg s",
+                    Unit::Seconds,
                     touch_delta.histogram_avg(ENSURE_ACCOUNT_HISTOGRAM),
                 );
-        match report::persist(&touch_report) {
+        match report::persist_cell(self.name(), &touch_report) {
             Ok(path) => {
                 eprintln!("[redsuite]   cell report: {}", path.display())
             }
@@ -349,15 +351,16 @@ impl Scenario for ColdHydrationTail {
                     .setting("concurrency", profile.burst_concurrency)
                     .setting("account space", ACCOUNT_SPACE)
                     .setting("slow threshold ms", SLOW_THRESHOLD.as_millis())
-                    .observe("delivery us", outcome.delivery)
-                    .metric("delivered", outcome.delivered as f64)
-                    .metric("slow (>100ms)", outcome.slow as f64)
-                    .metric("burst wall s", outcome.wall_s)
+                    .observe("delivery us", Unit::Micros, outcome.delivery)
+                    .metric("delivered", Unit::Count, outcome.delivered as f64)
+                    .metric("slow (>100ms)", Unit::Count, outcome.slow as f64)
+                    .metric("burst wall s", Unit::Seconds, outcome.wall_s)
                     .metric_if(
                         "validator ensure (tx) avg s",
+                        Unit::Seconds,
                         outcome.ensure_avg_s,
                     );
-            match report::persist(&cell_report) {
+            match report::persist_cell(self.name(), &cell_report) {
                 Ok(path) => {
                     eprintln!("[redsuite]   cell report: {}", path.display())
                 }
@@ -374,19 +377,29 @@ impl Scenario for ColdHydrationTail {
             .setting("burst payers", profile.burst_payers)
             .setting("burst concurrency", profile.burst_concurrency)
             .setting("account space", ACCOUNT_SPACE)
-            .metric("cold p50 us", cold_median_us)
-            .metric("cold p95 us", cold.quantile95 as f64)
-            .metric("warm p50 us", warm_median_us)
-            .metric("collapse ratio", collapse_ratio)
+            .metric("cold p50 us", Unit::Micros, cold_median_us)
+            .metric("cold p95 us", Unit::Micros, cold.quantile95 as f64)
+            .metric("warm p50 us", Unit::Micros, warm_median_us)
+            .metric("collapse ratio", Unit::Ratio, collapse_ratio)
             .metric(
                 "burst cold-deps p95 us",
+                Unit::Micros,
                 cold_deps.delivery.quantile95 as f64,
             )
             .metric(
                 "burst warm-deps p95 us",
+                Unit::Micros,
                 warm_deps.delivery.quantile95 as f64,
             )
-            .metric("burst cold-deps >100ms", cold_deps.slow as f64)
-            .metric("burst warm-deps >100ms", warm_deps.slow as f64))
+            .metric(
+                "burst cold-deps >100ms",
+                Unit::Count,
+                cold_deps.slow as f64,
+            )
+            .metric(
+                "burst warm-deps >100ms",
+                Unit::Count,
+                warm_deps.slow as f64,
+            ))
     }
 }

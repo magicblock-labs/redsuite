@@ -3,6 +3,7 @@ use std::{rc::Rc, time::Duration};
 use async_trait::async_trait;
 use json::{JsonContainerTrait, JsonValueTrait};
 use pubkey::Pubkey;
+use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, prep, system,
     transport::{events::EventSubscriptions, wsraw::RawWs},
@@ -447,7 +448,7 @@ impl Scenario for PubsubContracts {
         Ok(ScenarioReport::ok(self.name())
             .setting("transfer lamports", TRANSFER_LAMPORTS)
             .setting("sequential transfers", SEQUENTIAL_TRANSFERS)
-            .metric("account 1 drained to", drained as f64)
-            .metric("slot events", slot_events.len() as f64))
+            .metric("account 1 drained to", Unit::Count, drained as f64)
+            .metric("slot events", Unit::Count, slot_events.len() as f64))
     }
 }

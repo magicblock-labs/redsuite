@@ -6,6 +6,7 @@ use dlp_api::{
     instruction_builder::{commit_state, finalize, undelegate},
 };
 use keypair::Keypair;
+use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, dlp, prep, system, topology, BaseCtx, ChainCtx, ErCtx,
     Result, Scenario, ScenarioReport,
@@ -258,7 +259,11 @@ impl Scenario for CloneOnAccess {
         Ok(ScenarioReport::ok(self.name())
             .setting("account space", crate::ACCOUNT_SPACE)
             .setting("redelegation continuity window ms", 2_000u64)
-            .metric("fresh clone visibility ms", clone_visibility_ms)
-            .metric("base-to-er propagation ms", propagation_ms))
+            .metric(
+                "fresh clone visibility ms",
+                Unit::Millis,
+                clone_visibility_ms,
+            )
+            .metric("base-to-er propagation ms", Unit::Millis, propagation_ms))
     }
 }

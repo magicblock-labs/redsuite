@@ -1,8 +1,14 @@
 mod diff;
+mod store;
 use std::{
     fs,
-    path::PathBuf,
+    io::Write,
+    path::{Path, PathBuf},
     process::Command,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        OnceLock,
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -15,13 +21,85 @@ use crate::{
     topology, DynError, Result,
 };
 
-#[derive(Debug, Serialize, Deserialize)]
+pub const SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Unit {
+    Micros,
+    Millis,
+    Seconds,
+    Tps,
+    Rps,
+    PerSecond,
+    Count,
+    Kilobytes,
+    Megabytes,
+    Lamports,
+    Ratio,
+}
+
+impl Unit {
+    pub fn default_direction(self) -> Direction {
+        match self {
+            Unit::Micros | Unit::Millis => Direction::LowerIsBetter,
+            Unit::Tps | Unit::Rps => Direction::HigherIsBetter,
+            Unit::Seconds
+            | Unit::PerSecond
+            | Unit::Count
+            | Unit::Kilobytes
+            | Unit::Megabytes
+            | Unit::Lamports
+            | Unit::Ratio => Direction::Info,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Direction {
+    LowerIsBetter,
+    HigherIsBetter,
+    Info,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MeasureValue {
+    Scalar(f64),
+    Distribution(ObservationsStats),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Measurement {
+    pub label: String,
+    pub unit: Unit,
+    pub direction: Direction,
+    pub value: MeasureValue,
+}
+
+impl Measurement {
+    pub fn scalar(&self) -> Option<f64> {
+        match self.value {
+            MeasureValue::Scalar(value) => Some(value),
+            MeasureValue::Distribution(_) => None,
+        }
+    }
+
+    pub fn distribution(&self) -> Option<&ObservationsStats> {
+        match &self.value {
+            MeasureValue::Distribution(stats) => Some(stats),
+            MeasureValue::Scalar(_) => None,
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct ScenarioReport {
     pub scenario: String,
     pub passed: bool,
     pub config: Vec<(String, String)>,
-    pub observations: Vec<(String, ObservationsStats)>,
-    pub metrics: Vec<(String, f64)>,
+    pub measurements: Vec<Measurement>,
 }
 
 impl ScenarioReport {
@@ -30,8 +108,7 @@ impl ScenarioReport {
             scenario: name.to_owned(),
             passed: true,
             config: Vec::new(),
-            observations: Vec::new(),
-            metrics: Vec::new(),
+            measurements: Vec::new(),
         }
     }
 
@@ -54,46 +131,69 @@ impl ScenarioReport {
     pub fn observe(
         mut self,
         label: impl Into<String>,
+        unit: Unit,
         stats: ObservationsStats,
     ) -> Self {
-        self.observations.push((label.into(), stats));
+        self.measurements.push(Measurement {
+            label: label.into(),
+            unit,
+            direction: unit.default_direction(),
+            value: MeasureValue::Distribution(stats),
+        });
         self
     }
 
-    pub fn metric(mut self, label: impl Into<String>, value: f64) -> Self {
-        self.metrics.push((label.into(), value));
+    pub fn metric(
+        mut self,
+        label: impl Into<String>,
+        unit: Unit,
+        value: f64,
+    ) -> Self {
+        self.measurements.push(Measurement {
+            label: label.into(),
+            unit,
+            direction: unit.default_direction(),
+            value: MeasureValue::Scalar(value),
+        });
         self
     }
 
     pub fn metric_if(
-        mut self,
+        self,
         label: impl Into<String>,
+        unit: Unit,
         value: Option<f64>,
     ) -> Self {
-        if let Some(value) = value {
-            self.metrics.push((label.into(), value));
+        match value {
+            Some(value) => self.metric(label, unit, value),
+            None => self,
         }
-        self
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct RunMeta {
-    pub recorded_at: String, // YYYYMMDDThhmmssZ (campaign naming)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CampaignMeta {
+    pub schema: u32,
+    pub run: String,
+    pub started_at: String,
     pub er_bin: String,
     pub er_version: String,
     pub er_fingerprint: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct PersistedReport {
-    pub meta: RunMeta,
-    pub report: ScenarioReport,
-    #[serde(default)]
+pub struct ScenarioRun {
+    pub schema: u32,
+    pub run: String,
+    pub scenario: String,
+    pub passed: bool,
+    pub config: Vec<(String, String)>,
+    pub measurements: Vec<Measurement>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failures: Vec<PersistedFailure>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedFailure {
     pub phase: String,
     #[serde(default)]
@@ -124,8 +224,30 @@ pub fn reports_dir() -> PathBuf {
     topology::workspace_root().join("target/redsuite-reports")
 }
 
-pub fn persist(report: &ScenarioReport) -> Result<PathBuf> {
-    write_report(report, &[])
+pub fn run_id() -> &'static str {
+    static RUN_ID: OnceLock<String> = OnceLock::new();
+    RUN_ID.get_or_init(|| {
+        std::env::var("NEXTEST_RUN_ID")
+            .ok()
+            .map(|inherited| {
+                inherited
+                    .chars()
+                    .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-')
+                    .collect::<String>()
+            })
+            .filter(|inherited| !inherited.is_empty())
+            .unwrap_or_else(|| {
+                format!("{}-{}", utc_stamp(), std::process::id())
+            })
+    })
+}
+
+fn campaign_dir() -> PathBuf {
+    reports_dir().join(run_id())
+}
+
+fn slug_of(name: &str) -> String {
+    name.replace(['/', ' '], "-")
 }
 
 pub fn persist_run(record: &RunRecord) -> Result<PathBuf> {
@@ -142,12 +264,100 @@ pub fn persist_run(record: &RunRecord) -> Result<PathBuf> {
         ScenarioOutcome::Failed(_)
         | ScenarioOutcome::Panicked(_)
         | ScenarioOutcome::NotReached => {
-            fallback = ScenarioReport::failed(&record.name)
-                .metric_if("wall seconds", record.wall_seconds);
+            fallback = ScenarioReport::failed(&record.name).metric_if(
+                "wall seconds",
+                Unit::Seconds,
+                record.wall_seconds,
+            );
             &fallback
         }
     };
-    write_report(report, &failures)
+
+    let dir = campaign_dir();
+    ensure_campaign(&dir)?;
+    warn_on_stack_skew();
+    write_scenario_run(&dir, &scenario_run_doc(report, &failures))
+}
+
+pub fn persist_cell(parent: &str, report: &ScenarioReport) -> Result<PathBuf> {
+    let dir = campaign_dir();
+    ensure_campaign(&dir)?;
+    append_cell(&dir, parent, &scenario_run_doc(report, &[]))
+}
+
+fn scenario_run_doc(
+    report: &ScenarioReport,
+    failures: &[PersistedFailure],
+) -> ScenarioRun {
+    ScenarioRun {
+        schema: SCHEMA_VERSION,
+        run: run_id().to_owned(),
+        scenario: report.scenario.clone(),
+        passed: report.passed,
+        config: report.config.clone(),
+        measurements: report.measurements.clone(),
+        failures: failures.to_vec(),
+    }
+}
+
+fn ensure_campaign(dir: &Path) -> Result<()> {
+    fs::create_dir_all(dir)?;
+    if dir.join("campaign.json").exists() {
+        return Ok(());
+    }
+    let (er_bin, er_version, er_fingerprint) = er_identity();
+    write_campaign_meta(
+        dir,
+        &CampaignMeta {
+            schema: SCHEMA_VERSION,
+            run: run_id().to_owned(),
+            started_at: utc_stamp(),
+            er_bin,
+            er_version,
+            er_fingerprint,
+        },
+    )
+}
+
+fn staging_path(dir: &Path, prefix: &str) -> PathBuf {
+    static STAGING_NONCE: AtomicUsize = AtomicUsize::new(0);
+    let nonce = STAGING_NONCE.fetch_add(1, Ordering::Relaxed);
+    dir.join(format!("{prefix}.tmp{}-{nonce}", std::process::id()))
+}
+
+fn write_campaign_meta(dir: &Path, meta: &CampaignMeta) -> Result<()> {
+    let staging = staging_path(dir, "campaign");
+    fs::write(&staging, json::to_string_pretty(meta)?)?;
+    fs::rename(&staging, dir.join("campaign.json"))?;
+    Ok(())
+}
+
+fn write_scenario_run(dir: &Path, doc: &ScenarioRun) -> Result<PathBuf> {
+    let body = json::to_string_pretty(doc)?;
+    let slug = slug_of(&doc.scenario);
+    let mut path = dir.join(format!("{slug}.json"));
+    // a retried scenario within one campaign keeps both attempts
+    for attempt in 2.. {
+        if !path.exists() {
+            break;
+        }
+        path = dir.join(format!("{slug}-{attempt}.json"));
+    }
+    let staging = staging_path(dir, &slug);
+    fs::write(&staging, body)?;
+    fs::rename(&staging, &path)?;
+    Ok(path)
+}
+
+fn append_cell(dir: &Path, parent: &str, doc: &ScenarioRun) -> Result<PathBuf> {
+    let line = json::to_string(doc)?;
+    let path = dir.join(format!("{}.cells.jsonl", slug_of(parent)));
+    let mut journal = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    writeln!(journal, "{line}")?;
+    Ok(path)
 }
 
 fn run_failures(record: &RunRecord) -> Vec<PersistedFailure> {
@@ -191,47 +401,42 @@ fn scenario_failure(error: &DynError) -> PersistedFailure {
     }
 }
 
-fn write_report(
-    report: &ScenarioReport,
-    failures: &[PersistedFailure],
-) -> Result<PathBuf> {
-    let meta = run_meta();
-    let dir = reports_dir();
-    fs::create_dir_all(&dir)?;
-
-    #[derive(Serialize)]
-    struct Doc<'a> {
-        meta: &'a RunMeta,
-        report: &'a ScenarioReport,
-        #[serde(skip_serializing_if = "<[_]>::is_empty")]
-        failures: &'a [PersistedFailure],
-    }
-    let body = json::to_string_pretty(&Doc {
-        meta: &meta,
-        report,
-        failures,
-    })?;
-
-    let slug = report.scenario.replace(['/', ' '], "-");
-    let mut path = dir.join(format!("{}-{slug}.json", meta.recorded_at));
-    // same scenario twice within a second — keep both runs
-    for attempt in 2.. {
-        if !path.exists() {
-            break;
-        }
-        path = dir.join(format!("{}-{slug}-{attempt}.json", meta.recorded_at));
-    }
-    fs::write(&path, body)?;
-    Ok(path)
+fn running_stack_exe() -> Option<PathBuf> {
+    topology::current_state()
+        .map(|state| PathBuf::from(format!("/proc/{}/exe", state.er_pid)))
+        .filter(|exe| exe.exists())
 }
 
-fn run_meta() -> RunMeta {
-    let running_exe = topology::current_state()
-        .map(|state| PathBuf::from(format!("/proc/{}/exe", state.er_pid)))
-        .filter(|exe| exe.exists());
+fn er_identity() -> (String, String, String) {
+    let running_exe = running_stack_exe();
     let resolved = topology::er_bin_path().ok();
+    let er = running_exe.clone().or(resolved);
 
-    if let (Some(running), Some(resolved)) = (&running_exe, &resolved) {
+    let er_bin = running_exe
+        .as_deref()
+        .and_then(|exe| fs::read_link(exe).ok())
+        .or(er.clone())
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "unknown".into());
+    let er_version = er
+        .as_deref()
+        .and_then(|bin| Command::new(bin).arg("--version").output().ok())
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+        .unwrap_or_else(|| "unknown".into());
+    let er_fingerprint = er
+        .as_deref()
+        .map(fingerprint)
+        .unwrap_or_else(|| "unknown".into());
+    (er_bin, er_version, er_fingerprint)
+}
+
+fn warn_on_stack_skew() {
+    let running_exe = running_stack_exe();
+    let resolved = topology::er_bin_path().ok();
+    if let (Some(running), Some(resolved)) =
+        (running_exe.as_deref(), resolved.as_deref())
+    {
         if fingerprint(running) != fingerprint(resolved) {
             eprintln!(
                 "[redsuite] warning: the shared stack is not running {} — \
@@ -239,27 +444,6 @@ fn run_meta() -> RunMeta {
                 resolved.display()
             );
         }
-    }
-
-    let er = running_exe.clone().or(resolved);
-    RunMeta {
-        recorded_at: utc_stamp(),
-        er_bin: running_exe
-            .as_deref()
-            .and_then(|exe| fs::read_link(exe).ok())
-            .or(er.clone())
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "unknown".into()),
-        er_version: er
-            .as_deref()
-            .and_then(|bin| Command::new(bin).arg("--version").output().ok())
-            .filter(|out| out.status.success())
-            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
-            .unwrap_or_else(|| "unknown".into()),
-        er_fingerprint: er
-            .as_deref()
-            .map(fingerprint)
-            .unwrap_or_else(|| "unknown".into()),
     }
 }
 
@@ -308,33 +492,50 @@ fn utc_stamp() -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn report_document_round_trips() {
-        let report = ScenarioReport::ok("redline/some_scenario")
+    fn sample_report() -> ScenarioReport {
+        ScenarioReport::ok("redline/some_scenario")
             .setting("rate", 200)
-            .observe("delivery us", ObservationsStats::default())
-            .metric("achieved tps", 199.0);
-        let doc = PersistedReport {
-            meta: RunMeta {
-                recorded_at: "20260708T120000Z".into(),
-                er_bin: "/x/magicblock-validator".into(),
-                er_version: "magicblock-config 0.12.1".into(),
-                er_fingerprint: "123-456".into(),
-            },
-            report,
-            failures: vec![PersistedFailure::new(
+            .observe("delivery us", Unit::Micros, ObservationsStats::default())
+            .metric("achieved tps", Unit::Tps, 199.0)
+    }
+
+    #[test]
+    fn scenario_run_round_trips() {
+        let doc = scenario_run_doc(
+            &sample_report(),
+            &[PersistedFailure::new(
                 "teardown",
                 "infrastructure",
                 "private ER `x` is still running",
             )],
-        };
+        );
         let text = json::to_string(&doc).unwrap();
-        let back: PersistedReport = json::from_str(&text).unwrap();
-        assert_eq!(back.report.scenario, "redline/some_scenario");
-        assert_eq!(back.report.config[0].1, "200");
-        assert_eq!(back.meta.er_fingerprint, "123-456");
+        let back: ScenarioRun = json::from_str(&text).unwrap();
+        assert_eq!(back.schema, SCHEMA_VERSION);
+        assert_eq!(back.run, run_id());
+        assert_eq!(back.scenario, "redline/some_scenario");
+        assert_eq!(back.config[0].1, "200");
+        assert_eq!(back.measurements.len(), 2);
+        assert_eq!(back.measurements[0].unit, Unit::Micros);
+        assert_eq!(back.measurements[0].direction, Direction::LowerIsBetter);
+        assert!(back.measurements[0].distribution().is_some());
+        assert_eq!(back.measurements[1].unit, Unit::Tps);
+        assert_eq!(back.measurements[1].direction, Direction::HigherIsBetter);
+        assert_eq!(back.measurements[1].scalar(), Some(199.0));
         assert_eq!(back.failures[0].phase, "teardown");
         assert_eq!(back.failures[0].kind, "infrastructure");
+    }
+
+    #[test]
+    fn units_carry_their_default_direction() {
+        assert_eq!(Unit::Micros.default_direction(), Direction::LowerIsBetter);
+        assert_eq!(Unit::Millis.default_direction(), Direction::LowerIsBetter);
+        assert_eq!(Unit::Tps.default_direction(), Direction::HigherIsBetter);
+        assert_eq!(Unit::Rps.default_direction(), Direction::HigherIsBetter);
+        assert_eq!(Unit::Seconds.default_direction(), Direction::Info);
+        assert_eq!(Unit::PerSecond.default_direction(), Direction::Info);
+        assert_eq!(Unit::Count.default_direction(), Direction::Info);
+        assert_eq!(Unit::Ratio.default_direction(), Direction::Info);
     }
 
     #[test]
@@ -442,10 +643,118 @@ mod tests {
 
     #[test]
     fn documents_without_failures_still_parse() {
-        let text = r#"{"meta":{"recorded_at":"20260708T120000Z","er_bin":"x","er_version":"y","er_fingerprint":"z"},"report":{"scenario":"redshift/example","passed":true,"config":[],"observations":[],"metrics":[]}}"#;
-        let back: PersistedReport = json::from_str(text).unwrap();
+        let text = r#"{"schema":1,"run":"abc","scenario":"redshift/example","passed":true,"config":[],"measurements":[]}"#;
+        let back: ScenarioRun = json::from_str(text).unwrap();
         assert!(back.failures.is_empty());
-        assert!(back.report.passed);
+        assert!(back.passed);
+    }
+
+    #[test]
+    fn campaign_and_cell_files_round_trip_on_disk() {
+        let dir = std::env::temp_dir()
+            .join(format!("redsuite-report-write-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        write_campaign_meta(
+            &dir,
+            &CampaignMeta {
+                schema: SCHEMA_VERSION,
+                run: "test-run".into(),
+                started_at: "20260824T120000Z".into(),
+                er_bin: "/x/magicblock-validator".into(),
+                er_version: "magicblock-config 0.12.1".into(),
+                er_fingerprint: "123-456".into(),
+            },
+        )
+        .unwrap();
+        let first =
+            write_scenario_run(&dir, &scenario_run_doc(&sample_report(), &[]))
+                .unwrap();
+        let second =
+            write_scenario_run(&dir, &scenario_run_doc(&sample_report(), &[]))
+                .unwrap();
+        let cell = ScenarioReport::ok("redline/some_scenario/light").metric(
+            "achieved tps",
+            Unit::Tps,
+            88.0,
+        );
+        let journal = append_cell(
+            &dir,
+            "redline/some_scenario",
+            &scenario_run_doc(&cell, &[]),
+        )
+        .unwrap();
+
+        assert!(first
+            .to_string_lossy()
+            .ends_with("redline-some_scenario.json"));
+        assert!(second
+            .to_string_lossy()
+            .ends_with("redline-some_scenario-2.json"));
+        assert!(journal
+            .to_string_lossy()
+            .ends_with("redline-some_scenario.cells.jsonl"));
+
+        let meta: CampaignMeta = json::from_str(
+            &fs::read_to_string(dir.join("campaign.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(meta.run, "test-run");
+        let back: ScenarioRun =
+            json::from_str(&fs::read_to_string(&first).unwrap()).unwrap();
+        assert_eq!(back.scenario, "redline/some_scenario");
+        let journal_lines = fs::read_to_string(&journal).unwrap();
+        let cell_back: ScenarioRun =
+            json::from_str(journal_lines.lines().next().unwrap()).unwrap();
+        assert_eq!(cell_back.scenario, "redline/some_scenario/light");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn parallel_test_threads_share_one_campaign_without_rename_races() {
+        let dir = std::env::temp_dir()
+            .join(format!("redsuite-report-race-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let meta = CampaignMeta {
+            schema: SCHEMA_VERSION,
+            run: "race-run".into(),
+            started_at: "20260824T120000Z".into(),
+            er_bin: "/x/er".into(),
+            er_version: "v".into(),
+            er_fingerprint: "1-2".into(),
+        };
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        for _ in 0..25 {
+                            write_campaign_meta(&dir, &meta).unwrap();
+                        }
+                    })
+                })
+                .collect();
+            for worker in workers {
+                worker.join().unwrap();
+            }
+        });
+
+        let back: CampaignMeta = json::from_str(
+            &fs::read_to_string(dir.join("campaign.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(back.run, "race-run");
+        let leftovers = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name() != "campaign.json")
+            .count();
+        assert_eq!(leftovers, 0);
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -6,6 +6,7 @@ use std::{
 
 use async_trait::async_trait;
 use pubkey::Pubkey;
+use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, prep,
     profile::{self, ProfileValues},
@@ -326,22 +327,40 @@ impl Scenario for HighCu {
                     .setting("measured iters", profile.iterations)
                     .setting("offered tps", profile.rate)
                     .setting("concurrency", profile.concurrency)
-                    .observe("delivery us", cell.outcome.delivery)
-                    .observe("account-update lag us", cell.updates.lag)
-                    .metric("achieved tps", cell.outcome.achieved_rps())
+                    .observe("delivery us", Unit::Micros, cell.outcome.delivery)
+                    .observe(
+                        "account-update lag us",
+                        Unit::Micros,
+                        cell.updates.lag,
+                    )
+                    .metric(
+                        "achieved tps",
+                        Unit::Tps,
+                        cell.outcome.achieved_rps(),
+                    )
                     .metric(
                         "executed tps",
+                        Unit::Tps,
                         cell.executed_tps(profile.iterations),
                     )
-                    .metric("drain s", cell.drain.as_secs_f64())
-                    .metric("superseded", cell.updates.superseded as f64)
-                    .metric("probe consumed cus", cell.probe_cus)
+                    .metric("drain s", Unit::Seconds, cell.drain.as_secs_f64())
+                    .metric(
+                        "superseded",
+                        Unit::Count,
+                        cell.updates.superseded as f64,
+                    )
+                    .metric("probe consumed cus", Unit::Count, cell.probe_cus)
                     .metric_if(
                         "validator tx processing avg us",
+                        Unit::Micros,
                         cell.validator_avg_us,
                     )
-                    .metric_if("validator txs in window", cell.validator_txs);
-            match report::persist(&cell_report) {
+                    .metric_if(
+                        "validator txs in window",
+                        Unit::Count,
+                        cell.validator_txs,
+                    );
+            match report::persist_cell(self.name(), &cell_report) {
                 Ok(path) => {
                     eprintln!("[redsuite]   cell report: {}", path.display())
                 }
@@ -418,40 +437,53 @@ impl Scenario for HighCu {
             summary = summary
                 .metric(
                     format!("{} delivery p50 us", cell.label),
+                    Unit::Micros,
                     cell.outcome.delivery.median as f64,
                 )
                 .metric(
                     format!("{} delivery p95 us", cell.label),
+                    Unit::Micros,
                     cell.outcome.delivery.quantile95 as f64,
                 )
                 .metric(
                     format!("{} account-update lag p50 us", cell.label),
+                    Unit::Micros,
                     cell.updates.lag.median as f64,
                 )
                 .metric(
                     format!("{} achieved tps", cell.label),
+                    Unit::Tps,
                     cell.outcome.achieved_rps(),
                 )
                 .metric(
                     format!("{} executed tps", cell.label),
+                    Unit::Tps,
                     cell.executed_tps(profile.iterations),
                 )
                 .metric(
                     format!("{} drain s", cell.label),
+                    Unit::Seconds,
                     cell.drain.as_secs_f64(),
                 )
                 .metric(
                     format!("{} probe consumed cus", cell.label),
+                    Unit::Count,
                     cell.probe_cus,
                 )
                 .metric_if(
                     format!("{} validator tx processing avg us", cell.label),
+                    Unit::Micros,
                     cell.validator_avg_us,
                 );
         }
-        summary = summary.metric("heavy/light probe cu ratio", cu_ratio);
+        summary =
+            summary.metric("heavy/light probe cu ratio", Unit::Ratio, cu_ratio);
         if let Some(ratio) = validator_avg_ratio {
-            summary = summary.metric("heavy/light validator avg ratio", ratio);
+            summary = summary.metric(
+                "heavy/light validator avg ratio",
+                Unit::Ratio,
+                ratio,
+            );
         }
         Ok(summary)
     }

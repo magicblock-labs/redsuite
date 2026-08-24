@@ -3,6 +3,7 @@ use std::time::Instant;
 use async_trait::async_trait;
 use keypair::Keypair;
 use pubkey::Pubkey;
+use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, BaseCtx, ChainCtx, ErCtx, Result, Scenario, ScenarioReport,
 };
@@ -83,6 +84,10 @@ impl Scenario for ParallelCloning {
 
         Ok(ScenarioReport::ok(self.name())
             .setting("wallets", WALLET_COUNT)
-            .metric("concurrent first-touch wall ms", concurrent_wall_ms))
+            .metric(
+                "concurrent first-touch wall ms",
+                Unit::Millis,
+                concurrent_wall_ms,
+            ))
     }
 }

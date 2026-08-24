@@ -2,6 +2,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use keypair::Keypair;
+use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, prep, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
     ScenarioReport,
@@ -132,7 +133,7 @@ impl Scenario for AccountInfoSemantics {
 
         Ok(ScenarioReport::ok(self.name())
             .setting("escrow funding lamports", ESCROW_FUNDING)
-            .metric("first clone read ms", first_read_ms)
-            .metric("non-delegated refresh ms", refresh_ms))
+            .metric("first clone read ms", Unit::Millis, first_read_ms)
+            .metric("non-delegated refresh ms", Unit::Millis, refresh_ms))
     }
 }

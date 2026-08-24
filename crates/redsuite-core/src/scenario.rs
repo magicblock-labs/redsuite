@@ -9,7 +9,7 @@ use crate::{
     context::{BaseCtx, ErCtx},
     manifest,
     profile::ExecutionConfig,
-    report::ScenarioReport,
+    report::{MeasureValue, ScenarioReport, Unit},
     resources::Resources,
     runner::panic_message,
     topology, DynError, Result,
@@ -290,9 +290,11 @@ where
     let teardown_errors = resources.audit();
     record.wall_seconds = Some(wall_seconds);
     record.scenario = match outcome {
-        Ok(Ok(report)) => {
-            ScenarioOutcome::Passed(report.metric("wall seconds", wall_seconds))
-        }
+        Ok(Ok(report)) => ScenarioOutcome::Passed(report.metric(
+            "wall seconds",
+            Unit::Seconds,
+            wall_seconds,
+        )),
         Ok(Err(error)) => ScenarioOutcome::Failed(error),
         Err(payload) => ScenarioOutcome::Panicked(panic_message(payload)),
     };
@@ -365,11 +367,16 @@ fn conclude(record: &mut RunRecord) {
                     .collect();
                 eprintln!("[redsuite]   config: {}", knobs.join(" "));
             }
-            for (label, stats) in &report.observations {
-                eprintln!("[redsuite]   {label}: {stats:?}");
-            }
-            for (label, value) in &report.metrics {
-                eprintln!("[redsuite]   {label}: {value}");
+            for measurement in &report.measurements {
+                match &measurement.value {
+                    MeasureValue::Distribution(stats) => eprintln!(
+                        "[redsuite]   {}: {stats:?}",
+                        measurement.label
+                    ),
+                    MeasureValue::Scalar(value) => {
+                        eprintln!("[redsuite]   {}: {value}", measurement.label)
+                    }
+                }
             }
         }
         ScenarioOutcome::Failed(error) => match failed_check(error) {

@@ -5,6 +5,7 @@ use std::{
 
 use async_trait::async_trait;
 use keypair::Keypair;
+use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, mdp, prep, system, BaseCtx, ChainCtx, CheckError, ErCtx,
     Result, Scenario, ScenarioReport,
@@ -189,6 +190,6 @@ impl Scenario for ApiInvariants {
                 "record bytes",
                 format!("{} -> {}", registered.data.len(), synced.data.len()),
             )
-            .metric("transfers", CLOCK_ITERATIONS as f64))
+            .metric("transfers", Unit::Count, CLOCK_ITERATIONS as f64))
     }
 }

@@ -6,6 +6,7 @@ use std::{
 use async_trait::async_trait;
 use futures_util::future::join_all;
 use pubkey::Pubkey;
+use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, prep,
     profile::{self, ProfileValues},
@@ -277,20 +278,34 @@ impl Scenario for EnsureGateStall {
                         "request timeout s",
                         STALL_REQUEST_TIMEOUT.as_secs(),
                     )
-                    .observe("delivery us", outcome.delivery)
-                    .metric("achieved tps", cell_outcome.achieved_tps)
-                    .metric("delivered", cell_outcome.delivered as f64)
-                    .metric("failed", cell_outcome.failed as f64)
+                    .observe("delivery us", Unit::Micros, outcome.delivery)
+                    .metric(
+                        "achieved tps",
+                        Unit::Tps,
+                        cell_outcome.achieved_tps,
+                    )
+                    .metric(
+                        "delivered",
+                        Unit::Count,
+                        cell_outcome.delivered as f64,
+                    )
+                    .metric("failed", Unit::Count, cell_outcome.failed as f64)
                     .metric_if(
                         "validator ensure avg s",
+                        Unit::Seconds,
                         cell_outcome.ensure_avg_s,
                     )
                     .metric(
                         "monitored accounts (end)",
+                        Unit::Count,
                         cell_outcome.monitored_end,
                     )
-                    .metric("evictions in window", cell_outcome.evictions);
-            match report::persist(&cell_report) {
+                    .metric(
+                        "evictions in window",
+                        Unit::Count,
+                        cell_outcome.evictions,
+                    );
+            match report::persist_cell(self.name(), &cell_report) {
                 Ok(path) => {
                     eprintln!("[redsuite]   cell report: {}", path.display())
                 }
@@ -369,20 +384,42 @@ impl Scenario for EnsureGateStall {
             .setting("offered rate /s", profile.rate)
             .setting("concurrency", profile.concurrency)
             .setting("request timeout s", STALL_REQUEST_TIMEOUT.as_secs())
-            .metric("thrash p50 slowdown x", slowdown);
+            .metric("thrash p50 slowdown x", Unit::Ratio, slowdown);
         for cell in &cells {
             summary = summary
                 .metric(
                     format!("{} achieved tps", cell.name),
+                    Unit::Tps,
                     cell.achieved_tps,
                 )
-                .metric(format!("{} p50 us", cell.name), cell.p50_us)
-                .metric(format!("{} p95 us", cell.name), cell.p95_us)
-                .metric(format!("{} max us", cell.name), cell.max_us)
-                .metric(format!("{} failed", cell.name), cell.failed as f64)
-                .metric(format!("{} evictions", cell.name), cell.evictions)
+                .metric(
+                    format!("{} p50 us", cell.name),
+                    Unit::Micros,
+                    cell.p50_us,
+                )
+                .metric(
+                    format!("{} p95 us", cell.name),
+                    Unit::Micros,
+                    cell.p95_us,
+                )
+                .metric(
+                    format!("{} max us", cell.name),
+                    Unit::Micros,
+                    cell.max_us,
+                )
+                .metric(
+                    format!("{} failed", cell.name),
+                    Unit::Count,
+                    cell.failed as f64,
+                )
+                .metric(
+                    format!("{} evictions", cell.name),
+                    Unit::Count,
+                    cell.evictions,
+                )
                 .metric_if(
                     format!("{} ensure avg s", cell.name),
+                    Unit::Seconds,
                     cell.ensure_avg_s,
                 );
         }

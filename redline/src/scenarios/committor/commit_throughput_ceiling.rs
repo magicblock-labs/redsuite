@@ -7,6 +7,7 @@ use std::{
 use async_trait::async_trait;
 use futures_util::future::join_all;
 use pubkey::Pubkey;
+use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq,
     monitor::{MonitorSpec, SteadyStateMonitor},
@@ -447,33 +448,61 @@ impl Scenario for CommitThroughputCeiling {
             .setting("prewarmed", true)
             .setting("verdict", steady_state.verdict)
             .setting("fully drained", drain.fully_drained)
-            .observe("delivery us", delivery_outcome.delivery)
-            .metric("fresh drain intents/s", drain_rate)
-            .metric("delivery+drain span s", span_wall.as_secs_f64())
-            .metric("drain wall s", drain.drain_wall.as_secs_f64())
-            .metric("monitor arrival /s", steady_state.arrival_rate)
-            .metric("monitor drain /s", steady_state.drain_rate)
-            .metric("outstanding peak", steady_state.outstanding_peak)
-            .metric("backlog gauge peak", steady_state.backlog_peak)
-            .metric("busy peak", steady_state.busy_peak)
+            .observe("delivery us", Unit::Micros, delivery_outcome.delivery)
+            .metric("fresh drain intents/s", Unit::PerSecond, drain_rate)
+            .metric(
+                "delivery+drain span s",
+                Unit::Seconds,
+                span_wall.as_secs_f64(),
+            )
+            .metric(
+                "drain wall s",
+                Unit::Seconds,
+                drain.drain_wall.as_secs_f64(),
+            )
+            .metric(
+                "monitor arrival /s",
+                Unit::PerSecond,
+                steady_state.arrival_rate,
+            )
+            .metric(
+                "monitor drain /s",
+                Unit::PerSecond,
+                steady_state.drain_rate,
+            )
+            .metric(
+                "outstanding peak",
+                Unit::Count,
+                steady_state.outstanding_peak,
+            )
+            .metric(
+                "backlog gauge peak",
+                Unit::Count,
+                steady_state.backlog_peak,
+            )
+            .metric("busy peak", Unit::Count, steady_state.busy_peak)
             .metric_if(
                 "validator intent exec avg s",
+                Unit::Seconds,
                 delta.histogram_avg_all(
                     "mbv_committor_intent_execution_time_histogram_v2",
                 ),
             )
             .metric_if(
                 "alt tables used",
+                Unit::Count,
                 delta.counter("mbv_committor_intent_alt_count_sum"),
             )
             .metric_if(
                 "alt preparation avg s",
+                Unit::Seconds,
                 delta
                     .histogram_avg("mbv_committor_intent_alt_preparation_time"),
             );
         if drain.fully_drained {
             summary = summary.metric(
                 "receipt base txs per commit",
+                Unit::Count,
                 receipt_base_txs as f64 / profile.fresh_commits as f64,
             );
         }
@@ -615,17 +644,22 @@ impl CommitThroughputCeiling {
                 .setting("rounds", ROUNDS)
                 .setting("alt warmup round", true)
                 .setting("fully drained", drain.fully_drained)
-                .observe("delivery us", delivery_outcome.delivery)
-                .metric("reused drain intents/s", drain_rate)
-                .metric("reused/fresh drain ratio", contrast_ratio)
-                .metric("delivery+drain span s", span_wall.as_secs_f64())
+                .observe("delivery us", Unit::Micros, delivery_outcome.delivery)
+                .metric("reused drain intents/s", Unit::PerSecond, drain_rate)
+                .metric("reused/fresh drain ratio", Unit::Ratio, contrast_ratio)
+                .metric(
+                    "delivery+drain span s",
+                    Unit::Seconds,
+                    span_wall.as_secs_f64(),
+                )
                 .metric_if(
                     "validator intent exec avg s",
+                    Unit::Seconds,
                     delta.histogram_avg_all(
                         "mbv_committor_intent_execution_time_histogram_v2",
                     ),
                 );
-        match report::persist(&cell_report) {
+        match report::persist_cell(self.name(), &cell_report) {
             Ok(path) => {
                 eprintln!("[redsuite]   cell report: {}", path.display())
             }
@@ -635,7 +669,7 @@ impl CommitThroughputCeiling {
         }
 
         Ok(summary
-            .metric("reused drain intents/s", drain_rate)
-            .metric("reused/fresh drain ratio", contrast_ratio))
+            .metric("reused drain intents/s", Unit::PerSecond, drain_rate)
+            .metric("reused/fresh drain ratio", Unit::Ratio, contrast_ratio))
     }
 }

@@ -3,6 +3,7 @@ use std::{rc::Rc, time::Duration};
 use async_trait::async_trait;
 use instruction::Instruction;
 use pubkey::Pubkey;
+use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, host, prep,
     profile::{self, ProfileValues},
@@ -288,6 +289,7 @@ impl Scenario for StorageProdsizeSustain {
                     .setting("concurrency", profile.concurrency)
                     .metric(
                         "fill storage growth mb",
+                        Unit::Megabytes,
                         cell.fill_growth_bytes as f64 / 1e6,
                     );
             for (window_name, window) in
@@ -296,22 +298,26 @@ impl Scenario for StorageProdsizeSustain {
                 cell_report = cell_report
                     .observe(
                         format!("window {window_name} delivery us"),
+                        Unit::Micros,
                         window.outcome.delivery,
                     )
                     .metric(
                         format!("window {window_name} achieved tps"),
+                        Unit::Tps,
                         window.outcome.achieved_rps(),
                     )
                     .metric(
                         format!("window {window_name} storage growth mb"),
+                        Unit::Megabytes,
                         window.storage_growth_bytes as f64 / 1e6,
                     )
                     .metric_if(
                         format!("window {window_name} validator tx avg us"),
+                        Unit::Micros,
                         window.tx_processing_avg_us,
                     );
             }
-            match report::persist(&cell_report) {
+            match report::persist_cell(self.name(), &cell_report) {
                 Ok(path) => {
                     eprintln!("[redsuite]   cell report: {}", path.display())
                 }
@@ -369,27 +375,33 @@ impl Scenario for StorageProdsizeSustain {
             summary = summary
                 .metric(
                     format!("{} window A p50 us", cell.name),
+                    Unit::Micros,
                     cell.windows[0].outcome.delivery.median as f64,
                 )
                 .metric(
                     format!("{} window B p50 us", cell.name),
+                    Unit::Micros,
                     cell.windows[1].outcome.delivery.median as f64,
                 )
                 .metric(
                     format!("{} window p50 B/A ratio", cell.name),
+                    Unit::Ratio,
                     cell.windows[1].outcome.delivery.median as f64
                         / cell.windows[0].outcome.delivery.median.max(1) as f64,
                 )
                 .metric(
                     format!("{} window B p95 us", cell.name),
+                    Unit::Micros,
                     cell.windows[1].outcome.delivery.quantile95 as f64,
                 )
                 .metric(
                     format!("{} fill growth mb", cell.name),
+                    Unit::Megabytes,
                     cell.fill_growth_bytes as f64 / 1e6,
                 )
                 .metric_if(
                     format!("{} window B validator tx avg us", cell.name),
+                    Unit::Micros,
                     cell.windows[1].tx_processing_avg_us,
                 );
         }

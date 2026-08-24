@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use instruction::{AccountMeta, Instruction};
 use keypair::Keypair;
 use pubkey::Pubkey;
+use redsuite_core::report::Unit;
 use redsuite_core::{
     catalog::Fixture, check, check_eq, loader_v4, manifest, prep, topology,
     BaseCtx, ChainCtx, CheckError, ErCtx, Result, Scenario, ScenarioReport,
@@ -152,8 +153,8 @@ impl Scenario for LoaderMatrix {
                 "v3 authority preserved",
                 cloned_v3_authority == v3_authority,
             )
-            .metric("v4 deploy s", deploy_s)
-            .metric("v4 upgrade pickup s", upgrade_pickup_s))
+            .metric("v4 deploy s", Unit::Seconds, deploy_s)
+            .metric("v4 upgrade pickup s", Unit::Seconds, upgrade_pickup_s))
     }
 }
 
