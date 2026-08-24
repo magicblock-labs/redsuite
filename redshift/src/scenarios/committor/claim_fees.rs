@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use redsuite_core::report::Unit;
 use redsuite_core::{
     check, dlp, topology, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
     ScenarioReport,
@@ -57,8 +58,12 @@ impl Scenario for ClaimFees {
 
         Ok(ScenarioReport::ok(self.name())
             .setting("vault", vault)
-            .metric("test fee lamports", TEST_FEE_LAMPORTS as f64)
-            .metric("claimed lamports", claimed as f64)
-            .metric("vault floor lamports", vault_after as f64))
+            .metric(
+                "test fee lamports",
+                Unit::Lamports,
+                TEST_FEE_LAMPORTS as f64,
+            )
+            .metric("claimed lamports", Unit::Lamports, claimed as f64)
+            .metric("vault floor lamports", Unit::Lamports, vault_after as f64))
     }
 }

@@ -3,6 +3,7 @@ use std::{rc::Rc, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use keypair::Keypair;
 use pubkey::Pubkey;
+use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, prep,
     profile::{self, ProfileValues},
@@ -195,18 +196,20 @@ impl Scenario for RpcCapacityBlast {
             .setting("requests", profile.requests)
             .setting("offered rps", profile.offered)
             .setting("concurrency", profile.concurrency)
-            .observe("delivery us", outcome.delivery)
-            .metric("delivered rps", delivered_rps)
-            .metric("blast wall s", outcome.wall.as_secs_f64())
-            .metric("failed", outcome.failed as f64)
+            .observe("delivery us", Unit::Micros, outcome.delivery)
+            .metric("delivered rps", Unit::Rps, delivered_rps)
+            .metric("blast wall s", Unit::Seconds, outcome.wall.as_secs_f64())
+            .metric("failed", Unit::Count, outcome.failed as f64)
             .metric_if(
                 "validator tx processing avg us",
+                Unit::Micros,
                 delta
                     .histogram_avg(TX_PROCESSING_HISTOGRAM)
                     .map(|seconds| seconds * 1e6),
             )
             .metric_if(
                 "validator txs in window",
+                Unit::Count,
                 delta.counter("mbv_transaction_count"),
             ))
     }

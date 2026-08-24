@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use instruction::Instruction;
 use keypair::Keypair;
 use pubkey::Pubkey;
+use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, host, prep,
     profile::{self, ProfileValues},
@@ -541,21 +542,38 @@ impl Scenario for ExecutorSaturation {
                     .setting("mode", "pre-signed burst")
                     .setting("batch per thread", profile.batch)
                     .setting("concurrency", profile.concurrency)
-                    .observe("delivery us", cell.outcome.delivery)
-                    .metric("achieved tps", cell.outcome.achieved_rps())
+                    .observe("delivery us", Unit::Micros, cell.outcome.delivery)
+                    .metric(
+                        "achieved tps",
+                        Unit::Tps,
+                        cell.outcome.achieved_rps(),
+                    )
                     .metric(
                         "executed tps",
+                        Unit::Tps,
                         cell.executed_tps(profile.iterations),
                     )
-                    .metric("sign s", cell.sign_s)
-                    .metric("blast s", cell.blast_s)
-                    .metric("drain s", cell.drain.as_secs_f64())
-                    .metric("probe consumed cus", cell.probe_cus)
-                    .metric("validator cores", cell.cores)
-                    .metric("top thread cores", cell.top_thread_cores)
-                    .metric("busy threads", cell.busy_threads as f64)
-                    .metric_if("validator txs in window", cell.validator_txs);
-            match report::persist(&cell_report) {
+                    .metric("sign s", Unit::Seconds, cell.sign_s)
+                    .metric("blast s", Unit::Seconds, cell.blast_s)
+                    .metric("drain s", Unit::Seconds, cell.drain.as_secs_f64())
+                    .metric("probe consumed cus", Unit::Count, cell.probe_cus)
+                    .metric("validator cores", Unit::Count, cell.cores)
+                    .metric(
+                        "top thread cores",
+                        Unit::Count,
+                        cell.top_thread_cores,
+                    )
+                    .metric(
+                        "busy threads",
+                        Unit::Count,
+                        cell.busy_threads as f64,
+                    )
+                    .metric_if(
+                        "validator txs in window",
+                        Unit::Count,
+                        cell.validator_txs,
+                    );
+            match report::persist_cell(self.name(), &cell_report) {
                 Ok(path) => {
                     eprintln!("[redsuite]   cell report: {}", path.display())
                 }
@@ -607,9 +625,10 @@ impl Scenario for ExecutorSaturation {
             .setting("mode", "pre-signed burst")
             .setting("batch per thread", profile.batch)
             .setting("concurrency", profile.concurrency)
-            .metric("heavy/light probe cu ratio", cu_ratio)
+            .metric("heavy/light probe cu ratio", Unit::Ratio, cu_ratio)
             .metric(
                 "heavy/light cores ratio",
+                Unit::Ratio,
                 if light.cores > 0.0 {
                     heavy.cores / light.cores
                 } else {
@@ -620,37 +639,57 @@ impl Scenario for ExecutorSaturation {
             summary = summary
                 .metric(
                     format!("{} achieved tps", cell.label),
+                    Unit::Tps,
                     cell.outcome.achieved_rps(),
                 )
                 .metric(
                     format!("{} executed tps", cell.label),
+                    Unit::Tps,
                     cell.executed_tps(profile.iterations),
                 )
                 .metric(
                     format!("{} delivery p50 us", cell.label),
+                    Unit::Micros,
                     cell.outcome.delivery.median as f64,
                 )
                 .metric(
                     format!("{} delivery p95 us", cell.label),
+                    Unit::Micros,
                     cell.outcome.delivery.quantile95 as f64,
                 )
-                .metric(format!("{} sign s", cell.label), cell.sign_s)
-                .metric(format!("{} blast s", cell.label), cell.blast_s)
+                .metric(
+                    format!("{} sign s", cell.label),
+                    Unit::Seconds,
+                    cell.sign_s,
+                )
+                .metric(
+                    format!("{} blast s", cell.label),
+                    Unit::Seconds,
+                    cell.blast_s,
+                )
                 .metric(
                     format!("{} drain s", cell.label),
+                    Unit::Seconds,
                     cell.drain.as_secs_f64(),
                 )
                 .metric(
                     format!("{} probe consumed cus", cell.label),
+                    Unit::Count,
                     cell.probe_cus,
                 )
-                .metric(format!("{} validator cores", cell.label), cell.cores)
+                .metric(
+                    format!("{} validator cores", cell.label),
+                    Unit::Count,
+                    cell.cores,
+                )
                 .metric(
                     format!("{} top thread cores", cell.label),
+                    Unit::Count,
                     cell.top_thread_cores,
                 )
                 .metric(
                     format!("{} busy threads", cell.label),
+                    Unit::Count,
                     cell.busy_threads as f64,
                 );
         }

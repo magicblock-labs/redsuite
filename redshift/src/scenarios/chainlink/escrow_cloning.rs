@@ -2,6 +2,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use keypair::Keypair;
+use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, dlp, prep, system, BaseCtx, ChainCtx, ErCtx, Result,
     Scenario, ScenarioReport,
@@ -219,6 +220,10 @@ impl Scenario for EscrowCloning {
         Ok(ScenarioReport::ok(self.name())
             .setting("escrow funding lamports", ESCROW_FUNDING)
             .setting("executed transfer lamports", EXECUTED_TRANSFER)
-            .metric("escrow clone visibility ms", clone_visibility_ms))
+            .metric(
+                "escrow clone visibility ms",
+                Unit::Millis,
+                clone_visibility_ms,
+            ))
     }
 }

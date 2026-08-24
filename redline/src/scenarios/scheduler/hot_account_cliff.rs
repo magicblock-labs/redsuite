@@ -3,6 +3,7 @@ use std::{rc::Rc, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use keypair::Keypair;
 use pubkey::Pubkey;
+use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, prep,
     profile::{self, ProfileValues},
@@ -257,23 +258,26 @@ impl Scenario for HotAccountCliff {
                     .setting("measured iters", profile.iterations)
                     .setting("offered tps", profile.rate)
                     .setting("concurrency", profile.concurrency)
-                    .observe("delivery us", outcome.delivery)
-                    .metric("achieved tps", cell.achieved)
+                    .observe("delivery us", Unit::Micros, outcome.delivery)
+                    .metric("achieved tps", Unit::Tps, cell.achieved)
                     .metric_if(
                         "validator tx processing avg us",
+                        Unit::Micros,
                         delta
                             .histogram_avg("mbv_transaction_processing_time")
                             .map(|seconds| seconds * 1e6),
                     )
                     .metric_if(
                         "max lock contention queue",
+                        Unit::Count,
                         delta.gauge("mbv_max_lock_contention_queue_size"),
                     )
                     .metric_if(
                         "validator txs in window",
+                        Unit::Count,
                         delta.counter("mbv_transaction_count"),
                     );
-            match report::persist(&cell_report) {
+            match report::persist_cell(self.name(), &cell_report) {
                 Ok(path) => {
                     eprintln!("[redsuite]   cell report: {}", path.display())
                 }
@@ -341,9 +345,21 @@ impl Scenario for HotAccountCliff {
             );
         for cell in &cells {
             summary = summary
-                .metric(format!("hot{} delivery p50 us", cell.hot), cell.p50_us)
-                .metric(format!("hot{} delivery p95 us", cell.hot), cell.p95_us)
-                .metric(format!("hot{} achieved tps", cell.hot), cell.achieved);
+                .metric(
+                    format!("hot{} delivery p50 us", cell.hot),
+                    Unit::Micros,
+                    cell.p50_us,
+                )
+                .metric(
+                    format!("hot{} delivery p95 us", cell.hot),
+                    Unit::Micros,
+                    cell.p95_us,
+                )
+                .metric(
+                    format!("hot{} achieved tps", cell.hot),
+                    Unit::Tps,
+                    cell.achieved,
+                );
         }
         Ok(summary)
     }

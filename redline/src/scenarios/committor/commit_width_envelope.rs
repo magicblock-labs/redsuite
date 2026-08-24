@@ -7,6 +7,7 @@ use std::{
 
 use async_trait::async_trait;
 use pubkey::Pubkey;
+use redsuite_core::report::Unit;
 use redsuite_core::{
     api::custom_error_code,
     check, check_eq, prep,
@@ -421,30 +422,42 @@ impl Scenario for CommitWidthEnvelope {
                     .setting("concurrency", profile.concurrency)
                     .setting("pool", profile.pool)
                     .setting("receipt timeout s", RECEIPT_TIMEOUT.as_secs())
-                    .observe("er delivery us", er_delivery)
-                    .observe("commit round-trip us", round_trip)
-                    .metric("base txs per commit", flow_txs_per_commit)
+                    .observe("er delivery us", Unit::Micros, er_delivery)
+                    .observe("commit round-trip us", Unit::Micros, round_trip)
+                    .metric(
+                        "base txs per commit",
+                        Unit::Count,
+                        flow_txs_per_commit,
+                    )
                     .metric(
                         "receipt base txs per commit",
+                        Unit::Count,
                         receipt_txs_per_commit,
                     )
-                    .metric("window alt intents", alt_tables_used)
-                    .metric("window alt base txs", alt_base_txs as f64)
+                    .metric("window alt intents", Unit::Count, alt_tables_used)
+                    .metric(
+                        "window alt base txs",
+                        Unit::Count,
+                        alt_base_txs as f64,
+                    )
                     .metric(
                         "achieved commits /s",
+                        Unit::PerSecond,
                         profile.commits as f64 / outcome.wall.as_secs_f64(),
                     )
                     .metric_if(
                         "validator intent exec avg s",
+                        Unit::Seconds,
                         delta.histogram_avg_all(
                             "mbv_committor_intent_execution_time_histogram_v2",
                         ),
                     )
                     .metric_if(
                         "intents in window",
+                        Unit::Count,
                         delta.counter("mbv_committor_intents_count"),
                     );
-            match report::persist(&cell_report) {
+            match report::persist_cell(self.name(), &cell_report) {
                 Ok(path) => {
                     eprintln!("[redsuite]   cell report: {}", path.display())
                 }
@@ -462,7 +475,7 @@ impl Scenario for CommitWidthEnvelope {
         }
 
         let mut probe_settings: Vec<(String, String)> = Vec::new();
-        let mut probe_metrics: Vec<(String, f64)> = Vec::new();
+        let mut probe_metrics: Vec<(String, Unit, f64)> = Vec::new();
         if profile.probes {
             // width 15 exceeds the no-LUT envelope: pre-gate validators
             // deliver it via ALTs, gate validators (>= 0.13.7) refuse it at
@@ -553,18 +566,22 @@ impl Scenario for CommitWidthEnvelope {
                         ));
                         probe_metrics.push((
                             "probe w15 round-trip s".to_owned(),
+                            Unit::Seconds,
                             wall.as_secs_f64(),
                         ));
                         probe_metrics.push((
                             "probe w15 base flow txs".to_owned(),
+                            Unit::Count,
                             flow_after.new_flow_since(&flow_before) as f64,
                         ));
                         probe_metrics.push((
                             "probe w15 alt base txs".to_owned(),
+                            Unit::Count,
                             alt_base_txs as f64,
                         ));
                         probe_metrics.push((
                             "probe w15 own alt txs".to_owned(),
+                            Unit::Count,
                             own_alt_txs as f64,
                         ));
                         if let Some(window_alt_intents) =
@@ -572,6 +589,7 @@ impl Scenario for CommitWidthEnvelope {
                         {
                             probe_metrics.push((
                                 "probe w15 window alt intents".to_owned(),
+                                Unit::Count,
                                 window_alt_intents,
                             ));
                         }
@@ -619,6 +637,7 @@ impl Scenario for CommitWidthEnvelope {
                             .unwrap_or(0.0);
                         probe_metrics.push((
                             "probe w30 failed intents".to_owned(),
+                            Unit::Count,
                             failed_intents,
                         ));
                         match receipt_outcome {
@@ -788,19 +807,22 @@ impl Scenario for CommitWidthEnvelope {
             summary = summary
                 .metric(
                     format!("w{} round-trip p50 us", cell.width),
+                    Unit::Micros,
                     cell.round_trip_p50_us,
                 )
                 .metric(
                     format!("w{} round-trip p95 us", cell.width),
+                    Unit::Micros,
                     cell.round_trip_p95_us,
                 )
                 .metric(
                     format!("w{} base txs per commit", cell.width),
+                    Unit::Count,
                     cell.base_txs_per_commit,
                 );
         }
-        for (label, value) in probe_metrics {
-            summary = summary.metric(label, value);
+        for (label, unit, value) in probe_metrics {
+            summary = summary.metric(label, unit, value);
         }
         Ok(summary)
     }

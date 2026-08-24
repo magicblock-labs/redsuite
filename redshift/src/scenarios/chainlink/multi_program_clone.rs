@@ -1,6 +1,7 @@
 use std::time::Instant;
 
 use async_trait::async_trait;
+use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, topology, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
     ScenarioReport,
@@ -96,6 +97,10 @@ impl Scenario for MultiProgramClone {
 
         Ok(ScenarioReport::ok(self.name())
             .setting("loaders", "v3,v3")
-            .metric("two-program clone tx wall ms", multi_clone_ms))
+            .metric(
+                "two-program clone tx wall ms",
+                Unit::Millis,
+                multi_clone_ms,
+            ))
     }
 }

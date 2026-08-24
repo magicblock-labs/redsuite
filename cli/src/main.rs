@@ -27,8 +27,8 @@ usage:
   redsuite stack status                        show the shared base+ER stack
   redsuite stack down                          stop the shared stack
   redsuite report list                         list persisted scenario reports
-  redsuite report compare [scenario] [--strict] [--brief]  diff the latest two runs per scenario (--brief: changed metrics only)
-  redsuite report bmf [--out <path>]           export reports as Bencher Metric Format
+  redsuite report compare [scenario] [--strict] [--brief]  diff the latest run per scenario against its nearest comparable baseline (--brief: changed metrics only)
+  redsuite report bmf [--out <path>]           export the latest campaign as Bencher Metric Format
 
 environment:
   MAGICBLOCK_VALIDATOR_BIN   the ER binary under test (else `magicblock-validator` on PATH)

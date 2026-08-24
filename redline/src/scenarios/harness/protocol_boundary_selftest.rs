@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use instruction::Instruction;
 use keypair::Keypair;
 use pubkey::Pubkey;
+use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, prep,
     profile::{self, ProfileValues},
@@ -227,13 +228,14 @@ impl Scenario for ProtocolBoundarySelftest {
             .setting("measured iters", profile.iterations)
             .setting("offered tps", profile.rate)
             .setting("concurrency", profile.concurrency)
-            .observe("delivery us", cell.outcome.delivery)
-            .metric("achieved tps", cell.outcome.achieved_rps())
+            .observe("delivery us", Unit::Micros, cell.outcome.delivery)
+            .metric("achieved tps", Unit::Tps, cell.outcome.achieved_rps())
             .metric_if(
                 "validator tx processing avg us",
+                Unit::Micros,
                 cell.tx_processing_avg_us,
             );
-            match report::persist(&cell_report) {
+            match report::persist_cell(self.name(), &cell_report) {
                 Ok(path) => {
                     eprintln!("[redsuite]   cell report: {}", path.display())
                 }
@@ -317,21 +319,51 @@ impl Scenario for ProtocolBoundarySelftest {
             .setting("offered tps", profile.rate)
             .setting("concurrency", profile.concurrency)
             .setting("expect artifact", profile.expect_artifact)
-            .metric("single p50 us", single.outcome.delivery.median as f64)
-            .metric("single p95 us", single.outcome.delivery.quantile95 as f64)
-            .metric("single achieved tps", single.outcome.achieved_rps())
-            .metric("multi p50 us", multi.outcome.delivery.median as f64)
-            .metric("multi p95 us", multi.outcome.delivery.quantile95 as f64)
-            .metric("multi achieved tps", multi.outcome.achieved_rps())
-            .metric("p50 ratio", p50_ratio)
+            .metric(
+                "single p50 us",
+                Unit::Micros,
+                single.outcome.delivery.median as f64,
+            )
+            .metric(
+                "single p95 us",
+                Unit::Micros,
+                single.outcome.delivery.quantile95 as f64,
+            )
+            .metric(
+                "single achieved tps",
+                Unit::Tps,
+                single.outcome.achieved_rps(),
+            )
+            .metric(
+                "multi p50 us",
+                Unit::Micros,
+                multi.outcome.delivery.median as f64,
+            )
+            .metric(
+                "multi p95 us",
+                Unit::Micros,
+                multi.outcome.delivery.quantile95 as f64,
+            )
+            .metric(
+                "multi achieved tps",
+                Unit::Tps,
+                multi.outcome.achieved_rps(),
+            )
+            .metric("p50 ratio", Unit::Ratio, p50_ratio)
             .metric(
                 "artifact detected",
+                Unit::Count,
                 if artifact_detected { 1.0 } else { 0.0 },
             )
             .metric_if(
                 "single validator tx avg us",
+                Unit::Micros,
                 single.tx_processing_avg_us,
             )
-            .metric_if("multi validator tx avg us", multi.tx_processing_avg_us))
+            .metric_if(
+                "multi validator tx avg us",
+                Unit::Micros,
+                multi.tx_processing_avg_us,
+            ))
     }
 }

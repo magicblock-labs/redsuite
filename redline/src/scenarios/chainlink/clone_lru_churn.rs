@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use futures_util::future::join_all;
 use pubkey::Pubkey;
+use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, prep,
     profile::{self, ProfileValues},
@@ -310,25 +311,44 @@ impl Scenario for CloneLruChurn {
                     .setting("offered rate /s", profile.rate)
                     .setting("concurrency", profile.concurrency)
                     .setting("request timeout s", REQUEST_TIMEOUT.as_secs())
-                    .observe("read latency us", outcome.delivery)
-                    .metric("achieved reads /s", cell_outcome.achieved_rps)
-                    .metric("delivered", cell_outcome.delivered as f64)
-                    .metric("failed", cell_outcome.failed as f64)
-                    .metric("evictions in window", cell_outcome.evictions)
-                    .metric("eviction rate /s", cell_outcome.eviction_rate)
+                    .observe("read latency us", Unit::Micros, outcome.delivery)
+                    .metric(
+                        "achieved reads /s",
+                        Unit::PerSecond,
+                        cell_outcome.achieved_rps,
+                    )
+                    .metric(
+                        "delivered",
+                        Unit::Count,
+                        cell_outcome.delivered as f64,
+                    )
+                    .metric("failed", Unit::Count, cell_outcome.failed as f64)
+                    .metric(
+                        "evictions in window",
+                        Unit::Count,
+                        cell_outcome.evictions,
+                    )
+                    .metric(
+                        "eviction rate /s",
+                        Unit::PerSecond,
+                        cell_outcome.eviction_rate,
+                    )
                     .metric_if(
                         "fetches found in window",
+                        Unit::Count,
                         cell_outcome.fetches_found,
                     )
                     .metric_if(
                         "validator ensure avg s",
+                        Unit::Seconds,
                         cell_outcome.ensure_avg_s,
                     )
                     .metric(
                         "monitored accounts (end)",
+                        Unit::Count,
                         cell_outcome.monitored_end,
                     );
-            match report::persist(&cell_report) {
+            match report::persist_cell(self.name(), &cell_report) {
                 Ok(path) => {
                     eprintln!("[redsuite]   cell report: {}", path.display())
                 }
@@ -413,22 +433,42 @@ impl Scenario for CloneLruChurn {
             summary = summary
                 .metric(
                     format!("{} eviction rate /s", cell.name),
+                    Unit::PerSecond,
                     cell.eviction_rate,
                 )
-                .metric(format!("{} evictions", cell.name), cell.evictions)
+                .metric(
+                    format!("{} evictions", cell.name),
+                    Unit::Count,
+                    cell.evictions,
+                )
                 .metric(
                     format!("{} achieved reads /s", cell.name),
+                    Unit::PerSecond,
                     cell.achieved_rps,
                 )
-                .metric(format!("{} p50 us", cell.name), cell.p50_us)
-                .metric(format!("{} p95 us", cell.name), cell.p95_us)
-                .metric(format!("{} failed", cell.name), cell.failed as f64)
+                .metric(
+                    format!("{} p50 us", cell.name),
+                    Unit::Micros,
+                    cell.p50_us,
+                )
+                .metric(
+                    format!("{} p95 us", cell.name),
+                    Unit::Micros,
+                    cell.p95_us,
+                )
+                .metric(
+                    format!("{} failed", cell.name),
+                    Unit::Count,
+                    cell.failed as f64,
+                )
                 .metric_if(
                     format!("{} fetches found", cell.name),
+                    Unit::Count,
                     cell.fetches_found,
                 )
                 .metric_if(
                     format!("{} ensure avg s", cell.name),
+                    Unit::Seconds,
                     cell.ensure_avg_s,
                 );
         }

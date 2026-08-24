@@ -3,6 +3,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures_util::future::join_all;
 use pubkey::Pubkey;
+use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, host,
     profile::{self, ProfileValues},
@@ -253,31 +254,46 @@ impl Scenario for WsConnCapacity {
             .setting("churn ops", profile.churn_ops)
             .setting("churn concurrency", profile.churn_concurrency)
             .setting("fd tolerance", FD_TOLERANCE)
-            .observe("churn op us", churn.delivery)
-            .metric("baseline fds", fd_baseline as f64)
-            .metric("baseline rss kb", rss_baseline_kb as f64)
-            .metric("churn ops /s", churn.achieved_rps())
-            .metric("churn failed", churn.failed as f64)
-            .metric("fds after churn", fds_after_churn as f64)
-            .metric("churn fd settle s", churn_settle_s)
-            .metric("rss after churn kb", rss_after_churn_kb as f64);
+            .observe("churn op us", Unit::Micros, churn.delivery)
+            .metric("baseline fds", Unit::Count, fd_baseline as f64)
+            .metric("baseline rss kb", Unit::Kilobytes, rss_baseline_kb as f64)
+            .metric("churn ops /s", Unit::PerSecond, churn.achieved_rps())
+            .metric("churn failed", Unit::Count, churn.failed as f64)
+            .metric("fds after churn", Unit::Count, fds_after_churn as f64)
+            .metric("churn fd settle s", Unit::Seconds, churn_settle_s)
+            .metric(
+                "rss after churn kb",
+                Unit::Kilobytes,
+                rss_after_churn_kb as f64,
+            );
         for rung in &rungs {
             let rung_name = format!("conns{}", rung.connections);
             summary = summary
-                .metric(format!("{rung_name} fds idle"), rung.fds_idle as f64)
+                .metric(
+                    format!("{rung_name} fds idle"),
+                    Unit::Count,
+                    rung.fds_idle as f64,
+                )
                 .metric(
                     format!("{rung_name} fds subscribed"),
+                    Unit::Count,
                     rung.fds_subscribed as f64,
                 )
                 .metric(
                     format!("{rung_name} rss kb"),
+                    Unit::Kilobytes,
                     rung.rss_subscribed_kb as f64,
                 )
                 .metric(
                     format!("{rung_name} fds after close"),
+                    Unit::Count,
                     rung.fds_after_close as f64,
                 )
-                .metric(format!("{rung_name} fd settle s"), rung.settle_s);
+                .metric(
+                    format!("{rung_name} fd settle s"),
+                    Unit::Seconds,
+                    rung.settle_s,
+                );
         }
         Ok(summary)
     }

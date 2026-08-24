@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use instruction::Instruction;
 use keypair::Keypair;
 use pubkey::Pubkey;
+use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, host, prep,
     profile::{self, ProfileValues},
@@ -432,56 +433,72 @@ impl Scenario for RestartUnderLoad {
             .setting("concurrency", profile.concurrency)
             .setting("database size", profile.database_size)
             .setting("index size", profile.index_size)
-            .metric("db size at restart mb", db_size_at_restart as f64 / 1e6)
-            .metric("fill growth mb", fill_growth as f64 / 1e6)
+            .metric(
+                "db size at restart mb",
+                Unit::Megabytes,
+                db_size_at_restart as f64 / 1e6,
+            )
+            .metric("fill growth mb", Unit::Megabytes, fill_growth as f64 / 1e6)
             .metric(
                 "restart total ms",
+                Unit::Millis,
                 graceful.timing.total.as_secs_f64() * 1e3,
             );
         for cell in [&graceful, &crash] {
             report = report
                 .metric(
                     format!("{} total ms", cell.name),
+                    Unit::Millis,
                     cell.timing.total.as_secs_f64() * 1e3,
                 )
                 .metric(
                     format!("{} shutdown ms", cell.name),
+                    Unit::Millis,
                     cell.timing.shutdown.as_secs_f64() * 1e3,
                 )
                 .metric(
                     format!("{} startup ms", cell.name),
+                    Unit::Millis,
                     cell.timing.startup.as_secs_f64() * 1e3,
                 )
                 .metric(
                     format!("{} needed sigkill", cell.name),
+                    Unit::Count,
                     cell.timing.needed_sigkill as u8 as f64,
                 )
                 .metric(
                     format!("{} exit code", cell.name),
+                    Unit::Count,
                     cell.timing.exit_code.unwrap_or(-1) as f64,
                 )
                 .metric_if(
                     format!("{} replay ran", cell.name),
+                    Unit::Count,
                     cell.replay_ran.map(|ran| ran as u8 as f64),
                 )
                 .metric_if(
                     format!("{} ledger processing ms", cell.name),
+                    Unit::Millis,
                     cell.ledger_processing_ms,
                 )
                 .metric(
                     format!("{} load delivered", cell.name),
+                    Unit::Count,
                     cell.load.delivered as f64,
                 )
                 .metric(
                     format!("{} load failed", cell.name),
+                    Unit::Count,
                     cell.load.failed as f64,
                 )
                 .metric(
                     format!("{} load achieved tps", cell.name),
+                    Unit::Tps,
                     cell.load.achieved_tps,
                 )
                 .metric(
                     format!("{} client outage ms", cell.name),
+                    Unit::Millis,
                     cell.load
                         .outage
                         .map(|d| d.as_secs_f64() * 1e3)

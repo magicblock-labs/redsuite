@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, prep,
     stats::StreamingStats,
@@ -101,7 +102,7 @@ impl Scenario for SimpleLoad {
         }
 
         Ok(ScenarioReport::ok(self.name())
-            .observe("send+confirm us", latency.finalize(false))
-            .observe("account-update lag us", update_lag))
+            .observe("send+confirm us", Unit::Micros, latency.finalize(false))
+            .observe("account-update lag us", Unit::Micros, update_lag))
     }
 }

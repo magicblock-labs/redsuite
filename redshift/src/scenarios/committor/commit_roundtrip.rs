@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, prep, receipt, BaseCtx, ChainCtx, CheckError, ErCtx,
     Result, Scenario, ScenarioReport,
@@ -359,8 +360,12 @@ impl Scenario for CommitRoundtrip {
             )
             .setting("commit id", commit_receipt.commit_id.unwrap_or_default())
             .setting("lockout rejection", lockout_rejection)
-            .metric("clone visibility ms", clone_visibility_ms)
-            .metric("commit roundtrip s", commit_roundtrip_s)
-            .metric("commit-undelegate roundtrip s", undelegate_roundtrip_s))
+            .metric("clone visibility ms", Unit::Millis, clone_visibility_ms)
+            .metric("commit roundtrip s", Unit::Seconds, commit_roundtrip_s)
+            .metric(
+                "commit-undelegate roundtrip s",
+                Unit::Seconds,
+                undelegate_roundtrip_s,
+            ))
     }
 }

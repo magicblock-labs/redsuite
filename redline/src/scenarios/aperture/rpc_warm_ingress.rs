@@ -1,6 +1,7 @@
 use std::{rc::Rc, time::Duration};
 
 use async_trait::async_trait;
+use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, prep,
     profile::{self, LoopMode, ProfileValues},
@@ -290,25 +291,31 @@ impl Scenario for WarmIngress {
             .setting("measured iters", profile.iterations)
             .setting("offered tps", profile.rate)
             .setting("concurrency", profile.concurrency)
-            .observe("delivery us", outcome.delivery)
-            .observe("signature latency us", sig_outcome.latency)
-            .observe("achieved rps", outcome.rps)
-            .observe("account-update lag us", update_outcome.lag)
-            .metric("achieved tps", outcome.achieved_rps())
-            .metric("measured wall s", outcome.wall.as_secs_f64())
-            .metric("superseded", update_outcome.superseded as f64)
+            .observe("delivery us", Unit::Micros, outcome.delivery)
+            .observe("signature latency us", Unit::Micros, sig_outcome.latency)
+            .observe("achieved rps", Unit::Rps, outcome.rps)
+            .observe("account-update lag us", Unit::Micros, update_outcome.lag)
+            .metric("achieved tps", Unit::Tps, outcome.achieved_rps())
+            .metric(
+                "measured wall s",
+                Unit::Seconds,
+                outcome.wall.as_secs_f64(),
+            )
+            .metric("superseded", Unit::Count, update_outcome.superseded as f64)
             // validator-side numbers (histogram window averages, converted
             // to us) — never comparable 1:1 with the client-side stats
             // above, but a divergence points at the harness, not the
             // validator (R1)
             .metric_if(
                 "validator tx processing avg us",
+                Unit::Micros,
                 delta
                     .histogram_avg("mbv_transaction_processing_time")
                     .map(|seconds| seconds * 1e6),
             )
             .metric_if(
                 "validator ensure accounts avg us",
+                Unit::Micros,
                 delta
                     .histogram_avg(
                         r#"mbv_ensure_accounts_time{kind="transaction"}"#,
@@ -317,14 +324,16 @@ impl Scenario for WarmIngress {
             )
             .metric_if(
                 "validator txs in window",
+                Unit::Count,
                 delta.counter("mbv_transaction_count"),
             )
             .metric_if(
                 "monitored accounts (gauge)",
+                Unit::Count,
                 delta.gauge("mbv_monitored_accounts_gauge"),
             );
         if let Some(sync) = outcome.sync {
-            report = report.observe("sync round-trip us", sync);
+            report = report.observe("sync round-trip us", Unit::Micros, sync);
         }
         Ok(report)
     }
