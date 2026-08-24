@@ -56,7 +56,7 @@ impl Scenario for PostDelegationTokenTransfer {
         let source_ata = spl::derive_ata(&source, &mint_key);
         let destination_ata = spl::derive_ata(&destination, &mint_key);
 
-        base.send_with(
+        base.submit_and_confirm_with(
             &fee_payer,
             &[&mint, &source_authority],
             &[
@@ -89,7 +89,7 @@ impl Scenario for PostDelegationTokenTransfer {
         )
         .await?;
 
-        base.send(
+        base.submit_and_confirm(
             &fee_payer,
             &[
                 initialize_global_vault(&fee_payer.pubkey(), &mint_key),
@@ -99,7 +99,7 @@ impl Scenario for PostDelegationTokenTransfer {
         )
         .await?;
 
-        base.send_with(
+        base.submit_and_confirm_with(
             &fee_payer,
             &[&source_authority, &destination_authority],
             &[
@@ -113,7 +113,7 @@ impl Scenario for PostDelegationTokenTransfer {
         )
         .await?;
 
-        base.send(
+        base.submit_and_confirm(
             &fee_payer,
             &[
                 delegate_eata(&fee_payer.pubkey(), &source, &mint_key, er),
@@ -161,13 +161,13 @@ impl Scenario for PostDelegationTokenTransfer {
             vec![transfer_action.cleartext()],
         );
 
-        base.send_with(
+        base.submit_and_confirm_with(
             &fee_payer,
             &[&delegated_account],
             &[system::assign(&delegated_account.pubkey(), &dlp::dlp_id())],
         )
         .await?;
-        base.send_with(
+        base.submit_and_confirm_with(
             &fee_payer,
             &[&delegated_account, &source_authority],
             &[delegate_ix],
@@ -190,7 +190,7 @@ impl Scenario for PostDelegationTokenTransfer {
         // account, never a projection.
         let plain_owner = Keypair::new().pubkey();
         let plain_ata = spl::derive_ata(&plain_owner, &mint_key);
-        base.send_with(
+        base.submit_and_confirm_with(
             &fee_payer,
             &[&source_authority],
             &[
@@ -221,7 +221,7 @@ impl Scenario for PostDelegationTokenTransfer {
         let foreign_authority = Keypair::new();
         let foreign = foreign_authority.pubkey();
         let foreign_ata = spl::derive_ata(&foreign, &mint_key);
-        base.send_with(
+        base.submit_and_confirm_with(
             &fee_payer,
             &[&source_authority],
             &[
@@ -235,13 +235,13 @@ impl Scenario for PostDelegationTokenTransfer {
             ],
         )
         .await?;
-        base.send_with(
+        base.submit_and_confirm_with(
             &fee_payer,
             &[&foreign_authority],
             &[deposit_spl_tokens(&foreign, &mint_key, FOREIGN_BALANCE)],
         )
         .await?;
-        base.send(
+        base.submit_and_confirm(
             &fee_payer,
             &[delegate_eata_to(
                 &fee_payer.pubkey(),
@@ -291,13 +291,13 @@ impl Scenario for PostDelegationTokenTransfer {
             },
             vec![failing_action.cleartext()],
         );
-        base.send_with(
+        base.submit_and_confirm_with(
             &fee_payer,
             &[&failing_account],
             &[system::assign(&failing_account.pubkey(), &dlp::dlp_id())],
         )
         .await?;
-        base.send_with(
+        base.submit_and_confirm_with(
             &fee_payer,
             &[&failing_account, &source_authority],
             &[failing_delegate],

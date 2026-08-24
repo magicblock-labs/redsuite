@@ -74,7 +74,7 @@ impl Scenario for SimpleLoad {
             );
             updates.track(id, target);
             let sent = Instant::now();
-            er.send(&payer, &[ix]).await?;
+            er.submit_and_confirm(&payer, &[ix]).await?;
             latency.push(sent.elapsed().as_micros() as u32);
         }
 

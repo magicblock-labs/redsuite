@@ -82,7 +82,7 @@ async fn run_lookup_table_lifecycle(base: &BaseCtx) -> Result<()> {
         authority.pubkey(),
         recent_slot,
     );
-    base.send(&authority, &[create_ix]).await?;
+    base.submit_and_confirm(&authority, &[create_ix]).await?;
 
     let created = read_table(base, &table_pda).await?;
     check_eq!(
@@ -143,7 +143,7 @@ async fn extend_table_in_chunks(
             Some(authority.pubkey()),
             chunk.to_vec(),
         );
-        base.send(authority, &[ix]).await?;
+        base.submit_and_confirm(authority, &[ix]).await?;
     }
     Ok(())
 }
@@ -154,7 +154,8 @@ async fn run_multi_table_allocation(base: &BaseCtx) -> Result<()> {
     let first_slot = base.api().get_slot().await?;
     let (first_create_ix, first_table) =
         create_lookup_table(authority.pubkey(), authority.pubkey(), first_slot);
-    base.send(&authority, &[first_create_ix]).await?;
+    base.submit_and_confirm(&authority, &[first_create_ix])
+        .await?;
 
     let first_keys = unique_pubkeys(LOOKUP_TABLE_MAX_ADDRESSES);
     extend_table_in_chunks(base, &authority, first_table, &first_keys).await?;
@@ -178,7 +179,9 @@ async fn run_multi_table_allocation(base: &BaseCtx) -> Result<()> {
         unique_pubkeys(1),
     );
     check!(
-        base.send(&authority, &[overflow_ix]).await.is_err(),
+        base.submit_and_confirm(&authority, &[overflow_ix])
+            .await
+            .is_err(),
         "the lookup table accepted an address past the maximum count"
     )?;
 
@@ -188,7 +191,8 @@ async fn run_multi_table_allocation(base: &BaseCtx) -> Result<()> {
         authority.pubkey(),
         second_slot,
     );
-    base.send(&authority, &[second_create_ix]).await?;
+    base.submit_and_confirm(&authority, &[second_create_ix])
+        .await?;
 
     let second_keys =
         unique_pubkeys(TOTAL_PUBKEYS - LOOKUP_TABLE_MAX_ADDRESSES);
@@ -219,7 +223,7 @@ async fn run_deactivation_lifecycle(base: &BaseCtx) -> Result<()> {
         authority.pubkey(),
         recent_slot,
     );
-    base.send(&authority, &[create_ix]).await?;
+    base.submit_and_confirm(&authority, &[create_ix]).await?;
 
     let before = read_table(base, &table_pda).await?;
     check_eq!(
@@ -229,7 +233,8 @@ async fn run_deactivation_lifecycle(base: &BaseCtx) -> Result<()> {
     )?;
 
     let deactivate_ix = deactivate_lookup_table(table_pda, authority.pubkey());
-    base.send(&authority, &[deactivate_ix]).await?;
+    base.submit_and_confirm(&authority, &[deactivate_ix])
+        .await?;
 
     let after = read_table(base, &table_pda).await?;
     check_ne!(

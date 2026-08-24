@@ -102,8 +102,8 @@ async fn delegate_and_clone_counter(
     let payer_ephem = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
 
     let (init, counter) = build::init_counter(payer_ephem.pubkey(), LABEL);
-    base.send(&payer_ephem, &[init]).await?;
-    base.send(
+    base.submit_and_confirm(&payer_ephem, &[init]).await?;
+    base.submit_and_confirm(
         &payer_ephem,
         &[build::delegate_counter(
             payer_ephem.pubkey(),
@@ -121,10 +121,14 @@ async fn delegate_and_clone_counter(
             &er.identity(),
         ),
     ];
-    base.send_with(&payer_chain, &[&payer_ephem], &delegate_setup)
-        .await?;
+    base.submit_and_confirm_with(
+        &payer_chain,
+        &[&payer_ephem],
+        &delegate_setup,
+    )
+    .await?;
 
-    er.send(&payer_ephem, &[build::add(payer_ephem.pubkey(), 1)])
+    er.submit_and_confirm(&payer_ephem, &[build::add(payer_ephem.pubkey(), 1)])
         .await?;
     let clone = er
         .account(&counter)
@@ -204,7 +208,8 @@ impl PrivateErScenario for ConfigGates {
         let recent_slot = base.api().get_slot().await?;
         let (create_ix, table) =
             create_lookup_table(open_pubkey, open_pubkey, recent_slot);
-        base.send(&open_identity, &[create_ix]).await?;
+        base.submit_and_confirm(&open_identity, &[create_ix])
+            .await?;
         let control =
             alt_transactions_since(base, &open_pubkey, &baseline).await?;
         check_eq!(

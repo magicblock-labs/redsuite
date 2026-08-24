@@ -45,7 +45,7 @@ impl Scenario for MultiProgramClone {
         .await?;
 
         let multi_clone_tx = Instant::now();
-        er.send(
+        er.submit_and_confirm(
             &payer,
             &[
                 build::simple_byte_set_at(

@@ -57,8 +57,11 @@ impl Scenario for CommitRoundtrip {
         }
         let clone_visibility_ms = clone_started.elapsed().as_secs_f64() * 1e3;
 
-        er.send(&payer, &[build::simple_byte_set(FIRST_WRITE, &accounts)])
-            .await?;
+        er.submit_and_confirm(
+            &payer,
+            &[build::simple_byte_set(FIRST_WRITE, &accounts)],
+        )
+        .await?;
         let committed_state = er
             .account(&committed)
             .await?
@@ -81,7 +84,7 @@ impl Scenario for CommitRoundtrip {
 
         let commit_started = Instant::now();
         let commit_signature = er
-            .send(
+            .submit_and_confirm(
                 &payer,
                 &[build::commit_accounts(1, payer.pubkey(), &accounts[..1])],
             )
@@ -181,8 +184,11 @@ impl Scenario for CommitRoundtrip {
             "committing one account must not touch its sibling on base"
         )?;
 
-        er.send(&payer, &[build::simple_byte_set(SECOND_WRITE, &accounts)])
-            .await?;
+        er.submit_and_confirm(
+            &payer,
+            &[build::simple_byte_set(SECOND_WRITE, &accounts)],
+        )
+        .await?;
         let committed_final = er
             .account(&committed)
             .await?
@@ -199,7 +205,7 @@ impl Scenario for CommitRoundtrip {
 
         let undelegate_started = Instant::now();
         let undelegate_signature = er
-            .send(
+            .submit_and_confirm(
                 &payer,
                 &[build::commit_and_undelegate_accounts(
                     2,
@@ -320,7 +326,7 @@ impl Scenario for CommitRoundtrip {
         )
         .await?;
         let write_after_undelegate = er
-            .send(
+            .submit_and_confirm(
                 &lockout_payer,
                 &[build::simple_byte_set(LOCKOUT_WRITE, &[committed])],
             )

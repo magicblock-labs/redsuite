@@ -165,7 +165,7 @@ impl BackgroundLoad {
                 let ix = shape(&pool, global_id);
                 let outage = outage.clone();
                 async move {
-                    match sender.send_fresh(&[ix]).await {
+                    match sender.submit_fresh(&[ix]).await {
                         Ok(_) => {
                             let mut state = outage.borrow_mut();
                             state.close_open_outage();
@@ -348,7 +348,7 @@ impl Scenario for RestartUnderLoad {
             |id| {
                 let sender = senders[(id as usize) % senders.len()].clone();
                 let ix = shape(&pool, id);
-                async move { sender.send(&[ix]).await.map(|_| ()) }
+                async move { sender.submit(&[ix]).await.map(|_| ()) }
             },
         )
         .await;

@@ -15,7 +15,7 @@ use signer::Signer;
 use transaction::Transaction;
 
 use crate::{
-    api::{self, Api, Metrics},
+    api::{self, Api, ConfirmOptions, Metrics},
     profile::ExecutionConfig,
     resources::Resources,
     Result,
@@ -23,10 +23,6 @@ use crate::{
 
 const AIRDROP_TIMEOUT: Duration = Duration::from_secs(60);
 const AIRDROP_POLL: Duration = Duration::from_millis(200);
-// Same 20s budget as test-integration's 40x500ms convention, but polled at
-// the ER's block cadence so confirm latency reflects the chain, not the poll.
-const CONFIRM_ATTEMPTS: u32 = 400;
-const CONFIRM_POLL: Duration = Duration::from_millis(50);
 // The ER produces 50ms blocks, so its blockhash window is much shorter than
 // the base chain's.
 const BASE_BLOCKHASH_TTL: Duration = Duration::from_secs(20);
@@ -35,12 +31,12 @@ const ER_BLOCKHASH_TTL: Duration = Duration::from_secs(2);
 #[async_trait(?Send)]
 pub trait ChainCtx {
     fn api(&self) -> &Api;
-    async fn send(
+    async fn submit_and_confirm(
         &self,
         payer: &Keypair,
         ixs: &[Instruction],
     ) -> Result<Signature>;
-    async fn send_with(
+    async fn submit_and_confirm_with(
         &self,
         payer: &Keypair,
         cosigners: &[&Keypair],
@@ -78,7 +74,7 @@ impl BlockhashCache {
     }
 }
 
-async fn send_and_confirm(
+async fn submit_and_confirm(
     api: &Api,
     blockhash: &BlockhashCache,
     payer: &Keypair,
@@ -95,13 +91,8 @@ async fn send_and_confirm(
         hash,
     );
     let sig = api.send_transaction(&tx).await?;
-    for _ in 0..CONFIRM_ATTEMPTS {
-        if api.signature_confirmed(&sig).await? {
-            return Ok(sig);
-        }
-        tokio::time::sleep(CONFIRM_POLL).await;
-    }
-    Err(format!("transaction {sig} not confirmed within {CONFIRM_ATTEMPTS}x{CONFIRM_POLL:?}").into())
+    api.confirm(&sig, ConfirmOptions::default()).await?;
+    Ok(sig)
 }
 
 #[derive(Clone)]
@@ -128,15 +119,15 @@ impl TxSender {
         ))
     }
 
-    pub async fn deliver(&self, tx: &Transaction) -> Result<Signature> {
+    pub async fn submit_prepared(&self, tx: &Transaction) -> Result<Signature> {
         self.api.send_transaction(tx).await
     }
 
-    pub async fn send(&self, ixs: &[Instruction]) -> Result<Signature> {
-        self.deliver(&self.prepare(ixs).await?).await
+    pub async fn submit(&self, ixs: &[Instruction]) -> Result<Signature> {
+        self.submit_prepared(&self.prepare(ixs).await?).await
     }
 
-    pub async fn send_fresh(&self, ixs: &[Instruction]) -> Result<Signature> {
+    pub async fn submit_fresh(&self, ixs: &[Instruction]) -> Result<Signature> {
         let hash = self.api.get_latest_blockhash().await?;
         let tx = Transaction::new_signed_with_payer(
             ixs,
@@ -145,6 +136,15 @@ impl TxSender {
             hash,
         );
         self.api.send_transaction(&tx).await
+    }
+
+    pub async fn submit_and_confirm(
+        &self,
+        ixs: &[Instruction],
+    ) -> Result<Signature> {
+        let sig = self.submit(ixs).await?;
+        self.api.confirm(&sig, ConfirmOptions::default()).await?;
+        Ok(sig)
     }
 }
 
@@ -315,20 +315,20 @@ impl ChainCtx for BaseCtx {
     fn api(&self) -> &Api {
         &self.api
     }
-    async fn send(
+    async fn submit_and_confirm(
         &self,
         payer: &Keypair,
         ixs: &[Instruction],
     ) -> Result<Signature> {
-        send_and_confirm(&self.api, &self.blockhash, payer, &[], ixs).await
+        submit_and_confirm(&self.api, &self.blockhash, payer, &[], ixs).await
     }
-    async fn send_with(
+    async fn submit_and_confirm_with(
         &self,
         payer: &Keypair,
         cosigners: &[&Keypair],
         ixs: &[Instruction],
     ) -> Result<Signature> {
-        send_and_confirm(&self.api, &self.blockhash, payer, cosigners, ixs)
+        submit_and_confirm(&self.api, &self.blockhash, payer, cosigners, ixs)
             .await
     }
     async fn account(&self, pk: &Pubkey) -> Result<Option<Account>> {
@@ -344,20 +344,20 @@ impl ChainCtx for ErCtx {
     fn api(&self) -> &Api {
         &self.api
     }
-    async fn send(
+    async fn submit_and_confirm(
         &self,
         payer: &Keypair,
         ixs: &[Instruction],
     ) -> Result<Signature> {
-        send_and_confirm(&self.api, &self.blockhash, payer, &[], ixs).await
+        submit_and_confirm(&self.api, &self.blockhash, payer, &[], ixs).await
     }
-    async fn send_with(
+    async fn submit_and_confirm_with(
         &self,
         payer: &Keypair,
         cosigners: &[&Keypair],
         ixs: &[Instruction],
     ) -> Result<Signature> {
-        send_and_confirm(&self.api, &self.blockhash, payer, cosigners, ixs)
+        submit_and_confirm(&self.api, &self.blockhash, payer, cosigners, ixs)
             .await
     }
     async fn account(&self, pk: &Pubkey) -> Result<Option<Account>> {

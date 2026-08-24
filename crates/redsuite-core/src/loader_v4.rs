@@ -7,20 +7,19 @@ use signer::Signer;
 use solana_loader_v4_interface::instruction as v4;
 use transaction::Transaction;
 
-use crate::{context::BaseCtx, system, ChainCtx, Result};
+use crate::{api::ConfirmOptions, context::BaseCtx, system, ChainCtx, Result};
 
 const CHUNK_SIZE: usize = 800;
 const DEPLOY_LAMPORTS: u64 = 10 * 1_000_000_000;
-const LENGTH_HEADROOM: u32 = 1024;
-const CONFIRM_ATTEMPTS: u32 = 100;
 const CONFIRM_POLL: Duration = Duration::from_millis(200);
+const LENGTH_HEADROOM: u32 = 1024;
 
 // Deploy passes repeat byte-identical transactions: the Deploy instruction,
 // and every Write chunk the upgrade did not change. Under the BaseCtx cached
 // blockhash (20 s TTL) such a repeat gets the signature of its first landing
 // and dedups into a silent no-op — the upgrade "succeeds" while the program
-// stays Retracted. A fresh blockhash per send keeps every pass distinct.
-async fn send_fresh(
+// stays Retracted. A fresh blockhash per submission keeps every pass distinct.
+async fn submit_fresh_and_confirm(
     base: &BaseCtx,
     payer: &Keypair,
     cosigners: &[&Keypair],
@@ -36,17 +35,15 @@ async fn send_fresh(
         hash,
     );
     let sig = base.api().send_transaction(&tx).await?;
-    for _ in 0..CONFIRM_ATTEMPTS {
-        if base.api().signature_confirmed(&sig).await? {
-            return Ok(());
-        }
-        tokio::time::sleep(CONFIRM_POLL).await;
-    }
-    Err(format!(
-        "loader-v4 transaction {sig} not confirmed within \
-         {CONFIRM_ATTEMPTS}x{CONFIRM_POLL:?}"
-    )
-    .into())
+    base.api()
+        .confirm(
+            &sig,
+            ConfirmOptions {
+                poll: CONFIRM_POLL,
+                ..ConfirmOptions::default()
+            },
+        )
+        .await
 }
 
 pub fn loader_v4_id() -> Pubkey {
@@ -70,9 +67,10 @@ pub async fn deploy_program(
             0,
             &loader_v4_id(),
         );
-        send_fresh(base, authority, &[program], &[create]).await?;
+        submit_fresh_and_confirm(base, authority, &[program], &[create])
+            .await?;
     } else {
-        send_fresh(
+        submit_fresh_and_confirm(
             base,
             authority,
             &[],
@@ -87,7 +85,7 @@ pub async fn deploy_program(
         .map(|account| account.lamports)
         .unwrap_or(0);
     if balance < DEPLOY_LAMPORTS {
-        send_fresh(
+        submit_fresh_and_confirm(
             base,
             authority,
             &[],
@@ -101,7 +99,7 @@ pub async fn deploy_program(
     }
 
     let new_size = bytes.len() as u32 + LENGTH_HEADROOM;
-    send_fresh(
+    submit_fresh_and_confirm(
         base,
         authority,
         &[],
@@ -116,7 +114,7 @@ pub async fn deploy_program(
 
     for (index, chunk) in bytes.chunks(CHUNK_SIZE).enumerate() {
         let offset = (index * CHUNK_SIZE) as u32;
-        send_fresh(
+        submit_fresh_and_confirm(
             base,
             authority,
             &[],
@@ -130,7 +128,7 @@ pub async fn deploy_program(
         .await?;
     }
 
-    send_fresh(
+    submit_fresh_and_confirm(
         base,
         authority,
         &[],

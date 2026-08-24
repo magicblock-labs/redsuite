@@ -16,9 +16,12 @@ pub use diff::{bmf, compare, list};
 use json::{Deserialize, Serialize};
 
 use crate::{
+    api,
     scenario::{failed_check, RunRecord, ScenarioOutcome},
     stats::ObservationsStats,
-    topology, DynError, Result,
+    topology,
+    transport::http,
+    DynError, Result,
 };
 
 pub const SCHEMA_VERSION: u32 = 1;
@@ -386,19 +389,65 @@ fn run_failures(record: &RunRecord) -> Vec<PersistedFailure> {
 }
 
 fn scenario_failure(error: &DynError) -> PersistedFailure {
-    match failed_check(error) {
-        Some(check) => PersistedFailure {
+    if let Some(check) = failed_check(error) {
+        return PersistedFailure {
             expected: check.expected.clone(),
             actual: check.actual.clone(),
             context: check.context.clone(),
             ..PersistedFailure::new("scenario", "check", &check.check)
-        },
-        None => PersistedFailure::new(
-            "scenario",
-            "infrastructure",
-            error.to_string(),
-        ),
+        };
     }
+    if let Some(tx) = error.downcast_ref::<api::TxError>() {
+        return PersistedFailure {
+            context: vec![
+                ("signature".to_owned(), tx.signature.to_string()),
+                ("error".to_owned(), format!("{:?}", tx.err)),
+            ],
+            ..PersistedFailure::new("scenario", "transaction", tx.to_string())
+        };
+    }
+    if let Some(timeout) = error.downcast_ref::<api::ConfirmTimeout>() {
+        return PersistedFailure {
+            context: vec![(
+                "signature".to_owned(),
+                timeout.signature.to_string(),
+            )],
+            ..PersistedFailure::new(
+                "scenario",
+                "confirm-timeout",
+                timeout.to_string(),
+            )
+        };
+    }
+    if let Some(rpc) = error.downcast_ref::<api::RpcError>() {
+        let mut context = vec![
+            ("code".to_owned(), rpc.code.to_string()),
+            ("method".to_owned(), rpc.method.clone()),
+            ("url".to_owned(), rpc.url.clone()),
+        ];
+        if let Some(data) = &rpc.data {
+            context.push(("data".to_owned(), format!("{data:?}")));
+        }
+        return PersistedFailure {
+            context,
+            ..PersistedFailure::new("scenario", "rpc", rpc.to_string())
+        };
+    }
+    if let Some(transport) = error.downcast_ref::<http::TransportError>() {
+        let mut context = vec![("url".to_owned(), transport.url.clone())];
+        if let Some(status) = transport.status {
+            context.push(("status".to_owned(), status.to_string()));
+        }
+        return PersistedFailure {
+            context,
+            ..PersistedFailure::new(
+                "scenario",
+                "transport",
+                transport.to_string(),
+            )
+        };
+    }
+    PersistedFailure::new("scenario", "infrastructure", error.to_string())
 }
 
 fn running_stack_exe() -> Option<PathBuf> {
@@ -559,6 +608,62 @@ mod tests {
         assert_eq!(failures[0].actual.as_deref(), Some("0 bytes"));
         assert_eq!(failures[0].context[0].0, "account");
         assert!(record.failure().unwrap().contains("check failed"));
+    }
+
+    #[test]
+    fn structured_errors_classify_into_typed_failure_kinds() {
+        use signature::Signature;
+
+        let tx: DynError = Box::new(api::TxError {
+            signature: Signature::default(),
+            err: json::from_str(r#"{"InstructionError":[0,{"Custom":1}]}"#)
+                .unwrap(),
+        });
+        let failure = scenario_failure(&tx);
+        assert_eq!(failure.kind, "transaction");
+        assert_eq!(failure.context[0].0, "signature");
+        assert!(failure.context[1].1.contains("InstructionError"));
+
+        let timeout: DynError = Box::new(api::ConfirmTimeout {
+            signature: Signature::default(),
+            deadline: std::time::Duration::from_secs(20),
+        });
+        let failure = scenario_failure(&timeout);
+        assert_eq!(failure.kind, "confirm-timeout");
+        assert!(failure.message.contains("execution outcome unknown"));
+
+        let rpc: DynError = Box::new(api::RpcError {
+            code: -32003,
+            message: "tx verification error".into(),
+            data: None,
+            method: "sendTransaction".into(),
+            url: "http://127.0.0.1:1".into(),
+        });
+        let failure = scenario_failure(&rpc);
+        assert_eq!(failure.kind, "rpc");
+        assert!(failure
+            .context
+            .iter()
+            .any(|(key, value)| key == "code" && value == "-32003"));
+        assert!(failure
+            .context
+            .iter()
+            .any(|(key, value)| key == "method" && value == "sendTransaction"));
+
+        let transport: DynError = Box::new(http::TransportError {
+            url: "http://127.0.0.1:1".into(),
+            status: Some(502),
+            detail: "bad gateway".into(),
+        });
+        let failure = scenario_failure(&transport);
+        assert_eq!(failure.kind, "transport");
+        assert!(failure
+            .context
+            .iter()
+            .any(|(key, value)| key == "status" && value == "502"));
+
+        let plain: DynError = "connection reset".into();
+        assert_eq!(scenario_failure(&plain).kind, "infrastructure");
     }
 
     #[test]

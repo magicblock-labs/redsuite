@@ -35,7 +35,7 @@ impl Scenario for Example {
             let lamports = LAMPORTS_PER_TRANSFER + unique;
             let transfer = transfer_ix(payer.pubkey(), recipient, lamports);
             let sent = Instant::now();
-            base.send(&payer, &[transfer]).await?;
+            base.submit_and_confirm(&payer, &[transfer]).await?;
             latency.push(sent.elapsed().as_micros() as u32);
             expected += lamports;
         }

@@ -103,7 +103,7 @@ fn execute_cell(
                 ],
             );
             let sender = senders[(global_id as usize) % senders.len()].clone();
-            async move { sender.send(&[ix]).await.map(|_| ()) }
+            async move { sender.submit(&[ix]).await.map(|_| ()) }
         }
     };
     execute_threaded(config, factory)

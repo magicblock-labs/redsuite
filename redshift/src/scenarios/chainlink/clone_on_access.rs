@@ -55,8 +55,11 @@ impl Scenario for CloneOnAccess {
         .await?;
 
         let plain = crate::init_account(base, &payer, 0, er.identity()).await?;
-        base.send(&payer, &[build::simple_byte_set(PRE_CLONE_WRITE, &[plain])])
-            .await?;
+        base.submit_and_confirm(
+            &payer,
+            &[build::simple_byte_set(PRE_CLONE_WRITE, &[plain])],
+        )
+        .await?;
 
         let first_access = Instant::now();
         check::poll(
@@ -88,7 +91,7 @@ impl Scenario for CloneOnAccess {
             "the first ER access must observe the state written on base before cloning"
         )?;
 
-        base.send(
+        base.submit_and_confirm(
             &payer,
             &[build::simple_byte_set(POST_CLONE_WRITE, &[plain])],
         )
@@ -105,7 +108,7 @@ impl Scenario for CloneOnAccess {
         let propagation_ms = mutation_confirmed.elapsed().as_secs_f64() * 1e3;
 
         let undelegated_write = er
-            .send(
+            .submit_and_confirm(
                 &payer,
                 &[build::simple_byte_set(UNDELEGATED_WRITE, &[plain])],
             )
@@ -145,8 +148,11 @@ impl Scenario for CloneOnAccess {
             "the ER must present a delegated account as owned by its program"
         )?;
 
-        er.send(&payer, &[build::simple_byte_set(ER_WRITE, &[delegated])])
-            .await?;
+        er.submit_and_confirm(
+            &payer,
+            &[build::simple_byte_set(ER_WRITE, &[delegated])],
+        )
+        .await?;
         let after_er_write = er
             .account(&delegated)
             .await?
@@ -180,7 +186,8 @@ impl Scenario for CloneOnAccess {
                 &er.identity(),
             ),
         ];
-        base.send_with(&payer, &[&wallet], &delegate_setup).await?;
+        base.submit_and_confirm_with(&payer, &[&wallet], &delegate_setup)
+            .await?;
         check::poll(
             "the ER clones the delegated wallet at full balance",
             CLONE_TIMEOUT,
@@ -220,7 +227,7 @@ impl Scenario for CloneOnAccess {
                 &er.identity(),
             ),
         ];
-        base.send_with(&payer, &[&identity, &wallet], &cycle)
+        base.submit_and_confirm_with(&payer, &[&identity, &wallet], &cycle)
             .await?;
 
         let continuity_deadline = Instant::now() + CONTINUITY_WINDOW;
@@ -246,7 +253,7 @@ impl Scenario for CloneOnAccess {
             WALLET_LAMPORTS,
             "the er clone balance must be intact after the cycle"
         )?;
-        er.send(
+        er.submit_and_confirm(
             &wallet,
             &[system::transfer(
                 &wallet.pubkey(),

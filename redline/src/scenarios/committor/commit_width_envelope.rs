@@ -245,7 +245,8 @@ impl Scenario for CommitWidthEnvelope {
                     async move {
                         let started = Instant::now();
                         let tx = sender.prepare(&[ix]).await?;
-                        let commit_signature = sender.deliver(&tx).await?;
+                        let commit_signature =
+                            sender.submit_prepared(&tx).await?;
                         tally
                             .borrow_mut()
                             .er_delivery
@@ -489,7 +490,7 @@ impl Scenario for CommitWidthEnvelope {
                 let flow_before = snapshot_base_flow(base.api()).await?;
                 let before = er.scrape_metrics().await?;
                 let started = Instant::now();
-                let commit_signature = sender.send(&[ix]).await?;
+                let commit_signature = sender.submit(&[ix]).await?;
                 match scheduling_outcome(
                     er.api(),
                     &commit_signature,
@@ -604,7 +605,7 @@ impl Scenario for CommitWidthEnvelope {
                 let ix =
                     build::commit_accounts(offset, payer_pubkey, &accounts);
                 let before = er.scrape_metrics().await?;
-                let commit_signature = sender.send(&[ix]).await?;
+                let commit_signature = sender.submit(&[ix]).await?;
                 let outcome_note = match scheduling_outcome(
                     er.api(),
                     &commit_signature,
@@ -714,7 +715,7 @@ impl Scenario for CommitWidthEnvelope {
                         probe_payer_pubkey,
                         &[probe_account],
                     );
-                    let commit_signature = probe_sender.send(&[ix]).await?;
+                    let commit_signature = probe_sender.submit(&[ix]).await?;
                     let limit_receipt = receipt::fetch_commit_receipt(
                         er.api(),
                         &commit_signature,
@@ -738,7 +739,7 @@ impl Scenario for CommitWidthEnvelope {
                 );
                 let rejected_tx = probe_sender.prepare(&[ix]).await?;
                 let rejected_signature =
-                    probe_sender.deliver(&rejected_tx).await?;
+                    probe_sender.submit_prepared(&rejected_tx).await?;
                 let deadline = tokio::time::Instant::now() + REJECTION_TIMEOUT;
                 let rejection_code = loop {
                     if let Some(status) = er

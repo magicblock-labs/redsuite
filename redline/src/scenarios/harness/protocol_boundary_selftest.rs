@@ -98,7 +98,7 @@ fn run_cell(
         move |id: u64| {
             let sender = senders[(id as usize) % senders.len()].clone();
             let ix = shape(&pool, id_offset + id);
-            async move { sender.send(&[ix]).await.map(|_| ()) }
+            async move { sender.submit(&[ix]).await.map(|_| ()) }
         }
     };
     execute_threaded(config, factory)

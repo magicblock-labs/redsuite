@@ -213,7 +213,7 @@ impl Scenario for EnsureGateStall {
                     let accounts = sample_accounts(&pool, id, READ_WIDTH);
                     let ix = build::read_accounts_data(id, &accounts);
                     let sender = sender.clone();
-                    async move { sender.send(&[ix]).await.map(|_| ()) }
+                    async move { sender.submit(&[ix]).await.map(|_| ()) }
                 }
             };
             let outcome = execute(

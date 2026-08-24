@@ -46,7 +46,7 @@ impl Scenario for Commits {
             let pdas: Vec<_> = committees.iter().map(|c| c.pda).collect();
 
             let signature = er
-                .send(
+                .submit_and_confirm(
                     &payer,
                     &[build::schedule_commit_cpi(
                         payer.pubkey(),
@@ -130,7 +130,7 @@ impl Scenario for Commits {
         let (foreign_player, foreign_pda) =
             (foreign[0].player.pubkey(), foreign[0].pda);
         let illegal_commit = er
-            .send(
+            .submit_and_confirm(
                 &outsider_payer,
                 &[build::schedule_commit_cpi(
                     outsider_payer.pubkey(),
@@ -178,7 +178,7 @@ impl Scenario for Commits {
         let (undelegate_player, undelegate_pda) =
             (undelegate[0].player.pubkey(), undelegate[0].pda);
         let illegal_undelegate = er
-            .send(
+            .submit_and_confirm(
                 &outsider_payer,
                 &[build::schedule_commit_cpi(
                     outsider_payer.pubkey(),

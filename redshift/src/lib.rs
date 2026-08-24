@@ -81,7 +81,7 @@ pub async fn init_account(
         seed,
         authority,
     );
-    base.send(payer, &[init]).await?;
+    base.submit_and_confirm(payer, &[init]).await?;
     Ok(pda)
 }
 
@@ -117,6 +117,6 @@ pub async fn init_delegated_account_at(
         seed,
         authority,
     );
-    base.send(payer, &[init, delegate]).await?;
+    base.submit_and_confirm(payer, &[init, delegate]).await?;
     Ok(pda)
 }

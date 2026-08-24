@@ -40,7 +40,7 @@ impl Scenario for FeePayerRules {
         )?;
 
         let signature = er
-            .send(
+            .submit_and_confirm(
                 &delegated_payer,
                 &[build::direct_schedule_commit(
                     delegated_payer.pubkey(),
@@ -82,7 +82,7 @@ impl Scenario for FeePayerRules {
         // fee gate is the only thing left to fail on.
         let outsider = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
         let fee_only = er
-            .send(
+            .submit_and_confirm(
                 &outsider,
                 &[system::transfer(&outsider.pubkey(), &outsider.pubkey(), 1)],
             )
