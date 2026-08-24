@@ -99,7 +99,7 @@ async fn execute_window(
             let id = first_id + iteration;
             let sender = senders[(id as usize) % senders.len()].clone();
             let ix = shape(pool, id);
-            async move { sender.send(&[ix]).await.map(|_| ()) }
+            async move { sender.submit(&[ix]).await.map(|_| ()) }
         },
     )
     .await;
@@ -210,7 +210,7 @@ impl Scenario for StorageProdsizeSustain {
                 |id| {
                     let sender = senders[(id as usize) % senders.len()].clone();
                     let ix = shape(&pool, id);
-                    async move { sender.send(&[ix]).await.map(|_| ()) }
+                    async move { sender.submit(&[ix]).await.map(|_| ()) }
                 },
             )
             .await;

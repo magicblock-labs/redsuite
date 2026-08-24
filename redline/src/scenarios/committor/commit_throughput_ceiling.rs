@@ -125,7 +125,7 @@ async fn deliver_commits(
             let delivered = delivered.clone();
             async move {
                 let tx = sender.prepare(&[ix]).await?;
-                let commit_signature = sender.deliver(&tx).await?;
+                let commit_signature = sender.submit_prepared(&tx).await?;
                 delivered.borrow_mut().push((id, commit_signature));
                 Ok(())
             }

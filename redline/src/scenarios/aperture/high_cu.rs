@@ -129,7 +129,7 @@ async fn run_cell(
             &[pdas[pda_index]],
         );
         let sender = senders[(global_id as usize) % senders.len()].clone();
-        async move { sender.send(&[ix]).await.map(|_| ()) }
+        async move { sender.submit(&[ix]).await.map(|_| ()) }
     };
     let count_before_warmup = er.scrape_metrics().await?.get(TX_COUNT);
     let warm = execute(
@@ -176,7 +176,7 @@ async fn run_cell(
         let sender = senders[(global_id as usize) % senders.len()].clone();
         let probe = probe.clone();
         async move {
-            let sig = sender.send(&[ix]).await?;
+            let sig = sender.submit(&[ix]).await?;
             if probe.borrow().is_none() {
                 *probe.borrow_mut() = Some(sig);
             }

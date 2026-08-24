@@ -123,7 +123,7 @@ async fn burst_cell(
                     0,
                     &[prewarm_account],
                 );
-            sender.send(&[warm_ix]).await?;
+            sender.submit(&[warm_ix]).await?;
         }
     }
 
@@ -143,7 +143,7 @@ async fn burst_cell(
             let slow = slow.clone();
             async move {
                 let started = Instant::now();
-                let delivery = sender.send(&[ix]).await.map(|_| ());
+                let delivery = sender.submit(&[ix]).await.map(|_| ());
                 if started.elapsed() > SLOW_THRESHOLD {
                     slow.set(slow.get() + 1);
                 }

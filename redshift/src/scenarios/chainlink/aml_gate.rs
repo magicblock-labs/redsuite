@@ -271,7 +271,7 @@ async fn run_risk_case(
         ),
         spl::mint_to(&mint.pubkey(), &source_ata, &owner_pk, SHUTTLE_AMOUNT),
     ];
-    base.send_with(&fee_payer, &[&mint, &owner], &setup_ixs)
+    base.submit_and_confirm_with(&fee_payer, &[&mint, &owner], &setup_ixs)
         .await?;
 
     // 2. Initialize rent PDA if it doesn't exist yet, and top it up
@@ -281,7 +281,7 @@ async fn run_risk_case(
             payer: fee_payer.pubkey(),
         }
         .instruction();
-        base.send(&fee_payer, &[rent_pda_ix]).await?;
+        base.submit_and_confirm(&fee_payer, &[rent_pda_ix]).await?;
     }
     base.airdrop(&rent_pda, 1_000_000_000).await?;
 
@@ -291,7 +291,7 @@ async fn run_risk_case(
         mint: mint.pubkey(),
     }
     .instruction();
-    base.send(&fee_payer, &[vault_ix]).await?;
+    base.submit_and_confirm(&fee_payer, &[vault_ix]).await?;
 
     let fees_vault =
         dlp_api::pda::validator_fees_vault_pda_from_validator(&er_identity);
@@ -317,7 +317,8 @@ async fn run_risk_case(
         validator: Some(er_identity),
     }
     .instruction();
-    base.send_with(&fee_payer, &[&owner], &[shuttle_ix]).await?;
+    base.submit_and_confirm_with(&fee_payer, &[&owner], &[shuttle_ix])
+        .await?;
 
     // Verify shuttle ATA delegation record exists on base chain
     check!(

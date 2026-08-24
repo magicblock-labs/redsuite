@@ -51,7 +51,7 @@ impl Scenario for EscrowCloning {
 
         let drain_target = Keypair::new().pubkey();
         let transfer_result = er
-            .send(
+            .submit_and_confirm(
                 &escrowed.payer,
                 &[system::transfer(
                     &escrowed.payer.pubkey(),
@@ -132,8 +132,12 @@ impl Scenario for EscrowCloning {
                 &er.identity(),
             ),
         ];
-        base.send_with(&funder, &[&spender.payer], &delegate_spender)
-            .await?;
+        base.submit_and_confirm_with(
+            &funder,
+            &[&spender.payer],
+            &delegate_spender,
+        )
+        .await?;
 
         let receiver = Keypair::new();
         base.airdrop(&receiver.pubkey(), RENT_EXEMPT).await?;
@@ -145,7 +149,7 @@ impl Scenario for EscrowCloning {
                 &er.identity(),
             ),
         ];
-        base.send_with(&funder, &[&receiver], &delegate_receiver)
+        base.submit_and_confirm_with(&funder, &[&receiver], &delegate_receiver)
             .await?;
         check::poll(
             "the ER clones the delegated receiver at its rent-exempt balance",
@@ -174,7 +178,7 @@ impl Scenario for EscrowCloning {
         let wallet_before =
             er.api().get_balance(&spender.payer.pubkey()).await?;
 
-        er.send(
+        er.submit_and_confirm(
             &spender.payer,
             &[system::transfer(
                 &spender.payer.pubkey(),

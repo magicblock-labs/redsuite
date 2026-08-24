@@ -36,7 +36,7 @@ pub async fn init_delegated_accounts(
             seed,
             authority,
         );
-        base.send(payer, &[init, delegate]).await?;
+        base.submit_and_confirm(payer, &[init, delegate]).await?;
         pdas.push(pda);
     }
     Ok(pdas)
@@ -86,12 +86,12 @@ pub async fn init_accounts_batched(
                     pdas.push(pda);
                     pending.push(init);
                     if pending.len() >= PREP_INITS_PER_TX {
-                        base.send(payer, &pending).await?;
+                        base.submit_and_confirm(payer, &pending).await?;
                         pending.clear();
                     }
                 }
                 if !pending.is_empty() {
-                    base.send(payer, &pending).await?;
+                    base.submit_and_confirm(payer, &pending).await?;
                 }
                 Ok::<Vec<Pubkey>, DynError>(pdas)
             },
@@ -174,12 +174,12 @@ pub async fn init_delegated_accounts_batched_at(
                     pending.push(init);
                     pending.push(delegate);
                     if pending.len() >= PREP_PAIRS_PER_TX * 2 {
-                        base.send(payer, &pending).await?;
+                        base.submit_and_confirm(payer, &pending).await?;
                         pending.clear();
                     }
                 }
                 if !pending.is_empty() {
-                    base.send(payer, &pending).await?;
+                    base.submit_and_confirm(payer, &pending).await?;
                 }
                 Ok::<Vec<Pubkey>, DynError>(pdas)
             },

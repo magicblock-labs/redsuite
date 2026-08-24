@@ -15,15 +15,106 @@ use crate::{transport::http, Result};
 pub struct RpcError {
     pub code: i64,
     pub message: String,
+    pub data: Option<json::Value>,
+    pub method: String,
+    pub url: String,
 }
 
 impl std::fmt::Display for RpcError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "rpc error {}: {}", self.code, self.message)
+        write!(
+            f,
+            "rpc error {}: {} ({} at {})",
+            self.code, self.message, self.method, self.url
+        )?;
+        if let Some(data) = &self.data {
+            write!(f, " data: {data:?}")?;
+        }
+        Ok(())
     }
 }
 
 impl std::error::Error for RpcError {}
+
+#[derive(Debug)]
+pub struct TxError {
+    pub signature: Signature,
+    pub err: json::Value,
+}
+
+impl TxError {
+    pub fn custom_code(&self) -> Option<u32> {
+        custom_error_code(&self.err)
+    }
+}
+
+impl std::fmt::Display for TxError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "transaction {} failed on-chain: {:?}",
+            self.signature, self.err
+        )
+    }
+}
+
+impl std::error::Error for TxError {}
+
+#[derive(Debug)]
+pub struct ConfirmTimeout {
+    pub signature: Signature,
+    pub deadline: Duration,
+}
+
+impl std::fmt::Display for ConfirmTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "transaction {} not confirmed within {:?} — execution outcome \
+             unknown, do not resubmit",
+            self.signature, self.deadline
+        )
+    }
+}
+
+impl std::error::Error for ConfirmTimeout {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Commitment {
+    Confirmed,
+    Finalized,
+}
+
+impl Commitment {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Commitment::Confirmed => "confirmed",
+            Commitment::Finalized => "finalized",
+        }
+    }
+}
+
+// Same 20s budget as test-integration's 40x500ms convention, but polled at
+// the ER's block cadence so confirm latency reflects the chain, not the poll.
+pub const CONFIRM_DEADLINE: Duration = Duration::from_secs(20);
+pub const CONFIRM_POLL: Duration = Duration::from_millis(50);
+
+#[derive(Debug, Clone, Copy)]
+pub struct ConfirmOptions {
+    pub commitment: Commitment,
+    pub deadline: Duration,
+    pub poll: Duration,
+}
+
+impl Default for ConfirmOptions {
+    fn default() -> Self {
+        Self {
+            commitment: Commitment::Confirmed,
+            deadline: CONFIRM_DEADLINE,
+            poll: CONFIRM_POLL,
+        }
+    }
+}
 
 #[derive(Deserialize)]
 struct Envelope<T> {
@@ -35,6 +126,8 @@ struct Envelope<T> {
 struct EnvelopeError {
     code: i64,
     message: String,
+    #[serde(default)]
+    data: Option<json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -130,7 +223,17 @@ pub struct TransactionInfo {
 #[derive(Debug)]
 pub struct SignatureStatus {
     pub confirmed: bool,
+    pub finalized: bool,
     pub err: Option<json::Value>,
+}
+
+impl SignatureStatus {
+    pub fn meets(&self, commitment: Commitment) -> bool {
+        match commitment {
+            Commitment::Confirmed => self.confirmed,
+            Commitment::Finalized => self.finalized,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -139,6 +242,67 @@ struct RpcSignatureInfo {
 }
 
 const TX_POLL: Duration = Duration::from_millis(200);
+
+const NO_PARAMS: [&str; 0] = [];
+
+#[derive(Serialize)]
+struct CommitmentConfig {
+    commitment: &'static str,
+}
+
+impl CommitmentConfig {
+    fn confirmed() -> Self {
+        Self {
+            commitment: Commitment::Confirmed.as_str(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct AccountConfig {
+    encoding: &'static str,
+    commitment: &'static str,
+}
+
+impl AccountConfig {
+    fn base64_confirmed() -> Self {
+        Self {
+            encoding: "base64",
+            commitment: Commitment::Confirmed.as_str(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SendTransactionConfig {
+    encoding: &'static str,
+    skip_preflight: bool,
+    preflight_commitment: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TransactionConfig {
+    encoding: &'static str,
+    commitment: &'static str,
+    max_supported_transaction_version: u8,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BlockConfig {
+    transaction_details: &'static str,
+    rewards: bool,
+    commitment: &'static str,
+    max_supported_transaction_version: u8,
+}
+
+#[derive(Serialize)]
+struct SignaturesConfig {
+    limit: usize,
+    commitment: &'static str,
+}
 
 #[derive(Clone)]
 pub struct Api {
@@ -168,7 +332,7 @@ impl Api {
     pub async fn call<T: DeserializeOwned>(
         &self,
         method: &str,
-        params: &str,
+        params: &impl Serialize,
     ) -> Result<T> {
         self.call_nullable(method, params).await?.ok_or_else(|| {
             format!("{method}: response carried neither result nor error")
@@ -181,8 +345,9 @@ impl Api {
     pub async fn call_nullable<T: DeserializeOwned>(
         &self,
         method: &str,
-        params: &str,
+        params: &impl Serialize,
     ) -> Result<Option<T>> {
+        let params = json::to_string(params)?;
         let body = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{params}}}"#
         );
@@ -194,17 +359,20 @@ impl Api {
             return Err(Box::new(RpcError {
                 code: err.code,
                 message: err.message,
+                data: err.data,
+                method: method.to_owned(),
+                url: self.url.clone(),
             }));
         }
         Ok(envelope.result)
     }
 
     pub async fn get_health(&self) -> Result<String> {
-        self.call("getHealth", "[]").await
+        self.call("getHealth", &NO_PARAMS).await
     }
 
     pub async fn get_slot(&self) -> Result<u64> {
-        self.call("getSlot", r#"[{"commitment":"confirmed"}]"#)
+        self.call("getSlot", &(CommitmentConfig::confirmed(),))
             .await
     }
 
@@ -224,7 +392,7 @@ impl Api {
     }
 
     pub async fn get_balance(&self, pk: &Pubkey) -> Result<u64> {
-        let params = format!(r#"["{pk}", {{"commitment":"confirmed"}}]"#);
+        let params = (pk.to_string(), CommitmentConfig::confirmed());
         let resp: WithContext<u64> = self.call("getBalance", &params).await?;
         Ok(resp.value)
     }
@@ -234,14 +402,12 @@ impl Api {
         pk: &Pubkey,
         lamports: u64,
     ) -> Result<String> {
-        let params = format!(r#"["{pk}", {lamports}]"#);
-        self.call("requestAirdrop", &params).await
+        self.call("requestAirdrop", &(pk.to_string(), lamports))
+            .await
     }
 
     pub async fn get_account(&self, pk: &Pubkey) -> Result<Option<Account>> {
-        let params = format!(
-            r#"["{pk}", {{"encoding":"base64","commitment":"confirmed"}}]"#
-        );
+        let params = (pk.to_string(), AccountConfig::base64_confirmed());
         let resp: WithContext<Option<RpcAccount>> =
             self.call("getAccountInfo", &params).await?;
         resp.value.map(decode_rpc_account).transpose()
@@ -251,14 +417,8 @@ impl Api {
         &self,
         pks: &[Pubkey],
     ) -> Result<Vec<Option<Account>>> {
-        let keys = pks
-            .iter()
-            .map(|pk| format!(r#""{pk}""#))
-            .collect::<Vec<_>>()
-            .join(",");
-        let params = format!(
-            r#"[[{keys}], {{"encoding":"base64","commitment":"confirmed"}}]"#
-        );
+        let keys: Vec<String> = pks.iter().map(Pubkey::to_string).collect();
+        let params = (keys, AccountConfig::base64_confirmed());
         let resp: WithContext<Vec<Option<RpcAccount>>> =
             self.call("getMultipleAccounts", &params).await?;
         if resp.value.len() != pks.len() {
@@ -277,7 +437,7 @@ impl Api {
 
     pub async fn get_latest_blockhash(&self) -> Result<Hash> {
         let resp: WithContext<RpcBlockhash> = self
-            .call("getLatestBlockhash", r#"[{"commitment":"confirmed"}]"#)
+            .call("getLatestBlockhash", &(CommitmentConfig::confirmed(),))
             .await?;
         Ok(Hash::from_str(&resp.value.blockhash)?)
     }
@@ -288,30 +448,51 @@ impl Api {
     ) -> Result<Signature> {
         let encoded = base64::engine::general_purpose::STANDARD
             .encode(bincode::serialize(tx)?);
-        let params = format!(
-            r#"["{encoded}", {{"encoding":"base64","skipPreflight":true,"preflightCommitment":"confirmed"}}]"#
+        let params = (
+            encoded,
+            SendTransactionConfig {
+                encoding: "base64",
+                skip_preflight: true,
+                preflight_commitment: Commitment::Confirmed.as_str(),
+            },
         );
         let sig: String = self.call("sendTransaction", &params).await?;
         Ok(Signature::from_str(&sig)?)
     }
 
-    pub async fn signature_confirmed(&self, sig: &Signature) -> Result<bool> {
-        let Some(status) = self.get_signature_status(sig).await? else {
-            return Ok(false);
-        };
-        if let Some(err) = &status.err {
-            return Err(
-                format!("transaction {sig} failed on-chain: {err:?}").into()
-            );
+    pub async fn confirm(
+        &self,
+        sig: &Signature,
+        options: ConfirmOptions,
+    ) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + options.deadline;
+        loop {
+            if let Some(status) = self.get_signature_status(sig).await? {
+                if let Some(err) = status.err {
+                    return Err(Box::new(TxError {
+                        signature: *sig,
+                        err,
+                    }));
+                }
+                if status.meets(options.commitment) {
+                    return Ok(());
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(Box::new(ConfirmTimeout {
+                    signature: *sig,
+                    deadline: options.deadline,
+                }));
+            }
+            tokio::time::sleep(options.poll).await;
         }
-        Ok(status.confirmed)
     }
 
     pub async fn get_signature_status(
         &self,
         sig: &Signature,
     ) -> Result<Option<SignatureStatus>> {
-        let params = format!(r#"[["{sig}"]]"#);
+        let params = ([sig.to_string()],);
         let resp: WithContext<Vec<Option<RpcSignatureStatus>>> =
             self.call("getSignatureStatuses", &params).await?;
         let Some(Some(status)) = resp.value.into_iter().next() else {
@@ -322,6 +503,10 @@ impl Api {
                 status.confirmation_status.as_deref(),
                 Some("confirmed" | "finalized")
             ),
+            finalized: matches!(
+                status.confirmation_status.as_deref(),
+                Some("finalized")
+            ),
             err: status.err,
         }))
     }
@@ -330,8 +515,13 @@ impl Api {
         &self,
         sig: &Signature,
     ) -> Result<Option<TransactionInfo>> {
-        let params = format!(
-            r#"["{sig}", {{"encoding":"json","commitment":"confirmed","maxSupportedTransactionVersion":0}}]"#
+        let params = (
+            sig.to_string(),
+            TransactionConfig {
+                encoding: "json",
+                commitment: Commitment::Confirmed.as_str(),
+                max_supported_transaction_version: 0,
+            },
         );
         let raw: Option<RpcTransaction> =
             self.call_nullable("getTransaction", &params).await?;
@@ -356,13 +546,18 @@ impl Api {
     }
 
     pub async fn get_block_time(&self, slot: u64) -> Result<Option<i64>> {
-        self.call_nullable("getBlockTime", &format!("[{slot}]"))
-            .await
+        self.call_nullable("getBlockTime", &(slot,)).await
     }
 
     pub async fn get_block(&self, slot: u64) -> Result<Option<BlockInfo>> {
-        let params = format!(
-            r#"[{slot}, {{"transactionDetails":"none","rewards":false,"commitment":"confirmed","maxSupportedTransactionVersion":0}}]"#
+        let params = (
+            slot,
+            BlockConfig {
+                transaction_details: "none",
+                rewards: false,
+                commitment: Commitment::Confirmed.as_str(),
+                max_supported_transaction_version: 0,
+            },
         );
         let raw: Option<RpcBlock> =
             self.call_nullable("getBlock", &params).await?;
@@ -376,8 +571,12 @@ impl Api {
         pk: &Pubkey,
         limit: usize,
     ) -> Result<Vec<String>> {
-        let params = format!(
-            r#"["{pk}", {{"limit":{limit},"commitment":"confirmed"}}]"#
+        let params = (
+            pk.to_string(),
+            SignaturesConfig {
+                limit,
+                commitment: Commitment::Confirmed.as_str(),
+            },
         );
         let infos: Vec<RpcSignatureInfo> =
             self.call("getSignaturesForAddress", &params).await?;
@@ -645,6 +844,81 @@ mod tests {
         let delta = MetricsDelta::new(before, after);
         // (2.0 + 1.0) / (20 + 20)
         assert_eq!(delta.histogram_avg_all("mbv_exec"), Some(0.075));
+    }
+
+    #[test]
+    fn typed_params_serialize_to_the_rpc_wire_shapes() {
+        assert_eq!(json::to_string(&NO_PARAMS).unwrap(), "[]");
+        assert_eq!(
+            json::to_string(&(CommitmentConfig::confirmed(),)).unwrap(),
+            r#"[{"commitment":"confirmed"}]"#
+        );
+        assert_eq!(
+            json::to_string(&(
+                "abc".to_owned(),
+                AccountConfig::base64_confirmed()
+            ))
+            .unwrap(),
+            r#"["abc",{"encoding":"base64","commitment":"confirmed"}]"#
+        );
+        let send = (
+            "dGVzdA==".to_owned(),
+            SendTransactionConfig {
+                encoding: "base64",
+                skip_preflight: true,
+                preflight_commitment: Commitment::Confirmed.as_str(),
+            },
+        );
+        assert_eq!(
+            json::to_string(&send).unwrap(),
+            r#"["dGVzdA==",{"encoding":"base64","skipPreflight":true,"preflightCommitment":"confirmed"}]"#
+        );
+        assert_eq!(
+            json::to_string(&(["sig1".to_owned()],)).unwrap(),
+            r#"[["sig1"]]"#
+        );
+        assert_eq!(json::to_string(&(42u64,)).unwrap(), "[42]");
+    }
+
+    #[test]
+    fn rpc_envelope_errors_keep_code_message_and_data() {
+        let text = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32003,"message":"tx verification error","data":{"logs":["a"]}}}"#;
+        let envelope: Envelope<String> = json::from_str(text).unwrap();
+        assert!(envelope.result.is_none());
+        let error = envelope.error.unwrap();
+        assert_eq!(error.code, -32003);
+        assert_eq!(error.message, "tx verification error");
+        assert!(error.data.is_some());
+
+        let bare = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"method not found"}}"#;
+        let envelope: Envelope<String> = json::from_str(bare).unwrap();
+        assert!(envelope.error.unwrap().data.is_none());
+    }
+
+    #[test]
+    fn signature_status_meets_commitment_levels() {
+        let confirmed = SignatureStatus {
+            confirmed: true,
+            finalized: false,
+            err: None,
+        };
+        assert!(confirmed.meets(Commitment::Confirmed));
+        assert!(!confirmed.meets(Commitment::Finalized));
+        let finalized = SignatureStatus {
+            confirmed: true,
+            finalized: true,
+            err: None,
+        };
+        assert!(finalized.meets(Commitment::Confirmed));
+        assert!(finalized.meets(Commitment::Finalized));
+    }
+
+    #[test]
+    fn confirm_options_default_matches_the_confirm_budget() {
+        let options = ConfirmOptions::default();
+        assert_eq!(options.commitment, Commitment::Confirmed);
+        assert_eq!(options.deadline, Duration::from_secs(20));
+        assert_eq!(options.poll, Duration::from_millis(50));
     }
 
     #[test]

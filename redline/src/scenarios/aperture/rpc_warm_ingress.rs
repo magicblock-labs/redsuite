@@ -128,7 +128,7 @@ impl Scenario for WarmIngress {
             |id| {
                 let sender = senders[(id as usize) % senders.len()].clone();
                 let (ix, _) = shape(id);
-                async move { sender.send(&[ix]).await.map(|_| ()) }
+                async move { sender.submit(&[ix]).await.map(|_| ()) }
             },
         )
         .await;
@@ -166,7 +166,7 @@ impl Scenario for WarmIngress {
                 // must exist before the tx can confirm
                 let tx = sender.prepare(&[ix]).await?;
                 sigs.subscribe(id, &tx.signatures[0]).await?;
-                sender.deliver(&tx).await?;
+                sender.submit_prepared(&tx).await?;
                 Ok(())
             }
         };

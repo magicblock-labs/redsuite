@@ -49,7 +49,7 @@ impl Scenario for ApiInvariants {
 
         for iteration in 0..CLOCK_ITERATIONS {
             let signature = sender
-                .send_fresh(&[system::transfer(
+                .submit_fresh(&[system::transfer(
                     &from_pubkey,
                     &to_pubkey,
                     TRANSFER_LAMPORTS,
@@ -140,7 +140,8 @@ impl Scenario for ApiInvariants {
         };
         let record_pda = mdp::record_pda(&validator.pubkey());
 
-        base.send(&validator, &[mdp::register(&record)]).await?;
+        base.submit_and_confirm(&validator, &[mdp::register(&record)])
+            .await?;
         let registered = base
             .account(&record_pda)
             .await?
@@ -160,7 +161,8 @@ impl Scenario for ApiInvariants {
         mutated.status = mdp::STATUS_DRAINING;
         mutated.base_fee = 0;
         mutated.addr = "this.is.very.long.string.to.test.sync".to_owned();
-        base.send(&validator, &[mdp::sync(&mutated)]).await?;
+        base.submit_and_confirm(&validator, &[mdp::sync(&mutated)])
+            .await?;
         let synced = base
             .account(&record_pda)
             .await?
@@ -175,8 +177,11 @@ impl Scenario for ApiInvariants {
             "sync with a longer addr should have grown the record account"
         )?;
 
-        base.send(&validator, &[mdp::unregister(&validator.pubkey())])
-            .await?;
+        base.submit_and_confirm(
+            &validator,
+            &[mdp::unregister(&validator.pubkey())],
+        )
+        .await?;
         let unregistered = base.account(&record_pda).await?;
         check!(
             unregistered.is_none(),

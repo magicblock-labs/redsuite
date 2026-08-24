@@ -122,7 +122,7 @@ impl Scenario for RpcCapacityBlast {
                             id,
                             &[account],
                         );
-                    async move { sender.send(&[ix]).await.map(|_| ()) }
+                    async move { sender.submit(&[ix]).await.map(|_| ()) }
                 }
             }
         };

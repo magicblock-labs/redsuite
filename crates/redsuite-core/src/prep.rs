@@ -55,7 +55,7 @@ pub async fn escrowed_payer(
         dlp::top_up_ephemeral_balance(&payer_pubkey, top_up_lamports, 0),
         dlp::delegate_ephemeral_balance(&payer_pubkey, &validator, 0),
     ];
-    ctx.send(&payer, &escrow_setup).await?;
+    ctx.submit_and_confirm(&payer, &escrow_setup).await?;
 
     let escrow = dlp::ephemeral_balance_pda(&payer_pubkey, 0);
     let escrow_lamports = top_up_lamports + ZERO_DATA_RENT_EXEMPT_LAMPORTS;
@@ -119,7 +119,8 @@ pub async fn init_committees(
             COMMIT_FREQUENCY_MS,
             Some(validator),
         );
-        base.send_with(payer, &[&player], &[init, delegate]).await?;
+        base.submit_and_confirm_with(payer, &[&player], &[init, delegate])
+            .await?;
         let on_base = base.account(&pda).await?.ok_or(
             "the committee pda is not on base after init and delegate",
         )?;
@@ -166,7 +167,7 @@ pub async fn delegated_payer(
         system::assign(&delegatee_pubkey, &dlp::dlp_id()),
         dlp::delegate_account(&funder.pubkey(), &delegatee_pubkey, &validator),
     ];
-    ctx.send_with(funder, &[&delegatee], &delegate_setup)
+    ctx.submit_and_confirm_with(funder, &[&delegatee], &delegate_setup)
         .await?;
     let on_chain = ctx
         .account(&delegatee_pubkey)

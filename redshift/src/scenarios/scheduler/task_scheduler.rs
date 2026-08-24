@@ -114,8 +114,8 @@ async fn scheduled_actor(
 ) -> Result<Actor> {
     let payer = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
     let (init, counter) = flexi::init_counter(payer.pubkey(), LABEL);
-    base.send(&payer, &[init]).await?;
-    base.send(
+    base.submit_and_confirm(&payer, &[init]).await?;
+    base.submit_and_confirm(
         &payer,
         &[flexi::delegate_counter(
             payer.pubkey(),
@@ -133,7 +133,8 @@ async fn scheduled_actor(
             &er.identity(),
         ),
     ];
-    base.send_with(funder, &[&payer], &delegate_setup).await?;
+    base.submit_and_confirm_with(funder, &[&payer], &delegate_setup)
+        .await?;
 
     check::poll(
         "the er clones the scheduled actor's counter",
@@ -210,7 +211,7 @@ async fn test_schedule(
     db: &TaskDb,
 ) -> Result<()> {
     let actor = scheduled_actor(base, er, funder).await?;
-    er.send(
+    er.submit_and_confirm(
         &actor.payer,
         &[flexi::schedule_counter_task(
             actor.pubkey(),
@@ -225,7 +226,7 @@ async fn test_schedule(
     await_er_count(er, &actor, 3).await?;
     await_task_removed(db, 101).await?;
     assert_no_failures_for_task(db, 101, "schedule")?;
-    er.send(
+    er.submit_and_confirm(
         &actor.payer,
         &[flexi::cancel_counter_task(actor.pubkey(), 101)],
     )
@@ -240,7 +241,7 @@ async fn test_reschedule(
     db: &TaskDb,
 ) -> Result<()> {
     let actor = scheduled_actor(base, er, funder).await?;
-    er.send(
+    er.submit_and_confirm(
         &actor.payer,
         &[flexi::schedule_counter_task(
             actor.pubkey(),
@@ -253,7 +254,7 @@ async fn test_reschedule(
     )
     .await?;
     tokio::time::sleep(SCHEDULE_SETTLE).await;
-    er.send(
+    er.submit_and_confirm(
         &actor.payer,
         &[flexi::schedule_counter_task(
             actor.pubkey(),
@@ -268,7 +269,7 @@ async fn test_reschedule(
     await_er_count(er, &actor, 4).await?;
     await_task_removed(db, 102).await?;
     assert_no_failures_for_task(db, 102, "reschedule")?;
-    er.send(
+    er.submit_and_confirm(
         &actor.payer,
         &[flexi::cancel_counter_task(actor.pubkey(), 102)],
     )
@@ -283,7 +284,7 @@ async fn test_signed_refusal(
 ) -> Result<String> {
     let actor = scheduled_actor(base, er, funder).await?;
     let attempt = er
-        .send(
+        .submit_and_confirm(
             &actor.payer,
             &[flexi::schedule_counter_task(
                 actor.pubkey(),
@@ -313,7 +314,7 @@ async fn test_crank_signer(
     funder: &Keypair,
 ) -> Result<Pubkey> {
     let actor = scheduled_actor(base, er, funder).await?;
-    er.send(
+    er.submit_and_confirm(
         &actor.payer,
         &[flexi::schedule_task_direct(
             actor.pubkey(),
@@ -357,7 +358,7 @@ async fn test_magic_cpi_crank(
     );
     commit.accounts[0].is_writable = false;
 
-    er.send(
+    er.submit_and_confirm(
         &authority,
         &[flexi::schedule_task_direct(
             authority.pubkey(),
@@ -393,7 +394,7 @@ async fn test_unauthorized_reschedule(
 ) -> Result<String> {
     let owner = scheduled_actor(base, er, funder).await?;
     let intruder = scheduled_actor(base, er, funder).await?;
-    er.send(
+    er.submit_and_confirm(
         &owner.payer,
         &[flexi::schedule_counter_task(
             owner.pubkey(),
@@ -406,7 +407,7 @@ async fn test_unauthorized_reschedule(
     )
     .await?;
     tokio::time::sleep(SCHEDULE_SETTLE).await;
-    er.send(
+    er.submit_and_confirm(
         &intruder.payer,
         &[flexi::schedule_counter_task(
             intruder.pubkey(),
@@ -458,7 +459,7 @@ async fn test_unauthorized_reschedule(
         "the original task must keep executions"
     )?;
 
-    er.send(
+    er.submit_and_confirm(
         &owner.payer,
         &[flexi::cancel_counter_task(owner.pubkey(), 106)],
     )
@@ -474,7 +475,7 @@ async fn test_schedule_error(
     db: &TaskDb,
 ) -> Result<String> {
     let actor = scheduled_actor(base, er, funder).await?;
-    er.send(
+    er.submit_and_confirm(
         &actor.payer,
         &[flexi::schedule_counter_task(
             actor.pubkey(),
@@ -508,7 +509,7 @@ async fn test_schedule_error(
         0,
         "a failing task must not move the counter"
     )?;
-    er.send(
+    er.submit_and_confirm(
         &actor.payer,
         &[flexi::cancel_counter_task(actor.pubkey(), 107)],
     )
@@ -524,7 +525,7 @@ async fn test_cancel_ongoing(
 ) -> Result<u64> {
     const ITERATIONS: i64 = 1_000_000;
     let actor = scheduled_actor(base, er, funder).await?;
-    er.send(
+    er.submit_and_confirm(
         &actor.payer,
         &[flexi::schedule_counter_task(
             actor.pubkey(),
@@ -544,7 +545,7 @@ async fn test_cancel_ongoing(
         },
     )
     .await?;
-    er.send(
+    er.submit_and_confirm(
         &actor.payer,
         &[flexi::cancel_counter_task(actor.pubkey(), 108)],
     )

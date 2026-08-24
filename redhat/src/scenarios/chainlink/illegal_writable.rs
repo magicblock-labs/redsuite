@@ -26,7 +26,7 @@ async fn refused(
     needles: &[&str],
 ) -> Result<()> {
     let sender = er.sender(payer.clone());
-    let signature = sender.send(instructions).await?;
+    let signature = sender.submit(instructions).await?;
     let tx = er
         .api()
         .await_transaction(&signature, RECEIPT_TIMEOUT)

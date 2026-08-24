@@ -71,7 +71,7 @@ async fn transfer(
 ) -> Result<String> {
     tokio::time::sleep(BLOCKHASH_RENEW).await;
     let signature = sender
-        .send_fresh(&[system::transfer(from, to, lamports)])
+        .submit_fresh(&[system::transfer(from, to, lamports)])
         .await?;
     Ok(signature.to_string())
 }
@@ -261,7 +261,7 @@ impl Scenario for PubsubContracts {
             .await?;
         let immediate_sig = immediate_tx.signatures[0];
         confirmations.subscribe(1, &immediate_sig).await?;
-        sender.deliver(&immediate_tx).await?;
+        sender.submit_prepared(&immediate_tx).await?;
         tokio::time::timeout(EVENT_TIMEOUT, confirmations.await_id(1))
             .await
             .map_err(|_| {
@@ -269,7 +269,7 @@ impl Scenario for PubsubContracts {
             })??;
 
         let delayed_signature = sender
-            .send_fresh(&[system::transfer(
+            .submit_fresh(&[system::transfer(
                 &account1_pubkey,
                 &account2_pubkey,
                 8_888,
@@ -340,7 +340,7 @@ impl Scenario for PubsubContracts {
         )?;
         while raw.next_notification(RAW_DRAIN_TIMEOUT).await?.is_some() {}
         let after_account_unsub = sender
-            .send_fresh(&[system::transfer(
+            .submit_fresh(&[system::transfer(
                 &account1_pubkey,
                 &account2_pubkey,
                 TRANSFER_LAMPORTS,
@@ -372,7 +372,7 @@ impl Scenario for PubsubContracts {
         )?;
         while raw.next_notification(RAW_DRAIN_TIMEOUT).await?.is_some() {}
         let after_logs_unsub = sender
-            .send_fresh(&[system::transfer(
+            .submit_fresh(&[system::transfer(
                 &account1_pubkey,
                 &account2_pubkey,
                 TRANSFER_LAMPORTS,
@@ -404,7 +404,7 @@ impl Scenario for PubsubContracts {
         )?;
         while raw.next_notification(RAW_DRAIN_TIMEOUT).await?.is_some() {}
         let after_program_unsub = sender
-            .send_fresh(&[system::transfer(
+            .submit_fresh(&[system::transfer(
                 &account1_pubkey,
                 &account2_pubkey,
                 TRANSFER_LAMPORTS,

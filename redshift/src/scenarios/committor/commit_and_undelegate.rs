@@ -74,7 +74,7 @@ async fn commit_undelegate_lifecycle(
     let pdas: Vec<_> = committees.iter().map(|c| c.pda).collect();
 
     let signature = er
-        .send(
+        .submit_and_confirm(
             payer,
             &[build::schedule_commit_cpi(
                 payer.pubkey(),
@@ -90,7 +90,7 @@ async fn commit_undelegate_lifecycle(
     let mut er_lockout = "";
     for player in &players {
         let attempt = er
-            .send(er_fee_payer, &[build::increase_count(*player)])
+            .submit_and_confirm(er_fee_payer, &[build::increase_count(*player)])
             .await;
         check!(
             attempt.is_err(),
@@ -143,7 +143,8 @@ async fn commit_undelegate_lifecycle(
     }
 
     for player in &players {
-        base.send(payer, &[build::increase_count(*player)]).await?;
+        base.submit_and_confirm(payer, &[build::increase_count(*player)])
+            .await?;
     }
     for pda in &pdas {
         let on_base = base
@@ -169,7 +170,7 @@ async fn commit_undelegate_lifecycle(
             )
         })
         .collect();
-    base.send(payer, &redelegate).await?;
+    base.submit_and_confirm(payer, &redelegate).await?;
     for pda in &pdas {
         let on_base = base
             .account(pda)
@@ -185,7 +186,10 @@ async fn commit_undelegate_lifecycle(
     let mut base_frozen = "";
     for player in &players {
         let attempt = base
-            .send(base_negative_payer, &[build::increase_count(*player)])
+            .submit_and_confirm(
+                base_negative_payer,
+                &[build::increase_count(*player)],
+            )
             .await;
         check!(
             attempt.is_err(),
@@ -202,7 +206,7 @@ async fn commit_undelegate_lifecycle(
             ),
             ER_WRITE_TIMEOUT,
             || async {
-                er.send(
+                er.submit_and_confirm(
                     er_fee_payer,
                     &[build::increase_count(committee.player.pubkey())],
                 )
@@ -283,7 +287,7 @@ async fn order_book_cell(
         prep::COMMIT_FREQUENCY_MS,
         Some(er.identity()),
     );
-    base.send_with(payer, &[&manager], &[init, delegate])
+    base.submit_and_confirm_with(payer, &[&manager], &[init, delegate])
         .await?;
     let on_base = base
         .account(&book)
@@ -313,7 +317,7 @@ async fn order_book_cell(
 
     let update = random_book_update(seed);
     let signature = er
-        .send(
+        .submit_and_confirm(
             payer,
             &[
                 build::update_order_book(
@@ -386,7 +390,7 @@ async fn rejected_intent_cell(
     refusal: &str,
 ) -> Result<()> {
     let sender = er.sender(payer.clone());
-    let signature = sender.send(&[instruction]).await?;
+    let signature = sender.submit(&[instruction]).await?;
     let tx = er
         .api()
         .await_transaction(&signature, RECEIPT_TIMEOUT)
@@ -520,8 +524,11 @@ async fn test_failed_undelegation_lockout(
     let player = committees[0].player.pubkey();
     let pda = committees[0].pda;
 
-    er.send(&payer, &[build::set_count(player, FAIL_UNDELEGATION_COUNT)])
-        .await?;
+    er.submit_and_confirm(
+        &payer,
+        &[build::set_count(player, FAIL_UNDELEGATION_COUNT)],
+    )
+    .await?;
     let on_er = er
         .account(&pda)
         .await?
@@ -533,7 +540,7 @@ async fn test_failed_undelegation_lockout(
     )?;
 
     let signature = er
-        .send(
+        .submit_and_confirm(
             &payer,
             &[build::schedule_commit_cpi(
                 payer.pubkey(),
@@ -572,7 +579,7 @@ async fn test_failed_undelegation_lockout(
     )?;
 
     let attempt = er
-        .send(&er_fee_payer, &[build::set_count(player, 2222)])
+        .submit_and_confirm(&er_fee_payer, &[build::set_count(player, 2222)])
         .await;
     check!(
         attempt.is_err(),

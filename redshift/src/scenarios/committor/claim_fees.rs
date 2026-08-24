@@ -36,7 +36,7 @@ impl Scenario for ClaimFees {
 
         let claimer_before =
             base.api().get_balance(&validator.pubkey()).await?;
-        base.send(
+        base.submit_and_confirm(
             &validator,
             &[dlp::validator_claim_fees(&validator.pubkey(), None)],
         )

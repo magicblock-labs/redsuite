@@ -217,7 +217,10 @@ async fn invoke_until(
             accounts: accounts.clone(),
             data: data_for(attempt),
         };
-        match er.send(payer, std::slice::from_ref(&ix)).await {
+        match er
+            .submit_and_confirm(payer, std::slice::from_ref(&ix))
+            .await
+        {
             Ok(signature) => {
                 let logs = er
                     .api()
@@ -265,7 +268,10 @@ async fn invoke_until_upgraded(
             accounts: vec![],
             data: log_data(attempt),
         };
-        if let Ok(signature) = er.send(payer, std::slice::from_ref(&ix)).await {
+        if let Ok(signature) = er
+            .submit_and_confirm(payer, std::slice::from_ref(&ix))
+            .await
+        {
             let logs = er
                 .api()
                 .get_transaction(&signature)
