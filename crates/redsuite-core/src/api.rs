@@ -348,9 +348,7 @@ impl Api {
         params: &impl Serialize,
     ) -> Result<Option<T>> {
         let params = json::to_string(params)?;
-        let body = format!(
-            r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{params}}}"#
-        );
+        let body = crate::transport::conn::request_text(1, method, &params);
         let response = http::post_json(&self.client, &self.url, body).await?;
         let envelope: Envelope<T> = json::from_str(&response).map_err(|e| {
             format!("{method}: unexpected response shape: {e} ({response})")
