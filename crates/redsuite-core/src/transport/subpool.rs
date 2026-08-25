@@ -7,13 +7,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-use base64::Engine;
-use futures_util::{SinkExt, StreamExt};
-use json::Deserialize;
+use json::LazyValue;
 use pubkey::Pubkey;
 use tokio::sync::watch;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
 
+use super::{
+    conn::{self, CloseReason, Flow, FrameHandler},
+    ws::account_update_data,
+};
 use crate::{stats::StreamingStats, Result};
 
 const AWAIT_POLL: Duration = Duration::from_millis(20);
@@ -307,29 +308,74 @@ impl SubscriberPool {
     }
 }
 
-#[derive(Deserialize)]
-struct Frame {
-    method: Option<String>,
-    id: Option<u64>,
-    result: Option<u64>,
-    error: Option<json::Value>,
-    params: Option<NotificationParams>,
+struct PoolHandler {
+    state: Arc<Mutex<ConnState>>,
+    produced: Arc<ProducedLedger>,
+    expected: Arc<ExpectedWrites>,
+    extractor: Extractor,
+    threshold_micros: u64,
+    account_by_req: HashMap<u64, Pubkey>,
+    account_by_subid: HashMap<u64, Pubkey>,
+    local_lag: StreamingStats,
 }
 
-#[derive(Deserialize)]
-struct NotificationParams {
-    subscription: u64,
-    result: NotificationResult,
-}
+impl FrameHandler for PoolHandler {
+    fn on_reply(&mut self, id: u64, result: Option<&LazyValue<'_>>) -> Flow {
+        if let (Some(account), Some(subid)) =
+            (self.account_by_req.remove(&id), conn::reply_u64(result))
+        {
+            self.account_by_subid.insert(subid, account);
+        }
+        self.state.lock().unwrap().ready_subs += 1;
+        Flow::Continue
+    }
 
-#[derive(Deserialize)]
-struct NotificationResult {
-    value: AccountValue,
-}
+    fn on_notification(
+        &mut self,
+        method: &str,
+        subscription: u64,
+        payload: &LazyValue<'_>,
+    ) -> Flow {
+        if method != "accountNotification" {
+            return Flow::Continue;
+        }
+        let Some(data) = account_update_data(payload) else {
+            return Flow::Continue;
+        };
+        let Some(id) = (self.extractor)(&data) else {
+            return Flow::Continue;
+        };
+        let Some(lag_micros) = self.produced.lag_micros(id) else {
+            return Flow::Continue;
+        };
+        let Some(account) = self.account_by_subid.get(&subscription).copied()
+        else {
+            return Flow::Continue;
+        };
+        let Some(write_ids) = self.expected.get(&account) else {
+            return Flow::Continue;
+        };
+        let Ok(index) = write_ids.binary_search(&id) else {
+            return Flow::Continue;
+        };
+        {
+            let mut state = self.state.lock().unwrap();
+            let recv = state.by_account.entry(account).or_default();
+            if !recv.mark(index, write_ids.len()) {
+                return Flow::Continue;
+            }
+            state.received += 1;
+            if lag_micros > self.threshold_micros {
+                state.over_threshold += 1;
+            }
+        }
+        self.local_lag.push(lag_micros.min(u32::MAX as u64) as u32);
+        Flow::Continue
+    }
 
-#[derive(Deserialize)]
-struct AccountValue {
-    data: (String, String),
+    fn on_closed(&mut self, reason: &CloseReason) {
+        self.state.lock().unwrap().error = Some(reason.to_string());
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -343,104 +389,40 @@ async fn run_connection(
     mut shutdown: watch::Receiver<bool>,
     threshold_micros: u64,
 ) {
-    let fail = |message: String| {
-        state.lock().unwrap().error = Some(message);
-    };
-    let socket = match connect_async(&url).await {
-        Ok((socket, _)) => socket,
+    let socket = match conn::connect(&url).await {
+        Ok(socket) => socket,
         Err(error) => {
-            fail(format!("{url}: {error}"));
+            state.lock().unwrap().error = Some(error.to_string());
             return;
         }
     };
-    let (mut sink, mut stream) = socket.split();
+    let (requester, mut stream) = conn::split(socket);
+    let mut handler = PoolHandler {
+        state: state.clone(),
+        produced,
+        expected,
+        extractor,
+        threshold_micros,
+        account_by_req: HashMap::new(),
+        account_by_subid: HashMap::new(),
+        local_lag: StreamingStats::new(),
+    };
 
-    let mut account_by_req: HashMap<u64, Pubkey> = HashMap::new();
-    for (account_index, account) in accounts.iter().enumerate() {
-        let req_id = account_index as u64 + 1;
-        account_by_req.insert(req_id, *account);
-        let message = format!(
-            r#"{{"jsonrpc":"2.0","id":{req_id},"method":"accountSubscribe","params":["{account}",{{"encoding":"base64","commitment":"confirmed"}}]}}"#
-        );
-        if let Err(error) = sink.send(Message::Text(message.into())).await {
-            fail(format!("accountSubscribe send: {error}"));
+    for account in accounts.iter() {
+        let req_id = requester.mint();
+        handler.account_by_req.insert(req_id, *account);
+        if let Err(error) = requester
+            .send(req_id, "accountSubscribe", &conn::account_params(account))
+            .await
+        {
+            state.lock().unwrap().error = Some(error.to_string());
             return;
         }
     }
 
-    let mut account_by_subid: HashMap<u64, Pubkey> = HashMap::new();
-    let mut local_lag = StreamingStats::new();
-    let mut stopped = false;
-    while !stopped {
-        tokio::select! {
-            _ = shutdown.changed() => stopped = true,
-            incoming = stream.next() => {
-                let text = match incoming {
-                    Some(Ok(Message::Text(text))) => text,
-                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
-                        fail("connection closed".to_owned());
-                        break;
-                    }
-                    Some(Ok(_)) => continue,
-                };
-                let Ok(frame) = json::from_str::<Frame>(&text) else {
-                    continue;
-                };
-                if let Some(error) = frame.error {
-                    fail(error.to_string());
-                    break;
-                }
-                match (frame.method.as_deref(), frame.params, frame.id) {
-                    (Some("accountNotification"), Some(params), _) => {
-                        let Ok(data) = base64::engine::general_purpose::STANDARD
-                            .decode(&params.result.value.data.0)
-                        else {
-                            continue;
-                        };
-                        let Some(id) = extractor(&data) else {
-                            continue;
-                        };
-                        let Some(lag_micros) = produced.lag_micros(id) else {
-                            continue;
-                        };
-                        let Some(account) =
-                            account_by_subid.get(&params.subscription).copied()
-                        else {
-                            continue;
-                        };
-                        let Some(write_ids) = expected.get(&account) else {
-                            continue;
-                        };
-                        let Ok(index) = write_ids.binary_search(&id) else {
-                            continue;
-                        };
-                        {
-                            let mut state = state.lock().unwrap();
-                            let recv =
-                                state.by_account.entry(account).or_default();
-                            if !recv.mark(index, write_ids.len()) {
-                                continue;
-                            }
-                            state.received += 1;
-                            if lag_micros > threshold_micros {
-                                state.over_threshold += 1;
-                            }
-                        }
-                        local_lag.push(lag_micros.min(u32::MAX as u64) as u32);
-                    }
-                    (None, _, Some(req_id)) => {
-                        let mut state = state.lock().unwrap();
-                        if let (Some(account), Some(subid)) =
-                            (account_by_req.remove(&req_id), frame.result)
-                        {
-                            account_by_subid.insert(subid, account);
-                        }
-                        state.ready_subs += 1;
-                    }
-                    _ => {}
-                }
-            }
-        }
+    tokio::select! {
+        _ = shutdown.changed() => {}
+        _ = conn::drive(&mut stream, &mut handler) => {}
     }
-    state.lock().unwrap().lag = Some(local_lag);
+    state.lock().unwrap().lag = Some(std::mem::take(&mut handler.local_lag));
 }

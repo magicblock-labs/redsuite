@@ -1,3 +1,4 @@
+pub mod conn;
 pub mod events;
 pub mod http;
 pub mod rate;

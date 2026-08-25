@@ -318,6 +318,11 @@ impl Scenario for PubsubContracts {
             )?;
             last_slot = slot;
         }
+        check_eq!(
+            events.malformed_frames(),
+            0,
+            "the event stream carried frames that do not parse as JSON-RPC"
+        )?;
         events.finalize();
 
         let mut raw = RawWs::connect(er.ws_url()).await?;
@@ -443,6 +448,11 @@ impl Scenario for PubsubContracts {
         let unsent_signature = unsent.signatures[0].to_string();
         let signature_sub = raw.signature_subscribe(&unsent_signature).await?;
         raw.signature_unsubscribe(signature_sub).await?;
+        check_eq!(
+            raw.malformed_frames(),
+            0,
+            "the raw socket carried frames that do not parse as JSON-RPC"
+        )?;
         raw.close().await?;
 
         Ok(ScenarioReport::ok(self.name())
