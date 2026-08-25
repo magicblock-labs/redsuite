@@ -1,4 +1,12 @@
-use crate::{report, topology, Result};
+use crate::{profile, report, topology, Result};
+
+pub const ENV_VARS: &[&str] = &[
+    topology::ER_BIN_ENV,
+    topology::ROOT_ENV,
+    topology::CLONE_URL_ENV,
+    profile::PROFILE_ENV,
+    profile::LOOP_ENV,
+];
 
 pub fn dispatch(args: &[String]) -> Option<Result<()>> {
     let arg = |index: usize| args.get(index).map(String::as_str);

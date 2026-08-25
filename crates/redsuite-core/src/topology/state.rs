@@ -27,10 +27,12 @@ pub struct StackState {
     pub base_programs: Vec<String>,
 }
 
+pub const ROOT_ENV: &str = "REDSUITE_ROOT";
+
 pub fn workspace_root() -> PathBuf {
     // `REDSUITE_ROOT` covers test binaries relocated after compilation
     // (e.g. `cargo nextest archive`).
-    if let Some(root) = std::env::var_os("REDSUITE_ROOT") {
+    if let Some(root) = std::env::var_os(ROOT_ENV) {
         return PathBuf::from(root);
     }
     Path::new(env!("CARGO_MANIFEST_DIR"))

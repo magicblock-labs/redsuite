@@ -75,7 +75,7 @@ pub fn redline_loader_v3_pair() -> [(Pubkey, Pubkey); 2] {
     })
 }
 
-pub(super) const CLONE_URL_ENV: &str = "REDSUITE_CLONE_URL";
+pub const CLONE_URL_ENV: &str = "REDSUITE_CLONE_URL";
 const DEFAULT_CLONE_URL: &str = "https://api.mainnet-beta.solana.com";
 
 const PROTOCOL_FEES_VAULT_ID: &str =
@@ -89,7 +89,7 @@ pub(super) fn clone_url() -> String {
 
 const BASE_BIN: &str = "solana-test-validator";
 const ER_BIN: &str = "magicblock-validator";
-const ER_BIN_ENV: &str = "MAGICBLOCK_VALIDATOR_BIN";
+pub const ER_BIN_ENV: &str = "MAGICBLOCK_VALIDATOR_BIN";
 
 const BASE_LEDGER_SHREDS: &str = "200000";
 pub(super) const BASE_READY_TIMEOUT: Duration = Duration::from_secs(60);
