@@ -1,12 +1,32 @@
 use crate::{profile, report, topology, Result};
 
-pub const ENV_VARS: &[&str] = &[
-    topology::ER_BIN_ENV,
-    topology::ROOT_ENV,
-    topology::CLONE_URL_ENV,
-    profile::PROFILE_ENV,
-    profile::LOOP_ENV,
+pub const ENV_VARS: &[(&str, &str)] = &[
+    (
+        topology::ER_BIN_ENV,
+        "the ER binary under test (else `magicblock-validator` on PATH)",
+    ),
+    (
+        topology::ROOT_ENV,
+        "workspace root, when the binary runs outside the checkout",
+    ),
+    (
+        topology::CLONE_URL_ENV,
+        "where a cold boot clones base programs from (default mainnet-beta)",
+    ),
+    (
+        profile::PROFILE_ENV,
+        "scenario profile: lite (default), full, soak, deep",
+    ),
+    (profile::LOOP_ENV, "S1 loop mode: open (default) or closed"),
 ];
+
+pub fn usage_env() -> String {
+    let mut text = String::from("\nenvironment:\n");
+    for (name, description) in ENV_VARS {
+        text.push_str(&format!("  {name:<26} {description}\n"));
+    }
+    text
+}
 
 pub fn dispatch(args: &[String]) -> Option<Result<()>> {
     let arg = |index: usize| args.get(index).map(String::as_str);

@@ -325,15 +325,6 @@ committor (ER → base commits):
   byte-for-byte, and it files one undelegation so the owning program refuses
   it. The account then keeps its committed state but stays delegated, which is
   the failure mode worth knowing about.
-- `commit_limit_and_fees` — commits the same account until it runs into the
-  free limit, where the next plain commit is refused but a commit-and-undelegate
-  still gets through. Past the higher paid limit the commit succeeds for a
-  charge, and the exact lamports are paid by the payer and turn up in the validator's
-  vault. It closes by offering an intent with too many accounts, which the
-  validator has to reject while it is still being scheduled.
-- `intent_flows` — schedules intents one at a time and in bundles, each
-  carrying handlers that run on base once the commit has landed and pay out of
-  the payer's escrow.
 - `claim_fees` — funds the validator's own fee vault on base and then claims
   it, signed by the validator itself. The lamports land on the identity and the
   vault is left sitting at its rent-exempt floor.
