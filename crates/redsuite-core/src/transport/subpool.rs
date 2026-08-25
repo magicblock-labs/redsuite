@@ -12,7 +12,7 @@ use pubkey::Pubkey;
 use tokio::sync::watch;
 
 use super::{
-    conn::{self, CloseReason, Flow, FrameHandler},
+    conn::{self, CloseReason, FrameHandler},
     ws::account_update_data,
 };
 use crate::{stats::StreamingStats, Result};
@@ -320,14 +320,13 @@ struct PoolHandler {
 }
 
 impl FrameHandler for PoolHandler {
-    fn on_reply(&mut self, id: u64, result: Option<&LazyValue<'_>>) -> Flow {
+    fn on_reply(&mut self, id: u64, result: Option<&LazyValue<'_>>) {
         if let (Some(account), Some(subid)) =
             (self.account_by_req.remove(&id), conn::reply_u64(result))
         {
             self.account_by_subid.insert(subid, account);
         }
         self.state.lock().unwrap().ready_subs += 1;
-        Flow::Continue
     }
 
     fn on_notification(
@@ -335,34 +334,34 @@ impl FrameHandler for PoolHandler {
         method: &str,
         subscription: u64,
         payload: &LazyValue<'_>,
-    ) -> Flow {
+    ) {
         if method != "accountNotification" {
-            return Flow::Continue;
+            return;
         }
         let Some(data) = account_update_data(payload) else {
-            return Flow::Continue;
+            return;
         };
         let Some(id) = (self.extractor)(&data) else {
-            return Flow::Continue;
+            return;
         };
         let Some(lag_micros) = self.produced.lag_micros(id) else {
-            return Flow::Continue;
+            return;
         };
         let Some(account) = self.account_by_subid.get(&subscription).copied()
         else {
-            return Flow::Continue;
+            return;
         };
         let Some(write_ids) = self.expected.get(&account) else {
-            return Flow::Continue;
+            return;
         };
         let Ok(index) = write_ids.binary_search(&id) else {
-            return Flow::Continue;
+            return;
         };
         {
             let mut state = self.state.lock().unwrap();
             let recv = state.by_account.entry(account).or_default();
             if !recv.mark(index, write_ids.len()) {
-                return Flow::Continue;
+                return;
             }
             state.received += 1;
             if lag_micros > self.threshold_micros {
@@ -370,7 +369,6 @@ impl FrameHandler for PoolHandler {
             }
         }
         self.local_lag.push(lag_micros.min(u32::MAX as u64) as u32);
-        Flow::Continue
     }
 
     fn on_closed(&mut self, reason: &CloseReason) {

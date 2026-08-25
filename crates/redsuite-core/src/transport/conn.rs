@@ -8,7 +8,7 @@ use pubkey::Pubkey;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{
     connect_async,
-    tungstenite::{self, Message},
+    tungstenite::{self, Message, Utf8Bytes},
     MaybeTlsStream, WebSocketStream,
 };
 
@@ -60,25 +60,77 @@ struct EnvelopeParams<'a> {
     result: LazyValue<'a>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Flow {
-    Continue,
-    Stop,
+enum Frame<'a> {
+    Reply {
+        id: u64,
+        result: Option<LazyValue<'a>>,
+    },
+    Notification {
+        method: &'a str,
+        subscription: u64,
+        payload: LazyValue<'a>,
+    },
+    ServerError(String),
+    Malformed,
+    Ignored,
+}
+
+fn classify(text: &str) -> Frame<'_> {
+    let Ok(envelope) = json::from_str::<Envelope>(text) else {
+        return Frame::Malformed;
+    };
+    if let Some(error) = envelope.error {
+        return Frame::ServerError(error.as_raw_str().to_owned());
+    }
+    match (envelope.method, envelope.params, envelope.id) {
+        (Some(method), Some(params), _) => Frame::Notification {
+            method,
+            subscription: params.subscription,
+            payload: params.result,
+        },
+        (None, _, Some(id)) => Frame::Reply {
+            id,
+            result: envelope.result,
+        },
+        _ => Frame::Ignored,
+    }
+}
+
+enum Received {
+    Text(Utf8Bytes),
+    Skip,
+    Closed(CloseReason),
+}
+
+async fn receive<S>(stream: &mut S) -> Received
+where
+    S: Stream<Item = std::result::Result<Message, tungstenite::Error>> + Unpin,
+{
+    let Some(incoming) = stream.next().await else {
+        return Received::Closed(CloseReason::StreamEnded);
+    };
+    match incoming {
+        Ok(Message::Text(text)) => Received::Text(text),
+        Ok(Message::Close(_)) => Received::Closed(CloseReason::ServerClose),
+        Ok(_) => Received::Skip,
+        Err(error) => {
+            Received::Closed(CloseReason::Transport(error.to_string()))
+        }
+    }
 }
 
 pub trait FrameHandler {
-    fn on_reply(&mut self, id: u64, result: Option<&LazyValue<'_>>) -> Flow;
+    fn on_reply(&mut self, id: u64, result: Option<&LazyValue<'_>>);
 
     fn on_notification(
         &mut self,
         method: &str,
         subscription: u64,
         payload: &LazyValue<'_>,
-    ) -> Flow;
+    );
 
-    fn on_malformed(&mut self, text: &str) -> Flow {
+    fn on_malformed(&mut self, text: &str) {
         let _ = text;
-        Flow::Continue
     }
 
     fn on_closed(&mut self, reason: &CloseReason) {
@@ -86,63 +138,90 @@ pub trait FrameHandler {
     }
 }
 
-pub async fn drive<S, H>(stream: &mut S, handler: &mut H) -> Option<CloseReason>
+pub async fn drive<S, H>(stream: &mut S, handler: &mut H) -> CloseReason
 where
     S: Stream<Item = std::result::Result<Message, tungstenite::Error>> + Unpin,
     H: FrameHandler,
 {
     loop {
-        let Some(incoming) = stream.next().await else {
-            return close(handler, CloseReason::StreamEnded);
-        };
-        let text = match incoming {
-            Ok(Message::Text(text)) => text,
-            Ok(Message::Close(_)) => {
-                return close(handler, CloseReason::ServerClose)
-            }
-            Ok(_) => continue,
-            Err(error) => {
-                return close(
-                    handler,
-                    CloseReason::Transport(error.to_string()),
-                )
+        let text = match receive(stream).await {
+            Received::Text(text) => text,
+            Received::Skip => continue,
+            Received::Closed(reason) => {
+                handler.on_closed(&reason);
+                return reason;
             }
         };
-        let Ok(envelope) = json::from_str::<Envelope>(&text) else {
-            match handler.on_malformed(&text) {
-                Flow::Continue => continue,
-                Flow::Stop => return None,
+        match classify(&text) {
+            Frame::Reply { id, result } => {
+                handler.on_reply(id, result.as_ref())
             }
-        };
-        if let Some(error) = envelope.error {
-            let reason =
-                CloseReason::ServerError(error.as_raw_str().to_owned());
-            return close(handler, reason);
-        }
-        let flow = match (envelope.method, envelope.params, envelope.id) {
-            (Some(method), Some(params), _) => handler.on_notification(
+            Frame::Notification {
                 method,
-                params.subscription,
-                &params.result,
-            ),
-            (None, _, Some(id)) => {
-                handler.on_reply(id, envelope.result.as_ref())
+                subscription,
+                payload,
+            } => handler.on_notification(method, subscription, &payload),
+            Frame::ServerError(error) => {
+                let reason = CloseReason::ServerError(error);
+                handler.on_closed(&reason);
+                return reason;
             }
-            _ => continue,
-        };
-        match flow {
-            Flow::Continue => continue,
-            Flow::Stop => return None,
+            Frame::Malformed => handler.on_malformed(&text),
+            Frame::Ignored => {}
         }
     }
 }
 
-fn close<H: FrameHandler>(
-    handler: &mut H,
-    reason: CloseReason,
-) -> Option<CloseReason> {
-    handler.on_closed(&reason);
-    Some(reason)
+pub enum RawEvent {
+    Reply {
+        id: u64,
+        result: Option<json::Value>,
+    },
+    Notification {
+        method: String,
+        subscription: u64,
+        payload: json::Value,
+    },
+    Malformed,
+}
+
+pub async fn next_event<S>(
+    stream: &mut S,
+) -> std::result::Result<RawEvent, CloseReason>
+where
+    S: Stream<Item = std::result::Result<Message, tungstenite::Error>> + Unpin,
+{
+    loop {
+        let text = match receive(stream).await {
+            Received::Text(text) => text,
+            Received::Skip => continue,
+            Received::Closed(reason) => return Err(reason),
+        };
+        return Ok(match classify(&text) {
+            Frame::Reply { id, result } => RawEvent::Reply {
+                id,
+                result: result
+                    .and_then(|value| json::from_str(value.as_raw_str()).ok()),
+            },
+            Frame::Notification {
+                method,
+                subscription,
+                payload,
+            } => match json::from_str(payload.as_raw_str()) {
+                Ok(payload) => RawEvent::Notification {
+                    method: method.to_owned(),
+                    subscription,
+                    payload,
+                },
+                Err(_) => RawEvent::Malformed,
+            },
+            Frame::ServerError(error) => {
+                return Err(CloseReason::ServerError(error))
+            }
+            Frame::Malformed => RawEvent::Malformed,
+            Frame::Ignored => continue,
+        });
+    }
 }
 
 pub fn reply_u64(result: Option<&LazyValue<'_>>) -> Option<u64> {
@@ -222,7 +301,7 @@ impl Requester {
 }
 
 pub struct Reader {
-    handle: tokio::task::JoinHandle<Option<CloseReason>>,
+    handle: tokio::task::JoinHandle<CloseReason>,
 }
 
 impl Reader {
@@ -259,17 +338,11 @@ mod tests {
         notifications: Vec<(String, u64, String)>,
         malformed: usize,
         closed: Option<String>,
-        stop_on_notification: bool,
     }
 
     impl FrameHandler for Recording {
-        fn on_reply(
-            &mut self,
-            id: u64,
-            result: Option<&LazyValue<'_>>,
-        ) -> Flow {
+        fn on_reply(&mut self, id: u64, result: Option<&LazyValue<'_>>) {
             self.replies.push((id, reply_u64(result)));
-            Flow::Continue
         }
 
         fn on_notification(
@@ -277,22 +350,16 @@ mod tests {
             method: &str,
             subscription: u64,
             payload: &LazyValue<'_>,
-        ) -> Flow {
+        ) {
             self.notifications.push((
                 method.to_owned(),
                 subscription,
                 payload.as_raw_str().to_owned(),
             ));
-            if self.stop_on_notification {
-                Flow::Stop
-            } else {
-                Flow::Continue
-            }
         }
 
-        fn on_malformed(&mut self, _text: &str) -> Flow {
+        fn on_malformed(&mut self, _text: &str) {
             self.malformed += 1;
-            Flow::Continue
         }
 
         fn on_closed(&mut self, reason: &CloseReason) {
@@ -300,31 +367,32 @@ mod tests {
         }
     }
 
-    fn run(frames: &[&str], handler: &mut Recording) -> Option<CloseReason> {
-        let messages: Vec<std::result::Result<Message, tungstenite::Error>> =
-            frames
-                .iter()
-                .map(|frame| Ok(Message::Text((*frame).to_owned().into())))
-                .collect();
-        let mut frame_stream = stream::iter(messages);
+    fn messages(
+        frames: &[&str],
+    ) -> Vec<std::result::Result<Message, tungstenite::Error>> {
+        frames
+            .iter()
+            .map(|frame| Ok(Message::Text((*frame).to_owned().into())))
+            .collect()
+    }
+
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
         tokio::runtime::Builder::new_current_thread()
             .build()
             .expect("runtime build is infallible")
-            .block_on(drive(&mut frame_stream, handler))
+            .block_on(future)
     }
 
     #[test]
     fn classifies_replies_and_notifications() {
         let mut handler = Recording::default();
-        let reason = run(
-            &[
-                r#"{"jsonrpc":"2.0","id":3,"result":17}"#,
-                r#"{"jsonrpc":"2.0","id":4,"result":true}"#,
-                r#"{"jsonrpc":"2.0","method":"slotNotification","params":{"subscription":17,"result":{"slot":9}}}"#,
-                "not json",
-            ],
-            &mut handler,
-        );
+        let mut frame_stream = stream::iter(messages(&[
+            r#"{"jsonrpc":"2.0","id":3,"result":17}"#,
+            r#"{"jsonrpc":"2.0","id":4,"result":true}"#,
+            r#"{"jsonrpc":"2.0","method":"slotNotification","params":{"subscription":17,"result":{"slot":9}}}"#,
+            "not json",
+        ]));
+        let reason = block_on(drive(&mut frame_stream, &mut handler));
         assert_eq!(handler.replies, vec![(3, Some(17)), (4, None)]);
         assert_eq!(
             handler.notifications,
@@ -335,43 +403,64 @@ mod tests {
             )]
         );
         assert_eq!(handler.malformed, 1);
-        assert!(matches!(reason, Some(CloseReason::StreamEnded)));
+        assert!(matches!(reason, CloseReason::StreamEnded));
         assert_eq!(handler.closed.as_deref(), Some("stream ended"));
     }
 
     #[test]
     fn error_frames_are_terminal() {
         let mut handler = Recording::default();
-        let reason = run(
-            &[
-                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"bad params"}}"#,
-                r#"{"jsonrpc":"2.0","id":2,"result":5}"#,
-            ],
-            &mut handler,
-        );
+        let mut frame_stream = stream::iter(messages(&[
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"bad params"}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"result":5}"#,
+        ]));
+        let reason = block_on(drive(&mut frame_stream, &mut handler));
         assert!(handler.replies.is_empty());
-        let Some(CloseReason::ServerError(error)) = reason else {
+        let CloseReason::ServerError(error) = reason else {
             panic!("expected a server error, got {reason:?}");
         };
         assert!(error.contains("bad params"));
     }
 
     #[test]
-    fn stop_returns_without_a_reason() {
-        let mut handler = Recording {
-            stop_on_notification: true,
-            ..Recording::default()
-        };
-        let reason = run(
-            &[
-                r#"{"jsonrpc":"2.0","method":"slotNotification","params":{"subscription":1,"result":1}}"#,
-                r#"{"jsonrpc":"2.0","id":9,"result":9}"#,
-            ],
-            &mut handler,
-        );
-        assert!(reason.is_none());
-        assert_eq!(handler.notifications.len(), 1);
-        assert!(handler.replies.is_empty());
-        assert!(handler.closed.is_none());
+    fn next_event_returns_one_owned_event_at_a_time() {
+        let mut frame_stream = stream::iter(messages(&[
+            r#"{"jsonrpc":"2.0","id":7,"result":21}"#,
+            r#"{"jsonrpc":"2.0","method":"slotNotification","params":{"subscription":21,"result":{"slot":3}}}"#,
+            "not json",
+        ]));
+        block_on(async {
+            let Ok(RawEvent::Reply { id, result }) =
+                next_event(&mut frame_stream).await
+            else {
+                panic!("expected a reply first");
+            };
+            assert_eq!(id, 7);
+            assert_eq!(
+                result.and_then(|value| {
+                    use json::JsonValueTrait;
+                    value.as_u64()
+                }),
+                Some(21)
+            );
+            let Ok(RawEvent::Notification {
+                method,
+                subscription,
+                ..
+            }) = next_event(&mut frame_stream).await
+            else {
+                panic!("expected a notification second");
+            };
+            assert_eq!(method, "slotNotification");
+            assert_eq!(subscription, 21);
+            assert!(matches!(
+                next_event(&mut frame_stream).await,
+                Ok(RawEvent::Malformed)
+            ));
+            assert!(matches!(
+                next_event(&mut frame_stream).await,
+                Err(CloseReason::StreamEnded)
+            ));
+        });
     }
 }

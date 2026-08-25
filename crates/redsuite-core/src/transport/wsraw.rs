@@ -1,63 +1,20 @@
 use std::{collections::VecDeque, time::Duration};
 
 use futures_util::SinkExt;
-use json::{JsonValueTrait, LazyValue};
+use json::JsonValueTrait;
 use pubkey::Pubkey;
 use tokio_tungstenite::tungstenite::Message;
 
-use super::conn::{self, CloseReason, Flow, FrameHandler, Socket};
+use super::conn::{self, CloseReason, RawEvent, Socket};
 use crate::Result;
 
-#[derive(Default)]
-struct RawState {
-    want_reply: Option<u64>,
-    reply: Option<Option<json::Value>>,
-    queue: VecDeque<(String, u64, json::Value)>,
-    malformed: usize,
-}
-
-impl FrameHandler for RawState {
-    fn on_reply(&mut self, id: u64, result: Option<&LazyValue<'_>>) -> Flow {
-        if self.want_reply != Some(id) {
-            return Flow::Continue;
-        }
-        self.want_reply = None;
-        self.reply = Some(
-            result.and_then(|value| json::from_str(value.as_raw_str()).ok()),
-        );
-        Flow::Stop
-    }
-
-    fn on_notification(
-        &mut self,
-        method: &str,
-        subscription: u64,
-        payload: &LazyValue<'_>,
-    ) -> Flow {
-        let Ok(value) = json::from_str::<json::Value>(payload.as_raw_str())
-        else {
-            self.malformed += 1;
-            return Flow::Continue;
-        };
-        self.queue
-            .push_back((method.to_owned(), subscription, value));
-        if self.want_reply.is_none() {
-            Flow::Stop
-        } else {
-            Flow::Continue
-        }
-    }
-
-    fn on_malformed(&mut self, _text: &str) -> Flow {
-        self.malformed += 1;
-        Flow::Continue
-    }
-}
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct RawWs {
     socket: Socket,
     next_req_id: u64,
-    state: RawState,
+    queue: VecDeque<(String, u64, json::Value)>,
+    malformed: usize,
 }
 
 impl RawWs {
@@ -65,7 +22,8 @@ impl RawWs {
         Ok(Self {
             socket: conn::connect(url).await?,
             next_req_id: 1,
-            state: RawState::default(),
+            queue: VecDeque::new(),
+            malformed: 0,
         })
     }
 
@@ -82,23 +40,39 @@ impl RawWs {
             ))
             .await
             .map_err(|error| format!("{method} send: {error}"))?;
-        self.state.want_reply = Some(req_id);
-        self.state.reply = None;
-        match conn::drive(&mut self.socket, &mut self.state).await {
-            None => match self.state.reply.take() {
-                Some(Some(result)) => Ok(result),
-                Some(None) => {
-                    Err(format!("{method}: reply had no result").into())
+        let deadline = tokio::time::Instant::now() + REQUEST_TIMEOUT;
+        loop {
+            let remaining = deadline
+                .checked_duration_since(tokio::time::Instant::now())
+                .unwrap_or(Duration::ZERO);
+            let event = tokio::time::timeout(
+                remaining,
+                conn::next_event(&mut self.socket),
+            )
+            .await
+            .map_err(|_| {
+                format!("{method}: no reply within {REQUEST_TIMEOUT:?}")
+            })?;
+            match event {
+                Ok(RawEvent::Reply { id, result }) if id == req_id => {
+                    return result.ok_or_else(|| {
+                        format!("{method}: reply had no result").into()
+                    });
                 }
-                None => {
-                    Err(format!("{method}: reader stopped without a reply")
-                        .into())
+                Ok(RawEvent::Reply { .. }) => {}
+                Ok(RawEvent::Notification {
+                    method: notified,
+                    subscription,
+                    payload,
+                }) => self.queue.push_back((notified, subscription, payload)),
+                Ok(RawEvent::Malformed) => self.malformed += 1,
+                Err(CloseReason::ServerError(error)) => {
+                    return Err(format!("{method}: {error}").into());
                 }
-            },
-            Some(CloseReason::ServerError(error)) => {
-                Err(format!("{method}: {error}").into())
+                Err(reason) => {
+                    return Err(format!("{method}: {reason}").into());
+                }
             }
-            Some(reason) => Err(format!("{method}: {reason}").into()),
         }
     }
 
@@ -175,23 +149,35 @@ impl RawWs {
         &mut self,
         timeout: Duration,
     ) -> Result<Option<(String, u64, json::Value)>> {
-        if let Some(notification) = self.state.queue.pop_front() {
+        if let Some(notification) = self.queue.pop_front() {
             return Ok(Some(notification));
         }
-        let drained = tokio::time::timeout(
-            timeout,
-            conn::drive(&mut self.socket, &mut self.state),
-        )
-        .await;
-        match drained {
-            Err(_) => Ok(None),
-            Ok(None) => Ok(self.state.queue.pop_front()),
-            Ok(Some(reason)) => Err(format!("ws: {reason}").into()),
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline
+                .checked_duration_since(tokio::time::Instant::now())
+                .unwrap_or(Duration::ZERO);
+            let event = tokio::time::timeout(
+                remaining,
+                conn::next_event(&mut self.socket),
+            )
+            .await;
+            match event {
+                Err(_) => return Ok(None),
+                Ok(Ok(RawEvent::Notification {
+                    method,
+                    subscription,
+                    payload,
+                })) => return Ok(Some((method, subscription, payload))),
+                Ok(Ok(RawEvent::Reply { .. })) => {}
+                Ok(Ok(RawEvent::Malformed)) => self.malformed += 1,
+                Ok(Err(reason)) => return Err(format!("ws: {reason}").into()),
+            }
         }
     }
 
     pub fn malformed_frames(&self) -> usize {
-        self.state.malformed
+        self.malformed
     }
 
     pub async fn close(mut self) -> Result<()> {

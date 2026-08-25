@@ -11,7 +11,7 @@ use pubkey::Pubkey;
 use signature::Signature;
 use tokio::sync::oneshot;
 
-use super::conn::{self, CloseReason, Flow, FrameHandler, Reader, Requester};
+use super::conn::{self, CloseReason, FrameHandler, Reader, Requester};
 use crate::{
     stats::{ObservationsStats, StreamingStats},
     Result,
@@ -78,7 +78,7 @@ struct AccountHandler<E> {
 }
 
 impl<E: Fn(&[u8]) -> Option<u64>> FrameHandler for AccountHandler<E> {
-    fn on_reply(&mut self, id: u64, result: Option<&LazyValue<'_>>) -> Flow {
+    fn on_reply(&mut self, id: u64, result: Option<&LazyValue<'_>>) {
         let mut shared = self.shared.borrow_mut();
         if let (Some(account), Some(subid)) =
             (shared.subs_by_req.remove(&id), conn::reply_u64(result))
@@ -86,7 +86,6 @@ impl<E: Fn(&[u8]) -> Option<u64>> FrameHandler for AccountHandler<E> {
             shared.account_by_subid.insert(subid, account);
         }
         shared.ready_subs += 1;
-        Flow::Continue
     }
 
     fn on_notification(
@@ -94,15 +93,15 @@ impl<E: Fn(&[u8]) -> Option<u64>> FrameHandler for AccountHandler<E> {
         method: &str,
         subscription: u64,
         payload: &LazyValue<'_>,
-    ) -> Flow {
+    ) {
         if method != "accountNotification" {
-            return Flow::Continue;
+            return;
         }
         let Some(data) = account_update_data(payload) else {
-            return Flow::Continue;
+            return;
         };
         let Some(id) = (self.extractor)(&data) else {
-            return Flow::Continue;
+            return;
         };
         let mut shared = self.shared.borrow_mut();
         if let Some((_, sent)) = shared.pending.remove(&id) {
@@ -127,7 +126,6 @@ impl<E: Fn(&[u8]) -> Option<u64>> FrameHandler for AccountHandler<E> {
                 shared.settle_waiter(pending_id);
             }
         }
-        Flow::Continue
     }
 
     fn on_closed(&mut self, reason: &CloseReason) {
@@ -321,14 +319,13 @@ struct SigHandler {
 }
 
 impl FrameHandler for SigHandler {
-    fn on_reply(&mut self, id: u64, result: Option<&LazyValue<'_>>) -> Flow {
+    fn on_reply(&mut self, id: u64, result: Option<&LazyValue<'_>>) {
         let mut shared = self.shared.borrow_mut();
         if let (Some(tracked), Some(subid)) =
             (shared.id_by_req.remove(&id), conn::reply_u64(result))
         {
             shared.id_by_subid.insert(subid, tracked);
         }
-        Flow::Continue
     }
 
     fn on_notification(
@@ -336,20 +333,20 @@ impl FrameHandler for SigHandler {
         method: &str,
         subscription: u64,
         payload: &LazyValue<'_>,
-    ) -> Flow {
+    ) {
         if method != "signatureNotification" {
-            return Flow::Continue;
+            return;
         }
         let Ok(result) = json::from_str::<SigPayload>(payload.as_raw_str())
         else {
-            return Flow::Continue;
+            return;
         };
         let mut shared = self.shared.borrow_mut();
         let Some(id) = shared.id_by_subid.remove(&subscription) else {
-            return Flow::Continue;
+            return;
         };
         let Some(sent) = shared.pending.remove(&id) else {
-            return Flow::Continue;
+            return;
         };
         match result.value.err {
             None => {
@@ -364,7 +361,6 @@ impl FrameHandler for SigHandler {
             }
         }
         shared.settle_waiter(id);
-        Flow::Continue
     }
 
     fn on_closed(&mut self, reason: &CloseReason) {

@@ -3,7 +3,7 @@ use std::{cell::RefCell, collections::HashMap, rc::Rc, time::Duration};
 use json::LazyValue;
 use pubkey::Pubkey;
 
-use super::conn::{self, CloseReason, Flow, FrameHandler, Reader, Requester};
+use super::conn::{self, CloseReason, FrameHandler, Reader, Requester};
 use crate::Result;
 
 const AWAIT_POLL: Duration = Duration::from_millis(20);
@@ -28,13 +28,12 @@ struct EventHandler {
 }
 
 impl FrameHandler for EventHandler {
-    fn on_reply(&mut self, id: u64, result: Option<&LazyValue<'_>>) -> Flow {
+    fn on_reply(&mut self, id: u64, result: Option<&LazyValue<'_>>) {
         let mut shared = self.shared.borrow_mut();
         if let Some(subid) = conn::reply_u64(result) {
             shared.key_by_subid.insert(subid, id);
         }
         shared.ready_subs += 1;
-        Flow::Continue
     }
 
     fn on_notification(
@@ -42,23 +41,21 @@ impl FrameHandler for EventHandler {
         _method: &str,
         subscription: u64,
         payload: &LazyValue<'_>,
-    ) -> Flow {
+    ) {
         let mut shared = self.shared.borrow_mut();
         let Some(key) = shared.key_by_subid.get(&subscription).copied() else {
-            return Flow::Continue;
+            return;
         };
         let Ok(event) = json::from_str::<json::Value>(payload.as_raw_str())
         else {
             shared.malformed += 1;
-            return Flow::Continue;
+            return;
         };
         shared.events.entry(key).or_default().push(event);
-        Flow::Continue
     }
 
-    fn on_malformed(&mut self, _text: &str) -> Flow {
+    fn on_malformed(&mut self, _text: &str) {
         self.shared.borrow_mut().malformed += 1;
-        Flow::Continue
     }
 
     fn on_closed(&mut self, reason: &CloseReason) {
