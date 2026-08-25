@@ -273,6 +273,111 @@ mod tests {
         })
     }
 
+    fn readme() -> String {
+        std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../README.md"
+        ))
+        .expect("read README.md")
+    }
+
+    #[test]
+    fn readme_names_every_scenario() {
+        let readme = readme();
+        for entry in entries() {
+            assert!(
+                readme.contains(&format!("`{}`", entry.short_name)),
+                "README.md does not name scenario {}",
+                entry.name()
+            );
+        }
+    }
+
+    #[test]
+    fn readme_env_table_matches_the_registry() {
+        let readme = readme();
+        let section = readme
+            .split("## Environment")
+            .nth(1)
+            .expect("README.md has an Environment section")
+            .split("\n## ")
+            .next()
+            .expect("the Environment section has an end");
+        let mut documented: Vec<&str> = section
+            .lines()
+            .filter(|line| line.starts_with('|'))
+            .filter_map(|line| {
+                let cell = line.split('|').nth(1)?.trim();
+                cell.strip_prefix('`')?.strip_suffix('`')
+            })
+            .collect();
+        documented.sort_unstable();
+        let mut expected: Vec<&str> =
+            redsuite_core::frontend::ENV_VARS.to_vec();
+        expected.sort_unstable();
+        assert_eq!(
+            documented, expected,
+            "the README environment table drifted from frontend::ENV_VARS"
+        );
+    }
+
+    fn scenarios_booting_private_ers() -> Vec<String> {
+        use redsuite_core::catalog::Topology;
+        let mut names: Vec<String> = entries()
+            .filter(|entry| entry.topology == Topology::PrivateEr)
+            .map(|entry| entry.short_name.to_owned())
+            .collect();
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
+        for family in ["redline", "redshift", "redhat"] {
+            let scenarios_dir = format!("{root}/{family}/src/scenarios");
+            for subsystem in std::fs::read_dir(&scenarios_dir)
+                .expect("read the scenarios directory")
+            {
+                let subsystem = subsystem.unwrap().path();
+                if !subsystem.is_dir() {
+                    continue;
+                }
+                for file in std::fs::read_dir(&subsystem).unwrap() {
+                    let file = file.unwrap().path();
+                    let Some(stem) =
+                        file.file_stem().and_then(|stem| stem.to_str())
+                    else {
+                        continue;
+                    };
+                    if stem == "mod" {
+                        continue;
+                    }
+                    let source = std::fs::read_to_string(&file).unwrap();
+                    if source.contains("private_er(") {
+                        names.push(stem.to_owned());
+                    }
+                }
+            }
+        }
+        names.sort_unstable();
+        names.dedup();
+        names
+    }
+
+    #[test]
+    fn readme_names_every_private_er_scenario() {
+        let readme = readme();
+        let section = readme
+            .split("## Running")
+            .nth(1)
+            .expect("README.md has a Running section")
+            .split("\n## ")
+            .next()
+            .expect("the Running section has an end");
+        for name in scenarios_booting_private_ers() {
+            assert!(
+                section.contains(&format!("`{name}`")),
+                "the README Running section does not name `{name}` as a \
+                 private-ER scenario"
+            );
+        }
+    }
+
     #[test]
     fn nextest_groups_match_the_catalog() {
         let overrides = nextest_overrides();

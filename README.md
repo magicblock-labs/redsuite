@@ -81,7 +81,7 @@ benchmark hosts use — no cargo, no checkout of the tests:
     redsuite run all                          # everything (redline last, alone)
     redsuite stack status                     # ports, pids, health
     redsuite stack down                       # stop the shared stack
-    redsuite report compare                   # diff the latest two runs
+    redsuite report compare                   # diff the latest run against its nearest baseline
 
 It still needs `solana-test-validator` on PATH and the ER binary under test
 (`MAGICBLOCK_VALIDATOR_BIN`), and it reads the built programs from the
@@ -133,7 +133,8 @@ The harness needs two binaries:
 | `MAGICBLOCK_VALIDATOR_BIN` | the ER binary under test; else `magicblock-validator` on PATH |
 | `REDSUITE_ROOT` | workspace root, when the `redsuite` binary runs outside a checkout |
 | `REDSUITE_CLONE_URL` | where a cold boot clones base programs from; defaults to mainnet-beta |
-| `REDSUITE_PROFILE` | `lite` (default) or `full` |
+| `REDSUITE_PROFILE` | scenario profile: `lite` (default), `full`, `soak`, or `deep` |
+| `REDSUITE_LOOP` | S1 loop mode: `open` (default) or `closed` |
 
 A cold boot clones its base programs from `REDSUITE_CLONE_URL`, so the first
 boot needs that endpoint. A warm stack does not, and neither does a rerun.

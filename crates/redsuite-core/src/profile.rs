@@ -5,8 +5,8 @@ use std::{
 
 use crate::Result;
 
-const PROFILE_ENV: &str = "REDSUITE_PROFILE";
-const LOOP_ENV: &str = "REDSUITE_LOOP";
+pub const PROFILE_ENV: &str = "REDSUITE_PROFILE";
+pub const LOOP_ENV: &str = "REDSUITE_LOOP";
 
 pub const ALL: &[&str] = &["lite", "full", "soak", "deep"];
 
