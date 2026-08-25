@@ -3,8 +3,9 @@ mod catalog;
 use futures_util::StreamExt;
 use redsuite_core::{
     catalog::{Lane, ScenarioEntry},
+    frontend,
     profile::{self, ExecutionConfig, LoopMode, Profile},
-    report, topology, Result, RunRecord,
+    Result, RunRecord,
 };
 
 const FAMILIES: &[&[ScenarioEntry]] = &[
@@ -18,25 +19,22 @@ fn entries() -> impl Iterator<Item = &'static ScenarioEntry> {
     FAMILIES.iter().flat_map(|scenarios| scenarios.iter())
 }
 
-const USAGE: &str = "\
+const USAGE_HEAD: &str = "\
 usage:
-  redsuite list [family]                       list scenarios (family: redline|redshift|redhat)
-  redsuite run <scenario|family|all> [opts]    run scenarios (benchmarks last, alone)
-      --profile <lite|full|soak|deep>          scenario profile (default lite)
-      --loop <open|closed>                     S1 loop mode
-  redsuite stack status                        show the shared base+ER stack
-  redsuite stack down                          stop the shared stack
-  redsuite report list                         list persisted scenario reports
-  redsuite report compare [scenario] [--strict] [--brief]  diff the latest run per scenario against its nearest comparable baseline (--brief: changed metrics only)
-  redsuite report bmf [--out <path>]           export the latest campaign as Bencher Metric Format
+  redsuite list [family]                                  list scenarios (family: redline|redshift|redhat)
+  redsuite run <scenario|family|all> [opts]               run scenarios (benchmarks last, alone)
+      --profile <lite|full|soak|deep>                     scenario profile (default lite)
+      --loop <open|closed>                                S1 loop mode
+";
 
+const USAGE_ENV: &str = "
 environment:
   MAGICBLOCK_VALIDATOR_BIN   the ER binary under test (else `magicblock-validator` on PATH)
   REDSUITE_ROOT              workspace root, when the binary runs outside the checkout
 ";
 
 fn usage() -> ! {
-    eprint!("{USAGE}");
+    eprint!("{USAGE_HEAD}{}{USAGE_ENV}", frontend::usage("redsuite"));
     std::process::exit(2);
 }
 
@@ -201,28 +199,10 @@ async fn main() {
             Ok(())
         }
         Some("run") => run(&args[1..]).await,
-        Some("stack") => match arg(1) {
-            Some("status") => topology::status(),
-            Some("down") => topology::down(),
-            _ => usage(),
+        _ => match frontend::dispatch(&args) {
+            Some(outcome) => outcome,
+            None => usage(),
         },
-        Some("report") => match arg(1) {
-            Some("list") => report::list(),
-            Some("compare") => {
-                let rest = &args[2..];
-                let strict = rest.iter().any(|flag| flag == "--strict");
-                let brief = rest.iter().any(|flag| flag == "--brief");
-                let filter = rest.iter().find(|arg| !arg.starts_with("--"));
-                report::compare(filter.map(String::as_str), strict, brief)
-            }
-            Some("bmf") => match (arg(2), arg(3)) {
-                (Some("--out"), Some(path)) => report::bmf(Some(path)),
-                (None, _) => report::bmf(None),
-                _ => usage(),
-            },
-            _ => usage(),
-        },
-        _ => usage(),
     };
 
     if let Err(err) = outcome {

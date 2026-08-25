@@ -4,21 +4,16 @@ use std::{
     process::{exit, Command},
 };
 
-use redsuite_core::{catalog::Fixture, manifest, report, topology};
+use redsuite_core::{catalog::Fixture, frontend, manifest};
 
 type Result<T> = redsuite_core::Result<T>;
 
 const FAMILY_PROGRAMS: &[&str] = &["redline", "redshift", "redhat"];
 
-const USAGE: &str = "\
+const USAGE_HEAD: &str = "\
 usage:
-  cargo xtask programs                                         build the family SBF programs into target/deploy/
-  cargo xtask stack status                                     show the shared base+ER stack (booted on demand by tests)
-  cargo xtask stack down                                       stop the shared stack and clear its state
-  cargo xtask report list                                      list persisted scenario reports (target/redsuite-reports/)
-  cargo xtask report compare [scenario] [--strict] [--brief]   diff the latest run per scenario against its nearest comparable baseline; --strict fails on regressions, --brief shows changed metrics only
-  cargo xtask report bmf [--out <path>]                        export the latest campaign as Bencher Metric Format JSON
-  cargo xtask fmt [--check]                                    format the workspace (nightly rustfmt, rustfmt-nightly.toml)
+  cargo xtask programs                                       build the family SBF programs into target/deploy/
+  cargo xtask fmt [--check]                                  format the workspace (nightly rustfmt, rustfmt-nightly.toml)
 ";
 
 fn main() {
@@ -30,37 +25,18 @@ fn main() {
 
 fn run() -> Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
-    let arg = |i: usize| args.get(i).map(String::as_str);
+    let arg = |index: usize| args.get(index).map(String::as_str);
     match arg(0) {
         Some("programs") => programs(),
-        Some("stack") => match arg(1) {
-            Some("status") => topology::status(),
-            Some("down") => topology::down(),
-            _ => usage(),
-        },
-        Some("report") => match arg(1) {
-            Some("list") => report::list(),
-            Some("compare") => {
-                let rest = &args[2..];
-                let strict = rest.iter().any(|a| a == "--strict");
-                let brief = rest.iter().any(|a| a == "--brief");
-                let filter =
-                    rest.iter().find(|a| !a.starts_with("--")).cloned();
-                report::compare(filter.as_deref(), strict, brief)
-            }
-            Some("bmf") => match (arg(2), arg(3)) {
-                (Some("--out"), Some(path)) => report::bmf(Some(path)),
-                (None, _) => report::bmf(None),
-                _ => usage(),
-            },
-            _ => usage(),
-        },
         Some("fmt") => match arg(1) {
             None => fmt(false),
             Some("--check") => fmt(true),
             _ => usage(),
         },
-        _ => usage(),
+        _ => match frontend::dispatch(&args) {
+            Some(outcome) => outcome,
+            None => usage(),
+        },
     }
 }
 
@@ -77,7 +53,7 @@ fn fmt(check: bool) -> Result<()> {
 }
 
 fn usage() -> Result<()> {
-    eprint!("{USAGE}");
+    eprint!("{USAGE_HEAD}{}", frontend::usage("cargo xtask"));
     exit(2);
 }
 
