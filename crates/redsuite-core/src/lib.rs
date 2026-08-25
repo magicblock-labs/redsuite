@@ -3,6 +3,7 @@ pub mod catalog;
 pub mod check;
 pub mod context;
 pub mod dlp;
+pub mod frontend;
 pub mod host;
 pub mod loader_v4;
 pub mod manifest;
