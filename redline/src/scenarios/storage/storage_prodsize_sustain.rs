@@ -19,8 +19,6 @@ const FLATNESS_P50_FACTOR: f64 = 1.5;
 
 const TX_PROCESSING_HISTOGRAM: &str = "mbv_transaction_processing_time";
 
-const DATABASE_SIZE_BYTES: u64 = 3 * 1024 * 1024 * 1024;
-const INDEX_SIZE_BYTES: u64 = 256 * 1024 * 1024;
 const PROD_SUPERBLOCK_SLOTS: u64 = 72_000;
 
 struct Profile {
@@ -266,8 +264,6 @@ impl Scenario for StorageProdsizeSustain {
                 ScenarioReport::ok(&format!("{}/{}", self.name(), cell.name))
                     .setting("profile", profile.name)
                     .setting("superblock slots", cell.superblock_slots)
-                    .setting("database size", DATABASE_SIZE_BYTES)
-                    .setting("index size", INDEX_SIZE_BYTES)
                     .setting("block time", "50ms")
                     .setting("payers", profile.payers)
                     .setting("accounts", profile.accounts)
@@ -347,8 +343,6 @@ impl Scenario for StorageProdsizeSustain {
         let mut summary = ScenarioReport::ok(self.name())
             .setting("profile", profile.name)
             .setting("shape", "read-write 3/tx (1 src + 2 dst data-copy)")
-            .setting("database size", DATABASE_SIZE_BYTES)
-            .setting("index size", INDEX_SIZE_BYTES)
             .setting("block time", "50ms")
             .setting(
                 "superblocks",

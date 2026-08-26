@@ -319,7 +319,11 @@ impl ErPlan {
             self.identity.to_base58_string(), // throwaway test identity
         );
         cmd.env("MBV_ENGINE__LEDGER__DIRECTORY", &self.storage_dir);
-        // the accountsdb directory does NOT derive from the ledger directory
+        // engine.accountsdb.directory defaults to a compile-time constant
+        // path, not to the configured engine.ledger.directory — overriding
+        // only the ledger directory leaves the accountsdb at the global
+        // default. Set both, mirroring the engine's default
+        // <ledger dir>/accountsdb layout under this ER's storage dir.
         cmd.env(
             "MBV_ENGINE__ACCOUNTSDB__DIRECTORY",
             self.storage_dir.join("accountsdb"),
