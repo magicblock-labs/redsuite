@@ -95,11 +95,6 @@ impl EventSubscriptions {
             .await
     }
 
-    pub async fn logs_subscribe_all(&self) -> Result<u64> {
-        self.subscribe("logsSubscribe", conn::logs_all_params())
-            .await
-    }
-
     pub async fn logs_subscribe_mentions(
         &self,
         account: &Pubkey,
