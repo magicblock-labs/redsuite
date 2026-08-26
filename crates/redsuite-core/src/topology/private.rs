@@ -227,6 +227,7 @@ pub async fn private_er(
     let mut ports = process::PortLease::default();
     let (rpc_port, ws_port) = ports.pair()?;
     let metrics_port = ports.single()?;
+    let replication_port = ports.single()?;
     let storage_dir = dir.join(format!("er-{}", options.label));
     if let Err(error) = fs::remove_dir_all(&storage_dir) {
         if error.kind() != std::io::ErrorKind::NotFound {
@@ -242,6 +243,7 @@ pub async fn private_er(
         base_ws_url: base.ws_url().to_owned(),
         listen_port: rpc_port,
         metrics_port,
+        replication_port,
         storage_dir,
         env: options.env,
         reset: true,

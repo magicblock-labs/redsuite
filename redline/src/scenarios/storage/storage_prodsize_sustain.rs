@@ -160,23 +160,11 @@ impl Scenario for StorageProdsizeSustain {
                     label: format!("s11-{cell_name}"),
                     env: vec![
                         (
-                            "MBV_ACCOUNTSDB__DATABASE_SIZE".to_owned(),
-                            DATABASE_SIZE_BYTES.to_string(),
-                        ),
-                        (
-                            "MBV_ACCOUNTSDB__INDEX_SIZE".to_owned(),
-                            INDEX_SIZE_BYTES.to_string(),
-                        ),
-                        (
-                            "MBV_ACCOUNTSDB__MAX_SNAPSHOTS".to_owned(),
-                            "4".to_owned(),
-                        ),
-                        (
-                            "MBV_LEDGER__BLOCK_TIME".to_owned(),
+                            "MBV_ENGINE__BLOCKSTORE__BLOCKTIME".to_owned(),
                             "50ms".to_owned(),
                         ),
                         (
-                            "MBV_LEDGER__SUPERBLOCK_SIZE".to_owned(),
+                            "MBV_ENGINE__BLOCKSTORE__SUPERBLOCK".to_owned(),
                             superblock_slots.to_string(),
                         ),
                     ],

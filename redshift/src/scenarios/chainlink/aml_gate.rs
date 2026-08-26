@@ -36,7 +36,14 @@ const QUERY_TIMEOUT: Duration = Duration::from_secs(15);
 const UNDELEGATION_TIMEOUT: Duration = Duration::from_secs(20);
 const MERGE_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub struct MockRangeServer {
+// The risk server owns the threshold: the validator only ever sees the
+// boolean verdict, so the mock computes isRisky from the seeded score here.
+const RISK_THRESHOLD: u64 = 5;
+
+// Stands in for the risk server the validator queries via
+// GET /risk?pubkey=<addr>, answering the camelCase {"isRisky":bool} shape
+// magicblock-aml deserializes.
+pub struct MockRiskServer {
     base_url: String,
     request_count: Arc<AtomicUsize>,
     shutdown: Arc<AtomicBool>,
@@ -45,7 +52,7 @@ pub struct MockRangeServer {
     requested_addresses: Arc<RwLock<Vec<String>>>,
 }
 
-impl MockRangeServer {
+impl MockRiskServer {
     pub fn start() -> Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         listener.set_nonblocking(true)?;
@@ -67,11 +74,11 @@ impl MockRangeServer {
                         let read = stream.read(&mut buffer).unwrap_or(0);
                         let request = String::from_utf8_lossy(&buffer[..read]);
 
-                        let body = if request.starts_with("GET /risk/address?")
-                            && request.contains("address=")
+                        let body = if request.starts_with("GET /risk?")
+                            && request.contains("pubkey=")
                         {
                             let address = request
-                                .split("address=")
+                                .split("pubkey=")
                                 .nth(1)
                                 .unwrap_or("")
                                 .split(['&', ' '])
@@ -88,16 +95,16 @@ impl MockRangeServer {
                                 .copied()
                                 .unwrap_or(0);
                             worker_request_count.fetch_add(1, Ordering::SeqCst);
-                            format!(r#"{{"riskScore":{risk_score}}}"#)
+                            let is_risky = risk_score >= RISK_THRESHOLD;
+                            format!(r#"{{"isRisky":{is_risky}}}"#)
                         } else {
                             r#"{"error":"not found"}"#.to_string()
                         };
-                        let status =
-                            if request.starts_with("GET /risk/address?") {
-                                "200 OK"
-                            } else {
-                                "404 Not Found"
-                            };
+                        let status = if request.starts_with("GET /risk?") {
+                            "200 OK"
+                        } else {
+                            "404 Not Found"
+                        };
                         let response = format!(
                             "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
                             body.len(),
@@ -152,7 +159,7 @@ impl MockRangeServer {
     }
 }
 
-impl Drop for MockRangeServer {
+impl Drop for MockRiskServer {
     fn drop(&mut self) {
         self.stop();
     }
@@ -205,11 +212,13 @@ async fn run_risk_case(
     expect_allowed: bool,
     label: &str,
 ) -> Result<RiskCaseOutcome> {
-    let mut server = MockRangeServer::start()?;
+    let mut server = MockRiskServer::start()?;
     let owner = Keypair::new();
     let owner_pk = owner.pubkey();
     server.set_risk(&owner_pk.to_string(), owner_risk);
 
+    // No api key or threshold: both belong to the risk server now; loopback
+    // http is the one plaintext scheme magicblock-aml accepts.
     let mut private = topology::private_er(
         base,
         topology::ErOptions {
@@ -217,16 +226,8 @@ async fn run_risk_case(
             env: vec![
                 ("MBV_CHAINLINK__RISK__ENABLED".to_owned(), "true".to_owned()),
                 (
-                    "MBV_CHAINLINK__RISK__BASE_URL".to_owned(),
+                    "MBV_CHAINLINK__RISK__RISK_SERVER_URL".to_owned(),
                     server.base_url().to_owned(),
-                ),
-                (
-                    "MBV_CHAINLINK__RISK__API_KEY".to_owned(),
-                    "test-api-key".to_owned(),
-                ),
-                (
-                    "MBV_CHAINLINK__RISK__RISK_SCORE_THRESHOLD".to_owned(),
-                    "5".to_owned(),
                 ),
             ],
             ..Default::default()
@@ -326,9 +327,9 @@ async fn run_risk_case(
         "shuttle ATA delegation record was not created on base chain"
     )?;
 
-    // 5. Wait for Range risk server query
+    // 5. Wait for the risk server query
     check::poll(
-        "the Range risk server receives the shuttle owner query",
+        "the risk server receives the shuttle owner query",
         QUERY_TIMEOUT,
         || async {
             server.request_count() > 0
@@ -338,7 +339,7 @@ async fn run_risk_case(
     .await?;
     check!(
         server.requested_addresses().contains(&owner_pk.to_string()),
-        "Range risk server did not check shuttle owner"
+        "the risk server did not check the shuttle owner"
     )?;
 
     // 6. Verify the gate decision through the merge itself: an allowed merge
