@@ -27,14 +27,12 @@ usage:
       --loop <open|closed>                                S1 loop mode
 ";
 
-const USAGE_ENV: &str = "
-environment:
-  MAGICBLOCK_VALIDATOR_BIN   the ER binary under test (else `magicblock-validator` on PATH)
-  REDSUITE_ROOT              workspace root, when the binary runs outside the checkout
-";
-
 fn usage() -> ! {
-    eprint!("{USAGE_HEAD}{}{USAGE_ENV}", frontend::usage("redsuite"));
+    eprint!(
+        "{USAGE_HEAD}{}{}",
+        frontend::usage("redsuite"),
+        frontend::usage_env()
+    );
     std::process::exit(2);
 }
 
@@ -312,8 +310,10 @@ mod tests {
             })
             .collect();
         documented.sort_unstable();
-        let mut expected: Vec<&str> =
-            redsuite_core::frontend::ENV_VARS.to_vec();
+        let mut expected: Vec<&str> = redsuite_core::frontend::ENV_VARS
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
         expected.sort_unstable();
         assert_eq!(
             documented, expected,
@@ -376,6 +376,64 @@ mod tests {
                  private-ER scenario"
             );
         }
+    }
+
+    #[test]
+    fn readme_scenario_bullets_exist_in_the_catalog() {
+        let readme = readme();
+        let known: Vec<&str> =
+            entries().map(|entry| entry.short_name).collect();
+        for family in ["redline", "redshift", "redhat"] {
+            let heading = format!("## {family} scenarios");
+            let section = readme
+                .split(&heading)
+                .nth(1)
+                .unwrap_or_else(|| panic!("README.md has a {heading} section"))
+                .split("\n## ")
+                .next()
+                .expect("the family section has an end");
+            for line in section.lines() {
+                let Some(rest) = line.strip_prefix("- `") else {
+                    continue;
+                };
+                let Some(name) = rest.split('`').next() else {
+                    continue;
+                };
+                assert!(
+                    known.contains(&name),
+                    "the README {family} section lists `{name}`, which is \
+                     not in the catalog"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn private_er_concurrency_matches_nextest() {
+        let config = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../.config/nextest.toml"
+        ))
+        .expect("read .config/nextest.toml");
+        let max_threads = config
+            .lines()
+            .find_map(|line| {
+                line.trim()
+                    .strip_prefix("private-er")?
+                    .split("max-threads =")
+                    .nth(1)?
+                    .trim()
+                    .trim_end_matches('}')
+                    .trim()
+                    .parse::<usize>()
+                    .ok()
+            })
+            .expect("nextest.toml sets max-threads for the private-er group");
+        assert_eq!(
+            max_threads, PRIVATE_ER_CONCURRENCY,
+            "the private-ER concurrency in nextest.toml drifted from \
+             PRIVATE_ER_CONCURRENCY"
+        );
     }
 
     #[test]
