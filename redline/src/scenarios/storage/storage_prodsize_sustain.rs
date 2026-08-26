@@ -19,8 +19,6 @@ const FLATNESS_P50_FACTOR: f64 = 1.5;
 
 const TX_PROCESSING_HISTOGRAM: &str = "mbv_transaction_processing_time";
 
-const DATABASE_SIZE_BYTES: u64 = 3 * 1024 * 1024 * 1024;
-const INDEX_SIZE_BYTES: u64 = 256 * 1024 * 1024;
 const PROD_SUPERBLOCK_SLOTS: u64 = 72_000;
 
 struct Profile {
@@ -160,23 +158,11 @@ impl Scenario for StorageProdsizeSustain {
                     label: format!("s11-{cell_name}"),
                     env: vec![
                         (
-                            "MBV_ACCOUNTSDB__DATABASE_SIZE".to_owned(),
-                            DATABASE_SIZE_BYTES.to_string(),
-                        ),
-                        (
-                            "MBV_ACCOUNTSDB__INDEX_SIZE".to_owned(),
-                            INDEX_SIZE_BYTES.to_string(),
-                        ),
-                        (
-                            "MBV_ACCOUNTSDB__MAX_SNAPSHOTS".to_owned(),
-                            "4".to_owned(),
-                        ),
-                        (
-                            "MBV_LEDGER__BLOCK_TIME".to_owned(),
+                            "MBV_ENGINE__BLOCKSTORE__BLOCKTIME".to_owned(),
                             "50ms".to_owned(),
                         ),
                         (
-                            "MBV_LEDGER__SUPERBLOCK_SIZE".to_owned(),
+                            "MBV_ENGINE__BLOCKSTORE__SUPERBLOCK".to_owned(),
                             superblock_slots.to_string(),
                         ),
                     ],
@@ -278,8 +264,6 @@ impl Scenario for StorageProdsizeSustain {
                 ScenarioReport::ok(&format!("{}/{}", self.name(), cell.name))
                     .setting("profile", profile.name)
                     .setting("superblock slots", cell.superblock_slots)
-                    .setting("database size", DATABASE_SIZE_BYTES)
-                    .setting("index size", INDEX_SIZE_BYTES)
                     .setting("block time", "50ms")
                     .setting("payers", profile.payers)
                     .setting("accounts", profile.accounts)
@@ -359,8 +343,6 @@ impl Scenario for StorageProdsizeSustain {
         let mut summary = ScenarioReport::ok(self.name())
             .setting("profile", profile.name)
             .setting("shape", "read-write 3/tx (1 src + 2 dst data-copy)")
-            .setting("database size", DATABASE_SIZE_BYTES)
-            .setting("index size", INDEX_SIZE_BYTES)
             .setting("block time", "50ms")
             .setting(
                 "superblocks",

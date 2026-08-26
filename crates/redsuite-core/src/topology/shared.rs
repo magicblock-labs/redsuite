@@ -273,6 +273,7 @@ async fn attach_er(
     let mut er_ports = process::PortLease::default();
     let (er_rpc_port, er_ws_port) = er_ports.pair()?;
     let er_metrics_port = er_ports.single()?;
+    let er_replication_port = er_ports.single()?;
 
     // a fresh base is a new chain — prior-generation ER state is invalid
     let _ = fs::remove_dir_all(dir.join("er-storage"));
@@ -284,6 +285,7 @@ async fn attach_er(
         base_ws_url: format!("ws://127.0.0.1:{}", state.base_ws_port),
         listen_port: er_rpc_port,
         metrics_port: er_metrics_port,
+        replication_port: er_replication_port,
         storage_dir: dir.join("er-storage"),
         env: Vec::new(),
         reset: true,

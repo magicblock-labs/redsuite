@@ -30,8 +30,6 @@ struct Profile {
     concurrency: usize,
     ramp: Duration,
     settle: Duration,
-    database_size: u64,
-    index_size: u64,
 }
 
 const LITE: Profile = Profile {
@@ -43,8 +41,6 @@ const LITE: Profile = Profile {
     concurrency: 64,
     ramp: Duration::from_secs(3),
     settle: Duration::from_secs(2),
-    database_size: 512 * 1024 * 1024,
-    index_size: 64 * 1024 * 1024,
 };
 
 const FULL: Profile = Profile {
@@ -56,8 +52,6 @@ const FULL: Profile = Profile {
     concurrency: 256,
     ramp: Duration::from_secs(5),
     settle: Duration::from_secs(3),
-    database_size: 2 * 1024 * 1024 * 1024,
-    index_size: 256 * 1024 * 1024,
 };
 
 const DEEP: Profile = Profile {
@@ -69,8 +63,6 @@ const DEEP: Profile = Profile {
     concurrency: 256,
     ramp: Duration::from_secs(8),
     settle: Duration::from_secs(4),
-    database_size: 6 * 1024 * 1024 * 1024,
-    index_size: 512 * 1024 * 1024,
 };
 
 const PROFILES: ProfileValues<Profile> = ProfileValues {
@@ -293,17 +285,10 @@ impl Scenario for RestartUnderLoad {
             base,
             topology::ErOptions {
                 label: "restart-under-load".to_owned(),
-                env: vec![
-                    (
-                        "MBV_ACCOUNTSDB__DATABASE_SIZE".to_owned(),
-                        profile.database_size.to_string(),
-                    ),
-                    (
-                        "MBV_ACCOUNTSDB__INDEX_SIZE".to_owned(),
-                        profile.index_size.to_string(),
-                    ),
-                    ("MBV_LEDGER__BLOCK_TIME".to_owned(), "50ms".to_owned()),
-                ],
+                env: vec![(
+                    "MBV_ENGINE__BLOCKSTORE__BLOCKTIME".to_owned(),
+                    "50ms".to_owned(),
+                )],
                 request_timeout: None,
             },
         )
@@ -431,8 +416,6 @@ impl Scenario for RestartUnderLoad {
             .setting("fill iters", profile.fill)
             .setting("offered load tps", profile.load_rate)
             .setting("concurrency", profile.concurrency)
-            .setting("database size", profile.database_size)
-            .setting("index size", profile.index_size)
             .metric(
                 "db size at restart mb",
                 Unit::Megabytes,

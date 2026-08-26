@@ -28,8 +28,8 @@ const STALL_REQUEST_TIMEOUT: Duration = Duration::from_secs(75);
 const CLONE_TIMEOUT: Duration = Duration::from_secs(15);
 const PREWARM_CONCURRENCY: usize = 16;
 
-const MONITORED_GAUGE: &str = "mbv_monitored_accounts_gauge";
-const EVICTED_COUNTER: &str = "mbv_evicted_accounts_count";
+const MONITORED_GAUGE: &str = "engine_keeper_account_cache_entries";
+const EVICTED_COUNTER: &str = "engine_keeper_account_cache_evictions";
 const ENSURE_HISTOGRAM: &str =
     r#"mbv_ensure_accounts_time{kind="transaction"}"#;
 
@@ -186,7 +186,7 @@ impl Scenario for EnsureGateStall {
                     label: format!("s6-{}", cell.name),
                     env: vec![
                         (
-                            "MBV_CHAINLINK__MAX_MONITORED_ACCOUNTS".to_owned(),
+                            "MBV_ENGINE__ACCOUNTSDB__LRU_CAPACITY".to_owned(),
                             cell.cap.to_string(),
                         ),
                         // campaign parity: fast resubscription keeps the
@@ -344,10 +344,14 @@ impl Scenario for EnsureGateStall {
             }
         }
 
-        check_eq!(
-            healthy.evictions,
-            0.0,
-            "healthy cell (cap ≥ working set) must not evict"
+        // The engine's account cache is a per-bucket sampled LRU, so a
+        // fraction of the working set can evict below capacity; only
+        // systematic eviction marks a broken knob.
+        let healthy_tolerance = (profile.working_set as f64) * 0.15;
+        check!(
+            healthy.evictions <= healthy_tolerance,
+            "healthy cell (cap ≥ working set) evicted {} accounts",
+            healthy.evictions
         )?;
 
         check!(

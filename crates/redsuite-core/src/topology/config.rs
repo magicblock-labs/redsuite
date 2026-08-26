@@ -290,14 +290,20 @@ pub(super) struct ErPlan {
     pub(super) base_ws_url: String,
     pub(super) listen_port: u16,
     pub(super) metrics_port: u16,
+    // every validator binds a follower listener (default 127.0.0.1:10000);
+    pub(super) replication_port: u16,
     pub(super) storage_dir: PathBuf,
     pub(super) env: Vec<(String, String)>,
-    // --reset wipes only the ledger (rocksdb) and skips replay; it preserves
-    // the accountsdb. A restart-in-place relaunch omits it so the ER reopens
-    // the on-disk ledger + accountsdb it already has.
+    // reset=true wipes only the ledger (rocksdb) and skips replay; it
+    // preserves the accountsdb. A restart-in-place relaunch passes false so
+    // the ER reopens the on-disk ledger + accountsdb it already has.
     pub(super) reset: bool,
 }
 
+// The engine validator keeps only --remotes / --lifecycle / -l on the command
+// line. Identity, storage and reset moved into the MBV_ config tree: figment
+// strips the prefix, splits on `__` and turns the remaining `_` into `-`, so
+// MBV_ENGINE__LEDGER__DIRECTORY sets engine.ledger.directory.
 impl ErPlan {
     pub(super) fn command(&self) -> Command {
         let mut cmd = Command::new(&self.bin);
@@ -307,17 +313,26 @@ impl ErPlan {
             .arg(&self.base_ws_url);
         cmd.args(["--lifecycle", "ephemeral"])
             .arg("-l")
-            .arg(format!("127.0.0.1:{}", self.listen_port))
-            .arg("-k")
-            .arg(self.identity.to_base58_string()) // throwaway test identity
-            .arg("--storage")
-            .arg(&self.storage_dir);
-        if self.reset {
-            cmd.arg("--reset");
-        }
-        cmd.arg("--no-tui");
-        // Not `-m`: the CLI overlay feeds a bare string where a MetricsConfig
-        // struct is expected and the validator exits — the env path works.
+            .arg(format!("127.0.0.1:{}", self.listen_port));
+        cmd.env(
+            "MBV_ENGINE__AUTHORITY__LOCAL",
+            self.identity.to_base58_string(), // throwaway test identity
+        );
+        cmd.env("MBV_ENGINE__LEDGER__DIRECTORY", &self.storage_dir);
+        // engine.accountsdb.directory defaults to a compile-time constant
+        // path, not to the configured engine.ledger.directory — overriding
+        // only the ledger directory leaves the accountsdb at the global
+        // default. Set both, mirroring the engine's default
+        // <ledger dir>/accountsdb layout under this ER's storage dir.
+        cmd.env(
+            "MBV_ENGINE__ACCOUNTSDB__DIRECTORY",
+            self.storage_dir.join("accountsdb"),
+        );
+        cmd.env(
+            "MBV_ENGINE__REPLICATION__BIND_ADDRESS",
+            format!("127.0.0.1:{}", self.replication_port),
+        );
+        cmd.env("MBV_LEDGER__RESET", self.reset.to_string());
         cmd.env(
             "MBV_METRICS__ADDRESS",
             format!("127.0.0.1:{}", self.metrics_port),
@@ -335,7 +350,7 @@ impl ErPlan {
 #[derive(Default)]
 pub struct ErOptions {
     pub label: String,
-    // e.g. ("MBV_CHAINLINK__MAX_MONITORED_ACCOUNTS", "100")
+    // e.g. ("MBV_ENGINE__ACCOUNTSDB__LRU_CAPACITY", "100")
     pub env: Vec<(String, String)>,
     pub request_timeout: Option<Duration>,
 }
@@ -368,6 +383,14 @@ mod tests {
             .collect()
     }
 
+    fn env_of(cmd: &Command, key: &str) -> Option<String> {
+        cmd.get_envs().find_map(|(name, value)| {
+            (name == key).then(|| {
+                value.unwrap_or_default().to_string_lossy().into_owned()
+            })
+        })
+    }
+
     fn plan(reset: bool) -> ErPlan {
         ErPlan {
             bin: PathBuf::from("magicblock-validator"),
@@ -376,6 +399,7 @@ mod tests {
             base_ws_url: "ws://127.0.0.1:8900".to_owned(),
             listen_port: 7799,
             metrics_port: 7801,
+            replication_port: 7802,
             storage_dir: PathBuf::from("/tmp/er-storage"),
             env: vec![("MBV_TEST".to_owned(), "1".to_owned())],
             reset,
@@ -384,17 +408,37 @@ mod tests {
 
     #[test]
     fn er_plans_are_inspectable_without_spawning() {
-        let args = args_of(&plan(true).command());
+        let cmd = plan(true).command();
+        let args = args_of(&cmd);
         assert_eq!(args.iter().filter(|arg| *arg == "--remotes").count(), 2);
-        assert!(args.contains(&"--reset".to_owned()));
         assert!(args.contains(&"127.0.0.1:7799".to_owned()));
+        // identity, storage and reset travel in the MBV_ env tree
+        assert_eq!(env_of(&cmd, "MBV_LEDGER__RESET").as_deref(), Some("true"));
+        assert_eq!(
+            env_of(&cmd, "MBV_ENGINE__LEDGER__DIRECTORY").as_deref(),
+            Some("/tmp/er-storage")
+        );
+        assert_eq!(
+            env_of(&cmd, "MBV_ENGINE__ACCOUNTSDB__DIRECTORY").as_deref(),
+            Some("/tmp/er-storage/accountsdb")
+        );
+        assert_eq!(
+            env_of(&cmd, "MBV_ENGINE__REPLICATION__BIND_ADDRESS").as_deref(),
+            Some("127.0.0.1:7802")
+        );
+        assert!(env_of(&cmd, "MBV_ENGINE__AUTHORITY__LOCAL").is_some());
+        // the flags the engine CLI no longer accepts must be gone
+        for dead in ["-k", "--storage", "--reset", "--no-tui"] {
+            assert!(!args.contains(&dead.to_owned()), "{dead} must not appear");
+        }
     }
 
     #[test]
-    fn restart_relaunch_plans_omit_reset() {
-        let args = args_of(&plan(false).command());
+    fn restart_relaunch_plans_disable_reset() {
+        let cmd = plan(false).command();
+        let args = args_of(&cmd);
         assert_eq!(args.iter().filter(|arg| *arg == "--remotes").count(), 2);
-        assert!(!args.contains(&"--reset".to_owned()));
+        assert_eq!(env_of(&cmd, "MBV_LEDGER__RESET").as_deref(), Some("false"));
     }
 
     #[test]
