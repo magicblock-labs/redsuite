@@ -186,13 +186,13 @@ impl Scenario for PubsubContracts {
             "the last account 1 notification must show the fully drained balance"
         )?;
 
-        let logs_all_key = events.logs_subscribe_all().await?;
+        // The engine validator dropped the logsSubscribe(all)
         let mentions1_key =
             events.logs_subscribe_mentions(&account1_pubkey).await?;
         let mentions2_key =
             events.logs_subscribe_mentions(&account2_pubkey).await?;
         let program_key = events.program_subscribe(&system_program).await?;
-        events.await_subscribed(6, Duration::from_secs(5)).await?;
+        events.await_subscribed(5, Duration::from_secs(5)).await?;
 
         let mut logs_signatures = Vec::with_capacity(LOGS_TRANSFERS);
         for _ in 0..LOGS_TRANSFERS {
@@ -209,7 +209,6 @@ impl Scenario for PubsubContracts {
         }
         for logs_signature in &logs_signatures {
             for (key, what) in [
-                (logs_all_key, "logs(all) entry"),
                 (mentions1_key, "logs mentions(account1) entry"),
                 (mentions2_key, "logs mentions(account2) entry"),
             ] {
@@ -301,7 +300,7 @@ impl Scenario for PubsubContracts {
         )?;
 
         let slot_key = events.slot_subscribe().await?;
-        events.await_subscribed(7, Duration::from_secs(5)).await?;
+        events.await_subscribed(6, Duration::from_secs(5)).await?;
         events.await_events(slot_key, 10, EVENT_TIMEOUT).await?;
         let slot_events = events.events(slot_key);
         let mut last_slot = 0u64;
@@ -436,6 +435,20 @@ impl Scenario for PubsubContracts {
         check!(
             raw.next_notification(RAW_SILENCE_TIMEOUT).await?.is_none(),
             "slot notifications continued after unsubscribe"
+        )?;
+
+        // The engine pubsub is mentions-only: the logsSubscribe(all)
+        // firehose must be refused with invalid params naming the filter,
+        // never accepted or silently narrowed.
+        let refusal = match raw.logs_subscribe_all().await {
+            Err(error) => error.to_string(),
+            Ok(subid) => format!("accepted as subscription {subid}"),
+        };
+        check!(
+            refusal.contains("-32602")
+                && refusal.contains("'all' filter is not supported"),
+            "logsSubscribe(all) must be refused with invalid params \
+             naming the filter, got: {refusal}"
         )?;
 
         let unsent = sender

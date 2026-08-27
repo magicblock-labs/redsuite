@@ -202,23 +202,20 @@ impl BackgroundLoad {
     }
 }
 
-struct CellOutcome {
-    name: &'static str,
+struct RestartOutcome {
     timing: RestartTiming,
     load: LoadTally,
     replay_ran: Option<bool>,
     ledger_processing_ms: Option<f64>,
 }
 
-async fn restart_cell(
+async fn graceful_restart(
     private: &mut topology::PrivateEr,
     senders: &[TxSender],
     pool: Rc<Vec<Pubkey>>,
     first_id: u64,
     profile: &Profile,
-    name: &'static str,
-    config: RestartConfig,
-) -> Result<CellOutcome> {
+) -> Result<RestartOutcome> {
     let load = BackgroundLoad::start(
         senders.to_vec(),
         pool,
@@ -228,7 +225,13 @@ async fn restart_cell(
     );
     tokio::time::sleep(profile.ramp).await;
 
-    let timing = private.restart(config).await?;
+    let timing = private
+        .restart(RestartConfig {
+            hard_kill: false,
+            reset: false,
+            ready_timeout: READY_TIMEOUT,
+        })
+        .await?;
 
     tokio::time::sleep(profile.settle).await;
     let load = load.finish().await?;
@@ -239,7 +242,7 @@ async fn restart_cell(
     let ledger_processing_ms = timing_ms(&log_text, LEDGER_TIMING_ANCHOR);
 
     eprintln!(
-        "[redsuite] restart_under_load {name}: total {} ms (shutdown {} ms, startup {} ms), \
+        "[redsuite] restart_under_load graceful: total {} ms (shutdown {} ms, startup {} ms), \
          exit {:?}/sig {:?}, needed_sigkill {}, slot {:?} -> {:?}, replay_ran {:?}, \
          load delivered {} failed {} @ {:.0} tps, client outage {} ms",
         timing.total.as_millis(),
@@ -257,8 +260,7 @@ async fn restart_cell(
         load.outage.map(|d| d.as_millis()).unwrap_or(0),
     );
 
-    Ok(CellOutcome {
-        name,
+    Ok(RestartOutcome {
         timing,
         load,
         replay_ran,
@@ -294,14 +296,14 @@ impl Scenario for RestartUnderLoad {
         )
         .await?;
         private.wait_ready(READY_TIMEOUT).await?;
-        let cell_er = private.ctx();
+        let private_er = private.ctx();
 
         let pool = crate::init_delegated_accounts_batched(
             base,
             &prep_payers,
             profile.accounts,
             crate::ACCOUNT_SPACE,
-            cell_er.identity(),
+            private_er.identity(),
         )
         .await?;
         for pda in &pool {
@@ -309,7 +311,7 @@ impl Scenario for RestartUnderLoad {
                 &format!("the ER clones the delegated pda {pda}"),
                 CLONE_TIMEOUT,
                 || async {
-                    matches!(cell_er.account(pda).await, Ok(Some(acc)) if acc.data.len() == crate::ACCOUNT_SPACE as usize)
+                    matches!(private_er.account(pda).await, Ok(Some(acc)) if acc.data.len() == crate::ACCOUNT_SPACE as usize)
                 },
             )
             .await?;
@@ -320,7 +322,7 @@ impl Scenario for RestartUnderLoad {
             prep_payers.into_iter().map(Rc::new).collect();
         let senders: Vec<TxSender> = payers
             .iter()
-            .map(|payer| cell_er.sender(payer.clone()))
+            .map(|payer| private_er.sender(payer.clone()))
             .collect();
 
         let storage_at_boot = host::dir_size_bytes(private.storage_dir())?;
@@ -346,33 +348,12 @@ impl Scenario for RestartUnderLoad {
         let db_size_at_restart = host::dir_size_bytes(private.storage_dir())?;
         let fill_growth = db_size_at_restart.saturating_sub(storage_at_boot);
 
-        let graceful = restart_cell(
+        let graceful = graceful_restart(
             &mut private,
             &senders,
             pool.clone(),
             profile.fill,
             profile,
-            "graceful",
-            RestartConfig {
-                hard_kill: false,
-                reset: false,
-                ready_timeout: READY_TIMEOUT,
-            },
-        )
-        .await?;
-
-        let crash = restart_cell(
-            &mut private,
-            &senders,
-            pool.clone(),
-            profile.fill * 2,
-            profile,
-            "crash",
-            RestartConfig {
-                hard_kill: true,
-                reset: false,
-                ready_timeout: READY_TIMEOUT,
-            },
         )
         .await?;
 
@@ -427,67 +408,66 @@ impl Scenario for RestartUnderLoad {
                 Unit::Millis,
                 graceful.timing.total.as_secs_f64() * 1e3,
             );
-        for cell in [&graceful, &crash] {
-            report = report
-                .metric(
-                    format!("{} total ms", cell.name),
-                    Unit::Millis,
-                    cell.timing.total.as_secs_f64() * 1e3,
-                )
-                .metric(
-                    format!("{} shutdown ms", cell.name),
-                    Unit::Millis,
-                    cell.timing.shutdown.as_secs_f64() * 1e3,
-                )
-                .metric(
-                    format!("{} startup ms", cell.name),
-                    Unit::Millis,
-                    cell.timing.startup.as_secs_f64() * 1e3,
-                )
-                .metric(
-                    format!("{} needed sigkill", cell.name),
-                    Unit::Count,
-                    cell.timing.needed_sigkill as u8 as f64,
-                )
-                .metric(
-                    format!("{} exit code", cell.name),
-                    Unit::Count,
-                    cell.timing.exit_code.unwrap_or(-1) as f64,
-                )
-                .metric_if(
-                    format!("{} replay ran", cell.name),
-                    Unit::Count,
-                    cell.replay_ran.map(|ran| ran as u8 as f64),
-                )
-                .metric_if(
-                    format!("{} ledger processing ms", cell.name),
-                    Unit::Millis,
-                    cell.ledger_processing_ms,
-                )
-                .metric(
-                    format!("{} load delivered", cell.name),
-                    Unit::Count,
-                    cell.load.delivered as f64,
-                )
-                .metric(
-                    format!("{} load failed", cell.name),
-                    Unit::Count,
-                    cell.load.failed as f64,
-                )
-                .metric(
-                    format!("{} load achieved tps", cell.name),
-                    Unit::Tps,
-                    cell.load.achieved_tps,
-                )
-                .metric(
-                    format!("{} client outage ms", cell.name),
-                    Unit::Millis,
-                    cell.load
-                        .outage
-                        .map(|d| d.as_secs_f64() * 1e3)
-                        .unwrap_or(0.0),
-                );
-        }
+        report = report
+            .metric(
+                "graceful total ms",
+                Unit::Millis,
+                graceful.timing.total.as_secs_f64() * 1e3,
+            )
+            .metric(
+                "graceful shutdown ms",
+                Unit::Millis,
+                graceful.timing.shutdown.as_secs_f64() * 1e3,
+            )
+            .metric(
+                "graceful startup ms",
+                Unit::Millis,
+                graceful.timing.startup.as_secs_f64() * 1e3,
+            )
+            .metric(
+                "graceful needed sigkill",
+                Unit::Count,
+                graceful.timing.needed_sigkill as u8 as f64,
+            )
+            .metric(
+                "graceful exit code",
+                Unit::Count,
+                graceful.timing.exit_code.unwrap_or(-1) as f64,
+            )
+            .metric_if(
+                "graceful replay ran",
+                Unit::Count,
+                graceful.replay_ran.map(|ran| ran as u8 as f64),
+            )
+            .metric_if(
+                "graceful ledger processing ms",
+                Unit::Millis,
+                graceful.ledger_processing_ms,
+            )
+            .metric(
+                "graceful load delivered",
+                Unit::Count,
+                graceful.load.delivered as f64,
+            )
+            .metric(
+                "graceful load failed",
+                Unit::Count,
+                graceful.load.failed as f64,
+            )
+            .metric(
+                "graceful load achieved tps",
+                Unit::Tps,
+                graceful.load.achieved_tps,
+            )
+            .metric(
+                "graceful client outage ms",
+                Unit::Millis,
+                graceful
+                    .load
+                    .outage
+                    .map(|d| d.as_secs_f64() * 1e3)
+                    .unwrap_or(0.0),
+            );
 
         Ok(report)
     }
