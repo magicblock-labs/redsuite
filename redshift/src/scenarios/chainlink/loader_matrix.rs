@@ -18,7 +18,8 @@ const PAYER_DELEGATION: u64 = 1_000_000_000;
 const V4_AUTHORITY_FUNDING: u64 = 15_000_000_000;
 const INVOKE_TIMEOUT: Duration = Duration::from_secs(30);
 const UPGRADE_TIMEOUT: Duration = Duration::from_secs(90);
-const LOADER_V4_STATUS_DEPLOYED: u64 = 1;
+const LOADER_V3_PROGRAMDATA_METADATA: usize = 45;
+const LOADER_V4_HEADER: usize = 48;
 
 pub struct LoaderMatrix;
 
@@ -41,40 +42,75 @@ impl Scenario for LoaderMatrix {
         let memo_v1: Pubkey = MEMO_V1_ID.parse()?;
         let memo_v2: Pubkey = MEMO_V2_ID.parse()?;
 
-        invoke_until(er, payer, memo_v1, &memo_data, vec![], |_| true).await?;
+        let base_memo_v1 = base
+            .account(&memo_v1)
+            .await?
+            .ok_or("memo v1 is not on the base chain")?;
+        invoke_until(er, payer, memo_v1, &memo_data, vec![], |logs| {
+            program_succeeded(logs, &memo_v1)
+        })
+        .await?;
+        let (v1_owner, v1_data) = cloned_program(er, &memo_v1).await?;
+        check_eq!(
+            v1_owner,
+            sdk_ids::bpf_loader_deprecated::ID,
+            "the cloned memo v1 must keep LoaderV1 ownership"
+        )?;
         check!(
-            er.account(&memo_v1).await?.is_some(),
-            "memo v1 (LoaderV1) must be cloned into the ER after invocation"
+            v1_data == base_memo_v1.data,
+            "the memo v1 clone must byte-equal the base program account \
+             (er {} bytes, base {} bytes)",
+            v1_data.len(),
+            base_memo_v1.data.len()
         )?;
 
+        let base_memo_v2 = base
+            .account(&memo_v2)
+            .await?
+            .ok_or("memo v2 is not on the base chain")?;
         invoke_until(er, payer, memo_v2, &memo_data, vec![], has_memo).await?;
-        let (v2_authority, v2_status) = loader_v4_state(er, &memo_v2).await?;
+        let (v2_owner, v2_data) = cloned_program(er, &memo_v2).await?;
         check_eq!(
-            v2_status,
-            LOADER_V4_STATUS_DEPLOYED,
-            "the cloned memo v2 must normalize to a Deployed LoaderV4 program"
+            v2_owner,
+            loader_v4::loader_v4_id(),
+            "the cloned memo v2 must land under LoaderV4 ownership"
         )?;
-        check_eq!(
-            v2_authority,
-            memo_v2,
-            "a v1/v2 clone normalizes its authority to the program id itself"
+        check!(
+            v2_data == base_memo_v2.data,
+            "the memo v2 clone must byte-equal the base program account \
+             (er {} bytes, base {} bytes)",
+            v2_data.len(),
+            base_memo_v2.data.len()
         )?;
 
-        let (v3_id, v3_authority) = topology::redshift_loader_v3_target();
+        let (v3_id, _) = topology::redshift_loader_v3_target();
         let v3_logs =
             invoke_until(er, payer, v3_id, &log_data, vec![], has_log_msg)
                 .await?;
-        let (cloned_v3_authority, v3_status) =
-            loader_v4_state(er, &v3_id).await?;
+        let v3_programdata = Pubkey::find_program_address(
+            &[v3_id.as_ref()],
+            &sdk_ids::bpf_loader_upgradeable::ID,
+        )
+        .0;
+        let mut base_v3_programdata = base
+            .account(&v3_programdata)
+            .await?
+            .ok_or("the v3 programdata account is not on the base chain")?
+            .data;
+        let base_v3_elf =
+            base_v3_programdata.split_off(LOADER_V3_PROGRAMDATA_METADATA);
+        let (v3_owner, v3_data) = cloned_program(er, &v3_id).await?;
         check_eq!(
-            v3_status,
-            LOADER_V4_STATUS_DEPLOYED,
-            "the cloned v3 program must be a Deployed LoaderV4 program"
+            v3_owner,
+            loader_v4::loader_v4_id(),
+            "the cloned v3 program must land under LoaderV4 ownership"
         )?;
-        check_eq!(
-            cloned_v3_authority,
-            v3_authority,
-            "the v3 upgrade authority must survive the clone into the ER"
+        check!(
+            v3_data == base_v3_elf,
+            "the v3 clone must byte-equal the base programdata ELF \
+             (er {} bytes, base {} bytes)",
+            v3_data.len(),
+            base_v3_elf.len()
         )?;
         check!(
             v3_logs.iter().any(|line| line.contains("LogMsg:")),
@@ -115,17 +151,27 @@ impl Scenario for LoaderMatrix {
                 .any(|line| line.contains("LogMsg:") && !line.contains("upgraded")),
             "the freshly deployed v4 program must log without the upgrade suffix"
         )?;
-        let (v4_authority, v4_status) =
-            loader_v4_state(er, &program.pubkey()).await?;
+        let (v4_owner, v4_data) = cloned_program(er, &program.pubkey()).await?;
         check_eq!(
-            v4_status,
-            LOADER_V4_STATUS_DEPLOYED,
-            "the deployed v4 program must clone as a Deployed LoaderV4 program"
+            v4_owner,
+            loader_v4::loader_v4_id(),
+            "the deployed v4 program must clone under LoaderV4 ownership"
         )?;
-        check_eq!(
-            v4_authority,
-            authority.pubkey(),
-            "the v4 deploy authority must survive the clone into the ER"
+        let base_v4_elf =
+            base_v4_program_bytes(base, &program.pubkey()).await?;
+        check!(
+            base_v4_elf.starts_with(&base_bytes),
+            "the base v4 program bytes must start with the deployed .so \
+             (base {} bytes, .so {} bytes)",
+            base_v4_elf.len(),
+            base_bytes.len()
+        )?;
+        check!(
+            v4_data == base_v4_elf,
+            "the v4 clone must byte-equal the base program bytes \
+             (er {} bytes, base {} bytes)",
+            v4_data.len(),
+            base_v4_elf.len()
         )?;
 
         loader_v4::deploy_program(base, &authority, &program, &upgraded_bytes)
@@ -133,26 +179,37 @@ impl Scenario for LoaderMatrix {
         let upgrade_started = Instant::now();
         invoke_until_upgraded(er, payer, program.pubkey()).await?;
         let upgrade_pickup_s = upgrade_started.elapsed().as_secs_f64();
-        let (upgraded_authority, upgraded_status) =
-            loader_v4_state(er, &program.pubkey()).await?;
+        let (upgraded_owner, upgraded_data) =
+            cloned_program(er, &program.pubkey()).await?;
         check_eq!(
-            upgraded_status,
-            LOADER_V4_STATUS_DEPLOYED,
-            "the upgraded v4 program must stay a Deployed LoaderV4 program"
+            upgraded_owner,
+            loader_v4::loader_v4_id(),
+            "the upgraded v4 program must stay under LoaderV4 ownership"
         )?;
-        check_eq!(
-            upgraded_authority,
-            authority.pubkey(),
-            "the v4 authority must survive the upgrade"
+        let base_upgraded_elf =
+            base_v4_program_bytes(base, &program.pubkey()).await?;
+        check!(
+            base_upgraded_elf.starts_with(&upgraded_bytes),
+            "the base v4 program bytes must start with the upgraded .so \
+             (base {} bytes, .so {} bytes)",
+            base_upgraded_elf.len(),
+            upgraded_bytes.len()
+        )?;
+        check!(
+            upgraded_data == base_upgraded_elf,
+            "the upgraded v4 clone must byte-equal the base program bytes \
+             (er {} bytes, base {} bytes)",
+            upgraded_data.len(),
+            base_upgraded_elf.len()
         )?;
 
         Ok(ScenarioReport::ok(self.name())
             .setting("loaders", "v1,v2,v3,v4")
-            .setting("v2 authority normalized", v2_authority == memo_v2)
             .setting(
-                "v3 authority preserved",
-                cloned_v3_authority == v3_authority,
+                "clone representation",
+                "bare ELF, no LoaderV4State header",
             )
+            .setting("v1 owner", v1_owner.to_string())
             .metric("v4 deploy s", Unit::Seconds, deploy_s)
             .metric("v4 upgrade pickup s", Unit::Seconds, upgrade_pickup_s))
     }
@@ -174,29 +231,38 @@ fn has_memo(logs: &[String]) -> bool {
     logs.iter().any(|line| line.contains("redsuite memo"))
 }
 
-async fn loader_v4_state(
+fn program_succeeded(logs: &[String], program: &Pubkey) -> bool {
+    let success_line = format!("Program {program} success");
+    logs.iter().any(|line| line == &success_line)
+}
+
+async fn cloned_program(
     er: &ErCtx,
     program: &Pubkey,
-) -> Result<(Pubkey, u64)> {
-    let account = er
+) -> Result<(Pubkey, Vec<u8>)> {
+    let cloned = er
         .account(program)
         .await?
         .ok_or_else(|| CheckError::new("program not present in the ER"))?;
-    if account.data.len() < 48 {
+    Ok((cloned.owner, cloned.data))
+}
+
+async fn base_v4_program_bytes(
+    base: &BaseCtx,
+    program: &Pubkey,
+) -> Result<Vec<u8>> {
+    let account = base
+        .account(program)
+        .await?
+        .ok_or_else(|| CheckError::new("program not present on base"))?;
+    if account.data.len() < LOADER_V4_HEADER {
         return Err(CheckError::new(
-            "program account too small for a LoaderV4 header",
+            "base program account too small for a LoaderV4 header",
         )
         .actual(format!("{} bytes", account.data.len()))
         .into());
     }
-    let authority = Pubkey::try_from(&account.data[8..40])
-        .map_err(|_| "bad authority bytes in LoaderV4 header")?;
-    let status = u64::from_le_bytes(
-        account.data[40..48]
-            .try_into()
-            .map_err(|_| "bad status bytes in LoaderV4 header")?,
-    );
-    Ok((authority, status))
+    Ok(account.data[LOADER_V4_HEADER..].to_vec())
 }
 
 async fn invoke_until(
