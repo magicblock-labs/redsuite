@@ -9,6 +9,7 @@ use redsuite_core::{
     catalog::Fixture, check, check_eq, loader_v4, manifest, prep, topology,
     BaseCtx, ChainCtx, CheckError, ErCtx, Result, Scenario, ScenarioReport,
 };
+use signature::Signature;
 use signer::Signer;
 
 const MEMO_V1_ID: &str = "Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo";
@@ -18,6 +19,10 @@ const PAYER_DELEGATION: u64 = 1_000_000_000;
 const V4_AUTHORITY_FUNDING: u64 = 15_000_000_000;
 const INVOKE_TIMEOUT: Duration = Duration::from_secs(30);
 const UPGRADE_TIMEOUT: Duration = Duration::from_secs(90);
+// The engine reports a confirmed status one blocktime before the ledger
+// serves the transaction, so a lookup right after confirm must re-poll.
+const LEDGER_VISIBILITY_TIMEOUT: Duration = Duration::from_millis(250);
+const LEDGER_VISIBILITY_POLL: Duration = Duration::from_millis(10);
 const LOADER_V3_PROGRAMDATA_METADATA: usize = 45;
 const LOADER_V4_HEADER: usize = 48;
 
@@ -265,6 +270,22 @@ async fn base_v4_program_bytes(
     Ok(account.data[LOADER_V4_HEADER..].to_vec())
 }
 
+async fn confirmed_logs(
+    er: &ErCtx,
+    signature: &Signature,
+) -> Result<Vec<String>> {
+    let deadline = Instant::now() + LEDGER_VISIBILITY_TIMEOUT;
+    loop {
+        if let Some(info) = er.api().get_transaction(signature).await? {
+            return Ok(info.logs);
+        }
+        if Instant::now() >= deadline {
+            return Ok(Vec::new());
+        }
+        tokio::time::sleep(LEDGER_VISIBILITY_POLL).await;
+    }
+}
+
 async fn invoke_until(
     er: &ErCtx,
     payer: &Keypair,
@@ -288,12 +309,7 @@ async fn invoke_until(
             .await
         {
             Ok(signature) => {
-                let logs = er
-                    .api()
-                    .get_transaction(&signature)
-                    .await?
-                    .map(|info| info.logs)
-                    .unwrap_or_default();
+                let logs = confirmed_logs(er, &signature).await?;
                 if accept(&logs) {
                     return Ok(logs);
                 }
@@ -338,12 +354,7 @@ async fn invoke_until_upgraded(
             .submit_and_confirm(payer, std::slice::from_ref(&ix))
             .await
         {
-            let logs = er
-                .api()
-                .get_transaction(&signature)
-                .await?
-                .map(|info| info.logs)
-                .unwrap_or_default();
+            let logs = confirmed_logs(er, &signature).await?;
             if logs.iter().any(|line| {
                 line.contains("LogMsg: probe") && line.contains("upgraded")
             }) {

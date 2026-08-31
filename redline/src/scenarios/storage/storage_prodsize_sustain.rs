@@ -18,6 +18,8 @@ const CLONE_TIMEOUT: Duration = Duration::from_secs(15);
 const FLATNESS_P50_FACTOR: f64 = 1.5;
 
 const TX_PROCESSING_HISTOGRAM: &str = "mbv_transaction_processing_time";
+const LEDGER_TRANSACTIONS_GAUGE: &str = "engine_ledger_transactions";
+const LEDGER_FILL_TIMEOUT: Duration = Duration::from_secs(5);
 
 const PROD_SUPERBLOCK_SLOTS: u64 = 72_000;
 
@@ -117,6 +119,7 @@ struct CellOutcome {
     name: &'static str,
     superblock_slots: u64,
     fill_growth_bytes: u64,
+    fill_ledger_txs: f64,
     windows: [WindowOutcome; 2],
 }
 
@@ -187,6 +190,11 @@ impl Scenario for StorageProdsizeSustain {
                 .collect();
 
             let storage_at_boot = host::dir_size_bytes(private.storage_dir())?;
+            let ledger_txs_at_boot = cell_er
+                .scrape_metrics()
+                .await?
+                .get(LEDGER_TRANSACTIONS_GAUGE)
+                .unwrap_or(0.0);
             let fill = execute(
                 RunConfig {
                     iterations: profile.fill,
@@ -206,6 +214,30 @@ impl Scenario for StorageProdsizeSustain {
                 "{cell_name}: fill deliveries failed: {:?}",
                 fill.first_error
             )?;
+            check::poll(
+                &format!(
+                    "{cell_name}: the ledger records the {} fill transactions",
+                    profile.fill
+                ),
+                LEDGER_FILL_TIMEOUT,
+                || async {
+                    matches!(
+                        cell_er.scrape_metrics().await,
+                        Ok(metrics) if metrics
+                            .get(LEDGER_TRANSACTIONS_GAUGE)
+                            .unwrap_or(0.0)
+                            - ledger_txs_at_boot
+                            >= profile.fill as f64
+                    )
+                },
+            )
+            .await?;
+            let fill_ledger_txs = cell_er
+                .scrape_metrics()
+                .await?
+                .get(LEDGER_TRANSACTIONS_GAUGE)
+                .unwrap_or(0.0)
+                - ledger_txs_at_boot;
             let fill_growth_bytes =
                 host::dir_size_bytes(private.storage_dir())?
                     .saturating_sub(storage_at_boot);
@@ -233,16 +265,19 @@ impl Scenario for StorageProdsizeSustain {
                 name: cell_name,
                 superblock_slots,
                 fill_growth_bytes,
+                fill_ledger_txs,
                 windows: [window_a, window_b],
             };
             eprintln!(
-                "[redsuite] {}: {} (superblock {}) — fill grew ledger {:.1} MB; \
+                "[redsuite] {}: {} (superblock {}) — fill recorded {:.0} \
+                 ledger txs, dir delta {:.1} MB; \
                  window A p50 {} us / p95 {} us @ {:.0} tps, \
                  window B p50 {} us / p95 {} us @ {:.0} tps, \
                  validator tx avg {} / {} us",
                 self.name(),
                 cell.name,
                 cell.superblock_slots,
+                cell.fill_ledger_txs,
                 cell.fill_growth_bytes as f64 / 1e6,
                 cell.windows[0].outcome.delivery.median,
                 cell.windows[0].outcome.delivery.quantile95,
@@ -275,6 +310,11 @@ impl Scenario for StorageProdsizeSustain {
                         "fill storage growth mb",
                         Unit::Megabytes,
                         cell.fill_growth_bytes as f64 / 1e6,
+                    )
+                    .metric(
+                        "fill ledger txs",
+                        Unit::Count,
+                        cell.fill_ledger_txs,
                     );
             for (window_name, window) in
                 [("A", &cell.windows[0]), ("B", &cell.windows[1])]
@@ -314,11 +354,6 @@ impl Scenario for StorageProdsizeSustain {
         }
 
         for cell in &cells {
-            check!(
-                cell.fill_growth_bytes > 0,
-                "INVALID: {}: the fill phase did not grow the storage",
-                cell.name
-            )?;
             for window in &cell.windows {
                 check_eq!(
                     window.outcome.failed,
@@ -380,6 +415,11 @@ impl Scenario for StorageProdsizeSustain {
                     format!("{} fill growth mb", cell.name),
                     Unit::Megabytes,
                     cell.fill_growth_bytes as f64 / 1e6,
+                )
+                .metric(
+                    format!("{} fill ledger txs", cell.name),
+                    Unit::Count,
+                    cell.fill_ledger_txs,
                 )
                 .metric_if(
                     format!("{} window B validator tx avg us", cell.name),
