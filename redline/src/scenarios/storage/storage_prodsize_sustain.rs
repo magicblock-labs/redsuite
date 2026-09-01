@@ -63,7 +63,7 @@ const PROFILES: ProfileValues<Profile> = ProfileValues {
     deep: None,
 };
 
-fn shape(pool: &[Pubkey], id: u64) -> Instruction {
+pub(crate) fn shape(pool: &[Pubkey], id: u64) -> Instruction {
     use crate::program::instruction::build;
     let len = pool.len() as u64;
     let base_index = ((id - 1) * 3) % len;

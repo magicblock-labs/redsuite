@@ -83,6 +83,11 @@ pub mod redline {
             resources: [Resource::Er, Resource::HostExclusive],
             fixtures: [Fixture::RedlineProgram],
         },
+        superblock_boundary_latency => storage::superblock_boundary_latency::SuperblockBoundaryLatency {
+            topology: Shared,
+            resources: [Resource::Er, Resource::HostExclusive],
+            fixtures: [Fixture::RedlineProgram],
+        },
         restart_under_load => lifecycle::restart_under_load::RestartUnderLoad {
             topology: Shared,
             resources: [Resource::Er, Resource::HostExclusive],
