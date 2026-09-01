@@ -28,7 +28,9 @@ const SETTLE_TIMEOUT: Duration = Duration::from_secs(60);
 const HASH_INIT: Pubkey = Pubkey::new_from_array([7u8; 32]);
 const CU_LIMIT: u32 = 1_400_000;
 
-use crate::metrics::{ENGINE_TRANSACTIONS, RPC_TRANSACTIONS};
+use crate::metrics::{
+    ENGINE_TRANSACTIONS, RPC_ACCEPTED_TRANSACTIONS, RPC_HANDLED_TRANSACTIONS,
+};
 
 const BLOCKED_TRANSACTIONS: &str = "engine_processor_blocked_transactions";
 const BUSY_EXECUTORS: &str = "engine_processor_busy_executors";
@@ -597,13 +599,23 @@ impl Scenario for MixedSustainedLoad {
         )?;
         let excess = engine_txs - total as f64;
 
-        let rpc_txs = delta.counter(RPC_TRANSACTIONS);
-        if let Some(rpc_txs) = rpc_txs {
+        let rpc_handled = delta.counter(RPC_HANDLED_TRANSACTIONS);
+        if let Some(rpc_handled) = rpc_handled {
             check_eq!(
-                rpc_txs,
+                rpc_handled,
                 total as f64,
-                "the RPC layer accepted {rpc_txs:.0} transactions, not the \
-                 {total} the workload submitted"
+                "the RPC layer handled {rpc_handled:.0} sendTransaction calls, \
+                 not the {total} the workload submitted"
+            )?;
+        }
+        let rpc_accepted = delta.counter(RPC_ACCEPTED_TRANSACTIONS);
+        if let Some(rpc_accepted) = rpc_accepted {
+            check_eq!(
+                rpc_accepted,
+                total as f64,
+                "the RPC layer accepted {rpc_accepted:.0} of the {total} \
+                 transactions the workload submitted — the rest failed decode, \
+                 sanitization or account ensure before reaching the engine"
             )?;
         }
 
@@ -657,7 +669,8 @@ impl Scenario for MixedSustainedLoad {
             .metric("failed txs", Unit::Count, outcome.failed as f64)
             .metric("engine txs", Unit::Count, engine_txs)
             .metric("engine txs beyond workload", Unit::Count, excess)
-            .metric_if("rpc accepted txs", Unit::Count, rpc_txs)
+            .metric_if("rpc handled txs", Unit::Count, rpc_handled)
+            .metric_if("rpc accepted txs", Unit::Count, rpc_accepted)
             .metric("drain s", Unit::Seconds, drained.elapsed.as_secs_f64())
             .metric("blocked at drain", Unit::Count, drained.blocked)
             .metric("busy at drain", Unit::Count, drained.busy)

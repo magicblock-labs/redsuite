@@ -16,7 +16,7 @@ use redsuite_core::{
     runner::{
         execute_raw, panic_message, RawRunOutcome, RunConfig, RunOutcome,
     },
-    topology, Api, BaseCtx, ChainCtx, CheckError, ErClient, ErCtx,
+    topology, Api, BaseCtx, BatchBody, ChainCtx, CheckError, ErClient, ErCtx,
     MetricsDelta, Result, Scenario, ScenarioReport, TxSender,
 };
 use signature::Signature;
@@ -278,7 +278,7 @@ fn execute_cell_burst(
                         signed.push(tx);
                     }
                     staged += signed.len() as u64;
-                    let bodies: Vec<Rc<String>> =
+                    let bodies: Vec<Rc<BatchBody>> =
                         if rpc_batch > 0 {
                             signed
                                 .chunks(rpc_batch)
