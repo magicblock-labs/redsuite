@@ -2256,6 +2256,7 @@ dependencies = [
  "solana-sdk-ids 3.1.0",
  "solana-signature",
  "solana-signer",
+ "sonic-rs",
  "tokio",
 ]
 
