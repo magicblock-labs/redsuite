@@ -24,7 +24,7 @@ const PAYER_LAMPORTS: u64 = 2_000_000_000;
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(300);
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(20);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
-const TX_COUNT: &str = "mbv_transaction_count";
+const TX_COUNT: &str = crate::metrics::ENGINE_TRANSACTIONS;
 const HASH_INIT: Pubkey = Pubkey::new_from_array([7u8; 32]);
 const LIGHT_ITERS: u32 = 1;
 const HEAVY_ITERS: u32 = 20;
@@ -231,7 +231,8 @@ async fn run_cell(
     updates.await_settled(SETTLE_TIMEOUT).await?;
     let after = er.scrape_metrics().await?;
     let delta = MetricsDelta::new(before, after);
-    if let Some(failed) = delta.counter("mbv_failed_transactions_count") {
+    if let Some(failed) = delta.counter_all(crate::metrics::FAILED_TRANSACTIONS)
+    {
         check_eq!(
             failed,
             0.0,

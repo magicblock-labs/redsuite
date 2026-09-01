@@ -17,7 +17,7 @@ use crate::program::instruction::build;
 
 const PAYER_LAMPORTS: u64 = 2_000_000_000;
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(300);
-const TX_COUNT: &str = "mbv_transaction_count";
+const TX_COUNT: &str = crate::metrics::ENGINE_TRANSACTIONS;
 // healthy cells must stay within this factor of the widest cell's p50
 const FLAT_FACTOR: f64 = 3.0;
 // a cell beyond this factor is the cliff
@@ -222,7 +222,8 @@ impl Scenario for HotAccountCliff {
             }
             let after = er.scrape_metrics().await?;
             let delta = MetricsDelta::new(before, after);
-            if let Some(failed) = delta.counter("mbv_failed_transactions_count")
+            if let Some(failed) =
+                delta.counter_all(crate::metrics::FAILED_TRANSACTIONS)
             {
                 check_eq!(
                     failed,
@@ -275,7 +276,7 @@ impl Scenario for HotAccountCliff {
                     .metric_if(
                         "validator txs in window",
                         Unit::Count,
-                        delta.counter("mbv_transaction_count"),
+                        delta.counter(crate::metrics::ENGINE_TRANSACTIONS),
                     );
             match report::persist_cell(self.name(), &cell_report) {
                 Ok(path) => {

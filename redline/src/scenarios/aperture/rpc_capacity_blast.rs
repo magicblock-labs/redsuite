@@ -171,14 +171,17 @@ impl Scenario for RpcCapacityBlast {
                 self.name()
             );
         }
-        if let Some(processed) = delta.counter("mbv_transaction_count") {
+        if let Some(processed) =
+            delta.counter(crate::metrics::ENGINE_TRANSACTIONS)
+        {
             check!(
                 processed >= profile.requests as f64,
                 "validator processed {processed} txs, expected at least {}",
                 profile.requests
             )?;
         }
-        if let Some(failed_txs) = delta.counter("mbv_failed_transactions_count")
+        if let Some(failed_txs) =
+            delta.counter_all(crate::metrics::FAILED_TRANSACTIONS)
         {
             check_eq!(
                 failed_txs,
@@ -210,7 +213,7 @@ impl Scenario for RpcCapacityBlast {
             .metric_if(
                 "validator txs in window",
                 Unit::Count,
-                delta.counter("mbv_transaction_count"),
+                delta.counter(crate::metrics::ENGINE_TRANSACTIONS),
             ))
     }
 }

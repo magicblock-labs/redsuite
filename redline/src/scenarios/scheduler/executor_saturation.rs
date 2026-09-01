@@ -16,8 +16,8 @@ use redsuite_core::{
     runner::{
         execute_raw, panic_message, RawRunOutcome, RunConfig, RunOutcome,
     },
-    topology, BaseCtx, ChainCtx, CheckError, ErClient, ErCtx, MetricsDelta,
-    Result, Scenario, ScenarioReport, TxSender,
+    topology, Api, BaseCtx, ChainCtx, CheckError, ErClient, ErCtx,
+    MetricsDelta, Result, Scenario, ScenarioReport, TxSender,
 };
 use signature::Signature;
 
@@ -27,7 +27,7 @@ const PAYER_LAMPORTS: u64 = 2_000_000_000;
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(900);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const CLONE_TIMEOUT: Duration = Duration::from_secs(60);
-const TX_COUNT: &str = "mbv_transaction_count";
+const TX_COUNT: &str = crate::metrics::ENGINE_TRANSACTIONS;
 const HASH_INIT: Pubkey = Pubkey::new_from_array([7u8; 32]);
 const LIGHT_ITERS: u32 = 1;
 const CU_LIMIT: u32 = 1_400_000;
@@ -43,8 +43,37 @@ struct Profile {
     threads: usize,
     warmup: u64,
     iterations: u64,
+    heavy_iterations: u64,
     batch: usize,
+    rpc_batch: usize,
     concurrency: usize,
+    heavy_concurrency: usize,
+}
+
+impl Profile {
+    fn cell_iterations(&self, label: &str) -> u64 {
+        if label == "heavy" {
+            self.heavy_iterations
+        } else {
+            self.iterations
+        }
+    }
+
+    fn cell_concurrency(&self, label: &str) -> usize {
+        if label == "heavy" {
+            self.heavy_concurrency
+        } else {
+            self.concurrency
+        }
+    }
+
+    fn mode(&self) -> &'static str {
+        if self.rpc_batch > 0 {
+            "staged backlog, batched rpc"
+        } else {
+            "pre-signed burst"
+        }
+    }
 }
 
 const LITE: Profile = Profile {
@@ -56,8 +85,11 @@ const LITE: Profile = Profile {
     threads: 8,
     warmup: 5_000,
     iterations: 60_000,
+    heavy_iterations: 60_000,
     batch: 2_500,
+    rpc_batch: 0,
     concurrency: 2_048,
+    heavy_concurrency: 2_048,
 };
 
 const FULL: Profile = Profile {
@@ -69,14 +101,33 @@ const FULL: Profile = Profile {
     threads: 8,
     warmup: 25_000,
     iterations: 300_000,
+    heavy_iterations: 300_000,
     batch: 2_500,
+    rpc_batch: 0,
     concurrency: 2_048,
+    heavy_concurrency: 2_048,
+};
+
+const SOAK: Profile = Profile {
+    name: "soak",
+    programs: 8,
+    payers: 64,
+    accounts_per_program: 64,
+    heavy_iters: 180,
+    threads: 16,
+    warmup: 50_000,
+    iterations: 1_000_000,
+    heavy_iterations: 100_000,
+    batch: u64::MAX as usize,
+    rpc_batch: 500,
+    concurrency: 512,
+    heavy_concurrency: 8,
 };
 
 const PROFILES: ProfileValues<Profile> = ProfileValues {
     lite: LITE,
     full: FULL,
-    soak: None,
+    soak: Some(SOAK),
     deep: None,
 };
 
@@ -105,6 +156,7 @@ struct BurstConfig {
     threads: usize,
     iterations: u64,
     batch: usize,
+    rpc_batch: usize,
     concurrency: usize,
 }
 
@@ -112,6 +164,7 @@ struct BurstOutcome {
     outcome: RunOutcome,
     sign_s: f64,
     blast_s: f64,
+    staged: u64,
 }
 
 fn build_ixs(
@@ -173,6 +226,7 @@ fn execute_cell_burst(
         let payer_bytes = payer_bytes.clone();
         let probe = probe.clone();
         let batch = config.batch.max(1);
+        let rpc_batch = config.rpc_batch;
         let outcome_sender = outcome_sender.clone();
         handles.push(std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -199,6 +253,7 @@ fn execute_cell_burst(
                 let mut outcomes = Vec::new();
                 let mut sign_s = 0.0f64;
                 let mut blast_s = 0.0f64;
+                let mut staged = 0u64;
                 let ids: Vec<u64> = (1..=iterations)
                     .map(|iteration| thread_first_id + iteration)
                     .collect();
@@ -222,28 +277,68 @@ fn execute_cell_burst(
                         let _ = probe.set(tx.signatures[0]);
                         signed.push(tx);
                     }
+                    staged += signed.len() as u64;
+                    let bodies: Vec<Rc<String>> =
+                        if rpc_batch > 0 {
+                            signed
+                                .chunks(rpc_batch)
+                                .map(|chunk| {
+                                    Rc::new(Api::batch_send_body(chunk).expect(
+                                        "batch body build is infallible",
+                                    ))
+                                })
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
                     sign_s += sign_started.elapsed().as_secs_f64();
 
                     let blast_started = Instant::now();
-                    let outcome = execute_raw(
-                        RunConfig {
-                            iterations: signed.len() as u64,
-                            rate: u32::MAX,
-                            concurrency,
-                        },
-                        |batch_index| {
-                            let tx = signed[(batch_index - 1) as usize].clone();
-                            let api = api.clone();
-                            async move {
-                                api.send_transaction(&tx).await.map(|_| ())
-                            }
-                        },
-                    )
-                    .await;
+                    let outcome = if rpc_batch > 0 {
+                        execute_raw(
+                            RunConfig {
+                                iterations: bodies.len() as u64,
+                                rate: u32::MAX,
+                                concurrency,
+                            },
+                            |index| {
+                                let body = bodies[(index - 1) as usize].clone();
+                                let api = api.clone();
+                                async move {
+                                    match api.send_batch(&body).await {
+                                        Ok(0) => Ok(()),
+                                        Ok(rejected) => Err(format!(
+                                            "{rejected} batch entries rejected"
+                                        )
+                                        .into()),
+                                        Err(error) => Err(error),
+                                    }
+                                }
+                            },
+                        )
+                        .await
+                    } else {
+                        execute_raw(
+                            RunConfig {
+                                iterations: signed.len() as u64,
+                                rate: u32::MAX,
+                                concurrency,
+                            },
+                            |batch_index| {
+                                let tx =
+                                    signed[(batch_index - 1) as usize].clone();
+                                let api = api.clone();
+                                async move {
+                                    api.send_transaction(&tx).await.map(|_| ())
+                                }
+                            },
+                        )
+                        .await
+                    };
                     blast_s += blast_started.elapsed().as_secs_f64();
                     outcomes.push(outcome);
                 }
-                (outcomes, sign_s, blast_s)
+                (outcomes, sign_s, blast_s, staged)
             }));
             let _ = outcome_sender.send(result);
         }));
@@ -255,13 +350,15 @@ fn execute_cell_burst(
     let mut all_outcomes: Vec<RawRunOutcome> = Vec::new();
     let mut sign_s = 0.0f64;
     let mut blast_s = 0.0f64;
-    while let Ok((outcomes, thread_sign_s, thread_blast_s)) =
+    let mut staged = 0u64;
+    while let Ok((outcomes, thread_sign_s, thread_blast_s, thread_staged)) =
         outcome_receiver.recv()
     {
         received += 1;
         all_outcomes.extend(outcomes);
         sign_s = sign_s.max(thread_sign_s);
         blast_s = blast_s.max(thread_blast_s);
+        staged += thread_staged;
     }
     let mut first_worker_panic = None;
     for handle in handles {
@@ -289,6 +386,7 @@ fn execute_cell_burst(
         outcome,
         sign_s,
         blast_s,
+        staged,
     })
 }
 
@@ -320,9 +418,15 @@ struct Cell {
     top_thread_cores: f64,
     busy_threads: usize,
     validator_txs: Option<f64>,
+    staged: u64,
+    iterations: u64,
 }
 
 impl Cell {
+    fn delivered_tps(&self) -> f64 {
+        self.staged as f64 / self.blast_s.max(1e-9)
+    }
+
     fn executed_tps(&self, iterations: u64) -> f64 {
         iterations as f64 / (self.outcome.wall + self.drain).as_secs_f64()
     }
@@ -401,6 +505,7 @@ impl Scenario for ExecutorSaturation {
                 threads: profile.threads,
                 iterations: profile.warmup,
                 batch: profile.batch,
+                rpc_batch: profile.rpc_batch,
                 concurrency: profile.concurrency,
             },
             0,
@@ -427,6 +532,7 @@ impl Scenario for ExecutorSaturation {
             ("light", LIGHT_ITERS, false),
             ("heavy", profile.heavy_iters, true),
         ] {
+            let cell_iterations = profile.cell_iterations(label);
             let probe: Arc<OnceLock<Signature>> = Arc::new(OnceLock::new());
             let before = er.scrape_metrics().await?;
             let cpu_before = host::cpu_sample(er_pid)?;
@@ -434,9 +540,10 @@ impl Scenario for ExecutorSaturation {
                 er_rpc_url.clone(),
                 BurstConfig {
                     threads: profile.threads,
-                    iterations: profile.iterations,
+                    iterations: cell_iterations,
                     batch: profile.batch,
-                    concurrency: profile.concurrency,
+                    rpc_batch: profile.rpc_batch,
+                    concurrency: profile.cell_concurrency(label),
                 },
                 offset,
                 programs.clone(),
@@ -447,7 +554,7 @@ impl Scenario for ExecutorSaturation {
                 probe.clone(),
             )?;
             let outcome = burst.outcome;
-            offset += profile.iterations;
+            offset += cell_iterations;
             check_eq!(
                 outcome.failed,
                 0,
@@ -456,14 +563,26 @@ impl Scenario for ExecutorSaturation {
             )?;
             let drain = match before.get(TX_COUNT) {
                 Some(seen) => {
-                    drain_processed(er, seen + profile.iterations as f64)
-                        .await?
+                    drain_processed(er, seen + cell_iterations as f64).await?
                 }
                 None => Duration::ZERO,
             };
             let cpu_after = host::cpu_sample(er_pid)?;
             let after = er.scrape_metrics().await?;
             let delta = MetricsDelta::new(before, after);
+
+            if let Some(failed) =
+                delta.counter_all(crate::metrics::FAILED_TRANSACTIONS)
+            {
+                check_eq!(
+                    failed,
+                    0.0,
+                    "{label}: the validator dropped or failed {failed:.0} of \
+                     {cell_iterations} transactions — a staged backlog that \
+                     outlives the 60 s blockhash window is dropped unexecuted; \
+                     reduce this profile's backlog"
+                )?;
+            }
 
             let probe_sig =
                 probe.get().copied().ok_or("no probe signature captured")?;
@@ -502,6 +621,8 @@ impl Scenario for ExecutorSaturation {
                     .filter(|cores| **cores >= BUSY_THREAD_CORES)
                     .count(),
                 validator_txs: delta.counter(TX_COUNT),
+                staged: burst.staged,
+                iterations: cell_iterations,
             };
             eprintln!(
                 "[redsuite] {}: {label} (sha256 iters {iters}): signed in {:.1} s, \
@@ -511,8 +632,8 @@ impl Scenario for ExecutorSaturation {
                 self.name(),
                 cell.sign_s,
                 cell.blast_s,
-                cell.outcome.achieved_rps(),
-                cell.executed_tps(profile.iterations),
+                cell.delivered_tps(),
+                cell.executed_tps(cell_iterations),
                 cell.drain.as_secs_f64(),
                 cell.outcome.delivery.median,
                 cell.outcome.delivery.quantile95,
@@ -538,10 +659,11 @@ impl Scenario for ExecutorSaturation {
                     )
                     .setting("payers", profile.payers)
                     .setting("driver threads", profile.threads)
-                    .setting("measured iters", profile.iterations)
-                    .setting("mode", "pre-signed burst")
+                    .setting("measured iters", cell_iterations)
+                    .setting("mode", profile.mode())
+                    .setting("rpc batch", profile.rpc_batch)
                     .setting("batch per thread", profile.batch)
-                    .setting("concurrency", profile.concurrency)
+                    .setting("concurrency", profile.cell_concurrency(label))
                     .observe("delivery us", Unit::Micros, cell.outcome.delivery)
                     .metric(
                         "achieved tps",
@@ -551,7 +673,7 @@ impl Scenario for ExecutorSaturation {
                     .metric(
                         "executed tps",
                         Unit::Tps,
-                        cell.executed_tps(profile.iterations),
+                        cell.executed_tps(cell_iterations),
                     )
                     .metric("sign s", Unit::Seconds, cell.sign_s)
                     .metric("blast s", Unit::Seconds, cell.blast_s)
@@ -621,10 +743,13 @@ impl Scenario for ExecutorSaturation {
             .setting("heavy iters", profile.heavy_iters)
             .setting("payers", profile.payers)
             .setting("driver threads", profile.threads)
-            .setting("measured iters per cell", profile.iterations)
-            .setting("mode", "pre-signed burst")
+            .setting("measured iters", profile.iterations)
+            .setting("heavy measured iters", profile.heavy_iterations)
+            .setting("mode", profile.mode())
+            .setting("rpc batch", profile.rpc_batch)
             .setting("batch per thread", profile.batch)
             .setting("concurrency", profile.concurrency)
+            .setting("heavy concurrency", profile.heavy_concurrency)
             .metric("heavy/light probe cu ratio", Unit::Ratio, cu_ratio)
             .metric(
                 "heavy/light cores ratio",
@@ -640,12 +765,17 @@ impl Scenario for ExecutorSaturation {
                 .metric(
                     format!("{} achieved tps", cell.label),
                     Unit::Tps,
-                    cell.outcome.achieved_rps(),
+                    cell.delivered_tps(),
                 )
                 .metric(
                     format!("{} executed tps", cell.label),
                     Unit::Tps,
-                    cell.executed_tps(profile.iterations),
+                    cell.executed_tps(cell.iterations),
+                )
+                .metric(
+                    format!("{} staged txs", cell.label),
+                    Unit::Count,
+                    cell.staged as f64,
                 )
                 .metric(
                     format!("{} delivery p50 us", cell.label),

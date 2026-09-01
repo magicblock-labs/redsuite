@@ -440,6 +440,45 @@ impl Api {
         Ok(Hash::from_str(&resp.value.blockhash)?)
     }
 
+    pub fn batch_send_body(transactions: &[Transaction]) -> Result<String> {
+        const CONFIG: &str = r#"{"encoding":"base64","skipPreflight":true,"preflightCommitment":"confirmed"}"#;
+        let mut body = String::from("[");
+        for (index, tx) in transactions.iter().enumerate() {
+            if index > 0 {
+                body.push(',');
+            }
+            let encoded = base64::engine::general_purpose::STANDARD
+                .encode(bincode::serialize(tx)?);
+            let params = format!(r#"["{encoded}",{CONFIG}]"#);
+            body.push_str(&crate::transport::conn::request_text(
+                index as u64 + 1,
+                "sendTransaction",
+                &params,
+            ));
+        }
+        body.push(']');
+        Ok(body)
+    }
+
+    pub async fn send_batch(&self, body: &str) -> Result<usize> {
+        if body == "[]" {
+            return Ok(0);
+        }
+        let response =
+            http::post_json(&self.client, &self.url, body.to_owned()).await?;
+        let envelopes: Vec<Envelope<String>> = json::from_str(&response)
+            .map_err(|error| {
+                format!(
+                    "sendTransaction batch: unexpected response shape: \
+                     {error} ({response})"
+                )
+            })?;
+        Ok(envelopes
+            .iter()
+            .filter(|envelope| envelope.error.is_some())
+            .count())
+    }
+
     pub async fn send_transaction(
         &self,
         tx: &Transaction,
