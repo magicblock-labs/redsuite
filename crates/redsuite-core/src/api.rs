@@ -118,6 +118,8 @@ impl Default for ConfirmOptions {
 
 #[derive(Deserialize)]
 struct Envelope<T> {
+    #[serde(default)]
+    id: Option<u64>,
     result: Option<T>,
     error: Option<EnvelopeError>,
 }
@@ -304,6 +306,21 @@ struct SignaturesConfig {
     commitment: &'static str,
 }
 
+pub struct BatchBody {
+    body: String,
+    len: usize,
+}
+
+impl BatchBody {
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
 #[derive(Clone)]
 pub struct Api {
     url: String,
@@ -438,6 +455,87 @@ impl Api {
             .call("getLatestBlockhash", &(CommitmentConfig::confirmed(),))
             .await?;
         Ok(Hash::from_str(&resp.value.blockhash)?)
+    }
+
+    pub fn batch_send_body(transactions: &[Transaction]) -> Result<BatchBody> {
+        const CONFIG: &str = r#"{"encoding":"base64","skipPreflight":true,"preflightCommitment":"confirmed"}"#;
+        let mut body = String::from("[");
+        for (index, tx) in transactions.iter().enumerate() {
+            if index > 0 {
+                body.push(',');
+            }
+            let encoded = base64::engine::general_purpose::STANDARD
+                .encode(bincode::serialize(tx)?);
+            let params = format!(r#"["{encoded}",{CONFIG}]"#);
+            body.push_str(&crate::transport::conn::request_text(
+                index as u64 + 1,
+                "sendTransaction",
+                &params,
+            ));
+        }
+        body.push(']');
+        Ok(BatchBody {
+            body,
+            len: transactions.len(),
+        })
+    }
+
+    pub async fn send_batch(&self, batch: &BatchBody) -> Result<usize> {
+        if batch.is_empty() {
+            return Ok(0);
+        }
+        let response =
+            http::post_json(&self.client, &self.url, batch.body.clone())
+                .await?;
+        let envelopes: Vec<Envelope<String>> = json::from_str(&response)
+            .map_err(|error| {
+                format!(
+                    "sendTransaction batch: unexpected response shape: \
+                     {error} ({response})"
+                )
+            })?;
+        if envelopes.len() != batch.len {
+            return Err(format!(
+                "sendTransaction batch: sent {} requests, got {} responses",
+                batch.len,
+                envelopes.len()
+            )
+            .into());
+        }
+        let mut answered = vec![false; batch.len];
+        let mut rejected = 0;
+        for envelope in &envelopes {
+            let id = envelope.id.ok_or_else(|| {
+                "sendTransaction batch: response entry carries no id"
+                    .to_string()
+            })?;
+            let index = usize::try_from(id)
+                .ok()
+                .filter(|id| (1..=batch.len).contains(id))
+                .ok_or_else(|| {
+                    format!(
+                        "sendTransaction batch: response id {id} outside 1..={}",
+                        batch.len
+                    )
+                })?
+                - 1;
+            if std::mem::replace(&mut answered[index], true) {
+                return Err(format!(
+                    "sendTransaction batch: duplicate response id {id}"
+                )
+                .into());
+            }
+            if envelope.error.is_some() {
+                rejected += 1;
+            } else if envelope.result.is_none() {
+                return Err(format!(
+                    "sendTransaction batch: response id {id} carries neither \
+                     result nor error"
+                )
+                .into());
+            }
+        }
+        Ok(rejected)
     }
 
     pub async fn send_transaction(

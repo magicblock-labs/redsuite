@@ -48,6 +48,11 @@ pub mod redline {
             resources: [Resource::Er, Resource::HostExclusive],
             fixtures: [Fixture::RedlineProgram],
         },
+        mixed_sustained_load => scheduler::mixed_sustained_load::MixedSustainedLoad {
+            topology: Shared,
+            resources: [Resource::Er, Resource::HostExclusive],
+            fixtures: [Fixture::RedlineProgram],
+        },
         clone_lru_churn => chainlink::clone_lru_churn::CloneLruChurn {
             topology: Shared,
             resources: [Resource::Er, Resource::HostExclusive],

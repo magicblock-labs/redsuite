@@ -219,7 +219,9 @@ impl Scenario for WarmIngress {
         // validator-side cross-checks, gated on what this build exposes:
         // the no-op gate (our load provably hit the validator) and the
         // nothing-failed-on-chain invariant
-        if let Some(processed) = delta.counter("mbv_transaction_count") {
+        if let Some(processed) =
+            delta.counter(crate::metrics::ENGINE_TRANSACTIONS)
+        {
             check!(
                 processed >= profile.iterations as f64,
                 "validator processed {processed} txs in the measured window, \
@@ -227,7 +229,9 @@ impl Scenario for WarmIngress {
                 profile.iterations
             )?;
         }
-        if let Some(failed) = delta.counter("mbv_failed_transactions_count") {
+        if let Some(failed) =
+            delta.counter_all(crate::metrics::FAILED_TRANSACTIONS)
+        {
             check_eq!(failed, 0.0, "transactions failed on the validator")?;
         }
 
@@ -325,7 +329,7 @@ impl Scenario for WarmIngress {
             .metric_if(
                 "validator txs in window",
                 Unit::Count,
-                delta.counter("mbv_transaction_count"),
+                delta.counter(crate::metrics::ENGINE_TRANSACTIONS),
             )
             .metric_if(
                 "monitored accounts (gauge)",

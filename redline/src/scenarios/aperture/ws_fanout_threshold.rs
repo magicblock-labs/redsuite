@@ -384,7 +384,7 @@ impl Scenario for WsFanoutThreshold {
                     .metric_if(
                         "validator txs in window",
                         Unit::Count,
-                        delta.counter("mbv_transaction_count"),
+                        delta.counter(crate::metrics::ENGINE_TRANSACTIONS),
                     )
                     .metric_if(
                         "validator tx processing avg us",
@@ -402,7 +402,7 @@ impl Scenario for WsFanoutThreshold {
                 ),
             }
             if let Some(failed_txs) =
-                delta.counter("mbv_failed_transactions_count")
+                delta.counter_all(crate::metrics::FAILED_TRANSACTIONS)
             {
                 check_eq!(
                     failed_txs,
