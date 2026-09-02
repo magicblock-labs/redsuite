@@ -14,6 +14,8 @@ use redsuite_core::{
 
 const PREP_PAYER_LAMPORTS: u64 = 4_000_000_000;
 const CLONE_TIMEOUT: Duration = Duration::from_secs(15);
+const LEDGER_SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
+const LEDGER_SETTLE_POLL: Duration = Duration::from_millis(50);
 const CATASTROPHIC_RPS_FLOOR: f64 = 1_000.0;
 
 const TX_PROCESSING_HISTOGRAM: &str = "mbv_transaction_processing_time";
@@ -135,6 +137,11 @@ impl Scenario for RpcCapacityBlast {
             },
             factory,
         )?;
+        if let Some(ledger_txs_before) =
+            before.get(crate::metrics::ENGINE_TRANSACTIONS)
+        {
+            settle_ledger(er, ledger_txs_before, profile.requests as f64).await;
+        }
         let after = er.scrape_metrics().await?;
         let delta = MetricsDelta::new(before, after);
 
@@ -215,5 +222,27 @@ impl Scenario for RpcCapacityBlast {
                 Unit::Count,
                 delta.counter(crate::metrics::ENGINE_TRANSACTIONS),
             ))
+    }
+}
+
+async fn settle_ledger(er: &ErCtx, baseline: f64, expected: f64) {
+    let deadline = tokio::time::Instant::now() + LEDGER_SETTLE_TIMEOUT;
+    loop {
+        // The scrape's own client timeout (10 s) exceeds the settle window;
+        // cap each scrape at the remaining deadline so a stalled metrics
+        // endpoint cannot hold settlement past it.
+        let committed = tokio::time::timeout_at(deadline, er.scrape_metrics())
+            .await
+            .ok()
+            .and_then(|scraped| scraped.ok())
+            .and_then(|metrics| {
+                metrics.get(crate::metrics::ENGINE_TRANSACTIONS)
+            })
+            .map(|total| total - baseline)
+            .unwrap_or(0.0);
+        if committed >= expected || tokio::time::Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(LEDGER_SETTLE_POLL).await;
     }
 }

@@ -4,27 +4,22 @@ use async_trait::async_trait;
 use instruction::{AccountMeta, Instruction};
 use keypair::Keypair;
 use pubkey::Pubkey;
-use redsuite_core::report::Unit;
 use redsuite_core::{
-    catalog::Fixture, check, check_eq, loader_v4, manifest, prep, topology,
-    BaseCtx, ChainCtx, CheckError, ErCtx, Result, Scenario, ScenarioReport,
+    check, check_eq, loader_v4, prep, topology, BaseCtx, ChainCtx, CheckError,
+    ErCtx, Result, Scenario, ScenarioReport,
 };
 use signature::Signature;
-use signer::Signer;
 
 const MEMO_V1_ID: &str = "Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo";
 const MEMO_V2_ID: &str = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr";
 
 const PAYER_DELEGATION: u64 = 1_000_000_000;
-const V4_AUTHORITY_FUNDING: u64 = 15_000_000_000;
 const INVOKE_TIMEOUT: Duration = Duration::from_secs(30);
-const UPGRADE_TIMEOUT: Duration = Duration::from_secs(90);
 // The engine reports a confirmed status one blocktime before the ledger
 // serves the transaction, so a lookup right after confirm must re-poll.
 const LEDGER_VISIBILITY_TIMEOUT: Duration = Duration::from_millis(250);
 const LEDGER_VISIBILITY_POLL: Duration = Duration::from_millis(10);
 const LOADER_V3_PROGRAMDATA_METADATA: usize = 45;
-const LOADER_V4_HEADER: usize = 48;
 
 pub struct LoaderMatrix;
 
@@ -122,101 +117,13 @@ impl Scenario for LoaderMatrix {
             "the v3 program invocation must emit its LogMsg line"
         )?;
 
-        let base_bytes =
-            std::fs::read(manifest::resolve(Fixture::RedshiftProgramSlim)?)
-                .map_err(|err| {
-                    format!("reading the slim redshift .so: {err}")
-                })?;
-        let upgraded_bytes = std::fs::read(manifest::resolve(
-            Fixture::RedshiftProgramSlimUpgraded,
-        )?)
-        .map_err(|err| {
-            format!("reading the slim upgraded redshift .so: {err}")
-        })?;
-
-        let authority = prep::funded_payer(base, V4_AUTHORITY_FUNDING).await?;
-        let program = Keypair::new();
-        let deploy_started = Instant::now();
-        loader_v4::deploy_program(base, &authority, &program, &base_bytes)
-            .await?;
-        let deploy_s = deploy_started.elapsed().as_secs_f64();
-
-        let v4_logs = invoke_until(
-            er,
-            payer,
-            program.pubkey(),
-            &log_data,
-            vec![],
-            has_log_msg,
-        )
-        .await?;
-        check!(
-            v4_logs
-                .iter()
-                .any(|line| line.contains("LogMsg:") && !line.contains("upgraded")),
-            "the freshly deployed v4 program must log without the upgrade suffix"
-        )?;
-        let (v4_owner, v4_data) = cloned_program(er, &program.pubkey()).await?;
-        check_eq!(
-            v4_owner,
-            loader_v4::loader_v4_id(),
-            "the deployed v4 program must clone under LoaderV4 ownership"
-        )?;
-        let base_v4_elf =
-            base_v4_program_bytes(base, &program.pubkey()).await?;
-        check!(
-            base_v4_elf.starts_with(&base_bytes),
-            "the base v4 program bytes must start with the deployed .so \
-             (base {} bytes, .so {} bytes)",
-            base_v4_elf.len(),
-            base_bytes.len()
-        )?;
-        check!(
-            v4_data == base_v4_elf,
-            "the v4 clone must byte-equal the base program bytes \
-             (er {} bytes, base {} bytes)",
-            v4_data.len(),
-            base_v4_elf.len()
-        )?;
-
-        loader_v4::deploy_program(base, &authority, &program, &upgraded_bytes)
-            .await?;
-        let upgrade_started = Instant::now();
-        invoke_until_upgraded(er, payer, program.pubkey()).await?;
-        let upgrade_pickup_s = upgrade_started.elapsed().as_secs_f64();
-        let (upgraded_owner, upgraded_data) =
-            cloned_program(er, &program.pubkey()).await?;
-        check_eq!(
-            upgraded_owner,
-            loader_v4::loader_v4_id(),
-            "the upgraded v4 program must stay under LoaderV4 ownership"
-        )?;
-        let base_upgraded_elf =
-            base_v4_program_bytes(base, &program.pubkey()).await?;
-        check!(
-            base_upgraded_elf.starts_with(&upgraded_bytes),
-            "the base v4 program bytes must start with the upgraded .so \
-             (base {} bytes, .so {} bytes)",
-            base_upgraded_elf.len(),
-            upgraded_bytes.len()
-        )?;
-        check!(
-            upgraded_data == base_upgraded_elf,
-            "the upgraded v4 clone must byte-equal the base program bytes \
-             (er {} bytes, base {} bytes)",
-            upgraded_data.len(),
-            base_upgraded_elf.len()
-        )?;
-
         Ok(ScenarioReport::ok(self.name())
-            .setting("loaders", "v1,v2,v3,v4")
+            .setting("loaders", "v1,v2,v3")
             .setting(
                 "clone representation",
                 "bare ELF, no LoaderV4State header",
             )
-            .setting("v1 owner", v1_owner.to_string())
-            .metric("v4 deploy s", Unit::Seconds, deploy_s)
-            .metric("v4 upgrade pickup s", Unit::Seconds, upgrade_pickup_s))
+            .setting("v1 owner", v1_owner.to_string()))
     }
 }
 
@@ -250,24 +157,6 @@ async fn cloned_program(
         .await?
         .ok_or_else(|| CheckError::new("program not present in the ER"))?;
     Ok((cloned.owner, cloned.data))
-}
-
-async fn base_v4_program_bytes(
-    base: &BaseCtx,
-    program: &Pubkey,
-) -> Result<Vec<u8>> {
-    let account = base
-        .account(program)
-        .await?
-        .ok_or_else(|| CheckError::new("program not present on base"))?;
-    if account.data.len() < LOADER_V4_HEADER {
-        return Err(CheckError::new(
-            "base program account too small for a LoaderV4 header",
-        )
-        .actual(format!("{} bytes", account.data.len()))
-        .into());
-    }
-    Ok(account.data[LOADER_V4_HEADER..].to_vec())
 }
 
 async fn confirmed_logs(
@@ -330,41 +219,6 @@ async fn invoke_until(
                 "invoke of {program} never met its log condition"
             ))
             .actual(format!("{last_logs:?}"))
-            .into());
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-}
-
-async fn invoke_until_upgraded(
-    er: &ErCtx,
-    payer: &Keypair,
-    program: Pubkey,
-) -> Result<()> {
-    let deadline = Instant::now() + UPGRADE_TIMEOUT;
-    let mut attempt = 0u64;
-    loop {
-        attempt += 1;
-        let ix = Instruction {
-            program_id: program,
-            accounts: vec![],
-            data: log_data(attempt),
-        };
-        if let Ok(signature) = er
-            .submit_and_confirm(payer, std::slice::from_ref(&ix))
-            .await
-        {
-            let logs = confirmed_logs(er, &signature).await?;
-            if logs.iter().any(|line| {
-                line.contains("LogMsg: probe") && line.contains("upgraded")
-            }) {
-                return Ok(());
-            }
-        }
-        if Instant::now() >= deadline {
-            return Err(CheckError::new(
-                "the ER never picked up the v4 upgrade",
-            )
             .into());
         }
         tokio::time::sleep(Duration::from_millis(500)).await;

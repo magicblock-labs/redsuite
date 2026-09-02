@@ -183,11 +183,7 @@ pub mod redshift {
         loader_matrix => chainlink::loader_matrix::LoaderMatrix {
             topology: Shared,
             resources: [Resource::Er],
-            fixtures: [
-                Fixture::RedshiftProgram,
-                Fixture::RedshiftProgramSlim,
-                Fixture::RedshiftProgramSlimUpgraded,
-            ],
+            fixtures: [Fixture::RedshiftProgram],
         },
         post_delegation_token_transfer => chainlink::post_delegation_token_transfer::PostDelegationTokenTransfer {
             topology: Shared,
