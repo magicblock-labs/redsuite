@@ -1,16 +1,21 @@
 use std::{
     rc::Rc,
-    sync::{Arc, OnceLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, OnceLock,
+    },
+    thread::JoinHandle,
     time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
+use futures_util::future::join_all;
 use instruction::Instruction;
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::report::Unit;
 use redsuite_core::{
-    check, check_eq, host, prep,
+    api, check, check_eq, host, prep,
     profile::{self, ProfileValues},
     report,
     runner::{
@@ -23,22 +28,37 @@ use signature::Signature;
 
 use crate::program::{instruction::build, layout, utils::hash_chain};
 
-const PAYER_LAMPORTS: u64 = 2_000_000_000;
+// Each payer funds one delegated account: init + delegate on the base chain
+// and zero-fee load on the ER.
+const PAYER_LAMPORTS: u64 = 200_000_000;
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(900);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const CLONE_TIMEOUT: Duration = Duration::from_secs(60);
+// A burst of fresh delegations wedges the ER's discovery cloner; prep funds
+// and delegates in chunks and hydrates each chunk before the next.
+const PREP_CHUNK: usize = 32;
+const BUSY_SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
 const TX_COUNT: &str = crate::metrics::ENGINE_TRANSACTIONS;
+const BUSY_EXECUTORS: &str = "engine_processor_busy_executors";
+const ORDERING_DEPENDENCIES: &str = "engine_processor_ordering_dependencies";
+const BLOCKED_TRANSACTIONS: &str = "engine_processor_blocked_transactions";
+const PROGRAM: Pubkey = crate::program::ID;
 const HASH_INIT: Pubkey = Pubkey::new_from_array([7u8; 32]);
 const LIGHT_ITERS: u32 = 1;
 const CU_LIMIT: u32 = 1_400_000;
 const CU_CONTRAST_FLOOR: f64 = 10.0;
 const BUSY_THREAD_CORES: f64 = 0.5;
 
+// The sequencer orders transactions by static account key and the fee payer
+// is always writable, so every payer is a serial chain. Its pending window is
+// 16 x executors; `accounts` (= payers) must exceed that window or the window
+// fills with same-payer chains and the per-slot drain pays their depth
+// serially. One payer per delegated account makes payer and account chains
+// coincide, and transaction ids map onto accounts round-robin so a contiguous
+// run of ids never repeats an account.
 struct Profile {
     name: &'static str,
-    programs: usize,
-    payers: usize,
-    accounts_per_program: usize,
+    accounts: usize,
     heavy_iters: u32,
     threads: usize,
     warmup: u64,
@@ -78,9 +98,7 @@ impl Profile {
 
 const LITE: Profile = Profile {
     name: "lite",
-    programs: 8,
-    payers: 32,
-    accounts_per_program: 12,
+    accounts: 256,
     heavy_iters: 180,
     threads: 8,
     warmup: 5_000,
@@ -94,9 +112,7 @@ const LITE: Profile = Profile {
 
 const FULL: Profile = Profile {
     name: "full",
-    programs: 8,
-    payers: 32,
-    accounts_per_program: 32,
+    accounts: 512,
     heavy_iters: 180,
     threads: 8,
     warmup: 25_000,
@@ -110,9 +126,7 @@ const FULL: Profile = Profile {
 
 const SOAK: Profile = Profile {
     name: "soak",
-    programs: 8,
-    payers: 64,
-    accounts_per_program: 64,
+    accounts: 512,
     heavy_iters: 180,
     threads: 16,
     warmup: 50_000,
@@ -152,6 +166,12 @@ fn consumed_cus(logs: &[String]) -> Option<f64> {
     })
 }
 
+// Account (and payer) slot of a transaction id: ids are 1-based and
+// contiguous, so any run of `len` consecutive ids covers every slot once.
+fn slot_of(global_id: u64, len: usize) -> usize {
+    (global_id - 1) as usize % len
+}
+
 struct BurstConfig {
     threads: usize,
     iterations: u64,
@@ -168,18 +188,14 @@ struct BurstOutcome {
 }
 
 fn build_ixs(
-    programs: &[Pubkey],
-    pools: &[Vec<Pubkey>],
+    accounts: &[Pubkey],
     global_id: u64,
     iters: u32,
     raise_budget: bool,
 ) -> Vec<Instruction> {
-    let index = (global_id - 1) as usize;
-    let program_index = index % programs.len();
-    let pda = pools[program_index]
-        [(index / programs.len()) % pools[program_index].len()];
+    let pda = accounts[slot_of(global_id, accounts.len())];
     let compute = build::expensive_hash_compute_at(
-        programs[program_index],
+        PROGRAM,
         global_id,
         HASH_INIT,
         iters,
@@ -197,8 +213,7 @@ fn execute_cell_burst(
     er_rpc_url: String,
     config: BurstConfig,
     id_offset: u64,
-    programs: Arc<Vec<Pubkey>>,
-    pools: Arc<Vec<Vec<Pubkey>>>,
+    accounts: Arc<Vec<Pubkey>>,
     payer_bytes: Arc<Vec<[u8; 64]>>,
     iters: u32,
     raise_budget: bool,
@@ -221,8 +236,7 @@ fn execute_cell_burst(
         let thread_first_id = first_id;
         first_id += iterations;
         let er_rpc_url = er_rpc_url.clone();
-        let programs = programs.clone();
-        let pools = pools.clone();
+        let accounts = accounts.clone();
         let payer_bytes = payer_bytes.clone();
         let probe = probe.clone();
         let batch = config.batch.max(1);
@@ -236,13 +250,11 @@ fn execute_cell_burst(
             let local = tokio::task::LocalSet::new();
             let result = runtime.block_on(local.run_until(async move {
                 let client = ErClient::new(er_rpc_url);
+                // Every thread signs for every payer: the payer of a
+                // transaction is fixed by its id, not by the thread.
                 let senders: Vec<TxSender> = payer_bytes
                     .iter()
-                    .enumerate()
-                    .filter(|(payer_index, _)| {
-                        payer_index % threads == thread_index
-                    })
-                    .map(|(_, bytes)| {
+                    .map(|bytes| {
                         let payer = Keypair::try_from(&bytes[..])
                             .expect("payer bytes round-trip");
                         client.sender(Rc::new(payer))
@@ -262,14 +274,13 @@ fn execute_cell_burst(
                     let mut signed = Vec::with_capacity(chunk.len());
                     for &global_id in chunk {
                         let ixs = build_ixs(
-                            &programs,
-                            &pools,
+                            &accounts,
                             global_id,
                             iters,
                             raise_budget,
                         );
                         let sender =
-                            &senders[(global_id as usize) % senders.len()];
+                            &senders[slot_of(global_id, senders.len())];
                         let tx = sender
                             .prepare(&ixs)
                             .await
@@ -406,6 +417,73 @@ async fn drain_processed(er: &ErCtx, target: f64) -> Result<Duration> {
     Ok(started.elapsed())
 }
 
+// Samples the engine's busy-executor gauge from a side thread while a cell
+// blasts and drains: the direct read of pool utilisation, unaffected by the
+// driver threads sharing the host with the validator.
+struct BusySampler {
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<Vec<f64>>>,
+}
+
+struct BusySamples {
+    mean: f64,
+    max: f64,
+    count: usize,
+}
+
+impl BusySampler {
+    fn spawn(metrics_url: String) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = stop.clone();
+        let handle = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("sampler runtime build is infallible");
+            runtime.block_on(async move {
+                let mut samples = Vec::new();
+                while !flag.load(Ordering::Relaxed) {
+                    if let Ok(metrics) = api::scrape_metrics(&metrics_url).await
+                    {
+                        if let Some(busy) = metrics.get(BUSY_EXECUTORS) {
+                            samples.push(busy);
+                        }
+                    }
+                    tokio::time::sleep(BUSY_SAMPLE_INTERVAL).await;
+                }
+                samples
+            })
+        });
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn finish(mut self) -> BusySamples {
+        self.stop.store(true, Ordering::Relaxed);
+        let samples = self
+            .handle
+            .take()
+            .and_then(|handle| handle.join().ok())
+            .unwrap_or_default();
+        let count = samples.len();
+        let mean = if count > 0 {
+            samples.iter().sum::<f64>() / count as f64
+        } else {
+            0.0
+        };
+        let max = samples.iter().copied().fold(0.0, f64::max);
+        BusySamples { mean, max, count }
+    }
+}
+
+impl Drop for BusySampler {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
 struct Cell {
     label: &'static str,
     iters: u32,
@@ -417,9 +495,14 @@ struct Cell {
     cores: f64,
     top_thread_cores: f64,
     busy_threads: usize,
+    busy: BusySamples,
     validator_txs: Option<f64>,
+    dependencies: Option<f64>,
+    blocked: Option<f64>,
     staged: u64,
     iterations: u64,
+    dropped: Option<f64>,
+    execution_failed: Option<f64>,
 }
 
 impl Cell {
@@ -429,6 +512,13 @@ impl Cell {
 
     fn executed_tps(&self, iterations: u64) -> f64 {
         iterations as f64 / (self.outcome.wall + self.drain).as_secs_f64()
+    }
+
+    // Share of the cell's transactions that registered behind an unfinished
+    // predecessor: how often two in-window transactions shared an account.
+    fn dependency_ratio(&self) -> Option<f64> {
+        self.dependencies
+            .map(|dependencies| dependencies / self.iterations.max(1) as f64)
     }
 }
 
@@ -443,35 +533,33 @@ impl Scenario for ExecutorSaturation {
     async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
         let (profile, _) =
             profile::select(self.name(), base.config(), &PROFILES);
-        let programs: Arc<Vec<Pubkey>> =
-            Arc::new(topology::redline_alias_ids(profile.programs));
-        for program in programs.iter() {
-            let deployed = base.account(program).await?;
-            if !deployed.map(|account| account.executable).unwrap_or(false) {
-                return Err(format!(
-                    "alias program {program} is not on the base chain — the \
-                     running stack predates program aliases; run `stack down` \
-                     and retry"
-                )
-                .into());
+
+        let prep_started = Instant::now();
+        let mut payers: Vec<Keypair> = Vec::with_capacity(profile.accounts);
+        while payers.len() < profile.accounts {
+            let count = PREP_CHUNK.min(profile.accounts - payers.len());
+            let funded = join_all(
+                (0..count).map(|_| prep::funded_payer(base, PAYER_LAMPORTS)),
+            )
+            .await;
+            for payer in funded {
+                payers.push(payer?);
             }
         }
-
-        let payers =
-            prep::funded_payers(base, profile.payers, PAYER_LAMPORTS).await?;
-        let prep_started = Instant::now();
-        let mut pools: Vec<Vec<Pubkey>> = Vec::with_capacity(profile.programs);
-        for program in programs.iter() {
-            let pool = crate::init_delegated_accounts_batched_at(
-                *program,
+        // One delegated account per payer, so `accounts[i]` is owned and
+        // signed for by `payers[i]`.
+        let mut accounts: Vec<Pubkey> = Vec::with_capacity(profile.accounts);
+        for chunk in payers.chunks(PREP_CHUNK) {
+            let pdas = crate::init_delegated_accounts_batched_at(
+                PROGRAM,
                 base,
-                &payers,
-                profile.accounts_per_program,
+                chunk,
+                chunk.len(),
                 crate::ACCOUNT_SPACE,
                 er.identity(),
             )
             .await?;
-            for pda in &pool {
+            for pda in &pdas {
                 check::poll(
                     &format!("the ER clones the delegated pda {pda}"),
                     CLONE_TIMEOUT,
@@ -481,16 +569,15 @@ impl Scenario for ExecutorSaturation {
                 )
                 .await?;
             }
-            pools.push(pool);
+            accounts.extend(pdas);
         }
         eprintln!(
-            "[redsuite] {}: prepped {} programs x {} delegated accounts in {:.1} s",
+            "[redsuite] {}: prepped {} payers x 1 delegated account in {:.1} s",
             self.name(),
-            profile.programs,
-            profile.accounts_per_program,
+            profile.accounts,
             prep_started.elapsed().as_secs_f64(),
         );
-        let pools = Arc::new(pools);
+        let accounts = Arc::new(accounts);
         let payer_bytes: Arc<Vec<[u8; 64]>> =
             Arc::new(payers.iter().map(|payer| payer.to_bytes()).collect());
         let er_rpc_url = er.api().url().to_owned();
@@ -509,8 +596,7 @@ impl Scenario for ExecutorSaturation {
                 concurrency: profile.concurrency,
             },
             0,
-            programs.clone(),
-            pools.clone(),
+            accounts.clone(),
             payer_bytes.clone(),
             LIGHT_ITERS,
             false,
@@ -536,6 +622,7 @@ impl Scenario for ExecutorSaturation {
             let probe: Arc<OnceLock<Signature>> = Arc::new(OnceLock::new());
             let before = er.scrape_metrics().await?;
             let cpu_before = host::cpu_sample(er_pid)?;
+            let sampler = BusySampler::spawn(er.metrics_url().to_owned());
             let burst = execute_cell_burst(
                 er_rpc_url.clone(),
                 BurstConfig {
@@ -546,8 +633,7 @@ impl Scenario for ExecutorSaturation {
                     concurrency: profile.cell_concurrency(label),
                 },
                 offset,
-                programs.clone(),
-                pools.clone(),
+                accounts.clone(),
                 payer_bytes.clone(),
                 iters,
                 raise_budget,
@@ -567,20 +653,37 @@ impl Scenario for ExecutorSaturation {
                 }
                 None => Duration::ZERO,
             };
+            let busy = sampler.finish();
             let cpu_after = host::cpu_sample(er_pid)?;
             let after = er.scrape_metrics().await?;
             let delta = MetricsDelta::new(before, after);
 
-            if let Some(failed) =
-                delta.counter_all(crate::metrics::FAILED_TRANSACTIONS)
-            {
+            let failed_kind = |kind: &str| {
+                delta.counter(&format!(
+                    "{}{{kind=\"{kind}\"}}",
+                    crate::metrics::FAILED_TRANSACTIONS
+                ))
+            };
+            let dropped = failed_kind("dropped");
+            let execution_failed = failed_kind("execution");
+            if let Some(dropped) = dropped {
                 check_eq!(
-                    failed,
+                    dropped,
                     0.0,
-                    "{label}: the validator dropped or failed {failed:.0} of \
-                     {cell_iterations} transactions — a staged backlog that \
-                     outlives the 60 s blockhash window is dropped unexecuted; \
-                     reduce this profile's backlog"
+                    "{label}: the sequencer dropped {dropped:.0} of \
+                     {cell_iterations} transactions before execution — either \
+                     a duplicate signature or a blockhash already outside the \
+                     60 s window. Staging plus blasting took longer than that \
+                     window, or ids collided across cells"
+                )?;
+            }
+            if let Some(execution_failed) = execution_failed {
+                check_eq!(
+                    execution_failed,
+                    0.0,
+                    "{label}: {execution_failed:.0} of {cell_iterations} \
+                     transactions reached the SVM and failed there — compare \
+                     the probe's consumed CUs against the {CU_LIMIT} CU limit"
                 )?;
             }
 
@@ -620,15 +723,22 @@ impl Scenario for ExecutorSaturation {
                     .iter()
                     .filter(|cores| **cores >= BUSY_THREAD_CORES)
                     .count(),
+                busy,
                 validator_txs: delta.counter(TX_COUNT),
+                dependencies: delta.counter(ORDERING_DEPENDENCIES),
+                blocked: delta.counter(BLOCKED_TRANSACTIONS),
                 staged: burst.staged,
                 iterations: cell_iterations,
+                dropped,
+                execution_failed,
             };
             eprintln!(
                 "[redsuite] {}: {label} (sha256 iters {iters}): signed in {:.1} s, \
                  blasted in {:.1} s ({:.0} tps delivered), {:.0} tps executed \
                  (drain {:.1} s), p50 {} us / p95 {} us, probe {:.0} cus, \
-                 validator cores {:.2} (top thread {:.2}, {} threads >= {:.1})",
+                 busy executors mean {:.1} / max {:.0} over {} samples, \
+                 dependency ratio {:.3}, validator cores {:.2} (top thread \
+                 {:.2}, {} threads >= {:.1})",
                 self.name(),
                 cell.sign_s,
                 cell.blast_s,
@@ -638,6 +748,10 @@ impl Scenario for ExecutorSaturation {
                 cell.outcome.delivery.median,
                 cell.outcome.delivery.quantile95,
                 cell.probe_cus,
+                cell.busy.mean,
+                cell.busy.max,
+                cell.busy.count,
+                cell.dependency_ratio().unwrap_or(f64::NAN),
                 cell.cores,
                 cell.top_thread_cores,
                 cell.busy_threads,
@@ -650,14 +764,9 @@ impl Scenario for ExecutorSaturation {
                     .setting("sha256 iters", cell.iters)
                     .setting(
                         "shape",
-                        "width-1 sha256 hash-chain, programs round-robin",
+                        "width-1 sha256 hash-chain, one payer per account",
                     )
-                    .setting("programs", profile.programs)
-                    .setting(
-                        "accounts per program",
-                        profile.accounts_per_program,
-                    )
-                    .setting("payers", profile.payers)
+                    .setting("accounts", profile.accounts)
                     .setting("driver threads", profile.threads)
                     .setting("measured iters", cell_iterations)
                     .setting("mode", profile.mode())
@@ -679,6 +788,19 @@ impl Scenario for ExecutorSaturation {
                     .metric("blast s", Unit::Seconds, cell.blast_s)
                     .metric("drain s", Unit::Seconds, cell.drain.as_secs_f64())
                     .metric("probe consumed cus", Unit::Count, cell.probe_cus)
+                    .metric("busy executors mean", Unit::Count, cell.busy.mean)
+                    .metric("busy executors max", Unit::Count, cell.busy.max)
+                    .metric_if(
+                        "dependency ratio",
+                        Unit::Ratio,
+                        cell.dependency_ratio(),
+                    )
+                    .metric_if(
+                        "ordering dependencies",
+                        Unit::Count,
+                        cell.dependencies,
+                    )
+                    .metric_if("blocked txs", Unit::Count, cell.blocked)
                     .metric("validator cores", Unit::Count, cell.cores)
                     .metric(
                         "top thread cores",
@@ -694,6 +816,12 @@ impl Scenario for ExecutorSaturation {
                         "validator txs in window",
                         Unit::Count,
                         cell.validator_txs,
+                    )
+                    .metric_if("dropped txs", Unit::Count, cell.dropped)
+                    .metric_if(
+                        "execution failed txs",
+                        Unit::Count,
+                        cell.execution_failed,
                     );
             match report::persist_cell(self.name(), &cell_report) {
                 Ok(path) => {
@@ -706,21 +834,21 @@ impl Scenario for ExecutorSaturation {
             cells.push(cell);
         }
 
+        // The heavy cell covers every account (its ids span a multiple of
+        // `accounts`), so each must hold the heavy chain.
         let expected_hash =
             hash_chain(HASH_INIT.to_bytes(), profile.heavy_iters);
-        for (program_index, pool) in pools.iter().enumerate() {
-            for (pda_index, pda) in pool.iter().enumerate() {
-                let on_er = er.account(pda).await?.ok_or("pda not on er")?;
-                let hash_bytes = &on_er.data[layout::HASH_OFFSET
-                    ..layout::HASH_OFFSET + layout::HASH_SIZE];
-                check_eq!(
-                    hash_bytes,
-                    expected_hash,
-                    "program {program_index} pda {pda_index} must hold the \
-                     {}-iteration hash chain — heavy work was not executed",
-                    profile.heavy_iters
-                )?;
-            }
+        for (index, pda) in accounts.iter().enumerate() {
+            let on_er = er.account(pda).await?.ok_or("pda not on er")?;
+            let hash_bytes = &on_er.data
+                [layout::HASH_OFFSET..layout::HASH_OFFSET + layout::HASH_SIZE];
+            check_eq!(
+                hash_bytes,
+                expected_hash,
+                "account {index} must hold the {}-iteration hash chain — \
+                 heavy work was not executed",
+                profile.heavy_iters
+            )?;
         }
 
         let light = &cells[0];
@@ -736,12 +864,13 @@ impl Scenario for ExecutorSaturation {
 
         let mut summary = ScenarioReport::ok(self.name())
             .setting("profile", profile.name)
-            .setting("shape", "width-1 sha256 hash-chain, programs round-robin")
-            .setting("programs", profile.programs)
-            .setting("accounts per program", profile.accounts_per_program)
+            .setting(
+                "shape",
+                "width-1 sha256 hash-chain, one payer per account",
+            )
+            .setting("accounts", profile.accounts)
             .setting("light iters", LIGHT_ITERS)
             .setting("heavy iters", profile.heavy_iters)
-            .setting("payers", profile.payers)
             .setting("driver threads", profile.threads)
             .setting("measured iters", profile.iterations)
             .setting("heavy measured iters", profile.heavy_iterations)
@@ -806,6 +935,21 @@ impl Scenario for ExecutorSaturation {
                     format!("{} probe consumed cus", cell.label),
                     Unit::Count,
                     cell.probe_cus,
+                )
+                .metric(
+                    format!("{} busy executors mean", cell.label),
+                    Unit::Count,
+                    cell.busy.mean,
+                )
+                .metric(
+                    format!("{} busy executors max", cell.label),
+                    Unit::Count,
+                    cell.busy.max,
+                )
+                .metric_if(
+                    format!("{} dependency ratio", cell.label),
+                    Unit::Ratio,
+                    cell.dependency_ratio(),
                 )
                 .metric(
                     format!("{} validator cores", cell.label),
