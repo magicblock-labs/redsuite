@@ -28,14 +28,10 @@ use signature::Signature;
 
 use crate::program::{instruction::build, layout, utils::hash_chain};
 
-// Each payer funds one delegated account: init + delegate on the base chain
-// and zero-fee load on the ER.
 const PAYER_LAMPORTS: u64 = 200_000_000;
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(900);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const CLONE_TIMEOUT: Duration = Duration::from_secs(60);
-// A burst of fresh delegations wedges the ER's discovery cloner; prep funds
-// and delegates in chunks and hydrates each chunk before the next.
 const PREP_CHUNK: usize = 32;
 const BUSY_SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
 const TX_COUNT: &str = crate::metrics::ENGINE_TRANSACTIONS;
@@ -49,13 +45,6 @@ const CU_LIMIT: u32 = 1_400_000;
 const CU_CONTRAST_FLOOR: f64 = 10.0;
 const BUSY_THREAD_CORES: f64 = 0.5;
 
-// The sequencer orders transactions by static account key and the fee payer
-// is always writable, so every payer is a serial chain. Its pending window is
-// 16 x executors; `accounts` (= payers) must exceed that window or the window
-// fills with same-payer chains and the per-slot drain pays their depth
-// serially. One payer per delegated account makes payer and account chains
-// coincide, and transaction ids map onto accounts round-robin so a contiguous
-// run of ids never repeats an account.
 struct Profile {
     name: &'static str,
     accounts: usize,
@@ -166,8 +155,6 @@ fn consumed_cus(logs: &[String]) -> Option<f64> {
     })
 }
 
-// Account (and payer) slot of a transaction id: ids are 1-based and
-// contiguous, so any run of `len` consecutive ids covers every slot once.
 fn slot_of(global_id: u64, len: usize) -> usize {
     (global_id - 1) as usize % len
 }
@@ -250,8 +237,6 @@ fn execute_cell_burst(
             let local = tokio::task::LocalSet::new();
             let result = runtime.block_on(local.run_until(async move {
                 let client = ErClient::new(er_rpc_url);
-                // Every thread signs for every payer: the payer of a
-                // transaction is fixed by its id, not by the thread.
                 let senders: Vec<TxSender> = payer_bytes
                     .iter()
                     .map(|bytes| {
@@ -417,9 +402,6 @@ async fn drain_processed(er: &ErCtx, target: f64) -> Result<Duration> {
     Ok(started.elapsed())
 }
 
-// Samples the engine's busy-executor gauge from a side thread while a cell
-// blasts and drains: the direct read of pool utilisation, unaffected by the
-// driver threads sharing the host with the validator.
 struct BusySampler {
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<Vec<f64>>>,
@@ -514,8 +496,6 @@ impl Cell {
         iterations as f64 / (self.outcome.wall + self.drain).as_secs_f64()
     }
 
-    // Share of the cell's transactions that registered behind an unfinished
-    // predecessor: how often two in-window transactions shared an account.
     fn dependency_ratio(&self) -> Option<f64> {
         self.dependencies
             .map(|dependencies| dependencies / self.iterations.max(1) as f64)
@@ -546,8 +526,6 @@ impl Scenario for ExecutorSaturation {
                 payers.push(payer?);
             }
         }
-        // One delegated account per payer, so `accounts[i]` is owned and
-        // signed for by `payers[i]`.
         let mut accounts: Vec<Pubkey> = Vec::with_capacity(profile.accounts);
         for chunk in payers.chunks(PREP_CHUNK) {
             let pdas = crate::init_delegated_accounts_batched_at(
@@ -834,9 +812,6 @@ impl Scenario for ExecutorSaturation {
             cells.push(cell);
         }
 
-        // Heavy ids are contiguous and `heavy_iterations >= accounts`, so the
-        // round-robin reaches every slot at least once and each account must
-        // hold the heavy chain.
         let expected_hash =
             hash_chain(HASH_INIT.to_bytes(), profile.heavy_iters);
         for (index, pda) in accounts.iter().enumerate() {

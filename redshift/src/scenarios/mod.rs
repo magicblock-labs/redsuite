@@ -3,3 +3,4 @@ pub mod committor;
 pub mod harness;
 pub mod pubsub;
 pub mod scheduler;
+pub mod storage;
