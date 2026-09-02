@@ -114,10 +114,11 @@ flock, `genesis-accounts/`, logs, ledgers).
 
 Scenario isolation comes from fresh keypairs, not fresh chains.
 Scenarios that kill a validator, restart one, or need their own config boot
-private ERs. `task_scheduler`, `config_gates`, and `aml_gate` run on one
-instead of the shared ER; `restart_under_load`, `ws_conn_capacity`,
-`clone_lru_churn`, `cold_hydration_tail`, `ensure_gate_stall`, and
-`storage_prodsize_sustain` boot theirs beside the shared stack. Each takes
+private ERs. `task_scheduler`, `config_gates`, `aml_gate`, and
+`ledger_retention` run on one instead of the shared ER; `restart_under_load`,
+`ws_conn_capacity`, `clone_lru_churn`, `cold_hydration_tail`,
+`ensure_gate_stall`, `storage_prodsize_sustain`, and
+`superblock_boundary_latency` boot theirs beside the shared stack. Each takes
 its own identity from a 32-slot pool minted at genesis, so private ERs never
 collide with the shared one or each other.
 
@@ -171,8 +172,13 @@ scheduler:
 - `hot_account_cliff` — sends a fixed transaction rate at fewer and fewer
   accounts (32 down to 4) so they all fight over the same account locks.
 - `executor_saturation` — pre-signs a large pile of transactions and fires
-  them all at once, spread over many independent accounts and several copies
-  of the test program.
+  them all at once, one payer per delegated account so no two in-flight
+  transactions share a writable key; reports the engine's busy-executor
+  gauge and ordering-dependency count alongside throughput.
+- `mixed_sustained_load` — holds a fixed transaction rate over many payer
+  lanes while cycling the workload every 20 slots: two slots of high-CU
+  sha256 work, nine of simple writes, nine of read-write transactions. The
+  validator must keep up without drops or failures and drain the backlog.
 
 chainlink (account cloning / subscriptions):
 
@@ -200,6 +206,9 @@ storage:
 - `storage_prodsize_sustain` — sustained load against a validator with
   production-sized storage settings, measured as two equal back-to-back
   windows.
+- `superblock_boundary_latency` — boots a private ER with short superblocks,
+  fills its ledger, then offers a steady rate and compares the latency of
+  requests that land on a superblock seal against the ones that do not.
 
 lifecycle (restart / shutdown):
 
@@ -360,6 +369,17 @@ pubsub (websocket subscriptions):
   and slots, then makes transfers and checks every promised notification
   arrives with the right content. After unsubscribing, sends more transfers
   and checks nothing arrives.
+
+storage (ledger retention):
+
+- `ledger_retention` — boots a private ER with 40-slot superblocks and a
+  one-byte ledger size limit, so retention purges the oldest sealed
+  superblock at every check. Sends counter adds across superblocks, and at
+  each of at least three purges confirms only the oldest history vanished:
+  pruned transactions and their blocks return null, retained ones stay
+  queryable, getSignaturesForAddress lists exactly the retained set, and the
+  counter holds every add. Then restarts the ER in place without reset and
+  checks the same history and state survive.
 
 ## redhat scenarios
 

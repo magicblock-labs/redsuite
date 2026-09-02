@@ -145,6 +145,11 @@ pub mod redshift {
             resources: [Resource::Er],
             fixtures: [Fixture::RedshiftProgram],
         },
+        ledger_retention => storage::ledger_retention::LedgerRetention {
+            topology: PrivateEr,
+            resources: [Resource::Er],
+            fixtures: [Fixture::RedshiftProgram],
+        },
         api_invariants => harness::api_invariants::ApiInvariants {
             topology: Shared,
             resources: [Resource::Er],
