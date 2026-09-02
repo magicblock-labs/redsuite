@@ -228,10 +228,13 @@ impl Scenario for RpcCapacityBlast {
 async fn settle_ledger(er: &ErCtx, baseline: f64, expected: f64) {
     let deadline = tokio::time::Instant::now() + LEDGER_SETTLE_TIMEOUT;
     loop {
-        let committed = er
-            .scrape_metrics()
+        // The scrape's own client timeout (10 s) exceeds the settle window;
+        // cap each scrape at the remaining deadline so a stalled metrics
+        // endpoint cannot hold settlement past it.
+        let committed = tokio::time::timeout_at(deadline, er.scrape_metrics())
             .await
             .ok()
+            .and_then(|scraped| scraped.ok())
             .and_then(|metrics| {
                 metrics.get(crate::metrics::ENGINE_TRANSACTIONS)
             })

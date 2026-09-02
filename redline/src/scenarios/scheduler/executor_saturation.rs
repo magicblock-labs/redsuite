@@ -834,8 +834,9 @@ impl Scenario for ExecutorSaturation {
             cells.push(cell);
         }
 
-        // The heavy cell covers every account (its ids span a multiple of
-        // `accounts`), so each must hold the heavy chain.
+        // Heavy ids are contiguous and `heavy_iterations >= accounts`, so the
+        // round-robin reaches every slot at least once and each account must
+        // hold the heavy chain.
         let expected_hash =
             hash_chain(HASH_INIT.to_bytes(), profile.heavy_iters);
         for (index, pda) in accounts.iter().enumerate() {
