@@ -159,6 +159,7 @@ async fn superblocks(er: &ErCtx) -> Result<u64> {
 }
 
 struct Lanes {
+    admit: Rc<Cell<bool>>,
     stop: Rc<Cell<bool>>,
     records: Rc<RefCell<Vec<Record>>>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
@@ -171,6 +172,7 @@ impl Lanes {
         pool: &Rc<Vec<Pubkey>>,
         next_id: Rc<Cell<u64>>,
     ) -> Self {
+        let admit = Rc::new(Cell::new(true));
         let stop = Rc::new(Cell::new(false));
         let records = Rc::new(RefCell::new(Vec::new()));
         let tasks = senders
@@ -180,11 +182,12 @@ impl Lanes {
                 let account = pool[lane];
                 let sender = sender.clone();
                 let api = api.clone();
+                let admit = admit.clone();
                 let stop = stop.clone();
                 let records = records.clone();
                 let next_id = next_id.clone();
                 tokio::task::spawn_local(async move {
-                    while !stop.get() {
+                    while admit.get() && !stop.get() {
                         let id = next_id.get();
                         next_id.set(id + 1);
                         let ix = build::expensive_hash_compute_at(
@@ -221,6 +224,7 @@ impl Lanes {
             })
             .collect();
         Self {
+            admit,
             stop,
             records,
             tasks,
@@ -228,6 +232,7 @@ impl Lanes {
     }
 
     fn halt(&self) {
+        self.admit.set(false);
         self.stop.set(true);
     }
 
@@ -239,8 +244,8 @@ impl Lanes {
             .count()
     }
 
-    async fn join(self) -> Result<Vec<Record>> {
-        self.stop.set(true);
+    async fn drain(self) -> Result<Vec<Record>> {
+        self.admit.set(false);
         for task in self.tasks {
             task.await.map_err(|error| format!("lane task: {error}"))?;
         }
@@ -291,11 +296,11 @@ where
 }
 
 async fn resolve(api: &Api, records: &mut [Record]) -> Result<()> {
-    let grace_ends = tokio::time::Instant::now() + RESOLVE_GRACE;
     for record in records.iter_mut() {
         if !matches!(record.outcome, Outcome::Unresolved | Outcome::Rejected) {
             continue;
         }
+        let grace_ends = tokio::time::Instant::now() + RESOLVE_GRACE;
         loop {
             match api.get_transaction(&record.signature).await? {
                 Some(tx) => {
@@ -519,7 +524,7 @@ async fn run_mode(
     lanes.halt();
     let first = private.restart(mode.restart_config()).await?;
     check_exit(mode, &format!("{label} first restart"), &first)?;
-    let mut records = lanes.join().await?;
+    let mut records = lanes.drain().await?;
     let at_kill = Tally::of(&records);
     check!(
         at_kill.confirmed > 0,
@@ -577,7 +582,8 @@ async fn run_mode(
     )
     .await?;
     let superblocks_crossed = superblocks(er).await? - superblocks_before;
-    let resumed_records = resumed.join().await?;
+    let mut resumed_records = resumed.drain().await?;
+    resolve(&api, &mut resumed_records).await?;
     let resume = Tally::of(&resumed_records);
     check!(
         resume.confirmed > 0,
