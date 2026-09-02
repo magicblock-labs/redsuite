@@ -212,8 +212,14 @@ storage:
 
 lifecycle (restart / shutdown):
 
-- `restart_under_load` — boots a validator with a large database,
-  fills it, then restarts the process in place. Times the shutdown and startup.
+- `restart_under_load` — runs twice on fresh private validators, once
+  stopped with SIGTERM and once with SIGKILL, never resetting storage. Lanes
+  write to one account each and track every transaction; at termination new
+  work stops and each transaction is confirmed, failed, or unresolved. After
+  the relaunch every unresolved signature is resolved, every confirmed one
+  must still be in the ledger, and each account must hold the id of its last
+  confirmed write. Load then resumes until another superblock seals and drains
+  cleanly, and a second restart must preserve that state. Times both restarts.
 
 harness:
 
