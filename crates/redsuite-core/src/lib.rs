@@ -25,6 +25,7 @@ pub use api::{Api, BatchBody, Metrics, MetricsDelta};
 pub use check::CheckError;
 pub use context::{BaseCtx, ChainCtx, ErClient, ErCtx, TxSender};
 pub use report::ScenarioReport;
+pub use resources::LaunchRecord;
 pub use scenario::{
     run_private_er_scenario, run_shared_scenario, Phase, PhaseOutcome,
     PrivateErScenario, RunError, RunRecord, Scenario, ScenarioOutcome,

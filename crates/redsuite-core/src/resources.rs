@@ -3,7 +3,35 @@ use std::{
     rc::Rc,
 };
 
+use json::{Deserialize, Serialize};
+
 use crate::{host, DynError};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchRecord {
+    pub label: String,
+    pub role: String,
+    pub bin: String,
+    pub bin_version: String,
+    pub bin_fingerprint: String,
+    pub identity: String,
+    pub launched_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rpc_port: Option<u16>,
+    pub metrics_port: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replication_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<String>,
+    pub storage_dir: String,
+    pub log: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<String>,
+    #[serde(default)]
+    pub pid: u32,
+    #[serde(default)]
+    pub relaunches: u32,
+}
 
 #[derive(Default)]
 pub struct Resources {
@@ -11,15 +39,47 @@ pub struct Resources {
 }
 
 impl Resources {
+    #[cfg(test)]
     pub(crate) fn register(&self, label: &str, pid: u32) -> Rc<ResourceRecord> {
         let record = Rc::new(ResourceRecord {
             label: label.to_owned(),
             pid: Cell::new(pid),
             finished: Cell::new(false),
             finish_error: RefCell::new(None),
+            launch: None,
+            relaunches: Cell::new(0),
         });
         self.records.borrow_mut().push(record.clone());
         record
+    }
+
+    pub(crate) fn register_launch(
+        &self,
+        launch: LaunchRecord,
+    ) -> Rc<ResourceRecord> {
+        let record = Rc::new(ResourceRecord {
+            label: launch.label.clone(),
+            pid: Cell::new(launch.pid),
+            finished: Cell::new(false),
+            finish_error: RefCell::new(None),
+            launch: Some(launch),
+            relaunches: Cell::new(0),
+        });
+        self.records.borrow_mut().push(record.clone());
+        record
+    }
+
+    pub(crate) fn launches(&self) -> Vec<LaunchRecord> {
+        self.records
+            .borrow()
+            .iter()
+            .filter_map(|record| {
+                let mut launch = record.launch.clone()?;
+                launch.pid = record.pid.get();
+                launch.relaunches = record.relaunches.get();
+                Some(launch)
+            })
+            .collect()
     }
 
     // Audits every private ER booted against this run's base: an explicit
@@ -55,12 +115,15 @@ pub(crate) struct ResourceRecord {
     pid: Cell<u32>,
     finished: Cell<bool>,
     finish_error: RefCell<Option<String>>,
+    launch: Option<LaunchRecord>,
+    relaunches: Cell<u32>,
 }
 
 impl ResourceRecord {
     pub(crate) fn relaunched(&self, pid: u32) {
         self.pid.set(pid);
         self.finished.set(false);
+        self.relaunches.set(self.relaunches.get() + 1);
     }
 
     pub(crate) fn mark_finished(&self) {
@@ -114,5 +177,42 @@ mod tests {
         record.mark_finished();
         record.relaunched(std::process::id());
         assert_eq!(resources.audit().len(), 1);
+    }
+
+    fn launch(label: &str, pid: u32) -> LaunchRecord {
+        LaunchRecord {
+            label: label.to_owned(),
+            role: "verifier".to_owned(),
+            bin: "/x/magicblock-verifier".to_owned(),
+            bin_version: "v".to_owned(),
+            bin_fingerprint: "1-2".to_owned(),
+            identity: "id".to_owned(),
+            launched_at: "20260903T080000Z".to_owned(),
+            rpc_port: None,
+            metrics_port: 9001,
+            replication_port: None,
+            upstream: Some("127.0.0.1:7802".to_owned()),
+            storage_dir: "/x/storage".to_owned(),
+            log: "/x/verifier.log".to_owned(),
+            config: Some("/x/storage/verifier.toml".to_owned()),
+            pid,
+            relaunches: 0,
+        }
+    }
+
+    #[test]
+    fn launches_report_the_current_pid_and_relaunch_count() {
+        let resources = Resources::default();
+        resources.register("plain", u32::MAX - 1).mark_finished();
+        let record = resources.register_launch(launch("v0", u32::MAX - 1));
+        record.mark_finished();
+        record.relaunched(u32::MAX - 2);
+        record.mark_finished();
+        let launches = resources.launches();
+        assert_eq!(launches.len(), 1);
+        assert_eq!(launches[0].label, "v0");
+        assert_eq!(launches[0].pid, u32::MAX - 2);
+        assert_eq!(launches[0].relaunches, 1);
+        assert!(resources.audit().is_empty());
     }
 }

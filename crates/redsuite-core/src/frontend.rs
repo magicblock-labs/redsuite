@@ -6,6 +6,11 @@ pub const ENV_VARS: &[(&str, &str)] = &[
         "the ER binary under test (else `magicblock-validator` on PATH)",
     ),
     (
+        topology::VERIFIER_BIN_ENV,
+        "the verifier binary for replicated topologies (else beside the ER \
+         binary, else on PATH)",
+    ),
+    (
         topology::ROOT_ENV,
         "workspace root, when the binary runs outside the checkout",
     ),

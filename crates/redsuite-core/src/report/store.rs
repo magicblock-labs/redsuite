@@ -240,6 +240,7 @@ fn decode_v0(file: String, doc: V0Doc) -> LegacyRun {
             config: doc.report.config,
             measurements,
             failures: doc.failures,
+            launches: Vec::new(),
         },
     }
 }
@@ -299,6 +300,7 @@ mod tests {
             config: Vec::new(),
             measurements: Vec::new(),
             failures: Vec::new(),
+            launches: Vec::new(),
         }
     }
 
@@ -404,6 +406,7 @@ mod tests {
             config: Vec::new(),
             measurements: Vec::new(),
             failures: Vec::new(),
+            launches: Vec::new(),
         };
         fs::write(
             campaign.join("redline-high_cu.json"),

@@ -17,6 +17,7 @@ use json::{Deserialize, Serialize};
 
 use crate::{
     api,
+    resources::LaunchRecord,
     scenario::{failed_check, RunRecord, ScenarioOutcome},
     stats::ObservationsStats,
     topology,
@@ -194,6 +195,8 @@ pub struct ScenarioRun {
     pub measurements: Vec<Measurement>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failures: Vec<PersistedFailure>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub launches: Vec<LaunchRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -279,18 +282,22 @@ pub fn persist_run(record: &RunRecord) -> Result<PathBuf> {
     let dir = campaign_dir();
     ensure_campaign(&dir)?;
     warn_on_stack_skew();
-    write_scenario_run(&dir, &scenario_run_doc(report, &failures))
+    write_scenario_run(
+        &dir,
+        &scenario_run_doc(report, &failures, &record.launches),
+    )
 }
 
 pub fn persist_cell(parent: &str, report: &ScenarioReport) -> Result<PathBuf> {
     let dir = campaign_dir();
     ensure_campaign(&dir)?;
-    append_cell(&dir, parent, &scenario_run_doc(report, &[]))
+    append_cell(&dir, parent, &scenario_run_doc(report, &[], &[]))
 }
 
 fn scenario_run_doc(
     report: &ScenarioReport,
     failures: &[PersistedFailure],
+    launches: &[LaunchRecord],
 ) -> ScenarioRun {
     ScenarioRun {
         schema: SCHEMA_VERSION,
@@ -300,6 +307,7 @@ fn scenario_run_doc(
         config: report.config.clone(),
         measurements: report.measurements.clone(),
         failures: failures.to_vec(),
+        launches: launches.to_vec(),
     }
 }
 
@@ -469,9 +477,7 @@ fn er_identity() -> (String, String, String) {
         .unwrap_or_else(|| "unknown".into());
     let er_version = er
         .as_deref()
-        .and_then(|bin| Command::new(bin).arg("--version").output().ok())
-        .filter(|out| out.status.success())
-        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+        .map(binary_version)
         .unwrap_or_else(|| "unknown".into());
     let er_fingerprint = er
         .as_deref()
@@ -496,6 +502,45 @@ fn warn_on_stack_skew() {
     }
 }
 
+pub(crate) fn binary_provenance(path: &std::path::Path) -> (String, String) {
+    (binary_version(path), fingerprint(path))
+}
+
+// A validator prints its version and then its shutdown log lines; only the
+// first line names the build, and terminal colour codes are noise.
+fn binary_version(path: &std::path::Path) -> String {
+    Command::new(path)
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| version_line(&String::from_utf8_lossy(&out.stdout)))
+        .unwrap_or_else(|| "unknown".into())
+}
+
+fn version_line(output: &str) -> Option<String> {
+    let line = output
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?;
+    let mut cleaned = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                for next in chars.by_ref() {
+                    if next.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        cleaned.push(ch);
+    }
+    Some(cleaned)
+}
+
 fn fingerprint(path: &std::path::Path) -> String {
     match fs::metadata(path) {
         Ok(meta) => {
@@ -511,7 +556,7 @@ fn fingerprint(path: &std::path::Path) -> String {
     }
 }
 
-fn utc_stamp() -> String {
+pub(crate) fn utc_stamp() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -557,6 +602,7 @@ mod tests {
                 "infrastructure",
                 "private ER `x` is still running",
             )],
+            &[],
         );
         let text = json::to_string(&doc).unwrap();
         let back: ScenarioRun = json::from_str(&text).unwrap();
@@ -599,6 +645,7 @@ mod tests {
             name: "redshift/example".into(),
             phases: Vec::new(),
             scenario: ScenarioOutcome::Failed(error),
+            launches: Vec::new(),
             wall_seconds: Some(1.0),
         };
         let failures = run_failures(&record);
@@ -672,6 +719,7 @@ mod tests {
             name: "redshift/example".into(),
             phases: Vec::new(),
             scenario: ScenarioOutcome::Panicked("index out of bounds".into()),
+            launches: Vec::new(),
             wall_seconds: Some(1.0),
         };
         let failures = run_failures(&record);
@@ -705,6 +753,7 @@ mod tests {
                 },
             ],
             scenario: ScenarioOutcome::Failed("assert blew up".into()),
+            launches: Vec::new(),
             wall_seconds: Some(1.5),
         };
 
@@ -734,6 +783,7 @@ mod tests {
             }],
             scenario: ScenarioOutcome::NotReached,
             wall_seconds: None,
+            launches: Vec::new(),
         };
 
         let failures = run_failures(&record);
@@ -773,12 +823,16 @@ mod tests {
             },
         )
         .unwrap();
-        let first =
-            write_scenario_run(&dir, &scenario_run_doc(&sample_report(), &[]))
-                .unwrap();
-        let second =
-            write_scenario_run(&dir, &scenario_run_doc(&sample_report(), &[]))
-                .unwrap();
+        let first = write_scenario_run(
+            &dir,
+            &scenario_run_doc(&sample_report(), &[], &[]),
+        )
+        .unwrap();
+        let second = write_scenario_run(
+            &dir,
+            &scenario_run_doc(&sample_report(), &[], &[]),
+        )
+        .unwrap();
         let cell = ScenarioReport::ok("redline/some_scenario/light").metric(
             "achieved tps",
             Unit::Tps,
@@ -787,7 +841,7 @@ mod tests {
         let journal = append_cell(
             &dir,
             "redline/some_scenario",
-            &scenario_run_doc(&cell, &[]),
+            &scenario_run_doc(&cell, &[], &[]),
         )
         .unwrap();
 
@@ -860,6 +914,20 @@ mod tests {
         assert_eq!(leftovers, 0);
 
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn version_line_keeps_the_first_line_without_colour_codes() {
+        let noisy = "magicblock-config 0.14.11\n\u{1b}[2m2026-09-03T08:59:47Z\u{1b}[0m \u{1b}[32m INFO\u{1b}[0m main runtime shutdown\n";
+        assert_eq!(
+            version_line(noisy).as_deref(),
+            Some("magicblock-config 0.14.11")
+        );
+        assert_eq!(
+            version_line("\n  \u{1b}[1mv1\u{1b}[0m  \n").as_deref(),
+            Some("v1")
+        );
+        assert_eq!(version_line("\n\n"), None);
     }
 
     #[test]

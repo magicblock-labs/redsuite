@@ -114,24 +114,42 @@ flock, `genesis-accounts/`, logs, ledgers).
 
 Scenario isolation comes from fresh keypairs, not fresh chains.
 Scenarios that kill a validator, restart one, or need their own config boot
-private ERs. `task_scheduler`, `config_gates`, `aml_gate`, and
-`ledger_retention` run on one instead of the shared ER; `restart_under_load`,
+private ERs. `task_scheduler`, `config_gates`, `aml_gate`,
+`ledger_retention`, and `verifier_lifecycle` run on one instead of the shared
+ER (`verifier_lifecycle` boots its private ER as a leader with two verifiers
+replicating from it); `restart_under_load`,
 `ws_conn_capacity`, `clone_lru_churn`, `cold_hydration_tail`,
 `ensure_gate_stall`, `storage_prodsize_sustain`, and
 `superblock_boundary_latency` boot theirs beside the shared stack. Each takes
 its own identity from a 32-slot pool minted at genesis, so private ERs never
 collide with the shared one or each other.
 
-The harness needs two binaries:
+The harness needs two binaries, and a third for replicated topologies:
 
 - base — `solana-test-validator` on PATH;
-- ER — `$MAGICBLOCK_VALIDATOR_BIN`, else `magicblock-validator` on PATH.
+- ER — `$MAGICBLOCK_VALIDATOR_BIN`, else `magicblock-validator` on PATH;
+- verifier — `$MAGICBLOCK_VERIFIER_BIN`, else `magicblock-verifier` beside
+  the ER binary, else on PATH. Only scenarios that boot a leader with
+  verifiers need it.
+
+A replicated topology (`topology::replicated`) is one private ER booted as a
+leader whose follower allowlist names N freshly minted verifier identities,
+plus N `magicblock-verifier` processes replicating from its listener. Every
+verifier gets its own identity, generated TOML, storage directory, log and
+metrics port, and a scenario can stop, start or restart each one on its own
+while the others keep following (a verifier killed before it archived a
+snapshot cannot reopen its storage; `reset_storage` wipes it so the next
+start rejoins from the leader's snapshot). Each launch is recorded in the run's
+report under `launches` (binary, version, identity, ports, storage, log,
+config, pid and relaunch count), and `redsuite stack down` reaps any
+leader, verifier or private ER a crashed run left behind.
 
 ## Environment
 
 | variable | what |
 |---|---|
 | `MAGICBLOCK_VALIDATOR_BIN` | the ER binary under test; else `magicblock-validator` on PATH |
+| `MAGICBLOCK_VERIFIER_BIN` | the verifier binary for replicated topologies; else beside the ER binary, else on PATH |
 | `REDSUITE_ROOT` | workspace root, when the `redsuite` binary runs outside a checkout |
 | `REDSUITE_CLONE_URL` | where a cold boot clones base programs from; defaults to mainnet-beta |
 | `REDSUITE_PROFILE` | scenario profile: `lite` (default), `full`, `soak`, or `deep` |
@@ -385,6 +403,17 @@ pubsub (websocket subscriptions):
   and slots, then makes transfers and checks every promised notification
   arrives with the right content. After unsubscribing, sends more transfers
   and checks nothing arrives.
+
+replication (leader + verifiers):
+
+- `verifier_lifecycle` — boots a private ER as a leader with two verifiers
+  following it, checks every node has its own identity, storage, log,
+  configuration and metrics port, and that both verifiers catch up with the
+  leader's transactions and blocks. Then it stops one verifier gracefully
+  while the other keeps following, restarts it and watches it reconnect and
+  catch up, and finally hard-kills the second verifier and keeps it offline
+  while the leader and the first verifier carry on, before letting it rejoin
+  from wiped storage. Teardown must reap every process the topology owns.
 
 storage (ledger retention):
 

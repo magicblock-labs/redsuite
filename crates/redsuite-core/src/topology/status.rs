@@ -9,6 +9,7 @@ pub fn status() -> Result<()> {
             "no shared stack ({} absent) — the first scenario boots it",
             state::state_path().display()
         );
+        describe_orphans(&[]);
         return Ok(());
     };
     let describe = |name: &str, pid: u32, bin: &str, port: u16| {
@@ -36,24 +37,54 @@ pub fn status() -> Result<()> {
     }
     println!("er identity   {}", state.er_identity);
     println!("logs          {}", state::stack_dir().display());
+    describe_orphans(&[state.base_pid, state.er_pid]);
     Ok(())
 }
 
+fn describe_orphans(exclude: &[u32]) {
+    let orphans =
+        process::orphaned_topology_processes(&state::stack_dir(), exclude);
+    if orphans.is_empty() {
+        return;
+    }
+    println!(
+        "{} scenario-owned process(es) still running outside the shared \
+         stack (private ERs, leaders or verifiers):",
+        orphans.len()
+    );
+    for (pid, cmdline) in orphans {
+        println!("  pid {pid:<8} {cmdline}");
+    }
+}
+
 pub fn down() -> Result<()> {
-    let Some(state) = state::read_state() else {
-        println!("no shared stack to stop");
-        return Ok(());
-    };
-    for (name, pid, bin) in [
-        ("er", state.er_pid, state.er_bin.as_str()),
-        ("base", state.base_pid, state.base_bin.as_str()),
-    ] {
-        if process::proc_matches(pid, bin) {
-            println!("stopping {name} (pid {pid})");
-            process::kill_pid(pid);
+    let mut known = Vec::new();
+    match state::read_state() {
+        None => println!("no shared stack to stop"),
+        Some(state) => {
+            for (name, pid, bin) in [
+                ("er", state.er_pid, state.er_bin.as_str()),
+                ("base", state.base_pid, state.base_bin.as_str()),
+            ] {
+                if process::proc_matches(pid, bin) {
+                    println!("stopping {name} (pid {pid})");
+                    process::kill_pid(pid);
+                }
+                known.push(pid);
+            }
+            if let Err(error) = fs::remove_file(state::state_path()) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    return Err(error.into());
+                }
+            }
         }
     }
-    fs::remove_file(state::state_path())?;
+    for (pid, cmdline) in
+        process::orphaned_topology_processes(&state::stack_dir(), &known)
+    {
+        println!("stopping orphaned topology process (pid {pid}): {cmdline}");
+        process::kill_pid(pid);
+    }
     println!("stack down");
     Ok(())
 }

@@ -118,6 +118,87 @@ pub(super) fn kill_matching(procs: &[(u32, &str)]) {
     }
 }
 
+// Every process the topology layer spawns names the stack directory: the
+// base and verifiers on their command line, ERs in their MBV_ storage env.
+// Only the topology binaries qualify, so a shell or editor that merely
+// mentions the directory is never touched.
+pub(super) const TOPOLOGY_BINS: [&str; 3] = [
+    "solana-test-validator",
+    "magicblock-validator",
+    "magicblock-verifier",
+];
+
+pub(super) fn orphaned_topology_processes(
+    stack_dir: &Path,
+    exclude: &[u32],
+) -> Vec<(u32, String)> {
+    let marker = format!("{}/", stack_dir.display());
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        if pid == std::process::id() || exclude.contains(&pid) {
+            continue;
+        }
+        let Ok(raw) = fs::read(format!("/proc/{pid}/cmdline")) else {
+            continue;
+        };
+        let argv: Vec<String> = raw
+            .split(|byte| *byte == 0)
+            .filter(|arg| !arg.is_empty())
+            .map(|arg| String::from_utf8_lossy(arg).into_owned())
+            .collect();
+        let Some(program) = argv.first() else {
+            continue;
+        };
+        let bin = Path::new(program)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if !TOPOLOGY_BINS.contains(&bin.as_str()) {
+            continue;
+        }
+        let cmdline = argv.join(" ");
+        let environ = fs::read(format!("/proc/{pid}/environ"))
+            .map(|raw| String::from_utf8_lossy(&raw).into_owned())
+            .unwrap_or_default();
+        let owned = cmdline.contains(&marker)
+            || environ.split('\0').any(|pair| {
+                pair.starts_with("MBV_ENGINE__LEDGER__DIRECTORY=")
+                    && pair.contains(&marker)
+            });
+        if owned && proc_running(pid) {
+            found.push((pid, cmdline));
+        }
+    }
+    found.sort_unstable();
+    found
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_sweep_never_matches_this_test_process() {
+        let stack_dir = std::env::temp_dir().join("redsuite-stack");
+        let orphans = orphaned_topology_processes(&stack_dir, &[]);
+        assert!(orphans.iter().all(|(pid, _)| *pid != std::process::id()));
+        for (_, cmdline) in &orphans {
+            let program = cmdline.split(' ').next().unwrap_or_default();
+            let bin = Path::new(program)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            assert!(TOPOLOGY_BINS.contains(&bin.as_str()), "{cmdline}");
+        }
+    }
+}
+
 pub(super) fn proc_matches(pid: u32, bin: &str) -> bool {
     fs::read(format!("/proc/{pid}/cmdline"))
         .map(|cmdline| String::from_utf8_lossy(&cmdline).contains(bin))

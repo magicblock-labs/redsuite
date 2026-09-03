@@ -90,6 +90,8 @@ pub(super) fn clone_url() -> String {
 const BASE_BIN: &str = "solana-test-validator";
 const ER_BIN: &str = "magicblock-validator";
 pub const ER_BIN_ENV: &str = "MAGICBLOCK_VALIDATOR_BIN";
+const VERIFIER_BIN: &str = "magicblock-verifier";
+pub const VERIFIER_BIN_ENV: &str = "MAGICBLOCK_VERIFIER_BIN";
 
 const BASE_LEDGER_SHREDS: &str = "200000";
 pub(super) const BASE_READY_TIMEOUT: Duration = Duration::from_secs(60);
@@ -121,6 +123,42 @@ pub(super) fn find_er_bin() -> Result<PathBuf> {
 
 pub fn er_bin_path() -> Result<PathBuf> {
     find_er_bin()
+}
+
+// The verifier ships beside the ER binary in the validator build tree; an
+// explicit env override wins, PATH is the last resort.
+pub(super) fn find_verifier_bin() -> Result<PathBuf> {
+    if let Some(explicit) = std::env::var_os(VERIFIER_BIN_ENV) {
+        let explicit = PathBuf::from(explicit);
+        return if explicit.exists() {
+            Ok(explicit)
+        } else {
+            Err(format!(
+                "{VERIFIER_BIN_ENV}={} does not exist",
+                explicit.display()
+            )
+            .into())
+        };
+    }
+    if let Some(sibling) = find_er_bin()
+        .ok()
+        .and_then(|er| er.parent().map(|dir| dir.join(VERIFIER_BIN)))
+        .filter(|candidate| candidate.is_file())
+    {
+        return Ok(sibling);
+    }
+    which(VERIFIER_BIN).ok_or_else(|| {
+        format!(
+            "{VERIFIER_BIN} not found — build it beside the ER binary \
+             (`cargo build --release -p magicblock-verifier`), set \
+             {VERIFIER_BIN_ENV}, or put it on PATH"
+        )
+        .into()
+    })
+}
+
+pub fn verifier_bin_path() -> Result<PathBuf> {
+    find_verifier_bin()
 }
 
 fn which(bin: &str) -> Option<PathBuf> {
@@ -298,6 +336,8 @@ pub(super) struct ErPlan {
     // preserves the accountsdb. A restart-in-place relaunch passes false so
     // the ER reopens the on-disk ledger + accountsdb it already has.
     pub(super) reset: bool,
+    // follower identities the replication listener admits; empty denies all
+    pub(super) allowed_followers: Vec<Pubkey>,
 }
 
 // The engine validator keeps only --remotes / --lifecycle / -l on the command
@@ -337,6 +377,12 @@ impl ErPlan {
             "MBV_METRICS__ADDRESS",
             format!("127.0.0.1:{}", self.metrics_port),
         );
+        if !self.allowed_followers.is_empty() {
+            cmd.env(
+                "MBV_ENGINE__REPLICATION__ALLOWED_FOLLOWERS",
+                toml_string_array(&self.allowed_followers),
+            );
+        }
         for (key, value) in &self.env {
             cmd.env(key, value);
         }
@@ -345,6 +391,95 @@ impl ErPlan {
         }
         cmd
     }
+}
+
+fn toml_string_array(values: &[Pubkey]) -> String {
+    let quoted: Vec<String> =
+        values.iter().map(|value| format!("\"{value}\"")).collect();
+    format!("[{}]", quoted.join(", "))
+}
+
+pub(super) const VERIFIER_CONFIG_FILE: &str = "verifier.toml";
+const VERIFIER_ENV_PREFIX: &str = "MBV_VERIFIER_";
+const MIRRORED_LEADER_ENV_PREFIX: &str = "MBV_ENGINE__BLOCKSTORE__";
+
+// A validated verifier launch: the bare replicated engine reads one TOML
+// (identity, storage, upstream) plus MBV_VERIFIER_ overrides; command()
+// stays pure so a relaunch reuses the exact invocation.
+pub(super) struct VerifierPlan {
+    pub(super) bin: PathBuf,
+    pub(super) identity: Keypair,
+    pub(super) upstream_port: u16,
+    pub(super) upstream_authority: Pubkey,
+    pub(super) metrics_port: u16,
+    pub(super) storage_dir: PathBuf,
+    pub(super) env: Vec<(String, String)>,
+}
+
+impl VerifierPlan {
+    pub(super) fn config_path(&self) -> PathBuf {
+        self.storage_dir.join(VERIFIER_CONFIG_FILE)
+    }
+
+    pub(super) fn upstream_address(&self) -> String {
+        format!("127.0.0.1:{}", self.upstream_port)
+    }
+
+    pub(super) fn config_toml(&self) -> String {
+        format!(
+            "[metrics]\naddress = \"127.0.0.1:{metrics}\"\n\n\
+             [engine.authority]\nlocal = \"{identity}\"\n\n\
+             [engine.accountsdb]\ndirectory = \"{accountsdb}\"\n\n\
+             [engine.ledger]\ndirectory = \"{ledger}\"\n\n\
+             [engine.replication]\nupstream-address = \"{upstream}\"\n\
+             upstream-authority = \"{authority}\"\n",
+            metrics = self.metrics_port,
+            identity = self.identity.to_base58_string(),
+            accountsdb = self.storage_dir.join("accountsdb").display(),
+            ledger = self.storage_dir.display(),
+            upstream = self.upstream_address(),
+            authority = self.upstream_authority,
+        )
+    }
+
+    pub(super) fn write_config(&self) -> Result<PathBuf> {
+        let path = self.config_path();
+        std::fs::create_dir_all(&self.storage_dir)?;
+        std::fs::write(&path, self.config_toml())?;
+        Ok(path)
+    }
+
+    pub(super) fn command(&self) -> Command {
+        let mut cmd = Command::new(&self.bin);
+        cmd.arg(self.config_path());
+        for (key, value) in &self.env {
+            cmd.env(key, value);
+        }
+        if std::env::var_os("RUST_LOG").is_none() {
+            cmd.env("RUST_LOG", "info");
+        }
+        cmd
+    }
+}
+
+// Block timing must match between a leader and its followers, so the
+// leader's blockstore overrides are mirrored into the verifier's env tree.
+pub(super) fn mirrored_verifier_env(
+    leader_env: &[(String, String)],
+) -> Vec<(String, String)> {
+    leader_env
+        .iter()
+        .filter(|(key, _)| key.starts_with(MIRRORED_LEADER_ENV_PREFIX))
+        .map(|(key, value)| {
+            (
+                format!(
+                    "{VERIFIER_ENV_PREFIX}{}",
+                    key.trim_start_matches("MBV_")
+                ),
+                value.clone(),
+            )
+        })
+        .collect()
 }
 
 #[derive(Default)]
@@ -403,7 +538,97 @@ mod tests {
             storage_dir: PathBuf::from("/tmp/er-storage"),
             env: vec![("MBV_TEST".to_owned(), "1".to_owned())],
             reset,
+            allowed_followers: Vec::new(),
         }
+    }
+
+    #[test]
+    fn leader_plans_carry_the_follower_allowlist() {
+        let cmd = plan(true).command();
+        assert!(env_of(&cmd, "MBV_ENGINE__REPLICATION__ALLOWED_FOLLOWERS")
+            .is_none());
+        let mut leader = plan(true);
+        let followers = [Pubkey::new_unique(), Pubkey::new_unique()];
+        leader.allowed_followers = followers.to_vec();
+        let cmd = leader.command();
+        assert_eq!(
+            env_of(&cmd, "MBV_ENGINE__REPLICATION__ALLOWED_FOLLOWERS")
+                .as_deref(),
+            Some(
+                format!("[\"{}\", \"{}\"]", followers[0], followers[1])
+                    .as_str()
+            )
+        );
+    }
+
+    #[test]
+    fn verifier_plans_write_one_toml_and_pass_only_its_path() {
+        let identity = Keypair::new();
+        let upstream_authority = Pubkey::new_unique();
+        let plan = VerifierPlan {
+            bin: PathBuf::from("magicblock-verifier"),
+            identity: Keypair::try_from(&identity.to_bytes()[..]).unwrap(),
+            upstream_port: 7802,
+            upstream_authority,
+            metrics_port: 9101,
+            storage_dir: PathBuf::from("/tmp/er-leader-verifier0"),
+            env: vec![(
+                "MBV_VERIFIER_ENGINE__BLOCKSTORE__BLOCKTIME".to_owned(),
+                "20ms".to_owned(),
+            )],
+        };
+        let toml = plan.config_toml();
+        assert!(toml.contains("address = \"127.0.0.1:9101\""));
+        assert!(toml
+            .contains(&format!("local = \"{}\"", identity.to_base58_string())));
+        assert!(toml
+            .contains("directory = \"/tmp/er-leader-verifier0/accountsdb\""));
+        assert!(toml.contains("directory = \"/tmp/er-leader-verifier0\""));
+        assert!(toml.contains("upstream-address = \"127.0.0.1:7802\""));
+        assert!(toml.contains(&format!(
+            "upstream-authority = \"{upstream_authority}\""
+        )));
+        let cmd = plan.command();
+        assert_eq!(
+            args_of(&cmd),
+            vec!["/tmp/er-leader-verifier0/verifier.toml".to_owned()]
+        );
+        assert_eq!(
+            env_of(&cmd, "MBV_VERIFIER_ENGINE__BLOCKSTORE__BLOCKTIME")
+                .as_deref(),
+            Some("20ms")
+        );
+    }
+
+    #[test]
+    fn only_blockstore_overrides_mirror_from_leader_to_verifiers() {
+        let mirrored = mirrored_verifier_env(&[
+            (
+                "MBV_ENGINE__BLOCKSTORE__BLOCKTIME".to_owned(),
+                "20ms".to_owned(),
+            ),
+            (
+                "MBV_ENGINE__BLOCKSTORE__SUPERBLOCK".to_owned(),
+                "64".to_owned(),
+            ),
+            (
+                "MBV_ENGINE__ACCOUNTSDB__LRU_CAPACITY".to_owned(),
+                "100".to_owned(),
+            ),
+        ]);
+        assert_eq!(
+            mirrored,
+            vec![
+                (
+                    "MBV_VERIFIER_ENGINE__BLOCKSTORE__BLOCKTIME".to_owned(),
+                    "20ms".to_owned()
+                ),
+                (
+                    "MBV_VERIFIER_ENGINE__BLOCKSTORE__SUPERBLOCK".to_owned(),
+                    "64".to_owned()
+                ),
+            ]
+        );
     }
 
     #[test]

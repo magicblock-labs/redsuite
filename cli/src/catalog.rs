@@ -155,6 +155,11 @@ pub mod redshift {
             resources: [Resource::Er],
             fixtures: [Fixture::RedshiftProgram],
         },
+        verifier_lifecycle => replication::verifier_lifecycle::VerifierLifecycle {
+            topology: PrivateEr,
+            resources: [Resource::Er],
+            fixtures: [],
+        },
         api_invariants => harness::api_invariants::ApiInvariants {
             topology: Shared,
             resources: [Resource::Er],

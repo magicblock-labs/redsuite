@@ -23,5 +23,5 @@ filter = "test(catalog::redline::)"
 test-group = "benchmarks"
 
 [[profile.default.overrides]]
-filter = "test(aml_gate) or test(config_gates) or test(task_scheduler) or test(ledger_retention)"
+filter = "test(aml_gate) or test(config_gates) or test(task_scheduler) or test(ledger_retention) or test(verifier_lifecycle)"
 test-group = "private-er"
