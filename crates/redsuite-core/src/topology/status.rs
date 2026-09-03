@@ -72,7 +72,11 @@ pub fn down() -> Result<()> {
                 }
                 known.push(pid);
             }
-            fs::remove_file(state::state_path())?;
+            if let Err(error) = fs::remove_file(state::state_path()) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    return Err(error.into());
+                }
+            }
         }
     }
     for (pid, cmdline) in
