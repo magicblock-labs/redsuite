@@ -613,6 +613,7 @@ mod tests {
             config: report.config,
             measurements: report.measurements,
             failures: Vec::new(),
+            launches: Vec::new(),
         }
     }
 
@@ -696,6 +697,7 @@ mod tests {
         assert!(reason.contains("the clone matches base"));
 
         let passed_with_teardown_failure = ScenarioRun {
+            launches: Vec::new(),
             failures: vec![PersistedFailure {
                 phase: "teardown".into(),
                 kind: "infrastructure".into(),

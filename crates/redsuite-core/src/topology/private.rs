@@ -18,7 +18,8 @@ use crate::{
     api::Api,
     context::{BaseCtx, ChainCtx, ErCtx},
     host::proc_running,
-    resources::ResourceRecord,
+    report,
+    resources::{LaunchRecord, ResourceRecord},
     Result,
 };
 
@@ -56,6 +57,34 @@ impl PrivateEr {
 
     pub fn pid(&self) -> u32 {
         self.pid
+    }
+
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub fn identity(&self) -> Pubkey {
+        self.ctx.identity()
+    }
+
+    pub fn rpc_port(&self) -> u16 {
+        self.plan.listen_port
+    }
+
+    pub fn metrics_port(&self) -> u16 {
+        self.plan.metrics_port
+    }
+
+    pub fn replication_port(&self) -> u16 {
+        self.plan.replication_port
+    }
+
+    pub fn allowed_followers(&self) -> &[Pubkey] {
+        &self.plan.allowed_followers
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.child.is_some() && proc_running(self.pid)
     }
 
     pub fn storage_dir(&self) -> &Path {
@@ -218,6 +247,23 @@ pub async fn private_er(
     base: &BaseCtx,
     options: ErOptions,
 ) -> Result<PrivateEr> {
+    launch(base, options, Vec::new()).await
+}
+
+// A leader is a private ER whose replication listener admits followers.
+pub(super) async fn leader_er(
+    base: &BaseCtx,
+    options: ErOptions,
+    allowed_followers: Vec<Pubkey>,
+) -> Result<PrivateEr> {
+    launch(base, options, allowed_followers).await
+}
+
+async fn launch(
+    base: &BaseCtx,
+    options: ErOptions,
+    allowed_followers: Vec<Pubkey>,
+) -> Result<PrivateEr> {
     let dir = state::stack_dir();
     fs::create_dir_all(&dir)?;
     let er_bin = config::find_er_bin()?;
@@ -236,6 +282,11 @@ pub async fn private_er(
     }
     let log = dir.join(format!("er-{}.log", options.label));
     let identity_pubkey = er_identity.pubkey();
+    let role = if allowed_followers.is_empty() {
+        "private-er"
+    } else {
+        "leader"
+    };
     let plan = config::ErPlan {
         bin: er_bin,
         identity: er_identity,
@@ -247,15 +298,34 @@ pub async fn private_er(
         storage_dir,
         env: options.env,
         reset: true,
+        allowed_followers,
     };
     eprintln!(
-        "[redsuite] booting private ER `{}` on 127.0.0.1:{rpc_port} …",
+        "[redsuite] booting {role} `{}` on 127.0.0.1:{rpc_port} …",
         options.label
     );
     ports.release();
     let child = process::spawn_child(plan.command(), &log)?;
     let pid = child.id();
-    let record = base.resources().register(&options.label, pid);
+    let (bin_version, bin_fingerprint) = report::binary_provenance(&plan.bin);
+    let record = base.resources().register_launch(LaunchRecord {
+        label: options.label.clone(),
+        role: role.to_owned(),
+        bin: plan.bin.display().to_string(),
+        bin_version,
+        bin_fingerprint,
+        identity: identity_pubkey.to_string(),
+        launched_at: report::utc_stamp(),
+        rpc_port: Some(rpc_port),
+        metrics_port,
+        replication_port: Some(replication_port),
+        upstream: None,
+        storage_dir: plan.storage_dir.display().to_string(),
+        log: log.display().to_string(),
+        config: None,
+        pid,
+        relaunches: 0,
+    });
 
     let er_api = Api::new(format!("http://127.0.0.1:{rpc_port}"));
     let ready = process::wait_until(

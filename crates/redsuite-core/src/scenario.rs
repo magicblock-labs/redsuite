@@ -10,7 +10,7 @@ use crate::{
     manifest,
     profile::ExecutionConfig,
     report::{MeasureValue, ScenarioReport, Unit},
-    resources::Resources,
+    resources::{LaunchRecord, Resources},
     runner::panic_message,
     topology, DynError, Result,
 };
@@ -111,6 +111,7 @@ pub struct RunRecord {
     pub phases: Vec<PhaseOutcome>,
     pub scenario: ScenarioOutcome,
     pub wall_seconds: Option<f64>,
+    pub launches: Vec<LaunchRecord>,
 }
 
 impl RunRecord {
@@ -120,6 +121,7 @@ impl RunRecord {
             phases: Vec::new(),
             scenario: ScenarioOutcome::NotReached,
             wall_seconds: None,
+            launches: Vec::new(),
         }
     }
 
@@ -288,6 +290,7 @@ where
     let outcome = AssertUnwindSafe(body(provisioned)).catch_unwind().await;
     let wall_seconds = started.elapsed().as_secs_f64();
     let teardown_errors = resources.audit();
+    record.launches = resources.launches();
     record.wall_seconds = Some(wall_seconds);
     record.scenario = match outcome {
         Ok(Ok(report)) => ScenarioOutcome::Passed(report.metric(
@@ -405,6 +408,20 @@ fn conclude(record: &mut RunRecord) {
         if let Some(error) = &outcome.error {
             eprintln!("[redsuite]   {error}");
         }
+    }
+    for launch in &record.launches {
+        eprintln!(
+            "[redsuite]   launched {} `{}`: pid {} ({} relaunches), {} {}, \
+             metrics 127.0.0.1:{}, storage {}",
+            launch.role,
+            launch.label,
+            launch.pid,
+            launch.relaunches,
+            launch.bin,
+            launch.bin_version,
+            launch.metrics_port,
+            launch.storage_dir,
+        );
     }
     if matches!(record.scenario, ScenarioOutcome::Skipped(_)) {
         return;
