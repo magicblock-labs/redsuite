@@ -37,6 +37,10 @@ pub enum Instruction {
         id: u64,
     },
     CloseAccount,
+    HashFold {
+        id: u64,
+        iters: u32,
+    },
 }
 
 pub mod build {
@@ -249,6 +253,18 @@ pub mod build {
         with_bincode(&Instruction::CloseAccount, metas)
     }
 
+    pub fn hash_fold(
+        id: u64,
+        iters: u32,
+        accounts: &[Pubkey],
+    ) -> SolanaInstruction {
+        let metas = accounts
+            .iter()
+            .map(|&pk| AccountMeta::new(pk, false))
+            .collect();
+        with_bincode(&Instruction::HashFold { id, iters }, metas)
+    }
+
     fn commit_metas(payer: Pubkey, accounts: &[Pubkey]) -> Vec<AccountMeta> {
         let mut metas = vec![
             AccountMeta::new(payer, true),
@@ -300,6 +316,7 @@ mod tests {
             (Instruction::AccountDataCopy { id: 1 }, 7),
             (Instruction::ReadAccountsData { id: 1 }, 8),
             (Instruction::CloseAccount, 9),
+            (Instruction::HashFold { id: 1, iters: 0 }, 10),
         ];
         for (ix, expected) in cases {
             let bytes = bincode::serialize(&ix).unwrap();

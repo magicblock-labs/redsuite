@@ -11,6 +11,17 @@ pub fn hash_chain(mut hash: [u8; 32], iters: u32) -> [u8; 32] {
     hash
 }
 
+pub fn fold_hash(id: u64, hashes: &[[u8; 32]], iters: u32) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(id.to_le_bytes());
+    for hash in hashes {
+        hasher.update(hash);
+    }
+    let mut digest = [0u8; 32];
+    digest.copy_from_slice(&hasher.finalize());
+    hash_chain(digest, iters)
+}
+
 pub fn derive_pda(
     program_id: &Pubkey,
     base: Pubkey,
@@ -36,6 +47,21 @@ mod tests {
         assert_eq!(hash_chain(init, 32), hash_chain(init, 32));
         assert_ne!(hash_chain(init, 32), hash_chain(init, 31));
         assert_ne!(hash_chain([8u8; 32], 32), hash_chain(init, 32));
+    }
+
+    #[test]
+    fn fold_hash_pins_id_input_order_and_rounds() {
+        let a = [1u8; 32];
+        let b = [2u8; 32];
+        assert_eq!(fold_hash(7, &[a, b], 0), fold_hash(7, &[a, b], 0));
+        assert_ne!(fold_hash(7, &[a, b], 0), fold_hash(8, &[a, b], 0));
+        assert_ne!(fold_hash(7, &[a, b], 0), fold_hash(7, &[b, a], 0));
+        assert_ne!(fold_hash(7, &[a], 0), fold_hash(7, &[a, b], 0));
+        assert_ne!(fold_hash(7, &[a, b], 0), fold_hash(7, &[a, b], 1));
+
+        let x_then_y = fold_hash(2, &[fold_hash(1, &[a], 0), b], 0);
+        let y_then_x = fold_hash(1, &[fold_hash(2, &[a, b], 0)], 0);
+        assert_ne!(x_then_y, y_then_x);
     }
 
     #[test]

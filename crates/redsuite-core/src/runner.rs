@@ -338,9 +338,23 @@ where
     F: FnMut(u64) -> Fut,
     Fut: Future<Output = Result<()>> + 'static,
 {
-    execute_inner(Completion::Stop(stop), rate, concurrency, request, NO_SYNC)
+    execute_until_raw(rate, concurrency, stop, request)
         .await
         .finalize()
+}
+
+pub async fn execute_until_raw<F, Fut>(
+    rate: u32,
+    concurrency: usize,
+    stop: Rc<Cell<bool>>,
+    request: F,
+) -> RawRunOutcome
+where
+    F: FnMut(u64) -> Fut,
+    Fut: Future<Output = Result<()>> + 'static,
+{
+    execute_inner(Completion::Stop(stop), rate, concurrency, request, NO_SYNC)
+        .await
 }
 
 pub async fn execute_and_sync<F, Fut, S, SFut>(

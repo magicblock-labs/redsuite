@@ -12,7 +12,9 @@ use solana_program::{
 };
 use solana_sdk_ids::system_program;
 
-use crate::layout::{DATA_OFFSET, OWNER_PUBKEY_SIZE};
+use crate::layout::{
+    DATA_OFFSET, HASH_OFFSET, HASH_SIZE, ID_OFFSET, OWNER_PUBKEY_SIZE,
+};
 
 fn prepare_buffer(index: &mut usize, target: &mut [u8], data: &[u8]) {
     target[*index..*index + data.len()].copy_from_slice(data);
@@ -291,6 +293,45 @@ pub fn read_accounts_data(
     Ok(())
 }
 
+pub fn hash_fold(
+    iter: &mut std::slice::Iter<AccountInfo>,
+    id: u64,
+    iters: u32,
+) -> ProgramResult {
+    let accounts: Vec<_> = iter.collect();
+    if accounts.is_empty() {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    }
+
+    let mut hashes = Vec::with_capacity(accounts.len());
+    for account in &accounts {
+        if account.lamports() == 0 {
+            return Err(ProgramError::UninitializedAccount);
+        }
+        let data = account.try_borrow_data()?;
+        require_space(data.len(), HASH_OFFSET + HASH_SIZE)?;
+        let mut hash = [0u8; HASH_SIZE];
+        hash.copy_from_slice(&data[HASH_OFFSET..HASH_OFFSET + HASH_SIZE]);
+        hashes.push(hash);
+    }
+
+    let digest = crate::utils::fold_hash(id, &hashes, iters);
+    for account in &accounts {
+        let mut data = account.try_borrow_mut_data()?;
+        let mut index = ID_OFFSET;
+        prepare_buffer(&mut index, &mut data, &id.to_le_bytes());
+        prepare_buffer(&mut index, &mut data, &digest);
+    }
+
+    msg!(
+        "folded {} accounts over {} rounds, txn: {}",
+        accounts.len(),
+        iters,
+        id
+    );
+    Ok(())
+}
+
 pub fn commit_accounts(
     iter: &mut std::slice::Iter<AccountInfo>,
     id: u64,
@@ -498,6 +539,58 @@ mod tests {
             true,
         );
         assert!(verify_account_owner(&signer, &zeroed).is_err());
+    }
+
+    #[test]
+    fn hash_fold_chains_prior_state_into_every_account() {
+        let program = crate::ID;
+        let key_a = SolPubkey::new_unique();
+        let key_b = SolPubkey::new_unique();
+        let mut lamports_a = 1u64;
+        let mut lamports_b = 1u64;
+        let mut data_a = vec![0u8; HASH_OFFSET + HASH_SIZE];
+        let mut data_b = vec![0u8; HASH_OFFSET + HASH_SIZE];
+        data_a[HASH_OFFSET..].copy_from_slice(&[1u8; HASH_SIZE]);
+        data_b[HASH_OFFSET..].copy_from_slice(&[2u8; HASH_SIZE]);
+
+        let accounts = vec![
+            account_info(&key_a, &mut lamports_a, &mut data_a, &program, false),
+            account_info(&key_b, &mut lamports_b, &mut data_b, &program, false),
+        ];
+        hash_fold(&mut accounts.iter(), 9, 3).unwrap();
+        drop(accounts);
+
+        let expected = crate::utils::fold_hash(
+            9,
+            &[[1u8; HASH_SIZE], [2u8; HASH_SIZE]],
+            3,
+        );
+        for data in [&data_a, &data_b] {
+            assert_eq!(
+                data[ID_OFFSET..ID_OFFSET + ID_SIZE],
+                9u64.to_le_bytes()
+            );
+            assert_eq!(data[HASH_OFFSET..HASH_OFFSET + HASH_SIZE], expected);
+        }
+
+        let mut short_lamports = 1u64;
+        let mut short_data = vec![0u8; HASH_OFFSET + HASH_SIZE - 1];
+        let short_key = SolPubkey::new_unique();
+        let short = [account_info(
+            &short_key,
+            &mut short_lamports,
+            &mut short_data,
+            &program,
+            false,
+        )];
+        assert_eq!(
+            hash_fold(&mut short.iter(), 1, 0),
+            Err(ProgramError::AccountDataTooSmall)
+        );
+        assert_eq!(
+            hash_fold(&mut [].iter(), 1, 0),
+            Err(ProgramError::NotEnoughAccountKeys)
+        );
     }
 
     #[test]
