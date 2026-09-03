@@ -48,6 +48,11 @@ pub mod redline {
             resources: [Resource::Er, Resource::HostExclusive],
             fixtures: [Fixture::RedlineProgram],
         },
+        conflict_ordering => scheduler::conflict_ordering::ConflictOrdering {
+            topology: Shared,
+            resources: [Resource::Er, Resource::HostExclusive],
+            fixtures: [Fixture::RedlineProgram],
+        },
         mixed_sustained_load => scheduler::mixed_sustained_load::MixedSustainedLoad {
             topology: Shared,
             resources: [Resource::Er, Resource::HostExclusive],

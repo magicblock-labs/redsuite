@@ -179,6 +179,16 @@ scheduler:
   lanes while cycling the workload every 20 slots: two slots of high-CU
   sha256 work, nine of simple writes, nine of read-write transactions. The
   validator must keep up without drops or failures and drain the backlog.
+- `conflict_ordering` — proves conflicting transactions execute in their
+  accepted order regardless of executor timing. Account pairs receive
+  repeated `X(A) -> Y(A,B) -> Z(B)` chains, each step folding the accounts'
+  current hashes into a new one, while high-CU work on disjoint accounts
+  keeps every executor busy: first with a bounded number of unconfirmed
+  transactions (a deep ready queue), then open loop (the sequencer's
+  pending-work bound engaged). After each batch the pipeline must drain to
+  zero blocked, busy and pending work, and every pair must hold exactly the
+  fold of its accepted order — any reordering changes every later digest.
+  Needs a host whose engine runs at least two executors.
 
 chainlink (account cloning / subscriptions):
 

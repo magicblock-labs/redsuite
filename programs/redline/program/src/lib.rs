@@ -64,6 +64,7 @@ fn process_instruction(
             commit_undelegate_accounts(&mut iter, id)?
         }
         Instruction::CloseAccount => close_account(&mut iter)?,
+        Instruction::HashFold { id, iters } => hash_fold(&mut iter, id, iters)?,
     }
 
     Ok(())
