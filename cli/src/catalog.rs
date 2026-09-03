@@ -160,6 +160,11 @@ pub mod redshift {
             resources: [Resource::Er],
             fixtures: [],
         },
+        replication_recovery => replication::replication_recovery::ReplicationRecovery {
+            topology: PrivateEr,
+            resources: [Resource::Er],
+            fixtures: [Fixture::RedlineProgram],
+        },
         api_invariants => harness::api_invariants::ApiInvariants {
             topology: Shared,
             resources: [Resource::Er],

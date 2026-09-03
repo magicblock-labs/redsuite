@@ -27,6 +27,8 @@ pub struct LaunchRecord {
     pub log: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_set: Option<String>,
     #[serde(default)]
     pub pid: u32,
     #[serde(default)]
@@ -195,6 +197,7 @@ mod tests {
             storage_dir: "/x/storage".to_owned(),
             log: "/x/verifier.log".to_owned(),
             config: Some("/x/storage/verifier.toml".to_owned()),
+            cpu_set: None,
             pid,
             relaunches: 0,
         }

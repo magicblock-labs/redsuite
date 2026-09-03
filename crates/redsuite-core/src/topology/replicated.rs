@@ -37,6 +37,7 @@ pub struct ReplicatedOptions {
     pub verifiers: usize,
     pub leader_env: Vec<(String, String)>,
     pub verifier_env: Vec<(String, String)>,
+    pub verifier_cpu_sets: Vec<String>,
     pub request_timeout: Option<Duration>,
 }
 
@@ -90,6 +91,10 @@ impl Verifier {
 
     pub fn metrics_url(&self) -> &str {
         &self.metrics_url
+    }
+
+    pub fn cpu_set(&self) -> Option<&str> {
+        self.plan.cpu_set.as_deref()
     }
 
     pub fn upstream_address(&self) -> String {
@@ -395,6 +400,11 @@ pub async fn replicated(
         }
         let mut ports = process::PortLease::default();
         let metrics_port = ports.single()?;
+        let cpu_set = options
+            .verifier_cpu_sets
+            .get(index)
+            .filter(|set| !set.is_empty())
+            .cloned();
         let plan = VerifierPlan {
             bin: verifier_bin.clone(),
             identity,
@@ -403,12 +413,17 @@ pub async fn replicated(
             metrics_port,
             storage_dir,
             env: verifier_env.clone(),
+            cpu_set,
         };
         let config_path = plan.write_config()?;
         let log = dir.join(format!("er-{label}.log"));
         eprintln!(
             "[redsuite] booting verifier `{label}` (metrics 127.0.0.1:\
-             {metrics_port}) following {} …",
+             {metrics_port}{}) following {} …",
+            plan.cpu_set
+                .as_deref()
+                .map(|set| format!(", cpus {set}"))
+                .unwrap_or_default(),
             plan.upstream_address()
         );
         ports.release();
@@ -429,6 +444,7 @@ pub async fn replicated(
             storage_dir: plan.storage_dir.display().to_string(),
             log: log.display().to_string(),
             config: Some(config_path.display().to_string()),
+            cpu_set: plan.cpu_set.clone(),
             pid,
             relaunches: 0,
         });
