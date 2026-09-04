@@ -187,13 +187,23 @@ impl Verifier {
             )
             .into());
         }
-        if let Err(error) = fs::remove_dir_all(&self.plan.storage_dir) {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                return Err(error.into());
-            }
-        }
+        self.remove_storage()?;
         self.plan.write_config()?;
         Ok(())
+    }
+
+    fn remove_storage(&self) -> Result<()> {
+        match fs::remove_dir_all(&self.plan.storage_dir) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(())
+            }
+            Err(error) => Err(format!(
+                "removing the storage of verifier `{}`: {error}",
+                self.label
+            )
+            .into()),
+        }
     }
 
     pub async fn start(&mut self, ready_timeout: Duration) -> Result<Duration> {
@@ -235,7 +245,10 @@ impl Verifier {
         if self.child.is_none() {
             return Ok(());
         }
-        let outcome = self.stop(false).await.map(|_| ());
+        let outcome = match self.stop(false).await {
+            Ok(_) => self.remove_storage(),
+            Err(error) => Err(error),
+        };
         if let Err(error) = &outcome {
             self.record.record_finish_error(error.to_string());
         }

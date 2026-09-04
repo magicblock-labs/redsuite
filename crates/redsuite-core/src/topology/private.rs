@@ -129,11 +129,28 @@ impl PrivateEr {
     // The explicit teardown path: a graceful stop whose failure lands in the
     // run's teardown audit, not only in the caller's return value.
     pub async fn finish(mut self) -> Result<()> {
-        let outcome = self.stop(false).await;
+        let outcome = match self.stop(false).await {
+            Ok(()) => self.remove_storage(),
+            Err(error) => Err(error),
+        };
         if let Err(error) = &outcome {
             self.record.record_finish_error(error.to_string());
         }
         outcome
+    }
+
+    fn remove_storage(&self) -> Result<()> {
+        match fs::remove_dir_all(&self.plan.storage_dir) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(())
+            }
+            Err(error) => Err(format!(
+                "removing the storage of private ER `{}`: {error}",
+                self.label
+            )
+            .into()),
+        }
     }
 
     // Stop the ER (SIGTERM, or SIGKILL if hard_kill), then relaunch it on the
