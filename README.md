@@ -115,9 +115,9 @@ flock, `genesis-accounts/`, logs, ledgers).
 Scenario isolation comes from fresh keypairs, not fresh chains.
 Scenarios that kill a validator, restart one, or need their own config boot
 private ERs. `task_scheduler`, `config_gates`, `aml_gate`,
-`ledger_retention`, and `verifier_lifecycle` run on one instead of the shared
-ER (`verifier_lifecycle` boots its private ER as a leader with two verifiers
-replicating from it); `restart_under_load`,
+`ledger_retention`, `verifier_lifecycle`, and `replication_recovery` run on
+one instead of the shared ER (the last two boot their private ER as a leader
+with two verifiers replicating from it); `restart_under_load`,
 `ws_conn_capacity`, `clone_lru_churn`, `cold_hydration_tail`,
 `ensure_gate_stall`, `storage_prodsize_sustain`, and
 `superblock_boundary_latency` boot theirs beside the shared stack. Each takes
@@ -414,6 +414,15 @@ replication (leader + verifiers):
   catch up, and finally hard-kills the second verifier and keeps it offline
   while the leader and the first verifier carry on, before letting it rejoin
   from wiped storage. Teardown must reap every process the topology owns.
+- `replication_recovery` — one leader and two verifiers pinned to different
+  cpu sets, so they run different executor counts, under a steady stream of
+  `X(A) -> Y(A,B) -> Z(B)` hash-fold chains. Both verifiers must keep up,
+  one is restarted while its cursor is still retained and must catch up
+  under load, and in the full profile the other is kept offline until the
+  leader's retention has purged its history, so it must install a snapshot
+  and replay the tail. At the final sealed boundary both verifiers hold
+  exactly the leader's transactions, report zero sealed-checksum mismatches,
+  and the leader's accounts match the client-side fold model.
 
 storage (ledger retention):
 

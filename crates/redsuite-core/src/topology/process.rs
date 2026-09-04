@@ -152,14 +152,12 @@ pub(super) fn orphaned_topology_processes(
             .filter(|arg| !arg.is_empty())
             .map(|arg| String::from_utf8_lossy(arg).into_owned())
             .collect();
-        let Some(program) = argv.first() else {
-            continue;
-        };
-        let bin = Path::new(program)
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        if !TOPOLOGY_BINS.contains(&bin.as_str()) {
+        let runs_topology_bin = argv.iter().any(|arg| {
+            Path::new(arg).file_name().is_some_and(|name| {
+                TOPOLOGY_BINS.contains(&name.to_string_lossy().as_ref())
+            })
+        });
+        if !runs_topology_bin {
             continue;
         }
         let cmdline = argv.join(" ");
@@ -189,12 +187,13 @@ mod tests {
         let orphans = orphaned_topology_processes(&stack_dir, &[]);
         assert!(orphans.iter().all(|(pid, _)| *pid != std::process::id()));
         for (_, cmdline) in &orphans {
-            let program = cmdline.split(' ').next().unwrap_or_default();
-            let bin = Path::new(program)
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            assert!(TOPOLOGY_BINS.contains(&bin.as_str()), "{cmdline}");
+            assert!(
+                cmdline.split(' ').any(|arg| Path::new(arg)
+                    .file_name()
+                    .is_some_and(|name| TOPOLOGY_BINS
+                        .contains(&name.to_string_lossy().as_ref()))),
+                "{cmdline}"
+            );
         }
     }
 }

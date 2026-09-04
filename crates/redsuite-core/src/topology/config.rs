@@ -414,6 +414,9 @@ pub(super) struct VerifierPlan {
     pub(super) metrics_port: u16,
     pub(super) storage_dir: PathBuf,
     pub(super) env: Vec<(String, String)>,
+    // a `taskset -c` list; the engine sizes its executor pool from the cpus
+    // it can see, so this is how a verifier gets a different executor count
+    pub(super) cpu_set: Option<String>,
 }
 
 impl VerifierPlan {
@@ -450,7 +453,14 @@ impl VerifierPlan {
     }
 
     pub(super) fn command(&self) -> Command {
-        let mut cmd = Command::new(&self.bin);
+        let mut cmd = match &self.cpu_set {
+            Some(cpu_set) => {
+                let mut cmd = Command::new("taskset");
+                cmd.arg("-c").arg(cpu_set).arg(&self.bin);
+                cmd
+            }
+            None => Command::new(&self.bin),
+        };
         cmd.arg(self.config_path());
         for (key, value) in &self.env {
             cmd.env(key, value);
@@ -576,6 +586,7 @@ mod tests {
                 "MBV_VERIFIER_ENGINE__BLOCKSTORE__BLOCKTIME".to_owned(),
                 "20ms".to_owned(),
             )],
+            cpu_set: None,
         };
         let toml = plan.config_toml();
         assert!(toml.contains("address = \"127.0.0.1:9101\""));
@@ -597,6 +608,31 @@ mod tests {
             env_of(&cmd, "MBV_VERIFIER_ENGINE__BLOCKSTORE__BLOCKTIME")
                 .as_deref(),
             Some("20ms")
+        );
+    }
+
+    #[test]
+    fn a_cpu_set_pins_the_verifier_through_taskset() {
+        let plan = VerifierPlan {
+            bin: PathBuf::from("/x/magicblock-verifier"),
+            identity: Keypair::new(),
+            upstream_port: 7802,
+            upstream_authority: Pubkey::new_unique(),
+            metrics_port: 9101,
+            storage_dir: PathBuf::from("/tmp/er-leader-verifier1"),
+            env: Vec::new(),
+            cpu_set: Some("0-3".to_owned()),
+        };
+        let cmd = plan.command();
+        assert_eq!(cmd.get_program().to_string_lossy(), "taskset");
+        assert_eq!(
+            args_of(&cmd),
+            vec![
+                "-c".to_owned(),
+                "0-3".to_owned(),
+                "/x/magicblock-verifier".to_owned(),
+                "/tmp/er-leader-verifier1/verifier.toml".to_owned(),
+            ]
         );
     }
 
