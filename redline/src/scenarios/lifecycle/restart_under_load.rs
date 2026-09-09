@@ -1,5 +1,6 @@
 use std::{
     cell::{Cell, RefCell},
+    collections::BTreeMap,
     future::Future,
     rc::Rc,
     time::{Duration, Instant},
@@ -379,6 +380,65 @@ async fn check_state(
     Ok(())
 }
 
+struct Settlement {
+    checked: usize,
+    lost: usize,
+}
+
+async fn settle_after_restart(
+    api: &Api,
+    mode: Mode,
+    label: &str,
+    records: &mut [Record],
+) -> Result<Settlement> {
+    let lost = if mode.hard_kill() {
+        drop_lost_tail(api, label, records).await?
+    } else {
+        0
+    };
+    let checked = check_confirmed_present(api, label, records).await?;
+    Ok(Settlement { checked, lost })
+}
+
+async fn drop_lost_tail(
+    api: &Api,
+    label: &str,
+    records: &mut [Record],
+) -> Result<usize> {
+    let mut per_lane: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (index, record) in records.iter().enumerate() {
+        if record.outcome == Outcome::Confirmed {
+            per_lane.entry(record.lane).or_default().push(index);
+        }
+    }
+    let mut lost = 0;
+    for (lane, mut indices) in per_lane {
+        indices.sort_by_key(|&index| records[index].id);
+        while let Some(&index) = indices.last() {
+            let record = &records[index];
+            match api.get_transaction(&record.signature).await? {
+                Some(tx) => {
+                    check!(
+                        tx.err.is_none(),
+                        "{label}: surviving confirmed transaction {} (id {}, \
+                         lane {lane}) replayed as a failure: {:?}",
+                        record.signature,
+                        record.id,
+                        tx.err
+                    )?;
+                    break;
+                }
+                None => {
+                    records[index].outcome = Outcome::Dropped;
+                    lost += 1;
+                    indices.pop();
+                }
+            }
+        }
+    }
+    Ok(lost)
+}
+
 async fn check_confirmed_present(
     api: &Api,
     label: &str,
@@ -454,6 +514,8 @@ struct ModeOutcome {
     at_kill: Tally,
     resolved: Tally,
     confirmed_checked: usize,
+    lost_first: usize,
+    lost_second: usize,
     resume: Tally,
     superblocks_crossed: u64,
 }
@@ -564,6 +626,15 @@ async fn run_mode(
 
     let api = private.ctx().api().clone();
     resolve(&api, &mut records).await?;
+    let settled = settle_after_restart(
+        &api,
+        mode,
+        &format!("{label} after first restart"),
+        &mut records,
+    )
+    .await?;
+    let confirmed_checked = settled.checked;
+    let lost_first = settled.lost;
     let resolved = Tally::of(&records);
     check_eq!(
         resolved.unresolved + resolved.rejected,
@@ -571,12 +642,6 @@ async fn run_mode(
         "{label}: every submitted transaction must reach a terminal outcome \
          after the restart, got {resolved:?}"
     )?;
-    let confirmed_checked = check_confirmed_present(
-        &api,
-        &format!("{label} after first restart"),
-        &records,
-    )
-    .await?;
     check_state(
         private.ctx(),
         &format!("{label} after first restart"),
@@ -588,7 +653,7 @@ async fn run_mode(
         "[redsuite] restart_under_load {label}: first restart total {} ms \
          (shutdown {} ms, startup {} ms), exit {:?}/sig {:?}, slot {:?} -> \
          {:?}, replay_ran {replay_ran:?}, at kill {at_kill:?}, resolved \
-         {resolved:?}",
+         {resolved:?}, lost to the kill {lost_first}",
         first.total.as_millis(),
         first.shutdown.as_millis(),
         first.startup.as_millis(),
@@ -625,12 +690,14 @@ async fn run_mode(
 
     let second = private.restart(mode.restart_config()).await?;
     check_exit(mode, &format!("{label} second restart"), &second)?;
-    check_confirmed_present(
+    let lost_second = settle_after_restart(
         &api,
+        mode,
         &format!("{label} after second restart"),
-        &records,
+        &mut records,
     )
-    .await?;
+    .await?
+    .lost;
     check_state(
         private.ctx(),
         &format!("{label} after second restart"),
@@ -650,6 +717,8 @@ async fn run_mode(
         at_kill,
         resolved,
         confirmed_checked,
+        lost_first,
+        lost_second,
         resume,
         superblocks_crossed,
     })
@@ -743,6 +812,16 @@ fn report_mode(
             "confirmed entries verified",
             Unit::Count,
             outcome.confirmed_checked as f64,
+        ),
+        (
+            "confirmed lost to first restart",
+            Unit::Count,
+            outcome.lost_first as f64,
+        ),
+        (
+            "confirmed lost to second restart",
+            Unit::Count,
+            outcome.lost_second as f64,
         ),
         (
             "resume confirmed",
