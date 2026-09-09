@@ -86,6 +86,8 @@ fn programs() -> Result<()> {
                     root()
                         .join(format!("programs/{program}/program/Cargo.toml")),
                 )
+                .arg("--sbf-out-dir")
+                .arg(root().join("target/deploy"))
                 .args(["--", "--config", SBF_LTO]),
         )?;
     }
@@ -126,7 +128,10 @@ fn build_redshift_variant(
     run_cmd(&format!("cargo build-sbf (redshift {label})"), &mut command)?;
     let built = out_dir.join("redshift_program.so");
     let staged = root().join("target/deploy").join(staged_name);
-    std::fs::copy(&built, &staged)
+    // Not fs::copy: it fstats the freshly created destination, which fails
+    // with ENOENT on virtiofs bind mounts (Docker Desktop devcontainers).
+    std::fs::read(&built)
+        .and_then(|bytes| std::fs::write(&staged, bytes))
         .map_err(|err| format!("staging {staged_name}: {err}"))?;
     Ok(())
 }
