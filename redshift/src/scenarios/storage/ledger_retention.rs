@@ -102,13 +102,41 @@ async fn delegate_counter(
     Ok(counter)
 }
 
+async fn seed_history(
+    er: &ErCtx,
+    counter: &Pubkey,
+    sent: &mut Vec<Sent>,
+) -> Result<()> {
+    let listed = er
+        .api()
+        .get_signatures_for_address(counter, SIGNATURE_WINDOW)
+        .await?;
+    for signature in listed.iter().rev() {
+        let signature: Signature = signature.parse()?;
+        let tx =
+            er.api().get_transaction(&signature).await?.ok_or_else(|| {
+                format!("listed transaction {signature} is missing on the er")
+            })?;
+        sent.push(Sent {
+            signature,
+            slot: tx.slot,
+        });
+    }
+    Ok(())
+}
+
+fn add_count(adds: u64) -> u8 {
+    (adds % 255 + 1) as u8
+}
+
 async fn send_add(
     er: &ErCtx,
     payer: &Keypair,
+    count: u8,
     sent: &mut Vec<Sent>,
 ) -> Result<()> {
     let signature = er
-        .submit_and_confirm(payer, &[build::add(payer.pubkey(), 1)])
+        .submit_and_confirm(payer, &[build::add(payer.pubkey(), count)])
         .await?;
     let tx = er
         .api()
@@ -261,6 +289,7 @@ impl PrivateErScenario for LedgerRetention {
         let payer = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
         let mut sent: Vec<Sent> = Vec::new();
         let mut adds: u64 = 0;
+        let mut total: u64 = 0;
         let mut events: u64 = 0;
         let mut previous_pruned = 0usize;
         let mut first_pruning_event: Option<u64> = None;
@@ -270,12 +299,15 @@ impl PrivateErScenario for LedgerRetention {
             let er = private.ctx();
             await_program_clone(er, &redshift_interface::id()).await?;
             counter = delegate_counter(base, er, &payer).await?;
+            seed_history(er, &counter, &mut sent).await?;
 
             let baseline = truncations(er).await?;
             let started = Instant::now();
             loop {
-                send_add(er, &payer, &mut sent).await?;
+                let count = add_count(adds);
+                send_add(er, &payer, count, &mut sent).await?;
                 adds += 1;
+                total += u64::from(count);
 
                 let observed = truncations(er).await? - baseline;
                 if observed > events {
@@ -287,7 +319,7 @@ impl PrivateErScenario for LedgerRetention {
                         &view,
                         previous_pruned,
                         &counter,
-                        adds,
+                        total,
                     )
                     .await?;
                     if view.pruned.len() > previous_pruned
@@ -327,7 +359,7 @@ impl PrivateErScenario for LedgerRetention {
                 &before,
                 previous_pruned,
                 &counter,
-                adds,
+                total,
             )
             .await?;
             check!(
@@ -363,7 +395,7 @@ impl PrivateErScenario for LedgerRetention {
             &after,
             before.pruned.len(),
             &counter,
-            adds,
+            total,
         )
         .await?;
         check!(
@@ -371,8 +403,9 @@ impl PrivateErScenario for LedgerRetention {
             "the restart must preserve the retained history"
         )?;
 
-        send_add(er, &payer, &mut sent).await?;
-        adds += 1;
+        let count = add_count(adds);
+        send_add(er, &payer, count, &mut sent).await?;
+        total += u64::from(count);
         let final_view = observe(er, &sent).await?;
         verify(
             er,
@@ -380,7 +413,7 @@ impl PrivateErScenario for LedgerRetention {
             &final_view,
             after.pruned.len(),
             &counter,
-            adds,
+            total,
         )
         .await?;
         let superblocks_allocated = superblocks(er).await?;
