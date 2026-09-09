@@ -361,12 +361,6 @@ impl ErPlan {
             self.identity.to_base58_string(), // throwaway test identity
         );
         cmd.env("MBV_ENGINE__LEDGER__DIRECTORY", &self.storage_dir);
-        // Retention triggers on the used bytes of the whole filesystem that
-        // holds the ledger, which the engine assumes is dedicated to it. The
-        // stack shares a disk with everything else, so the default limit can
-        // already be exceeded at boot and every seal would purge history.
-        // Keep the limit unreachable; retention scenarios override it via
-        // `env`, which is applied after this.
         cmd.env(
             "MBV_ENGINE__LEDGER__SIZE_LIMIT",
             LEDGER_SIZE_LIMIT_UNREACHABLE.to_string(),
