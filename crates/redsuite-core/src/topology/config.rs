@@ -9,6 +9,8 @@ use pubkey::Pubkey;
 
 use crate::{catalog::Fixture, manifest, Result};
 
+const LEDGER_SIZE_LIMIT_UNREACHABLE: u64 = 1 << 60;
+
 pub const DLP_ID: &str = "DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh";
 pub const MDP_ID: &str = "DmnRGfyyftzacFb1XadYhWF6vWqXwtQk5tbr6XgR3BA1";
 pub const COMMITTOR_ID: &str = "ComtrB2KEaWgXsW1dhr1xYL4Ht4Bjj3gXnnL6KMdABq";
@@ -359,6 +361,16 @@ impl ErPlan {
             self.identity.to_base58_string(), // throwaway test identity
         );
         cmd.env("MBV_ENGINE__LEDGER__DIRECTORY", &self.storage_dir);
+        // Retention triggers on the used bytes of the whole filesystem that
+        // holds the ledger, which the engine assumes is dedicated to it. The
+        // stack shares a disk with everything else, so the default limit can
+        // already be exceeded at boot and every seal would purge history.
+        // Keep the limit unreachable; retention scenarios override it via
+        // `env`, which is applied after this.
+        cmd.env(
+            "MBV_ENGINE__LEDGER__SIZE_LIMIT",
+            LEDGER_SIZE_LIMIT_UNREACHABLE.to_string(),
+        );
         // engine.accountsdb.directory defaults to a compile-time constant
         // path, not to the configured engine.ledger.directory — overriding
         // only the ledger directory leaves the accountsdb at the global

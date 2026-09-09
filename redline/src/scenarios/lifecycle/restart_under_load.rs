@@ -35,6 +35,7 @@ const PROGRAM: Pubkey = crate::program::ID;
 const VERIFY_CAP: usize = 4_000;
 const SIGKILL: i32 = 9;
 const SUPERBLOCKS: &str = "engine_ledger_superblocks";
+const ACCOUNTSDB_SNAPSHOT_FILE: &str = "accountsdb.tar.zst";
 const REPLAY_STEP: &str = "\"ledger_replay\"";
 const LEDGER_TIMING_ANCHOR: &str = "\"maybe_process_ledger\"";
 
@@ -156,6 +157,22 @@ fn timing_ms(log_text: &str, step: &str) -> Option<f64> {
 
 async fn superblocks(er: &ErCtx) -> Result<u64> {
     Ok(er.scrape_metrics().await?.get(SUPERBLOCKS).unwrap_or(0.0) as u64)
+}
+
+fn archived_snapshots(storage_dir: &std::path::Path) -> Result<usize> {
+    let mut count = 0;
+    for entry in std::fs::read_dir(storage_dir)? {
+        let entry = entry?;
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with("superblock-"))
+            && entry.path().join(ACCOUNTSDB_SNAPSHOT_FILE).is_file()
+        {
+            count += 1;
+        }
+    }
+    Ok(count)
 }
 
 struct Lanes {
@@ -499,19 +516,28 @@ async fn run_mode(
     let next_id = Rc::new(Cell::new(1u64));
 
     let storage_at_boot = host::dir_size_bytes(private.storage_dir())?;
+    let superblocks_at_boot = superblocks(private.ctx()).await?;
+    let snapshots_at_boot = archived_snapshots(private.storage_dir())?;
     let lanes = Lanes::start(
         private.ctx().api().clone(),
         &senders,
         &pool,
         next_id.clone(),
     );
+    let er = private.ctx();
+    let storage_dir = private.storage_dir();
     run_lanes_until(
         &format!(
-            "{label}: the fill of {} confirmed transactions",
+            "{label}: the fill of {} confirmed transactions and a sealed \
+             superblock with its archived snapshot",
             profile.fill
         ),
         profile.resume_timeout * 4,
-        || async { Ok(lanes.confirmed() >= profile.fill) },
+        || async {
+            Ok(lanes.confirmed() >= profile.fill
+                && superblocks(er).await? > superblocks_at_boot
+                && archived_snapshots(storage_dir)? > snapshots_at_boot)
+        },
     )
     .await?;
     let db_size_at_restart = host::dir_size_bytes(private.storage_dir())?;
