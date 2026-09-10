@@ -342,10 +342,6 @@ pub(super) struct ErPlan {
     pub(super) allowed_followers: Vec<Pubkey>,
 }
 
-// The engine validator keeps only --remotes / --lifecycle / -l on the command
-// line. Identity, storage and reset moved into the MBV_ config tree: figment
-// strips the prefix, splits on `__` and turns the remaining `_` into `-`, so
-// MBV_ENGINE__LEDGER__DIRECTORY sets engine.ledger.directory.
 impl ErPlan {
     pub(super) fn command(&self) -> Command {
         let mut cmd = Command::new(&self.bin);
@@ -353,9 +349,7 @@ impl ErPlan {
             .arg(&self.base_rpc_url)
             .arg("--remotes")
             .arg(&self.base_ws_url);
-        cmd.args(["--lifecycle", "ephemeral"])
-            .arg("-l")
-            .arg(format!("127.0.0.1:{}", self.listen_port));
+        cmd.arg("-l").arg(format!("127.0.0.1:{}", self.listen_port));
         cmd.env(
             "MBV_ENGINE__AUTHORITY__LOCAL",
             self.identity.to_base58_string(), // throwaway test identity
