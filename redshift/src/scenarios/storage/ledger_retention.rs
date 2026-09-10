@@ -1,4 +1,7 @@
-use std::time::{Duration, Instant};
+use std::{
+    cell::RefCell,
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use keypair::Keypair;
@@ -107,10 +110,29 @@ async fn seed_history(
     counter: &Pubkey,
     sent: &mut Vec<Sent>,
 ) -> Result<()> {
-    let listed = er
-        .api()
-        .get_signatures_for_address(counter, SIGNATURE_WINDOW)
-        .await?;
+    let listed = RefCell::new(Vec::new());
+    check::poll(
+        "the er records the clone of the delegated counter",
+        PROGRAM_CLONE_TIMEOUT,
+        || async {
+            if !matches!(er.account(counter).await, Ok(Some(_))) {
+                return false;
+            }
+            match er
+                .api()
+                .get_signatures_for_address(counter, SIGNATURE_WINDOW)
+                .await
+            {
+                Ok(signatures) if !signatures.is_empty() => {
+                    *listed.borrow_mut() = signatures;
+                    true
+                }
+                _ => false,
+            }
+        },
+    )
+    .await?;
+    let listed = listed.into_inner();
     for signature in listed.iter().rev() {
         let signature: Signature = signature.parse()?;
         let tx =
