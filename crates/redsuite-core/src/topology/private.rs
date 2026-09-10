@@ -193,6 +193,7 @@ impl PrivateEr {
         .await?;
         let startup = launch_started.elapsed();
         let total = restart_started.elapsed();
+        self.ctx.reset_blockhash();
         let slot_after = api.get_slot().await.ok();
 
         Ok(RestartTiming {

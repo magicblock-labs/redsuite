@@ -62,6 +62,10 @@ impl BlockhashCache {
         }
     }
 
+    fn reset(&self) {
+        self.cached.borrow_mut().take();
+    }
+
     async fn get(&self, api: &Api) -> Result<Hash> {
         if let Some((hash, at)) = *self.cached.borrow() {
             if at.elapsed() < self.ttl {
@@ -270,6 +274,10 @@ impl ErCtx {
 
     pub fn identity(&self) -> Pubkey {
         self.identity
+    }
+
+    pub(crate) fn reset_blockhash(&self) {
+        self.blockhash.reset();
     }
 
     pub fn metrics_url(&self) -> &str {
