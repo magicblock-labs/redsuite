@@ -7,11 +7,11 @@ pub(super) const MINT_RENT: u64 = 2_000_000;
 const TOKEN_AMOUNT_OFFSET: usize = 64;
 
 pub(super) fn token_program() -> Pubkey {
-    spl_token_interface::ID
+    sdk::consts::TOKEN_PROGRAM_ID
 }
 
 pub(super) fn ata_program() -> Pubkey {
-    spl_associated_token_account_interface::program::ID
+    sdk::consts::ASSOCIATED_TOKEN_PROGRAM_ID
 }
 
 pub(super) fn derive_ata(owner: &Pubkey, mint: &Pubkey) -> Pubkey {

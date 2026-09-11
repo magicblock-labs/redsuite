@@ -28,8 +28,6 @@ json = { workspace = true }
 rand = { workspace = true }
 rusqlite = { workspace = true }
 solana-address-lookup-table-interface = { version = "3.0", features = ["bincode", "bytemuck"] }
-spl-token-interface = "3"
-spl-associated-token-account-interface = "2"
 sdk = { workspace = true, features = ["spl", "modular-sdk"] }
 
 [dev-dependencies]
