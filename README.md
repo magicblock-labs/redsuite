@@ -406,8 +406,27 @@ aperture (JSON-RPC surface):
   the right owners, delegates, balances and encodings, and the untouched
   account must never appear. Missing mints and invalid token program ids
   must be rejected within a bound. Reports the burst wall time and failure
-  count without a throughput verdict. RPC-surface scenarios carry the `rpc_`
-  prefix so they can be run together:
+  count without a throughput verdict.
+- `rpc_compat_methods` — proves the static and mocked compatibility methods
+  stay consumable by the official `solana-rpc-client`. Fires 256 concurrent,
+  unpaced typed requests under a bounded deadline, cycling `getBlockCommitment`,
+  `getClusterNodes`, `getEpochInfo`, `getEpochSchedule`,
+  `getFirstAvailableBlock`, `getGenesisHash`, `getHealth`,
+  `getHighestSnapshotSlot`, `getIdentity`, `getLargestAccounts`,
+  `getRecentPerformanceSamples`, `getSlotLeader`, `getSlotLeaders`,
+  `getSupply`, `getTokenLargestAccounts`, `getTokenSupply`,
+  `getTransactionCount`, `getVersion`, `getVoteAccounts` and
+  `minimumLedgerSlot`. Every answer must decode through the client's own
+  response types and carry the documented default (zero counters and stakes,
+  the default genesis hash, empty account and vote lists, the validator
+  identity as the only node and leader, the 432000-slot epoch schedule) or
+  the documented relation (epoch and slot index derived from a slot inside
+  the burst window, version and feature set well formed). Afterwards
+  `requestAirdrop` must be rejected with the disabled-faucet message, the
+  MagicBlock-specific `getRoutes` must answer an empty list raw, and an
+  unknown method must fail with the JSON-RPC method-not-found code. Reports
+  the burst wall time and failure count without a throughput verdict.
+  RPC-surface scenarios carry the `rpc_` prefix so they can be run together:
   `cargo nextest run -E 'test(/catalog::redshift::rpc_/)'`.
 
 harness:
