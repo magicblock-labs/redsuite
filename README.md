@@ -93,9 +93,10 @@ Benchmarks must never share the box, so keep that last lane exclusive.
 
 ## Running
 
-    cargo nextest run commit_roundtrip               # one scenario
-    cargo nextest run -E 'test(catalog::redline::)'  # one family
-    cargo nextest run                                # everything
+    cargo nextest run commit_roundtrip                    # one scenario
+    cargo nextest run -E 'test(catalog::redline::)'       # one family
+    cargo nextest run -E 'test(/catalog::redshift::rpc_/)' # the RPC-surface scenarios
+    cargo nextest run                                     # everything
 
 Use cargo-nextest. The concurrency limits live in `.config/nextest.toml`:
 private-ER scenarios run two at a time, and the redline family runs alone.
@@ -376,6 +377,26 @@ committor (ER → base commits):
   Creates a table, extends it to the 256-key cap, decodes the account and
   requires the stored keys to match what was put in, then refuses the key that
   would overflow it and deactivates the table.
+
+aperture (JSON-RPC surface):
+
+- `rpc_lifecycle` — drives one execution through every read that describes
+  it, using the official `solana-rpc-client`. Prepares 256 delegated
+  accounts, submits 256 uniquely signed writes concurrently and unpaced under
+  a bounded deadline, then requires `sendTransaction`, `getSignatureStatuses`,
+  `getTransaction`, `getSignaturesForAddress`, `getAccountInfo`,
+  `getMultipleAccounts`, `getBalance`, `getBlock`, `getBlockTime`,
+  `getBlocks`, `getBlocksWithLimit`, `getSlot` and `getBlockHeight` to tell
+  one story: the echoed signatures, the written values, the transaction
+  slots, the block contents and the block times all have to agree.
+  `getLatestBlockhash`, `isBlockhashValid` and `getFeeForMessage` are
+  exercised on the way in, `simulateTransaction` must leave no trace in state
+  or status, and the MagicBlock-specific `getBlockhashForAccounts` and
+  `getDelegationStatus` are called raw. Block publication is polled with a
+  bound before history is read. Reports the burst wall time and the send
+  failure count without a throughput verdict. RPC-surface
+  scenarios carry the `rpc_` prefix so they can be run together:
+  `cargo nextest run -E 'test(/catalog::redshift::rpc_/)'`.
 
 harness:
 

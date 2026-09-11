@@ -9,14 +9,20 @@ authors.workspace = true
 async-trait = { workspace = true }
 borsh = { workspace = true }
 tokio = { workspace = true }
+futures-util = { workspace = true }
+serde = { workspace = true }
 redsuite-core = { workspace = true }
 redline-interface = { workspace = true }
 redshift-interface = { workspace = true }
 instruction = { workspace = true }
 pubkey = { workspace = true }
+hash = { workspace = true }
+transaction = { workspace = true }
 keypair = { workspace = true }
 signature = { workspace = true }
 signer = { workspace = true }
+solana-commitment-config = "3.1"
+solana-transaction-status-client-types = "4.1"
 sdk-ids = { workspace = true }
 json = { workspace = true }
 rand = { workspace = true }

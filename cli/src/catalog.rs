@@ -165,6 +165,12 @@ pub mod redshift {
             resources: [Resource::Er],
             fixtures: [Fixture::RedlineProgram],
         },
+        rpc_lifecycle => aperture::rpc_lifecycle::RpcLifecycle {
+            topology: Shared,
+            resources: [Resource::Er],
+            fixtures: [Fixture::RedlineProgram],
+            optional_fixtures: [],
+        },
         api_invariants => harness::api_invariants::ApiInvariants {
             topology: Shared,
             resources: [Resource::Er],
