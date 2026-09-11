@@ -7,8 +7,10 @@ authors.workspace = true
 
 [dependencies]
 borsh = { workspace = true }
-solana-program = { workspace = true }
+pubkey = { workspace = true }
+instruction = { workspace = true }
+sdk-ids = { workspace = true }
+solana-program-error = { workspace = true }
 sdk = { workspace = true }
-solana-sdk-ids = "3"
-magic-api = { package = "magicblock-magic-program-api", version = "0.10.1", default-features = false }
+magic-api = { workspace = true }
 bincode = { workspace = true }

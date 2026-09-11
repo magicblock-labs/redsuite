@@ -8,4 +8,5 @@ authors.workspace = true
 [dependencies]
 borsh = { workspace = true }
 redshift-interface = { workspace = true }
-solana-program = { workspace = true }
+pubkey = { workspace = true }
+instruction = { workspace = true }

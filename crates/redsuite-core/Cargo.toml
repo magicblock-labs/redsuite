@@ -31,5 +31,9 @@ signer = { workspace = true }
 sdk-ids = { workspace = true }
 hash = { workspace = true }
 transaction = { workspace = true }
+message = { workspace = true }
 bincode = { workspace = true }
 solana-loader-v4-interface = { version = "3", features = ["bincode"] }
+solana-rpc-client = { workspace = true }
+solana-rpc-client-api = { workspace = true }
+dlp-api = { workspace = true, features = ["instruction", "encryption"] }

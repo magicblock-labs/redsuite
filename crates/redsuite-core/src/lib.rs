@@ -30,6 +30,8 @@ pub use scenario::{
     run_private_er_scenario, run_shared_scenario, Phase, PhaseOutcome,
     PrivateErScenario, RunError, RunRecord, Scenario, ScenarioOutcome,
 };
+pub use solana_rpc_client as rpc_client;
+pub use solana_rpc_client_api as rpc_client_api;
 
 pub type DynError = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, DynError>;

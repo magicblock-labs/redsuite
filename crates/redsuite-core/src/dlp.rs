@@ -1,76 +1,64 @@
-use instruction::{AccountMeta, Instruction};
+// Convenience layer over dlp-api: shorter argument lists and the ids/pdas in
+// one place. Nothing here encodes DLP instructions itself.
+pub use dlp_api::args::{CommitStateArgs, DelegateArgs};
+use dlp_api::{
+    args::DelegateEphemeralBalanceArgs,
+    instruction_builder::{self, Encryptable},
+    pda,
+};
+pub use dlp_api::{
+    pda::{
+        delegate_buffer_pda_from_delegated_account_and_owner_program as delegate_buffer_pda,
+        delegation_metadata_pda_from_delegated_account as delegation_metadata_pda,
+        delegation_record_pda_from_delegated_account as delegation_record_pda,
+    },
+    ID as DELEGATION_PROGRAM_ID,
+};
+use instruction::Instruction;
 use pubkey::Pubkey;
 
-use crate::{system::system_id, topology::DLP_ID};
-
-const BORSH_OPTION_NONE: u8 = 0;
-const BORSH_OPTION_SOME: u8 = 1;
-
 pub fn dlp_id() -> Pubkey {
-    DLP_ID.parse().expect("dlp program id")
+    DELEGATION_PROGRAM_ID
 }
 
 pub fn ephemeral_balance_pda(payer: &Pubkey, index: u8) -> Pubkey {
-    Pubkey::find_program_address(
-        &[b"balance", payer.as_ref(), &[index]],
-        &dlp_id(),
-    )
-    .0
+    pda::ephemeral_balance_pda_from_payer(payer, index)
 }
 
-pub fn delegation_record_pda(delegated_account: &Pubkey) -> Pubkey {
-    Pubkey::find_program_address(
-        &[b"delegation", delegated_account.as_ref()],
-        &dlp_id(),
-    )
-    .0
+pub fn commit_state_pda(delegated_account: &Pubkey) -> Pubkey {
+    pda::commit_state_pda_from_delegated_account(delegated_account)
 }
 
-pub fn delegation_metadata_pda(delegated_account: &Pubkey) -> Pubkey {
-    Pubkey::find_program_address(
-        &[b"delegation-metadata", delegated_account.as_ref()],
-        &dlp_id(),
-    )
-    .0
+pub fn commit_record_pda(delegated_account: &Pubkey) -> Pubkey {
+    pda::commit_record_pda_from_delegated_account(delegated_account)
 }
 
-fn delegate_buffer_pda(
-    delegated_account: &Pubkey,
-    owner_program: &Pubkey,
-) -> Pubkey {
-    Pubkey::find_program_address(
-        &[b"buffer", delegated_account.as_ref()],
-        owner_program,
-    )
-    .0
+pub fn undelegate_buffer_pda(delegated_account: &Pubkey) -> Pubkey {
+    pda::undelegate_buffer_pda_from_delegated_account(delegated_account)
+}
+
+pub fn program_config_pda(program_id: &Pubkey) -> Pubkey {
+    pda::program_config_from_program_id(program_id)
 }
 
 pub fn protocol_fees_vault_pda() -> Pubkey {
-    Pubkey::find_program_address(&[b"fees-vault"], &dlp_id()).0
+    pda::fees_vault_pda()
 }
 
 pub fn validator_fees_vault_pda(validator: &Pubkey) -> Pubkey {
-    Pubkey::find_program_address(
-        &[b"v-fees-vault", validator.as_ref()],
-        &dlp_id(),
-    )
-    .0
+    pda::validator_fees_vault_pda_from_validator(validator)
 }
 
 pub fn magic_fee_vault_pda(validator: &Pubkey) -> Pubkey {
-    Pubkey::find_program_address(
-        &[b"magic-fee-vault", validator.as_ref()],
-        &dlp_id(),
-    )
-    .0
+    pda::magic_fee_vault_pda_from_validator(validator)
 }
 
-fn dlp_programdata_pda() -> Pubkey {
-    Pubkey::find_program_address(
-        &[dlp_id().as_ref()],
-        &sdk_ids::bpf_loader_upgradeable::ID,
-    )
-    .0
+fn delegate_args(commit_frequency_ms: u32, validator: &Pubkey) -> DelegateArgs {
+    DelegateArgs {
+        commit_frequency_ms,
+        seeds: vec![],
+        validator: Some(*validator),
+    }
 }
 
 pub fn delegate_account(
@@ -78,27 +66,64 @@ pub fn delegate_account(
     delegatee: &Pubkey,
     validator: &Pubkey,
 ) -> Instruction {
-    let system = system_id();
-    let commit_frequency_ms = u32::MAX;
-    let seeds_count = 0u32;
-    let mut data = 0u64.to_le_bytes().to_vec();
-    data.extend_from_slice(&commit_frequency_ms.to_le_bytes());
-    data.extend_from_slice(&seeds_count.to_le_bytes());
-    data.push(BORSH_OPTION_SOME);
-    data.extend_from_slice(validator.as_ref());
-    Instruction {
-        program_id: dlp_id(),
-        accounts: vec![
-            AccountMeta::new(*payer, true),
-            AccountMeta::new(*delegatee, true),
-            AccountMeta::new_readonly(system, false),
-            AccountMeta::new(delegate_buffer_pda(delegatee, &system), false),
-            AccountMeta::new(delegation_record_pda(delegatee), false),
-            AccountMeta::new(delegation_metadata_pda(delegatee), false),
-            AccountMeta::new_readonly(system, false),
-        ],
-        data,
-    }
+    instruction_builder::delegate(
+        *payer,
+        *delegatee,
+        None,
+        delegate_args(u32::MAX, validator),
+    )
+}
+
+pub fn delegate_with_actions(
+    payer: &Pubkey,
+    delegated_account: &Pubkey,
+    owner: Option<Pubkey>,
+    delegate: DelegateArgs,
+    actions: &[Instruction],
+) -> Instruction {
+    instruction_builder::delegate_with_actions(
+        *payer,
+        *delegated_account,
+        owner,
+        delegate,
+        actions
+            .iter()
+            .cloned()
+            .map(Encryptable::cleartext)
+            .collect(),
+    )
+}
+
+pub fn commit_state(
+    validator: &Pubkey,
+    delegated_account: &Pubkey,
+    delegated_account_owner: &Pubkey,
+    args: CommitStateArgs,
+) -> Instruction {
+    instruction_builder::commit_state(
+        *validator,
+        *delegated_account,
+        *delegated_account_owner,
+        args,
+    )
+}
+
+pub fn finalize(validator: &Pubkey, delegated_account: &Pubkey) -> Instruction {
+    instruction_builder::finalize(*validator, *delegated_account)
+}
+
+pub fn undelegate(
+    validator: &Pubkey,
+    delegated_account: &Pubkey,
+    owner_program: &Pubkey,
+    delegation_rent_payer: &Pubkey,
+) -> Instruction {
+    instruction_builder::undelegate(
+        *validator,
+        *delegated_account,
+        *owner_program,
+        *delegation_rent_payer,
+    )
 }
 
 pub fn init_validator_fees_vault(
@@ -106,41 +131,14 @@ pub fn init_validator_fees_vault(
     admin: &Pubkey,
     validator: &Pubkey,
 ) -> Instruction {
-    Instruction {
-        program_id: dlp_id(),
-        accounts: vec![
-            AccountMeta::new(*payer, true),
-            AccountMeta::new(*admin, true),
-            AccountMeta::new_readonly(dlp_programdata_pda(), false),
-            AccountMeta::new(*validator, false),
-            AccountMeta::new(validator_fees_vault_pda(validator), false),
-            AccountMeta::new_readonly(system_id(), false),
-        ],
-        data: 6u64.to_le_bytes().to_vec(),
-    }
+    instruction_builder::init_validator_fees_vault(*payer, *admin, *validator)
 }
 
 pub fn validator_claim_fees(
     validator: &Pubkey,
     amount: Option<u64>,
 ) -> Instruction {
-    let mut data = 7u64.to_le_bytes().to_vec();
-    match amount {
-        Some(lamports) => {
-            data.push(BORSH_OPTION_SOME);
-            data.extend_from_slice(&lamports.to_le_bytes());
-        }
-        None => data.push(BORSH_OPTION_NONE),
-    }
-    Instruction {
-        program_id: dlp_id(),
-        accounts: vec![
-            AccountMeta::new(*validator, true),
-            AccountMeta::new(protocol_fees_vault_pda(), false),
-            AccountMeta::new(validator_fees_vault_pda(validator), false),
-        ],
-        data,
-    }
+    instruction_builder::validator_claim_fees(*validator, amount)
 }
 
 pub fn top_up_ephemeral_balance(
@@ -157,20 +155,12 @@ pub fn top_up_ephemeral_balance_for(
     lamports: u64,
     index: u8,
 ) -> Instruction {
-    let escrow = ephemeral_balance_pda(beneficiary, index);
-    let mut data = 9u64.to_le_bytes().to_vec();
-    data.extend_from_slice(&lamports.to_le_bytes());
-    data.push(index);
-    Instruction {
-        program_id: dlp_id(),
-        accounts: vec![
-            AccountMeta::new(*funder, true),
-            AccountMeta::new_readonly(*beneficiary, false),
-            AccountMeta::new(escrow, false),
-            AccountMeta::new_readonly(system_id(), false),
-        ],
-        data,
-    }
+    instruction_builder::top_up_ephemeral_balance(
+        *funder,
+        *beneficiary,
+        Some(lamports),
+        Some(index),
+    )
 }
 
 pub fn delegate_ephemeral_balance(
@@ -187,42 +177,16 @@ pub fn delegate_ephemeral_balance_for(
     validator: &Pubkey,
     index: u8,
 ) -> Instruction {
-    let escrow = ephemeral_balance_pda(beneficiary, index);
-    let system = system_id();
-    let commit_frequency_ms = 0u32;
-    let seeds_count = 0u32;
-    let mut data = 10u64.to_le_bytes().to_vec();
-    data.extend_from_slice(&commit_frequency_ms.to_le_bytes());
-    data.extend_from_slice(&seeds_count.to_le_bytes());
-    data.push(BORSH_OPTION_SOME);
-    data.extend_from_slice(validator.as_ref());
-    data.push(index);
-    Instruction {
-        program_id: dlp_id(),
-        accounts: vec![
-            AccountMeta::new(*funder, true),
-            AccountMeta::new_readonly(*beneficiary, true),
-            AccountMeta::new(escrow, false),
-            AccountMeta::new(delegate_buffer_pda(&escrow, &system), false),
-            AccountMeta::new(delegation_record_pda(&escrow), false),
-            AccountMeta::new(delegation_metadata_pda(&escrow), false),
-            AccountMeta::new_readonly(system, false),
-            AccountMeta::new_readonly(dlp_id(), false),
-        ],
-        data,
-    }
+    instruction_builder::delegate_ephemeral_balance(
+        *funder,
+        *beneficiary,
+        DelegateEphemeralBalanceArgs {
+            delegate_args: delegate_args(0, validator),
+            index,
+        },
+    )
 }
 
 pub fn close_ephemeral_balance(payer: &Pubkey, index: u8) -> Instruction {
-    let mut data = 11u64.to_le_bytes().to_vec();
-    data.push(index);
-    Instruction {
-        program_id: dlp_id(),
-        accounts: vec![
-            AccountMeta::new(*payer, true),
-            AccountMeta::new(ephemeral_balance_pda(payer, index), false),
-            AccountMeta::new_readonly(system_id(), false),
-        ],
-        data,
-    }
+    instruction_builder::close_ephemeral_balance(*payer, index)
 }

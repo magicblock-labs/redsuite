@@ -51,14 +51,20 @@ sha2 = "0.10"
 # against the vendored base-programs/dlp.so — see MANIFEST.toml).
 sdk = { package = "ephemeral-rollups-sdk", version = "0.16.2", default-features = false, features = ["modular-sdk"] }
 
-pubkey = { package = "solana-pubkey", version = "3", features = ["serde"] }
-hash = { package = "solana-hash", version = "3", features = ["serde"] }
-transaction = { package = "solana-transaction", version = "3", features = ["bincode"] }
-keypair = { package = "solana-keypair", version = "3" }
-signature = { package = "solana-signature", version = "3" }
-instruction = { package = "solana-instruction", version = "3" }
-account = { package = "solana-account", version = "3" }
+pubkey = { package = "solana-pubkey", version = "4.2", features = ["serde"] }
+hash = { package = "solana-hash", version = "4.3", features = ["serde", "std", "decode", "copy", "atomic", "sanitize"] }
+transaction = { package = "solana-transaction", version = "4.1", features = ["serde"] }
+message = { package = "solana-message", version = "4.1", features = ["serde"] }
+keypair = { package = "solana-keypair", version = "3.1" }
+signature = { package = "solana-signature", version = "3.4" }
+instruction = { package = "solana-instruction", version = "3.4", features = ["serde"] }
+account = { package = "solana-account", version = "4.3" }
 signer = { package = "solana-signer", version = "3" }
 sdk-ids = { package = "solana-sdk-ids", version = "3" }
+solana-program-error = "3"
+dlp-api = { package = "magicblock-delegation-program-api", version = "3.1.0", default-features = false }
+magic-api = { package = "magicblock-magic-program-api", version = "0.10.1", default-features = false }
+solana-rpc-client = "4.1"
+solana-rpc-client-api = "4.1"
 
 solana-program = "3.0"
