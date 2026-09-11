@@ -5,6 +5,8 @@ use pubkey::Pubkey;
 use redshift_interface::schedulecommit::{build, MainAccount};
 use signer::Signer;
 
+use crate::DynError;
+
 use crate::{
     check,
     context::{BaseCtx, ChainCtx, ErCtx},
@@ -182,4 +184,95 @@ pub async fn delegated_payer(
         .into());
     }
     Ok(delegatee)
+}
+
+const PREP_PAIRS_PER_TX: usize = 3;
+
+pub async fn init_delegated_accounts_batched(
+    base: &impl ChainCtx,
+    payers: &[Keypair],
+    count: usize,
+    space: u32,
+    authority: Pubkey,
+) -> Result<Vec<Pubkey>> {
+    init_delegated_accounts_batched_at(
+        redline_interface::id(),
+        base,
+        payers,
+        count,
+        space,
+        authority,
+    )
+    .await
+}
+
+pub async fn init_delegated_accounts_batched_at(
+    program_id: Pubkey,
+    base: &impl ChainCtx,
+    payers: &[Keypair],
+    count: usize,
+    space: u32,
+    authority: Pubkey,
+) -> Result<Vec<Pubkey>> {
+    if payers.is_empty() {
+        return Err("at least one prep payer is required".into());
+    }
+    let per_payer = count.div_ceil(payers.len());
+    if per_payer > u8::MAX as usize + 1 {
+        return Err(format!(
+            "{count} accounts over {} payers exceeds the u8 seed namespace",
+            payers.len()
+        )
+        .into());
+    }
+
+    let batches =
+        futures_util::future::join_all(payers.iter().enumerate().map(
+            |(payer_index, payer)| async move {
+                let first_index = payer_index * per_payer;
+                let last_index = ((payer_index + 1) * per_payer).min(count);
+                let mut pdas =
+                    Vec::with_capacity(last_index.saturating_sub(first_index));
+                let mut pending = Vec::new();
+                for account_index in first_index..last_index {
+                    let seed = (account_index - first_index) as u8;
+                    let (init, pda) =
+                        redline_interface::instruction::build::init_account_at(
+                            program_id,
+                            payer.pubkey(),
+                            payer.pubkey(),
+                            space,
+                            seed,
+                            authority,
+                        );
+                    let delegate =
+                        redline_interface::instruction::build::delegate_at(
+                            program_id,
+                            payer.pubkey(),
+                            pda,
+                            payer.pubkey(),
+                            seed,
+                            authority,
+                        );
+                    pdas.push(pda);
+                    pending.push(init);
+                    pending.push(delegate);
+                    if pending.len() >= PREP_PAIRS_PER_TX * 2 {
+                        base.submit_and_confirm(payer, &pending).await?;
+                        pending.clear();
+                    }
+                }
+                if !pending.is_empty() {
+                    base.submit_and_confirm(payer, &pending).await?;
+                }
+                Ok::<Vec<Pubkey>, DynError>(pdas)
+            },
+        ))
+        .await;
+
+    let mut pdas = Vec::with_capacity(count);
+    for batch in batches {
+        pdas.extend(batch?);
+    }
+    Ok(pdas)
 }
