@@ -171,6 +171,12 @@ pub mod redshift {
             fixtures: [Fixture::RedlineProgram],
             optional_fixtures: [],
         },
+        rpc_token_queries => aperture::rpc_token_queries::RpcTokenQueries {
+            topology: Shared,
+            resources: [Resource::Er],
+            fixtures: [],
+            optional_fixtures: [],
+        },
         api_invariants => harness::api_invariants::ApiInvariants {
             topology: Shared,
             resources: [Resource::Er],
