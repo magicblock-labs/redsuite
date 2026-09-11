@@ -12,7 +12,6 @@ tokio = { workspace = true }
 redsuite-core = { workspace = true }
 redline-interface = { workspace = true }
 redshift-interface = { workspace = true }
-dlp-api = { package = "magicblock-delegation-program-api", version = "3.1.0", features = ["encryption"] }
 instruction = { workspace = true }
 pubkey = { workspace = true }
 keypair = { workspace = true }
@@ -22,8 +21,9 @@ sdk-ids = { workspace = true }
 json = { workspace = true }
 rand = { workspace = true }
 rusqlite = { workspace = true }
-
-sdk = { workspace = true, features = ["spl", "modular-sdk"] }
 solana-address-lookup-table-interface = { version = "3.0", features = ["bincode", "bytemuck"] }
+spl-token-interface = "3"
+spl-associated-token-account-interface = "2"
+sdk = { workspace = true, features = ["spl", "modular-sdk"] }
 
 [dev-dependencies]

@@ -1,4 +1,4 @@
-use solana_program::declare_id;
+use pubkey::declare_id;
 
 declare_id!("AijneHkXJVVWyimuwfSJdrJktARZu2WiMaZBqHsq7CS5");
 
@@ -6,7 +6,8 @@ pub mod flexi;
 
 pub mod schedulecommit {
     use borsh::{BorshDeserialize, BorshSerialize};
-    use solana_program::{program_error::ProgramError, pubkey::Pubkey};
+    use pubkey::Pubkey;
+    use solana_program_error::ProgramError;
 
     pub const FAIL_UNDELEGATION_COUNT: u64 = u64::MAX - 1;
     pub const PDA_SEED: &[u8] = b"magic_schedule_commit";
@@ -192,14 +193,14 @@ pub mod schedulecommit {
     }
 
     pub mod build {
+        use instruction::{AccountMeta, Instruction};
         use sdk::{
             consts::{
                 DELEGATION_PROGRAM_ID, MAGIC_CONTEXT_ID, MAGIC_PROGRAM_ID,
             },
             delegate_args::{DelegateAccountMetas, DelegateAccounts},
         };
-        use solana_program::instruction::{AccountMeta, Instruction};
-        use solana_sdk_ids::system_program;
+        use sdk_ids::system_program;
 
         use super::*;
 

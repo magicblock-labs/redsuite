@@ -1,21 +1,13 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use dlp_api::{
-    args::DelegateArgs,
-    instruction_builder::{delegate_with_actions, Encryptable},
-    pda::{
-        delegate_buffer_pda_from_delegated_account_and_owner_program,
-        delegation_metadata_pda_from_delegated_account,
-        delegation_record_pda_from_delegated_account,
-    },
-};
 use instruction::{AccountMeta, Instruction};
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    check, check_eq, dlp, prep, system, BaseCtx, ChainCtx, ErCtx, Result,
-    Scenario, ScenarioReport,
+    check, check_eq,
+    dlp::{self, delegate_with_actions, DelegateArgs},
+    prep, system, BaseCtx, ChainCtx, ErCtx, Result, Scenario, ScenarioReport,
 };
 use signer::Signer;
 
@@ -150,15 +142,15 @@ impl Scenario for PostDelegationTokenTransfer {
             TRANSFER_AMOUNT,
         );
         let delegate_ix = delegate_with_actions(
-            fee_payer.pubkey(),
-            delegated_account.pubkey(),
+            &fee_payer.pubkey(),
+            &delegated_account.pubkey(),
             None,
             DelegateArgs {
                 commit_frequency_ms: u32::MAX,
                 seeds: vec![],
                 validator: Some(er.identity()),
             },
-            vec![transfer_action.cleartext()],
+            &[transfer_action],
         );
 
         base.submit_and_confirm_with(
@@ -281,15 +273,15 @@ impl Scenario for PostDelegationTokenTransfer {
             FAILING_AMOUNT,
         );
         let failing_delegate = delegate_with_actions(
-            fee_payer.pubkey(),
-            failing_account.pubkey(),
+            &fee_payer.pubkey(),
+            &failing_account.pubkey(),
             None,
             DelegateArgs {
                 commit_frequency_ms: u32::MAX,
                 seeds: vec![],
                 validator: Some(er.identity()),
             },
-            vec![failing_action.cleartext()],
+            &[failing_action],
         );
         base.submit_and_confirm_with(
             &fee_payer,
@@ -467,20 +459,11 @@ fn delegate_eata_to(
             AccountMeta::new(eata, false),
             AccountMeta::new_readonly(eata_program(), false),
             AccountMeta::new(
-                delegate_buffer_pda_from_delegated_account_and_owner_program(
-                    &eata,
-                    &eata_program(),
-                ),
+                dlp::delegate_buffer_pda(&eata, &eata_program()),
                 false,
             ),
-            AccountMeta::new(
-                delegation_record_pda_from_delegated_account(&eata),
-                false,
-            ),
-            AccountMeta::new(
-                delegation_metadata_pda_from_delegated_account(&eata),
-                false,
-            ),
+            AccountMeta::new(dlp::delegation_record_pda(&eata), false),
+            AccountMeta::new(dlp::delegation_metadata_pda(&eata), false),
             AccountMeta::new_readonly(dlp::dlp_id(), false),
             AccountMeta::new_readonly(system::system_id(), false),
         ],

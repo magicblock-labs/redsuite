@@ -1,5 +1,5 @@
 use borsh::{BorshDeserialize, BorshSerialize};
-use solana_program::{declare_id, pubkey::Pubkey};
+use pubkey::{declare_id, Pubkey};
 
 declare_id!("BTczL2chGpVHw25pbmMtkFAD1t7rxoa8pVbaUjsybjiq");
 
@@ -17,10 +17,10 @@ pub enum SecurityInstruction {
 }
 
 pub mod build {
+    use instruction::{AccountMeta, Instruction};
     use redshift_interface::schedulecommit::build::{
         magic_context_id, magic_program_id,
     };
-    use solana_program::instruction::{AccountMeta, Instruction};
 
     use super::*;
 

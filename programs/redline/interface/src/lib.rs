@@ -1,4 +1,4 @@
-use solana_program::declare_id;
+use pubkey::declare_id;
 
 declare_id!("3JnJ727jWEmPVU8qfXwtH63sCNDX7nMgsLbg8qy8aaPX");
 

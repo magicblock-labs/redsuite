@@ -1,5 +1,5 @@
+use pubkey::Pubkey;
 use serde::{Deserialize, Serialize};
-use solana_program::pubkey::Pubkey;
 
 #[derive(Serialize, Deserialize)]
 pub enum Instruction {
@@ -44,11 +44,9 @@ pub enum Instruction {
 }
 
 pub mod build {
+    use instruction::{AccountMeta, Instruction as SolanaInstruction};
     use sdk::consts::{MAGIC_CONTEXT_ID, MAGIC_PROGRAM_ID};
-    use solana_program::instruction::{
-        AccountMeta, Instruction as SolanaInstruction,
-    };
-    use solana_sdk_ids::system_program;
+    use sdk_ids::system_program;
 
     use super::*;
     use crate::utils::derive_pda;
@@ -352,7 +350,7 @@ mod tests {
 
         assert_eq!(
             ix.accounts.iter().map(|m| m.pubkey).collect::<Vec<_>>(),
-            vec![payer, pda, base, solana_sdk_ids::system_program::ID],
+            vec![payer, pda, base, sdk_ids::system_program::ID],
         );
         let decoded: Instruction = bincode::deserialize(&ix.data).unwrap();
         let Instruction::InitAccount {

@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    check, check_eq, prep, system, topology, BaseCtx, ChainCtx, ErCtx,
+    check, check_eq, dlp, prep, system, topology, BaseCtx, ChainCtx, ErCtx,
     PrivateErScenario, Result, ScenarioReport,
 };
 use sdk::spl::{
@@ -294,8 +294,7 @@ async fn run_risk_case(
     .instruction();
     base.submit_and_confirm(&fee_payer, &[vault_ix]).await?;
 
-    let fees_vault =
-        dlp_api::pda::validator_fees_vault_pda_from_validator(&er_identity);
+    let fees_vault = dlp::validator_fees_vault_pda(&er_identity);
     check!(
         base.account(&fees_vault).await?.is_some(),
         "the private ER identity {er_identity} has no validator fees vault on \
@@ -483,8 +482,6 @@ async fn delegation_record_exists(
     base: &BaseCtx,
     delegated_account: &Pubkey,
 ) -> Result<bool> {
-    let record_pda = dlp_api::pda::delegation_record_pda_from_delegated_account(
-        delegated_account,
-    );
+    let record_pda = dlp::delegation_record_pda(delegated_account);
     Ok(base.account(&record_pda).await?.is_some())
 }

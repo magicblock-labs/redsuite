@@ -1,11 +1,8 @@
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use dlp_api::{
-    args::CommitStateArgs,
-    instruction_builder::{commit_state, finalize, undelegate},
-};
 use keypair::Keypair;
+use redsuite_core::dlp::{commit_state, finalize, undelegate, CommitStateArgs};
 use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, dlp, prep, system, topology, BaseCtx, ChainCtx, ErCtx,
@@ -203,9 +200,9 @@ impl Scenario for CloneOnAccess {
         let identity = topology::er_identity_keypair()?;
         let cycle = [
             commit_state(
-                er.identity(),
-                wallet.pubkey(),
-                system::system_id(),
+                &er.identity(),
+                &wallet.pubkey(),
+                &system::system_id(),
                 CommitStateArgs {
                     nonce: 1,
                     lamports: WALLET_LAMPORTS,
@@ -213,12 +210,12 @@ impl Scenario for CloneOnAccess {
                     data: vec![],
                 },
             ),
-            finalize(er.identity(), wallet.pubkey()),
+            finalize(&er.identity(), &wallet.pubkey()),
             undelegate(
-                er.identity(),
-                wallet.pubkey(),
-                system::system_id(),
-                payer.pubkey(),
+                &er.identity(),
+                &wallet.pubkey(),
+                &system::system_id(),
+                &payer.pubkey(),
             ),
             system::assign(&wallet.pubkey(), &dlp::dlp_id()),
             dlp::delegate_account(

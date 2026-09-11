@@ -1,5 +1,5 @@
 use borsh::{to_vec, BorshDeserialize, BorshSerialize};
-use solana_program::pubkey::Pubkey;
+use pubkey::Pubkey;
 
 pub const FLEXI_SEED: &[u8] = b"flexi_counter";
 pub const PRIZE: u64 = 1_000_000;
@@ -123,12 +123,12 @@ pub enum FlexiInstruction {
 }
 
 pub mod build {
+    use instruction::{AccountMeta, Instruction};
     use sdk::{
         consts::{MAGIC_CONTEXT_ID, MAGIC_PROGRAM_ID},
         delegate_args::{DelegateAccountMetas, DelegateAccounts},
     };
-    use solana_program::instruction::{AccountMeta, Instruction};
-    use solana_sdk_ids::system_program;
+    use sdk_ids::system_program;
 
     use super::*;
 
