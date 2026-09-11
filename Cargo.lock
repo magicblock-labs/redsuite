@@ -1006,7 +1006,7 @@ dependencies = [
  "solana-pubkey 3.0.0",
  "solana-system-interface 2.0.0",
  "solana-sysvar 3.1.1",
- "spl-associated-token-account-interface 1.0.0",
+ "spl-associated-token-account-interface",
 ]
 
 [[package]]
@@ -2738,8 +2738,6 @@ dependencies = [
  "solana-signature",
  "solana-signer",
  "sonic-rs",
- "spl-associated-token-account-interface 2.0.0",
- "spl-token-interface",
  "tokio",
 ]
 
@@ -5800,16 +5798,6 @@ checksum = "5e6bbe0794e532ac08428d3abf5bf8ae75bd81dfddd785c388e326c00c92c6f5"
 dependencies = [
  "solana-instruction 2.3.3",
  "solana-pubkey 2.4.0",
-]
-
-[[package]]
-name = "spl-associated-token-account-interface"
-version = "2.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6433917b60441d68d99a17e121d9db0ea15a9a69c0e5afa34649cf5ba12612f"
-dependencies = [
- "solana-instruction 3.4.0",
- "solana-pubkey 3.0.0",
 ]
 
 [[package]]
