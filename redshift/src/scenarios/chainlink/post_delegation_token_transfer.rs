@@ -1,7 +1,6 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use instruction::{AccountMeta, Instruction};
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
@@ -12,8 +11,6 @@ use redsuite_core::{
 use signer::Signer;
 
 use super::spl;
-
-const EATA_PROGRAM: &str = "SPLxh1LVZzEkX99H6rqYizhytLWPZVV296zyYDPagv2";
 
 const AIRDROP: u64 = 2_000_000_000;
 const SOURCE_BALANCE: u64 = 200;
@@ -84,9 +81,13 @@ impl Scenario for PostDelegationTokenTransfer {
         base.submit_and_confirm(
             &fee_payer,
             &[
-                initialize_global_vault(&fee_payer.pubkey(), &mint_key),
-                initialize_eata(&fee_payer.pubkey(), &source, &mint_key),
-                initialize_eata(&fee_payer.pubkey(), &destination, &mint_key),
+                spl::initialize_global_vault(&fee_payer.pubkey(), &mint_key),
+                spl::initialize_eata(&fee_payer.pubkey(), &source, &mint_key),
+                spl::initialize_eata(
+                    &fee_payer.pubkey(),
+                    &destination,
+                    &mint_key,
+                ),
             ],
         )
         .await?;
@@ -95,8 +96,8 @@ impl Scenario for PostDelegationTokenTransfer {
             &fee_payer,
             &[&source_authority, &destination_authority],
             &[
-                deposit_spl_tokens(&source, &mint_key, SOURCE_BALANCE),
-                deposit_spl_tokens(
+                spl::deposit_spl_tokens(&source, &mint_key, SOURCE_BALANCE),
+                spl::deposit_spl_tokens(
                     &destination,
                     &mint_key,
                     DESTINATION_BALANCE,
@@ -108,8 +109,18 @@ impl Scenario for PostDelegationTokenTransfer {
         base.submit_and_confirm(
             &fee_payer,
             &[
-                delegate_eata(&fee_payer.pubkey(), &source, &mint_key, er),
-                delegate_eata(&fee_payer.pubkey(), &destination, &mint_key, er),
+                spl::delegate_eata(
+                    &fee_payer.pubkey(),
+                    &source,
+                    &mint_key,
+                    &er.identity(),
+                ),
+                spl::delegate_eata(
+                    &fee_payer.pubkey(),
+                    &destination,
+                    &mint_key,
+                    &er.identity(),
+                ),
             ],
         )
         .await?;
@@ -135,7 +146,7 @@ impl Scenario for PostDelegationTokenTransfer {
             "the destination ATA on chain must be drained into the vault"
         )?;
 
-        let transfer_action = spl_transfer(
+        let transfer_action = spl::transfer(
             &source_ata,
             &destination_ata,
             &source,
@@ -223,19 +234,23 @@ impl Scenario for PostDelegationTokenTransfer {
                     &mint_key,
                 ),
                 spl::mint_to(&mint_key, &foreign_ata, &source, FOREIGN_BALANCE),
-                initialize_eata(&fee_payer.pubkey(), &foreign, &mint_key),
+                spl::initialize_eata(&fee_payer.pubkey(), &foreign, &mint_key),
             ],
         )
         .await?;
         base.submit_and_confirm_with(
             &fee_payer,
             &[&foreign_authority],
-            &[deposit_spl_tokens(&foreign, &mint_key, FOREIGN_BALANCE)],
+            &[spl::deposit_spl_tokens(
+                &foreign,
+                &mint_key,
+                FOREIGN_BALANCE,
+            )],
         )
         .await?;
         base.submit_and_confirm(
             &fee_payer,
-            &[delegate_eata_to(
+            &[spl::delegate_eata(
                 &fee_payer.pubkey(),
                 &foreign,
                 &mint_key,
@@ -266,7 +281,7 @@ impl Scenario for PostDelegationTokenTransfer {
         // undelegation (ownership returns to system on base).
         let failing_account = Keypair::new();
         base.airdrop(&failing_account.pubkey(), AIRDROP).await?;
-        let failing_action = spl_transfer(
+        let failing_action = spl::transfer(
             &source_ata,
             &destination_ata,
             &source,
@@ -337,137 +352,6 @@ impl Scenario for PostDelegationTokenTransfer {
             )
             .setting("plain ata on er", PLAIN_BALANCE)
             .setting("foreign-delegated ata on er", 0u64))
-    }
-}
-
-fn eata_program() -> Pubkey {
-    EATA_PROGRAM.parse().expect("eata program id")
-}
-
-fn derive_eata(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
-    Pubkey::find_program_address(
-        &[owner.as_ref(), mint.as_ref()],
-        &eata_program(),
-    )
-    .0
-}
-
-fn derive_global_vault(mint: &Pubkey) -> Pubkey {
-    Pubkey::find_program_address(&[mint.as_ref()], &eata_program()).0
-}
-
-fn spl_transfer(
-    source: &Pubkey,
-    destination: &Pubkey,
-    authority: &Pubkey,
-    amount: u64,
-) -> Instruction {
-    let mut data = vec![3u8];
-    data.extend_from_slice(&amount.to_le_bytes());
-    Instruction {
-        program_id: spl::token_program(),
-        accounts: vec![
-            AccountMeta::new(*source, false),
-            AccountMeta::new(*destination, false),
-            AccountMeta::new_readonly(*authority, true),
-        ],
-        data,
-    }
-}
-
-fn initialize_global_vault(payer: &Pubkey, mint: &Pubkey) -> Instruction {
-    let vault = derive_global_vault(mint);
-    Instruction {
-        program_id: eata_program(),
-        accounts: vec![
-            AccountMeta::new(vault, false),
-            AccountMeta::new(*payer, true),
-            AccountMeta::new_readonly(*mint, false),
-            AccountMeta::new(derive_eata(&vault, mint), false),
-            AccountMeta::new(spl::derive_ata(&vault, mint), false),
-            AccountMeta::new_readonly(spl::token_program(), false),
-            AccountMeta::new_readonly(spl::ata_program(), false),
-            AccountMeta::new_readonly(system::system_id(), false),
-        ],
-        data: vec![1],
-    }
-}
-
-fn initialize_eata(
-    payer: &Pubkey,
-    user: &Pubkey,
-    mint: &Pubkey,
-) -> Instruction {
-    Instruction {
-        program_id: eata_program(),
-        accounts: vec![
-            AccountMeta::new(derive_eata(user, mint), false),
-            AccountMeta::new(*payer, true),
-            AccountMeta::new_readonly(*user, false),
-            AccountMeta::new_readonly(*mint, false),
-            AccountMeta::new_readonly(system::system_id(), false),
-        ],
-        data: vec![0],
-    }
-}
-
-fn deposit_spl_tokens(
-    user: &Pubkey,
-    mint: &Pubkey,
-    amount: u64,
-) -> Instruction {
-    let vault = derive_global_vault(mint);
-    let mut data = vec![2u8];
-    data.extend_from_slice(&amount.to_le_bytes());
-    Instruction {
-        program_id: eata_program(),
-        accounts: vec![
-            AccountMeta::new(derive_eata(user, mint), false),
-            AccountMeta::new_readonly(vault, false),
-            AccountMeta::new_readonly(*mint, false),
-            AccountMeta::new(spl::derive_ata(user, mint), false),
-            AccountMeta::new(spl::derive_ata(&vault, mint), false),
-            AccountMeta::new_readonly(*user, true),
-            AccountMeta::new_readonly(spl::token_program(), false),
-        ],
-        data,
-    }
-}
-
-fn delegate_eata(
-    payer: &Pubkey,
-    user: &Pubkey,
-    mint: &Pubkey,
-    er: &ErCtx,
-) -> Instruction {
-    delegate_eata_to(payer, user, mint, &er.identity())
-}
-
-fn delegate_eata_to(
-    payer: &Pubkey,
-    user: &Pubkey,
-    mint: &Pubkey,
-    validator: &Pubkey,
-) -> Instruction {
-    let eata = derive_eata(user, mint);
-    let mut data = vec![4u8];
-    data.extend_from_slice(validator.as_ref());
-    Instruction {
-        program_id: eata_program(),
-        accounts: vec![
-            AccountMeta::new(*payer, true),
-            AccountMeta::new(eata, false),
-            AccountMeta::new_readonly(eata_program(), false),
-            AccountMeta::new(
-                dlp::delegate_buffer_pda(&eata, &eata_program()),
-                false,
-            ),
-            AccountMeta::new(dlp::delegation_record_pda(&eata), false),
-            AccountMeta::new(dlp::delegation_metadata_pda(&eata), false),
-            AccountMeta::new_readonly(dlp::dlp_id(), false),
-            AccountMeta::new_readonly(system::system_id(), false),
-        ],
-        data,
     }
 }
 

@@ -394,8 +394,20 @@ aperture (JSON-RPC surface):
   or status, and the MagicBlock-specific `getBlockhashForAccounts` and
   `getDelegationStatus` are called raw. Block publication is polled with a
   bound before history is read. Reports the burst wall time and the send
-  failure count without a throughput verdict. RPC-surface
-  scenarios carry the `rpc_` prefix so they can be run together:
+  failure count without a throughput verdict.
+- `rpc_token_queries` — builds realistic SPL state on base and lets the ER
+  materialize it: two mints, two owners, an approved delegate, plain ATAs
+  and eATA-backed projections delegated to the ER, plus one account that is
+  never touched. Then fires 256 concurrent, unpaced reads under a bounded
+  deadline through the official `solana-rpc-client`, cycling
+  `getProgramAccounts` with mint and owner filters, `getTokenAccountBalance`,
+  `getTokenAccountsByOwner` and `getTokenAccountsByDelegate` with mint and
+  program filters. Every answer must name exactly the expected accounts with
+  the right owners, delegates, balances and encodings, and the untouched
+  account must never appear. Missing mints and invalid token program ids
+  must be rejected within a bound. Reports the burst wall time and failure
+  count without a throughput verdict. RPC-surface scenarios carry the `rpc_`
+  prefix so they can be run together:
   `cargo nextest run -E 'test(/catalog::redshift::rpc_/)'`.
 
 harness:
