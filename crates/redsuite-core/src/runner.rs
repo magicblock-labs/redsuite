@@ -416,6 +416,12 @@ pub struct Workers<T> {
     handles: Vec<JoinHandle<Result<T>>>,
 }
 
+impl<T> Drop for Workers<T> {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 pub fn spawn_workers<T, Factory, Fut>(
     threads: usize,
     factory: Factory,
@@ -449,17 +455,20 @@ where
     Workers { stop, handles }
 }
 
-impl<T: Send + 'static> Workers<T> {
+impl<T> Workers<T> {
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
     }
+}
 
-    pub fn join(self) -> Result<Vec<T>> {
+impl<T: Send + 'static> Workers<T> {
+    pub fn join(mut self) -> Result<Vec<T>> {
         self.stop();
-        let mut outcomes = Vec::with_capacity(self.handles.len());
+        let handles = std::mem::take(&mut self.handles);
+        let mut outcomes = Vec::with_capacity(handles.len());
         let mut first_panic = None;
         let mut first_error = None;
-        for handle in self.handles {
+        for handle in handles {
             match handle.join() {
                 Ok(Ok(outcome)) => outcomes.push(outcome),
                 Ok(Err(error)) => {
