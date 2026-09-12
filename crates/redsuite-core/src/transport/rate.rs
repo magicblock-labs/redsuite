@@ -171,7 +171,7 @@ impl AdmissionStats {
 
     pub fn finish(mut self) -> ObservationsStats {
         let tail = self.origin.elapsed() - Duration::from_secs(self.bucket);
-        if self.count > 0 && tail >= TAIL_BUCKET_MIN {
+        if self.count > 0 && (self.bucket == 0 || tail >= TAIL_BUCKET_MIN) {
             self.rps
                 .push((f64::from(self.count) / tail.as_secs_f64()) as u32);
         }
