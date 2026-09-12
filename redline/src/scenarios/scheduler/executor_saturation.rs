@@ -19,7 +19,8 @@ use redsuite_core::{
     profile::{self, ProfileValues},
     report,
     runner::{
-        execute_raw, panic_message, RawRunOutcome, RunConfig, RunOutcome,
+        execute_raw, merge_outcomes, spawn_workers, split_iterations,
+        RawRunOutcome, RunConfig, RunOutcome,
     },
     topology, Api, BaseCtx, BatchBody, ChainCtx, CheckError, ErClient, ErCtx,
     MetricsDelta, Result, Scenario, ScenarioReport, TxSender,
@@ -174,6 +175,13 @@ struct BurstOutcome {
     staged: u64,
 }
 
+struct WorkerBurst {
+    outcomes: Vec<RawRunOutcome>,
+    sign_s: f64,
+    blast_s: f64,
+    staged: u64,
+}
+
 fn build_ixs(
     accounts: &[Pubkey],
     global_id: u64,
@@ -196,7 +204,7 @@ fn build_ixs(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn execute_cell_burst(
+async fn execute_cell_burst(
     er_rpc_url: String,
     config: BurstConfig,
     id_offset: u64,
@@ -207,176 +215,132 @@ fn execute_cell_burst(
     probe: Arc<OnceLock<Signature>>,
 ) -> Result<BurstOutcome> {
     let threads = config.threads.max(1);
-    let base_iterations = config.iterations / threads as u64;
-    let remainder = config.iterations % threads as u64;
     let concurrency = (config.concurrency / threads).max(1);
-    let (outcome_sender, outcome_receiver) = std::sync::mpsc::channel();
-
-    let mut first_id = id_offset;
-    let mut handles = Vec::with_capacity(threads);
-    for thread_index in 0..threads {
-        let iterations =
-            base_iterations + u64::from((thread_index as u64) < remainder);
-        if iterations == 0 {
-            continue;
-        }
-        let thread_first_id = first_id;
-        first_id += iterations;
+    let batch = config.batch.max(1);
+    let rpc_batch = config.rpc_batch;
+    let spans = split_iterations(config.iterations, threads);
+    let bursts = spawn_workers(spans.len(), move |worker| {
+        let (first_id, iterations) = spans[worker.index];
+        let thread_first_id = id_offset + first_id;
         let er_rpc_url = er_rpc_url.clone();
         let accounts = accounts.clone();
         let payer_bytes = payer_bytes.clone();
         let probe = probe.clone();
-        let batch = config.batch.max(1);
-        let rpc_batch = config.rpc_batch;
-        let outcome_sender = outcome_sender.clone();
-        handles.push(std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("driver runtime build is infallible");
-            let local = tokio::task::LocalSet::new();
-            let result = runtime.block_on(local.run_until(async move {
-                let client = ErClient::new(er_rpc_url);
-                let senders: Vec<TxSender> = payer_bytes
-                    .iter()
-                    .map(|bytes| {
-                        let payer = Keypair::try_from(&bytes[..])
-                            .expect("payer bytes round-trip");
-                        client.sender(Rc::new(payer))
-                    })
-                    .collect();
-                let api = client.api().clone();
+        async move {
+            let client = ErClient::new(er_rpc_url);
+            let senders: Vec<TxSender> = payer_bytes
+                .iter()
+                .map(|bytes| {
+                    let payer = Keypair::try_from(&bytes[..])
+                        .expect("payer bytes round-trip");
+                    client.sender(Rc::new(payer))
+                })
+                .collect();
+            let api = client.api().clone();
 
-                let mut outcomes = Vec::new();
-                let mut sign_s = 0.0f64;
-                let mut blast_s = 0.0f64;
-                let mut staged = 0u64;
-                let ids: Vec<u64> = (1..=iterations)
-                    .map(|iteration| thread_first_id + iteration)
-                    .collect();
-                for chunk in ids.chunks(batch) {
-                    let sign_started = Instant::now();
-                    let mut signed = Vec::with_capacity(chunk.len());
-                    for &global_id in chunk {
-                        let ixs = build_ixs(
-                            &accounts,
-                            global_id,
-                            iters,
-                            raise_budget,
-                        );
-                        let sender =
-                            &senders[slot_of(global_id, senders.len())];
-                        let tx = sender
-                            .prepare(&ixs)
-                            .await
-                            .expect("pre-signing must not fail");
-                        let _ = probe.set(tx.signatures[0]);
-                        signed.push(tx);
-                    }
-                    staged += signed.len() as u64;
-                    let bodies: Vec<Rc<BatchBody>> =
-                        if rpc_batch > 0 {
-                            signed
-                                .chunks(rpc_batch)
-                                .map(|chunk| {
-                                    Rc::new(Api::batch_send_body(chunk).expect(
-                                        "batch body build is infallible",
-                                    ))
-                                })
-                                .collect()
-                        } else {
-                            Vec::new()
-                        };
-                    sign_s += sign_started.elapsed().as_secs_f64();
-
-                    let blast_started = Instant::now();
-                    let outcome = if rpc_batch > 0 {
-                        execute_raw(
-                            RunConfig {
-                                iterations: bodies.len() as u64,
-                                rate: u32::MAX,
-                                concurrency,
-                            },
-                            |index| {
-                                let body = bodies[(index - 1) as usize].clone();
-                                let api = api.clone();
-                                async move {
-                                    match api.send_batch(&body).await {
-                                        Ok(0) => Ok(()),
-                                        Ok(rejected) => Err(format!(
-                                            "{rejected} batch entries rejected"
-                                        )
-                                        .into()),
-                                        Err(error) => Err(error),
-                                    }
-                                }
-                            },
-                        )
+            let mut outcomes = Vec::new();
+            let mut sign_s = 0.0f64;
+            let mut blast_s = 0.0f64;
+            let mut staged = 0u64;
+            let ids: Vec<u64> = (1..=iterations)
+                .map(|iteration| thread_first_id + iteration)
+                .collect();
+            for chunk in ids.chunks(batch) {
+                let sign_started = Instant::now();
+                let mut signed = Vec::with_capacity(chunk.len());
+                for &global_id in chunk {
+                    let ixs =
+                        build_ixs(&accounts, global_id, iters, raise_budget);
+                    let sender = &senders[slot_of(global_id, senders.len())];
+                    let tx = sender
+                        .prepare(&ixs)
                         .await
-                    } else {
-                        execute_raw(
-                            RunConfig {
-                                iterations: signed.len() as u64,
-                                rate: u32::MAX,
-                                concurrency,
-                            },
-                            |batch_index| {
-                                let tx =
-                                    signed[(batch_index - 1) as usize].clone();
-                                let api = api.clone();
-                                async move {
-                                    api.send_transaction(&tx).await.map(|_| ())
-                                }
-                            },
-                        )
-                        .await
-                    };
-                    blast_s += blast_started.elapsed().as_secs_f64();
-                    outcomes.push(outcome);
+                        .expect("pre-signing must not fail");
+                    let _ = probe.set(tx.signatures[0]);
+                    signed.push(tx);
                 }
-                (outcomes, sign_s, blast_s, staged)
-            }));
-            let _ = outcome_sender.send(result);
-        }));
-    }
-    drop(outcome_sender);
+                staged += signed.len() as u64;
+                let bodies: Vec<Rc<BatchBody>> = if rpc_batch > 0 {
+                    signed
+                        .chunks(rpc_batch)
+                        .map(|chunk| {
+                            Rc::new(
+                                Api::batch_send_body(chunk)
+                                    .expect("batch body build is infallible"),
+                            )
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                sign_s += sign_started.elapsed().as_secs_f64();
 
-    let workers = handles.len();
-    let mut received = 0usize;
+                let blast_started = Instant::now();
+                let outcome = if rpc_batch > 0 {
+                    execute_raw(
+                        RunConfig {
+                            iterations: bodies.len() as u64,
+                            rate: u32::MAX,
+                            concurrency,
+                        },
+                        |index| {
+                            let body = bodies[(index - 1) as usize].clone();
+                            let api = api.clone();
+                            async move {
+                                match api.send_batch(&body).await {
+                                    Ok(0) => Ok(()),
+                                    Ok(rejected) => Err(format!(
+                                        "{rejected} batch entries rejected"
+                                    )
+                                    .into()),
+                                    Err(error) => Err(error),
+                                }
+                            }
+                        },
+                    )
+                    .await
+                } else {
+                    execute_raw(
+                        RunConfig {
+                            iterations: signed.len() as u64,
+                            rate: u32::MAX,
+                            concurrency,
+                        },
+                        |batch_index| {
+                            let tx = signed[(batch_index - 1) as usize].clone();
+                            let api = api.clone();
+                            async move {
+                                api.send_transaction(&tx).await.map(|_| ())
+                            }
+                        },
+                    )
+                    .await
+                };
+                blast_s += blast_started.elapsed().as_secs_f64();
+                outcomes.push(outcome);
+            }
+            Ok(WorkerBurst {
+                outcomes,
+                sign_s,
+                blast_s,
+                staged,
+            })
+        }
+    })
+    .join_async()
+    .await?;
+
     let mut all_outcomes: Vec<RawRunOutcome> = Vec::new();
     let mut sign_s = 0.0f64;
     let mut blast_s = 0.0f64;
     let mut staged = 0u64;
-    while let Ok((outcomes, thread_sign_s, thread_blast_s, thread_staged)) =
-        outcome_receiver.recv()
-    {
-        received += 1;
-        all_outcomes.extend(outcomes);
-        sign_s = sign_s.max(thread_sign_s);
-        blast_s = blast_s.max(thread_blast_s);
-        staged += thread_staged;
+    for burst in bursts {
+        all_outcomes.extend(burst.outcomes);
+        sign_s = sign_s.max(burst.sign_s);
+        blast_s = blast_s.max(burst.blast_s);
+        staged += burst.staged;
     }
-    let mut first_worker_panic = None;
-    for handle in handles {
-        if let Err(payload) = handle.join() {
-            first_worker_panic.get_or_insert_with(|| panic_message(payload));
-        }
-    }
-    if let Some(panic) = first_worker_panic {
-        return Err(format!("driver worker thread panicked: {panic}").into());
-    }
-    if received != workers {
-        return Err("a driver worker thread stopped without an outcome".into());
-    }
-
-    let mut outcome = all_outcomes
-        .into_iter()
-        .reduce(|mut merged, chunk_outcome| {
-            merged.merge(chunk_outcome);
-            merged
-        })
-        .map(RawRunOutcome::finalize)
-        .unwrap_or_default();
+    let mut outcome = merge_outcomes(all_outcomes);
     outcome.wall = Duration::from_secs_f64(blast_s.max(1e-9));
     Ok(BurstOutcome {
         outcome,
@@ -579,7 +543,8 @@ impl Scenario for ExecutorSaturation {
             LIGHT_ITERS,
             false,
             Arc::new(OnceLock::new()),
-        )?;
+        )
+        .await?;
         check_eq!(
             warm.outcome.failed,
             0,
@@ -616,7 +581,8 @@ impl Scenario for ExecutorSaturation {
                 iters,
                 raise_budget,
                 probe.clone(),
-            )?;
+            )
+            .await?;
             let outcome = burst.outcome;
             offset += cell_iterations;
             check_eq!(

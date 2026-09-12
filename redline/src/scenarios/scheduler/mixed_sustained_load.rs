@@ -13,7 +13,7 @@ use redsuite_core::{
     check, check_eq, host, prep,
     profile::{self, ProfileValues},
     runner::{
-        execute_raw, panic_message, RawRunOutcome, RunConfig, RunOutcome,
+        execute_raw, merge_outcomes, spawn_workers, RunConfig, RunOutcome,
     },
     topology, BaseCtx, ChainCtx, ErClient, ErCtx, MetricsDelta, Result,
     Scenario, ScenarioReport, TxSender,
@@ -250,109 +250,68 @@ struct ExecuteConfig {
     concurrency: usize,
 }
 
-fn execute(
+async fn execute(
     er_rpc_url: String,
     config: ExecuteConfig,
     pool: Arc<Vec<Pubkey>>,
     payer_bytes: Arc<Vec<[u8; 64]>>,
 ) -> Result<RunOutcome> {
     let threads = config.threads.max(1);
-    let spans = lane_spans(config.lanes, threads);
+    let spans: Vec<LaneSpan> = lane_spans(config.lanes, threads)
+        .into_iter()
+        .take_while(|span| span.jobs(config.lanes, config.total) > 0)
+        .collect();
     let rate = (config.rate / threads as u32).max(1);
-    let (sender, receiver) = std::sync::mpsc::channel();
-
-    let mut handles = Vec::with_capacity(spans.len());
-    for (index, span) in spans.into_iter().enumerate() {
-        let jobs = span.jobs(config.lanes, config.total);
-        if jobs == 0 {
-            continue;
-        }
+    let lanes = config.lanes;
+    let total = config.total;
+    let read_span = config.read_span;
+    let high_cu_iters = config.high_cu_iters;
+    let concurrency = config.concurrency;
+    let outcomes = spawn_workers(spans.len(), move |worker| {
+        let index = worker.index;
+        let span = spans[index];
         let er_rpc_url = er_rpc_url.clone();
         let pool = pool.clone();
         let payer_bytes = payer_bytes.clone();
-        let outcome_sender = sender.clone();
-        let lanes = config.lanes;
-        let total = config.total;
-        let read_span = config.read_span;
-        let high_cu_iters = config.high_cu_iters;
-        let concurrency = config.concurrency;
-        handles.push(std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("driver runtime build is infallible");
-            let local = tokio::task::LocalSet::new();
-            let outcome = runtime.block_on(local.run_until(async move {
-                let client = ErClient::new(er_rpc_url);
-                let senders: Vec<TxSender> = payer_bytes
-                    .iter()
-                    .enumerate()
-                    .filter(|(payer_index, _)| payer_index % threads == index)
-                    .map(|(_, bytes)| {
-                        let payer = Keypair::try_from(&bytes[..])
-                            .expect("payer bytes round-trip");
-                        client.sender(Rc::new(payer))
-                    })
-                    .collect();
-                let locks: Rc<Vec<tokio::sync::Mutex<()>>> = Rc::new(
-                    (0..span.len)
-                        .map(|_| tokio::sync::Mutex::new(()))
-                        .collect(),
-                );
-                execute_raw(
-                    RunConfig {
-                        iterations: jobs,
-                        rate,
-                        concurrency,
-                    },
-                    |iteration| {
-                        let id = span.job_id(iteration - 1, lanes, total);
-                        let lane_index =
-                            (lane_of(id, lanes) - span.lo) as usize;
-                        let ixs =
-                            build_ixs(id, &pool, read_span, high_cu_iters);
-                        let sender =
-                            senders[(id as usize) % senders.len()].clone();
-                        let locks = locks.clone();
-                        async move {
-                            let _lane = locks[lane_index].lock().await;
-                            sender.submit(&ixs).await.map(|_| ())
-                        }
-                    },
-                )
-                .await
-            }));
-            let _ = outcome_sender.send(outcome);
-        }));
-    }
-    drop(sender);
-
-    let workers = handles.len();
-    let mut outcomes: Vec<RawRunOutcome> = Vec::new();
-    while let Ok(outcome) = receiver.recv() {
-        outcomes.push(outcome);
-    }
-    let mut first_panic = None;
-    for handle in handles {
-        if let Err(payload) = handle.join() {
-            first_panic.get_or_insert_with(|| panic_message(payload));
+        async move {
+            let client = ErClient::new(er_rpc_url);
+            let senders: Vec<TxSender> = payer_bytes
+                .iter()
+                .enumerate()
+                .filter(|(payer_index, _)| payer_index % threads == index)
+                .map(|(_, bytes)| {
+                    let payer = Keypair::try_from(&bytes[..])
+                        .expect("payer bytes round-trip");
+                    client.sender(Rc::new(payer))
+                })
+                .collect();
+            let locks: Rc<Vec<tokio::sync::Mutex<()>>> = Rc::new(
+                (0..span.len).map(|_| tokio::sync::Mutex::new(())).collect(),
+            );
+            Ok(execute_raw(
+                RunConfig {
+                    iterations: span.jobs(lanes, total),
+                    rate,
+                    concurrency,
+                },
+                |iteration| {
+                    let id = span.job_id(iteration - 1, lanes, total);
+                    let lane_index = (lane_of(id, lanes) - span.lo) as usize;
+                    let ixs = build_ixs(id, &pool, read_span, high_cu_iters);
+                    let sender = senders[(id as usize) % senders.len()].clone();
+                    let locks = locks.clone();
+                    async move {
+                        let _lane = locks[lane_index].lock().await;
+                        sender.submit(&ixs).await.map(|_| ())
+                    }
+                },
+            )
+            .await)
         }
-    }
-    if let Some(panic) = first_panic {
-        return Err(format!("driver worker thread panicked: {panic}").into());
-    }
-    if outcomes.len() != workers {
-        return Err("a driver worker thread stopped without an outcome".into());
-    }
-
-    Ok(outcomes
-        .into_iter()
-        .reduce(|mut merged, outcome| {
-            merged.merge(outcome);
-            merged
-        })
-        .map(RawRunOutcome::finalize)
-        .unwrap_or_default())
+    })
+    .join_async()
+    .await?;
+    Ok(merge_outcomes(outcomes))
 }
 
 struct DrainState {
@@ -571,7 +530,8 @@ impl Scenario for MixedSustainedLoad {
             },
             pool.clone(),
             payer_bytes,
-        )?;
+        )
+        .await?;
 
         check_eq!(
             outcome.failed,

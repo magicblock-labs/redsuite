@@ -3,7 +3,12 @@ use std::{
     cell::{Cell, RefCell},
     future::Future,
     rc::Rc,
-    time::Instant,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    thread::JoinHandle,
+    time::{Duration, Instant},
 };
 
 use tokio::task::{JoinError, JoinSet};
@@ -13,6 +18,8 @@ use crate::{
     transport::rate::RateManager,
     DynError, Result,
 };
+
+const STOP_POLL: Duration = Duration::from_millis(20);
 
 pub struct RunConfig {
     pub iterations: u64,
@@ -64,7 +71,7 @@ impl RunOutcome {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct RawRunOutcome {
     pub delivered: u64,
     pub failed: u64,
@@ -379,6 +386,125 @@ where
     .finalize()
 }
 
+pub struct Worker {
+    pub index: usize,
+    pub threads: usize,
+    stop: Arc<AtomicBool>,
+}
+
+impl Worker {
+    pub fn stop_flag(&self) -> Arc<AtomicBool> {
+        self.stop.clone()
+    }
+
+    pub fn stop_cell(&self) -> Rc<Cell<bool>> {
+        let cell = Rc::new(Cell::new(false));
+        let stop = self.stop.clone();
+        let bridge = cell.clone();
+        tokio::task::spawn_local(async move {
+            while !stop.load(Ordering::Relaxed) {
+                tokio::time::sleep(STOP_POLL).await;
+            }
+            bridge.set(true);
+        });
+        cell
+    }
+}
+
+pub struct Workers<T> {
+    stop: Arc<AtomicBool>,
+    handles: Vec<JoinHandle<Result<T>>>,
+}
+
+pub fn spawn_workers<T, Factory, Fut>(
+    threads: usize,
+    factory: Factory,
+) -> Workers<T>
+where
+    T: Send + 'static,
+    Factory: Fn(Worker) -> Fut + Clone + Send + 'static,
+    Fut: Future<Output = Result<T>>,
+{
+    let stop = Arc::new(AtomicBool::new(false));
+    let handles = (0..threads)
+        .map(|index| {
+            let factory = factory.clone();
+            let worker = Worker {
+                index,
+                threads,
+                stop: stop.clone(),
+            };
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("driver runtime build is infallible");
+                let local = tokio::task::LocalSet::new();
+                runtime.block_on(
+                    local.run_until(async move { factory(worker).await }),
+                )
+            })
+        })
+        .collect();
+    Workers { stop, handles }
+}
+
+impl<T: Send + 'static> Workers<T> {
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+
+    pub fn join(self) -> Result<Vec<T>> {
+        self.stop();
+        let mut outcomes = Vec::with_capacity(self.handles.len());
+        let mut first_panic = None;
+        let mut first_error = None;
+        for handle in self.handles {
+            match handle.join() {
+                Ok(Ok(outcome)) => outcomes.push(outcome),
+                Ok(Err(error)) => {
+                    first_error.get_or_insert(error);
+                }
+                Err(payload) => {
+                    first_panic.get_or_insert_with(|| panic_message(payload));
+                }
+            }
+        }
+        if let Some(panic) = first_panic {
+            return Err(
+                format!("driver worker thread panicked: {panic}").into()
+            );
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        Ok(outcomes)
+    }
+
+    pub async fn join_async(self) -> Result<Vec<T>> {
+        self.stop();
+        tokio::task::spawn_blocking(move || self.join())
+            .await
+            .map_err(|error| format!("driver worker join failed: {error}"))?
+    }
+}
+
+pub fn split_iterations(iterations: u64, threads: usize) -> Vec<(u64, u64)> {
+    let threads = threads.max(1) as u64;
+    let base = iterations / threads;
+    let remainder = iterations % threads;
+    let mut first_id = 0u64;
+    (0..threads)
+        .map(|index| {
+            let count = base + u64::from(index < remainder);
+            let span = (first_id, count);
+            first_id += count;
+            span
+        })
+        .take_while(|(_, count)| *count > 0)
+        .collect()
+}
+
 pub fn execute_threaded<Factory, Request, Fut>(
     config: ThreadRunConfig,
     factory: Factory,
@@ -389,68 +515,31 @@ where
     Fut: Future<Output = Result<()>> + 'static,
 {
     let threads = config.threads.max(1);
-    let base_iterations = config.iterations / threads as u64;
-    let remainder = config.iterations % threads as u64;
-    let (outcome_sender, outcome_receiver) = std::sync::mpsc::channel();
-
-    let mut first_id = 0u64;
-    let mut handles = Vec::with_capacity(threads);
-    for thread_index in 0..threads {
-        let iterations =
-            base_iterations + u64::from((thread_index as u64) < remainder);
-        if iterations == 0 {
-            continue;
+    let rate = (config.rate / threads as u32).max(1);
+    let concurrency = (config.concurrency / threads).max(1);
+    let spans = split_iterations(config.iterations, threads);
+    let outcomes = spawn_workers(spans.len(), move |worker| {
+        let (first_id, iterations) = spans[worker.index];
+        let mut request = factory(worker.index);
+        async move {
+            Ok(execute_raw(
+                RunConfig {
+                    iterations,
+                    rate,
+                    concurrency,
+                },
+                |iteration| request(first_id + iteration),
+            )
+            .await)
         }
-        let thread_first_id = first_id;
-        first_id += iterations;
-        let rate = (config.rate / threads as u32).max(1);
-        let concurrency = (config.concurrency / threads).max(1);
-        let factory = factory.clone();
-        let outcome_sender = outcome_sender.clone();
-        handles.push(std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("driver runtime build is infallible");
-            let local = tokio::task::LocalSet::new();
-            let outcome = runtime.block_on(local.run_until(async move {
-                let mut request = factory(thread_index);
-                execute_raw(
-                    RunConfig {
-                        iterations,
-                        rate,
-                        concurrency,
-                    },
-                    |iteration| request(thread_first_id + iteration),
-                )
-                .await
-            }));
-            let _ = outcome_sender.send(outcome);
-        }));
-    }
-    drop(outcome_sender);
-
-    let workers = handles.len();
-    let mut outcomes = Vec::with_capacity(workers);
-    while let Ok(outcome) = outcome_receiver.recv() {
-        outcomes.push(outcome);
-    }
-    let mut first_worker_panic = None;
-    for handle in handles {
-        if let Err(payload) = handle.join() {
-            first_worker_panic.get_or_insert_with(|| panic_message(payload));
-        }
-    }
-    if let Some(panic) = first_worker_panic {
-        return Err(format!("driver worker thread panicked: {panic}").into());
-    }
-    if outcomes.len() != workers {
-        return Err("a driver worker thread stopped without an outcome".into());
-    }
+    })
+    .join()?;
     Ok(merge_outcomes(outcomes))
 }
 
-fn merge_outcomes(outcomes: Vec<RawRunOutcome>) -> RunOutcome {
+pub fn merge_outcomes(
+    outcomes: impl IntoIterator<Item = RawRunOutcome>,
+) -> RunOutcome {
     outcomes
         .into_iter()
         .reduce(|mut merged, outcome| {

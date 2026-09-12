@@ -19,7 +19,10 @@ use redsuite_core::{
     api, check, check_eq, prep,
     profile::{self, ProfileValues},
     report,
-    runner::{execute_until_raw, panic_message},
+    runner::{
+        execute_until_raw, merge_outcomes, spawn_workers, RawRunOutcome,
+        RunOutcome, Worker, Workers,
+    },
     stats::{ObservationsStats, StreamingStats},
     transport::ws::SignatureConfirmations,
     BaseCtx, ChainCtx, CheckError, ErClient, ErCtx, Metrics, MetricsDelta,
@@ -42,7 +45,6 @@ const SETTLE_TIMEOUT: Duration = Duration::from_secs(60);
 const CONFIRM_TIMEOUT: Duration = Duration::from_secs(60);
 const WARM_IN_TIMEOUT: Duration = Duration::from_secs(15);
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
-const STOP_POLL: Duration = Duration::from_millis(20);
 const CALIBRATION: Duration = Duration::from_secs(3);
 const STALL_BOUND: Duration = Duration::from_secs(10);
 const CU_LIMIT: u32 = 1_400_000;
@@ -276,49 +278,6 @@ impl LoadMode {
     }
 }
 
-struct LoadOutcome {
-    delivered: u64,
-    failed: u64,
-    first_error: Option<String>,
-    delivery: ObservationsStats,
-    wall: Duration,
-}
-
-struct LoadTally {
-    delivered: u64,
-    failed: u64,
-    first_error: Option<String>,
-    delivery: StreamingStats,
-    wall: Duration,
-}
-
-impl LoadTally {
-    fn merge(&mut self, other: LoadTally) {
-        self.delivered += other.delivered;
-        self.failed += other.failed;
-        if self.first_error.is_none() {
-            self.first_error = other.first_error;
-        }
-        self.delivery.merge(other.delivery);
-        self.wall = self.wall.max(other.wall);
-    }
-
-    fn finalize(self) -> LoadOutcome {
-        LoadOutcome {
-            delivered: self.delivered,
-            failed: self.failed,
-            first_error: self.first_error,
-            delivery: self.delivery.finalize(false),
-            wall: self.wall,
-        }
-    }
-}
-
-struct LoadHandles {
-    stop: Arc<AtomicBool>,
-    threads: Vec<JoinHandle<Result<LoadTally>>>,
-}
-
 fn spawn_load(
     er_rpc_url: String,
     er_ws_url: String,
@@ -327,99 +286,58 @@ fn spawn_load(
     accounts: Arc<Vec<Pubkey>>,
     payer_bytes: Arc<Vec<[u8; 64]>>,
     iters: u32,
-) -> LoadHandles {
-    let stop = Arc::new(AtomicBool::new(false));
+) -> Workers<RawRunOutcome> {
     let threads = threads.clamp(1, accounts.len().max(1));
-    let handles = (0..threads)
-        .map(|thread| {
-            let er_rpc_url = er_rpc_url.clone();
-            let er_ws_url = er_ws_url.clone();
-            let accounts = accounts.clone();
-            let payer_bytes = payer_bytes.clone();
-            let stop = stop.clone();
-            std::thread::spawn(move || {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("driver runtime build is infallible");
-                let local = tokio::task::LocalSet::new();
-                runtime.block_on(local.run_until(async move {
-                    let client = ErClient::new(er_rpc_url);
-                    let (lane_limit, concurrency) = match mode {
-                        LoadMode::Bounded { lanes } => (lanes, 0),
-                        LoadMode::Open { concurrency } => {
-                            (accounts.len(), (concurrency / threads).max(1))
-                        }
-                    };
-                    let mut lanes = Vec::new();
-                    for index in (thread..lane_limit.min(accounts.len()))
-                        .step_by(threads)
-                    {
-                        let payer = Keypair::try_from(&payer_bytes[index][..])
-                            .expect("payer bytes round-trip");
-                        lanes.push((
-                            accounts[index],
-                            client.sender(Rc::new(payer)),
-                        ));
-                    }
-                    if lanes.is_empty() {
-                        return Ok(LoadTally {
-                            delivered: 0,
-                            failed: 0,
-                            first_error: None,
-                            delivery: StreamingStats::new(),
-                            wall: Duration::ZERO,
-                        });
-                    }
-                    match mode {
-                        LoadMode::Open { .. } => {
-                            open_load(lanes, iters, concurrency, stop).await
-                        }
-                        LoadMode::Bounded { .. } => {
-                            bounded_load(&er_ws_url, lanes, iters, stop).await
-                        }
-                    }
-                }))
-            })
-        })
-        .collect();
-    LoadHandles {
-        stop,
-        threads: handles,
-    }
+    spawn_workers(threads, move |worker| {
+        let er_rpc_url = er_rpc_url.clone();
+        let er_ws_url = er_ws_url.clone();
+        let accounts = accounts.clone();
+        let payer_bytes = payer_bytes.clone();
+        async move {
+            let client = ErClient::new(er_rpc_url);
+            let (lane_limit, concurrency) = match mode {
+                LoadMode::Bounded { lanes } => (lanes, 0),
+                LoadMode::Open { concurrency } => {
+                    (accounts.len(), (concurrency / worker.threads).max(1))
+                }
+            };
+            let mut lanes = Vec::new();
+            for index in (worker.index..lane_limit.min(accounts.len()))
+                .step_by(worker.threads)
+            {
+                let payer = Keypair::try_from(&payer_bytes[index][..])
+                    .expect("payer bytes round-trip");
+                lanes.push((accounts[index], client.sender(Rc::new(payer))));
+            }
+            if lanes.is_empty() {
+                return Ok(RawRunOutcome::default());
+            }
+            match mode {
+                LoadMode::Open { .. } => {
+                    Ok(open_load(lanes, iters, concurrency, &worker).await)
+                }
+                LoadMode::Bounded { .. } => {
+                    bounded_load(&er_ws_url, lanes, iters, worker.stop_flag())
+                        .await
+                }
+            }
+        }
+    })
 }
 
 async fn open_load(
     lanes: Vec<(Pubkey, TxSender)>,
     iters: u32,
     concurrency: usize,
-    stop: Arc<AtomicBool>,
-) -> Result<LoadTally> {
-    let stop_cell = Rc::new(Cell::new(false));
-    let bridge = {
-        let stop_cell = stop_cell.clone();
-        tokio::task::spawn_local(async move {
-            while !stop.load(Ordering::Relaxed) {
-                tokio::time::sleep(STOP_POLL).await;
-            }
-            stop_cell.set(true);
-        })
-    };
-    let outcome = execute_until_raw(u32::MAX, concurrency, stop_cell, |id| {
+    worker: &Worker,
+) -> RawRunOutcome {
+    execute_until_raw(u32::MAX, concurrency, worker.stop_cell(), |id| {
         let (account, sender) = &lanes[((id - 1) as usize) % lanes.len()];
         let ixs = independent_ixs(id, *account, iters);
         let sender = sender.clone();
         async move { sender.submit(&ixs).await.map(|_| ()) }
     })
-    .await;
-    bridge.abort();
-    Ok(LoadTally {
-        delivered: outcome.delivered,
-        failed: outcome.failed,
-        first_error: outcome.first_error,
-        delivery: outcome.delivery,
-        wall: outcome.wall,
-    })
+    .await
 }
 
 #[derive(Default)]
@@ -435,7 +353,7 @@ async fn bounded_load(
     lanes: Vec<(Pubkey, TxSender)>,
     iters: u32,
     stop: Arc<AtomicBool>,
-) -> Result<LoadTally> {
+) -> Result<RawRunOutcome> {
     let sigs = Rc::new(SignatureConfirmations::connect(ws_url).await?);
     let tally = Rc::new(RefCell::new(LaneTally {
         delivery: Some(StreamingStats::new()),
@@ -498,36 +416,18 @@ async fn bounded_load(
     }
     let confirmations = sigs.finalize();
     let mut tally = tally.borrow_mut();
-    Ok(LoadTally {
+    Ok(RawRunOutcome {
         delivered: tally.delivered,
         failed: tally.failed + confirmations.failed as u64,
         first_error: tally.first_error.take().or(confirmations.first_failure),
         delivery: tally.delivery.take().unwrap_or_default(),
         wall: started.elapsed(),
+        ..RawRunOutcome::default()
     })
 }
 
-async fn join_load(handles: LoadHandles) -> Result<LoadOutcome> {
-    handles.stop.store(true, Ordering::Relaxed);
-    let mut merged: Option<LoadTally> = None;
-    for handle in handles.threads {
-        let tally = tokio::task::spawn_blocking(move || handle.join())
-            .await
-            .map_err(|error| format!("load driver join failed: {error}"))?
-            .map_err(|payload| {
-                format!(
-                    "load driver thread panicked: {}",
-                    panic_message(payload)
-                )
-            })??;
-        match merged.as_mut() {
-            Some(merged) => merged.merge(tally),
-            None => merged = Some(tally),
-        }
-    }
-    Ok(merged
-        .map(LoadTally::finalize)
-        .ok_or("no load driver thread was started")?)
+async fn join_load(handles: Workers<RawRunOutcome>) -> Result<RunOutcome> {
+    Ok(merge_outcomes(handles.join_async().await?))
 }
 
 struct Samples {
@@ -675,7 +575,7 @@ async fn drain(er: &ErCtx, target: f64) -> Result<DrainState> {
 
 async fn await_load_reaching_executors(
     er: &ErCtx,
-    handles: &mut Option<LoadHandles>,
+    handles: &mut Option<Workers<RawRunOutcome>>,
 ) -> Result<()> {
     let reached = check::poll(
         "the independent load reaches the executors",
@@ -720,7 +620,7 @@ struct PhaseOutcome {
     chains: u64,
     chain_txs: u64,
     send: ObservationsStats,
-    load: LoadOutcome,
+    load: RunOutcome,
     samples: Samples,
     wall: Duration,
 }
