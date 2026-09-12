@@ -14,7 +14,7 @@ use redsuite_core::{
     prep,
     profile::{self, ProfileValues},
     receipt, report,
-    runner::{execute, RunConfig},
+    runner::{execute, Pacing, RunConfig},
     BaseCtx, ChainCtx, CheckError, ErCtx, MetricsDelta, Result, Scenario,
     ScenarioReport,
 };
@@ -134,12 +134,12 @@ async fn deliver_commits(
     let outcome = execute(
         RunConfig {
             iterations: sets.len() as u64,
-            rate,
+            rate: Pacing::PerSecond(rate),
             concurrency,
         },
         request,
     )
-    .await;
+    .await?;
     if outcome.failed > 0 {
         return Err(format!(
             "commit deliveries failed: {:?}",

@@ -9,7 +9,7 @@ use redsuite_core::{
     check, check_eq, prep,
     profile::{self, ProfileValues},
     report,
-    runner::{execute_threaded, RunOutcome, ThreadRunConfig},
+    runner::{execute_threaded, Pacing, RunOutcome, ThreadRunConfig},
     stats::{ObservationsStats, StreamingStats},
     transport::subpool::{
         ConnReport, ExpectedWrites, ProducedLedger, SubscriberPool,
@@ -193,7 +193,7 @@ impl Scenario for WsFanoutThreshold {
             ThreadRunConfig {
                 threads: profile.threads,
                 iterations: profile.warmup,
-                rate: profile.rate,
+                rate: Pacing::PerSecond(profile.rate),
                 concurrency: profile.concurrency,
             },
             0,
@@ -240,7 +240,7 @@ impl Scenario for WsFanoutThreshold {
                 ThreadRunConfig {
                     threads: profile.threads,
                     iterations: profile.iterations,
-                    rate: profile.rate,
+                    rate: Pacing::PerSecond(profile.rate),
                     concurrency: profile.concurrency,
                 },
                 id_cursor,

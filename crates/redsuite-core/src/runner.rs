@@ -13,9 +13,10 @@ use std::{
 
 use tokio::task::{JoinError, JoinSet};
 
+pub use crate::transport::rate::{split_budget, Pacing};
 use crate::{
     stats::{ObservationsStats, StreamingStats},
-    transport::rate::RateManager,
+    transport::rate::Throttle,
     DynError, Result,
 };
 
@@ -23,14 +24,14 @@ const STOP_POLL: Duration = Duration::from_millis(20);
 
 pub struct RunConfig {
     pub iterations: u64,
-    pub rate: u32,
+    pub rate: Pacing,
     pub concurrency: usize,
 }
 
 pub struct ThreadRunConfig {
     pub threads: usize,
     pub iterations: u64,
-    pub rate: u32,
+    pub rate: Pacing,
     pub concurrency: usize,
 }
 
@@ -61,6 +62,7 @@ pub struct RunOutcome {
     pub delivery: ObservationsStats,
     // closed loop only: send-start → all confirmations for the id
     pub sync: Option<ObservationsStats>,
+    pub offered: Pacing,
     pub rps: ObservationsStats,
     pub wall: std::time::Duration,
 }
@@ -80,6 +82,7 @@ pub struct RawRunOutcome {
     pub first_error: Option<String>,
     pub delivery: StreamingStats,
     pub sync: Option<StreamingStats>,
+    pub offered: Pacing,
     pub rps: ObservationsStats,
     pub wall: std::time::Duration,
 }
@@ -101,6 +104,7 @@ impl RawRunOutcome {
             }
             (own_sync, other_sync) => own_sync.or(other_sync),
         };
+        self.offered = self.offered.combine(other.offered);
         self.rps = self.rps.add_rates(other.rps);
         self.wall = self.wall.max(other.wall);
     }
@@ -114,6 +118,7 @@ impl RawRunOutcome {
             first_error: self.first_error,
             delivery: self.delivery.finalize(false),
             sync: self.sync.map(|sync| sync.finalize(false)),
+            offered: self.offered,
             rps: self.rps,
             wall: self.wall,
         }
@@ -219,25 +224,25 @@ const NO_SYNC: Option<NoSync> = None;
 
 async fn execute_inner<Request, RequestFut, Sync, SyncFut>(
     completion: Completion,
-    rate: u32,
+    pacing: Pacing,
     concurrency: usize,
     mut request: Request,
     mut sync: Option<Sync>,
-) -> RawRunOutcome
+) -> Result<RawRunOutcome>
 where
     Request: FnMut(u64) -> RequestFut,
     RequestFut: Future<Output = Result<()>> + 'static,
     Sync: FnMut(u64) -> SyncFut,
     SyncFut: Future<Output = Result<()>> + 'static,
 {
-    let mut rate_manager = RateManager::new(concurrency, rate);
+    let mut throttle = Throttle::new(pacing, concurrency)?;
     let tally = Rc::new(RefCell::new(Tally::new(sync.is_some())));
     let started = Instant::now();
 
     let mut jobs = JoinSet::new();
     let mut admitted = 0u64;
     while completion.admits(admitted) {
-        let permit = rate_manager.tick().await;
+        let permit = throttle.admit().await;
         admitted += 1;
         let request_fut = request(admitted);
         let sync_fut = sync.as_mut().map(|sync| sync(admitted));
@@ -275,7 +280,7 @@ where
             record_join(&tally, joined);
         }
     }
-    let rps = rate_manager.stats();
+    let rps = throttle.finish();
     while let Some(joined) = jobs.join_next().await {
         record_join(&tally, joined);
     }
@@ -283,7 +288,7 @@ where
     let tally = Rc::try_unwrap(tally)
         .unwrap_or_else(|_| panic!("execute jobs still hold the tally"))
         .into_inner();
-    RawRunOutcome {
+    Ok(RawRunOutcome {
         delivered: tally.delivered,
         failed: tally.failed,
         panicked: tally.panicked,
@@ -291,9 +296,10 @@ where
         first_error: tally.first_error,
         delivery: tally.delivery,
         sync: tally.sync,
+        offered: pacing,
         rps,
         wall: started.elapsed(),
-    }
+    })
 }
 
 fn record_join(
@@ -310,15 +316,18 @@ fn record_join(
     }
 }
 
-pub async fn execute<F, Fut>(cfg: RunConfig, request: F) -> RunOutcome
+pub async fn execute<F, Fut>(cfg: RunConfig, request: F) -> Result<RunOutcome>
 where
     F: FnMut(u64) -> Fut,
     Fut: Future<Output = Result<()>> + 'static,
 {
-    execute_raw(cfg, request).await.finalize()
+    Ok(execute_raw(cfg, request).await?.finalize())
 }
 
-pub async fn execute_raw<F, Fut>(cfg: RunConfig, request: F) -> RawRunOutcome
+pub async fn execute_raw<F, Fut>(
+    cfg: RunConfig,
+    request: F,
+) -> Result<RawRunOutcome>
 where
     F: FnMut(u64) -> Fut,
     Fut: Future<Output = Result<()>> + 'static,
@@ -336,54 +345,60 @@ where
 // Same open-loop pacing as `execute`, but runs until `stop` is set instead of a
 // fixed iteration count — for load that must span an externally-timed event.
 pub async fn execute_until<F, Fut>(
-    rate: u32,
+    pacing: Pacing,
     concurrency: usize,
     stop: Rc<Cell<bool>>,
     request: F,
-) -> RunOutcome
+) -> Result<RunOutcome>
 where
     F: FnMut(u64) -> Fut,
     Fut: Future<Output = Result<()>> + 'static,
 {
-    execute_until_raw(rate, concurrency, stop, request)
-        .await
-        .finalize()
+    Ok(execute_until_raw(pacing, concurrency, stop, request)
+        .await?
+        .finalize())
 }
 
 pub async fn execute_until_raw<F, Fut>(
-    rate: u32,
+    pacing: Pacing,
     concurrency: usize,
     stop: Rc<Cell<bool>>,
     request: F,
-) -> RawRunOutcome
+) -> Result<RawRunOutcome>
 where
     F: FnMut(u64) -> Fut,
     Fut: Future<Output = Result<()>> + 'static,
 {
-    execute_inner(Completion::Stop(stop), rate, concurrency, request, NO_SYNC)
-        .await
+    execute_inner(
+        Completion::Stop(stop),
+        pacing,
+        concurrency,
+        request,
+        NO_SYNC,
+    )
+    .await
 }
 
 pub async fn execute_and_sync<F, Fut, S, SFut>(
     cfg: RunConfig,
     request: F,
     sync: S,
-) -> RunOutcome
+) -> Result<RunOutcome>
 where
     F: FnMut(u64) -> Fut,
     Fut: Future<Output = Result<()>> + 'static,
     S: FnMut(u64) -> SFut,
     SFut: Future<Output = Result<()>> + 'static,
 {
-    execute_inner(
+    Ok(execute_inner(
         Completion::Iterations(cfg.iterations),
         cfg.rate,
         cfg.concurrency,
         request,
         Some(sync),
     )
-    .await
-    .finalize()
+    .await?
+    .finalize())
 }
 
 pub struct Worker {
@@ -498,20 +513,57 @@ impl<T: Send + 'static> Workers<T> {
     }
 }
 
-pub fn split_iterations(iterations: u64, threads: usize) -> Vec<(u64, u64)> {
-    let threads = threads.max(1) as u64;
-    let base = iterations / threads;
-    let remainder = iterations % threads;
+pub fn split_iterations(iterations: u64, workers: usize) -> Vec<(u64, u64)> {
     let mut first_id = 0u64;
-    (0..threads)
-        .map(|index| {
-            let count = base + u64::from(index < remainder);
+    split_budget(iterations, workers)
+        .into_iter()
+        .take_while(|count| *count > 0)
+        .map(|count| {
             let span = (first_id, count);
             first_id += count;
             span
         })
-        .take_while(|(_, count)| *count > 0)
         .collect()
+}
+
+pub struct WorkerBudgets {
+    pub iterations: Vec<(u64, u64)>,
+    pub rate: Vec<Pacing>,
+    pub concurrency: Vec<usize>,
+}
+
+impl WorkerBudgets {
+    pub fn partition(
+        threads: usize,
+        iterations: u64,
+        rate: Pacing,
+        concurrency: usize,
+    ) -> Result<Self> {
+        rate.interval()?;
+        if concurrency == 0 {
+            return Err(
+                "an admission budget needs a concurrency above zero".into()
+            );
+        }
+        let mut workers = threads.max(1).min(concurrency);
+        if let Pacing::PerSecond(rate) = rate {
+            workers = workers.min(rate as usize);
+        }
+        let iterations = split_iterations(iterations, workers);
+        let workers = iterations.len();
+        Ok(Self {
+            iterations,
+            rate: rate.partition(workers)?,
+            concurrency: split_budget(concurrency as u64, workers)
+                .into_iter()
+                .map(|share| share as usize)
+                .collect(),
+        })
+    }
+
+    pub fn workers(&self) -> usize {
+        self.iterations.len()
+    }
 }
 
 pub fn execute_threaded<Factory, Request, Fut>(
@@ -523,15 +575,19 @@ where
     Request: FnMut(u64) -> Fut,
     Fut: Future<Output = Result<()>> + 'static,
 {
-    let threads = config.threads.max(1);
-    let rate = (config.rate / threads as u32).max(1);
-    let concurrency = (config.concurrency / threads).max(1);
-    let spans = split_iterations(config.iterations, threads);
-    let outcomes = spawn_workers(spans.len(), move |worker| {
-        let (first_id, iterations) = spans[worker.index];
+    let budgets = WorkerBudgets::partition(
+        config.threads,
+        config.iterations,
+        config.rate,
+        config.concurrency,
+    )?;
+    let outcomes = spawn_workers(budgets.workers(), move |worker| {
+        let (first_id, iterations) = budgets.iterations[worker.index];
+        let rate = budgets.rate[worker.index];
+        let concurrency = budgets.concurrency[worker.index];
         let mut request = factory(worker.index);
         async move {
-            Ok(execute_raw(
+            execute_raw(
                 RunConfig {
                     iterations,
                     rate,
@@ -539,7 +595,7 @@ where
                 },
                 |iteration| request(first_id + iteration),
             )
-            .await)
+            .await
         }
     })
     .join()?;
@@ -566,7 +622,7 @@ mod tests {
     fn config(iterations: u64) -> RunConfig {
         RunConfig {
             iterations,
-            rate: 10_000,
+            rate: Pacing::PerSecond(10_000),
             concurrency: 4,
         }
     }
@@ -586,7 +642,8 @@ mod tests {
                 assert_ne!(id, 3, "iteration three explodes");
                 Ok(())
             }))
-            .await;
+            .await
+            .expect("the run configuration is valid");
         assert_eq!(outcome.delivered, 4);
         assert_eq!(outcome.failed, 1);
         assert_eq!(outcome.panicked, 1);
@@ -604,7 +661,8 @@ mod tests {
                     Ok(())
                 }
             }))
-            .await;
+            .await
+            .expect("the run configuration is valid");
         assert_eq!(outcome.delivered, 3);
         assert_eq!(outcome.failed, 1);
         assert_eq!(outcome.panicked, 0);
@@ -625,7 +683,8 @@ mod tests {
                     }
                 },
             ))
-            .await;
+            .await
+            .expect("the run configuration is valid");
         assert_eq!(outcome.delivered, 2);
         assert_eq!(outcome.failed, 1);
         assert_eq!(outcome.delivered + outcome.failed, 3);
@@ -641,22 +700,28 @@ mod tests {
         let stop = Rc::new(Cell::new(false));
         let admitted = Rc::new(Cell::new(0u64));
         let outcome = tokio::task::LocalSet::new()
-            .run_until(execute_until(10_000, 4, stop.clone(), {
-                let stop = stop.clone();
-                let admitted = admitted.clone();
-                move |id| {
-                    admitted.set(admitted.get() + 1);
-                    if id >= 3 {
-                        stop.set(true);
+            .run_until(execute_until(
+                Pacing::PerSecond(10_000),
+                4,
+                stop.clone(),
+                {
+                    let stop = stop.clone();
+                    let admitted = admitted.clone();
+                    move |id| {
+                        admitted.set(admitted.get() + 1);
+                        if id >= 3 {
+                            stop.set(true);
+                        }
+                        let explode = id == 2;
+                        async move {
+                            assert!(!explode, "iteration two explodes");
+                            Ok(())
+                        }
                     }
-                    let explode = id == 2;
-                    async move {
-                        assert!(!explode, "iteration two explodes");
-                        Ok(())
-                    }
-                }
-            }))
-            .await;
+                },
+            ))
+            .await
+            .expect("the run configuration is valid");
         assert_eq!(outcome.delivered + outcome.failed, admitted.get());
         assert_eq!(outcome.panicked, 1);
     }
@@ -667,7 +732,7 @@ mod tests {
             ThreadRunConfig {
                 threads: 2,
                 iterations: 6,
-                rate: 10_000,
+                rate: Pacing::PerSecond(10_000),
                 concurrency: 4,
             },
             |_thread_index| {
@@ -690,7 +755,7 @@ mod tests {
             ThreadRunConfig {
                 threads: 2,
                 iterations: 4,
-                rate: 10_000,
+                rate: Pacing::PerSecond(10_000),
                 concurrency: 4,
             },
             |thread_index| {

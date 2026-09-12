@@ -8,7 +8,7 @@ use redsuite_core::{
     check, check_eq, prep,
     profile::{self, ProfileValues},
     report,
-    runner::{execute, RunConfig},
+    runner::{execute, Pacing, RunConfig},
     topology, BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario,
     ScenarioReport,
 };
@@ -236,12 +236,12 @@ impl Scenario for CloneLruChurn {
             let warmup = execute(
                 RunConfig {
                     iterations: profile.warmup,
-                    rate: profile.rate,
+                    rate: Pacing::PerSecond(profile.rate),
                     concurrency: profile.concurrency,
                 },
                 request.clone(),
             )
-            .await;
+            .await?;
             check_eq!(
                 warmup.failed,
                 0,
@@ -255,12 +255,12 @@ impl Scenario for CloneLruChurn {
             let outcome = execute(
                 RunConfig {
                     iterations: profile.iterations,
-                    rate: profile.rate,
+                    rate: Pacing::PerSecond(profile.rate),
                     concurrency: profile.concurrency,
                 },
                 |iteration| request(offset + iteration),
             )
-            .await;
+            .await?;
             let after = settled_scrape(cell_er).await?;
             let delta = MetricsDelta::new(before, after);
 

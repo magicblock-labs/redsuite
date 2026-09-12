@@ -13,7 +13,8 @@ use redsuite_core::{
     check, check_eq, host, prep,
     profile::{self, ProfileValues},
     runner::{
-        execute_raw, merge_outcomes, spawn_workers, RunConfig, RunOutcome,
+        execute_raw, merge_outcomes, spawn_workers, Pacing, RunConfig,
+        RunOutcome,
     },
     topology, BaseCtx, ChainCtx, ErClient, ErCtx, MetricsDelta, Result,
     Scenario, ScenarioReport, TxSender,
@@ -261,7 +262,7 @@ async fn execute(
         .into_iter()
         .take_while(|span| span.jobs(config.lanes, config.total) > 0)
         .collect();
-    let rate = (config.rate / threads as u32).max(1);
+    let rates = Pacing::PerSecond(config.rate).partition(spans.len())?;
     let lanes = config.lanes;
     let total = config.total;
     let read_span = config.read_span;
@@ -270,6 +271,7 @@ async fn execute(
     let outcomes = spawn_workers(spans.len(), move |worker| {
         let index = worker.index;
         let span = spans[index];
+        let rate = rates[index];
         let er_rpc_url = er_rpc_url.clone();
         let pool = pool.clone();
         let payer_bytes = payer_bytes.clone();
@@ -288,7 +290,7 @@ async fn execute(
             let locks: Rc<Vec<tokio::sync::Mutex<()>>> = Rc::new(
                 (0..span.len).map(|_| tokio::sync::Mutex::new(())).collect(),
             );
-            Ok(execute_raw(
+            execute_raw(
                 RunConfig {
                     iterations: span.jobs(lanes, total),
                     rate,
@@ -306,7 +308,7 @@ async fn execute(
                     }
                 },
             )
-            .await)
+            .await
         }
     })
     .join_async()

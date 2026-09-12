@@ -5,7 +5,7 @@ use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, prep,
     profile::{self, LoopMode, ProfileValues},
-    runner::{execute, execute_and_sync, RunConfig},
+    runner::{execute, execute_and_sync, Pacing, RunConfig},
     transport::ws::{AccountUpdates, SignatureConfirmations},
     BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
     TxSender,
@@ -122,7 +122,7 @@ impl Scenario for WarmIngress {
         let warmup = execute(
             RunConfig {
                 iterations: profile.warmup,
-                rate: profile.rate,
+                rate: Pacing::PerSecond(profile.rate),
                 concurrency: profile.concurrency,
             },
             |id| {
@@ -131,7 +131,7 @@ impl Scenario for WarmIngress {
                 async move { sender.submit(&[ix]).await.map(|_| ()) }
             },
         )
-        .await;
+        .await?;
         check_eq!(
             warmup.failed,
             0,
@@ -189,7 +189,7 @@ impl Scenario for WarmIngress {
         };
         let cfg = RunConfig {
             iterations: profile.iterations,
-            rate: profile.rate,
+            rate: Pacing::PerSecond(profile.rate),
             concurrency: profile.concurrency,
         };
         // Open loop (default): the rate permit is released on delivery —
@@ -197,9 +197,9 @@ impl Scenario for WarmIngress {
         // for the id arrives — true round-trip under backpressure.
         let mode = base.config().loop_mode;
         let outcome = if mode == LoopMode::Closed {
-            execute_and_sync(cfg, request, sync).await
+            execute_and_sync(cfg, request, sync).await?
         } else {
-            execute(cfg, request).await
+            execute(cfg, request).await?
         };
         check_eq!(
             outcome.failed,

@@ -11,7 +11,7 @@ use redsuite_core::{
     check, check_eq, prep,
     profile::{self, ProfileValues},
     report,
-    runner::{execute, RunConfig, RunOutcome},
+    runner::{execute, Pacing, RunConfig, RunOutcome},
     transport::ws::{AccountUpdates, UpdateOutcome},
     BaseCtx, ChainCtx, CheckError, ErCtx, MetricsDelta, Result, Scenario,
     ScenarioReport, TxSender,
@@ -135,12 +135,12 @@ async fn run_cell(
     let warm = execute(
         RunConfig {
             iterations: profile.warmup,
-            rate: profile.rate,
+            rate: Pacing::PerSecond(profile.rate),
             concurrency: profile.concurrency,
         },
         warmup_request,
     )
-    .await;
+    .await?;
     check_eq!(
         warm.failed,
         0,
@@ -187,12 +187,12 @@ async fn run_cell(
     let outcome = execute(
         RunConfig {
             iterations: profile.iterations,
-            rate: profile.rate,
+            rate: Pacing::PerSecond(profile.rate),
             concurrency: profile.concurrency,
         },
         request,
     )
-    .await;
+    .await?;
     check_eq!(
         outcome.failed,
         0,

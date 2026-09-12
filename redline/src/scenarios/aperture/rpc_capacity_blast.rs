@@ -7,7 +7,7 @@ use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, prep,
     profile::{self, ProfileValues},
-    runner::{execute_threaded, ThreadRunConfig},
+    runner::{execute_threaded, Pacing, ThreadRunConfig},
     BaseCtx, ChainCtx, ErClient, ErCtx, MetricsDelta, Result, Scenario,
     ScenarioReport, TxSender,
 };
@@ -132,7 +132,7 @@ impl Scenario for RpcCapacityBlast {
             ThreadRunConfig {
                 threads,
                 iterations: profile.requests,
-                rate: profile.offered,
+                rate: Pacing::PerSecond(profile.offered),
                 concurrency: profile.concurrency,
             },
             factory,
@@ -207,6 +207,7 @@ impl Scenario for RpcCapacityBlast {
             .setting("offered rps", profile.offered)
             .setting("concurrency", profile.concurrency)
             .observe("delivery us", Unit::Micros, outcome.delivery)
+            .observe("achieved rps", Unit::Rps, outcome.rps)
             .metric("delivered rps", Unit::Rps, delivered_rps)
             .metric("blast wall s", Unit::Seconds, outcome.wall.as_secs_f64())
             .metric("failed", Unit::Count, outcome.failed as f64)

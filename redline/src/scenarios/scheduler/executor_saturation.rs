@@ -19,8 +19,8 @@ use redsuite_core::{
     profile::{self, ProfileValues},
     report,
     runner::{
-        execute_raw, merge_outcomes, spawn_workers, split_iterations,
-        RawRunOutcome, RunConfig, RunOutcome,
+        execute_raw, merge_outcomes, spawn_workers, Pacing, RawRunOutcome,
+        RunConfig, RunOutcome, WorkerBudgets,
     },
     topology, Api, BaseCtx, BatchBody, ChainCtx, CheckError, ErClient, ErCtx,
     MetricsDelta, Result, Scenario, ScenarioReport, TxSender,
@@ -214,13 +214,17 @@ async fn execute_cell_burst(
     raise_budget: bool,
     probe: Arc<OnceLock<Signature>>,
 ) -> Result<BurstOutcome> {
-    let threads = config.threads.max(1);
-    let concurrency = (config.concurrency / threads).max(1);
+    let budgets = WorkerBudgets::partition(
+        config.threads,
+        config.iterations,
+        Pacing::Unlimited,
+        config.concurrency,
+    )?;
     let batch = config.batch.max(1);
     let rpc_batch = config.rpc_batch;
-    let spans = split_iterations(config.iterations, threads);
-    let bursts = spawn_workers(spans.len(), move |worker| {
-        let (first_id, iterations) = spans[worker.index];
+    let bursts = spawn_workers(budgets.workers(), move |worker| {
+        let (first_id, iterations) = budgets.iterations[worker.index];
+        let concurrency = budgets.concurrency[worker.index];
         let thread_first_id = id_offset + first_id;
         let er_rpc_url = er_rpc_url.clone();
         let accounts = accounts.clone();
@@ -280,7 +284,7 @@ async fn execute_cell_burst(
                     execute_raw(
                         RunConfig {
                             iterations: bodies.len() as u64,
-                            rate: u32::MAX,
+                            rate: Pacing::Unlimited,
                             concurrency,
                         },
                         |index| {
@@ -298,12 +302,12 @@ async fn execute_cell_burst(
                             }
                         },
                     )
-                    .await
+                    .await?
                 } else {
                     execute_raw(
                         RunConfig {
                             iterations: signed.len() as u64,
-                            rate: u32::MAX,
+                            rate: Pacing::Unlimited,
                             concurrency,
                         },
                         |batch_index| {
@@ -314,7 +318,7 @@ async fn execute_cell_burst(
                             }
                         },
                     )
-                    .await
+                    .await?
                 };
                 blast_s += blast_started.elapsed().as_secs_f64();
                 outcomes.push(outcome);
