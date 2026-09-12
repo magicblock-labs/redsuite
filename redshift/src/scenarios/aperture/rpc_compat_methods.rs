@@ -352,14 +352,10 @@ async fn run_method(
         }
         Method::Version => {
             let version = client.get_version().await?;
-            let numeric_parts = version
-                .solana_core
-                .split('.')
-                .filter(|part| part.parse::<u32>().is_ok())
-                .count();
-            check_eq!(
-                numeric_parts,
-                3,
+            let parts: Vec<&str> = version.solana_core.split('.').collect();
+            check!(
+                parts.len() == 3
+                    && parts.iter().all(|part| part.parse::<u32>().is_ok()),
                 "getVersion solana-core must be a dotted numeric version, got \
                  {:?}",
                 version.solana_core
