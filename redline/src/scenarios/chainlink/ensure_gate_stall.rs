@@ -11,7 +11,7 @@ use redsuite_core::{
     check, check_eq, prep,
     profile::{self, ProfileValues},
     report,
-    runner::{execute, RunConfig},
+    runner::{execute, Pacing, RunConfig},
     topology, BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario,
     ScenarioReport,
 };
@@ -219,12 +219,12 @@ impl Scenario for EnsureGateStall {
             let outcome = execute(
                 RunConfig {
                     iterations: cell.iterations,
-                    rate: profile.rate,
+                    rate: Pacing::PerSecond(profile.rate),
                     concurrency: profile.concurrency,
                 },
                 request,
             )
-            .await;
+            .await?;
             let after = cell_er.scrape_metrics().await?;
             let delta = MetricsDelta::new(before, after);
 

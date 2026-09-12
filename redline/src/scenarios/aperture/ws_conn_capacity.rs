@@ -7,7 +7,7 @@ use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, host,
     profile::{self, ProfileValues},
-    runner::{execute, RunConfig},
+    runner::{execute, Pacing, RunConfig},
     topology,
     transport::wsraw::RawWs,
     BaseCtx, ErCtx, Result, Scenario, ScenarioReport,
@@ -195,7 +195,7 @@ impl Scenario for WsConnCapacity {
         let churn = execute(
             RunConfig {
                 iterations: profile.churn_ops,
-                rate: profile.churn_ops as u32,
+                rate: Pacing::PerSecond(profile.churn_ops as u32),
                 concurrency: profile.churn_concurrency,
             },
             |_| {
@@ -210,7 +210,7 @@ impl Scenario for WsConnCapacity {
                 }
             },
         )
-        .await;
+        .await?;
         let (fds_after_churn, churn_settle_s) =
             await_fd_settle(pid, fd_baseline).await?;
         let rss_after_churn_kb = host::rss_kb(pid)?;

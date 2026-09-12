@@ -5,7 +5,10 @@ use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, prep,
     stats::StreamingStats,
-    transport::{rate::RateManager, ws::AccountUpdates},
+    transport::{
+        rate::{Pacing, Throttle},
+        ws::AccountUpdates,
+    },
     BaseCtx, ChainCtx, ErCtx, Result, Scenario, ScenarioReport,
 };
 
@@ -63,10 +66,10 @@ impl Scenario for SimpleLoad {
             .await_subscribed(pdas.len(), Duration::from_secs(5))
             .await?;
 
-        let mut rate = RateManager::new(CONCURRENCY, RATE);
+        let mut throttle = Throttle::new(Pacing::PerSecond(RATE), CONCURRENCY)?;
         let mut latency = StreamingStats::new();
         for id in 1..=ITERATIONS {
-            let _permit = rate.tick().await;
+            let _permit = throttle.admit().await;
             let target = pdas[((id - 1) % pdas.len() as u64) as usize];
             let ix = crate::program::instruction::build::simple_byte_set(
                 id,

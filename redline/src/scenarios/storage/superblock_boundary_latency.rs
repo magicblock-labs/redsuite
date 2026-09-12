@@ -10,7 +10,7 @@ use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, host, prep,
     profile::{self, ProfileValues},
-    runner::{execute, RunConfig},
+    runner::{execute, Pacing, RunConfig},
     topology,
     transport::wsraw::RawWs,
     BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
@@ -276,7 +276,7 @@ impl Scenario for SuperblockBoundaryLatency {
         let fill = execute(
             RunConfig {
                 iterations: profile.fill,
-                rate: profile.rate,
+                rate: Pacing::PerSecond(profile.rate),
                 concurrency: profile.concurrency,
             },
             |id| {
@@ -285,7 +285,7 @@ impl Scenario for SuperblockBoundaryLatency {
                 async move { sender.submit(&[ix]).await.map(|_| ()) }
             },
         )
-        .await;
+        .await?;
         check_eq!(
             fill.failed,
             0,
@@ -321,10 +321,10 @@ impl Scenario for SuperblockBoundaryLatency {
         );
         let health = observe_health(cell_er, stop.clone());
         let load = async {
-            let outcome = execute(
+            let outcome: Result<_> = execute(
                 RunConfig {
                     iterations: profile.iterations,
-                    rate: profile.rate,
+                    rate: Pacing::PerSecond(profile.rate),
                     concurrency: profile.concurrency,
                 },
                 |id| {
@@ -338,6 +338,7 @@ impl Scenario for SuperblockBoundaryLatency {
             outcome
         };
         let (outcome, intervals, health) = tokio::join!(load, observer, health);
+        let outcome = outcome?;
         let intervals = intervals?;
         let after = cell_er.scrape_metrics().await?;
         let delta = MetricsDelta::new(before, after);

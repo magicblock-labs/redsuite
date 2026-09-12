@@ -12,7 +12,7 @@ use redsuite_core::{
     check_eq, prep,
     profile::{self, ProfileValues},
     report,
-    runner::{execute, RunConfig},
+    runner::{execute, Pacing, RunConfig},
     stats::{ObservationsStats, StreamingStats},
     topology, BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario,
     ScenarioReport, TxSender,
@@ -155,12 +155,12 @@ async fn burst_cell(
     let outcome = execute(
         RunConfig {
             iterations: pool.len() as u64,
-            rate: pool.len() as u32,
+            rate: Pacing::PerSecond(pool.len() as u32),
             concurrency,
         },
         request,
     )
-    .await;
+    .await?;
     let wall_s = started.elapsed().as_secs_f64();
     let after = cell_er.scrape_metrics().await?;
     let delta = MetricsDelta::new(before, after);

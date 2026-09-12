@@ -273,7 +273,7 @@ harness:
 | `read latency us`       | Read speed while we force the account cache to constantly throw accounts out and re-fetch them.                                | Each evict-and-refetch cycle costs more than it used to.                                                |
 | `commit round-trip us`  | How long from "save this state to the base chain" until it's actually confirmed there.                                         | The commit pipeline is slowing down                                                                     |
 | `er delivery us`        | Just the rollup's commit time.                                                                                                 | Tells you rollup side takes longer for commit                                                           |
-| `achieved rps`          | How many transactions the client managed to send each second (`sendTransaction` calls), counted second by second over the run. | A low average means you hit a ceiling; big swings mean throughput is unstable.                          |
+| `achieved rps`          | How many requests the harness actually admitted each second, counted second by second after the concurrency gate.             | A low average means you hit a ceiling; big swings mean throughput is unstable.                          |
 
 Everything is a distribution, not an average — problems show up in the
 p95/max tail long before the average moves.

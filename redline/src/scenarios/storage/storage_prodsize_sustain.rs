@@ -8,7 +8,7 @@ use redsuite_core::{
     check, check_eq, host, prep,
     profile::{self, ProfileValues},
     report,
-    runner::{execute, RunConfig, RunOutcome},
+    runner::{execute, Pacing, RunConfig, RunOutcome},
     topology, BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario,
     ScenarioReport, TxSender,
 };
@@ -92,7 +92,7 @@ async fn execute_window(
     let outcome = execute(
         RunConfig {
             iterations: profile.window,
-            rate: profile.rate,
+            rate: Pacing::PerSecond(profile.rate),
             concurrency: profile.concurrency,
         },
         |iteration| {
@@ -102,7 +102,7 @@ async fn execute_window(
             async move { sender.submit(&[ix]).await.map(|_| ()) }
         },
     )
-    .await;
+    .await?;
     let after = er.scrape_metrics().await?;
     let delta = MetricsDelta::new(before, after);
     let storage_after = host::dir_size_bytes(storage_dir)?;
@@ -198,7 +198,7 @@ impl Scenario for StorageProdsizeSustain {
             let fill = execute(
                 RunConfig {
                     iterations: profile.fill,
-                    rate: profile.rate,
+                    rate: Pacing::PerSecond(profile.rate),
                     concurrency: profile.concurrency,
                 },
                 |id| {
@@ -207,7 +207,7 @@ impl Scenario for StorageProdsizeSustain {
                     async move { sender.submit(&[ix]).await.map(|_| ()) }
                 },
             )
-            .await;
+            .await?;
             check_eq!(
                 fill.failed,
                 0,

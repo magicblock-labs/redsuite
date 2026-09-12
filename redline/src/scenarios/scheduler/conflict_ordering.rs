@@ -20,8 +20,8 @@ use redsuite_core::{
     profile::{self, ProfileValues},
     report,
     runner::{
-        execute_until_raw, merge_outcomes, spawn_workers, RawRunOutcome,
-        RunOutcome, Worker, Workers,
+        execute_until_raw, merge_outcomes, spawn_workers, split_budget, Pacing,
+        RawRunOutcome, RunOutcome, Worker, Workers,
     },
     stats::{ObservationsStats, StreamingStats},
     transport::ws::SignatureConfirmations,
@@ -297,9 +297,11 @@ fn spawn_load(
             let client = ErClient::new(er_rpc_url);
             let (lane_limit, concurrency) = match mode {
                 LoadMode::Bounded { lanes } => (lanes, 0),
-                LoadMode::Open { concurrency } => {
-                    (accounts.len(), (concurrency / worker.threads).max(1))
-                }
+                LoadMode::Open { concurrency } => (
+                    accounts.len(),
+                    split_budget(concurrency as u64, worker.threads)
+                        [worker.index] as usize,
+                ),
             };
             let mut lanes = Vec::new();
             for index in (worker.index..lane_limit.min(accounts.len()))
@@ -313,8 +315,11 @@ fn spawn_load(
                 return Ok(RawRunOutcome::default());
             }
             match mode {
+                LoadMode::Open { .. } if concurrency == 0 => {
+                    Ok(RawRunOutcome::default())
+                }
                 LoadMode::Open { .. } => {
-                    Ok(open_load(lanes, iters, concurrency, &worker).await)
+                    open_load(lanes, iters, concurrency, &worker).await
                 }
                 LoadMode::Bounded { .. } => {
                     bounded_load(&er_ws_url, lanes, iters, worker.stop_flag())
@@ -330,13 +335,18 @@ async fn open_load(
     iters: u32,
     concurrency: usize,
     worker: &Worker,
-) -> RawRunOutcome {
-    execute_until_raw(u32::MAX, concurrency, worker.stop_cell(), |id| {
-        let (account, sender) = &lanes[((id - 1) as usize) % lanes.len()];
-        let ixs = independent_ixs(id, *account, iters);
-        let sender = sender.clone();
-        async move { sender.submit(&ixs).await.map(|_| ()) }
-    })
+) -> Result<RawRunOutcome> {
+    execute_until_raw(
+        Pacing::Unlimited,
+        concurrency,
+        worker.stop_cell(),
+        |id| {
+            let (account, sender) = &lanes[((id - 1) as usize) % lanes.len()];
+            let ixs = independent_ixs(id, *account, iters);
+            let sender = sender.clone();
+            async move { sender.submit(&ixs).await.map(|_| ()) }
+        },
+    )
     .await
 }
 

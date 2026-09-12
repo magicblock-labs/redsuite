@@ -8,7 +8,7 @@ use redsuite_core::{
     check, check_eq, prep,
     profile::{self, ProfileValues},
     report,
-    runner::{execute_threaded, RunOutcome, ThreadRunConfig},
+    runner::{execute_threaded, Pacing, RunOutcome, ThreadRunConfig},
     BaseCtx, ChainCtx, ErClient, ErCtx, MetricsDelta, Result, Scenario,
     ScenarioReport, TxSender,
 };
@@ -179,7 +179,7 @@ impl Scenario for HotAccountCliff {
                 ThreadRunConfig {
                     threads: profile.threads,
                     iterations: profile.warmup,
-                    rate: profile.rate,
+                    rate: Pacing::PerSecond(profile.rate),
                     concurrency: profile.concurrency,
                 },
                 offset,
@@ -203,7 +203,7 @@ impl Scenario for HotAccountCliff {
                 ThreadRunConfig {
                     threads: profile.threads,
                     iterations: profile.iterations,
-                    rate: profile.rate,
+                    rate: Pacing::PerSecond(profile.rate),
                     concurrency: profile.concurrency,
                 },
                 offset,

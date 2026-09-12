@@ -13,7 +13,7 @@ use redsuite_core::{
     check, check_eq, prep,
     profile::{self, ProfileValues},
     receipt, report,
-    runner::{execute, RunConfig},
+    runner::{execute, Pacing, RunConfig},
     stats::StreamingStats,
     topology, Api, BaseCtx, ChainCtx, CheckError, ErCtx, MetricsDelta, Result,
     Scenario, ScenarioReport,
@@ -298,12 +298,12 @@ impl Scenario for CommitWidthEnvelope {
             let warmup = execute(
                 RunConfig {
                     iterations: WARMUP_COMMITS,
-                    rate: profile.rate,
+                    rate: Pacing::PerSecond(profile.rate),
                     concurrency: profile.concurrency,
                 },
                 make_request(width, offset, warmup_tally),
             )
-            .await;
+            .await?;
             offset += WARMUP_COMMITS;
             check_eq!(
                 warmup.failed,
@@ -321,12 +321,12 @@ impl Scenario for CommitWidthEnvelope {
             let outcome = execute(
                 RunConfig {
                     iterations: profile.commits,
-                    rate: profile.rate,
+                    rate: Pacing::PerSecond(profile.rate),
                     concurrency: profile.concurrency,
                 },
                 make_request(width, offset, tally.clone()),
             )
-            .await;
+            .await?;
             offset += profile.commits;
             check_eq!(
                 outcome.failed,
