@@ -177,6 +177,12 @@ pub mod redshift {
             fixtures: [],
             optional_fixtures: [],
         },
+        rpc_compat_methods => aperture::rpc_compat_methods::RpcCompatMethods {
+            topology: Shared,
+            resources: [Resource::Er],
+            fixtures: [],
+            optional_fixtures: [],
+        },
         api_invariants => harness::api_invariants::ApiInvariants {
             topology: Shared,
             resources: [Resource::Er],
