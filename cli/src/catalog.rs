@@ -125,6 +125,11 @@ pub mod redshift {
             resources: [Resource::Er],
             fixtures: [Fixture::RedlineProgram],
         },
+        commit_blackout => committor::commit_blackout::CommitBlackout {
+            topology: PrivateEr,
+            resources: [Resource::Er],
+            fixtures: [Fixture::RedlineProgram],
+        },
         commit_roundtrip => committor::commit_roundtrip::CommitRoundtrip {
             topology: Shared,
             resources: [Resource::Er],

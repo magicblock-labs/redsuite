@@ -116,7 +116,8 @@ flock, `genesis-accounts/`, logs, ledgers).
 Scenario isolation comes from fresh keypairs, not fresh chains.
 Scenarios that kill a validator, restart one, or need their own config boot
 private ERs. `task_scheduler`, `config_gates`, `aml_gate`,
-`ledger_retention`, `verifier_lifecycle`, and `replication_recovery` run on
+`ledger_retention`, `commit_blackout`, `verifier_lifecycle`, and
+`replication_recovery` run on
 one instead of the shared ER (the last two boot their private ER as a leader
 with two verifiers replicating from it); `restart_under_load`,
 `ws_conn_capacity`, `clone_lru_churn`, `cold_hydration_tail`,
@@ -144,6 +145,21 @@ start rejoins from the leader's snapshot). Each launch is recorded in the run's
 report under `launches` (binary, version, identity, ports, storage, log,
 config, pid and relaunch count), and `redsuite stack down` reaps any
 leader, verifier or private ER a crashed run left behind.
+
+A private ER can also be booted behind RedSuite-owned base-chain proxies
+(`netfault::BaseProxies`): one HTTP and one WebSocket listener that forward
+the ER's remote traffic to the real base validator. A scenario registers an
+interception by RPC method, account or transaction signature at the request,
+response or notification stage, waits until it fires, and then releases,
+discards, or rejects that one operation; rules stall or reject every match
+until removed; and every proxied connection can be closed at once. The
+scenario's own base client never goes through the proxies, so it can verify
+what base executed independently. The proxies only hold, drop, reject or
+disconnect real traffic and never fabricate account contents or slots. Each
+hold, release, discard, rejection, disconnect and restore is stamped and
+lands in the report, an interception that never fires fails the scenario,
+and dropping the proxies releases pending work and closes their connections
+even when the scenario fails early.
 
 ## Environment
 
@@ -352,6 +368,17 @@ chainlink (account cloning):
 
 committor (ER → base commits):
 
+- `commit_blackout` — boots a private ER behind the base-chain proxies and
+  commits three times. First the base `sendTransaction` response is held
+  until the scenario's own base client proves the commit landed, then it is
+  discarded so the ER never learns its submission succeeded. Then the base
+  `signatureNotification` is held and `getSignatureStatuses` stalled for the
+  same signature, no receipt may appear while the confirmation is withheld,
+  and traffic is restored. Finally every proxied connection is closed and a
+  fresh account must still clone and commit. Each commit has to converge on
+  the ER with the base copy matching the ER snapshot, and the report lists
+  every held, released, discarded, stalled and closed operation with its
+  timestamp.
 - `commit_roundtrip` — writes two delegated accounts on the ER, commits one
   and checks it lands on base byte-for-byte while the other doesn't move.
   Then commits and undelegates both — the owning program gets its accounts
