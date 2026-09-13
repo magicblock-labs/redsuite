@@ -1,5 +1,6 @@
 pub mod claim_fees;
 pub mod commit_and_undelegate;
+pub mod commit_blackout;
 pub mod commit_roundtrip;
 pub mod commits;
 pub mod table_mania;
