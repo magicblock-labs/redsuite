@@ -130,6 +130,11 @@ pub mod redshift {
             resources: [Resource::Er],
             fixtures: [Fixture::RedlineProgram],
         },
+        commit_exactly_once => committor::commit_exactly_once::CommitExactlyOnce {
+            topology: PrivateEr,
+            resources: [Resource::Er],
+            fixtures: [Fixture::RedlineProgram, Fixture::RedshiftProgram],
+        },
         commit_roundtrip => committor::commit_roundtrip::CommitRoundtrip {
             topology: Shared,
             resources: [Resource::Er],

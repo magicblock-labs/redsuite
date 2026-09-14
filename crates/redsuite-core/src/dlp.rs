@@ -17,6 +17,8 @@ pub use dlp_api::{
 use instruction::Instruction;
 use pubkey::Pubkey;
 
+use crate::Result;
+
 pub fn dlp_id() -> Pubkey {
     DELEGATION_PROGRAM_ID
 }
@@ -189,4 +191,13 @@ pub fn delegate_ephemeral_balance_for(
 
 pub fn close_ephemeral_balance(payer: &Pubkey, index: u8) -> Instruction {
     instruction_builder::close_ephemeral_balance(*payer, index)
+}
+
+pub fn last_commit_id(delegation_metadata: &[u8]) -> Result<u64> {
+    let metadata =
+        dlp_api::state::DelegationMetadata::try_from_bytes_with_discriminator(
+            delegation_metadata,
+        )
+        .map_err(|error| format!("decoding delegation metadata: {error:?}"))?;
+    Ok(metadata.last_commit_id)
 }

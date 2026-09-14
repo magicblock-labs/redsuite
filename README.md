@@ -116,8 +116,8 @@ flock, `genesis-accounts/`, logs, ledgers).
 Scenario isolation comes from fresh keypairs, not fresh chains.
 Scenarios that kill a validator, restart one, or need their own config boot
 private ERs. `task_scheduler`, `config_gates`, `aml_gate`,
-`ledger_retention`, `commit_blackout`, `verifier_lifecycle`, and
-`replication_recovery` run on
+`ledger_retention`, `commit_blackout`, `commit_exactly_once`,
+`verifier_lifecycle`, and `replication_recovery` run on
 one instead of the shared ER (the last two boot their private ER as a leader
 with two verifiers replicating from it); `restart_under_load`,
 `ws_conn_capacity`, `clone_lru_churn`, `cold_hydration_tail`,
@@ -379,6 +379,27 @@ committor (ER → base commits):
   the ER with the base copy matching the ER snapshot, and the report lists
   every held, released, discarded, stalled and closed operation with its
   timestamp.
+- `commit_exactly_once` — boots a private ER behind the base-chain proxies
+  and proves a base commit is never applied twice because the ER missed the
+  response confirming it landed. Each faulted commit forwards the base
+  submission, holds the ER's `sendTransaction` response until the scenario's
+  own base client proves the transaction succeeded and advanced the
+  delegation nonce by one, then discards the response while
+  `getSignatureStatuses` and `signatureNotification` for that signature are
+  withheld. The nonce must not move during the blackout, the receipt after
+  connectivity is restored must report success and name the transaction
+  that landed (a duplicate-rejection receipt fails outright, base bytes
+  alone are not enough), and a follow-up commit to the same account must
+  advance the nonce by exactly one. The same fault is repeated with a
+  same-storage restart of the ER while the persisted intent is still
+  unconfirmed: the recovered intent is replayed exactly once, so the nonce
+  advances one more step and then holds, and the fresh receipt must report
+  success for a base transaction that landed. An action-only intent then
+  increments a base-chain counter
+  through a standalone base action under the same fault: the counter must
+  read one before and after recovery, and a succeeded receipt must name a
+  base transaction that actually landed. Reports the nonce after every
+  phase, the restart timings and every fault event.
 - `commit_roundtrip` — writes two delegated accounts on the ER, commits one
   and checks it lands on base byte-for-byte while the other doesn't move.
   Then commits and undelegates both — the owning program gets its accounts
