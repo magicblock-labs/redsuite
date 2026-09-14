@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{collections::HashSet, time::Duration};
 
 use pubkey::Pubkey;
 use signature::Signature;
@@ -19,7 +19,13 @@ pub const SPONSORED_COMMIT_LIMIT: u64 = 10;
 
 const LOG_MARKER: &str = "ScheduledCommitSent ";
 
+const SCHEDULE_MARKER: &str = "Scheduled commit with ID: ";
+
 const SCHEDULE_FETCH_TIMEOUT: Duration = Duration::from_secs(20);
+
+const RECEIPT_HISTORY_LIMIT: usize = 64;
+
+const RECEIPT_POLL: Duration = Duration::from_millis(500);
 
 #[derive(Debug)]
 pub struct CommitReceipt {
@@ -76,6 +82,16 @@ pub fn receipt_signature_in_logs(logs: &[String]) -> Option<Signature> {
         let rest = strip_program_prefix(line)
             .strip_prefix("ScheduledCommitSent signature: ")?;
         rest.trim().parse().ok()
+    })
+}
+
+pub fn intent_id_in_logs(logs: &[String]) -> Option<u64> {
+    logs.iter().find_map(|line| {
+        strip_program_prefix(line)
+            .strip_prefix(SCHEDULE_MARKER)?
+            .trim()
+            .parse()
+            .ok()
     })
 }
 
@@ -161,6 +177,58 @@ pub async fn fetch_commit_receipt(
         })?;
     let receipt_tx = er.await_transaction(&receipt_signature, timeout).await?;
     Ok(parse_receipt(receipt_signature, &receipt_tx))
+}
+
+pub async fn scheduled_intent_id(
+    er: &Api,
+    commit_signature: &Signature,
+) -> Result<u64> {
+    let commit_tx = er
+        .await_transaction(commit_signature, SCHEDULE_FETCH_TIMEOUT)
+        .await?;
+    intent_id_in_logs(&commit_tx.logs).ok_or_else(|| {
+        CheckError::new(format!(
+            "commit tx {commit_signature} logs carry no scheduled intent id"
+        ))
+        .into()
+    })
+}
+
+pub async fn fetch_commit_receipt_by_intent(
+    er: &Api,
+    validator: &Pubkey,
+    intent_id: u64,
+    timeout: Duration,
+) -> Result<CommitReceipt> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut seen = HashSet::new();
+    loop {
+        let history = er
+            .get_signatures_for_address(validator, RECEIPT_HISTORY_LIMIT)
+            .await?;
+        for text in history {
+            if !seen.insert(text.clone()) {
+                continue;
+            }
+            let Ok(signature) = text.parse::<Signature>() else {
+                continue;
+            };
+            let Some(tx) = er.get_transaction(&signature).await? else {
+                continue;
+            };
+            let receipt = parse_receipt(signature, &tx);
+            if receipt.commit_id == Some(intent_id) {
+                return Ok(receipt);
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "no commit receipt for intent {intent_id} within {timeout:?}"
+            )
+            .into());
+        }
+        tokio::time::sleep(RECEIPT_POLL).await;
+    }
 }
 
 pub async fn confirm_base_signatures(

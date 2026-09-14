@@ -153,6 +153,19 @@ pub fn process(accounts: &[AccountInfo], payload: &[u8]) -> ProgramResult {
             process_cancel_counter_task(accounts, task_id)
         }
         Mul { multiplier } => process_mul(accounts, multiplier),
+        CreateActionIntent {
+            counter,
+            count,
+            compute_units,
+        } => process_create_action_intent(
+            accounts,
+            counter,
+            count,
+            compute_units,
+        ),
+        AddActionHandler { count } => {
+            process_add_action_handler(accounts, count)
+        }
         AddAndScheduleCommit {
             count,
             undelegate,
@@ -645,6 +658,57 @@ fn process_create_transfer_intent(
     .add_post_commit_action(call_handler)
     .then(callback)
     .build_and_invoke()
+}
+
+fn process_create_action_intent(
+    accounts: &[AccountInfo],
+    counter: Pubkey,
+    count: u8,
+    compute_units: u32,
+) -> ProgramResult {
+    let [payer, magic_context, magic_program] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+    let action = FlexiInstruction::AddActionHandler { count };
+    let handler = CallHandler {
+        args: ActionArgs {
+            data: tagged(&action),
+            escrow_index: ACTOR_ESCROW_INDEX,
+        },
+        compute_units,
+        escrow_authority: payer.clone(),
+        destination_program: crate::ID,
+        accounts: vec![ShortAccountMeta {
+            pubkey: counter,
+            is_writable: true,
+        }],
+    };
+    MagicIntentBundleBuilder::new(
+        payer.clone(),
+        magic_context.clone(),
+        magic_program.clone(),
+    )
+    .add_standalone_actions([handler])
+    .build_and_invoke()
+}
+
+fn process_add_action_handler(
+    accounts: &[AccountInfo],
+    count: u8,
+) -> ProgramResult {
+    let [counter, source_program, _, escrow_account] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+    if !escrow_account.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if source_program.key != &crate::ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if counter.owner != &crate::ID {
+        return Err(ProgramError::InvalidAccountOwner);
+    }
+    add(counter, count)
 }
 
 fn process_commit_action_handler(

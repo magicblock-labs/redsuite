@@ -120,6 +120,14 @@ pub enum FlexiInstruction {
         undelegate: bool,
         has_magic_vault: bool,
     },
+    CreateActionIntent {
+        counter: Pubkey,
+        count: u8,
+        compute_units: u32,
+    },
+    AddActionHandler {
+        count: u8,
+    },
 }
 
 pub mod build {
@@ -429,6 +437,27 @@ pub mod build {
             &FlexiInstruction::CreateIntentBundleCommitAndFinalize {
                 num_commit: commit_payers.len() as u8,
                 num_commit_finalize: commit_finalize_payers.len() as u8,
+            },
+            metas,
+        )
+    }
+
+    pub fn create_action_intent(
+        payer: Pubkey,
+        counter: Pubkey,
+        count: u8,
+        compute_units: u32,
+    ) -> Instruction {
+        let metas = vec![
+            AccountMeta::new(payer, true),
+            AccountMeta::new(MAGIC_CONTEXT_ID, false),
+            AccountMeta::new_readonly(MAGIC_PROGRAM_ID, false),
+        ];
+        with_tag(
+            &FlexiInstruction::CreateActionIntent {
+                counter,
+                count,
+                compute_units,
             },
             metas,
         )
