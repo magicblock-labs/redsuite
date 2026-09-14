@@ -1003,7 +1003,14 @@ async fn serve_ws(socket: TcpStream, upstream: String, shared: Shared) {
                         };
                         match gate(&shared, inbound).await {
                             Decision::Discard => break,
-                            Decision::Reject(_) => {}
+                            Decision::Reject(message) => {
+                                if parsed.subscription.is_none() {
+                                    let reply = rejection(&parsed.id, &message);
+                                    if client_sink.send(Message::Text(reply.into())).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
                             Decision::Release => {
                                 if client_sink.send(Message::Text(text)).await.is_err() {
                                     break;
