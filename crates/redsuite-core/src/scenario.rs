@@ -410,9 +410,14 @@ fn conclude(record: &mut RunRecord) {
         }
     }
     for launch in &record.launches {
+        let exit = launch
+            .exit
+            .as_deref()
+            .map(|exit| format!(", {exit}"))
+            .unwrap_or_default();
         eprintln!(
             "[redsuite]   launched {} `{}`: pid {} ({} relaunches), {} {}, \
-             metrics 127.0.0.1:{}, storage {}",
+             metrics 127.0.0.1:{}, storage {}{}",
             launch.role,
             launch.label,
             launch.pid,
@@ -421,6 +426,7 @@ fn conclude(record: &mut RunRecord) {
             launch.bin_version,
             launch.metrics_port,
             launch.storage_dir,
+            exit,
         );
     }
     if matches!(record.scenario, ScenarioOutcome::Skipped(_)) {

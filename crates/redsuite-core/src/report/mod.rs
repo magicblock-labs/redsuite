@@ -443,8 +443,17 @@ fn scenario_failure(error: &DynError) -> PersistedFailure {
     }
     if let Some(transport) = error.downcast_ref::<http::TransportError>() {
         let mut context = vec![("url".to_owned(), transport.url.clone())];
+        if let Some(method) = &transport.method {
+            context.push(("method".to_owned(), method.clone()));
+        }
         if let Some(status) = transport.status {
             context.push(("status".to_owned(), status.to_string()));
+        }
+        if let Some(kind) = transport.kind {
+            context.push(("transport-kind".to_owned(), kind.to_owned()));
+        }
+        if let Some(cause) = &transport.cause {
+            context.push(("cause".to_owned(), cause.clone()));
         }
         return PersistedFailure {
             context,
@@ -699,8 +708,11 @@ mod tests {
 
         let transport: DynError = Box::new(http::TransportError {
             url: "http://127.0.0.1:1".into(),
+            method: Some("getTransaction".into()),
             status: Some(502),
             detail: "bad gateway".into(),
+            kind: Some("connect"),
+            cause: Some("Connection refused (os error 111)".into()),
         });
         let failure = scenario_failure(&transport);
         assert_eq!(failure.kind, "transport");
@@ -708,6 +720,12 @@ mod tests {
             .context
             .iter()
             .any(|(key, value)| key == "status" && value == "502"));
+        assert!(failure
+            .context
+            .iter()
+            .any(|(key, value)| key == "method" && value == "getTransaction"));
+        assert!(failure.context.iter().any(|(key, value)| key == "cause"
+            && value == "Connection refused (os error 111)"));
 
         let plain: DynError = "connection reset".into();
         assert_eq!(scenario_failure(&plain).kind, "infrastructure");

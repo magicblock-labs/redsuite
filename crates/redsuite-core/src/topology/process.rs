@@ -79,6 +79,15 @@ pub(super) async fn terminate(
     }
 }
 
+pub(super) fn describe_exit(status: &ExitStatus) -> String {
+    use std::os::unix::process::ExitStatusExt;
+    match (status.code(), status.signal()) {
+        (Some(code), _) => format!("exit code {code}"),
+        (None, Some(signal)) => format!("signal {signal}"),
+        (None, None) => "unknown status".to_owned(),
+    }
+}
+
 pub(super) fn kill_pid(pid: u32) {
     if pid == 0 || !proc_running(pid) {
         return;
