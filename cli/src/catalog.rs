@@ -135,6 +135,11 @@ pub mod redshift {
             resources: [Resource::Er],
             fixtures: [Fixture::RedlineProgram, Fixture::RedshiftProgram],
         },
+        commit_settlement_order => committor::commit_settlement_order::CommitSettlementOrder {
+            topology: PrivateEr,
+            resources: [Resource::Er],
+            fixtures: [Fixture::RedlineProgram],
+        },
         commit_roundtrip => committor::commit_roundtrip::CommitRoundtrip {
             topology: Shared,
             resources: [Resource::Er],
