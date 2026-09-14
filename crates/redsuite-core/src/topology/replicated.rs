@@ -388,6 +388,7 @@ pub async fn replicated(
             label: options.label.clone(),
             env: options.leader_env.clone(),
             request_timeout: options.request_timeout,
+            base_endpoints: None,
         },
         identities
             .iter()

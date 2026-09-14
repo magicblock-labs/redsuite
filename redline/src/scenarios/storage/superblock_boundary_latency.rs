@@ -237,6 +237,7 @@ impl Scenario for SuperblockBoundaryLatency {
                     ),
                 ],
                 request_timeout: None,
+                base_endpoints: None,
             },
         )
         .await?;

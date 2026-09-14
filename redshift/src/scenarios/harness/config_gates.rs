@@ -161,6 +161,7 @@ impl PrivateErScenario for ConfigGates {
                     allowed_programs_env(&allowed),
                 )],
                 request_timeout: None,
+                base_endpoints: None,
             },
         )
         .await?;
@@ -178,6 +179,7 @@ impl PrivateErScenario for ConfigGates {
                 label: OPEN_ER_LABEL.to_owned(),
                 env: vec![],
                 request_timeout: None,
+                base_endpoints: None,
             },
         )
         .await?;

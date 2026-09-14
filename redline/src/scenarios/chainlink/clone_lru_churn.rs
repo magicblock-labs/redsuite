@@ -205,6 +205,7 @@ impl Scenario for CloneLruChurn {
                         ),
                     ],
                     request_timeout: Some(REQUEST_TIMEOUT),
+                    base_endpoints: None,
                 },
             )
             .await?;

@@ -498,6 +498,13 @@ pub struct ErOptions {
     // e.g. ("MBV_ENGINE__ACCOUNTSDB__LRU_CAPACITY", "100")
     pub env: Vec<(String, String)>,
     pub request_timeout: Option<Duration>,
+    pub base_endpoints: Option<BaseEndpoints>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BaseEndpoints {
+    pub rpc_url: String,
+    pub ws_url: String,
 }
 
 pub struct RestartConfig {

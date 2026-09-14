@@ -170,6 +170,7 @@ impl Scenario for StorageProdsizeSustain {
                         ),
                     ],
                     request_timeout: None,
+                    base_endpoints: None,
                 },
             )
             .await?;

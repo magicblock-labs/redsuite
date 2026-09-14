@@ -9,6 +9,7 @@ pub mod loader_v4;
 pub mod manifest;
 pub mod mdp;
 pub mod monitor;
+pub mod netfault;
 pub mod prep;
 pub mod profile;
 pub mod receipt;

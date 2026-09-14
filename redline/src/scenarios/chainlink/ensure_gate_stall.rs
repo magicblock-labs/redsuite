@@ -197,6 +197,7 @@ impl Scenario for EnsureGateStall {
                         ),
                     ],
                     request_timeout: Some(STALL_REQUEST_TIMEOUT),
+                    base_endpoints: None,
                 },
             )
             .await?;
