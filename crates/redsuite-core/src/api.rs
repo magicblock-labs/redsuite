@@ -366,7 +366,16 @@ impl Api {
     ) -> Result<Option<T>> {
         let params = json::to_string(params)?;
         let body = crate::transport::conn::request_text(1, method, &params);
-        let response = http::post_json(&self.client, &self.url, body).await?;
+        let response = http::post_json(&self.client, &self.url, body)
+            .await
+            .map_err(|mut error| {
+                if let Some(transport) =
+                    error.downcast_mut::<http::TransportError>()
+                {
+                    transport.method = Some(method.to_owned());
+                }
+                error
+            })?;
         let envelope: Envelope<T> = json::from_str(&response).map_err(|e| {
             format!("{method}: unexpected response shape: {e} ({response})")
         })?;
