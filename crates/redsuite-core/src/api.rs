@@ -159,6 +159,12 @@ struct RpcAccount {
     rent_epoch: u64,
 }
 
+#[derive(Deserialize)]
+struct RpcKeyedAccount {
+    pubkey: String,
+    account: RpcAccount,
+}
+
 fn decode_rpc_account(raw: RpcAccount) -> Result<Account> {
     let data = base64::engine::general_purpose::STANDARD
         .decode(&raw.data.0)
@@ -456,6 +462,23 @@ impl Api {
         resp.value
             .into_iter()
             .map(|raw| raw.map(decode_rpc_account).transpose())
+            .collect()
+    }
+
+    pub async fn get_program_accounts(
+        &self,
+        program: &Pubkey,
+    ) -> Result<Vec<(Pubkey, Account)>> {
+        let params = (program.to_string(), AccountConfig::base64_confirmed());
+        let resp: Vec<RpcKeyedAccount> =
+            self.call("getProgramAccounts", &params).await?;
+        resp.into_iter()
+            .map(|keyed| {
+                Ok((
+                    Pubkey::from_str(&keyed.pubkey)?,
+                    decode_rpc_account(keyed.account)?,
+                ))
+            })
             .collect()
     }
 

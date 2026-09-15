@@ -6,7 +6,7 @@ use keypair::Keypair;
 use pubkey::Pubkey;
 pub use redline_interface as program;
 use redsuite_core::{
-    check, check_eq, receipt, BaseCtx, ChainCtx, ErCtx, Result,
+    check, check_eq, dlp, receipt, BaseCtx, ChainCtx, ErCtx, Result,
 };
 use signer::Signer;
 
@@ -92,6 +92,42 @@ pub async fn init_delegated_account(
     authority: Pubkey,
 ) -> Result<Pubkey> {
     init_delegated_account_at(base, program::id(), payer, seed, authority).await
+}
+
+pub async fn init_delegated_account_sized(
+    base: &impl ChainCtx,
+    payer: &Keypair,
+    seed: u8,
+    authority: Pubkey,
+    space: u32,
+) -> Result<Pubkey> {
+    let program_id = program::id();
+    let (init, pda) = program::instruction::build::init_account_at(
+        program_id,
+        payer.pubkey(),
+        payer.pubkey(),
+        space,
+        seed,
+        authority,
+    );
+    let delegate = program::instruction::build::delegate_at(
+        program_id,
+        payer.pubkey(),
+        pda,
+        payer.pubkey(),
+        seed,
+        authority,
+    );
+    base.submit_and_confirm(payer, &[init, delegate]).await?;
+    Ok(pda)
+}
+
+pub async fn last_commit_id(base: &BaseCtx, account: &Pubkey) -> Result<u64> {
+    let metadata = base
+        .account(&dlp::delegation_metadata_pda(account))
+        .await?
+        .ok_or("the delegation metadata is missing on base")?;
+    dlp::last_commit_id(&metadata.data)
 }
 
 pub async fn init_delegated_account_at(

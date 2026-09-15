@@ -94,14 +94,6 @@ async fn write_and_commit(
     Ok((snapshot, commit_signature))
 }
 
-async fn last_commit_id(base: &BaseCtx, account: &Pubkey) -> Result<u64> {
-    let metadata = base
-        .account(&dlp::delegation_metadata_pda(account))
-        .await?
-        .ok_or("the delegation metadata is missing on base")?;
-    dlp::last_commit_id(&metadata.data)
-}
-
 async fn base_count(base: &BaseCtx, counter: &Pubkey) -> Result<u64> {
     let account = base
         .account(counter)
@@ -146,7 +138,7 @@ async fn hold_nonce(
 ) -> Result<()> {
     let deadline = Instant::now() + window;
     loop {
-        let nonce = last_commit_id(base, account).await?;
+        let nonce = crate::last_commit_id(base, account).await?;
         check_eq!(
             nonce,
             expected,
@@ -269,7 +261,7 @@ async fn commit_blackout(
         restart,
     } = faulted;
     let started = Instant::now();
-    let nonce_before = last_commit_id(base, &account).await?;
+    let nonce_before = crate::last_commit_id(base, &account).await?;
     let submission = proxies.intercept(
         Selector::method("sendTransaction")
             .http()
@@ -282,7 +274,7 @@ async fn commit_blackout(
     let held = submission.wait(INTERCEPT_TIMEOUT).await?;
     let landed = held.operation.signature()?;
     prove_landed(base, &landed, &account, &snapshot).await?;
-    let nonce = last_commit_id(base, &account).await?;
+    let nonce = crate::last_commit_id(base, &account).await?;
     check_eq!(
         nonce,
         nonce_before + 1,
@@ -301,7 +293,7 @@ async fn commit_blackout(
             "the recovered intent is replayed exactly once after the restart",
             BASE_STATE_TIMEOUT,
             || async {
-                matches!(last_commit_id(base, &account).await, Ok(current) if current == replayed)
+                matches!(crate::last_commit_id(base, &account).await, Ok(current) if current == replayed)
             },
         )
         .await?;
@@ -356,7 +348,7 @@ async fn follow_up_commit(
     write: u64,
     phase: &str,
 ) -> Result<u64> {
-    let nonce_before = last_commit_id(base, &account).await?;
+    let nonce_before = crate::last_commit_id(base, &account).await?;
     let (snapshot, commit_signature) =
         write_and_commit(er, payer, commit_id, write, &account).await?;
     settled_receipt(base, er, &commit_signature, false, phase).await?;
@@ -368,7 +360,7 @@ async fn follow_up_commit(
         },
     )
     .await?;
-    let nonce = last_commit_id(base, &account).await?;
+    let nonce = crate::last_commit_id(base, &account).await?;
     check_eq!(
         nonce,
         nonce_before + 1,

@@ -117,7 +117,8 @@ Scenario isolation comes from fresh keypairs, not fresh chains.
 Scenarios that kill a validator, restart one, or need their own config boot
 private ERs. `task_scheduler`, `config_gates`, `aml_gate`,
 `ledger_retention`, `commit_blackout`, `commit_exactly_once`,
-`verifier_lifecycle`, and `replication_recovery` run on
+`commit_settlement_order`, `verifier_lifecycle`, and `replication_recovery`
+run on
 one instead of the shared ER (the last two boot their private ER as a leader
 with two verifiers replicating from it); `restart_under_load`,
 `ws_conn_capacity`, `clone_lru_churn`, `cold_hydration_tail`,
@@ -400,6 +401,26 @@ committor (ER → base commits):
   read one before and after recovery, and a succeeded receipt must name a
   base transaction that actually landed. Reports the nonce after every
   phase, the restart timings and every fault event.
+- `commit_settlement_order` — boots a private ER behind the base-chain
+  proxies and proves a delayed commit cannot be overtaken by a later
+  conflicting one while unrelated commits keep flowing. Four delegated
+  accounts A, B, C and D are written and three bundles scheduled in order:
+  {A,B}, {B,C} and {D}. The first bundle's base submission is held at the
+  proxy before it reaches base, the other two are scheduled behind it, and
+  every account is overwritten on the ER with values that differ from the
+  staged commit payloads. While the first bundle waits, {D} must settle
+  with its staged value and the nonces of A and B must not move. The held
+  submission is then dropped so the ER retries, the retry is observed, and
+  {A,B} must land with its staged values before {B,C} is even submitted;
+  {B,C} then lands with its own staged values. Base transaction slots and
+  B's base history confirm the order, and a final bundle over all four
+  accounts must settle afterwards. The whole sequence runs twice: with
+  small accounts and with accounts large enough that delivery goes through
+  temporary commit buffers, which must appear on base as committor-owned
+  accounts while the first bundle is held and be gone once every bundle
+  settled. Reports how long D took to settle during the hold, the retry
+  gap, per-bundle base slots, the buffer count seen during the hold, and
+  every fault event.
 - `commit_roundtrip` — writes two delegated accounts on the ER, commits one
   and checks it lands on base byte-for-byte while the other doesn't move.
   Then commits and undelegates both — the owning program gets its accounts
