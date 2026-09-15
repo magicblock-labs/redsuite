@@ -461,6 +461,7 @@ pub async fn replicated(
             cpu_set: plan.cpu_set.clone(),
             pid,
             relaunches: 0,
+            exit: None,
         });
         let metrics_url = format!("http://127.0.0.1:{metrics_port}");
         let verifier = Verifier {

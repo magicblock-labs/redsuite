@@ -33,6 +33,8 @@ pub struct LaunchRecord {
     pub pid: u32,
     #[serde(default)]
     pub relaunches: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit: Option<String>,
 }
 
 #[derive(Default)]
@@ -48,6 +50,7 @@ impl Resources {
             pid: Cell::new(pid),
             finished: Cell::new(false),
             finish_error: RefCell::new(None),
+            exit: RefCell::new(None),
             launch: None,
             relaunches: Cell::new(0),
         });
@@ -64,6 +67,7 @@ impl Resources {
             pid: Cell::new(launch.pid),
             finished: Cell::new(false),
             finish_error: RefCell::new(None),
+            exit: RefCell::new(None),
             launch: Some(launch),
             relaunches: Cell::new(0),
         });
@@ -79,6 +83,7 @@ impl Resources {
                 let mut launch = record.launch.clone()?;
                 launch.pid = record.pid.get();
                 launch.relaunches = record.relaunches.get();
+                launch.exit = record.exit.borrow().clone();
                 Some(launch)
             })
             .collect()
@@ -117,6 +122,7 @@ pub(crate) struct ResourceRecord {
     pid: Cell<u32>,
     finished: Cell<bool>,
     finish_error: RefCell<Option<String>>,
+    exit: RefCell<Option<String>>,
     launch: Option<LaunchRecord>,
     relaunches: Cell<u32>,
 }
@@ -134,6 +140,10 @@ impl ResourceRecord {
 
     pub(crate) fn record_finish_error(&self, message: String) {
         *self.finish_error.borrow_mut() = Some(message);
+    }
+
+    pub(crate) fn record_exit(&self, message: String) {
+        *self.exit.borrow_mut() = Some(message);
     }
 }
 
@@ -200,6 +210,7 @@ mod tests {
             cpu_set: None,
             pid,
             relaunches: 0,
+            exit: None,
         }
     }
 
