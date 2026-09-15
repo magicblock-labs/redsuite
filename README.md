@@ -36,6 +36,14 @@ Then, in this repo:
 The first test boots the base + ER; every other test — and every later run —
 reuses them. `cargo xtask stack down` stops the stack.
 
+Scenarios run on Linux and macOS. Process supervision (readiness, graceful
+stop, hard kill, restart, orphan cleanup) and the ER measurements (per-thread
+CPU time, open file descriptors, resident size) read `/proc` on Linux and go
+through `libproc` on macOS. The validator raises its open-file limit to 1,000,000 at startup and
+exits if it cannot, so on macOS run `sudo launchctl limit maxfiles 1000000
+1000000` once per boot and `ulimit -n 1000000` in the shell that launches
+redsuite.
+
 ## Layout
 
     crates/redsuite-core/   the engine: topology, contexts, transport, prep, scenario, stats
@@ -535,8 +543,7 @@ replication (leader + verifiers):
   catch up, and finally hard-kills the second verifier and keeps it offline
   while the leader and the first verifier carry on, before letting it rejoin
   from wiped storage. Teardown must reap every process the topology owns.
-- `replication_recovery` — one leader and two verifiers pinned to different
-  cpu sets, so they run different executor counts, under a steady stream of
+- `replication_recovery` — one leader and two verifiers under a steady stream of
   `X(A) -> Y(A,B) -> Z(B)` hash-fold chains. Both verifiers must keep up,
   one is restarted while its cursor is still retained and must catch up
   under load, and in the full profile the other is kept offline until the

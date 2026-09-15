@@ -37,3 +37,6 @@ solana-loader-v4-interface = { version = "3", features = ["bincode"] }
 solana-rpc-client = { workspace = true }
 solana-rpc-client-api = { workspace = true }
 dlp-api = { workspace = true, features = ["instruction", "encryption"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libproc = "0.14"
