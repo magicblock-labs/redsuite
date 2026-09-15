@@ -227,10 +227,7 @@ pub(super) fn orphaned_topology_processes(
 fn owned_by_stack(pid: u32, cmdline: &str, marker: &str) -> bool {
     cmdline.contains(marker)
         || environment(pid).is_some_and(|environ| {
-            environ.split_whitespace().any(|pair| {
-                pair.starts_with("MBV_ENGINE__LEDGER__DIRECTORY=")
-                    && pair.contains(marker)
-            })
+            environ.contains(&format!("MBV_ENGINE__LEDGER__DIRECTORY={marker}"))
         })
 }
 
