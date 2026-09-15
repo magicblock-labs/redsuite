@@ -301,6 +301,8 @@ async fn run_variant(
     let b1 = write(er, &payer, value(2), &accounts.b).await?;
     let nonce_a = crate::last_commit_id(base, &accounts.a).await?;
     let nonce_b = crate::last_commit_id(base, &accounts.b).await?;
+    let nonce_c = crate::last_commit_id(base, &accounts.c).await?;
+    let nonce_d = crate::last_commit_id(base, &accounts.d).await?;
     let first_submission = proxies.intercept(
         Selector::method("sendTransaction")
             .http()
@@ -339,6 +341,12 @@ async fn run_variant(
          bundle is held",
     )
     .await?;
+    check_eq!(
+        crate::last_commit_id(base, &accounts.d).await?,
+        nonce_d + 1,
+        "{phase}: the independent bundle must advance D's commit nonce \
+         exactly once"
+    )?;
     hold_nonces(
         base,
         &[accounts.a, accounts.b],
@@ -396,6 +404,18 @@ async fn run_variant(
         "{phase}: B must carry the first bundle's staged value before the \
          conflicting bundle is submitted"
     )?;
+    check_eq!(
+        crate::last_commit_id(base, &accounts.a).await?,
+        nonce_a + 1,
+        "{phase}: the retried bundle must advance A's commit nonce exactly \
+         once"
+    )?;
+    check_eq!(
+        crate::last_commit_id(base, &accounts.b).await?,
+        nonce_b + 1,
+        "{phase}: the retried bundle must advance B's commit nonce exactly \
+         once before the conflicting bundle is submitted"
+    )?;
 
     let held_second = second_submission.wait(INTERCEPT_TIMEOUT).await?;
     check!(
@@ -425,6 +445,18 @@ async fn run_variant(
         base_data(base, &accounts.c).await?,
         c1,
         "{phase}: C must carry the second bundle's staged value"
+    )?;
+    check_eq!(
+        crate::last_commit_id(base, &accounts.b).await?,
+        nonce_b + 2,
+        "{phase}: the conflicting bundle must advance B's commit nonce \
+         exactly once on top of the delayed bundle"
+    )?;
+    check_eq!(
+        crate::last_commit_id(base, &accounts.c).await?,
+        nonce_c + 1,
+        "{phase}: the conflicting bundle must advance C's commit nonce \
+         exactly once"
     )?;
     check!(
         first_bundle.slot <= second_bundle.slot,
