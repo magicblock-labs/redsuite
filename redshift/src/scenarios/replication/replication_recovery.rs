@@ -370,19 +370,6 @@ fn log_mentions_mismatch(log: &Path) -> Result<Option<String>> {
         .map(strip_ansi))
 }
 
-fn cpu_sets() -> (String, String, usize) {
-    let total = std::thread::available_parallelism()
-        .map(|cpus| cpus.get())
-        .unwrap_or(2);
-    let narrow = (total / 4).clamp(4, total.max(1));
-    let wide = (total / 2).clamp(6, total.max(1)).max(narrow);
-    (
-        format!("0-{}", narrow - 1),
-        format!("0-{}", wide - 1),
-        total,
-    )
-}
-
 struct LagSample {
     max_lag: Vec<f64>,
     samples: usize,
@@ -678,7 +665,6 @@ impl PrivateErScenario for ReplicationRecovery {
     async fn run(&self, base: &BaseCtx) -> Result<ScenarioReport> {
         let (profile, _) =
             profile::select(self.name(), base.config(), &PROFILES);
-        let (narrow_cpus, wide_cpus, host_cpus) = cpu_sets();
 
         let mut leader_env = vec![(
             "MBV_ENGINE__BLOCKSTORE__SUPERBLOCK".to_owned(),
@@ -698,7 +684,6 @@ impl PrivateErScenario for ReplicationRecovery {
                 verifiers: 2,
                 leader_env,
                 verifier_env: Vec::new(),
-                verifier_cpu_sets: vec![narrow_cpus.clone(), wide_cpus.clone()],
                 request_timeout: None,
             },
         )
@@ -713,16 +698,9 @@ impl PrivateErScenario for ReplicationRecovery {
             .iter()
             .map(|verifier| executors_in_log(verifier.log()))
             .collect::<Result<_>>()?;
-        check!(
-            executors[0] != executors[1],
-            "the verifiers must run different executor counts, both report \
-             {} (host cpus {host_cpus}, cpu sets {narrow_cpus} / {wide_cpus})",
-            executors[0]
-        )?;
         eprintln!(
             "[redsuite] {}: leader ({leader_executors} executors) + verifier 0 \
-             ({} executors, cpus {narrow_cpus}) + verifier 1 ({} executors, \
-             cpus {wide_cpus}) up in {:.1} s",
+             ({} executors) + verifier 1 ({} executors) up in {:.1} s",
             self.name(),
             executors[0],
             executors[1],
@@ -881,9 +859,6 @@ impl PrivateErScenario for ReplicationRecovery {
                     "default".to_owned()
                 },
             )
-            .setting("host cpus", host_cpus)
-            .setting("verifier0 cpus", narrow_cpus)
-            .setting("verifier1 cpus", wide_cpus)
             .setting("leader executors", leader_executors)
             .setting("verifier0 executors", executors[0])
             .setting("verifier1 executors", executors[1])
@@ -993,16 +968,6 @@ mod tests {
         fs::write(&log, "nothing here\n").unwrap();
         assert!(executors_in_log(&log).is_err());
         fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn cpu_sets_differ_in_executor_count_on_six_or_more_cpus() {
-        let executors = |cpus: usize| cpus.saturating_sub(2).max(2) / 2;
-        for total in [6usize, 8, 16, 32, 64] {
-            let narrow = (total / 4).clamp(4, total);
-            let wide = (total / 2).clamp(6, total).max(narrow);
-            assert_ne!(executors(narrow), executors(wide), "{total} cpus");
-        }
     }
 
     #[test]

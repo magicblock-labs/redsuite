@@ -37,7 +37,6 @@ pub struct ReplicatedOptions {
     pub verifiers: usize,
     pub leader_env: Vec<(String, String)>,
     pub verifier_env: Vec<(String, String)>,
-    pub verifier_cpu_sets: Vec<String>,
     pub request_timeout: Option<Duration>,
 }
 
@@ -91,10 +90,6 @@ impl Verifier {
 
     pub fn metrics_url(&self) -> &str {
         &self.metrics_url
-    }
-
-    pub fn cpu_set(&self) -> Option<&str> {
-        self.plan.cpu_set.as_deref()
     }
 
     pub fn upstream_address(&self) -> String {
@@ -258,18 +253,48 @@ impl Verifier {
 
 impl Drop for Verifier {
     fn drop(&mut self) {
-        if self.child.is_none() && !proc_running(self.pid) {
+        let Some(mut child) = self.child.take() else {
+            if !proc_running(self.pid) {
+                return;
+            }
+            eprintln!(
+                "[redsuite] stopping verifier `{}` (pid {})",
+                self.label, self.pid
+            );
+            process::kill_pid(self.pid);
+            self.record.record_exit(
+                "terminated by cleanup, no child handle".to_owned(),
+            );
             return;
+        };
+        match child.try_wait().ok().flatten() {
+            Some(status) => {
+                let exit = process::describe_exit(&status);
+                eprintln!(
+                    "[redsuite] verifier `{}` (pid {}) had already exited \
+                     before cleanup: {exit}",
+                    self.label, self.pid
+                );
+                self.record
+                    .record_exit(format!("died before cleanup: {exit}"));
+            }
+            None => {
+                eprintln!(
+                    "[redsuite] stopping verifier `{}` (pid {})",
+                    self.label, self.pid
+                );
+                process::kill_pid(self.pid);
+                let exit = child
+                    .wait()
+                    .ok()
+                    .map(|status| process::describe_exit(&status));
+                self.record.record_exit(match exit {
+                    Some(exit) => format!("terminated by cleanup: {exit}"),
+                    None => "terminated by cleanup, status unknown".to_owned(),
+                });
+            }
         }
-        eprintln!(
-            "[redsuite] stopping verifier `{}` (pid {})",
-            self.label, self.pid
-        );
-        process::kill_pid(self.pid);
-        if let Some(mut child) = self.child.take() {
-            let _ = child.wait();
-            self.record.mark_finished();
-        }
+        self.record.mark_finished();
     }
 }
 
@@ -414,11 +439,6 @@ pub async fn replicated(
         }
         let mut ports = process::PortLease::default();
         let metrics_port = ports.single()?;
-        let cpu_set = options
-            .verifier_cpu_sets
-            .get(index)
-            .filter(|set| !set.is_empty())
-            .cloned();
         let plan = VerifierPlan {
             bin: verifier_bin.clone(),
             identity,
@@ -427,17 +447,12 @@ pub async fn replicated(
             metrics_port,
             storage_dir,
             env: verifier_env.clone(),
-            cpu_set,
         };
         let config_path = plan.write_config()?;
         let log = dir.join(format!("er-{label}.log"));
         eprintln!(
             "[redsuite] booting verifier `{label}` (metrics 127.0.0.1:\
-             {metrics_port}{}) following {} …",
-            plan.cpu_set
-                .as_deref()
-                .map(|set| format!(", cpus {set}"))
-                .unwrap_or_default(),
+             {metrics_port}) following {} …",
             plan.upstream_address()
         );
         ports.release();
@@ -458,7 +473,6 @@ pub async fn replicated(
             storage_dir: plan.storage_dir.display().to_string(),
             log: log.display().to_string(),
             config: Some(config_path.display().to_string()),
-            cpu_set: plan.cpu_set.clone(),
             pid,
             relaunches: 0,
             exit: None,

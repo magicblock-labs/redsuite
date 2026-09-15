@@ -377,7 +377,6 @@ async fn launch(
         storage_dir: plan.storage_dir.display().to_string(),
         log: log.display().to_string(),
         config: None,
-        cpu_set: None,
         pid,
         relaunches: 0,
         exit: None,

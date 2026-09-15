@@ -11,6 +11,7 @@ pub(super) const KILL_GRACE: Duration = Duration::from_secs(5);
 pub(super) const POLL: Duration = Duration::from_millis(250);
 // Fine cadence for restart timing, where the interval is the measurement floor.
 pub(super) const RESTART_POLL: Duration = Duration::from_millis(5);
+const LIVENESS_INTERVAL: Duration = Duration::from_millis(250);
 
 // Fresh process group so test-runner group signals don't reap the validator;
 // the prior boot's log is rotated to .log.prev.
@@ -137,6 +138,7 @@ pub(super) const TOPOLOGY_BINS: [&str; 3] = [
     "magicblock-verifier",
 ];
 
+#[cfg(target_os = "linux")]
 pub(super) fn orphaned_topology_processes(
     stack_dir: &Path,
     exclude: &[u32],
@@ -186,6 +188,70 @@ pub(super) fn orphaned_topology_processes(
     found
 }
 
+#[cfg(target_os = "macos")]
+pub(super) fn orphaned_topology_processes(
+    stack_dir: &Path,
+    exclude: &[u32],
+) -> Vec<(u32, String)> {
+    use libproc::{
+        proc_pid::pidpath,
+        processes::{pids_by_type, ProcFilter},
+    };
+    let marker = format!("{}/", stack_dir.display());
+    let Ok(pids) = pids_by_type(ProcFilter::All) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for pid in pids {
+        if pid == 0 || pid == std::process::id() || exclude.contains(&pid) {
+            continue;
+        }
+        let Ok(exe) = pidpath(pid as i32) else {
+            continue;
+        };
+        if !runs_topology_bin(&exe) {
+            continue;
+        }
+        let Some(cmdline) = cmdline(pid) else {
+            continue;
+        };
+        if owned_by_stack(pid, &cmdline, &marker) && proc_running(pid) {
+            found.push((pid, cmdline));
+        }
+    }
+    found.sort_unstable();
+    found
+}
+
+#[cfg(target_os = "macos")]
+fn owned_by_stack(pid: u32, cmdline: &str, marker: &str) -> bool {
+    cmdline.contains(marker)
+        || environment(pid).is_some_and(|environ| {
+            environ.contains(&format!("MBV_ENGINE__LEDGER__DIRECTORY={marker}"))
+        })
+}
+
+#[cfg(target_os = "macos")]
+fn runs_topology_bin(cmdline: &str) -> bool {
+    cmdline.split_whitespace().any(|arg| {
+        Path::new(arg).file_name().is_some_and(|name| {
+            TOPOLOGY_BINS.contains(&name.to_string_lossy().as_ref())
+        })
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn environment(pid: u32) -> Option<String> {
+    let output = Command::new("ps")
+        .args(["-ww", "-E", "-o", "command=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,10 +273,41 @@ mod tests {
     }
 }
 
+#[cfg(target_os = "linux")]
 pub(super) fn proc_matches(pid: u32, bin: &str) -> bool {
+    cmdline(pid).is_some_and(|cmdline| cmdline.contains(bin))
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn proc_matches(pid: u32, bin: &str) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    libproc::proc_pid::pidpath(pid as i32).is_ok_and(|exe| exe.contains(bin))
+        || cmdline(pid).is_some_and(|cmdline| cmdline.contains(bin))
+}
+
+#[cfg(target_os = "linux")]
+fn cmdline(pid: u32) -> Option<String> {
     fs::read(format!("/proc/{pid}/cmdline"))
-        .map(|cmdline| String::from_utf8_lossy(&cmdline).contains(bin))
-        .unwrap_or(false)
+        .ok()
+        .map(|raw| String::from_utf8_lossy(&raw).into_owned())
+}
+
+#[cfg(target_os = "macos")]
+fn cmdline(pid: u32) -> Option<String> {
+    if pid == 0 {
+        return None;
+    }
+    let output = Command::new("ps")
+        .args(["-ww", "-o", "command=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    (!text.is_empty()).then_some(text)
 }
 
 pub(super) fn rpc_listening(port: u16) -> bool {
@@ -246,16 +343,23 @@ where
     Fut: std::future::Future<Output = bool>,
 {
     let deadline = tokio::time::Instant::now() + timeout;
+    let mut liveness_checked = tokio::time::Instant::now();
     loop {
         if condition().await {
             return Ok(());
         }
-        if !proc_running(pid) {
-            return Err(format!(
-                "process exited while waiting for {what}; log tail:\n{}",
-                tail(log, 30)
-            )
-            .into());
+        let now = tokio::time::Instant::now();
+        if interval >= LIVENESS_INTERVAL
+            || now.duration_since(liveness_checked) >= LIVENESS_INTERVAL
+        {
+            liveness_checked = now;
+            if !proc_running(pid) {
+                return Err(format!(
+                    "process exited while waiting for {what}; log tail:\n{}",
+                    tail(log, 30)
+                )
+                .into());
+            }
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(format!(
