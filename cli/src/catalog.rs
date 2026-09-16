@@ -145,6 +145,11 @@ pub mod redshift {
             resources: [Resource::Er],
             fixtures: [Fixture::RedlineProgram],
         },
+        delegation_session_isolation => committor::delegation_session_isolation::DelegationSessionIsolation {
+            topology: PrivateEr,
+            resources: [Resource::Er],
+            fixtures: [Fixture::RedshiftProgram],
+        },
         commit_roundtrip => committor::commit_roundtrip::CommitRoundtrip {
             topology: Shared,
             resources: [Resource::Er],
