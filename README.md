@@ -125,8 +125,8 @@ Scenario isolation comes from fresh keypairs, not fresh chains.
 Scenarios that kill a validator, restart one, or need their own config boot
 private ERs. `task_scheduler`, `config_gates`, `aml_gate`,
 `ledger_retention`, `commit_blackout`, `commit_exactly_once`,
-`commit_settlement_order`, `undelegation_recovery`, `verifier_lifecycle`, and
-`replication_recovery`
+`commit_settlement_order`, `undelegation_recovery`,
+`delegation_session_isolation`, `verifier_lifecycle`, and `replication_recovery`
 run on
 one instead of the shared ER (the last two boot their private ER as a leader
 with two verifiers replicating from it); `restart_under_load`,
@@ -445,6 +445,21 @@ committor (ER → base commits):
   value landed. After the connections are restored, or the ER is restarted
   in place, a base write must become visible on the ER without any storage
   cleanup, and redelegating the account must let ER writes through again.
+- `delegation_session_isolation` — boots two private ERs, the first behind
+  the base-chain proxies, and proves work from an earlier delegation
+  session cannot touch the account after it was undelegated and delegated
+  again, since the address stays the same. Per case: an account delegated
+  to the first ER is written, a commit is scheduled while the proxy rejects
+  its base submission so the intent fails and stays on record, the
+  account's base notifications are held, the ER undelegates it, base must
+  receive the staged value before ownership returns, base writes a second
+  value, and the account is delegated again either to the same ER or to
+  the second one, where a third value is written. The held session-A
+  notifications are then released, the first ER is restarted so recovery
+  examines the failed intent, and throughout both windows base must keep
+  the session-B delegation, value and nonce while the session-B ER keeps
+  its state. After reassignment the old ER must reject writes and commits
+  for the account, and in both cases a fresh session-B commit must land.
 - `commit_roundtrip` — writes two delegated accounts on the ER, commits one
   and checks it lands on base byte-for-byte while the other doesn't move.
   Then commits and undelegates both — the owning program gets its accounts

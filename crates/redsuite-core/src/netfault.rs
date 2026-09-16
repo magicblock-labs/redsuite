@@ -14,10 +14,10 @@ use signature::Signature;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::{oneshot, Notify},
+    sync::{mpsc, oneshot, Notify},
     task::JoinHandle,
 };
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::{Message, Utf8Bytes};
 use transaction::versioned::VersionedTransaction;
 
 use crate::{
@@ -302,68 +302,107 @@ impl State {
     }
 }
 
-async fn gate(shared: &Shared, operation: Operation) -> Decision {
-    let (decision, pending) = {
-        let mut state = shared.borrow_mut();
-        let rule = state
-            .rules
-            .iter()
-            .find(|rule| rule.selector.matches(&operation))
-            .map(|rule| {
-                (
-                    rule.id,
-                    match &rule.effect {
-                        Effect::Reject(message) => Some(message.clone()),
-                        Effect::Stall => None,
-                    },
-                )
-            });
-        match rule {
-            Some((_, Some(message))) => {
-                state.record(Action::Rejected, Some(operation));
-                return Decision::Reject(message);
-            }
-            Some((id, None)) => {
-                let (sender, receiver) = oneshot::channel();
-                state.stalled.push((id, sender));
-                state.record(Action::Held, Some(operation.clone()));
-                (receiver, operation)
-            }
-            None => {
-                let trap = state
-                    .traps
-                    .iter()
-                    .find(|trap| {
-                        trap.fired.borrow().is_none()
-                            && trap.selector.matches(&operation)
-                    })
-                    .cloned();
-                match trap {
-                    None => return Decision::Release,
-                    Some(trap) => {
-                        let (sender, receiver) = oneshot::channel();
-                        let held_at = state.started.elapsed();
-                        *trap.fired.borrow_mut() = Some(Pending {
-                            operation: operation.clone(),
-                            held_at,
-                            decide: Some(sender),
-                        });
-                        state.record(Action::Held, Some(operation.clone()));
-                        trap.notify.notify_waiters();
-                        (receiver, operation)
-                    }
+enum GateStart {
+    Decided(Decision),
+    Pending(oneshot::Receiver<Decision>, Operation),
+}
+
+fn gate_start(shared: &Shared, operation: Operation) -> GateStart {
+    let mut state = shared.borrow_mut();
+    let rule = state
+        .rules
+        .iter()
+        .find(|rule| rule.selector.matches(&operation))
+        .map(|rule| {
+            (
+                rule.id,
+                match &rule.effect {
+                    Effect::Reject(message) => Some(message.clone()),
+                    Effect::Stall => None,
+                },
+            )
+        });
+    match rule {
+        Some((_, Some(message))) => {
+            state.record(Action::Rejected, Some(operation));
+            GateStart::Decided(Decision::Reject(message))
+        }
+        Some((id, None)) => {
+            let (sender, receiver) = oneshot::channel();
+            state.stalled.push((id, sender));
+            state.record(Action::Held, Some(operation.clone()));
+            GateStart::Pending(receiver, operation)
+        }
+        None => {
+            let trap = state
+                .traps
+                .iter()
+                .find(|trap| {
+                    trap.fired.borrow().is_none()
+                        && trap.selector.matches(&operation)
+                })
+                .cloned();
+            match trap {
+                None => GateStart::Decided(Decision::Release),
+                Some(trap) => {
+                    let (sender, receiver) = oneshot::channel();
+                    let held_at = state.started.elapsed();
+                    *trap.fired.borrow_mut() = Some(Pending {
+                        operation: operation.clone(),
+                        held_at,
+                        decide: Some(sender),
+                    });
+                    state.record(Action::Held, Some(operation.clone()));
+                    trap.notify.notify_waiters();
+                    GateStart::Pending(receiver, operation)
                 }
             }
         }
-    };
-    let decision = decision.await.unwrap_or(Decision::Release);
+    }
+}
+
+async fn gate_finish(
+    shared: &Shared,
+    receiver: oneshot::Receiver<Decision>,
+    operation: Operation,
+) -> Decision {
+    let decision = receiver.await.unwrap_or(Decision::Release);
     let action = match &decision {
         Decision::Release => Action::Released,
         Decision::Discard => Action::Discarded,
         Decision::Reject(_) => Action::Rejected,
     };
-    shared.borrow_mut().record(action, Some(pending));
+    shared.borrow_mut().record(action, Some(operation));
     decision
+}
+
+async fn gate(shared: &Shared, operation: Operation) -> Decision {
+    match gate_start(shared, operation) {
+        GateStart::Decided(decision) => decision,
+        GateStart::Pending(receiver, operation) => {
+            gate_finish(shared, receiver, operation).await
+        }
+    }
+}
+
+fn deliver(
+    outbound: &mpsc::UnboundedSender<Option<Message>>,
+    decision: Decision,
+    text: Utf8Bytes,
+    is_notification: bool,
+    id: &Option<json::Value>,
+) -> std::result::Result<(), ()> {
+    let message = match decision {
+        Decision::Discard => None,
+        Decision::Reject(message) => {
+            if is_notification {
+                return Ok(());
+            }
+            Some(Message::Text(rejection(id, &message).into()))
+        }
+        Decision::Release => Some(Message::Text(text)),
+    };
+    outbound.send(message).map_err(|_| ())
 }
 
 pub struct Held {
@@ -917,6 +956,16 @@ async fn serve_ws(socket: TcpStream, upstream: String, shared: Shared) {
     };
     let (mut client_sink, mut client_stream) = client.split();
     let (mut server_sink, mut server_stream) = server.split();
+    let (outbound, mut outbound_rx) =
+        mpsc::unbounded_channel::<Option<Message>>();
+    tokio::task::spawn_local(async move {
+        while let Some(Some(message)) = outbound_rx.recv().await {
+            if client_sink.send(message).await.is_err() {
+                break;
+            }
+        }
+        let _ = client_sink.close().await;
+    });
     let mut pending: HashMap<String, Operation> = HashMap::new();
     let mut subscriptions: HashMap<u64, Operation> = HashMap::new();
     loop {
@@ -941,7 +990,7 @@ async fn serve_ws(socket: TcpStream, upstream: String, shared: Shared) {
                             Decision::Discard => break,
                             Decision::Reject(message) => {
                                 let reply = rejection(&parsed.id, &message);
-                                if client_sink.send(Message::Text(reply.into())).await.is_err() {
+                                if outbound.send(Some(Message::Text(reply.into()))).is_err() {
                                     break;
                                 }
                             }
@@ -968,7 +1017,7 @@ async fn serve_ws(socket: TcpStream, upstream: String, shared: Shared) {
                 match frame {
                     Message::Text(text) => {
                         let Some(parsed) = parse(&text) else {
-                            if client_sink.send(Message::Text(text)).await.is_err() {
+                            if outbound.send(Some(Message::Text(text))).is_err() {
                                 break;
                             }
                             continue;
@@ -1002,26 +1051,27 @@ async fn serve_ws(socket: TcpStream, upstream: String, shared: Shared) {
                                 None => operation(Transport::Ws, Stage::Response, "?", parsed.strings),
                             }
                         };
-                        match gate(&shared, inbound).await {
-                            Decision::Discard => break,
-                            Decision::Reject(message) => {
-                                if parsed.subscription.is_none() {
-                                    let reply = rejection(&parsed.id, &message);
-                                    if client_sink.send(Message::Text(reply.into())).await.is_err() {
-                                        break;
-                                    }
-                                }
-                            }
-                            Decision::Release => {
-                                if client_sink.send(Message::Text(text)).await.is_err() {
+                        let is_notification = parsed.subscription.is_some();
+                        let id = parsed.id.clone();
+                        match gate_start(&shared, inbound) {
+                            GateStart::Decided(decision) => {
+                                if deliver(&outbound, decision, text, is_notification, &id).is_err() {
                                     break;
                                 }
+                            }
+                            GateStart::Pending(receiver, operation) => {
+                                let shared = shared.clone();
+                                let outbound = outbound.clone();
+                                tokio::task::spawn_local(async move {
+                                    let decision = gate_finish(&shared, receiver, operation).await;
+                                    let _ = deliver(&outbound, decision, text, is_notification, &id);
+                                });
                             }
                         }
                     }
                     Message::Close(_) => break,
                     other => {
-                        if client_sink.send(other).await.is_err() {
+                        if outbound.send(Some(other)).is_err() {
                             break;
                         }
                     }
@@ -1029,6 +1079,6 @@ async fn serve_ws(socket: TcpStream, upstream: String, shared: Shared) {
             }
         }
     }
-    let _ = client_sink.close().await;
+    let _ = outbound.send(None);
     let _ = server_sink.close().await;
 }
