@@ -20,6 +20,7 @@ hash = { workspace = true }
 transaction = { workspace = true }
 keypair = { workspace = true }
 signature = { workspace = true }
+account = { workspace = true }
 signer = { workspace = true }
 solana-commitment-config = "3.1"
 solana-transaction-status-client-types = "4.1"
