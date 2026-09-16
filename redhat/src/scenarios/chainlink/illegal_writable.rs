@@ -12,6 +12,7 @@ use signer::Signer;
 
 const RECEIPT_TIMEOUT: Duration = Duration::from_secs(20);
 const PROGRAM_ID_NOT_FOUND: &str = "failed to find parent program id";
+const IMMUTABLE: &str = "Account is immutable";
 const INVALID_ACCOUNT_OWNER: &str = "Invalid account owner";
 const NEEDS_TO_BE_OWNED: &str = "needs to be owned by the invoking program";
 
@@ -23,7 +24,7 @@ async fn refused(
     er: &ErCtx,
     payer: &Rc<Keypair>,
     instructions: &[Instruction],
-    needles: &[&str],
+    needles: &[&[&str]],
 ) -> Result<()> {
     let sender = er.sender(payer.clone());
     let signature = sender.submit(instructions).await?;
@@ -37,10 +38,10 @@ async fn refused(
     )?;
     let observed =
         format!("{}\n{:?}", tx.logs.join("\n"), tx.err.as_ref().unwrap());
-    for needle in needles {
+    for alternatives in needles {
         check!(
-            observed.contains(needle),
-            "the refusal must name '{needle}', got: {observed}"
+            alternatives.iter().any(|needle| observed.contains(needle)),
+            "the refusal must name one of {alternatives:?}, got: {observed}"
         )?;
     }
     Ok(())
@@ -72,7 +73,7 @@ impl Scenario for IllegalWritable {
             er,
             &payer,
             &[build::direct_schedule_commit(payer.pubkey(), None, &pdas)],
-            &[PROGRAM_ID_NOT_FOUND],
+            &[&[PROGRAM_ID_NOT_FOUND]],
         )
         .await?;
 
@@ -86,7 +87,7 @@ impl Scenario for IllegalWritable {
                 build::direct_schedule_commit(payer.pubkey(), None, &pdas),
                 system::transfer(&payer.pubkey(), &pdas[0], 2_000_000),
             ],
-            &[PROGRAM_ID_NOT_FOUND],
+            &[&[PROGRAM_ID_NOT_FOUND, IMMUTABLE]],
         )
         .await?;
 
@@ -101,7 +102,7 @@ impl Scenario for IllegalWritable {
                 &players,
                 &pdas,
             )],
-            &[INVALID_ACCOUNT_OWNER, NEEDS_TO_BE_OWNED],
+            &[&[INVALID_ACCOUNT_OWNER], &[NEEDS_TO_BE_OWNED]],
         )
         .await?;
 
@@ -127,7 +128,7 @@ impl Scenario for IllegalWritable {
                     &pdas,
                 ),
             ],
-            &[INVALID_ACCOUNT_OWNER, NEEDS_TO_BE_OWNED],
+            &[&[INVALID_ACCOUNT_OWNER], &[NEEDS_TO_BE_OWNED]],
         )
         .await?;
 

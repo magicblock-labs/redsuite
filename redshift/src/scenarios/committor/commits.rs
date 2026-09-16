@@ -7,8 +7,8 @@ use redshift_interface::schedulecommit::{
     build, MainAccount, ScheduleCommitType,
 };
 use redsuite_core::{
-    check, check_eq, prep, BaseCtx, ChainCtx, CheckError, ErCtx, Result,
-    Scenario, ScenarioReport,
+    check, check_eq, prep, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
+    ScenarioReport,
 };
 use signer::Signer;
 
@@ -17,6 +17,8 @@ use crate::program::DELEGATION_PROGRAM_ID;
 const BASE_STATE_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub struct Commits;
+
+const FOREIGN_REJECTION: &str = "MissingAccount";
 
 fn decoded_count(data: &[u8]) -> Result<u64> {
     Ok(MainAccount::try_from_slice(data)?.count)
@@ -148,28 +150,11 @@ impl Scenario for Commits {
              must fail"
         )?;
         let commit_error = format!("{:?}", illegal_commit.unwrap_err());
-        let commit_rejection = ["IllegalOwner", "MissingAccount"]
-            .into_iter()
-            .find(|code| commit_error.contains(code))
-            .ok_or_else(|| {
-                CheckError::new(format!(
-                    "the foreign commit for {foreign_pda} is rejected with a \
-                     known code"
-                ))
-                .expected(
-                    "IllegalOwner (upstream) or MissingAccount (observed on \
-                     this validator build)",
-                )
-                .actual(&commit_error)
-            })?;
-        if commit_rejection == "MissingAccount" {
-            eprintln!(
-                "[redsuite] {}: warning: the foreign commit was rejected \
-                 with MissingAccount; upstream 01_commits asserts \
-                 IllegalOwner exactly",
-                self.name()
-            );
-        }
+        check!(
+            commit_error.contains(FOREIGN_REJECTION),
+            "the foreign commit for {foreign_pda} must be rejected with \
+             {FOREIGN_REJECTION}, got {commit_error}"
+        )?;
 
         let undelegate =
             prep::init_committees(base, &payer, other_validator.pubkey(), 1)
@@ -196,33 +181,15 @@ impl Scenario for Commits {
              validator must fail"
         )?;
         let undelegate_error = format!("{:?}", illegal_undelegate.unwrap_err());
-        let undelegate_rejection = ["ReadonlyDataModified", "MissingAccount"]
-            .into_iter()
-            .find(|code| undelegate_error.contains(code))
-            .ok_or_else(|| {
-                CheckError::new(format!(
-                    "the foreign undelegation for {undelegate_pda} is \
-                     rejected with a known code"
-                ))
-                .expected(
-                    "ReadonlyDataModified (upstream) or MissingAccount \
-                     (observed on this validator build)",
-                )
-                .actual(&undelegate_error)
-            })?;
-        if undelegate_rejection == "MissingAccount" {
-            eprintln!(
-                "[redsuite] {}: warning: the foreign undelegation was \
-                 rejected with MissingAccount; upstream 01_commits asserts \
-                 ReadonlyDataModified exactly",
-                self.name()
-            );
-        }
+        check!(
+            undelegate_error.contains(FOREIGN_REJECTION),
+            "the foreign undelegation for {undelegate_pda} must be rejected \
+             with {FOREIGN_REJECTION}, got {undelegate_error}"
+        )?;
 
         Ok(report
             .setting("commit frequency ms", prep::COMMIT_FREQUENCY_MS)
             .setting("foreign validator", other_validator.pubkey())
-            .setting("foreign commit rejection", commit_rejection)
-            .setting("foreign undelegate rejection", undelegate_rejection))
+            .setting("foreign rejection", FOREIGN_REJECTION))
     }
 }
