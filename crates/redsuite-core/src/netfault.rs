@@ -393,7 +393,7 @@ fn deliver(
     id: &Option<json::Value>,
 ) -> std::result::Result<(), ()> {
     let message = match decision {
-        Decision::Discard => None,
+        Decision::Discard => return Ok(()),
         Decision::Reject(message) => {
             if is_notification {
                 return Ok(());
