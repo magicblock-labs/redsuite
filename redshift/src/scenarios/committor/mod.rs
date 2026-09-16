@@ -6,3 +6,4 @@ pub mod commit_roundtrip;
 pub mod commit_settlement_order;
 pub mod commits;
 pub mod table_mania;
+pub mod undelegation_recovery;

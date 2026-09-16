@@ -7,6 +7,7 @@ use signer::Signer;
 use super::{config, identity, process, state, state::StackState};
 use crate::{
     api::Api,
+    console,
     context::{BaseCtx, ChainCtx, ErCtx},
     profile::ExecutionConfig,
     Result,
@@ -43,10 +44,10 @@ async fn ensure_base(config: ExecutionConfig) -> Result<StackState> {
             if process::proc_matches(state.base_pid, &state.base_bin)
                 && base_healthy(&state).await =>
         {
-            eprintln!(
-                "[redsuite] reusing base L1 on 127.0.0.1:{}",
+            console::debug(format_args!(
+                "reusing base L1 on 127.0.0.1:{}",
                 state.base_rpc_port
-            );
+            ));
             Ok(state)
         }
         stale => {
@@ -66,10 +67,10 @@ async fn ensure_er(
         if process::proc_matches(state.er_pid, &state.er_bin)
             && er_healthy(&state).await
         {
-            eprintln!(
-                "[redsuite] reusing shared ER on 127.0.0.1:{}",
+            console::debug(format_args!(
+                "reusing shared ER on 127.0.0.1:{}",
                 state.er_rpc_port
-            );
+            ));
             return Ok(state);
         }
         kill_stack(&state);
@@ -146,10 +147,10 @@ async fn boot_base(config: ExecutionConfig) -> Result<StackState> {
         identity::write_vault_dump(&plan.genesis_accounts, &reserved.pubkey())?;
     }
     identity::reset_pool(&dir);
-    eprintln!(
-        "[redsuite] booting base L1 on 127.0.0.1:{base_rpc_port} \
-         (cloning from {clone_url}) …"
-    );
+    console::debug(format_args!(
+        "booting base L1 on 127.0.0.1:{base_rpc_port} (cloning from \
+         {clone_url}) …"
+    ));
     let base_log = dir.join("base.log");
     base_ports.release();
     let base_pid = process::spawn_detached(plan.command(), &base_log)?;
@@ -179,10 +180,10 @@ async fn boot_base(config: ExecutionConfig) -> Result<StackState> {
     match await_base_ready(&state, &base_log, config).await {
         Ok(()) => {
             state::write_state(&state)?;
-            eprintln!(
-                "[redsuite] base up: 127.0.0.1:{} (ws {}), identity {}",
+            console::debug(format_args!(
+                "base up: 127.0.0.1:{} (ws {}), identity {}",
                 state.base_rpc_port, state.base_ws_port, state.er_identity,
-            );
+            ));
             Ok(state)
         }
         Err(e) => {
@@ -291,7 +292,7 @@ async fn attach_er(
         reset: true,
         allowed_followers: Vec::new(),
     };
-    eprintln!("[redsuite] booting ER on 127.0.0.1:{er_rpc_port} …");
+    console::debug(format_args!("booting ER on 127.0.0.1:{er_rpc_port} …"));
     let er_log = dir.join("er.log");
     er_ports.release();
     let er_pid = process::spawn_detached(plan.command(), &er_log)?;
@@ -319,15 +320,15 @@ async fn attach_er(
         ..state
     };
     state::write_state(&state)?;
-    eprintln!(
-        "[redsuite] stack up: base 127.0.0.1:{} (ws {}), er 127.0.0.1:{} (ws {}, metrics {}), identity {}",
+    console::debug(format_args!(
+        "stack up: base 127.0.0.1:{} (ws {}), er 127.0.0.1:{} (ws {}, metrics {}), identity {}",
         state.base_rpc_port,
         state.base_ws_port,
         state.er_rpc_port,
         state.er_ws_port,
         state.er_metrics_port,
         state.er_identity,
-    );
+    ));
     Ok(state)
 }
 

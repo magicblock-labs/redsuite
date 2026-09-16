@@ -1,4 +1,4 @@
-use crate::{profile, report, topology, Result};
+use crate::{console, profile, report, topology, Result};
 
 pub const ENV_VARS: &[(&str, &str)] = &[
     (
@@ -23,6 +23,10 @@ pub const ENV_VARS: &[(&str, &str)] = &[
         "scenario profile: lite (default), full, soak, deep",
     ),
     (profile::LOOP_ENV, "S1 loop mode: open (default) or closed"),
+    (
+        console::VERBOSE_ENV,
+        "print stack and per-scenario detail lines for passing runs too",
+    ),
 ];
 
 pub fn usage_env() -> String {

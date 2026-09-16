@@ -16,6 +16,7 @@ use super::{
 };
 use crate::{
     api::Api,
+    console,
     context::{BaseCtx, ChainCtx, ErCtx},
     host::proc_running,
     report,
@@ -215,10 +216,10 @@ impl Drop for PrivateEr {
             if !proc_running(self.pid) {
                 return;
             }
-            eprintln!(
-                "[redsuite] stopping private ER `{}` (pid {})",
+            console::debug(format_args!(
+                "stopping private ER `{}` (pid {})",
                 self.label, self.pid
-            );
+            ));
             process::kill_pid(self.pid);
             self.record.record_exit(
                 "terminated by cleanup, no child handle".to_owned(),
@@ -228,19 +229,19 @@ impl Drop for PrivateEr {
         match child.try_wait().ok().flatten() {
             Some(status) => {
                 let exit = process::describe_exit(&status);
-                eprintln!(
-                    "[redsuite] private ER `{}` (pid {}) had already exited \
-                     before cleanup: {exit}",
+                console::line(format_args!(
+                    "private ER `{}` (pid {}) had already exited before \
+                     cleanup: {exit}",
                     self.label, self.pid
-                );
+                ));
                 self.record
                     .record_exit(format!("died before cleanup: {exit}"));
             }
             None => {
-                eprintln!(
-                    "[redsuite] stopping private ER `{}` (pid {})",
+                console::debug(format_args!(
+                    "stopping private ER `{}` (pid {})",
                     self.label, self.pid
-                );
+                ));
                 process::kill_pid(self.pid);
                 let exit = child
                     .wait()
@@ -354,10 +355,10 @@ async fn launch(
         reset: true,
         allowed_followers,
     };
-    eprintln!(
-        "[redsuite] booting {role} `{}` on 127.0.0.1:{rpc_port} …",
+    console::debug(format_args!(
+        "booting {role} `{}` on 127.0.0.1:{rpc_port} …",
         options.label
-    );
+    ));
     ports.release();
     let child = process::spawn_child(plan.command(), &log)?;
     let pid = child.id();

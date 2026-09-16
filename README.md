@@ -125,7 +125,8 @@ Scenario isolation comes from fresh keypairs, not fresh chains.
 Scenarios that kill a validator, restart one, or need their own config boot
 private ERs. `task_scheduler`, `config_gates`, `aml_gate`,
 `ledger_retention`, `commit_blackout`, `commit_exactly_once`,
-`commit_settlement_order`, `verifier_lifecycle`, and `replication_recovery`
+`commit_settlement_order`, `undelegation_recovery`, `verifier_lifecycle`, and
+`replication_recovery`
 run on
 one instead of the shared ER (the last two boot their private ER as a leader
 with two verifiers replicating from it); `restart_under_load`,
@@ -180,6 +181,7 @@ even when the scenario fails early.
 | `REDSUITE_CLONE_URL` | where a cold boot clones base programs from; defaults to mainnet-beta |
 | `REDSUITE_PROFILE` | scenario profile: `lite` (default), `full`, `soak`, or `deep` |
 | `REDSUITE_LOOP` | S1 loop mode: `open` (default) or `closed` |
+| `REDSUITE_VERBOSE` | set to print stack boot, reuse and per-scenario detail lines for passing scenarios too; by default those appear only for failures |
 
 A cold boot clones its base programs from `REDSUITE_CLONE_URL`, so the first
 boot needs that endpoint. A warm stack does not, and neither does a rerun.
@@ -429,6 +431,20 @@ committor (ER → base commits):
   settled. Reports how long D took to settle during the hold, the retry
   gap, per-bundle base slots, the buffer count seen during the hold, and
   every fault event.
+- `undelegation_recovery` — boots a private ER behind the base-chain
+  proxies and proves an account stays locked while its undelegation is
+  pending but is released once base completes it, even when the ER missed
+  the completion. Twice, with a reconnect and with a same-storage restart:
+  a delegated account is written on the ER and a commit-and-undelegate
+  scheduled, its base submission is held before reaching base, and ER
+  writes must be rejected with an upstream lockout code both while it is
+  held and after the held submission is dropped and resubmitted. The
+  account's base notifications are then dropped and the proxied
+  connections closed, the submission released, and the scenario's own base
+  client watches ownership return to the program only after the committed
+  value landed. After the connections are restored, or the ER is restarted
+  in place, a base write must become visible on the ER without any storage
+  cleanup, and redelegating the account must let ER writes through again.
 - `commit_roundtrip` — writes two delegated accounts on the ER, commits one
   and checks it lands on base byte-for-byte while the other doesn't move.
   Then commits and undelegates both — the owning program gets its accounts

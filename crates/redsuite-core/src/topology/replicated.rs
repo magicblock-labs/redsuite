@@ -18,6 +18,7 @@ use super::{
 };
 use crate::{
     api::{self, Metrics},
+    console,
     context::BaseCtx,
     host::proc_running,
     report,
@@ -257,10 +258,10 @@ impl Drop for Verifier {
             if !proc_running(self.pid) {
                 return;
             }
-            eprintln!(
-                "[redsuite] stopping verifier `{}` (pid {})",
+            console::debug(format_args!(
+                "stopping verifier `{}` (pid {})",
                 self.label, self.pid
-            );
+            ));
             process::kill_pid(self.pid);
             self.record.record_exit(
                 "terminated by cleanup, no child handle".to_owned(),
@@ -270,19 +271,19 @@ impl Drop for Verifier {
         match child.try_wait().ok().flatten() {
             Some(status) => {
                 let exit = process::describe_exit(&status);
-                eprintln!(
-                    "[redsuite] verifier `{}` (pid {}) had already exited \
-                     before cleanup: {exit}",
+                console::line(format_args!(
+                    "verifier `{}` (pid {}) had already exited before \
+                     cleanup: {exit}",
                     self.label, self.pid
-                );
+                ));
                 self.record
                     .record_exit(format!("died before cleanup: {exit}"));
             }
             None => {
-                eprintln!(
-                    "[redsuite] stopping verifier `{}` (pid {})",
+                console::debug(format_args!(
+                    "stopping verifier `{}` (pid {})",
                     self.label, self.pid
-                );
+                ));
                 process::kill_pid(self.pid);
                 let exit = child
                     .wait()
@@ -450,11 +451,11 @@ pub async fn replicated(
         };
         let config_path = plan.write_config()?;
         let log = dir.join(format!("er-{label}.log"));
-        eprintln!(
-            "[redsuite] booting verifier `{label}` (metrics 127.0.0.1:\
-             {metrics_port}) following {} …",
+        console::debug(format_args!(
+            "booting verifier `{label}` (metrics 127.0.0.1:{metrics_port}) \
+             following {} …",
             plan.upstream_address()
-        );
+        ));
         ports.release();
         let child = process::spawn_child(plan.command(), &log)?;
         let pid = child.id();

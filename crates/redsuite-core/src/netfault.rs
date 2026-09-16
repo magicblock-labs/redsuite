@@ -21,6 +21,7 @@ use tokio_tungstenite::tungstenite::Message;
 use transaction::versioned::VersionedTransaction;
 
 use crate::{
+    console,
     context::{BaseCtx, ChainCtx},
     report::{self, ScenarioReport},
     topology::BaseEndpoints,
@@ -483,10 +484,10 @@ impl BaseProxies {
                 shared.clone(),
             )),
         ];
-        eprintln!(
-            "[redsuite] base proxies up: rpc {} ws {}",
+        console::debug(format_args!(
+            "base proxies up: rpc {} ws {}",
             endpoints.rpc_url, endpoints.ws_url
-        );
+        ));
         Ok(Self {
             shared,
             endpoints,
