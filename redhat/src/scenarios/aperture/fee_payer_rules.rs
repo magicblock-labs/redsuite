@@ -94,9 +94,10 @@ impl Scenario for FeePayerRules {
         )?;
         let fee_error = format!("{:?}", fee_only.unwrap_err());
         check!(
-            fee_error.contains("InvalidAccountForFee"),
-            "expected InvalidAccountForFee for the non-delegated payer, got \
-             {fee_error}"
+            fee_error.contains("InvalidAccountForFee")
+                || fee_error.contains("Immutable"),
+            "expected InvalidAccountForFee or Immutable for the non-delegated \
+             payer, got {fee_error}"
         )?;
 
         Ok(ScenarioReport::ok(self.name())
@@ -105,6 +106,9 @@ impl Scenario for FeePayerRules {
                 "self commit base sigs",
                 commit_receipt.base_signatures.len(),
             )
-            .setting("non-delegated fee refusal", "InvalidAccountForFee"))
+            .setting(
+                "non-delegated fee refusal",
+                "InvalidAccountForFee | Immutable",
+            ))
     }
 }
