@@ -1,4 +1,5 @@
 pub mod account_info_semantics;
+pub mod activation_single_shot;
 pub mod aml_gate;
 pub mod clone_on_access;
 pub mod escrow_cloning;

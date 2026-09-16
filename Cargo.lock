@@ -2818,6 +2818,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "solana-account 4.3.2",
  "solana-account-decoder-client-types",
  "solana-address-lookup-table-interface 3.1.0",
  "solana-commitment-config",

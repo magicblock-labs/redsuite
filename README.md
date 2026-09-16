@@ -124,7 +124,8 @@ flock, `genesis-accounts/`, logs, ledgers).
 Scenario isolation comes from fresh keypairs, not fresh chains.
 Scenarios that kill a validator, restart one, or need their own config boot
 private ERs. `task_scheduler`, `config_gates`, `aml_gate`,
-`ledger_retention`, `commit_blackout`, `commit_exactly_once`,
+`activation_single_shot`, `ledger_retention`, `snapshot_read_race`,
+`commit_blackout`, `commit_exactly_once`,
 `commit_settlement_order`, `undelegation_recovery`,
 `delegation_session_isolation`, `verifier_lifecycle`, and `replication_recovery`
 run on
@@ -376,6 +377,17 @@ chainlink (account cloning):
   API before the tokens are merged. An owner scored above the threshold never
   gets a merge: no transaction goes near the destination, and the account is
   handed back undelegated.
+- `activation_single_shot` — boots a private ER behind the base-chain
+  proxies and delegates an account whose post-delegation action bumps a
+  delegated counter and names a never-cloned dependency. The proxy stalls
+  the dependency fetch, so the ER cannot finish activating; while it is
+  held, concurrent reads and transfers referencing the delegated account
+  hit the ER and a base credit delivers a subscription update for it. After
+  the release the counter must show the action exactly once, and it must
+  keep that value through a steady window, a base-connection reset with
+  fresh notifications, and an in-place restart on the same storage. A second
+  delegation carries a failing action under the same hold: it must leave the
+  counter untouched and hand the account back to the system program.
 
 committor (ER → base commits):
 
@@ -593,6 +605,13 @@ storage (ledger retention):
   queryable, getSignaturesForAddress lists exactly the retained set, and the
   counter holds every add. Then restarts the ER in place without reset and
   checks the same history and state survive.
+- `snapshot_read_race` — boots a private ER with 10-slot superblocks and
+  grows eight order books in small steps while reader tasks poll their
+  accounts continuously. Every grow must succeed, every read must keep
+  succeeding across superblock seals and the resulting account-store resizes
+  and compactions, and after an in-place SIGTERM restart the churn resumes
+  under the same rules. At the end each order book must reflect all of its
+  grows.
 
 ## redhat scenarios
 

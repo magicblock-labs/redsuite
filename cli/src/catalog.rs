@@ -263,6 +263,11 @@ pub mod redshift {
             resources: [Resource::Er],
             fixtures: [],
         },
+        activation_single_shot => chainlink::activation_single_shot::ActivationSingleShot {
+            topology: PrivateEr,
+            resources: [Resource::Er],
+            fixtures: [Fixture::RedshiftProgram],
+        },
         table_mania => committor::table_mania::TableManiaScenario {
             topology: Shared,
             resources: [Resource::Er],
