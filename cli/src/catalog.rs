@@ -170,6 +170,11 @@ pub mod redshift {
             resources: [Resource::Er],
             fixtures: [Fixture::RedshiftProgram],
         },
+        snapshot_read_race => storage::snapshot_read_race::SnapshotReadRace {
+            topology: PrivateEr,
+            resources: [Resource::Er],
+            fixtures: [Fixture::RedshiftProgram],
+        },
         verifier_lifecycle => replication::verifier_lifecycle::VerifierLifecycle {
             topology: PrivateEr,
             resources: [Resource::Er],
