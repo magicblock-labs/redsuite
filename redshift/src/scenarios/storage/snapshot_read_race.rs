@@ -49,7 +49,22 @@ impl Readers {
             let mut reads = 0u64;
             while !flag.get() {
                 match api.get_multiple_accounts(&addresses).await {
-                    Ok(_) => reads += 1,
+                    Ok(accounts) if accounts.iter().all(Option::is_some) => {
+                        reads += 1;
+                    }
+                    Ok(accounts) => {
+                        let missing = addresses
+                            .iter()
+                            .zip(accounts.iter())
+                            .filter(|(_, a)| a.is_none())
+                            .map(|(pk, _)| pk.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        return (
+                            reads,
+                            Some(format!("missing account(s): {missing}")),
+                        );
+                    }
                     Err(error) => return (reads, Some(error.to_string())),
                 }
             }
