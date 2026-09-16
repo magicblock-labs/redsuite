@@ -6,6 +6,7 @@ use futures_util::FutureExt;
 use crate::{
     catalog::Fixture,
     check::CheckError,
+    console,
     context::{BaseCtx, ErCtx},
     manifest,
     profile::ExecutionConfig,
@@ -319,7 +320,7 @@ fn preflight(fixtures: &[Fixture]) -> Result<()> {
     if !fixtures.is_empty() {
         let manifest = manifest::load()?;
         if let Some(warning) = manifest::revision_drift(&manifest) {
-            eprintln!("[redsuite] warning: {warning}");
+            console::line(format_args!("warning: {warning}"));
         }
         for fixture in fixtures {
             manifest::resolve(*fixture)?;
@@ -356,90 +357,96 @@ fn optional_fixture_gap(optional_fixtures: &[Fixture]) -> Option<String> {
 }
 
 fn conclude(record: &mut RunRecord) {
+    let passed = matches!(record.scenario, ScenarioOutcome::Passed(_));
+    let show_details = !passed || console::verbose();
     match &record.scenario {
         ScenarioOutcome::Passed(report) => {
-            eprintln!(
-                "[redsuite] {}: passed={}",
-                report.scenario, report.passed
-            );
-            if !report.config.is_empty() {
-                let knobs: Vec<String> = report
-                    .config
-                    .iter()
-                    .map(|(key, value)| format!("{key}={value}"))
-                    .collect();
-                eprintln!("[redsuite]   config: {}", knobs.join(" "));
-            }
-            for measurement in &report.measurements {
-                match &measurement.value {
-                    MeasureValue::Distribution(stats) => eprintln!(
-                        "[redsuite]   {}: {stats:?}",
-                        measurement.label
-                    ),
-                    MeasureValue::Scalar(value) => {
-                        eprintln!("[redsuite]   {}: {value}", measurement.label)
+            console::line(format_args!("{}: passed", report.scenario));
+            if show_details {
+                if !report.config.is_empty() {
+                    let knobs: Vec<String> = report
+                        .config
+                        .iter()
+                        .map(|(key, value)| format!("{key}={value}"))
+                        .collect();
+                    console::detail(format_args!(
+                        "config: {}",
+                        knobs.join(" ")
+                    ));
+                }
+                for measurement in &report.measurements {
+                    match &measurement.value {
+                        MeasureValue::Distribution(stats) => console::detail(
+                            format_args!("{}: {stats:?}", measurement.label),
+                        ),
+                        MeasureValue::Scalar(value) => console::detail(
+                            format_args!("{}: {value}", measurement.label),
+                        ),
                     }
                 }
             }
         }
         ScenarioOutcome::Failed(error) => match failed_check(error) {
-            Some(check) => {
-                eprintln!("[redsuite] {}: check failed: {check}", record.name)
-            }
-            None => eprintln!(
-                "[redsuite] {}: scenario failed: {error}",
+            Some(check) => console::line(format_args!(
+                "{}: check failed: {check}",
                 record.name
-            ),
+            )),
+            None => console::line(format_args!(
+                "{}: scenario failed: {error}",
+                record.name
+            )),
         },
-        ScenarioOutcome::Panicked(message) => {
-            eprintln!(
-                "[redsuite] {}: scenario panicked: {message}",
-                record.name
-            )
-        }
+        ScenarioOutcome::Panicked(message) => console::line(format_args!(
+            "{}: scenario panicked: {message}",
+            record.name
+        )),
         ScenarioOutcome::Skipped(reason) => {
-            eprintln!("[redsuite] {}: skipped — {reason}", record.name)
+            console::line(format_args!("{}: skipped — {reason}", record.name))
         }
         ScenarioOutcome::NotReached => {
-            eprintln!("[redsuite] {}: not run", record.name)
+            console::line(format_args!("{}: not run", record.name))
         }
     }
     for outcome in &record.phases {
         if let Some(error) = &outcome.error {
-            eprintln!("[redsuite]   {error}");
+            console::detail(format_args!("{error}"));
         }
     }
-    for launch in &record.launches {
-        let exit = launch
-            .exit
-            .as_deref()
-            .map(|exit| format!(", {exit}"))
-            .unwrap_or_default();
-        eprintln!(
-            "[redsuite]   launched {} `{}`: pid {} ({} relaunches), {} {}, \
-             metrics 127.0.0.1:{}, storage {}{}",
-            launch.role,
-            launch.label,
-            launch.pid,
-            launch.relaunches,
-            launch.bin,
-            launch.bin_version,
-            launch.metrics_port,
-            launch.storage_dir,
-            exit,
-        );
+    if show_details {
+        for launch in &record.launches {
+            let exit = launch
+                .exit
+                .as_deref()
+                .map(|exit| format!(", {exit}"))
+                .unwrap_or_default();
+            console::detail(format_args!(
+                "launched {} `{}`: pid {} ({} relaunches), {} {}, metrics \
+                 127.0.0.1:{}, storage {}{}",
+                launch.role,
+                launch.label,
+                launch.pid,
+                launch.relaunches,
+                launch.bin,
+                launch.bin_version,
+                launch.metrics_port,
+                launch.storage_dir,
+                exit,
+            ));
+        }
     }
     if matches!(record.scenario, ScenarioOutcome::Skipped(_)) {
         return;
     }
     match crate::report::persist_run(record) {
         Ok(path) => {
-            eprintln!("[redsuite]   report: {}", path.display());
+            if show_details {
+                console::detail(format_args!("report: {}", path.display()));
+            }
             record.phase_ok(Phase::Persist);
         }
         Err(error) => {
             let error = RunError::Persist(error);
-            eprintln!("[redsuite]   {error}");
+            console::detail(format_args!("{error}"));
             record.phase_failed(error);
         }
     }

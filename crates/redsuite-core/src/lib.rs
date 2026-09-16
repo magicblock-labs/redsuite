@@ -1,6 +1,7 @@
 pub mod api;
 pub mod catalog;
 pub mod check;
+pub mod console;
 pub mod context;
 pub mod dlp;
 pub mod frontend;

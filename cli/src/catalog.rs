@@ -140,6 +140,11 @@ pub mod redshift {
             resources: [Resource::Er],
             fixtures: [Fixture::RedlineProgram],
         },
+        undelegation_recovery => committor::undelegation_recovery::UndelegationRecovery {
+            topology: PrivateEr,
+            resources: [Resource::Er],
+            fixtures: [Fixture::RedlineProgram],
+        },
         commit_roundtrip => committor::commit_roundtrip::CommitRoundtrip {
             topology: Shared,
             resources: [Resource::Er],

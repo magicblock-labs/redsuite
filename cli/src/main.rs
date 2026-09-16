@@ -3,7 +3,7 @@ mod catalog;
 use futures_util::StreamExt;
 use redsuite_core::{
     catalog::{Lane, ScenarioEntry},
-    frontend,
+    console, frontend,
     profile::{self, ExecutionConfig, LoopMode, Profile},
     Result, RunRecord,
 };
@@ -61,7 +61,7 @@ async fn run_lane(
     let limit = limit.clamp(1, scenarios.len());
     futures_util::stream::iter(scenarios)
         .map(|entry| async move {
-            eprintln!("[redsuite] starting {}", entry.name());
+            console::debug(format_args!("starting {}", entry.name()));
             (entry.run)(config).await
         })
         .buffer_unordered(limit)
@@ -132,12 +132,11 @@ async fn run(args: &[String]) -> Result<()> {
 
     let mut records = Vec::new();
     if !shared.is_empty() || !private_er.is_empty() {
-        eprintln!(
-            "[redsuite] running {} shared-stack and {} private-ER scenarios \
-             in parallel",
+        console::debug(format_args!(
+            "running {} shared-stack and {} private-ER scenarios in parallel",
             shared.len(),
             private_er.len()
-        );
+        ));
         let shared_count = shared.len();
         let (mut from_shared, mut from_private) = futures_util::future::join(
             run_lane(shared, shared_count, config),
@@ -150,10 +149,10 @@ async fn run(args: &[String]) -> Result<()> {
 
     // Benchmarks run last and alone
     if !benchmarks.is_empty() {
-        eprintln!(
-            "[redsuite] running {} benchmark scenarios sequentially",
+        console::debug(format_args!(
+            "running {} benchmark scenarios sequentially",
             benchmarks.len()
-        );
+        ));
         records.append(&mut run_lane(benchmarks, 1, config).await);
     }
 
