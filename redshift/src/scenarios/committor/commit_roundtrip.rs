@@ -342,6 +342,7 @@ impl Scenario for CommitRoundtrip {
             "InvalidWritableAccount",
             "ExternalAccountDataModified",
             "ProgramFailedToComplete",
+            "Immutable",
         ]
         .into_iter()
         .find(|code| lockout_error.contains(code))
@@ -350,8 +351,8 @@ impl Scenario for CommitRoundtrip {
                 "the lockout write is rejected with an upstream code",
             )
             .expected(
-                "InvalidWritableAccount, ExternalAccountDataModified or \
-                 ProgramFailedToComplete",
+                "InvalidWritableAccount, ExternalAccountDataModified, \
+                 ProgramFailedToComplete or Immutable",
             )
             .actual(&lockout_error)
         })?;
