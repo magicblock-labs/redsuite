@@ -5,7 +5,7 @@ use std::{
 
 use json::{Deserialize, Serialize};
 
-use crate::{host, DynError};
+use crate::{host, topology, DynError};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaunchRecord {
@@ -112,6 +112,52 @@ impl Resources {
             }
         }
         errors
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reclaimed {
+    pub label: String,
+    pub storage_dir: String,
+    pub killed: bool,
+}
+
+impl Resources {
+    pub(crate) fn reclaim(&self) -> Vec<Reclaimed> {
+        let mut reclaimed = Vec::new();
+        for record in self.records.borrow().iter() {
+            let Some(launch) = &record.launch else {
+                continue;
+            };
+            let pid = record.pid.get();
+            let killed = !record.finished.get() && host::proc_running(pid);
+            if killed {
+                topology::kill_pid(pid);
+                record.mark_finished();
+            }
+            let storage_dir = std::path::Path::new(&launch.storage_dir);
+            let removed = match std::fs::remove_dir_all(storage_dir) {
+                Ok(()) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    false
+                }
+                Err(error) => {
+                    record.record_finish_error(format!(
+                        "reclaiming storage {}: {error}",
+                        launch.storage_dir
+                    ));
+                    false
+                }
+            };
+            if killed || removed {
+                reclaimed.push(Reclaimed {
+                    label: record.label.clone(),
+                    storage_dir: launch.storage_dir.clone(),
+                    killed,
+                });
+            }
+        }
+        reclaimed
     }
 }
 

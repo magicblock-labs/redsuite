@@ -62,7 +62,7 @@ pub fn dispatch(args: &[String]) -> Option<Result<()>> {
 pub fn usage(invocation: &str) -> String {
     [
         ("stack status", "show the shared base+ER stack (booted on demand by tests)"),
-        ("stack down", "stop the shared stack and clear its state"),
+        ("stack down", "stop the shared stack, clear its state and delete its storage"),
         ("report list", "list persisted scenario reports (target/redsuite-reports/)"),
         (
             "report compare [scenario] [--strict] [--brief]",
