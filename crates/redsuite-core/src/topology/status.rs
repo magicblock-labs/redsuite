@@ -1,7 +1,10 @@
-use std::fs;
+use std::{fs, path::PathBuf};
 
 use super::{process, state};
 use crate::Result;
+
+const STACK_STORAGE: &[&str] =
+    &["base-ledger", "er-storage", "genesis-accounts"];
 
 pub fn status() -> Result<()> {
     let Some(state) = state::read_state() else {
@@ -85,6 +88,37 @@ pub fn down() -> Result<()> {
         println!("stopping orphaned topology process (pid {pid}): {cmdline}");
         process::kill_pid(pid);
     }
-    println!("stack down");
+    let wiped = wipe_storage()?;
+    match wiped.len() {
+        0 => println!("stack down"),
+        count => println!(
+            "stack down, {count} storage director{} removed",
+            if count == 1 { "y" } else { "ies" }
+        ),
+    }
     Ok(())
+}
+
+pub fn wipe_storage() -> Result<Vec<PathBuf>> {
+    let dir = state::stack_dir();
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return Ok(Vec::new());
+    };
+    let mut removed = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !(STACK_STORAGE.contains(&name.as_str()) || name.starts_with("er-"))
+        {
+            continue;
+        }
+        fs::remove_dir_all(&path).map_err(|error| {
+            format!("removing stack storage {}: {error}", path.display())
+        })?;
+        removed.push(path);
+    }
+    Ok(removed)
 }

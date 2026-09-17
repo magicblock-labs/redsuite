@@ -291,6 +291,15 @@ where
     let outcome = AssertUnwindSafe(body(provisioned)).catch_unwind().await;
     let wall_seconds = started.elapsed().as_secs_f64();
     let teardown_errors = resources.audit();
+    for reclaimed in resources.reclaim() {
+        console::line(format_args!(
+            "{}: reclaimed private ER `{}`{}: removed {}",
+            record.name,
+            reclaimed.label,
+            if reclaimed.killed { " (stopped)" } else { "" },
+            reclaimed.storage_dir
+        ));
+    }
     record.launches = resources.launches();
     record.wall_seconds = Some(wall_seconds);
     record.scenario = match outcome {

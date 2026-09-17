@@ -89,7 +89,7 @@ pub(super) fn describe_exit(status: &ExitStatus) -> String {
     }
 }
 
-pub(super) fn kill_pid(pid: u32) {
+pub(crate) fn kill_pid(pid: u32) {
     if pid == 0 || !proc_running(pid) {
         return;
     }
