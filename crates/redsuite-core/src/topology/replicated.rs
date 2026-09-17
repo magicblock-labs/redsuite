@@ -1,5 +1,4 @@
 use std::{
-    fs,
     path::{Path, PathBuf},
     process::Child,
     rc::Rc,
@@ -189,17 +188,13 @@ impl Verifier {
     }
 
     fn remove_storage(&self) -> Result<()> {
-        match fs::remove_dir_all(&self.plan.storage_dir) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                Ok(())
-            }
-            Err(error) => Err(format!(
+        state::remove_storage(&self.plan.storage_dir).map_err(|error| {
+            format!(
                 "removing the storage of verifier `{}`: {error}",
                 self.label
             )
-            .into()),
-        }
+            .into()
+        })
     }
 
     pub async fn start(&mut self, ready_timeout: Duration) -> Result<Duration> {
@@ -433,11 +428,8 @@ pub async fn replicated(
     for (index, identity) in identities.into_iter().enumerate() {
         let label = format!("{}-verifier{index}", options.label);
         let storage_dir = dir.join(format!("er-{label}"));
-        if let Err(error) = fs::remove_dir_all(&storage_dir) {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                return Err(error.into());
-            }
-        }
+        state::remove_storage(&storage_dir)?;
+        let accountsdb_dir = state::accountsdb_dir(&storage_dir);
         let mut ports = process::PortLease::default();
         let metrics_port = ports.single()?;
         let plan = VerifierPlan {
@@ -447,6 +439,7 @@ pub async fn replicated(
             upstream_authority: leader.identity(),
             metrics_port,
             storage_dir,
+            accountsdb_dir,
             env: verifier_env.clone(),
         };
         let config_path = plan.write_config()?;
@@ -472,6 +465,8 @@ pub async fn replicated(
             replication_port: None,
             upstream: Some(plan.upstream_address()),
             storage_dir: plan.storage_dir.display().to_string(),
+            accountsdb_dir: state::split_accountsdb_dir(&plan.storage_dir)
+                .map(|dir| dir.display().to_string()),
             log: log.display().to_string(),
             config: Some(config_path.display().to_string()),
             pid,

@@ -111,7 +111,11 @@ only one ER exists at any moment. When the run ends it performs `stack
 down`, which stops every process it started and deletes the base ledger,
 the shared ER storage and every private ER directory under
 `target/redsuite-stack/` (logs stay). `--keep-storage` skips that final
-teardown. Independently of the mode, a scenario that fails before stopping
+teardown. Every validator's ledger lives under `target/redsuite-stack/`,
+which can be a symlink to a larger disk; set `REDSUITE_ACCOUNTSDB_DIR` to
+put the accounts databases on a separate disk, laid out as
+`<dir>/er-<label>/accountsdb`, and both `stack down` and the failure
+cleanup sweep that root too. Independently of the mode, a scenario that fails before stopping
 its private ERs has them stopped and their storage removed by the harness;
 the run log names what was reclaimed.
 
@@ -195,6 +199,7 @@ even when the scenario fails early.
 | `MAGICBLOCK_VALIDATOR_BIN` | the ER binary under test; else `magicblock-validator` on PATH |
 | `MAGICBLOCK_VERIFIER_BIN` | the verifier binary for replicated topologies; else beside the ER binary, else on PATH |
 | `REDSUITE_ROOT` | workspace root, when the `redsuite` binary runs outside a checkout |
+| `REDSUITE_ACCOUNTSDB_DIR` | root for every validator's accountsdb, when it should live on another disk than the ledger; by default it sits inside each validator's storage dir |
 | `REDSUITE_CLONE_URL` | where a cold boot clones base programs from; defaults to mainnet-beta |
 | `REDSUITE_PROFILE` | scenario profile: `lite` (default), `full`, `soak`, or `deep` |
 | `REDSUITE_LOOP` | S1 loop mode: `open` (default) or `closed` |

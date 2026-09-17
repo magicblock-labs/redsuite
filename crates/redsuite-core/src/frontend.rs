@@ -15,6 +15,11 @@ pub const ENV_VARS: &[(&str, &str)] = &[
         "workspace root, when the binary runs outside the checkout",
     ),
     (
+        topology::ACCOUNTSDB_ROOT_ENV,
+        "root for every validator's accountsdb, when it should live on \
+         another disk than the ledger (default: inside each storage dir)",
+    ),
+    (
         topology::CLONE_URL_ENV,
         "where a cold boot clones base programs from (default mainnet-beta)",
     ),

@@ -39,7 +39,7 @@ pub async fn stop_shared_er() -> Result<bool> {
         return Ok(false);
     }
     process::kill_matching(&[(state.er_pid, state.er_bin.as_str())]);
-    let _ = fs::remove_dir_all(dir.join("er-storage"));
+    let _ = state::remove_storage(&dir.join("er-storage"));
     state::write_state(&StackState {
         er_rpc_port: 0,
         er_ws_port: 0,
@@ -298,7 +298,8 @@ async fn attach_er(
     let er_replication_port = er_ports.single()?;
 
     // a fresh base is a new chain — prior-generation ER state is invalid
-    let _ = fs::remove_dir_all(dir.join("er-storage"));
+    let storage_dir = dir.join("er-storage");
+    let _ = state::remove_storage(&storage_dir);
 
     let plan = config::ErPlan {
         bin: er_bin,
@@ -308,7 +309,8 @@ async fn attach_er(
         listen_port: er_rpc_port,
         metrics_port: er_metrics_port,
         replication_port: er_replication_port,
-        storage_dir: dir.join("er-storage"),
+        accountsdb_dir: state::accountsdb_dir(&storage_dir),
+        storage_dir,
         env: Vec::new(),
         reset: true,
         allowed_followers: Vec::new(),

@@ -28,6 +28,7 @@ pub struct StackState {
 }
 
 pub const ROOT_ENV: &str = "REDSUITE_ROOT";
+pub const ACCOUNTSDB_ROOT_ENV: &str = "REDSUITE_ACCOUNTSDB_DIR";
 
 pub fn workspace_root() -> PathBuf {
     // `REDSUITE_ROOT` covers test binaries relocated after compilation
@@ -44,6 +45,38 @@ pub fn workspace_root() -> PathBuf {
 
 pub fn stack_dir() -> PathBuf {
     workspace_root().join("target/redsuite-stack")
+}
+
+pub fn accountsdb_root() -> Option<PathBuf> {
+    std::env::var_os(ACCOUNTSDB_ROOT_ENV).map(PathBuf::from)
+}
+
+pub(super) fn accountsdb_dir(storage_dir: &Path) -> PathBuf {
+    match (accountsdb_root(), storage_dir.file_name()) {
+        (Some(root), Some(name)) => root.join(name).join("accountsdb"),
+        _ => storage_dir.join("accountsdb"),
+    }
+}
+
+pub(super) fn split_accountsdb_dir(storage_dir: &Path) -> Option<PathBuf> {
+    let root = accountsdb_root()?;
+    Some(root.join(storage_dir.file_name()?))
+}
+
+pub(super) fn remove_storage(storage_dir: &Path) -> std::io::Result<()> {
+    remove_dir_if_present(storage_dir)?;
+    if let Some(split) = split_accountsdb_dir(storage_dir) {
+        remove_dir_if_present(&split)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn remove_dir_if_present(dir: &Path) -> std::io::Result<()> {
+    match fs::remove_dir_all(dir) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 pub(super) fn state_path() -> PathBuf {

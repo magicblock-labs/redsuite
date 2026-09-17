@@ -333,6 +333,7 @@ pub(super) struct ErPlan {
     // every validator binds a follower listener (default 127.0.0.1:10000);
     pub(super) replication_port: u16,
     pub(super) storage_dir: PathBuf,
+    pub(super) accountsdb_dir: PathBuf,
     pub(super) env: Vec<(String, String)>,
     // reset=true wipes only the ledger (rocksdb) and skips replay; it
     // preserves the accountsdb. A restart-in-place relaunch passes false so
@@ -364,10 +365,7 @@ impl ErPlan {
         // only the ledger directory leaves the accountsdb at the global
         // default. Set both, mirroring the engine's default
         // <ledger dir>/accountsdb layout under this ER's storage dir.
-        cmd.env(
-            "MBV_ENGINE__ACCOUNTSDB__DIRECTORY",
-            self.storage_dir.join("accountsdb"),
-        );
+        cmd.env("MBV_ENGINE__ACCOUNTSDB__DIRECTORY", &self.accountsdb_dir);
         cmd.env(
             "MBV_ENGINE__REPLICATION__BIND_ADDRESS",
             format!("127.0.0.1:{}", self.replication_port),
@@ -413,6 +411,7 @@ pub(super) struct VerifierPlan {
     pub(super) upstream_authority: Pubkey,
     pub(super) metrics_port: u16,
     pub(super) storage_dir: PathBuf,
+    pub(super) accountsdb_dir: PathBuf,
     pub(super) env: Vec<(String, String)>,
 }
 
@@ -435,7 +434,7 @@ impl VerifierPlan {
              upstream-authority = \"{authority}\"\n",
             metrics = self.metrics_port,
             identity = self.identity.to_base58_string(),
-            accountsdb = self.storage_dir.join("accountsdb").display(),
+            accountsdb = self.accountsdb_dir.display(),
             ledger = self.storage_dir.display(),
             upstream = self.upstream_address(),
             authority = self.upstream_authority,
@@ -543,6 +542,7 @@ mod tests {
             metrics_port: 7801,
             replication_port: 7802,
             storage_dir: PathBuf::from("/tmp/er-storage"),
+            accountsdb_dir: PathBuf::from("/tmp/er-storage/accountsdb"),
             env: vec![("MBV_TEST".to_owned(), "1".to_owned())],
             reset,
             allowed_followers: Vec::new(),
@@ -579,6 +579,9 @@ mod tests {
             upstream_authority,
             metrics_port: 9101,
             storage_dir: PathBuf::from("/tmp/er-leader-verifier0"),
+            accountsdb_dir: PathBuf::from(
+                "/tmp/er-leader-verifier0/accountsdb",
+            ),
             env: vec![(
                 "MBV_VERIFIER_ENGINE__BLOCKSTORE__BLOCKTIME".to_owned(),
                 "20ms".to_owned(),

@@ -141,17 +141,13 @@ impl PrivateEr {
     }
 
     fn remove_storage(&self) -> Result<()> {
-        match fs::remove_dir_all(&self.plan.storage_dir) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                Ok(())
-            }
-            Err(error) => Err(format!(
+        state::remove_storage(&self.plan.storage_dir).map_err(|error| {
+            format!(
                 "removing the storage of private ER `{}`: {error}",
                 self.label
             )
-            .into()),
-        }
+            .into()
+        })
     }
 
     // Stop the ER (SIGTERM, or SIGKILL if hard_kill), then relaunch it on the
@@ -324,11 +320,8 @@ async fn launch(
     let metrics_port = ports.single()?;
     let replication_port = ports.single()?;
     let storage_dir = dir.join(format!("er-{}", options.label));
-    if let Err(error) = fs::remove_dir_all(&storage_dir) {
-        if error.kind() != std::io::ErrorKind::NotFound {
-            return Err(error.into());
-        }
-    }
+    state::remove_storage(&storage_dir)?;
+    let accountsdb_dir = state::accountsdb_dir(&storage_dir);
     let log = dir.join(format!("er-{}.log", options.label));
     let identity_pubkey = er_identity.pubkey();
     let role = if allowed_followers.is_empty() {
@@ -351,6 +344,7 @@ async fn launch(
         metrics_port,
         replication_port,
         storage_dir,
+        accountsdb_dir,
         env: options.env,
         reset: true,
         allowed_followers,
@@ -376,6 +370,8 @@ async fn launch(
         replication_port: Some(replication_port),
         upstream: None,
         storage_dir: plan.storage_dir.display().to_string(),
+        accountsdb_dir: state::split_accountsdb_dir(&plan.storage_dir)
+            .map(|dir| dir.display().to_string()),
         log: log.display().to_string(),
         config: None,
         pid,

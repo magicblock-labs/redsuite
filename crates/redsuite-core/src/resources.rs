@@ -24,6 +24,8 @@ pub struct LaunchRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream: Option<String>,
     pub storage_dir: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accountsdb_dir: Option<String>,
     pub log: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config: Option<String>,
@@ -136,20 +138,19 @@ impl Resources {
                 topology::kill_pid(pid);
                 record.mark_finished();
             }
-            let storage_dir = std::path::Path::new(&launch.storage_dir);
-            let removed = match std::fs::remove_dir_all(storage_dir) {
-                Ok(()) => true,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    false
+            let mut removed = false;
+            for dir in std::iter::once(&launch.storage_dir)
+                .chain(launch.accountsdb_dir.iter())
+            {
+                match std::fs::remove_dir_all(dir) {
+                    Ok(()) => removed = true,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => record.record_finish_error(format!(
+                        "reclaiming storage {dir}: {error}"
+                    )),
                 }
-                Err(error) => {
-                    record.record_finish_error(format!(
-                        "reclaiming storage {}: {error}",
-                        launch.storage_dir
-                    ));
-                    false
-                }
-            };
+            }
             if killed || removed {
                 reclaimed.push(Reclaimed {
                     label: record.label.clone(),
@@ -251,6 +252,7 @@ mod tests {
             replication_port: None,
             upstream: Some("127.0.0.1:7802".to_owned()),
             storage_dir: "/x/storage".to_owned(),
+            accountsdb_dir: None,
             log: "/x/verifier.log".to_owned(),
             config: Some("/x/storage/verifier.toml".to_owned()),
             pid,

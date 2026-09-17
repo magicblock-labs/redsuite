@@ -106,8 +106,15 @@ pub fn down() -> Result<()> {
 }
 
 pub fn wipe_storage() -> Result<Vec<PathBuf>> {
-    let dir = state::stack_dir();
-    let Ok(entries) = fs::read_dir(&dir) else {
+    let mut removed = sweep(&state::stack_dir())?;
+    if let Some(root) = state::accountsdb_root() {
+        removed.extend(sweep(&root)?);
+    }
+    Ok(removed)
+}
+
+fn sweep(dir: &std::path::Path) -> Result<Vec<PathBuf>> {
+    let Ok(entries) = fs::read_dir(dir) else {
         return Ok(Vec::new());
     };
     let mut removed = Vec::new();
