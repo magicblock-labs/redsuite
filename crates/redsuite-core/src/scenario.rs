@@ -290,6 +290,23 @@ where
     // audit and the persisted report instead of aborting sibling scenarios
     let outcome = AssertUnwindSafe(body(provisioned)).catch_unwind().await;
     let wall_seconds = started.elapsed().as_secs_f64();
+    for reclaimed in resources.reclaim() {
+        let stopped = if reclaimed.killed { "stopped" } else { "" };
+        let removed = if reclaimed.removed {
+            format!("removed {}", reclaimed.storage_dir)
+        } else {
+            String::new()
+        };
+        let joiner = if reclaimed.killed && reclaimed.removed {
+            ", "
+        } else {
+            ""
+        };
+        console::line(format_args!(
+            "{}: reclaimed private ER `{}`: {stopped}{joiner}{removed}",
+            record.name, reclaimed.label
+        ));
+    }
     let teardown_errors = resources.audit();
     record.launches = resources.launches();
     record.wall_seconds = Some(wall_seconds);

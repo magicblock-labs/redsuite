@@ -5,7 +5,7 @@ use redsuite_core::{
     catalog::{Lane, ScenarioEntry},
     console, frontend,
     profile::{self, ExecutionConfig, LoopMode, Profile},
-    Result, RunRecord,
+    topology, Result, RunRecord,
 };
 
 const FAMILIES: &[&[ScenarioEntry]] = &[
@@ -25,6 +25,8 @@ usage:
   redsuite run <scenario|family|all> [opts]               run scenarios (benchmarks last, alone)
       --profile <lite|full|soak|deep>                     scenario profile (default lite)
       --loop <open|closed>                                S1 loop mode
+      --serial                                            one scenario at a time, then stack down
+      --keep-storage                                      with --serial: leave the stack and its storage up
 ";
 
 fn usage() -> ! {
@@ -73,8 +75,21 @@ async fn run(args: &[String]) -> Result<()> {
     let Some(target) = args.first() else { usage() };
 
     let mut config = ExecutionConfig::from_env()?;
+    let mut serial = false;
+    let mut keep_storage = false;
     let mut options = args[1..].iter();
     while let Some(flag) = options.next() {
+        match flag.as_str() {
+            "--serial" => {
+                serial = true;
+                continue;
+            }
+            "--keep-storage" => {
+                keep_storage = true;
+                continue;
+            }
+            _ => {}
+        }
         let value = options.next().unwrap_or_else(|| usage());
         match flag.as_str() {
             "--profile" => {
@@ -131,6 +146,23 @@ async fn run(args: &[String]) -> Result<()> {
         .partition(|entry| entry.lane() == Lane::PrivateEr);
 
     let mut records = Vec::new();
+    if serial {
+        console::debug(format_args!(
+            "running {} shared-stack, {} private-ER and {} benchmark \
+             scenarios one at a time",
+            shared.len(),
+            private_er.len(),
+            benchmarks.len()
+        ));
+        records.append(&mut run_lane(shared, 1, config).await);
+        records.append(&mut run_lane(private_er, 1, config).await);
+        records.append(&mut run_lane(benchmarks, 1, config).await);
+        let outcome = summarize(&records, total_scenarios);
+        if !keep_storage {
+            topology::down()?;
+        }
+        return outcome;
+    }
     if !shared.is_empty() || !private_er.is_empty() {
         console::debug(format_args!(
             "running {} shared-stack and {} private-ER scenarios in parallel",
@@ -156,6 +188,10 @@ async fn run(args: &[String]) -> Result<()> {
         records.append(&mut run_lane(benchmarks, 1, config).await);
     }
 
+    summarize(&records, total_scenarios)
+}
+
+fn summarize(records: &[RunRecord], total_scenarios: usize) -> Result<()> {
     let failed: Vec<&RunRecord> =
         records.iter().filter(|record| !record.passed()).collect();
     if !failed.is_empty() {

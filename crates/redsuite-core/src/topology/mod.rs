@@ -23,4 +23,6 @@ pub use shared::{base_only, running_base_programs, shared};
 pub use state::{
     current_state, stack_dir, workspace_root, StackState, ROOT_ENV,
 };
-pub use status::{down, status};
+pub use status::{down, status, wipe_storage};
+
+pub(crate) use process::kill_pid;

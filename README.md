@@ -87,8 +87,9 @@ benchmark hosts use — no cargo, no checkout of the tests:
     redsuite run redline/high_cu              # one scenario (short names work too)
     redsuite run redline --profile full       # a whole family
     redsuite run all                          # everything (redline last, alone)
+    redsuite run all --serial                 # one at a time, storage wiped at the end
     redsuite stack status                     # ports, pids, health
-    redsuite stack down                       # stop the shared stack
+    redsuite stack down                       # stop the shared stack and delete its storage
     redsuite report compare                   # diff the latest run against its nearest baseline
 
 It still needs `solana-test-validator` on PATH and the ER binary under test
@@ -98,6 +99,18 @@ workspace. Set `REDSUITE_ROOT` when it runs outside a checkout.
 `run all` uses three lanes: every shared-stack scenario at once, at most two
 private-ER scenarios beside them, then the redline family last and alone.
 Benchmarks must never share the box, so keep that last lane exclusive.
+
+Every ER preallocates its storage in multi-gigabyte steps, so a full parallel
+run needs room for about five validators at once. `--serial` trades wall
+time for disk: it runs the shared-stack scenarios one at a time, then the
+private-ER scenarios one at a time, then the benchmarks, so at most the
+shared ER and one scenario-owned topology exist together. When the run ends
+it performs `stack down`, which stops every process it started and deletes
+the base ledger, the shared ER storage and every private ER directory under
+`target/redsuite-stack/` (logs stay). `--keep-storage` skips that final
+teardown. Independently of the mode, a scenario that fails before stopping
+its private ERs has them stopped and their storage removed by the harness;
+the run log names what was reclaimed.
 
 ## Running
 
