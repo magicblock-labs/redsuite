@@ -28,6 +28,7 @@ pub struct StackState {
 }
 
 pub const ROOT_ENV: &str = "REDSUITE_ROOT";
+pub const STACK_DIR_ENV: &str = "REDSUITE_STACK_DIR";
 pub const ACCOUNTSDB_ROOT_ENV: &str = "REDSUITE_ACCOUNTSDB_DIR";
 
 pub fn workspace_root() -> PathBuf {
@@ -44,7 +45,10 @@ pub fn workspace_root() -> PathBuf {
 }
 
 pub fn stack_dir() -> PathBuf {
-    workspace_root().join("target/redsuite-stack")
+    match std::env::var_os(STACK_DIR_ENV) {
+        Some(dir) => PathBuf::from(dir),
+        None => workspace_root().join("target/redsuite-stack"),
+    }
 }
 
 pub fn accountsdb_root() -> Option<PathBuf> {

@@ -92,12 +92,12 @@ pub fn down() -> Result<()> {
     if wiped.is_empty() {
         println!("stack down");
     } else {
+        let stack_dir = state::stack_dir();
         let names: Vec<String> = wiped
             .iter()
-            .map(|path| {
-                path.file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| path.display().to_string())
+            .map(|path| match path.strip_prefix(&stack_dir) {
+                Ok(name) => name.display().to_string(),
+                Err(_) => path.display().to_string(),
             })
             .collect();
         println!("stack down, removed {}", names.join(", "));

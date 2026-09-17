@@ -22,7 +22,7 @@ pub use replicated::{
 pub use shared::{base_only, running_base_programs, shared, stop_shared_er};
 pub use state::{
     accountsdb_root, current_state, stack_dir, workspace_root, StackState,
-    ACCOUNTSDB_ROOT_ENV, ROOT_ENV,
+    ACCOUNTSDB_ROOT_ENV, ROOT_ENV, STACK_DIR_ENV,
 };
 pub use status::{down, status, wipe_storage};
 

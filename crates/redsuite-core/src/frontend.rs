@@ -15,6 +15,11 @@ pub const ENV_VARS: &[(&str, &str)] = &[
         "workspace root, when the binary runs outside the checkout",
     ),
     (
+        topology::STACK_DIR_ENV,
+        "where the stack lives: ledgers, state, logs (default \
+         target/redsuite-stack under the workspace root)",
+    ),
+    (
         topology::ACCOUNTSDB_ROOT_ENV,
         "root for every validator's accountsdb, when it should live on \
          another disk than the ledger (default: inside each storage dir)",
