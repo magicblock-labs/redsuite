@@ -120,6 +120,7 @@ pub struct Reclaimed {
     pub label: String,
     pub storage_dir: String,
     pub killed: bool,
+    pub removed: bool,
 }
 
 impl Resources {
@@ -154,6 +155,7 @@ impl Resources {
                     label: record.label.clone(),
                     storage_dir: launch.storage_dir.clone(),
                     killed,
+                    removed,
                 });
             }
         }
