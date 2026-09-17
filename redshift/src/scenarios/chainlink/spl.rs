@@ -209,6 +209,29 @@ pub(crate) fn deposit_spl_tokens(
     }
 }
 
+pub(crate) fn withdraw_spl_tokens(
+    user: &Pubkey,
+    mint: &Pubkey,
+    amount: u64,
+) -> Instruction {
+    let vault = derive_global_vault(mint);
+    let mut data = vec![3u8];
+    data.extend_from_slice(&amount.to_le_bytes());
+    Instruction {
+        program_id: eata_program(),
+        accounts: vec![
+            AccountMeta::new_readonly(*user, true),
+            AccountMeta::new(derive_eata(user, mint), false),
+            AccountMeta::new_readonly(vault, false),
+            AccountMeta::new_readonly(*mint, false),
+            AccountMeta::new(derive_ata(&vault, mint), false),
+            AccountMeta::new(derive_ata(user, mint), false),
+            AccountMeta::new_readonly(token_program(), false),
+        ],
+        data,
+    }
+}
+
 pub(crate) fn delegate_eata(
     payer: &Pubkey,
     user: &Pubkey,

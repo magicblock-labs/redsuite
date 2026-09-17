@@ -258,6 +258,11 @@ pub mod redshift {
             resources: [Resource::Er],
             fixtures: [],
         },
+        projected_token_lifecycle => chainlink::projected_token_lifecycle::ProjectedTokenLifecycle {
+            topology: PrivateEr,
+            resources: [Resource::Er],
+            fixtures: [Fixture::RedlineProgram],
+        },
         aml_gate => chainlink::aml_gate::AmlGate {
             topology: PrivateEr,
             resources: [Resource::Er],

@@ -148,7 +148,8 @@ private ERs. `task_scheduler`, `config_gates`, `aml_gate`,
 `activation_single_shot`, `ledger_retention`, `snapshot_read_race`,
 `commit_blackout`, `commit_exactly_once`,
 `commit_settlement_order`, `undelegation_recovery`,
-`delegation_session_isolation`, `verifier_lifecycle`, and `replication_recovery`
+`delegation_session_isolation`, `projected_token_lifecycle`,
+`verifier_lifecycle`, and `replication_recovery`
 run on
 one instead of the shared ER (the last two boot their private ER as a leader
 with two verifiers replicating from it); `restart_under_load`,
@@ -396,6 +397,10 @@ chainlink (account cloning):
 - `post_delegation_token_transfer` — attaches an SPL transfer to a delegation,
   so the validator runs that transfer the moment the account lands on
   the ER. It also checks the projection that makes this work.
+- `projected_token_lifecycle` — transfers between projected ATAs, loses commit
+  confirmation after base execution, then recovers, undelegates, withdraws,
+  and redelegates. Checks exact eATA settlement and token conservation at
+  every step, with unbacked and foreign-validator transfer controls.
 - `aml_gate` — screens the owner of an incoming token account against a risk
   API before the tokens are merged. An owner scored above the threshold never
   gets a merge: no transaction goes near the destination, and the account is

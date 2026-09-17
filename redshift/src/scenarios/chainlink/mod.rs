@@ -7,5 +7,6 @@ pub mod loader_matrix;
 pub mod multi_program_clone;
 pub mod parallel_cloning;
 pub mod post_delegation_token_transfer;
+pub mod projected_token_lifecycle;
 
 pub(crate) mod spl;
