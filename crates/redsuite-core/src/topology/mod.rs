@@ -19,7 +19,7 @@ pub use replicated::{
     replicated, ReplicatedOptions, ReplicatedTopology, Verifier, VerifierStop,
     VerifierTiming,
 };
-pub use shared::{base_only, running_base_programs, shared};
+pub use shared::{base_only, running_base_programs, shared, stop_shared_er};
 pub use state::{
     current_state, stack_dir, workspace_root, StackState, ROOT_ENV,
 };

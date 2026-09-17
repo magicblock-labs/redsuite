@@ -29,6 +29,27 @@ pub fn running_base_programs() -> Option<Vec<String>> {
         .then_some(state.base_programs)
 }
 
+pub async fn stop_shared_er() -> Result<bool> {
+    let dir = state::stack_dir();
+    let _lock = state::acquire_lock(dir.join("lock")).await?;
+    let Some(state) = state::read_state() else {
+        return Ok(false);
+    };
+    if state.er_pid == 0 {
+        return Ok(false);
+    }
+    process::kill_matching(&[(state.er_pid, state.er_bin.as_str())]);
+    let _ = fs::remove_dir_all(dir.join("er-storage"));
+    state::write_state(&StackState {
+        er_rpc_port: 0,
+        er_ws_port: 0,
+        er_metrics_port: 0,
+        er_pid: 0,
+        ..state
+    })?;
+    Ok(true)
+}
+
 pub async fn base_only(config: ExecutionConfig) -> Result<BaseCtx> {
     let dir = state::stack_dir();
     fs::create_dir_all(&dir)?;

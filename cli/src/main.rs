@@ -2,7 +2,7 @@ mod catalog;
 
 use futures_util::StreamExt;
 use redsuite_core::{
-    catalog::{Lane, ScenarioEntry},
+    catalog::{Lane, ScenarioEntry, Topology},
     console, frontend,
     profile::{self, ExecutionConfig, LoopMode, Profile},
     topology, Result, RunRecord,
@@ -147,16 +147,27 @@ async fn run(args: &[String]) -> Result<()> {
 
     let mut records = Vec::new();
     if serial {
+        let (private_benchmarks, shared_benchmarks): (Vec<_>, Vec<_>) =
+            benchmarks
+                .into_iter()
+                .partition(|entry| entry.topology == Topology::PrivateEr);
+        let mut on_shared_er = shared;
+        on_shared_er.extend(shared_benchmarks);
+        let mut on_private_er = private_er;
+        on_private_er.extend(private_benchmarks);
         console::debug(format_args!(
-            "running {} shared-stack, {} private-ER and {} benchmark \
-             scenarios one at a time",
-            shared.len(),
-            private_er.len(),
-            benchmarks.len()
+            "running {} shared-ER scenarios, then {} private-ER scenarios, \
+             one at a time",
+            on_shared_er.len(),
+            on_private_er.len()
         ));
-        records.append(&mut run_lane(shared, 1, config).await);
-        records.append(&mut run_lane(private_er, 1, config).await);
-        records.append(&mut run_lane(benchmarks, 1, config).await);
+        records.append(&mut run_lane(on_shared_er, 1, config).await);
+        if !on_private_er.is_empty() && topology::stop_shared_er().await? {
+            console::line(format_args!(
+                "stopped the shared ER before the private-ER scenarios"
+            ));
+        }
+        records.append(&mut run_lane(on_private_er, 1, config).await);
         let outcome = summarize(&records, total_scenarios);
         if !keep_storage {
             topology::down()?;

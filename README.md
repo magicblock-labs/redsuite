@@ -102,11 +102,14 @@ Benchmarks must never share the box, so keep that last lane exclusive.
 
 Every ER preallocates its storage in multi-gigabyte steps, so a full parallel
 run needs room for about five validators at once. `--serial` trades wall
-time for disk: it runs the shared-stack scenarios one at a time, then the
-private-ER scenarios one at a time, then the benchmarks, so at most the
-shared ER and one scenario-owned topology exist together. When the run ends
-it performs `stack down`, which stops every process it started and deletes
-the base ledger, the shared ER storage and every private ER directory under
+time for disk: it runs every scenario that uses the shared ER one at a
+time, benchmarks included, then stops the shared ER and removes its storage,
+then runs the private-ER scenarios one at a time against the remaining
+base. Apart from the scenarios that boot several validators by design (a
+second ER, a leader with verifiers, or a private ER beside the shared one),
+only one ER exists at any moment. When the run ends it performs `stack
+down`, which stops every process it started and deletes the base ledger,
+the shared ER storage and every private ER directory under
 `target/redsuite-stack/` (logs stay). `--keep-storage` skips that final
 teardown. Independently of the mode, a scenario that fails before stopping
 its private ERs has them stopped and their storage removed by the harness;

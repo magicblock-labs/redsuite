@@ -89,12 +89,18 @@ pub fn down() -> Result<()> {
         process::kill_pid(pid);
     }
     let wiped = wipe_storage()?;
-    match wiped.len() {
-        0 => println!("stack down"),
-        count => println!(
-            "stack down, {count} storage director{} removed",
-            if count == 1 { "y" } else { "ies" }
-        ),
+    if wiped.is_empty() {
+        println!("stack down");
+    } else {
+        let names: Vec<String> = wiped
+            .iter()
+            .map(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string())
+            })
+            .collect();
+        println!("stack down, removed {}", names.join(", "));
     }
     Ok(())
 }
