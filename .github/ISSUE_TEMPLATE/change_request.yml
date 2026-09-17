@@ -27,6 +27,6 @@ body:
     id: scope
     attributes:
       label: Scope
-      description: What should change, and what should remain unchanged?
+      description: Add boundaries or implementation scope when known and not already clear from the goal.
     validations:
-      required: true
+      required: false
