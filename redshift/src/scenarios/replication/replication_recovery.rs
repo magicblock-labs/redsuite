@@ -18,6 +18,7 @@ use redsuite_core::{
     BaseCtx, ChainCtx, CheckError, PrivateErScenario, Result, ScenarioReport,
     TxSender,
 };
+use signature::Signature;
 use signer::Signer;
 
 use crate::program::{instruction::build, layout, utils::fold_hash};
@@ -32,6 +33,7 @@ const CU_LIMIT: u32 = 1_400_000;
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(90);
 const CATCH_UP_TIMEOUT: Duration = Duration::from_secs(120);
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(120);
 const RETENTION_TIMEOUT: Duration = Duration::from_secs(180);
 const CLONE_TIMEOUT: Duration = Duration::from_secs(60);
 const SEAL_TIMEOUT: Duration = Duration::from_secs(60);
@@ -136,6 +138,7 @@ struct Pair {
     senders: Vec<TxSender>,
     model: PairModel,
     chains: u64,
+    last_signature: Option<Signature>,
 }
 
 impl Pair {
@@ -198,7 +201,7 @@ impl Workload {
                                 if step == heavy { heavy_iters } else { 0 };
                             let ixs =
                                 chain_ixs(id, iters, &pair.accounts(step));
-                            pair.senders[step.index()]
+                            let signature = pair.senders[step.index()]
                                 .submit(&ixs)
                                 .await
                                 .map_err(|error| {
@@ -207,6 +210,7 @@ impl Workload {
                                          not accepted by the leader: {error}"
                                     )
                                 })?;
+                            pair.last_signature = Some(signature);
                             pair.model.apply(step, id, iters);
                             sent.set(sent.get() + 1);
                         }
@@ -224,16 +228,49 @@ impl Workload {
         self.sent.get()
     }
 
-    async fn stop(self) -> Result<Vec<Pair>> {
+    async fn stop(
+        mut self,
+        topology: &ReplicatedTopology,
+    ) -> Result<(Vec<Pair>, u64)> {
         self.stop.set(true);
-        let mut pairs = Vec::with_capacity(self.tasks.len());
+        let stopped = tokio::time::timeout(DRAIN_TIMEOUT, async {
+            let mut pairs = Vec::with_capacity(self.tasks.len());
+            for task in &mut self.tasks {
+                let pair = task
+                    .await
+                    .map_err(|error| format!("workload task: {error}"))??;
+                if let Some(signature) = pair.last_signature {
+                    let tx = topology
+                        .leader()
+                        .ctx()
+                        .api()
+                        .await_transaction(&signature, DRAIN_TIMEOUT)
+                        .await?;
+                    check!(
+                        tx.err.is_none(),
+                        "final transaction {signature} failed: {:?}",
+                        tx.err
+                    )?;
+                }
+                pairs.push(pair);
+            }
+            await_leader_advance(
+                topology,
+                BLOCKS,
+                1.0,
+                "ledger metrics after the workload drains",
+            )
+            .await?;
+            Ok((pairs, self.sent()))
+        })
+        .await;
+        // On timeout or a producer error, don't leave detached producers behind.
         for task in self.tasks {
-            pairs.push(
-                task.await
-                    .map_err(|error| format!("workload task: {error}"))??,
-            );
+            task.abort();
         }
-        Ok(pairs)
+        stopped.map_err(|_| {
+            format!("workload did not drain within {DRAIN_TIMEOUT:?}")
+        })?
     }
 }
 
@@ -508,6 +545,7 @@ async fn prepare_pairs(
             senders,
             model: PairModel::default(),
             chains: 0,
+            last_signature: None,
         });
     }
     for payer in &payers {
@@ -777,8 +815,7 @@ impl PrivateErScenario for ReplicationRecovery {
             None
         };
 
-        let chain_txs = workload.sent();
-        let pairs = workload.stop().await?;
+        let (pairs, chain_txs) = workload.stop(&topology).await?;
         let final_txs = leader_metric(&topology, TRANSACTIONS).await?;
         await_leader_advance(
             &topology,
