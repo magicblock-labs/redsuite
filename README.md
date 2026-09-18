@@ -149,6 +149,9 @@ private ERs. `task_scheduler`, `config_gates`, `aml_gate`,
 `commit_blackout`, `commit_exactly_once`,
 `commit_settlement_order`, `undelegation_recovery`,
 `delegation_session_isolation`, `projected_token_lifecycle`,
+`transaction_retry_cold_fetch`, `transaction_retry_success`,
+`transaction_retry_failure`, `transaction_retry_subscriptions`,
+`transaction_retry_expiry_restart`,
 `verifier_lifecycle`, and `replication_recovery`
 run on
 one instead of the shared ER (the last two boot their private ER as a leader
@@ -158,6 +161,7 @@ with two verifiers replicating from it); `restart_under_load`,
 `superblock_boundary_latency` boot theirs beside the shared stack. Each takes
 its own identity from a 32-slot pool minted at genesis, so private ERs never
 collide with the shared one or each other.
+The five retry cases share their implementation in `transaction_retries`.
 
 The harness needs two binaries, and a third for replicated topologies:
 
@@ -528,6 +532,14 @@ committor (ER → base commits):
 
 aperture (JSON-RPC surface):
 
+- `transaction_retry_cold_fetch`, `transaction_retry_success`,
+  `transaction_retry_failure`, `transaction_retry_subscriptions`, and
+  `transaction_retry_expiry_restart` — reuse identical signed bytes across
+  fetch failures, concurrent submissions, expiry, and same-storage restart.
+  Check exact counter effects, rollback, payer fees, ledger occurrences, and
+  signature notifications registered before, during, and after submission.
+  Accepted submissions drain through block publication before assertions;
+  the current ER execution fee is zero.
 - `rpc_lifecycle` — drives one execution through every read that describes
   it, using the official `solana-rpc-client`. Prepares 256 delegated
   accounts, submits 256 uniquely signed writes concurrently and unpaced under
