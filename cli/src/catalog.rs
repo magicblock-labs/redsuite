@@ -195,6 +195,31 @@ pub mod redshift {
             resources: [Resource::Er],
             fixtures: [Fixture::RedlineProgram],
         },
+        transaction_retry_cold_fetch => aperture::transaction_retries::TransactionRetries::ColdFetch {
+            topology: PrivateEr,
+            resources: [Resource::Er],
+            fixtures: [Fixture::RedshiftProgram],
+        },
+        transaction_retry_success => aperture::transaction_retries::TransactionRetries::ConcurrentSuccess {
+            topology: PrivateEr,
+            resources: [Resource::Er],
+            fixtures: [Fixture::RedshiftProgram],
+        },
+        transaction_retry_failure => aperture::transaction_retries::TransactionRetries::ConcurrentFailure {
+            topology: PrivateEr,
+            resources: [Resource::Er],
+            fixtures: [Fixture::RedshiftProgram],
+        },
+        transaction_retry_subscriptions => aperture::transaction_retries::TransactionRetries::Subscriptions {
+            topology: PrivateEr,
+            resources: [Resource::Er],
+            fixtures: [Fixture::RedshiftProgram, Fixture::RedlineProgram],
+        },
+        transaction_retry_expiry_restart => aperture::transaction_retries::TransactionRetries::ExpiryRestart {
+            topology: PrivateEr,
+            resources: [Resource::Er],
+            fixtures: [Fixture::RedshiftProgram],
+        },
         rpc_lifecycle => aperture::rpc_lifecycle::RpcLifecycle {
             topology: Shared,
             resources: [Resource::Er],
