@@ -538,6 +538,8 @@ aperture (JSON-RPC surface):
   fetch failures, concurrent submissions, expiry, and same-storage restart.
   Check exact counter effects, rollback, payer fees, ledger occurrences, and
   signature notifications registered before, during, and after submission.
+  The subscription case queues conflicting readers and requires registrations
+  acknowledged after submission but before terminal status for both outcomes.
   Accepted submissions drain through block publication before assertions;
   the current ER execution fee is zero.
 - `rpc_lifecycle` — drives one execution through every read that describes

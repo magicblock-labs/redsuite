@@ -4,9 +4,10 @@ use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use futures_util::future::join_all;
 use hash::Hash;
-use instruction::AccountMeta;
+use instruction::{AccountMeta, Instruction};
 use keypair::Keypair;
 use pubkey::Pubkey;
+use redline_interface::instruction::build as load;
 use redshift_interface::flexi::{build, FlexiCounter};
 use redsuite_core::{
     api::RpcError,
@@ -163,10 +164,60 @@ async fn subscribe(er: &ErCtx, tx: &Signed) -> Result<(RawWs, u64)> {
     Ok((ws, id))
 }
 
-async fn execute(er: &ErCtx, tx: &Signed, copies: usize) -> Result<()> {
+async fn queue_readers(
+    er: &ErCtx,
+    payer: &Keypair,
+    counter: Pubkey,
+    round: u8,
+) -> Result<()> {
+    let blockhash = er.api().get_latest_blockhash().await?;
+    let mut data = vec![2];
+    data.extend_from_slice(&1_400_000u32.to_le_bytes());
+    let budget = Instruction {
+        program_id: sdk_ids::compute_budget::ID,
+        accounts: Vec::new(),
+        data,
+    };
+    let transactions: Vec<_> = (0..32u64 << ((round - 1) / 2))
+        .map(|id| {
+            Transaction::new_signed_with_payer(
+                &[
+                    budget.clone(),
+                    load::read_accounts_data(id, &[counter]),
+                    load::expensive_hash_compute(
+                        u64::from(round) * 256 + id,
+                        counter,
+                        180,
+                        &[],
+                    ),
+                ],
+                Some(&payer.pubkey()),
+                &[payer],
+                blockhash,
+            )
+        })
+        .collect();
+    for result in
+        join_all(transactions.iter().map(|tx| er.api().send_transaction(tx)))
+            .await
+    {
+        result?;
+    }
+    Ok(())
+}
+
+async fn execute(
+    er: &ErCtx,
+    tx: &Signed,
+    copies: usize,
+    queued: Option<(&Keypair, Pubkey, u8)>,
+) -> Result<bool> {
     let mut listeners = Vec::new();
     for _ in 0..2 {
         listeners.push(subscribe(er, tx).await?);
+    }
+    if let Some((payer, counter, round)) = queued {
+        queue_readers(er, payer, counter, round).await?;
     }
     let (sent, racing) = tokio::join!(
         tx.copies(er, copies),
@@ -176,6 +227,15 @@ async fn execute(er: &ErCtx, tx: &Signed, copies: usize) -> Result<()> {
     for listener in racing {
         listeners.push(listener?);
     }
+    let pending = if queued.is_some() {
+        listeners.push(subscribe(er, tx).await?);
+        er.api()
+            .get_signature_status(&tx.signature)
+            .await?
+            .is_none()
+    } else {
+        false
+    };
     tx.outcome(er).await?;
     listeners.push(subscribe(er, tx).await?);
     for (index, (mut ws, id)) in listeners.into_iter().enumerate() {
@@ -198,7 +258,7 @@ async fn execute(er: &ErCtx, tx: &Signed, copies: usize) -> Result<()> {
         )?;
         ws.close().await?;
     }
-    Ok(())
+    Ok(pending)
 }
 
 async fn audit(
@@ -287,6 +347,19 @@ impl PrivateErScenario for TransactionRetries {
             crate::PAYER_LAMPORTS,
         )
         .await?;
+        let load_payer = if matches!(self, Self::Subscriptions) {
+            Some(
+                prep::delegated_payer(
+                    base,
+                    &owner,
+                    er.identity(),
+                    crate::PAYER_LAMPORTS,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
         let owner = owner.pubkey();
         let keys = [payer.pubkey(), counter];
         let mut expected =
@@ -362,6 +435,7 @@ impl PrivateErScenario for TransactionRetries {
             Self::ConcurrentSuccess
             | Self::ConcurrentFailure
             | Self::Subscriptions => {
+                let mut pending_results = [false; 2];
                 for round in 1..=8 {
                     let fail = matches!(self, Self::ConcurrentFailure)
                         || matches!(self, Self::Subscriptions)
@@ -373,7 +447,16 @@ impl PrivateErScenario for TransactionRetries {
                     };
                     let tx = Signed::new(er, &payer, owner, round, fail, None)
                         .await?;
-                    let notifications = execute(er, &tx, copies).await;
+                    let notifications = execute(
+                        er,
+                        &tx,
+                        copies,
+                        load_payer
+                            .as_ref()
+                            .filter(|_| !pending_results[usize::from(fail)])
+                            .map(|payer| (payer, counter, round)),
+                    )
+                    .await;
                     start = audit(er, start, &[(&tx, 1)]).await?;
                     expected.0 -= tx.fee;
                     if !fail {
@@ -385,11 +468,22 @@ impl PrivateErScenario for TransactionRetries {
                         expected,
                         "round {round}: exact effect and fee"
                     )?;
-                    notifications?;
+                    let pending = notifications?;
+                    pending_results[usize::from(fail)] |= pending;
                     report = report.setting(
                         format!("round_{round}"),
-                        format!("{} fee={} {expected:?}", tx.signature, tx.fee),
+                        format!(
+                            "{} fee={} pending_subscription={pending} {expected:?}",
+                            tx.signature, tx.fee
+                        ),
                     );
+                }
+                if matches!(self, Self::Subscriptions) {
+                    check_eq!(
+                        pending_results,
+                        [true, true],
+                        "subscription acknowledged before terminal status for success and failure"
+                    )?;
                 }
             }
             Self::ExpiryRestart => {

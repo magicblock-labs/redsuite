@@ -213,7 +213,7 @@ pub mod redshift {
         transaction_retry_subscriptions => aperture::transaction_retries::TransactionRetries::Subscriptions {
             topology: PrivateEr,
             resources: [Resource::Er],
-            fixtures: [Fixture::RedshiftProgram],
+            fixtures: [Fixture::RedshiftProgram, Fixture::RedlineProgram],
         },
         transaction_retry_expiry_restart => aperture::transaction_retries::TransactionRetries::ExpiryRestart {
             topology: PrivateEr,
