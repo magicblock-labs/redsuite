@@ -14,6 +14,8 @@ const LEDGER_SIZE_LIMIT_UNREACHABLE: u64 = 1 << 60;
 pub const DLP_ID: &str = "DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh";
 pub const MDP_ID: &str = "DmnRGfyyftzacFb1XadYhWF6vWqXwtQk5tbr6XgR3BA1";
 pub const COMMITTOR_ID: &str = "ComtrB2KEaWgXsW1dhr1xYL4Ht4Bjj3gXnnL6KMdABq";
+pub const HYDRA_EPHEMERAL_ID: &str =
+    "eHyd5BU8QffvHi4GnXwxrK4WpS7pM2x9UGKHBWii7mf";
 // The validator's committor (>= 0.13.7)
 const NOOP_ID: &str = "noopb9bkMVfRPU8AsbpTUg8AQkHtKwMYZiFUjNRtMmV";
 const MEMO_V1_ID: &str = "Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo";
@@ -22,8 +24,14 @@ const TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const ATA_PROGRAM_ID: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 const EATA_PROGRAM_ID: &str = "SPLxh1LVZzEkX99H6rqYizhytLWPZVV296zyYDPagv2";
 
-const CLONED_UPGRADEABLE_PROGRAMS: &[&str] =
-    &[DLP_ID, MDP_ID, NOOP_ID, TOKEN_PROGRAM_ID, EATA_PROGRAM_ID];
+const CLONED_UPGRADEABLE_PROGRAMS: &[&str] = &[
+    DLP_ID,
+    MDP_ID,
+    NOOP_ID,
+    TOKEN_PROGRAM_ID,
+    EATA_PROGRAM_ID,
+    HYDRA_EPHEMERAL_ID,
+];
 const CLONED_LEGACY_PROGRAMS: &[&str] =
     &[MEMO_V1_ID, MEMO_V2_ID, ATA_PROGRAM_ID];
 

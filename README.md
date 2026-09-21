@@ -604,12 +604,22 @@ harness:
 
 scheduler:
 
-- `task_scheduler` — schedules tasks on a private ER and watches the
-  crank work through them: a short repeating task that finishes and clears its
-  row, one cancelled halfway through, one rescheduled by its owner, one that
-  fails until its retries run out, and one that a second authority tries to
-  steal. The counters on the ER and the task database on disk both have to
-  tell the same story.
+- `task_scheduler` — drives the scheduler the way a user does: `ScheduleTask`
+  and `CancelTask` through the flexi fixture on a private ER, nothing else.
+  Since validator PR #1369 the validator keeps each task as an account owned
+  by the ephemeral Hydra scheduler program and no longer executes anything
+  itself, so the scenario observes those accounts generically: schedule creates
+  one, cancel removes it, a cancelled task id can be reused and lands on the
+  same account with the new schedule, another authority's identical task id
+  gets its own account, a signer in the payload is refused, and the validator
+  identity sponsors the account and is refunded on cancel. The scheduler
+  program is cloned from `REDSUITE_CLONE_URL` into the base chain at a cold
+  boot like dlp, and the private ER clones it on first use, so the scenario
+  runs against the deployed bytes and no program binary lives in this repo.
+  Execution by an external cranker is out of scope. Rescheduling an active
+  task in place is not asserted: PR #1369 sends Cancel and Create in one
+  transaction and the ER rejects the Create with "invalid program argument",
+  so that path stays an upstream limitation.
 
 pubsub (websocket subscriptions):
 
@@ -678,7 +688,8 @@ aperture:
 
 ## Base-chain programs & accounts
 
-- dlp, mdp, SPL Token, both ATA programs and memo v1/v2 are cloned from
+- dlp, mdp, SPL Token, both ATA programs, memo v1/v2 and the ephemeral Hydra
+  scheduler program (`eHyd5…`) are cloned from
   `REDSUITE_CLONE_URL` when the base chain starts. dlp keeps its real mainnet
   upgrade authority, so no local key is its admin, and dlp calls that need the
   admin cannot be tested.

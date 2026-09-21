@@ -10,8 +10,8 @@ mod status;
 pub use config::{
     er_bin_path, redline_alias_ids, redline_loader_v3_pair,
     redshift_loader_v3_target, verifier_bin_path, BaseEndpoints, ErOptions,
-    RestartConfig, CLONE_URL_ENV, COMMITTOR_ID, DLP_ID, ER_BIN_ENV, MDP_ID,
-    VERIFIER_BIN_ENV,
+    RestartConfig, CLONE_URL_ENV, COMMITTOR_ID, DLP_ID, ER_BIN_ENV,
+    HYDRA_EPHEMERAL_ID, MDP_ID, VERIFIER_BIN_ENV,
 };
 pub use identity::{er_identity_keypair, identity_for_label};
 pub use private::{private_er, PrivateEr, RestartTiming};

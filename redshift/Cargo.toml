@@ -31,7 +31,6 @@ serde_json = "1"
 solana-account-decoder-client-types = "4.1"
 json = { workspace = true }
 rand = { workspace = true }
-rusqlite = { workspace = true }
 solana-address-lookup-table-interface = { version = "3.0", features = ["bincode", "bytemuck"] }
 sdk = { workspace = true, features = ["spl", "modular-sdk"] }
 
