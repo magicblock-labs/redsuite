@@ -185,6 +185,11 @@ pub mod redshift {
             resources: [Resource::Er],
             fixtures: [Fixture::RedshiftProgram],
         },
+        checkpoint_durability => storage::checkpoint_durability::CheckpointDurability {
+            topology: PrivateEr,
+            resources: [Resource::Er],
+            fixtures: [Fixture::RedshiftProgram],
+        },
         ledger_retention => storage::ledger_retention::LedgerRetention {
             topology: PrivateEr,
             resources: [Resource::Er],
