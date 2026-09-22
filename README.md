@@ -146,7 +146,7 @@ Scenario isolation comes from fresh keypairs, not fresh chains.
 Scenarios that kill a validator, restart one, or need their own config boot
 private ERs. `task_scheduler`, `config_gates`, `aml_gate`,
 `activation_single_shot`, `cache_lifecycle`, `undelegation_reconnect_gap`,
-`ledger_retention`, `snapshot_read_race`,
+`checkpoint_durability`, `ledger_retention`, `snapshot_read_race`,
 `commit_blackout`, `commit_exactly_once`,
 `commit_settlement_order`, `undelegation_recovery`,
 `delegation_session_isolation`, `projected_token_lifecycle`,
@@ -654,8 +654,11 @@ replication (leader + verifiers):
   exactly the leader's transactions, report zero sealed-checksum mismatches,
   and the leader's accounts match the client-side fold model.
 
-storage (ledger retention):
+storage (checkpoint durability and ledger retention):
 
+- `checkpoint_durability` — three SIGKILL restarts check every success and
+  executed failure protected by a completed checkpoint, state rollback and
+  fees, separate tail outcomes, and fresh execution after recovery.
 - `ledger_retention` — boots a private ER with 40-slot superblocks and a
   one-byte ledger size limit, so retention purges the oldest sealed
   superblock at every check. Sends counter adds across superblocks, and at

@@ -288,6 +288,9 @@ mod tests {
             slot: 42,
             block_time: None,
             lookup_tables: 0,
+            fee: 0,
+            pre_balances: Vec::new(),
+            post_balances: Vec::new(),
             err: None,
             logs: vec![
                 format!(
@@ -322,6 +325,9 @@ mod tests {
             slot: 43,
             block_time: None,
             lookup_tables: 0,
+            fee: 0,
+            pre_balances: Vec::new(),
+            post_balances: Vec::new(),
             err: Some(err),
             logs: vec![
                 format!("ScheduledCommitSent payer: {}", pk(1)),
@@ -350,6 +356,9 @@ mod tests {
             slot: 44,
             block_time: None,
             lookup_tables: 0,
+            fee: 0,
+            pre_balances: Vec::new(),
+            post_balances: Vec::new(),
             err: None,
             logs: vec![format!(
                 "Program log: ScheduledCommitSent included: [{}]",

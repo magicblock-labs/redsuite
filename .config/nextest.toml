@@ -23,5 +23,5 @@ filter = "test(catalog::redline::)"
 test-group = "benchmarks"
 
 [[profile.default.overrides]]
-filter = "test(aml_gate) or test(activation_single_shot) or test(cache_lifecycle) or test(undelegation_reconnect_gap) or test(config_gates) or test(task_scheduler) or test(ledger_retention) or test(snapshot_read_race) or test(commit_blackout) or test(commit_exactly_once) or test(commit_settlement_order) or test(undelegation_recovery) or test(delegation_session_isolation) or test(verifier_lifecycle) or test(replication_recovery) or test(projected_token_lifecycle) or test(transaction_retry_)"
+filter = "test(aml_gate) or test(activation_single_shot) or test(cache_lifecycle) or test(undelegation_reconnect_gap) or test(config_gates) or test(task_scheduler) or test(checkpoint_durability) or test(ledger_retention) or test(snapshot_read_race) or test(commit_blackout) or test(commit_exactly_once) or test(commit_settlement_order) or test(undelegation_recovery) or test(delegation_session_isolation) or test(verifier_lifecycle) or test(replication_recovery) or test(projected_token_lifecycle) or test(transaction_retry_)"
 test-group = "private-er"
