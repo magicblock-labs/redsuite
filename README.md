@@ -145,7 +145,8 @@ flock, `genesis-accounts/`, logs, ledgers).
 Scenario isolation comes from fresh keypairs, not fresh chains.
 Scenarios that kill a validator, restart one, or need their own config boot
 private ERs. `task_scheduler`, `config_gates`, `aml_gate`,
-`activation_single_shot`, `ledger_retention`, `snapshot_read_race`,
+`activation_single_shot`, `cache_lifecycle`, `undelegation_reconnect_gap`,
+`ledger_retention`, `snapshot_read_race`,
 `commit_blackout`, `commit_exactly_once`,
 `commit_settlement_order`, `undelegation_recovery`,
 `delegation_session_isolation`, `projected_token_lifecycle`,
@@ -388,6 +389,12 @@ chainlink (account cloning):
 - `parallel_cloning` — funds ten wallets on base and then reads all ten for
   the first time at once, through five overlapping requests. The validator is
   cloning ten accounts it has never seen.
+- `cache_lifecycle` — combines eviction, reconnecting subscriptions, delayed
+  stale observations, and continuous ER writes; protects delegated and
+  undelegating state, refreshes base reads, and discovers undelegation completion.
+- `undelegation_reconnect_gap` — shares the `cache_lifecycle` implementation,
+  with one churn cycle followed by a reconnect immediately before undelegation
+  settles, and checks how quickly the ER observes completion.
 - `multi_program_clone` — sends one transaction that calls two programs the ER
   has never seen. The validator has to fetch both program accounts and both of
   their program-data accounts together before it can execute anything

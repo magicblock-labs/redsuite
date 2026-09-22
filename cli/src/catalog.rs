@@ -125,6 +125,16 @@ pub mod redshift {
             resources: [Resource::Er],
             fixtures: [Fixture::RedlineProgram],
         },
+        cache_lifecycle => chainlink::cache_lifecycle::CacheLifecycle::Churn {
+            topology: PrivateEr,
+            resources: [Resource::Er],
+            fixtures: [Fixture::RedlineProgram],
+        },
+        undelegation_reconnect_gap => chainlink::cache_lifecycle::CacheLifecycle::UndelegationReconnectGap {
+            topology: PrivateEr,
+            resources: [Resource::Er],
+            fixtures: [Fixture::RedlineProgram],
+        },
         commit_blackout => committor::commit_blackout::CommitBlackout {
             topology: PrivateEr,
             resources: [Resource::Er],
