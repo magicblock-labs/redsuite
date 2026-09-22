@@ -19,8 +19,12 @@ use crate::program::{self, instruction::build, layout::*, utils::fold_hash};
 
 const TIMEOUT: Duration = Duration::from_secs(20);
 const EVICTIONS: &str = "engine_keeper_account_cache_evictions";
+const RECOVERY_OBSERVATION: Duration = Duration::from_secs(100);
 
-pub struct CacheLifecycle;
+pub enum CacheLifecycle {
+    Churn,
+    UndelegationReconnectGap,
+}
 
 fn id(account: Option<Account>) -> Option<u64> {
     account.and_then(|a| crate::written_id(&a.data))
@@ -48,10 +52,21 @@ async fn value(er: &ErCtx, keys: &[Pubkey], expected: u64) -> Result<()> {
 #[async_trait(?Send)]
 impl PrivateErScenario for CacheLifecycle {
     fn name(&self) -> &str {
-        "redshift/cache_lifecycle"
+        match self {
+            Self::Churn => "redshift/cache_lifecycle",
+            Self::UndelegationReconnectGap => {
+                "redshift/undelegation_reconnect_gap"
+            }
+        }
     }
 
     async fn run(&self, base: &BaseCtx) -> Result<ScenarioReport> {
+        let (label, churn_cycles) = match self {
+            Self::Churn => ("cache-lifecycle", 3),
+            Self::UndelegationReconnectGap => ("undelegation-reconnect-gap", 1),
+        };
+        let reconnect_before_settlement =
+            matches!(self, Self::UndelegationReconnectGap);
         let http = BaseProxies::spawn(base).await?;
         let ws = BaseProxies::spawn(base).await?;
         let observe = |method, key: &Pubkey| {
@@ -67,7 +82,7 @@ impl PrivateErScenario for CacheLifecycle {
         let private = topology::private_er(
             base,
             ErOptions {
-                label: "cache-lifecycle".into(),
+                label: label.into(),
                 env: vec![(
                     "MBV_ENGINE__ACCOUNTSDB__LRU_CAPACITY".into(),
                     "256".into(),
@@ -206,7 +221,8 @@ impl PrivateErScenario for CacheLifecycle {
             for held in stale {
                 held.release();
             }
-            for (cycle, &target) in readonly.iter().enumerate() {
+            for (cycle, &target) in readonly[..churn_cycles].iter().enumerate()
+            {
                 for chunk in pool.chunks(32) {
                     er.accounts(chunk).await?;
                 }
@@ -249,6 +265,13 @@ impl PrivateErScenario for CacheLifecycle {
                     "undelegation stayed pending through churn"
                 )?;
             }
+            if reconnect_before_settlement {
+                // Allow settlement as subscriptions are being rebuilt.
+                let resubscribing = ws
+                    .intercept(Selector::method("accountSubscribe").response());
+                ws.close_connections();
+                resubscribing.wait(TIMEOUT).await?.release();
+            }
             completed.set(true);
             settlement.remove();
             check::poll_for("base undelegation", TIMEOUT, || async {
@@ -262,28 +285,79 @@ impl PrivateErScenario for CacheLifecycle {
                 Result::Ok(())
             })
             .await?;
+            let released_at = tokio::time::Instant::now();
             set_base(900, pending).await?;
-            value(er, pending, 900).await?;
+            let recovery = if reconnect_before_settlement {
+                // Observe late recovery for diagnostics, but retain the
+                // TIMEOUT deadline checked after teardown below.
+                Some(
+                    check::poll_for(
+                        "ER discovers the completed undelegation",
+                        RECOVERY_OBSERVATION,
+                        || async {
+                            match local(er, pending).await {
+                                Ok(observed)
+                                    if observed.iter().all(|a| {
+                                        id(a.clone()) == Some(900)
+                                    }) =>
+                                {
+                                    Ok(released_at.elapsed())
+                                }
+                                Ok(observed) => Err(format!(
+                                    "{:?}",
+                                    observed
+                                        .iter()
+                                        .map(|a| id(a.clone()))
+                                        .collect::<Vec<_>>()
+                                )),
+                                Err(error) => Err(error.to_string()),
+                            }
+                        },
+                    )
+                    .await,
+                )
+            } else {
+                value(er, pending, 900).await?;
+                None
+            };
             set_base(901, readonly).await?;
             er.accounts(readonly).await?;
             value(er, readonly, 901).await?;
             done.set(true);
-            Result::Ok(evictions - before)
+            Result::Ok((evictions - before, recovery))
         };
-        let (_, evictions) = tokio::time::timeout(
+        let (_, (evictions, recovery)) = tokio::time::timeout(
             Duration::from_secs(180),
             try_join(traffic, faults),
         )
         .await??;
         let actual = base.accounts(delegated).await?;
         check_eq!(actual, base_delegated, "base unchanged by ER-only writes")?;
-        let report = ScenarioReport::ok(self.name())
+        let mut report = ScenarioReport::ok(self.name())
             .setting("cache evictions", evictions)
             .setting("warmed transactions", progress.get())
-            .setting("reconnects", readonly.len());
+            .setting(
+                "reconnects",
+                churn_cycles + usize::from(reconnect_before_settlement),
+            );
+        if let Some(recovery) = &recovery {
+            let recovered_after = match recovery {
+                Ok(elapsed) => format!("{elapsed:.1?}"),
+                Err(_) => format!("not within {RECOVERY_OBSERVATION:?}"),
+            };
+            report = report.setting("er recovered after", recovered_after);
+        }
         private.finish().await?;
         let mut events = http.finish()?;
         events.extend(ws.finish()?);
-        Ok(netfault::report_events(report, &events))
+        let report = netfault::report_events(report, &events);
+        if let Some(recovery) = recovery {
+            let elapsed = recovery?;
+            check!(
+                elapsed <= TIMEOUT,
+                "ER discovered the completed undelegation only after {elapsed:.1?}"
+            )?;
+        }
+        Ok(report)
     }
 }
