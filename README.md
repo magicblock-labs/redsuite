@@ -145,7 +145,7 @@ flock, `genesis-accounts/`, logs, ledgers).
 Scenario isolation comes from fresh keypairs, not fresh chains.
 Scenarios that kill a validator, restart one, or need their own config boot
 private ERs. `task_scheduler`, `config_gates`, `aml_gate`,
-`activation_single_shot`, `cache_lifecycle`, `undelegation_reconnect_gap`,
+`activation_single_shot`, `program_upgrade`, `cache_lifecycle`, `undelegation_reconnect_gap`,
 `checkpoint_durability`, `ledger_retention`, `snapshot_read_race`,
 `commit_blackout`, `commit_exactly_once`,
 `commit_settlement_order`, `undelegation_recovery`,
@@ -398,6 +398,9 @@ chainlink (account cloning):
 - `multi_program_clone` — sends one transaction that calls two programs the ER
   has never seen. The validator has to fetch both program accounts and both of
   their program-data accounts together before it can execute anything
+- `program_upgrade` — upgrades a live V3 program while holding observations and
+  cold clones; checks complete A/B effects, failed-write rollback, and consistent
+  B execution after fresh bytes materialize.
 - `loader_matrix` — exercises all four BPF loaders in one run: memo v1 and
   memo v2 cloned from mainnet with their original loaders intact, the redshift
   fixture preloaded as an upgradeable v3 program, and a fourth copy that the

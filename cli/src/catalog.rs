@@ -288,6 +288,11 @@ pub mod redshift {
             resources: [Resource::Er],
             fixtures: [Fixture::RedlineProgram],
         },
+        program_upgrade => chainlink::program_upgrade::ProgramUpgrade {
+            topology: PrivateEr,
+            resources: [Resource::Er],
+            fixtures: [Fixture::RedlineProgram, Fixture::RedshiftProgramSlim, Fixture::RedshiftProgramSlimUpgraded],
+        },
         loader_matrix => chainlink::loader_matrix::LoaderMatrix {
             topology: Shared,
             resources: [Resource::Er],
