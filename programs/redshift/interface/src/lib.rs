@@ -576,6 +576,13 @@ pub mod schedulecommit {
 pub const LOG_MSG_TAG: u8 = 4;
 pub const SCHEDULE_COMMIT_TAG: u8 = 5;
 pub const FLEXI_TAG: u8 = 6;
+pub const UPGRADE_TAG: u8 = 7;
+
+pub fn upgrade_probe_data(id: u64, fail: bool) -> Vec<u8> {
+    let mut data = vec![UPGRADE_TAG, u8::from(fail)];
+    data.extend_from_slice(&id.to_le_bytes());
+    data
+}
 
 pub fn log_msg_data(message: &str) -> Vec<u8> {
     let mut data = Vec::with_capacity(1 + message.len());

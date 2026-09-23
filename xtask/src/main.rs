@@ -106,9 +106,6 @@ fn programs() -> Result<()> {
     Ok(())
 }
 
-// The slim variants do not include the schedulecommit module or its sdk
-// dependencies. The loader_matrix v4 cell deploys these small binaries,
-// because a large redeploy wedges the clone of the program in the ER.
 fn build_redshift_variant(
     label: &str,
     features: &[&str],
@@ -117,7 +114,7 @@ fn build_redshift_variant(
     let out_dir = root().join(format!("target/deploy/redshift-{label}"));
     let mut command = Command::new("cargo");
     command
-        .args(["build-sbf", "--manifest-path"])
+        .args(["build-sbf", "--arch", "v3", "--manifest-path"])
         .arg(root().join("programs/redshift/program/Cargo.toml"))
         .arg("--no-default-features");
     if !features.is_empty() {

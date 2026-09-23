@@ -21,6 +21,7 @@ upgraded = []
 
 [dependencies]
 redshift-interface = { workspace = true }
+redline-interface = { workspace = true }
 borsh = { workspace = true, optional = true }
 sdk = { workspace = true, optional = true }
 solana-program = { workspace = true }
