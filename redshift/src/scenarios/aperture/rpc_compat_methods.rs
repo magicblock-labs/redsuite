@@ -13,7 +13,8 @@ use redsuite_core::{
         config::RpcLargestAccountsConfig, request::RpcRequest,
         response::RpcBlockCommitment,
     },
-    BaseCtx, ChainCtx, ErCtx, Result, Scenario, ScenarioReport,
+    topology::{self, ErOptions},
+    BaseCtx, ChainCtx, PrivateErScenario, Result, ScenarioReport,
 };
 use signer::Signer;
 use solana_commitment_config::CommitmentConfig;
@@ -21,7 +22,7 @@ use solana_commitment_config::CommitmentConfig;
 const REQUESTS: usize = 256;
 const BURST_DEADLINE: Duration = Duration::from_secs(20);
 const NEGATIVE_DEADLINE: Duration = Duration::from_secs(5);
-const SLOTS_IN_EPOCH: u64 = 432_000;
+const SUPERBLOCK_SLOTS: u64 = 40;
 const SLOT_LEADER_LIMIT: u64 = 8;
 const PERFORMANCE_SAMPLE_LIMIT: usize = 4;
 const PERFORMANCE_SAMPLE_PERIOD_SECS: u16 = 60;
@@ -147,17 +148,17 @@ async fn run_method(
             let info = client.get_epoch_info().await?;
             check_eq!(
                 info.slots_in_epoch,
-                SLOTS_IN_EPOCH,
+                SUPERBLOCK_SLOTS,
                 "getEpochInfo slotsInEpoch"
             )?;
             check_eq!(
                 info.epoch,
-                info.absolute_slot / SLOTS_IN_EPOCH,
+                info.absolute_slot / SUPERBLOCK_SLOTS,
                 "getEpochInfo epoch must be derived from absoluteSlot"
             )?;
             check_eq!(
                 info.slot_index,
-                info.absolute_slot % SLOTS_IN_EPOCH,
+                info.absolute_slot % SUPERBLOCK_SLOTS,
                 "getEpochInfo slotIndex must be derived from absoluteSlot"
             )?;
             check_eq!(
@@ -176,12 +177,12 @@ async fn run_method(
             let schedule = client.get_epoch_schedule().await?;
             check_eq!(
                 schedule.slots_per_epoch,
-                SLOTS_IN_EPOCH,
+                SUPERBLOCK_SLOTS,
                 "getEpochSchedule slotsPerEpoch"
             )?;
             check_eq!(
                 schedule.leader_schedule_slot_offset,
-                0,
+                SUPERBLOCK_SLOTS,
                 "getEpochSchedule leaderScheduleSlotOffset"
             )?;
             check!(!schedule.warmup, "getEpochSchedule warmup must be false")?;
@@ -397,20 +398,46 @@ async fn bounded<T>(
 }
 
 #[async_trait(?Send)]
-impl Scenario for RpcCompatMethods {
+impl PrivateErScenario for RpcCompatMethods {
     fn name(&self) -> &str {
         "redshift/rpc_compat_methods"
     }
 
-    async fn run(&self, _base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
+    async fn run(&self, base: &BaseCtx) -> Result<ScenarioReport> {
+        let private = topology::private_er(
+            base,
+            ErOptions {
+                label: "rpc-compat-methods".into(),
+                env: vec![(
+                    "MBV_ENGINE__BLOCKSTORE__SUPERBLOCK".into(),
+                    SUPERBLOCK_SLOTS.to_string(),
+                )],
+                ..ErOptions::default()
+            },
+        )
+        .await?;
+        let er = private.ctx();
         let client = RpcClient::new_with_commitment(
             er.api().url().to_owned(),
             confirmed(),
         );
+        let slot_floor = check::poll_for(
+            "configured epoch boundary",
+            BURST_DEADLINE,
+            || async {
+                let slot = client.get_slot().await?;
+                check!(
+                    slot > SUPERBLOCK_SLOTS,
+                    "advance beyond the first epoch"
+                )?;
+                Result::Ok(slot)
+            },
+        )
+        .await?;
         let fixture = Fixture {
             identity: er.identity(),
             mint: Keypair::new().pubkey(),
-            slot_floor: client.get_slot().await?,
+            slot_floor,
         };
 
         let burst_started = Instant::now();
@@ -533,7 +560,8 @@ impl Scenario for RpcCompatMethods {
             }
         }
 
-        Ok(ScenarioReport::ok(self.name())
+        let report = ScenarioReport::ok(self.name())
+            .setting("superblock slots", SUPERBLOCK_SLOTS)
             .setting("requests", REQUESTS)
             .setting("method kinds", CYCLE.len())
             .setting("identity", fixture.identity)
@@ -544,6 +572,8 @@ impl Scenario for RpcCompatMethods {
                 Unit::Millis,
                 burst_elapsed.as_secs_f64() * 1e3,
             )
-            .metric("burst failures", Unit::Count, failures as f64))
+            .metric("burst failures", Unit::Count, failures as f64);
+        private.finish().await?;
+        Ok(report)
     }
 }

@@ -248,7 +248,7 @@ pub mod redshift {
             optional_fixtures: [],
         },
         rpc_compat_methods => aperture::rpc_compat_methods::RpcCompatMethods {
-            topology: Shared,
+            topology: PrivateEr,
             resources: [Resource::Er],
             fixtures: [],
             optional_fixtures: [],

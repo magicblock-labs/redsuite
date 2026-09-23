@@ -144,7 +144,7 @@ flock, `genesis-accounts/`, logs, ledgers).
 
 Scenario isolation comes from fresh keypairs, not fresh chains.
 Scenarios that kill a validator, restart one, or need their own config boot
-private ERs. `task_scheduler`, `config_gates`, `aml_gate`,
+private ERs. `task_scheduler`, `config_gates`, `rpc_compat_methods`, `aml_gate`,
 `activation_single_shot`, `program_upgrade`, `cache_lifecycle`, `undelegation_reconnect_gap`,
 `checkpoint_durability`, `ledger_retention`, `snapshot_read_race`,
 `commit_blackout`, `commit_exactly_once`,
@@ -579,8 +579,8 @@ aperture (JSON-RPC surface):
   account must never appear. Missing mints and invalid token program ids
   must be rejected within a bound. Reports the burst wall time and failure
   count without a throughput verdict.
-- `rpc_compat_methods` — proves the static and mocked compatibility methods
-  stay consumable by the official `solana-rpc-client`. Fires 256 concurrent,
+- `rpc_compat_methods` — checks compatibility methods through the official
+  `solana-rpc-client` on a private ER. Fires 256 concurrent,
   unpaced typed requests under a bounded deadline, cycling `getBlockCommitment`,
   `getClusterNodes`, `getEpochInfo`, `getEpochSchedule`,
   `getFirstAvailableBlock`, `getGenesisHash`, `getHealth`,
@@ -591,9 +591,11 @@ aperture (JSON-RPC surface):
   `minimumLedgerSlot`. Every answer must decode through the client's own
   response types and carry the documented default (zero counters and stakes,
   the default genesis hash, empty account and vote lists, the validator
-  identity as the only node and leader, the 432000-slot epoch schedule) or
-  the documented relation (epoch and slot index derived from a slot inside
-  the burst window, version and feature set well formed). Afterwards
+  identity as the only node and leader) or the configured Engine schedule:
+  slots per epoch and leader-schedule offset equal the superblock interval,
+  with epoch and slot index checked after crossing an epoch boundary. Slots
+  must fall inside the burst window, and version and feature set must be
+  well formed. Afterwards
   `requestAirdrop` must be rejected with the disabled-faucet message, the
   MagicBlock-specific `getRoutes` must answer an empty list raw, and an
   unknown method must fail with the JSON-RPC method-not-found code. Reports
