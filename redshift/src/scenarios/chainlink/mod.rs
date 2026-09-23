@@ -1,7 +1,6 @@
 pub mod account_info_semantics;
 pub mod activation_single_shot;
 pub mod aml_gate;
-pub mod cache_lifecycle;
 pub mod clone_on_access;
 pub mod escrow_cloning;
 pub mod loader_matrix;
