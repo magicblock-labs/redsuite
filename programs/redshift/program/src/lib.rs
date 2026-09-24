@@ -4,14 +4,20 @@ use redline_interface::instruction::build;
 #[cfg(feature = "schedulecommit")]
 use sdk::consts::EXTERNAL_UNDELEGATE_DISCRIMINATOR;
 use solana_program::{
-    account_info::AccountInfo, entrypoint::ProgramResult, msg, program::invoke,
-    program_error::ProgramError, pubkey::Pubkey,
+    account_info::AccountInfo,
+    entrypoint::ProgramResult,
+    instruction::{AccountMeta, Instruction},
+    msg,
+    program::invoke,
+    program_error::ProgramError,
+    pubkey::Pubkey,
 };
 
 solana_program::entrypoint!(process_instruction);
 
 pub use redshift_interface::{
-    id, FLEXI_TAG, ID, LOG_MSG_TAG, SCHEDULE_COMMIT_TAG, UPGRADE_TAG,
+    id, EPHEMERAL_TAG, FLEXI_TAG, ID, LOG_MSG_TAG, SCHEDULE_COMMIT_TAG,
+    UPGRADE_TAG,
 };
 
 #[cfg(feature = "schedulecommit")]
@@ -49,6 +55,42 @@ pub fn process_instruction(
             let text = core::str::from_utf8(message)
                 .map_err(|_| ProgramError::InvalidInstructionData)?;
             msg!("LogMsg: {}{}", text, LOG_MSG_SUFFIX);
+            Ok(())
+        }
+        Some((&EPHEMERAL_TAG, payload)) => {
+            let [sponsor, account, vault, native] = accounts else {
+                return Err(ProgramError::NotEnoughAccountKeys);
+            };
+            let (&fill, data) = payload
+                .split_first()
+                .ok_or(ProgramError::InvalidInstructionData)?;
+            let observe = || {
+                msg!(
+                    "Ephemeral: {} {} {} {} {} {}",
+                    account.owner,
+                    account.data_len(),
+                    account.lamports(),
+                    sponsor.lamports(),
+                    vault.lamports(),
+                    solana_program::hash::hash(&account.data.borrow()),
+                )
+            };
+            observe();
+            invoke(
+                &Instruction {
+                    program_id: *native.key,
+                    accounts: accounts[..3]
+                        .iter()
+                        .map(|a| AccountMeta::new(*a.key, a.is_signer))
+                        .collect(),
+                    data: data.to_vec(),
+                },
+                accounts,
+            )?;
+            if fill != 0 {
+                account.try_borrow_mut_data()?.fill(fill);
+            }
+            observe();
             Ok(())
         }
         Some((&UPGRADE_TAG, payload)) => {

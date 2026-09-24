@@ -7,6 +7,12 @@ authors.workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
+account = { workspace = true }
+futures-util = { workspace = true }
+json = { workspace = true }
+magic-api = { workspace = true }
+sdk = { workspace = true }
+transaction = { workspace = true }
 borsh = { workspace = true }
 tokio = { workspace = true }
 redsuite-core = { workspace = true }

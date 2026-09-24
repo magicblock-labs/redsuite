@@ -577,6 +577,7 @@ pub const LOG_MSG_TAG: u8 = 4;
 pub const SCHEDULE_COMMIT_TAG: u8 = 5;
 pub const FLEXI_TAG: u8 = 6;
 pub const UPGRADE_TAG: u8 = 7;
+pub const EPHEMERAL_TAG: u8 = 8;
 
 pub fn upgrade_probe_data(id: u64, fail: bool) -> Vec<u8> {
     let mut data = vec![UPGRADE_TAG, u8::from(fail)];
@@ -589,4 +590,19 @@ pub fn log_msg_data(message: &str) -> Vec<u8> {
     data.push(LOG_MSG_TAG);
     data.extend_from_slice(message.as_bytes());
     data
+}
+
+pub fn ephemeral_cpi(
+    mut instruction: instruction::Instruction,
+    fill: u8,
+) -> instruction::Instruction {
+    instruction
+        .accounts
+        .push(instruction::AccountMeta::new_readonly(
+            instruction.program_id,
+            false,
+        ));
+    instruction.program_id = id();
+    instruction.data.splice(..0, [EPHEMERAL_TAG, fill]);
+    instruction
 }

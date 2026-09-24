@@ -138,10 +138,12 @@ impl RunRecord {
     }
 
     pub fn passed(&self) -> bool {
-        matches!(
-            self.scenario,
-            ScenarioOutcome::Passed(_) | ScenarioOutcome::Skipped(_)
-        ) && self.phases.iter().all(|outcome| outcome.error.is_none())
+        let passed = match &self.scenario {
+            ScenarioOutcome::Passed(report) => report.passed,
+            ScenarioOutcome::Skipped(_) => true,
+            _ => false,
+        };
+        passed && self.phases.iter().all(|outcome| outcome.error.is_none())
     }
 
     pub fn failure(&self) -> Option<String> {
@@ -374,11 +376,15 @@ fn optional_fixture_gap(optional_fixtures: &[Fixture]) -> Option<String> {
 }
 
 fn conclude(record: &mut RunRecord) {
-    let passed = matches!(record.scenario, ScenarioOutcome::Passed(_));
+    let passed = record.passed();
     let show_details = !passed || console::verbose();
     match &record.scenario {
         ScenarioOutcome::Passed(report) => {
-            console::line(format_args!("{}: passed", report.scenario));
+            console::line(format_args!(
+                "{}: {}",
+                report.scenario,
+                if passed { "passed" } else { "failed" }
+            ));
             if show_details {
                 if !report.config.is_empty() {
                     let knobs: Vec<String> = report

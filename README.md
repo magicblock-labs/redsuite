@@ -144,7 +144,7 @@ flock, `genesis-accounts/`, logs, ledgers).
 
 Scenario isolation comes from fresh keypairs, not fresh chains.
 Scenarios that kill a validator, restart one, or need their own config boot
-private ERs. `task_scheduler`, `config_gates`, `rpc_compat_methods`, `aml_gate`,
+private ERs. `ephemeral_accounts`, `task_scheduler`, `config_gates`, `rpc_compat_methods`, `aml_gate`,
 `activation_single_shot`, `program_upgrade`, `cache_lifecycle`, `undelegation_reconnect_gap`,
 `checkpoint_durability`, `ledger_retention`, `snapshot_read_race`,
 `commit_blackout`, `commit_exactly_once`,
@@ -684,6 +684,12 @@ storage (checkpoint durability and ledger retention):
 
 The security tests, one file each under `redhat/src/scenarios/<subsystem>/`.
 Each one performs an attack and requires the platform to refuse it.
+
+magicblock:
+
+- `ephemeral_accounts` — creates, resizes, closes and recreates sponsored
+  accounts, checking ownership, contents, rent and fees. Rejects unauthorized
+  calls and verifies rollback and serialized conflicts without duplicate refunds.
 
 chainlink:
 
