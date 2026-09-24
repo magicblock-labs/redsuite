@@ -160,7 +160,7 @@ with two verifiers replicating from it); `restart_under_load`,
 `ws_conn_capacity`, `clone_lru_churn`, `cold_hydration_tail`,
 `ensure_gate_stall`, `storage_prodsize_sustain`, and
 `superblock_boundary_latency` boot theirs beside the shared stack. Each takes
-its own identity from a 32-slot pool minted at genesis, so private ERs never
+its own identity from a 64-slot pool minted at genesis, so private ERs never
 collide with the shared one or each other.
 The five retry cases share their implementation in `transaction_retries`.
 

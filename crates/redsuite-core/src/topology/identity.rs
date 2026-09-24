@@ -7,7 +7,7 @@ use pubkey::Pubkey;
 use super::{config::DLP_ID, state};
 use crate::{context::BaseCtx, ChainCtx, Result};
 
-pub(super) const IDENTITY_POOL_SIZE: usize = 32;
+pub(super) const IDENTITY_POOL_SIZE: usize = 64;
 const POOL_MAP_FILE: &str = "identity-pool.json";
 const POOL_LOCK_FILE: &str = "identity-pool.lock";
 
