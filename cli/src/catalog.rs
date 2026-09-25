@@ -334,6 +334,11 @@ pub mod redhat {
 
     scenario_catalog! {
         family: Redhat,
+        ephemeral_accounts => magicblock::ephemeral_accounts::EphemeralAccounts {
+            topology: PrivateEr,
+            resources: [Resource::Er],
+            fixtures: [Fixture::RedshiftProgram],
+        },
         illegal_writable => chainlink::illegal_writable::IllegalWritable {
             topology: Shared,
             resources: [Resource::Er],
