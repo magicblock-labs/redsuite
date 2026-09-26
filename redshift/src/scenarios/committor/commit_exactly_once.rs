@@ -199,12 +199,10 @@ async fn settled_receipt(
     base: &BaseCtx,
     er: &ErCtx,
     commit_signature: &Signature,
-    restarted: bool,
+    restart_intent_id: Option<u64>,
     phase: &str,
 ) -> Result<CommitReceipt> {
-    let receipt = if restarted {
-        let intent_id =
-            receipt::scheduled_intent_id(er.api(), commit_signature).await?;
+    let receipt = if let Some(intent_id) = restart_intent_id {
         receipt::fetch_commit_receipt_by_intent(
             er.api(),
             &er.identity(),
@@ -280,27 +278,28 @@ async fn commit_blackout(
         nonce_before + 1,
         "{phase}: the intercepted commit advances the base nonce exactly once"
     )?;
+    let restart_intent_id = if restart {
+        Some(
+            receipt::scheduled_intent_id(
+                private.ctx().api(),
+                &commit_signature,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
     let confirmations = withhold_confirmations(proxies, &landed);
-    let restart = if restart {
+    let restart_timing = if restart {
         Some(private.restart(RestartConfig::default()).await?)
     } else {
         None
     };
     held.discard();
-    let settled = if restart.is_some() {
-        let replayed = nonce + 1;
-        check::poll(
-            "the recovered intent is replayed exactly once after the restart",
-            BASE_STATE_TIMEOUT,
-            || async {
-                matches!(crate::last_commit_id(base, &account).await, Ok(current) if current == replayed)
-            },
-        )
-        .await?;
-        replayed
-    } else {
-        nonce
-    };
+    // The base transaction already landed and advanced the DLP nonce. Recovery
+    // must reconcile that landed transaction instead of producing another base
+    // effect for the same intent.
+    let settled = nonce;
     hold_nonce(base, &account, settled, BLACKOUT_WINDOW, phase).await?;
     for rule in confirmations {
         rule.remove();
@@ -309,18 +308,16 @@ async fn commit_blackout(
         base,
         private.ctx(),
         &commit_signature,
-        restart.is_some(),
+        restart_intent_id,
         phase,
     )
     .await?;
-    if restart.is_none() {
-        check!(
-            receipt.base_signatures.contains(&landed),
-            "{phase}: the receipt must name the base transaction that landed \
-             ({landed}), got {:?}",
-            receipt.base_signatures
-        )?;
-    }
+    check!(
+        receipt.base_signatures.contains(&landed),
+        "{phase}: the receipt must name the base transaction that landed \
+         ({landed}), got {:?}",
+        receipt.base_signatures
+    )?;
     hold_nonce(base, &account, settled, SETTLE_WINDOW, phase).await?;
     let on_base = base
         .account(&account)
@@ -335,7 +332,7 @@ async fn commit_blackout(
         nonce: settled,
         receipt_base_signatures: receipt.base_signatures.len(),
         seconds: started.elapsed().as_secs_f64(),
-        restart,
+        restart: restart_timing,
     })
 }
 
@@ -351,7 +348,7 @@ async fn follow_up_commit(
     let nonce_before = crate::last_commit_id(base, &account).await?;
     let (snapshot, commit_signature) =
         write_and_commit(er, payer, commit_id, write, &account).await?;
-    settled_receipt(base, er, &commit_signature, false, phase).await?;
+    settled_receipt(base, er, &commit_signature, None, phase).await?;
     check::poll(
         "the base copy matches the er snapshot after the follow-up commit",
         BASE_STATE_TIMEOUT,

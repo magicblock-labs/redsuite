@@ -202,6 +202,7 @@ pub async fn fetch_commit_receipt_by_intent(
 ) -> Result<CommitReceipt> {
     let deadline = tokio::time::Instant::now() + timeout;
     let mut seen = HashSet::new();
+    let mut last_fetch_error = None;
     loop {
         let history = er
             .get_signatures_for_address(validator, RECEIPT_HISTORY_LIMIT)
@@ -213,8 +214,13 @@ pub async fn fetch_commit_receipt_by_intent(
             let Ok(signature) = text.parse::<Signature>() else {
                 continue;
             };
-            let Some(tx) = er.get_transaction(&signature).await? else {
-                continue;
+            let tx = match er.get_transaction(&signature).await {
+                Ok(Some(tx)) => tx,
+                Ok(None) => continue,
+                Err(error) => {
+                    last_fetch_error = Some(error.to_string());
+                    continue;
+                }
             };
             let receipt = parse_receipt(signature, &tx);
             if receipt.commit_id == Some(intent_id) {
@@ -222,10 +228,16 @@ pub async fn fetch_commit_receipt_by_intent(
             }
         }
         if tokio::time::Instant::now() >= deadline {
-            return Err(format!(
+            let mut message = format!(
                 "no commit receipt for intent {intent_id} within {timeout:?}"
-            )
-            .into());
+            );
+            if let Some(error) = &last_fetch_error {
+                message.push_str(&format!(
+                    "; last getTransaction error while scanning receipts: \
+                     {error}"
+                ));
+            }
+            return Err(message.into());
         }
         tokio::time::sleep(RECEIPT_POLL).await;
     }
