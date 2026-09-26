@@ -305,8 +305,9 @@ async fn isolate(
     )
     .await?;
 
-    let delayed = proxies
-        .stall(Selector::methods(&[]).ws().notification().account(&account));
+    let delayed = proxies.intercept(
+        Selector::methods(&[]).ws().notification().account(&account),
+    );
     let undelegate = schedule_commit(
         er_a.ctx(),
         payer,
@@ -333,6 +334,7 @@ async fn isolate(
         "base returns the account to the program with the staged value",
     )
     .await?;
+    let delayed = delayed.wait(INTERCEPT_TIMEOUT).await?;
 
     let base_value = value(case, 2);
     write(base, payer, &player, &account, base_value).await?;
@@ -365,7 +367,7 @@ async fn isolate(
     write(session_b, payer, &player, &account, er_value).await?;
     let nonce = crate::last_commit_id(base, &account).await?;
 
-    delayed.remove();
+    delayed.release();
     hold_steady(
         base,
         &SessionB {
