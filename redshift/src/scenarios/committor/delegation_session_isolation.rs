@@ -15,6 +15,7 @@ use redsuite_core::{
     topology::{ErOptions, PrivateEr, RestartConfig, RestartTiming},
     BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result, ScenarioReport,
 };
+use serde::Deserialize;
 use signer::Signer;
 
 const LABEL_A: &str = "session-isolation-a";
@@ -53,6 +54,12 @@ struct Outcome {
     old_validator_rejection: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawDelegationStatus {
+    is_delegated: bool,
+}
+
 fn value(case: u64, step: u64) -> u64 {
     100 * case + step
 }
@@ -85,6 +92,28 @@ async fn await_clone_count(
     )
     .await
     .map_err(|error| error.expected(format!("count {id}")))?;
+    Ok(())
+}
+
+async fn await_delegated(
+    er: &ErCtx,
+    account: &Pubkey,
+    what: &str,
+) -> Result<()> {
+    check::poll_for(what, CLONE_TIMEOUT, || async {
+        let status: RawDelegationStatus = er
+            .api()
+            .call("getDelegationStatus", &(account.to_string(),))
+            .await
+            .map_err(|error| format!("read failed: {error}"))?;
+        if status.is_delegated {
+            Ok(())
+        } else {
+            Err("not delegated".to_owned())
+        }
+    })
+    .await
+    .map_err(|error| error.expected("delegated"))?;
     Ok(())
 }
 
@@ -363,6 +392,12 @@ async fn isolate(
     )
     .await?;
     await_clone_count(session_b, &account, base_value).await?;
+    await_delegated(
+        session_b,
+        &account,
+        "session-b er activates the committee as delegated",
+    )
+    .await?;
     let er_value = value(case, 3);
     write(session_b, payer, &player, &account, er_value).await?;
     let nonce = crate::last_commit_id(base, &account).await?;
