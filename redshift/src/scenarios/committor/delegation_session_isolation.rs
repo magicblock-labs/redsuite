@@ -15,17 +15,19 @@ use redsuite_core::{
     topology::{ErOptions, PrivateEr, RestartConfig, RestartTiming},
     BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result, ScenarioReport,
 };
+use serde::Deserialize;
 use signer::Signer;
 
 const LABEL_A: &str = "session-isolation-a";
 const LABEL_B: &str = "session-isolation-b";
 const CLONE_TIMEOUT: Duration = Duration::from_secs(30);
-const RECEIPT_TIMEOUT: Duration = Duration::from_secs(60);
+const INTERCEPT_TIMEOUT: Duration = Duration::from_secs(60);
+const RECEIPT_TIMEOUT: Duration = Duration::from_secs(120);
+const BASE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(30);
 const COMPLETION_TIMEOUT: Duration = Duration::from_secs(60);
 const STALE_WINDOW: Duration = Duration::from_secs(5);
 const RECOVERY_WINDOW: Duration = Duration::from_secs(10);
 const POLL: Duration = Duration::from_millis(250);
-const BASE_REJECTION: &str = "redsuite: base rejects session-a work";
 
 pub struct DelegationSessionIsolation;
 
@@ -45,11 +47,17 @@ impl Target {
 }
 
 struct Outcome {
-    intent_failure: String,
+    session_a_recovery: String,
     completion_s: f64,
     restart: RestartTiming,
     fresh_commit_s: f64,
     old_validator_rejection: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawDelegationStatus {
+    is_delegated: bool,
 }
 
 fn value(case: u64, step: u64) -> u64 {
@@ -84,6 +92,28 @@ async fn await_clone_count(
     )
     .await
     .map_err(|error| error.expected(format!("count {id}")))?;
+    Ok(())
+}
+
+async fn await_delegated(
+    er: &ErCtx,
+    account: &Pubkey,
+    what: &str,
+) -> Result<()> {
+    check::poll_for(what, CLONE_TIMEOUT, || async {
+        let status: RawDelegationStatus = er
+            .api()
+            .call("getDelegationStatus", &(account.to_string(),))
+            .await
+            .map_err(|error| format!("read failed: {error}"))?;
+        if status.is_delegated {
+            Ok(())
+        } else {
+            Err("not delegated".to_owned())
+        }
+    })
+    .await
+    .map_err(|error| error.expected("delegated"))?;
     Ok(())
 }
 
@@ -209,41 +239,68 @@ async fn schedule_commit(
     .await
 }
 
-async fn fail_session_a_intent(
+async fn recover_session_a_commit_after_lost_response(
     base: &BaseCtx,
     er: &ErCtx,
     proxies: &BaseProxies,
     payer: &Keypair,
     player: &Pubkey,
     account: &Pubkey,
+    expected_id: u64,
 ) -> Result<String> {
-    let rejects = proxies.reject(
+    let submission = proxies.intercept(
         Selector::method("sendTransaction")
             .http()
-            .request()
+            .response()
             .account(account),
-        BASE_REJECTION,
     );
     let signature =
         schedule_commit(er, payer, player, ScheduleCommitType::Commit).await?;
+    let held = submission.wait(INTERCEPT_TIMEOUT).await?;
+    let base_signature = held.operation.signature()?;
+    let base_tx = base
+        .api()
+        .await_transaction(&base_signature, BASE_CONFIRM_TIMEOUT)
+        .await?;
+    check_eq!(
+        base_tx.err,
+        None,
+        "the intercepted session-a commit must land on base"
+    )?;
+    check::poll_for(
+        "base records the session-a commit before the response is lost",
+        COMPLETION_TIMEOUT,
+        || async {
+            match base_state(base, account).await {
+                Ok((owner, written))
+                    if owner == dlp::dlp_id()
+                        && written == Some(expected_id) =>
+                {
+                    Ok(())
+                }
+                Ok((owner, written)) => {
+                    Err(format!("owner {owner} count {written:?}"))
+                }
+                Err(error) => Err(format!("read failed: {error}")),
+            }
+        },
+    )
+    .await?;
+    held.discard();
+
     let receipt =
         receipt::fetch_commit_receipt(er.api(), &signature, RECEIPT_TIMEOUT)
             .await?;
-    rejects.remove();
-    let failure = receipt.error_message.clone().ok_or_else(|| {
-        format!(
-            "the session-a commit intent must fail while base rejects its \
-             submission, got base signatures {:?}",
-            receipt.base_signatures
-        )
-    })?;
-    let (owner, _) = base_state(base, account).await?;
-    check_eq!(
-        owner,
-        dlp::dlp_id(),
-        "the failed session-a intent must leave the account delegated"
+    check!(
+        receipt.succeeded() || receipt.failure_is_duplicate_rejection(),
+        "the session-a commit intent must converge after a lost base response, \
+         got {:?}",
+        receipt.error_message
     )?;
-    Ok(failure)
+    Ok(format!(
+        "lost response recovered with {} base signature(s)",
+        receipt.base_signatures.len()
+    ))
 }
 
 async fn isolate(
@@ -266,18 +323,20 @@ async fn isolate(
 
     let staged = value(case, 1);
     write(er_a.ctx(), payer, &player, &account, staged).await?;
-    let intent_failure = fail_session_a_intent(
+    let session_a_recovery = recover_session_a_commit_after_lost_response(
         base,
         er_a.ctx(),
         proxies,
         payer,
         &player,
         &account,
+        staged,
     )
     .await?;
 
-    let delayed = proxies
-        .stall(Selector::methods(&[]).ws().notification().account(&account));
+    let delayed = proxies.intercept(
+        Selector::methods(&[]).ws().notification().account(&account),
+    );
     let undelegate = schedule_commit(
         er_a.ctx(),
         payer,
@@ -304,6 +363,7 @@ async fn isolate(
         "base returns the account to the program with the staged value",
     )
     .await?;
+    let delayed = delayed.wait(INTERCEPT_TIMEOUT).await?;
 
     let base_value = value(case, 2);
     write(base, payer, &player, &account, base_value).await?;
@@ -332,11 +392,17 @@ async fn isolate(
     )
     .await?;
     await_clone_count(session_b, &account, base_value).await?;
+    await_delegated(
+        session_b,
+        &account,
+        "session-b er activates the committee as delegated",
+    )
+    .await?;
     let er_value = value(case, 3);
     write(session_b, payer, &player, &account, er_value).await?;
     let nonce = crate::last_commit_id(base, &account).await?;
 
-    delayed.remove();
+    delayed.release();
     hold_steady(
         base,
         &SessionB {
@@ -447,7 +513,7 @@ async fn isolate(
     let fresh_commit_s = fresh_started.elapsed().as_secs_f64();
 
     Ok(Outcome {
-        intent_failure,
+        session_a_recovery,
         completion_s,
         restart,
         fresh_commit_s,
@@ -511,8 +577,11 @@ impl PrivateErScenario for DelegationSessionIsolation {
         let report = ScenarioReport::ok(self.name())
             .setting("session-a er", LABEL_A)
             .setting("session-b er", LABEL_B)
-            .setting("redelegation intent failure", same.intent_failure)
-            .setting("reassignment intent failure", other.intent_failure)
+            .setting("redelegation session-a recovery", same.session_a_recovery)
+            .setting(
+                "reassignment session-a recovery",
+                other.session_a_recovery,
+            )
             .setting(
                 "old validator rejection",
                 other.old_validator_rejection.unwrap_or_default(),
