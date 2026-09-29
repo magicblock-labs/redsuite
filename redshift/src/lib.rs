@@ -62,6 +62,23 @@ pub async fn assert_commit_receipt(
     Ok(commit_receipt)
 }
 
+pub fn account_id(account: Option<account::Account>) -> Option<u64> {
+    account.and_then(|account| written_id(&account.data))
+}
+
+// The ER's local view, read without touching the accounts: getProgramAccounts
+// answers from what the validator already holds, so it never triggers a fetch.
+pub async fn local_accounts(
+    er: &ErCtx,
+    keys: &[Pubkey],
+) -> Result<Vec<Option<account::Account>>> {
+    let mut accounts = std::collections::HashMap::new();
+    for owner in [program::id(), program::DELEGATION_PROGRAM_ID] {
+        accounts.extend(er.api().get_program_accounts(&owner).await?);
+    }
+    Ok(keys.iter().map(|key| accounts.get(key).cloned()).collect())
+}
+
 pub fn written_id(data: &[u8]) -> Option<u64> {
     use program::layout::{ID_OFFSET, ID_SIZE};
     let bytes = data.get(ID_OFFSET..ID_OFFSET + ID_SIZE)?;

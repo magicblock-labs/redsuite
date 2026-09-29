@@ -145,7 +145,8 @@ flock, `genesis-accounts/`, logs, ledgers).
 Scenario isolation comes from fresh keypairs, not fresh chains.
 Scenarios that kill a validator, restart one, or need their own config boot
 private ERs. `ephemeral_accounts`, `task_scheduler`, `config_gates`, `rpc_compat_methods`, `aml_gate`,
-`activation_single_shot`, `program_upgrade`, `cache_lifecycle`, `undelegation_reconnect_gap`,
+`activation_single_shot`, `program_upgrade`, `cache_lifecycle`,
+`undelegation_reconnect_gap`, `undelegation_grpc_redundancy`,
 `checkpoint_durability`, `ledger_retention`, `snapshot_read_race`,
 `commit_blackout`, `commit_exactly_once`,
 `commit_settlement_order`, `undelegation_recovery`,
@@ -212,9 +213,41 @@ even when the scenario fails early.
 | `REDSUITE_PROFILE` | scenario profile: `lite` (default), `full`, `soak`, or `deep` |
 | `REDSUITE_LOOP` | S1 loop mode: `open` (default) or `closed` |
 | `REDSUITE_VERBOSE` | set to print stack boot, reuse and per-scenario detail lines for passing scenarios too; by default those appear only for failures |
+| `REDSUITE_YELLOWSTONE_PLUGIN` | a prebuilt `libyellowstone_grpc_geyser.so` to load instead of the cached upstream release |
+| `REDSUITE_YELLOWSTONE_DIR` | where cached Yellowstone releases live; defaults to `target/yellowstone` under the workspace root |
 
 A cold boot clones its base programs from `REDSUITE_CLONE_URL`, so the first
 boot needs that endpoint. A warm stack does not, and neither does a rerun.
+
+### Yellowstone gRPC
+
+The shared base boots with the upstream Yellowstone geyser plugin when it can,
+so the feed is provisioned once, before any scenario runs, and no scenario ever
+restarts the base to acquire it. An ER only receives the feed when its scenario
+puts the endpoint in `BaseEndpoints::grpc_url`; today only
+`undelegation_grpc_redundancy` does, so every other ER keeps exactly the
+remotes it always had. `BaseCtx::grpc` returns the endpoint and the release
+tag, or `None` when the base came up without the plugin.
+
+Acquiring the plugin never breaks a run. If the release cannot be resolved,
+downloaded or verified, the base boots without it; if the base then refuses to
+serve with the plugin loaded, it is relaunched without it. Either way the stack
+records no feed, and only a scenario that asks for one fails, naming the
+reason.
+
+The plugin is an upstream release binary, chosen by the `major.minor` version
+of the `solana-test-validator` on PATH and cached under
+`target/yellowstone/<release tag>`. The first run that needs it downloads the
+`.so`, checks it against the release checksums and keeps it. Upstream builds it
+for x86_64 linux only, so elsewhere point `REDSUITE_YELLOWSTONE_PLUGIN` at a
+plugin built for that host.
+
+A scenario proves the feed is live by what reaches the ER, not by a metric: the
+validator attributes subscription counters to a client id even when that
+client's endpoint is unreachable, so the counters cannot tell the transports
+apart. `undelegation_grpc_redundancy` holds the WebSocket and account-fetch
+paths for its accounts and fails if nothing arrives, which is why it fails when
+the feed is missing or pointed at a dead port.
 
 ## redline scenarios
 
@@ -395,6 +428,12 @@ chainlink (account cloning):
 - `undelegation_reconnect_gap` — shares the `cache_lifecycle` implementation,
   with one churn cycle followed by a reconnect immediately before undelegation
   settles, and checks how quickly the ER observes completion.
+- `undelegation_grpc_redundancy` — the same interruption as
+  `undelegation_reconnect_gap`, with the base chain's Yellowstone gRPC feed as
+  a third remote. Holds every WebSocket message and every account fetch for the
+  accounts under test, so gRPC is the only path left, then checks that the ER
+  still observes a base write to a cloned account and the completed
+  undelegation. See *Yellowstone gRPC*.
 - `multi_program_clone` — sends one transaction that calls two programs the ER
   has never seen. The validator has to fetch both program accounts and both of
   their program-data accounts together before it can execute anything

@@ -316,6 +316,42 @@ pub(super) fn rpc_listening(port: u16) -> bool {
     TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok()
 }
 
+// Both bases are usable at the same point: RPC answers, everything their
+// consumers dial is accepting, and the chain has ticked past genesis.
+pub(super) async fn await_base_serving(
+    rpc_url: &str,
+    log: &Path,
+    pid: u32,
+    listeners: &[(&str, u16)],
+) -> Result<()> {
+    let api = crate::api::Api::new(rpc_url.to_owned());
+    wait_until(
+        super::config::BASE_READY_TIMEOUT,
+        "base RPC healthy",
+        log,
+        pid,
+        || async { matches!(api.get_health().await.as_deref(), Ok("ok")) },
+    )
+    .await?;
+    for (what, port) in listeners {
+        wait_until(Duration::from_secs(20), what, log, pid, || async {
+            tokio::net::TcpStream::connect(("127.0.0.1", *port))
+                .await
+                .is_ok()
+        })
+        .await?;
+    }
+    // getHealth answers "ok" mid-genesis; dlp is only invocable once slots tick
+    wait_until(
+        Duration::from_secs(30),
+        "base past genesis (confirmed slot >= 2)",
+        log,
+        pid,
+        || async { matches!(api.get_slot().await, Ok(slot) if slot >= 2) },
+    )
+    .await
+}
+
 pub(super) async fn wait_until<F, Fut>(
     timeout: Duration,
     what: &str,

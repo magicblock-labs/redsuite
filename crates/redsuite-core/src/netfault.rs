@@ -506,6 +506,7 @@ impl BaseProxies {
         let endpoints = BaseEndpoints {
             rpc_url: format!("http://{}", http_listener.local_addr()?),
             ws_url: format!("ws://{}", ws_listener.local_addr()?),
+            grpc_url: None,
         };
         let upstream_rpc = base.api().url().to_owned();
         let upstream_ws = base.ws_url().to_owned();

@@ -135,6 +135,11 @@ pub mod redshift {
             resources: [Resource::Er],
             fixtures: [Fixture::RedlineProgram],
         },
+        undelegation_grpc_redundancy => chainlink::undelegation_grpc_redundancy::GrpcRedundancy {
+            topology: PrivateEr,
+            resources: [Resource::Er],
+            fixtures: [Fixture::RedlineProgram],
+        },
         commit_blackout => committor::commit_blackout::CommitBlackout {
             topology: PrivateEr,
             resources: [Resource::Er],

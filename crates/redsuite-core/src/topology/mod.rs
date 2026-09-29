@@ -6,6 +6,7 @@ mod replicated;
 mod shared;
 mod state;
 mod status;
+mod yellowstone;
 
 pub use config::{
     er_bin_path, redline_alias_ids, redline_loader_v3_pair,
@@ -25,5 +26,8 @@ pub use state::{
     ACCOUNTSDB_ROOT_ENV, ROOT_ENV, STACK_DIR_ENV,
 };
 pub use status::{down, status, wipe_storage};
+pub use yellowstone::{
+    CACHE_ENV as YELLOWSTONE_CACHE_ENV, PLUGIN_ENV as YELLOWSTONE_PLUGIN_ENV,
+};
 
 pub(crate) use process::kill_pid;

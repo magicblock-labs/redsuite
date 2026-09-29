@@ -11,6 +11,16 @@ pub const ENV_VARS: &[(&str, &str)] = &[
          binary, else on PATH)",
     ),
     (
+        topology::YELLOWSTONE_PLUGIN_ENV,
+        "a prebuilt libyellowstone_grpc_geyser.so to load instead of the \
+         cached upstream release",
+    ),
+    (
+        topology::YELLOWSTONE_CACHE_ENV,
+        "where cached Yellowstone releases live (default target/yellowstone \
+         under the workspace root)",
+    ),
+    (
         topology::ROOT_ENV,
         "workspace root, when the binary runs outside the checkout",
     ),
