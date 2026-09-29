@@ -7,7 +7,7 @@ use std::{
 use keypair::Keypair;
 use pubkey::Pubkey;
 
-use crate::{catalog::Fixture, manifest, Result};
+use crate::{catalog::Fixture, console, manifest, Result};
 
 const LEDGER_SIZE_LIMIT_UNREACHABLE: u64 = 1 << 60;
 
@@ -256,18 +256,39 @@ pub(super) struct BasePlan {
     // (program id, .so) loaded via --bpf-program; redline gets its aliases
     pub(super) bpf_programs: Vec<(String, PathBuf)>,
     pub(super) loaded_fixtures: Vec<String>,
+    pub(super) geyser_plugin_config: Option<PathBuf>,
+    // the Yellowstone release serving this base's gRPC feed, when it has one
+    pub(super) plugin: String,
 }
 
 impl BasePlan {
-    pub(super) fn gather(
+    // `grpc_port` asks for a Yellowstone gRPC feed on that port: the plugin is
+    // resolved and configured here, with the rest of the base's launch.
+    pub(super) async fn gather(
         bin: PathBuf,
         er_bin: &Path,
         stack_dir: &Path,
         rpc_port: u16,
         faucet_port: u16,
         gossip_port: u16,
-        clone_url: String,
+        grpc_port: Option<u16>,
     ) -> Result<Self> {
+        let mut geyser_plugin_config = None;
+        let mut plugin = String::new();
+        if let Some(port) = grpc_port {
+            match super::yellowstone::ensure(&bin).await {
+                Ok(yellowstone) => {
+                    let path = stack_dir.join(format!("geyser-{port}.json"));
+                    yellowstone
+                        .write_config(&path, &format!("127.0.0.1:{port}"))?;
+                    geyser_plugin_config = Some(path);
+                    plugin = yellowstone.tag;
+                }
+                Err(e) => console::line(format_args!(
+                    "no Yellowstone gRPC feed on this base: {e}"
+                )),
+            }
+        }
         let mut upgradeable_v3 = Vec::new();
         if let Ok(redshift_so) = manifest::resolve(Fixture::RedshiftProgram) {
             let (v3_id, v3_authority) = redshift_loader_v3_target();
@@ -286,10 +307,12 @@ impl BasePlan {
             gossip_port,
             ledger: stack_dir.join("base-ledger"),
             genesis_accounts: stack_dir.join("genesis-accounts"),
-            clone_url,
+            clone_url: clone_url(),
             upgradeable_v3,
             bpf_programs: staged.bpf,
             loaded_fixtures: staged.loaded_fixtures,
+            geyser_plugin_config,
+            plugin,
         })
     }
 
@@ -325,6 +348,9 @@ impl BasePlan {
             }
             cmd.arg("--bpf-program").arg(id).arg(so);
         }
+        if let Some(plugin) = &self.geyser_plugin_config {
+            cmd.arg("--geyser-plugin-config").arg(plugin);
+        }
         cmd
     }
 }
@@ -336,6 +362,7 @@ pub(super) struct ErPlan {
     pub(super) identity: Keypair,
     pub(super) base_rpc_url: String,
     pub(super) base_ws_url: String,
+    pub(super) base_grpc_url: Option<String>,
     pub(super) listen_port: u16,
     pub(super) metrics_port: u16,
     // every validator binds a follower listener (default 127.0.0.1:10000);
@@ -354,10 +381,24 @@ pub(super) struct ErPlan {
 impl ErPlan {
     pub(super) fn command(&self) -> Command {
         let mut cmd = Command::new(&self.bin);
-        cmd.arg("--remotes")
-            .arg(&self.base_rpc_url)
-            .arg("--remotes")
-            .arg(&self.base_ws_url);
+        match &self.base_grpc_url {
+            Some(grpc_url) => {
+                cmd.env(
+                    "MBV_REMOTES",
+                    toml_string_array(&[
+                        self.base_rpc_url.as_str(),
+                        self.base_ws_url.as_str(),
+                        &with_api_key(grpc_url),
+                    ]),
+                );
+            }
+            None => {
+                cmd.arg("--remotes")
+                    .arg(&self.base_rpc_url)
+                    .arg("--remotes")
+                    .arg(&self.base_ws_url);
+            }
+        }
         cmd.arg("-l").arg(format!("127.0.0.1:{}", self.listen_port));
         cmd.env(
             "MBV_ENGINE__AUTHORITY__LOCAL",
@@ -399,7 +440,17 @@ impl ErPlan {
     }
 }
 
-fn toml_string_array(values: &[Pubkey]) -> String {
+pub(super) const GRPC_API_KEY: &str = "redsuite";
+
+fn with_api_key(grpc_url: &str) -> String {
+    if grpc_url.contains('?') {
+        grpc_url.to_owned()
+    } else {
+        format!("{grpc_url}?api-key={GRPC_API_KEY}")
+    }
+}
+
+fn toml_string_array<T: std::fmt::Display>(values: &[T]) -> String {
     let quoted: Vec<String> =
         values.iter().map(|value| format!("\"{value}\"")).collect();
     format!("[{}]", quoted.join(", "))
@@ -502,6 +553,7 @@ pub struct ErOptions {
 pub struct BaseEndpoints {
     pub rpc_url: String,
     pub ws_url: String,
+    pub grpc_url: Option<String>,
 }
 
 pub struct RestartConfig {
@@ -546,6 +598,7 @@ mod tests {
             identity: Keypair::new(),
             base_rpc_url: "http://127.0.0.1:8899".to_owned(),
             base_ws_url: "ws://127.0.0.1:8900".to_owned(),
+            base_grpc_url: None,
             listen_port: 7799,
             metrics_port: 7801,
             replication_port: 7802,
@@ -704,6 +757,8 @@ mod tests {
                 PathBuf::from("/tmp/redline_program.so"),
             )],
             loaded_fixtures: vec![Fixture::RedlineProgram.so_name().to_owned()],
+            geyser_plugin_config: None,
+            plugin: String::new(),
         };
         let args = args_of(&plan.command());
         assert!(args.contains(&"--upgradeable-program".to_owned()));

@@ -181,6 +181,7 @@ impl ErClient {
 pub struct BaseCtx {
     api: Api,
     ws_url: String,
+    grpc: Option<(String, String)>,
     blockhash: Rc<BlockhashCache>,
     resources: Rc<Resources>,
     config: ExecutionConfig,
@@ -190,11 +191,13 @@ impl BaseCtx {
     pub(crate) fn new(
         rpc_url: String,
         ws_url: String,
+        grpc: Option<(String, String)>,
         config: ExecutionConfig,
     ) -> Self {
         Self {
             api: Api::new(rpc_url),
             ws_url,
+            grpc,
             blockhash: Rc::new(BlockhashCache::new(BASE_BLOCKHASH_TTL)),
             resources: Rc::new(Resources::default()),
             config,
@@ -203,6 +206,12 @@ impl BaseCtx {
 
     pub(crate) fn resources(&self) -> Rc<Resources> {
         self.resources.clone()
+    }
+
+    pub fn grpc(&self) -> Option<(&str, &str)> {
+        self.grpc
+            .as_ref()
+            .map(|(url, plugin)| (url.as_str(), plugin.as_str()))
     }
 
     pub fn config(&self) -> ExecutionConfig {

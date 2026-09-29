@@ -329,17 +329,22 @@ async fn launch(
     } else {
         "leader"
     };
-    let (base_rpc_url, base_ws_url) = match &options.base_endpoints {
-        Some(endpoints) => {
-            (endpoints.rpc_url.clone(), endpoints.ws_url.clone())
-        }
-        None => (base.api().url().to_owned(), base.ws_url().to_owned()),
+    let (base_rpc_url, base_ws_url, base_grpc_url) = match &options
+        .base_endpoints
+    {
+        Some(endpoints) => (
+            endpoints.rpc_url.clone(),
+            endpoints.ws_url.clone(),
+            endpoints.grpc_url.clone(),
+        ),
+        None => (base.api().url().to_owned(), base.ws_url().to_owned(), None),
     };
     let plan = config::ErPlan {
         bin: er_bin,
         identity: er_identity,
         base_rpc_url,
         base_ws_url,
+        base_grpc_url,
         listen_port: rpc_port,
         metrics_port,
         replication_port,

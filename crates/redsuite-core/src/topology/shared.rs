@@ -1,4 +1,4 @@
-use std::{fs, path::Path, time::Duration};
+use std::{fs, path::Path};
 
 use keypair::Keypair;
 use pubkey::Pubkey;
@@ -105,6 +105,12 @@ fn base_ctx(state: &StackState, config: ExecutionConfig) -> BaseCtx {
     BaseCtx::new(
         format!("http://127.0.0.1:{}", state.base_rpc_port),
         format!("ws://127.0.0.1:{}", state.base_ws_port),
+        (state.base_grpc_port != 0).then(|| {
+            (
+                format!("grpc://127.0.0.1:{}", state.base_grpc_port),
+                state.base_plugin.clone(),
+            )
+        }),
         config,
     )
 }
@@ -145,71 +151,92 @@ async fn boot_base(config: ExecutionConfig) -> Result<StackState> {
     let (base_rpc_port, base_ws_port) = base_ports.pair()?;
     let base_faucet_port = base_ports.single()?;
     let base_gossip_port = base_ports.single()?;
+    let feed_port = base_ports.single()?;
 
     let identity = Keypair::new();
     let identity_pool: Vec<Keypair> = (0..identity::IDENTITY_POOL_SIZE)
         .map(|_| Keypair::new())
         .collect();
     let clone_url = config::clone_url();
-
-    let plan = config::BasePlan::gather(
-        base_bin,
-        &er_bin,
-        &dir,
-        base_rpc_port,
-        base_faucet_port,
-        base_gossip_port,
-        clone_url.clone(),
-    )?;
-    let _ = fs::remove_dir_all(&plan.genesis_accounts);
-    fs::create_dir_all(&plan.genesis_accounts)?;
-    identity::write_vault_dump(&plan.genesis_accounts, &identity.pubkey())?;
-    for reserved in &identity_pool {
-        identity::write_vault_dump(&plan.genesis_accounts, &reserved.pubkey())?;
-    }
-    identity::reset_pool(&dir);
-    console::debug(format_args!(
-        "booting base L1 on 127.0.0.1:{base_rpc_port} (cloning from \
-         {clone_url}) …"
-    ));
     let base_log = dir.join("base.log");
-    base_ports.release();
-    let base_pid = process::spawn_detached(plan.command(), &base_log)?;
+    let mut feed = Some(feed_port);
 
-    let state = StackState {
-        base_rpc_port,
-        base_ws_port,
-        base_faucet_port,
-        base_gossip_port,
-        base_pid,
-        base_bin: config::bin_name(&plan.bin),
-        er_rpc_port: 0,
-        er_ws_port: 0,
-        er_metrics_port: 0,
-        er_pid: 0,
-        er_bin: config::bin_name(&er_bin),
-        er_identity: identity.pubkey().to_string(),
-        er_identity_keypair: identity.to_bytes().to_vec(),
-        er_identity_pool: identity_pool
-            .iter()
-            .map(|reserved| reserved.to_bytes().to_vec())
-            .collect(),
-        clone_url,
-        base_programs: plan.loaded_fixtures.clone(),
-    };
-
-    match await_base_ready(&state, &base_log, config).await {
-        Ok(()) => {
-            state::write_state(&state)?;
-            console::debug(format_args!(
-                "base up: 127.0.0.1:{} (ws {}), identity {}",
-                state.base_rpc_port, state.base_ws_port, state.er_identity,
-            ));
-            Ok(state)
+    loop {
+        let plan = config::BasePlan::gather(
+            base_bin.clone(),
+            &er_bin,
+            &dir,
+            base_rpc_port,
+            base_faucet_port,
+            base_gossip_port,
+            feed,
+        )
+        .await?;
+        let _ = fs::remove_dir_all(&plan.genesis_accounts);
+        fs::create_dir_all(&plan.genesis_accounts)?;
+        identity::write_vault_dump(&plan.genesis_accounts, &identity.pubkey())?;
+        for reserved in &identity_pool {
+            identity::write_vault_dump(
+                &plan.genesis_accounts,
+                &reserved.pubkey(),
+            )?;
         }
-        Err(e) => {
-            process::kill_pid(base_pid);
-            Err(e)
+        identity::reset_pool(&dir);
+        console::debug(format_args!(
+            "booting base L1 on 127.0.0.1:{base_rpc_port} (cloning from \
+             {clone_url}) …"
+        ));
+        base_ports.release();
+        let base_pid = process::spawn_detached(plan.command(), &base_log)?;
+
+        let state = StackState {
+            base_rpc_port,
+            base_ws_port,
+            base_faucet_port,
+            base_gossip_port,
+            base_grpc_port: if plan.plugin.is_empty() { 0 } else { feed_port },
+            base_plugin: plan.plugin.clone(),
+            base_pid,
+            base_bin: config::bin_name(&plan.bin),
+            er_rpc_port: 0,
+            er_ws_port: 0,
+            er_metrics_port: 0,
+            er_pid: 0,
+            er_bin: config::bin_name(&er_bin),
+            er_identity: identity.pubkey().to_string(),
+            er_identity_keypair: identity.to_bytes().to_vec(),
+            er_identity_pool: identity_pool
+                .iter()
+                .map(|reserved| reserved.to_bytes().to_vec())
+                .collect(),
+            clone_url: clone_url.clone(),
+            base_programs: plan.loaded_fixtures.clone(),
+        };
+
+        match await_base_ready(&state, &base_log, config).await {
+            Ok(()) => {
+                state::write_state(&state)?;
+                console::debug(format_args!(
+                    "base up: 127.0.0.1:{} (ws {}, grpc {}), identity {}",
+                    state.base_rpc_port,
+                    state.base_ws_port,
+                    state.base_grpc_port,
+                    state.er_identity,
+                ));
+                return Ok(state);
+            }
+            Err(e) => {
+                process::kill_pid(base_pid);
+                if state.base_grpc_port == 0 {
+                    return Err(e);
+                }
+                console::line(format_args!(
+                    "base L1 refused to serve with the Yellowstone plugin \
+                     ({}): {e}; retrying without the gRPC feed",
+                    state.base_plugin
+                ));
+                feed = None;
+            }
         }
     }
 }
@@ -219,36 +246,16 @@ async fn await_base_ready(
     base_log: &Path,
     config: ExecutionConfig,
 ) -> Result<()> {
-    let base_api =
-        Api::new(format!("http://127.0.0.1:{}", state.base_rpc_port));
-    process::wait_until(
-        config::BASE_READY_TIMEOUT,
-        "base L1 RPC healthy",
+    let mut listeners = vec![("base L1 WS listening", state.base_ws_port)];
+    if state.base_grpc_port != 0 {
+        listeners.push(("base L1 Yellowstone feed", state.base_grpc_port));
+    }
+    process::await_base_serving(
+        &format!("http://127.0.0.1:{}", state.base_rpc_port),
         base_log,
         state.base_pid,
-        || async { matches!(base_api.get_health().await.as_deref(), Ok("ok")) },
-    )
-    .await?;
-    // The ER dials the base WS first and exits if it cannot connect.
-    process::wait_until(
-        Duration::from_secs(15),
-        "base L1 WS listening",
-        base_log,
-        state.base_pid,
-        || async {
-            tokio::net::TcpStream::connect(("127.0.0.1", state.base_ws_port))
-                .await
-                .is_ok()
-        },
-    )
-    .await?;
-    // getHealth answers "ok" mid-genesis; dlp is only invocable once slots tick
-    process::wait_until(
-        Duration::from_secs(30),
-        "base L1 past genesis (confirmed slot >= 2)",
-        base_log,
-        state.base_pid,
-        || async { matches!(base_api.get_slot().await, Ok(slot) if slot >= 2) },
+        // The ER dials the base WS first and exits if it cannot connect.
+        &listeners,
     )
     .await?;
 
@@ -306,6 +313,7 @@ async fn attach_er(
         identity: er_identity,
         base_rpc_url: format!("http://127.0.0.1:{}", state.base_rpc_port),
         base_ws_url: format!("ws://127.0.0.1:{}", state.base_ws_port),
+        base_grpc_url: None,
         listen_port: er_rpc_port,
         metrics_port: er_metrics_port,
         replication_port: er_replication_port,

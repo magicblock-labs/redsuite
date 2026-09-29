@@ -10,5 +10,6 @@ pub mod parallel_cloning;
 pub mod post_delegation_token_transfer;
 pub mod program_upgrade;
 pub mod projected_token_lifecycle;
+pub mod undelegation_grpc_redundancy;
 
 pub(crate) mod spl;

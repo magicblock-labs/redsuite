@@ -1,6 +1,5 @@
-use std::{cell::Cell, collections::HashMap, rc::Rc, time::Duration};
+use std::{cell::Cell, rc::Rc, time::Duration};
 
-use account::Account;
 use async_trait::async_trait;
 use futures_util::future::{try_join, try_join_all};
 use json::JsonValueTrait;
@@ -26,22 +25,16 @@ pub enum CacheLifecycle {
     UndelegationReconnectGap,
 }
 
-fn id(account: Option<Account>) -> Option<u64> {
-    account.and_then(|a| crate::written_id(&a.data))
-}
-
-async fn local(er: &ErCtx, keys: &[Pubkey]) -> Result<Vec<Option<Account>>> {
-    let mut accounts = HashMap::new();
-    for owner in [program::id(), program::DELEGATION_PROGRAM_ID] {
-        accounts.extend(er.api().get_program_accounts(&owner).await?);
-    }
-    Ok(keys.iter().map(|key| accounts.get(key).cloned()).collect())
-}
-
 async fn value(er: &ErCtx, keys: &[Pubkey], expected: u64) -> Result<()> {
     check::poll_for("latest base value observed locally", TIMEOUT, || async {
-        for (key, account) in keys.iter().zip(local(er, keys).await?) {
-            check_eq!(id(account), Some(expected), "base value of {key}")?;
+        for (key, account) in
+            keys.iter().zip(crate::local_accounts(er, keys).await?)
+        {
+            check_eq!(
+                crate::account_id(account),
+                Some(expected),
+                "base value of {key}"
+            )?;
         }
         Result::Ok(())
     })
@@ -148,7 +141,7 @@ impl PrivateErScenario for CacheLifecycle {
             http.events().iter().any(|e| e.action == Action::Held)
         })
         .await?;
-        let protected = local(er, protected_keys).await?;
+        let protected = crate::local_accounts(er, protected_keys).await?;
         check!(protected.iter().all(Option::is_some), "protected residency")?;
         let base_delegated = base.accounts(delegated).await?;
         let pool: Vec<_> = (0..512).map(|_| Keypair::new().pubkey()).collect();
@@ -207,7 +200,8 @@ impl PrivateErScenario for CacheLifecycle {
                         .copy_from_slice(&hash);
                 }
                 let count = if completed.get() { 2 } else { 4 };
-                let actual = local(er, &protected_keys[..count]).await?;
+                let actual =
+                    crate::local_accounts(er, &protected_keys[..count]).await?;
                 check_eq!(actual, expected[..count], "protected local state")?;
                 if outcome.err.is_none() {
                     progress.set(progress.get() + 1);
@@ -229,7 +223,7 @@ impl PrivateErScenario for CacheLifecycle {
                 let next = eviction_count().await?;
                 check!(next > evictions, "evictions before reconnect {cycle}")?;
                 evictions = next;
-                let cold = local(er, &[target]).await?;
+                let cold = crate::local_accounts(er, &[target]).await?;
                 check!(cold[0].is_none(), "new subscription target is cold")?;
                 let reconnect = observe("accountSubscribe", &pending[0]);
                 ws.close_connections();
@@ -257,7 +251,11 @@ impl PrivateErScenario for CacheLifecycle {
                     Ok(())
                 })
                 .await?;
-                check_eq!(id(read), Some(latest), "HTTP read stays current")?;
+                check_eq!(
+                    crate::account_id(read),
+                    Some(latest),
+                    "HTTP read stays current"
+                )?;
                 value(er, &[target], latest).await?;
                 check!(
                     base.accounts(pending).await?.iter().all(|a|
@@ -295,10 +293,11 @@ impl PrivateErScenario for CacheLifecycle {
                         "ER discovers the completed undelegation",
                         RECOVERY_OBSERVATION,
                         || async {
-                            match local(er, pending).await {
+                            match crate::local_accounts(er, pending).await {
                                 Ok(observed)
                                     if observed.iter().all(|a| {
-                                        id(a.clone()) == Some(900)
+                                        crate::account_id(a.clone())
+                                            == Some(900)
                                     }) =>
                                 {
                                     Ok(released_at.elapsed())
@@ -307,7 +306,7 @@ impl PrivateErScenario for CacheLifecycle {
                                     "{:?}",
                                     observed
                                         .iter()
-                                        .map(|a| id(a.clone()))
+                                        .map(|a| crate::account_id(a.clone()))
                                         .collect::<Vec<_>>()
                                 )),
                                 Err(error) => Err(error.to_string()),

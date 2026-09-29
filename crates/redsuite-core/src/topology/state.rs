@@ -13,6 +13,10 @@ pub struct StackState {
     pub base_ws_port: u16,
     pub base_faucet_port: u16,
     pub base_gossip_port: u16,
+    #[serde(default)]
+    pub base_grpc_port: u16,
+    #[serde(default)]
+    pub base_plugin: String,
     pub base_pid: u32,
     pub base_bin: String,
     pub er_rpc_port: u16,
