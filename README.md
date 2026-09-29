@@ -221,8 +221,8 @@ boot needs that endpoint. A warm stack does not, and neither does a rerun.
 
 ### Yellowstone gRPC
 
-The shared base always boots with the upstream Yellowstone geyser plugin, so
-the feed is provisioned once, before any scenario runs, and no scenario ever
+The shared base boots with the upstream Yellowstone geyser plugin when it can,
+so the feed is provisioned once, before any scenario runs, and no scenario ever
 restarts the base to acquire it. An ER only receives the feed when its scenario
 puts the endpoint in `BaseEndpoints::grpc_url`; today only
 `undelegation_grpc_redundancy` does, so every other ER keeps exactly the

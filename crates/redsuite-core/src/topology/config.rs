@@ -276,13 +276,18 @@ impl BasePlan {
         let mut geyser_plugin_config = None;
         let mut plugin = String::new();
         if let Some(port) = grpc_port {
-            match super::yellowstone::ensure(&bin).await {
-                Ok(yellowstone) => {
-                    let path = stack_dir.join(format!("geyser-{port}.json"));
-                    yellowstone
-                        .write_config(&path, &format!("127.0.0.1:{port}"))?;
+            let feed = async {
+                let yellowstone = super::yellowstone::ensure(&bin).await?;
+                let path = stack_dir.join(format!("geyser-{port}.json"));
+                yellowstone
+                    .write_config(&path, &format!("127.0.0.1:{port}"))?;
+                Result::Ok((path, yellowstone.tag))
+            }
+            .await;
+            match feed {
+                Ok((path, tag)) => {
                     geyser_plugin_config = Some(path);
-                    plugin = yellowstone.tag;
+                    plugin = tag;
                 }
                 Err(e) => console::line(format_args!(
                     "no Yellowstone gRPC feed on this base: {e}"
