@@ -152,11 +152,10 @@ pub fn parse_receipt(
     receipt
 }
 
-pub async fn fetch_commit_receipt(
+pub async fn scheduled_receipt_signature(
     er: &Api,
     commit_signature: &Signature,
-    timeout: Duration,
-) -> Result<CommitReceipt> {
+) -> Result<Signature> {
     let commit_tx = er
         .await_transaction(commit_signature, SCHEDULE_FETCH_TIMEOUT)
         .await?;
@@ -167,14 +166,23 @@ pub async fn fetch_commit_receipt(
         .actual(format!("failed on-chain: {err:?}"))
         .into());
     }
-    let receipt_signature = receipt_signature_in_logs(&commit_tx.logs)
-        .ok_or_else(|| {
-            CheckError::new(format!(
-                "commit tx {commit_signature} logs carry no \
-                 ScheduledCommitSent signature — was a commit actually \
-                 scheduled?"
-            ))
-        })?;
+    receipt_signature_in_logs(&commit_tx.logs).ok_or_else(|| {
+        CheckError::new(format!(
+            "commit tx {commit_signature} logs carry no \
+             ScheduledCommitSent signature — was a commit actually \
+             scheduled?"
+        ))
+        .into()
+    })
+}
+
+pub async fn fetch_commit_receipt(
+    er: &Api,
+    commit_signature: &Signature,
+    timeout: Duration,
+) -> Result<CommitReceipt> {
+    let receipt_signature =
+        scheduled_receipt_signature(er, commit_signature).await?;
     let receipt_tx = er.await_transaction(&receipt_signature, timeout).await?;
     Ok(parse_receipt(receipt_signature, &receipt_tx))
 }

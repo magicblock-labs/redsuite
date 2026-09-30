@@ -24,6 +24,7 @@ const BASE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(30);
 const BASE_STATE_TIMEOUT: Duration = Duration::from_secs(30);
 const RECEIPT_TIMEOUT: Duration = Duration::from_secs(120);
 const BLACKOUT_WINDOW: Duration = Duration::from_secs(5);
+const BLACKOUT_POLL: Duration = Duration::from_millis(200);
 const SUBMISSION_WRITE: u64 = 41;
 const CONFIRMATION_WRITE: u64 = 42;
 const RECONNECT_WRITE: u64 = 43;
@@ -223,6 +224,9 @@ impl PrivateErScenario for CommitBlackout {
         let (snapshot, commit_signature) =
             write_and_commit(er, &payer, 2, CONFIRMATION_WRITE, &account)
                 .await?;
+        let receipt_signature =
+            receipt::scheduled_receipt_signature(er.api(), &commit_signature)
+                .await?;
         let probe = submission_probe.wait(INTERCEPT_TIMEOUT).await?;
         let base_signature = probe.operation.signature()?;
         let status_blackout = proxies.stall(
@@ -240,18 +244,21 @@ impl PrivateErScenario for CommitBlackout {
         probe.release();
         prove_landed(base, &base_signature, &account, &snapshot).await?;
         let held = notification_trap.wait(INTERCEPT_TIMEOUT).await?;
-        let blackout_receipt = receipt::fetch_commit_receipt(
-            er.api(),
-            &commit_signature,
-            BLACKOUT_WINDOW,
-        )
-        .await;
-        check!(
-            blackout_receipt.is_err(),
-            "no commit receipt may appear while the confirmation is withheld, \
-             got {:?}",
-            blackout_receipt.map(|receipt| receipt.base_signatures)
-        )?;
+        let blackout_end = Instant::now() + BLACKOUT_WINDOW;
+        loop {
+            check!(
+                er.api()
+                    .get_transaction(&receipt_signature)
+                    .await?
+                    .is_none(),
+                "no commit receipt {receipt_signature} may appear while \
+                 confirmation is withheld"
+            )?;
+            if Instant::now() >= blackout_end {
+                break;
+            }
+            tokio::time::sleep(BLACKOUT_POLL).await;
+        }
         held.release();
         status_blackout.remove();
         let confirmation = await_convergence(
