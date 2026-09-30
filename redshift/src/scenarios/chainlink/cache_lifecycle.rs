@@ -19,6 +19,7 @@ use crate::program::{self, instruction::build, layout::*, utils::fold_hash};
 const TIMEOUT: Duration = Duration::from_secs(20);
 const EVICTIONS: &str = "engine_keeper_account_cache_evictions";
 const RECOVERY_OBSERVATION: Duration = Duration::from_secs(100);
+const FETCHES: [&str; 2] = ["getAccountInfo", "getMultipleAccounts"];
 
 pub enum CacheLifecycle {
     Churn,
@@ -56,7 +57,7 @@ impl PrivateErScenario for CacheLifecycle {
     async fn run(&self, base: &BaseCtx) -> Result<ScenarioReport> {
         let (label, churn_cycles) = match self {
             Self::Churn => ("cache-lifecycle", 3),
-            Self::UndelegationReconnectGap => ("undelegation-reconnect-gap", 1),
+            Self::UndelegationReconnectGap => ("undelegation-reconnect-gap", 0),
         };
         let reconnect_before_settlement =
             matches!(self, Self::UndelegationReconnectGap);
@@ -72,6 +73,14 @@ impl PrivateErScenario for CacheLifecycle {
         };
         let mut endpoints = http.endpoints();
         endpoints.ws_url = ws.endpoints().ws_url;
+        if reconnect_before_settlement {
+            let (grpc_url, _) = base.grpc().ok_or(
+                "redshift/undelegation_reconnect_gap needs the base L1 \
+                 Yellowstone gRPC feed; run `redsuite stack down` and retry \
+                 on a host where the plugin resolves",
+            )?;
+            endpoints.grpc_url = Some(grpc_url.to_owned());
+        }
         let private = topology::private_er(
             base,
             ErOptions {
@@ -107,10 +116,14 @@ impl PrivateErScenario for CacheLifecycle {
             .await?;
         let (readonly, protected_keys) = keys.split_at(3);
         let (delegated, pending) = protected_keys.split_at(2);
-        let stale: Vec<_> = protected_keys
-            .iter()
-            .map(|key| observe("programNotification", key))
-            .collect();
+        let stale: Vec<_> = if reconnect_before_settlement {
+            Vec::new()
+        } else {
+            protected_keys
+                .iter()
+                .map(|key| observe("programNotification", key))
+                .collect()
+        };
         let delegates: Vec<_> = protected_keys
             .iter()
             .zip(3..)
@@ -210,10 +223,28 @@ impl PrivateErScenario for CacheLifecycle {
             Ok(())
         };
         let faults = async {
+            let mut blackout = Vec::new();
             let mut evictions = before;
             progressed(0).await?;
             for held in stale {
                 held.release();
+            }
+            if reconnect_before_settlement {
+                for chunk in pool.chunks(32) {
+                    er.accounts(chunk).await?;
+                }
+                let next = eviction_count().await?;
+                check!(next > evictions, "evictions before blackout")?;
+                evictions = next;
+                blackout.push(
+                    ws.stall(Selector::default().response().notification()),
+                );
+                for key in protected_keys {
+                    blackout.push(http.stall(
+                        Selector::methods(&FETCHES).response().account(key),
+                    ));
+                }
+                ws.close_connections();
             }
             for (cycle, &target) in readonly[..churn_cycles].iter().enumerate()
             {
@@ -262,13 +293,6 @@ impl PrivateErScenario for CacheLifecycle {
                         matches!(a, Some(a) if a.owner == program::DELEGATION_PROGRAM_ID)),
                     "undelegation stayed pending through churn"
                 )?;
-            }
-            if reconnect_before_settlement {
-                // Allow settlement as subscriptions are being rebuilt.
-                let resubscribing = ws
-                    .intercept(Selector::method("accountSubscribe").response());
-                ws.close_connections();
-                resubscribing.wait(TIMEOUT).await?.release();
             }
             completed.set(true);
             settlement.remove();
