@@ -5,6 +5,8 @@ use std::{
     time::Duration,
 };
 
+use rand::Rng;
+
 use crate::{host::proc_running, Result};
 
 pub(super) const KILL_GRACE: Duration = Duration::from_secs(5);
@@ -408,6 +410,152 @@ where
     }
 }
 
+#[cfg(target_os = "linux")]
+fn socket_address(raw: &str) -> Option<std::net::SocketAddr> {
+    use std::net::IpAddr;
+    let (ip, port) = raw.rsplit_once(':')?;
+    let mut bytes = Vec::new();
+    for word in ip.as_bytes().chunks_exact(8) {
+        bytes.extend(
+            u32::from_str_radix(std::str::from_utf8(word).ok()?, 16)
+                .ok()?
+                .to_ne_bytes(),
+        );
+    }
+    let ip = match ip.len() {
+        8 => IpAddr::from(<[u8; 4]>::try_from(bytes).ok()?),
+        32 => IpAddr::from(<[u8; 16]>::try_from(bytes).ok()?),
+        _ => return None,
+    };
+    Some((ip, u16::from_str_radix(port, 16).ok()?).into())
+}
+
+#[cfg(target_os = "linux")]
+fn port_holders(port: u16) -> Vec<String> {
+    let mut holders = Vec::new();
+    for protocol in ["tcp", "tcp6", "udp", "udp6"] {
+        let Ok(content) = fs::read_to_string(format!("/proc/net/{protocol}"))
+        else {
+            continue;
+        };
+        for line in content.lines().skip(1) {
+            let cols: Vec<&str> = line.split_whitespace().collect();
+            if cols.len() < 10 {
+                continue;
+            }
+            let Some(local) = socket_address(cols[1]) else {
+                continue;
+            };
+            if local.port() != port {
+                continue;
+            }
+            let state = match cols[3] {
+                "01" => "ESTABLISHED",
+                "02" => "SYN_SENT",
+                "03" => "SYN_RECV",
+                "04" => "FIN_WAIT1",
+                "05" => "FIN_WAIT2",
+                "06" => "TIME_WAIT",
+                "07" if protocol.starts_with("udp") => "UNCONN",
+                "07" => "CLOSE",
+                "08" => "CLOSE_WAIT",
+                "09" => "LAST_ACK",
+                "0A" => "LISTEN",
+                "0B" => "CLOSING",
+                "0C" => "NEW_SYN_RECV",
+                _ => "UNKNOWN",
+            };
+            let owner = if cols[9] == "0" {
+                "no live owner".to_owned()
+            } else {
+                find_socket_owner(&format!("socket:[{}]", cols[9]))
+                    .map(|(pid, cmd)| format!("pid={pid} cmd={cmd}"))
+                    .unwrap_or_else(|| "owner=unavailable".to_owned())
+            };
+            let peer = socket_address(cols[2])
+                .map(|address| address.to_string())
+                .unwrap_or_default();
+            holders.push(format!(
+                "{protocol} {local} -> {peer} state={state} {owner}"
+            ));
+        }
+    }
+    holders
+}
+
+#[cfg(target_os = "linux")]
+fn find_socket_owner(target: &str) -> Option<(u32, String)> {
+    let procs = fs::read_dir("/proc").ok()?;
+    for entry in procs.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let Ok(fds) = fs::read_dir(entry.path().join("fd")) else {
+            continue;
+        };
+        for fd in fds.flatten() {
+            if fs::read_link(fd.path())
+                .map(|link| link.to_string_lossy() == target)
+                .unwrap_or(false)
+            {
+                let cmd = cmdline(pid).unwrap_or_default().replace('\0', " ");
+                return Some((pid, cmd.trim_end().chars().take(160).collect()));
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn port_holders(port: u16) -> Vec<String> {
+    let output = match Command::new("lsof")
+        .args([
+            "-nP",
+            &format!("-iTCP:{port}"),
+            &format!("-iUDP:{port}"),
+            "-FpfPnT",
+        ])
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) => return vec![format!("lsof lookup failed: {error}")],
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut holders: Vec<String> = Vec::new();
+    let (mut pid, mut protocol, mut current) = (0, "", None);
+    for line in text.lines().filter(|line| !line.is_empty()) {
+        let (field, value) = line.split_at(1);
+        match field {
+            "p" => pid = value.parse::<u32>().unwrap_or_default(),
+            "f" => current = None,
+            "P" => protocol = value,
+            "n" if value
+                .split("->")
+                .next()
+                .is_some_and(|local| local.ends_with(&format!(":{port}"))) =>
+            {
+                let cmd =
+                    cmdline(pid).unwrap_or_else(|| "unavailable".to_owned());
+                current = Some(holders.len());
+                holders.push(format!("{protocol} {value} pid={pid} cmd={cmd}"));
+            }
+            "T" if value.starts_with("ST=") => {
+                if let Some(index) = current {
+                    holders[index].push_str(&format!(" state={}", &value[3..]));
+                }
+            }
+            _ => {}
+        }
+    }
+    if !output.stderr.is_empty() {
+        holders.push(format!(
+            "lsof: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    holders
+}
+
 fn tail(path: &Path, lines: usize) -> String {
     let Ok(content) = fs::read_to_string(path) else {
         return format!("<no log at {}>", path.display());
@@ -418,39 +566,101 @@ fn tail(path: &Path, lines: usize) -> String {
 
 #[derive(Default)]
 pub(super) struct PortLease {
-    holders: Vec<std::net::TcpListener>,
+    holders: Vec<(std::net::TcpListener, std::net::UdpSocket)>,
+    claims: Vec<(u16, fs::File)>,
+}
+
+const PORT_BAND: std::ops::Range<u16> = 20_000..30_000;
+const BAND_ATTEMPTS: usize = 512;
+
+fn registry_dir() -> std::path::PathBuf {
+    if let Some(dir) = std::env::var_os("REDSUITE_PORT_REGISTRY") {
+        return std::path::PathBuf::from(dir);
+    }
+    let who = std::env::var("HOME")
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_else(|_| "shared".to_owned());
+    let tag = who.bytes().fold(0xcbf2_9ce4_8422_2325u64, |acc, byte| {
+        (acc ^ byte as u64).wrapping_mul(0x100_0000_01b3)
+    });
+    std::env::temp_dir().join(format!("redsuite-ports-{tag:x}"))
 }
 
 impl PortLease {
+    fn claim(&mut self, want: u16) -> Result<u16> {
+        let dir = registry_dir();
+        fs::create_dir_all(&dir)?;
+        let start = rand::thread_rng().gen_range(PORT_BAND);
+        for first in (start..PORT_BAND.end)
+            .chain(PORT_BAND.start..start)
+            .take(BAND_ATTEMPTS)
+        {
+            if first + want > PORT_BAND.end {
+                continue;
+            }
+            let mut claims = Vec::new();
+            let mut holders = Vec::new();
+            for port in first..first + want {
+                let lock = fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .write(true)
+                    .open(dir.join(format!("{port}.lock")))?;
+                match lock.try_lock() {
+                    Ok(()) => {}
+                    Err(fs::TryLockError::WouldBlock) => break,
+                    Err(error) => return Err(error.into()),
+                }
+                let Ok(tcp) = std::net::TcpListener::bind(("127.0.0.1", port))
+                else {
+                    break;
+                };
+                let Ok(udp) = std::net::UdpSocket::bind(("127.0.0.1", port))
+                else {
+                    break;
+                };
+                claims.push((port, lock));
+                holders.push((tcp, udp));
+            }
+            if holders.len() != usize::from(want) {
+                continue;
+            }
+            self.holders.extend(holders);
+            self.claims.extend(claims);
+            return Ok(first);
+        }
+        Err(format!(
+            "no free block of {want} in {}-{} after {BAND_ATTEMPTS} attempts",
+            PORT_BAND.start,
+            PORT_BAND.end - 1
+        )
+        .into())
+    }
+
     pub(super) fn single(&mut self) -> Result<u16> {
-        let holder = std::net::TcpListener::bind(("127.0.0.1", 0))?;
-        let port = holder.local_addr()?.port();
-        self.holders.push(holder);
-        Ok(port)
+        self.claim(1)
     }
 
     pub(super) fn pair(&mut self) -> Result<(u16, u16)> {
-        let mut rejected = Vec::new();
-        for _ in 0..64 {
-            let first = std::net::TcpListener::bind(("127.0.0.1", 0))?;
-            let port = first.local_addr()?.port();
-            if port == u16::MAX {
-                rejected.push(first);
-                continue;
-            }
-            match std::net::TcpListener::bind(("127.0.0.1", port + 1)) {
-                Ok(second) => {
-                    self.holders.push(first);
-                    self.holders.push(second);
-                    return Ok((port, port + 1));
-                }
-                Err(_) => rejected.push(first),
-            }
-        }
-        Err("could not find two adjacent free ports".into())
+        let first = self.claim(2)?;
+        Ok((first, first + 1))
     }
 
     pub(super) fn release(&mut self) {
         self.holders.clear();
+    }
+
+    pub(super) fn failure(
+        &self,
+        error: impl std::fmt::Display,
+    ) -> crate::DynError {
+        let ports: Vec<_> = self.claims.iter().map(|(port, _)| *port).collect();
+        let mut message = format!("{error}\nreserved ports: {ports:?}");
+        for port in ports {
+            for holder in port_holders(port) {
+                message.push_str(&format!("\n  {holder}"));
+            }
+        }
+        message.into()
     }
 }
