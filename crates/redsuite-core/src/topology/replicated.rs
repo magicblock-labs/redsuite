@@ -65,6 +65,7 @@ pub struct Verifier {
     child: Option<Child>,
     record: Rc<ResourceRecord>,
     metrics_url: String,
+    ports: process::PortLease,
 }
 
 impl Verifier {
@@ -133,6 +134,7 @@ impl Verifier {
             || async { self.scrape_metrics().await.is_ok() },
         )
         .await
+        .map_err(|error| self.ports.failure(error))
     }
 
     pub async fn wait_connected(&self, timeout: Duration) -> Result<Duration> {
@@ -461,6 +463,7 @@ pub async fn replicated(
             identity: plan.identity.pubkey().to_string(),
             launched_at: report::utc_stamp(),
             rpc_port: None,
+            ws_port: None,
             metrics_port,
             replication_port: None,
             upstream: Some(plan.upstream_address()),
@@ -483,6 +486,7 @@ pub async fn replicated(
             child: Some(child),
             record,
             metrics_url,
+            ports,
         };
         if let Err(error) = verifier.wait_ready(VERIFIER_READY_TIMEOUT).await {
             let mut verifier = verifier;

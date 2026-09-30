@@ -18,6 +18,8 @@ pub struct LaunchRecord {
     pub launched_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rpc_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ws_port: Option<u16>,
     pub metrics_port: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replication_port: Option<u16>,
@@ -248,6 +250,7 @@ mod tests {
             identity: "id".to_owned(),
             launched_at: "20260903T080000Z".to_owned(),
             rpc_port: None,
+            ws_port: None,
             metrics_port: 9001,
             replication_port: None,
             upstream: Some("127.0.0.1:7802".to_owned()),

@@ -49,6 +49,7 @@ pub struct PrivateEr {
     child: Option<Child>,
     ctx: ErCtx,
     record: Rc<ResourceRecord>,
+    ports: process::PortLease,
 }
 
 impl PrivateEr {
@@ -112,6 +113,7 @@ impl PrivateEr {
             || api.primary_ready(),
         )
         .await
+        .map_err(|error| self.ports.failure(error))
     }
 
     // Stop the ER without a relaunch. hard_kill=true is the crash path the
@@ -187,7 +189,8 @@ impl PrivateEr {
             self.pid,
             || api.primary_ready(),
         )
-        .await?;
+        .await
+        .map_err(|error| self.ports.failure(error))?;
         let startup = launch_started.elapsed();
         let total = restart_started.elapsed();
         self.ctx.reset_blockhash();
@@ -371,6 +374,7 @@ async fn launch(
         identity: identity_pubkey.to_string(),
         launched_at: report::utc_stamp(),
         rpc_port: Some(rpc_port),
+        ws_port: Some(ws_port),
         metrics_port,
         replication_port: Some(replication_port),
         upstream: None,
@@ -394,8 +398,10 @@ async fn launch(
     )
     .await;
     if let Err(e) = ready {
+        let error =
+            ports.failure(format_args!("private ER `{}`: {e}", options.label));
         abort_boot(child, pid, &record);
-        return Err(e);
+        return Err(error);
     }
 
     if let Err(e) = await_magic_fee_vault(base, &identity_pubkey).await {
@@ -418,5 +424,6 @@ async fn launch(
         child: Some(child),
         ctx,
         record,
+        ports,
     })
 }

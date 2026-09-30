@@ -226,6 +226,7 @@ async fn boot_base(config: ExecutionConfig) -> Result<StackState> {
                 return Ok(state);
             }
             Err(e) => {
+                let e = base_ports.failure(e);
                 process::kill_pid(base_pid);
                 if state.base_grpc_port == 0 {
                     return Err(e);
@@ -338,6 +339,7 @@ async fn attach_er(
     )
     .await;
     if let Err(e) = ready {
+        let e = er_ports.failure(e);
         process::kill_pid(er_pid);
         return Err(e);
     }
