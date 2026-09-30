@@ -7,6 +7,7 @@ use std::{
 
 use async_trait::async_trait;
 use pubkey::Pubkey;
+use redsuite_core::redline::Accounts;
 use redsuite_core::report::Unit;
 use redsuite_core::{
     api::custom_error_code,
@@ -205,24 +206,11 @@ impl Scenario for CommitWidthEnvelope {
             profile::select(self.name(), base.config(), &PROFILES);
         let payer = prep::funded_payer(base, PAYER_LAMPORTS).await?;
         let payer_pubkey = payer.pubkey();
-        let pdas = crate::init_delegated_accounts(
-            base,
-            &payer,
-            profile.pool,
-            ACCOUNT_SPACE,
-            er.identity(),
-        )
-        .await?;
-        for pda in &pdas {
-            check::poll(
-                &format!("the ER clones the delegated pda {pda}"),
-                CLONE_TIMEOUT,
-                || async {
-                    matches!(er.account(pda).await, Ok(Some(acc)) if acc.data.len() == ACCOUNT_SPACE as usize)
-                },
-            )
+        let pdas = Accounts::new(ACCOUNT_SPACE, er.identity())
+            .init_delegated(base, &payer, profile.pool)
             .await?;
-        }
+        prep::await_clones(er, &pdas, ACCOUNT_SPACE as usize, CLONE_TIMEOUT)
+            .await?;
         let sender = er.sender(Rc::new(payer));
 
         // the whole pipeline per request: deliver on the ER, await the
@@ -690,14 +678,9 @@ impl Scenario for CommitWidthEnvelope {
                 let probe_payer =
                     prep::funded_payer(base, PAYER_LAMPORTS).await?;
                 let probe_payer_pubkey = probe_payer.pubkey();
-                let probe_pdas = crate::init_delegated_accounts(
-                    base,
-                    &probe_payer,
-                    1,
-                    ACCOUNT_SPACE,
-                    er.identity(),
-                )
-                .await?;
+                let probe_pdas = Accounts::new(ACCOUNT_SPACE, er.identity())
+                    .init_delegated(base, &probe_payer, 1)
+                    .await?;
                 let probe_account = probe_pdas[0];
                 check::poll(
                     "the ER clones the commit-limit probe account",

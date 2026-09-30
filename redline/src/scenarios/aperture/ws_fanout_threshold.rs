@@ -2,8 +2,8 @@ use std::{collections::HashMap, rc::Rc, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use instruction::Instruction;
-use keypair::Keypair;
 use pubkey::Pubkey;
+use redsuite_core::redline::Accounts;
 use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, prep,
@@ -116,8 +116,7 @@ fn execute_cell(
             .enumerate()
             .filter(|(payer_index, _)| payer_index % threads == thread_index)
             .map(|(_, bytes)| {
-                let payer = Keypair::try_from(&bytes[..])
-                    .expect("payer bytes round-trip");
+                let payer = prep::payer_from_bytes(bytes);
                 client.sender(Rc::new(payer))
             })
             .collect();
@@ -164,24 +163,16 @@ impl Scenario for WsFanoutThreshold {
         let prep_payers =
             prep::funded_payers(base, profile.payers, PREP_PAYER_LAMPORTS)
                 .await?;
-        let pool = crate::init_delegated_accounts_batched(
-            base,
-            &prep_payers,
-            profile.accounts,
-            crate::ACCOUNT_SPACE,
-            er.identity(),
+        let pool = Accounts::new(crate::ACCOUNT_SPACE, er.identity())
+            .init_batched(base, &prep_payers, profile.accounts, true)
+            .await?;
+        prep::await_clones(
+            er,
+            &pool,
+            crate::ACCOUNT_SPACE as usize,
+            CLONE_TIMEOUT,
         )
         .await?;
-        for pda in &pool {
-            check::poll(
-                &format!("the ER clones the delegated pda {pda}"),
-                CLONE_TIMEOUT,
-                || async {
-                    matches!(er.account(pda).await, Ok(Some(acc)) if acc.data.len() == crate::ACCOUNT_SPACE as usize)
-                },
-            )
-            .await?;
-        }
         let payer_bytes: Arc<Vec<[u8; 64]>> = Arc::new(
             prep_payers.iter().map(|payer| payer.to_bytes()).collect(),
         );

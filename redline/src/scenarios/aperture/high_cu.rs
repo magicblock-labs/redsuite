@@ -6,6 +6,7 @@ use std::{
 
 use async_trait::async_trait;
 use pubkey::Pubkey;
+use redsuite_core::redline::Accounts;
 use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, prep,
@@ -274,24 +275,16 @@ impl Scenario for HighCu {
             profile::select(self.name(), base.config(), &PROFILES);
         let payers =
             prep::funded_payers(base, profile.payers, PAYER_LAMPORTS).await?;
-        let pdas = crate::init_delegated_accounts(
-            base,
-            &payers[0],
-            profile.accounts,
-            crate::ACCOUNT_SPACE,
-            er.identity(),
+        let pdas = Accounts::new(crate::ACCOUNT_SPACE, er.identity())
+            .init_delegated(base, &payers[0], profile.accounts)
+            .await?;
+        prep::await_clones(
+            er,
+            &pdas,
+            crate::ACCOUNT_SPACE as usize,
+            Duration::from_secs(15),
         )
         .await?;
-        for pda in &pdas {
-            check::poll(
-                &format!("the ER clones the delegated pda {pda}"),
-                Duration::from_secs(15),
-                || async {
-                    matches!(er.account(pda).await, Ok(Some(acc)) if acc.data.len() == crate::ACCOUNT_SPACE as usize)
-                },
-            )
-            .await?;
-        }
         let senders: Vec<TxSender> = payers
             .into_iter()
             .map(|payer| er.sender(Rc::new(payer)))

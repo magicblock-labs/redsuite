@@ -6,12 +6,13 @@ use std::{
 
 use async_trait::async_trait;
 use instruction::Instruction;
-use keypair::Keypair;
 use pubkey::Pubkey;
+use redsuite_core::redline::Accounts;
 use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, host, prep,
     profile::{self, ProfileValues},
+    redline::causal::{compute_unit_limit, CU_LIMIT},
     runner::{
         execute_raw, merge_outcomes, spawn_workers, Pacing, RunConfig,
         RunOutcome,
@@ -27,7 +28,6 @@ const CLONE_TIMEOUT: Duration = Duration::from_secs(60);
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(1_800);
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(60);
 const HASH_INIT: Pubkey = Pubkey::new_from_array([7u8; 32]);
-const CU_LIMIT: u32 = 1_400_000;
 
 use crate::metrics::{
     ENGINE_TRANSACTIONS, RPC_ACCEPTED_TRANSACTIONS, RPC_HANDLED_TRANSACTIONS,
@@ -202,16 +202,6 @@ const PROFILES: ProfileValues<Profile> = ProfileValues {
     deep: None,
 };
 
-fn compute_unit_limit(limit: u32) -> Instruction {
-    let mut data = vec![2u8];
-    data.extend_from_slice(&limit.to_le_bytes());
-    Instruction {
-        program_id: sdk_ids::compute_budget::ID,
-        accounts: Vec::new(),
-        data,
-    }
-}
-
 fn build_ixs(
     id: u64,
     pool: &[Pubkey],
@@ -282,8 +272,7 @@ async fn execute(
                 .enumerate()
                 .filter(|(payer_index, _)| payer_index % threads == index)
                 .map(|(_, bytes)| {
-                    let payer = Keypair::try_from(&bytes[..])
-                        .expect("payer bytes round-trip");
+                    let payer = prep::payer_from_bytes(bytes);
                     client.sender(Rc::new(payer))
                 })
                 .collect();
@@ -479,24 +468,16 @@ impl Scenario for MixedSustainedLoad {
         let payers =
             prep::funded_payers(base, profile.payers, PAYER_LAMPORTS).await?;
         let prep_started = Instant::now();
-        let pool = crate::init_delegated_accounts_batched(
-            base,
-            &payers,
-            profile.lanes as usize,
-            crate::ACCOUNT_SPACE,
-            er.identity(),
+        let pool = Accounts::new(crate::ACCOUNT_SPACE, er.identity())
+            .init_batched(base, &payers, profile.lanes as usize, true)
+            .await?;
+        prep::await_clones(
+            er,
+            &pool,
+            crate::ACCOUNT_SPACE as usize,
+            CLONE_TIMEOUT,
         )
         .await?;
-        for pda in &pool {
-            check::poll(
-                &format!("the ER clones the delegated pda {pda}"),
-                CLONE_TIMEOUT,
-                || async {
-                    matches!(er.account(pda).await, Ok(Some(acc)) if acc.data.len() == crate::ACCOUNT_SPACE as usize)
-                },
-            )
-            .await?;
-        }
         eprintln!(
             "[redsuite] {}: prepped {} lanes in {:.1} s",
             self.name(),

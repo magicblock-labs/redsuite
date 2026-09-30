@@ -5,10 +5,10 @@ use std::time::Duration;
 use keypair::Keypair;
 use pubkey::Pubkey;
 pub use redline_interface as program;
+use redsuite_core::redline::Accounts;
 use redsuite_core::{
     check, check_eq, dlp, receipt, BaseCtx, ChainCtx, ErCtx, Result,
 };
-use signer::Signer;
 
 pub const ACCOUNT_SPACE: u32 = 128;
 pub const PAYER_LAMPORTS: u64 = 2_000_000_000;
@@ -91,15 +91,9 @@ pub async fn init_account(
     seed: u8,
     authority: Pubkey,
 ) -> Result<Pubkey> {
-    let (init, pda) = program::instruction::build::init_account(
-        payer.pubkey(),
-        payer.pubkey(),
-        ACCOUNT_SPACE,
-        seed,
-        authority,
-    );
-    base.submit_and_confirm(payer, &[init]).await?;
-    Ok(pda)
+    Accounts::new(ACCOUNT_SPACE, authority)
+        .init(base, payer, seed, false)
+        .await
 }
 
 pub async fn init_delegated_account(
@@ -118,25 +112,9 @@ pub async fn init_delegated_account_sized(
     authority: Pubkey,
     space: u32,
 ) -> Result<Pubkey> {
-    let program_id = program::id();
-    let (init, pda) = program::instruction::build::init_account_at(
-        program_id,
-        payer.pubkey(),
-        payer.pubkey(),
-        space,
-        seed,
-        authority,
-    );
-    let delegate = program::instruction::build::delegate_at(
-        program_id,
-        payer.pubkey(),
-        pda,
-        payer.pubkey(),
-        seed,
-        authority,
-    );
-    base.submit_and_confirm(payer, &[init, delegate]).await?;
-    Ok(pda)
+    Accounts::new(space, authority)
+        .init(base, payer, seed, true)
+        .await
 }
 
 pub async fn last_commit_id(base: &BaseCtx, account: &Pubkey) -> Result<u64> {
@@ -154,22 +132,11 @@ pub async fn init_delegated_account_at(
     seed: u8,
     authority: Pubkey,
 ) -> Result<Pubkey> {
-    let (init, pda) = program::instruction::build::init_account_at(
+    Accounts {
         program_id,
-        payer.pubkey(),
-        payer.pubkey(),
-        ACCOUNT_SPACE,
-        seed,
+        space: ACCOUNT_SPACE,
         authority,
-    );
-    let delegate = program::instruction::build::delegate_at(
-        program_id,
-        payer.pubkey(),
-        pda,
-        payer.pubkey(),
-        seed,
-        authority,
-    );
-    base.submit_and_confirm(payer, &[init, delegate]).await?;
-    Ok(pda)
+    }
+    .init(base, payer, seed, true)
+    .await
 }

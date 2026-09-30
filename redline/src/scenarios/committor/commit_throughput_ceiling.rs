@@ -7,6 +7,7 @@ use std::{
 use async_trait::async_trait;
 use futures_util::future::join_all;
 use pubkey::Pubkey;
+use redsuite_core::redline::Accounts;
 use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq,
@@ -158,16 +159,7 @@ async fn prewarm(er: &ErCtx, pool: &[Pubkey]) -> Result<()> {
         let touches = window.iter().map(|pda| er.account(pda));
         let _ = join_all(touches).await;
     }
-    for pda in pool {
-        check::poll(
-            &format!("the ER clones the delegated pda {pda}"),
-            CLONE_TIMEOUT,
-            || async {
-                matches!(er.account(pda).await, Ok(Some(acc)) if acc.data.len() == ACCOUNT_SPACE as usize)
-            },
-        )
-        .await?;
-    }
+    prep::await_clones(er, pool, ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
     Ok(())
 }
 
@@ -250,14 +242,9 @@ impl Scenario for CommitThroughputCeiling {
             prep::funded_payers(base, profile.prep_payers, PREP_PAYER_LAMPORTS)
                 .await?;
         let prep_started = Instant::now();
-        let pool = crate::init_delegated_accounts_batched(
-            base,
-            &prep_payers,
-            pool_size,
-            ACCOUNT_SPACE,
-            er.identity(),
-        )
-        .await?;
+        let pool = Accounts::new(ACCOUNT_SPACE, er.identity())
+            .init_batched(base, &prep_payers, pool_size, true)
+            .await?;
         eprintln!(
             "[redsuite] {}: prepped {} fresh delegated accounts in {:.1} s",
             self.name(),
@@ -540,14 +527,14 @@ impl CommitThroughputCeiling {
         let commits: u64 = ROUNDS * CONTRAST_SETS as u64;
         let contrast_payers =
             prep::funded_payers(base, 4, PREP_PAYER_LAMPORTS).await?;
-        let contrast_pool = crate::init_delegated_accounts_batched(
-            base,
-            &contrast_payers,
-            CONTRAST_SETS * COMMIT_WIDTH,
-            ACCOUNT_SPACE,
-            er.identity(),
-        )
-        .await?;
+        let contrast_pool = Accounts::new(ACCOUNT_SPACE, er.identity())
+            .init_batched(
+                base,
+                &contrast_payers,
+                CONTRAST_SETS * COMMIT_WIDTH,
+                true,
+            )
+            .await?;
         prewarm(er, &contrast_pool).await?;
         let set_for = |commit_index: usize| {
             contrast_pool[(commit_index % CONTRAST_SETS) * COMMIT_WIDTH..]

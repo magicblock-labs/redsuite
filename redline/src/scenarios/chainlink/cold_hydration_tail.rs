@@ -7,6 +7,7 @@ use std::{
 use async_trait::async_trait;
 use keypair::Keypair;
 use pubkey::Pubkey;
+use redsuite_core::redline::Accounts;
 use redsuite_core::report::Unit;
 use redsuite_core::{
     check_eq, prep,
@@ -191,14 +192,14 @@ impl Scenario for ColdHydrationTail {
         let prep_payers =
             prep::funded_payers(base, profile.prep_payers, PREP_PAYER_LAMPORTS)
                 .await?;
-        let all_accounts = crate::init_accounts_batched(
-            base,
-            &prep_payers,
-            profile.cold_accounts + profile.burst_accounts + 1,
-            ACCOUNT_SPACE,
-            er.identity(),
-        )
-        .await?;
+        let all_accounts = Accounts::new(ACCOUNT_SPACE, er.identity())
+            .init_batched(
+                base,
+                &prep_payers,
+                profile.cold_accounts + profile.burst_accounts + 1,
+                false,
+            )
+            .await?;
         let cold_pool = &all_accounts[..profile.cold_accounts];
         let prewarm_account = all_accounts[profile.cold_accounts];
         let burst_accounts = &all_accounts[profile.cold_accounts + 1..];

@@ -3,14 +3,15 @@ use std::{rc::Rc, time::Duration};
 use async_trait::async_trait;
 use instruction::Instruction;
 use pubkey::Pubkey;
+use redsuite_core::redline::Accounts;
 use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, host, prep,
     profile::{self, ProfileValues},
     report,
     runner::{execute, Pacing, RunConfig, RunOutcome},
-    topology, BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario,
-    ScenarioReport, TxSender,
+    topology, BaseCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
+    TxSender,
 };
 
 const PREP_PAYER_LAMPORTS: u64 = 4_000_000_000;
@@ -137,14 +138,9 @@ impl Scenario for StorageProdsizeSustain {
         let prep_payers =
             prep::funded_payers(base, profile.payers, PREP_PAYER_LAMPORTS)
                 .await?;
-        let pool = crate::init_delegated_accounts_batched(
-            base,
-            &prep_payers,
-            profile.accounts,
-            crate::ACCOUNT_SPACE,
-            er.identity(),
-        )
-        .await?;
+        let pool = Accounts::new(crate::ACCOUNT_SPACE, er.identity())
+            .init_batched(base, &prep_payers, profile.accounts, true)
+            .await?;
         let payers: Vec<Rc<keypair::Keypair>> =
             prep_payers.into_iter().map(Rc::new).collect();
 
@@ -175,16 +171,13 @@ impl Scenario for StorageProdsizeSustain {
             )
             .await?;
             let cell_er = private.ctx();
-            for pda in &pool {
-                check::poll(
-                    &format!("the ER clones the delegated pda {pda}"),
-                    CLONE_TIMEOUT,
-                    || async {
-                        matches!(cell_er.account(pda).await, Ok(Some(acc)) if acc.data.len() == crate::ACCOUNT_SPACE as usize)
-                    },
-                )
-                .await?;
-            }
+            prep::await_clones(
+                cell_er,
+                &pool,
+                crate::ACCOUNT_SPACE as usize,
+                CLONE_TIMEOUT,
+            )
+            .await?;
             let senders: Vec<TxSender> = payers
                 .iter()
                 .map(|payer| cell_er.sender(payer.clone()))

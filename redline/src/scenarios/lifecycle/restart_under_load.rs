@@ -8,6 +8,7 @@ use std::{
 
 use async_trait::async_trait;
 use pubkey::Pubkey;
+use redsuite_core::redline::Accounts;
 use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, host, prep,
@@ -552,14 +553,9 @@ async fn run_mode(
 
     let pool = {
         let er = private.ctx();
-        let pool = crate::init_delegated_accounts_batched(
-            base,
-            &prep_payers,
-            profile.lanes,
-            crate::ACCOUNT_SPACE,
-            er.identity(),
-        )
-        .await?;
+        let pool = Accounts::new(crate::ACCOUNT_SPACE, er.identity())
+            .init_batched(base, &prep_payers, profile.lanes, true)
+            .await?;
         for pda in &pool {
             check::poll(
                 &format!("the ER clones the delegated pda {pda}"),

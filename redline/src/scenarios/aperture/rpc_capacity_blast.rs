@@ -1,8 +1,8 @@
 use std::{rc::Rc, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use keypair::Keypair;
 use pubkey::Pubkey;
+use redsuite_core::redline::Accounts;
 use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, prep,
@@ -72,25 +72,17 @@ impl Scenario for RpcCapacityBlast {
             prep::funded_payers(base, profile.payers, PREP_PAYER_LAMPORTS)
                 .await?;
         let pool = Arc::new(
-            crate::init_delegated_accounts_batched(
-                base,
-                &prep_payers,
-                profile.accounts,
-                crate::ACCOUNT_SPACE,
-                er.identity(),
-            )
-            .await?,
+            Accounts::new(crate::ACCOUNT_SPACE, er.identity())
+                .init_batched(base, &prep_payers, profile.accounts, true)
+                .await?,
         );
-        for pda in pool.iter() {
-            check::poll(
-                &format!("the ER clones the delegated pda {pda}"),
-                CLONE_TIMEOUT,
-                || async {
-                    matches!(er.account(pda).await, Ok(Some(acc)) if acc.data.len() == crate::ACCOUNT_SPACE as usize)
-                },
-            )
-            .await?;
-        }
+        prep::await_clones(
+            er,
+            &pool,
+            crate::ACCOUNT_SPACE as usize,
+            CLONE_TIMEOUT,
+        )
+        .await?;
         let payer_bytes: Arc<Vec<[u8; 64]>> = Arc::new(
             prep_payers.iter().map(|payer| payer.to_bytes()).collect(),
         );
@@ -110,8 +102,7 @@ impl Scenario for RpcCapacityBlast {
                         payer_index % threads == thread_index
                     })
                     .map(|(_, bytes)| {
-                        let payer = Keypair::try_from(&bytes[..])
-                            .expect("payer bytes round-trip");
+                        let payer = prep::payer_from_bytes(bytes);
                         client.sender(Rc::new(payer))
                     })
                     .collect();

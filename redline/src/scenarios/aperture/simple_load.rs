@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use redsuite_core::redline::Accounts;
 use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, prep,
@@ -30,14 +31,9 @@ impl Scenario for SimpleLoad {
 
     async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
         let payer = prep::funded_payer(base, PAYER_LAMPORTS).await?;
-        let pdas = crate::init_delegated_accounts(
-            base,
-            &payer,
-            ACCOUNTS,
-            crate::ACCOUNT_SPACE,
-            er.identity(),
-        )
-        .await?;
+        let pdas = Accounts::new(crate::ACCOUNT_SPACE, er.identity())
+            .init_delegated(base, &payer, ACCOUNTS)
+            .await?;
 
         for pda in &pdas {
             let on_base = base.account(pda).await?.ok_or("pda not on base")?;
@@ -46,12 +42,11 @@ impl Scenario for SimpleLoad {
                 DELEGATION_PROGRAM_ID,
                 "delegated pda must be dlp-owned on base"
             )?;
-            check::poll(
-                &format!("the ER clones the delegated pda {pda}"),
+            prep::await_clones(
+                er,
+                std::slice::from_ref(pda),
+                crate::ACCOUNT_SPACE as usize,
                 Duration::from_secs(15),
-                || async {
-                    matches!(er.account(pda).await, Ok(Some(acc)) if acc.data.len() == crate::ACCOUNT_SPACE as usize)
-                },
             )
             .await?;
         }

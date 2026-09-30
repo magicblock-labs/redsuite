@@ -6,6 +6,7 @@ use std::{
 
 use async_trait::async_trait;
 use json::JsonValueTrait;
+use redsuite_core::redline::Accounts;
 use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, host, prep,
@@ -13,8 +14,7 @@ use redsuite_core::{
     runner::{execute, Pacing, RunConfig},
     topology,
     transport::wsraw::RawWs,
-    BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
-    TxSender,
+    BaseCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport, TxSender,
 };
 
 use super::storage_prodsize_sustain::shape;
@@ -243,24 +243,16 @@ impl Scenario for SuperblockBoundaryLatency {
         .await?;
         let cell_er = private.ctx();
 
-        let pool = crate::init_delegated_accounts_batched(
-            base,
-            &prep_payers,
-            profile.accounts,
-            crate::ACCOUNT_SPACE,
-            cell_er.identity(),
+        let pool = Accounts::new(crate::ACCOUNT_SPACE, cell_er.identity())
+            .init_batched(base, &prep_payers, profile.accounts, true)
+            .await?;
+        prep::await_clones(
+            cell_er,
+            &pool,
+            crate::ACCOUNT_SPACE as usize,
+            CLONE_TIMEOUT,
         )
         .await?;
-        for pda in &pool {
-            check::poll(
-                &format!("the ER clones the delegated pda {pda}"),
-                CLONE_TIMEOUT,
-                || async {
-                    matches!(cell_er.account(pda).await, Ok(Some(acc)) if acc.data.len() == crate::ACCOUNT_SPACE as usize)
-                },
-            )
-            .await?;
-        }
 
         let payers: Vec<Rc<keypair::Keypair>> =
             prep_payers.into_iter().map(Rc::new).collect();
