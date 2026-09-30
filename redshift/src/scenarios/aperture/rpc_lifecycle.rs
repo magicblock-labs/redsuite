@@ -6,6 +6,7 @@ use std::{
 use async_trait::async_trait;
 use futures_util::future::join_all;
 use pubkey::Pubkey;
+use redsuite_core::redline::Accounts;
 use redsuite_core::{
     check, check_eq, prep,
     report::Unit,
@@ -197,14 +198,9 @@ impl Scenario for RpcLifecycle {
         );
 
         let payers = prep::funded_payers(base, PAYERS, PAYER_LAMPORTS).await?;
-        let pdas = prep::init_delegated_accounts_batched(
-            base,
-            &payers,
-            WRITES,
-            crate::ACCOUNT_SPACE,
-            er.identity(),
-        )
-        .await?;
+        let pdas = Accounts::new(crate::ACCOUNT_SPACE, er.identity())
+            .init_batched(base, &payers, WRITES, true)
+            .await?;
         let per_payer = WRITES.div_ceil(PAYERS);
         await_clones(&client, &pdas).await?;
         let blockhash = client.get_latest_blockhash().await?;

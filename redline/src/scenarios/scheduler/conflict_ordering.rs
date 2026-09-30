@@ -11,13 +11,16 @@ use std::{
 
 use async_trait::async_trait;
 use futures_util::future::join_all;
-use instruction::Instruction;
 use keypair::Keypair;
 use pubkey::Pubkey;
+use redsuite_core::redline::Accounts;
 use redsuite_core::report::Unit;
 use redsuite_core::{
     api, check, check_eq, prep,
     profile::{self, ProfileValues},
+    redline::causal::{
+        chain_ixs, hex, independent_ixs, PairModel, Step, HASH_INIT, STEPS,
+    },
     report,
     runner::{
         execute_until_raw, merge_outcomes, spawn_workers, split_budget, Pacing,
@@ -31,14 +34,9 @@ use redsuite_core::{
 use signature::Signature;
 use signer::Signer;
 
-use crate::program::{
-    instruction::build,
-    layout,
-    utils::{fold_hash, hash_chain},
-};
+use crate::program::{layout, utils::hash_chain};
 
 const PAYER_LAMPORTS: u64 = 200_000_000;
-const PREP_CHUNK: usize = 32;
 const CLONE_TIMEOUT: Duration = Duration::from_secs(60);
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(600);
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -47,12 +45,9 @@ const WARM_IN_TIMEOUT: Duration = Duration::from_secs(15);
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
 const CALIBRATION: Duration = Duration::from_secs(3);
 const STALL_BOUND: Duration = Duration::from_secs(10);
-const CU_LIMIT: u32 = 1_400_000;
-const HASH_INIT: Pubkey = Pubkey::new_from_array([7u8; 32]);
 const OPEN_CONCURRENCY: usize = 128;
 const LANES_PER_EXECUTOR: usize = 12;
 const MIN_EXECUTORS: f64 = 2.0;
-const STEPS: u64 = 3;
 const PAYERS_PER_PAIR: usize = 3;
 
 const TX_COUNT: &str = crate::metrics::ENGINE_TRANSACTIONS;
@@ -123,33 +118,6 @@ const PROFILES: ProfileValues<Profile> = ProfileValues {
     deep: None,
 };
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-enum Step {
-    X,
-    Y,
-    Z,
-}
-
-impl Step {
-    const ALL: [Step; 3] = [Step::X, Step::Y, Step::Z];
-
-    fn index(self) -> usize {
-        match self {
-            Step::X => 0,
-            Step::Y => 1,
-            Step::Z => 2,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Step::X => "X(A)",
-            Step::Y => "Y(A,B)",
-            Step::Z => "Z(B)",
-        }
-    }
-}
-
 fn heavy_step(chain: u64) -> Step {
     Step::ALL[(chain % STEPS) as usize]
 }
@@ -172,82 +140,12 @@ fn phase_ranges(chains: u64) -> [(u64, u64); 2] {
     [(0, split), (split, chains)]
 }
 
-#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
-struct PairModel {
-    a: [u8; 32],
-    b: [u8; 32],
-    a_id: u64,
-    b_id: u64,
-}
-
-impl PairModel {
-    fn apply(&mut self, step: Step, id: u64, iters: u32) {
-        match step {
-            Step::X => {
-                self.a = fold_hash(id, &[self.a], iters);
-                self.a_id = id;
-            }
-            Step::Y => {
-                let merged = fold_hash(id, &[self.a, self.b], iters);
-                self.a = merged;
-                self.b = merged;
-                self.a_id = id;
-                self.b_id = id;
-            }
-            Step::Z => {
-                self.b = fold_hash(id, &[self.b], iters);
-                self.b_id = id;
-            }
-        }
-    }
-}
-
 struct Pair {
     a: Pubkey,
     b: Pubkey,
     senders: Vec<TxSender>,
     model: PairModel,
     steps: Vec<(u64, Step, Signature)>,
-}
-
-impl Pair {
-    fn accounts(&self, step: Step) -> Vec<Pubkey> {
-        match step {
-            Step::X => vec![self.a],
-            Step::Y => vec![self.a, self.b],
-            Step::Z => vec![self.b],
-        }
-    }
-}
-
-fn compute_unit_limit(limit: u32) -> Instruction {
-    let mut data = vec![2u8];
-    data.extend_from_slice(&limit.to_le_bytes());
-    Instruction {
-        program_id: sdk_ids::compute_budget::ID,
-        accounts: Vec::new(),
-        data,
-    }
-}
-
-fn chain_ixs(id: u64, iters: u32, accounts: &[Pubkey]) -> Vec<Instruction> {
-    let fold = build::hash_fold(id, iters, accounts);
-    if iters > 0 {
-        vec![compute_unit_limit(CU_LIMIT), fold]
-    } else {
-        vec![fold]
-    }
-}
-
-fn independent_ixs(id: u64, account: Pubkey, iters: u32) -> Vec<Instruction> {
-    vec![
-        compute_unit_limit(CU_LIMIT),
-        build::expensive_hash_compute(id, HASH_INIT, iters, &[account]),
-    ]
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -307,8 +205,7 @@ fn spawn_load(
             for index in (worker.index..lane_limit.min(accounts.len()))
                 .step_by(worker.threads)
             {
-                let payer = Keypair::try_from(&payer_bytes[index][..])
-                    .expect("payer bytes round-trip");
+                let payer = prep::payer_from_bytes(&payer_bytes[index]);
                 lanes.push((accounts[index], client.sender(Rc::new(payer))));
             }
             if lanes.is_empty() {
@@ -651,7 +548,7 @@ async fn drive_pair(
         for step in Step::ALL {
             let id = plan.space.step_id(plan.batch, pair_index, chain, step);
             let iters = if step == heavy { plan.heavy_iters } else { 0 };
-            let ixs = chain_ixs(id, iters, &pair.accounts(step));
+            let ixs = chain_ixs(id, iters, &step.accounts(pair.a, pair.b));
             let sent = Instant::now();
             let signature = pair.senders[step.index()]
                 .submit(&ixs)
@@ -839,59 +736,6 @@ async fn verify_independent(
     Ok(())
 }
 
-async fn prime_payers(er: &ErCtx, payers: &[Pubkey]) -> Result<()> {
-    for chunk in payers.chunks(PREP_CHUNK) {
-        let results = join_all(chunk.iter().map(|payer| async move {
-            check::poll(
-                &format!("the ER clones payer {payer}"),
-                CLONE_TIMEOUT,
-                || async {
-                    matches!(er.account(payer).await, Ok(Some(acc)) if acc.lamports > 0)
-                },
-            )
-            .await
-        }))
-        .await;
-        for result in results {
-            result?;
-        }
-    }
-    Ok(())
-}
-
-async fn await_clones(er: &ErCtx, pdas: &[Pubkey]) -> Result<()> {
-    for pda in pdas {
-        check::poll(
-            &format!("the ER clones the delegated pda {pda}"),
-            CLONE_TIMEOUT,
-            || async {
-                matches!(er.account(pda).await, Ok(Some(acc)) if acc.data.len() == crate::ACCOUNT_SPACE as usize)
-            },
-        )
-        .await?;
-    }
-    Ok(())
-}
-
-async fn funded_payers(base: &BaseCtx, count: usize) -> Result<Vec<Keypair>> {
-    let mut payers = Vec::with_capacity(count);
-    while payers.len() < count {
-        let chunk = PREP_CHUNK.min(count - payers.len());
-        let funded = join_all(
-            (0..chunk).map(|_| prep::funded_payer(base, PAYER_LAMPORTS)),
-        )
-        .await;
-        for payer in funded {
-            payers.push(payer?);
-        }
-    }
-    Ok(payers)
-}
-
-fn clone_keypair(payer: &Keypair) -> Keypair {
-    Keypair::try_from(&payer.to_bytes()[..]).expect("payer bytes round-trip")
-}
-
 struct BatchOutcome {
     phases: Vec<PhaseOutcome>,
     drained: DrainState,
@@ -943,48 +787,48 @@ impl Scenario for ConflictOrdering {
         }
 
         let prep_started = Instant::now();
-        let chain_payers =
-            funded_payers(base, profile.pairs * PAYERS_PER_PAIR).await?;
-        let independent_payers =
-            funded_payers(base, profile.independent_accounts).await?;
+        let payers = prep::funded_payers(
+            base,
+            profile.pairs * PAYERS_PER_PAIR + profile.independent_accounts,
+            PAYER_LAMPORTS,
+        )
+        .await?;
+        let (chain_payers, independent_payers) =
+            payers.split_at(profile.pairs * PAYERS_PER_PAIR);
 
         let prep_payers: Vec<Keypair> = chain_payers
             .iter()
             .step_by(PAYERS_PER_PAIR)
-            .map(clone_keypair)
+            .map(Keypair::insecure_clone)
             .collect();
-        let mut pair_accounts = Vec::with_capacity(profile.pairs * 2);
-        for chunk in prep_payers.chunks(PREP_CHUNK) {
-            let pdas = crate::init_delegated_accounts_batched(
+        let pair_accounts = Accounts::new(crate::ACCOUNT_SPACE, er.identity())
+            .init_batched(base, &prep_payers, profile.pairs * 2, true)
+            .await?;
+        prep::await_clones(
+            er,
+            &pair_accounts,
+            crate::ACCOUNT_SPACE as usize,
+            CLONE_TIMEOUT,
+        )
+        .await?;
+        let independent = Accounts::new(crate::ACCOUNT_SPACE, er.identity())
+            .init_batched(
                 base,
-                chunk,
-                chunk.len() * 2,
-                crate::ACCOUNT_SPACE,
-                er.identity(),
+                independent_payers,
+                profile.independent_accounts,
+                true,
             )
             .await?;
-            await_clones(er, &pdas).await?;
-            pair_accounts.extend(pdas);
-        }
-        let mut independent = Vec::with_capacity(profile.independent_accounts);
-        for chunk in independent_payers.chunks(PREP_CHUNK) {
-            let pdas = crate::init_delegated_accounts_batched(
-                base,
-                chunk,
-                chunk.len(),
-                crate::ACCOUNT_SPACE,
-                er.identity(),
-            )
-            .await?;
-            await_clones(er, &pdas).await?;
-            independent.extend(pdas);
-        }
-        let payer_keys: Vec<Pubkey> = chain_payers
-            .iter()
-            .chain(independent_payers.iter())
-            .map(|payer| payer.pubkey())
-            .collect();
-        prime_payers(er, &payer_keys).await?;
+        prep::await_clones(
+            er,
+            &independent,
+            crate::ACCOUNT_SPACE as usize,
+            CLONE_TIMEOUT,
+        )
+        .await?;
+        let payer_keys: Vec<Pubkey> =
+            payers.iter().map(Signer::pubkey).collect();
+        prep::await_cloned_payers(er, &payer_keys, CLONE_TIMEOUT).await?;
         eprintln!(
             "[redsuite] {}: prepped {} pairs x 2 accounts x 3 payers and {} \
              independent lanes in {:.1} s",
@@ -1003,7 +847,7 @@ impl Scenario for ConflictOrdering {
                 senders: chain_payers
                     [index * PAYERS_PER_PAIR..(index + 1) * PAYERS_PER_PAIR]
                     .iter()
-                    .map(|payer| er.sender(Rc::new(clone_keypair(payer))))
+                    .map(|payer| er.sender(Rc::new(payer.insecure_clone())))
                     .collect(),
                 model: PairModel::default(),
                 steps: Vec::new(),

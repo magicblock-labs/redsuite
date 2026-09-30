@@ -14,6 +14,7 @@ pub mod netfault;
 pub mod prep;
 pub mod profile;
 pub mod receipt;
+pub mod redline;
 pub mod report;
 mod resources;
 pub mod runner;

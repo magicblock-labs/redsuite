@@ -1,8 +1,8 @@
 use std::{rc::Rc, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use keypair::Keypair;
 use pubkey::Pubkey;
+use redsuite_core::redline::Accounts;
 use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, prep,
@@ -82,8 +82,7 @@ fn execute_cell(
             .enumerate()
             .filter(|(payer_index, _)| payer_index % threads == thread_index)
             .map(|(_, bytes)| {
-                let payer = Keypair::try_from(&bytes[..])
-                    .expect("payer bytes round-trip");
+                let payer = prep::payer_from_bytes(bytes);
                 client.sender(Rc::new(payer))
             })
             .collect();
@@ -145,24 +144,16 @@ impl Scenario for HotAccountCliff {
         let pool = *profile.cells.iter().max().unwrap();
         let payers =
             prep::funded_payers(base, profile.payers, PAYER_LAMPORTS).await?;
-        let pdas = crate::init_delegated_accounts(
-            base,
-            &payers[0],
-            pool,
-            crate::ACCOUNT_SPACE,
-            er.identity(),
+        let pdas = Accounts::new(crate::ACCOUNT_SPACE, er.identity())
+            .init_delegated(base, &payers[0], pool)
+            .await?;
+        prep::await_clones(
+            er,
+            &pdas,
+            crate::ACCOUNT_SPACE as usize,
+            Duration::from_secs(15),
         )
         .await?;
-        for pda in &pdas {
-            check::poll(
-                &format!("the ER clones the delegated pda {pda}"),
-                Duration::from_secs(15),
-                || async {
-                    matches!(er.account(pda).await, Ok(Some(acc)) if acc.data.len() == crate::ACCOUNT_SPACE as usize)
-                },
-            )
-            .await?;
-        }
         let payer_bytes: Arc<Vec<[u8; 64]>> =
             Arc::new(payers.iter().map(|payer| payer.to_bytes()).collect());
         let er_rpc_url = er.api().url().to_owned();

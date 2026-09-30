@@ -7,6 +7,7 @@ use instruction::{AccountMeta, Instruction};
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redshift_interface::{upgrade_probe_data, UPGRADE_TAG};
+use redsuite_core::redline::Accounts;
 use redsuite_core::{
     api::{custom_error_code, RpcError},
     catalog::Fixture,
@@ -127,14 +128,9 @@ impl PrivateErScenario for ProgramUpgrade {
             crate::PAYER_LAMPORTS,
         )
         .await?;
-        let keys = prep::init_delegated_accounts_batched(
-            base,
-            std::slice::from_ref(&funder),
-            2,
-            (DATA_OFFSET + ID_SIZE) as u32,
-            er.identity(),
-        )
-        .await?;
+        let keys = Accounts::new((DATA_OFFSET + ID_SIZE) as u32, er.identity())
+            .init_batched(base, std::slice::from_ref(&funder), 2, true)
+            .await?;
         let base_state = base.accounts(&keys).await?;
         let state = async || -> Result<Vec<Account>> {
             er.accounts(&keys)

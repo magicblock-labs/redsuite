@@ -7,13 +7,12 @@ use std::{
 };
 
 use async_trait::async_trait;
-use instruction::Instruction;
-use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, prep,
     profile::{self, ProfileValues},
+    redline::causal::{chain_ixs, hex, PairModel, Step, STEPS},
     topology::{self, ReplicatedOptions, ReplicatedTopology, Verifier},
     BaseCtx, ChainCtx, CheckError, PrivateErScenario, Result, ScenarioReport,
     TxSender,
@@ -21,15 +20,13 @@ use redsuite_core::{
 use signature::Signature;
 use signer::Signer;
 
-use crate::program::{instruction::build, layout, utils::fold_hash};
+use crate::program::layout;
 
 const LABEL: &str = "replication-recovery";
 const PAYERS_PER_PAIR: usize = 3;
-const STEPS: u64 = 3;
 const SUPERBLOCK_SLOTS: u64 = 128;
 const LEDGER_SIZE_LIMIT_BYTES: u64 = 1;
 const TRUNCATIONS_TO_OUTRUN: f64 = 2.0;
-const CU_LIMIT: u32 = 1_400_000;
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(90);
 const CATCH_UP_TIMEOUT: Duration = Duration::from_secs(120);
@@ -83,55 +80,6 @@ const PROFILES: ProfileValues<Profile> = ProfileValues {
     deep: None,
 };
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Step {
-    X,
-    Y,
-    Z,
-}
-
-impl Step {
-    const ALL: [Step; 3] = [Step::X, Step::Y, Step::Z];
-
-    fn index(self) -> usize {
-        match self {
-            Step::X => 0,
-            Step::Y => 1,
-            Step::Z => 2,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
-struct PairModel {
-    a: [u8; 32],
-    b: [u8; 32],
-    a_id: u64,
-    b_id: u64,
-}
-
-impl PairModel {
-    fn apply(&mut self, step: Step, id: u64, iters: u32) {
-        match step {
-            Step::X => {
-                self.a = fold_hash(id, &[self.a], iters);
-                self.a_id = id;
-            }
-            Step::Y => {
-                let merged = fold_hash(id, &[self.a, self.b], iters);
-                self.a = merged;
-                self.b = merged;
-                self.a_id = id;
-                self.b_id = id;
-            }
-            Step::Z => {
-                self.b = fold_hash(id, &[self.b], iters);
-                self.b_id = id;
-            }
-        }
-    }
-}
-
 struct Pair {
     a: Pubkey,
     b: Pubkey,
@@ -139,39 +87,6 @@ struct Pair {
     model: PairModel,
     chains: u64,
     last_signature: Option<Signature>,
-}
-
-impl Pair {
-    fn accounts(&self, step: Step) -> Vec<Pubkey> {
-        match step {
-            Step::X => vec![self.a],
-            Step::Y => vec![self.a, self.b],
-            Step::Z => vec![self.b],
-        }
-    }
-}
-
-fn compute_unit_limit(limit: u32) -> Instruction {
-    let mut data = vec![2u8];
-    data.extend_from_slice(&limit.to_le_bytes());
-    Instruction {
-        program_id: sdk_ids::compute_budget::ID,
-        accounts: Vec::new(),
-        data,
-    }
-}
-
-fn chain_ixs(id: u64, iters: u32, accounts: &[Pubkey]) -> Vec<Instruction> {
-    let fold = build::hash_fold(id, iters, accounts);
-    if iters > 0 {
-        vec![compute_unit_limit(CU_LIMIT), fold]
-    } else {
-        vec![fold]
-    }
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 struct Workload {
@@ -199,8 +114,11 @@ impl Workload {
                             next_id.set(id + 1);
                             let iters =
                                 if step == heavy { heavy_iters } else { 0 };
-                            let ixs =
-                                chain_ixs(id, iters, &pair.accounts(step));
+                            let ixs = chain_ixs(
+                                id,
+                                iters,
+                                &step.accounts(pair.a, pair.b),
+                            );
                             let signature = pair.senders[step.index()]
                                 .submit(&ixs)
                                 .await
@@ -510,55 +428,38 @@ async fn prepare_pairs(
         crate::PAYER_LAMPORTS,
     )
     .await?;
+    let accounts = redsuite_core::redline::Accounts::new(
+        crate::ACCOUNT_SPACE,
+        leader.identity(),
+    );
     let mut pairs = Vec::with_capacity(count);
     for index in 0..count {
         let owner = &payers[index * PAYERS_PER_PAIR];
-        let a =
-            crate::init_delegated_account(base, owner, 0, leader.identity())
-                .await?;
-        let b =
-            crate::init_delegated_account(base, owner, 1, leader.identity())
-                .await?;
-        for pda in [a, b] {
-            check::poll(
-                &format!("the leader clones the delegated pda {pda}"),
-                CLONE_TIMEOUT,
-                || async {
-                    matches!(leader.ctx().account(&pda).await, Ok(Some(acc)) if acc.data.len() == crate::ACCOUNT_SPACE as usize)
-                },
-            )
-            .await?;
-        }
+        let pdas = accounts.init_delegated(base, owner, 2).await?;
+        prep::await_clones(
+            leader.ctx(),
+            &pdas,
+            crate::ACCOUNT_SPACE as usize,
+            CLONE_TIMEOUT,
+        )
+        .await?;
         let senders = payers
             [index * PAYERS_PER_PAIR..(index + 1) * PAYERS_PER_PAIR]
             .iter()
-            .map(|payer| {
-                leader.ctx().sender(Rc::new(
-                    Keypair::try_from(&payer.to_bytes()[..])
-                        .expect("payer bytes round-trip"),
-                ))
-            })
+            .map(|payer| leader.ctx().sender(Rc::new(payer.insecure_clone())))
             .collect();
         pairs.push(Pair {
-            a,
-            b,
+            a: pdas[0],
+            b: pdas[1],
             senders,
             model: PairModel::default(),
             chains: 0,
             last_signature: None,
         });
     }
-    for payer in &payers {
-        let address = payer.pubkey();
-        check::poll(
-            &format!("the leader clones payer {address}"),
-            CLONE_TIMEOUT,
-            || async {
-                matches!(leader.ctx().account(&address).await, Ok(Some(acc)) if acc.lamports > 0)
-            },
-        )
-        .await?;
-    }
+    let payer_keys: Vec<Pubkey> =
+        payers.iter().map(|payer| payer.pubkey()).collect();
+    prep::await_cloned_payers(leader.ctx(), &payer_keys, CLONE_TIMEOUT).await?;
     Ok(pairs)
 }
 

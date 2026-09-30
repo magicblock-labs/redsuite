@@ -9,14 +9,14 @@ use std::{
 };
 
 use async_trait::async_trait;
-use futures_util::future::join_all;
 use instruction::Instruction;
-use keypair::Keypair;
 use pubkey::Pubkey;
+use redsuite_core::redline::Accounts;
 use redsuite_core::report::Unit;
 use redsuite_core::{
     api, check, check_eq, host, prep,
     profile::{self, ProfileValues},
+    redline::causal::{compute_unit_limit, CU_LIMIT},
     report,
     runner::{
         execute_raw, merge_outcomes, spawn_workers, Pacing, RawRunOutcome,
@@ -33,7 +33,6 @@ const PAYER_LAMPORTS: u64 = 200_000_000;
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(900);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const CLONE_TIMEOUT: Duration = Duration::from_secs(60);
-const PREP_CHUNK: usize = 32;
 const BUSY_SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
 const TX_COUNT: &str = crate::metrics::ENGINE_TRANSACTIONS;
 const BUSY_EXECUTORS: &str = "engine_processor_busy_executors";
@@ -42,7 +41,6 @@ const BLOCKED_TRANSACTIONS: &str = "engine_processor_blocked_transactions";
 const PROGRAM: Pubkey = crate::program::ID;
 const HASH_INIT: Pubkey = Pubkey::new_from_array([7u8; 32]);
 const LIGHT_ITERS: u32 = 1;
-const CU_LIMIT: u32 = 1_400_000;
 const CU_CONTRAST_FLOOR: f64 = 10.0;
 const BUSY_THREAD_CORES: f64 = 0.5;
 
@@ -135,16 +133,6 @@ const PROFILES: ProfileValues<Profile> = ProfileValues {
     deep: None,
 };
 
-fn compute_unit_limit(limit: u32) -> Instruction {
-    let mut data = vec![2u8];
-    data.extend_from_slice(&limit.to_le_bytes());
-    Instruction {
-        program_id: sdk_ids::compute_budget::ID,
-        accounts: Vec::new(),
-        data,
-    }
-}
-
 fn consumed_cus(logs: &[String]) -> Option<f64> {
     logs.iter().find_map(|line| {
         let (_, rest) = line.split_once(" consumed ")?;
@@ -235,8 +223,7 @@ async fn execute_cell_burst(
             let senders: Vec<TxSender> = payer_bytes
                 .iter()
                 .map(|bytes| {
-                    let payer = Keypair::try_from(&bytes[..])
-                        .expect("payer bytes round-trip");
+                    let payer = prep::payer_from_bytes(bytes);
                     client.sender(Rc::new(payer))
                 })
                 .collect();
@@ -483,40 +470,22 @@ impl Scenario for ExecutorSaturation {
             profile::select(self.name(), base.config(), &PROFILES);
 
         let prep_started = Instant::now();
-        let mut payers: Vec<Keypair> = Vec::with_capacity(profile.accounts);
-        while payers.len() < profile.accounts {
-            let count = PREP_CHUNK.min(profile.accounts - payers.len());
-            let funded = join_all(
-                (0..count).map(|_| prep::funded_payer(base, PAYER_LAMPORTS)),
-            )
-            .await;
-            for payer in funded {
-                payers.push(payer?);
-            }
+        let payers =
+            prep::funded_payers(base, profile.accounts, PAYER_LAMPORTS).await?;
+        let accounts = Accounts {
+            program_id: PROGRAM,
+            space: crate::ACCOUNT_SPACE,
+            authority: er.identity(),
         }
-        let mut accounts: Vec<Pubkey> = Vec::with_capacity(profile.accounts);
-        for chunk in payers.chunks(PREP_CHUNK) {
-            let pdas = crate::init_delegated_accounts_batched_at(
-                PROGRAM,
-                base,
-                chunk,
-                chunk.len(),
-                crate::ACCOUNT_SPACE,
-                er.identity(),
-            )
-            .await?;
-            for pda in &pdas {
-                check::poll(
-                    &format!("the ER clones the delegated pda {pda}"),
-                    CLONE_TIMEOUT,
-                    || async {
-                        matches!(er.account(pda).await, Ok(Some(acc)) if acc.data.len() == crate::ACCOUNT_SPACE as usize)
-                    },
-                )
-                .await?;
-            }
-            accounts.extend(pdas);
-        }
+        .init_batched(base, &payers, profile.accounts, true)
+        .await?;
+        prep::await_clones(
+            er,
+            &accounts,
+            crate::ACCOUNT_SPACE as usize,
+            CLONE_TIMEOUT,
+        )
+        .await?;
         eprintln!(
             "[redsuite] {}: prepped {} payers x 1 delegated account in {:.1} s",
             self.name(),

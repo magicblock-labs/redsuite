@@ -5,24 +5,28 @@ use pubkey::Pubkey;
 use redshift_interface::schedulecommit::{build, MainAccount};
 use signer::Signer;
 
-use crate::DynError;
-
 use crate::{
     check,
     context::{BaseCtx, ChainCtx, ErCtx},
-    dlp, system, Result,
+    dlp, system, DynError, Result,
 };
 
 const ZERO_DATA_RENT_EXEMPT_LAMPORTS: u64 = 890_880;
 pub const COMMIT_FREQUENCY_MS: u32 = 1_000_000_000;
 const COMMITTEE_CLONE_TIMEOUT: Duration = Duration::from_secs(15);
 
+const PREP_CONCURRENCY: usize = 32;
+
 pub async fn funded_payer(
     ctx: &impl ChainCtx,
     lamports: u64,
 ) -> Result<Keypair> {
     let payer = Keypair::new();
-    ctx.airdrop(&payer.pubkey(), lamports).await?;
+    ctx.airdrop(&payer.pubkey(), lamports)
+        .await
+        .map_err(|error| {
+            format!("funding payer {}: {error}", payer.pubkey())
+        })?;
     Ok(payer)
 }
 
@@ -31,11 +35,34 @@ pub async fn funded_payers(
     count: usize,
     lamports: u64,
 ) -> Result<Vec<Keypair>> {
-    let mut payers = Vec::with_capacity(count);
-    for _ in 0..count {
-        payers.push(funded_payer(ctx, lamports).await?);
-    }
-    Ok(payers)
+    bounded(count, "payer", |_| funded_payer(ctx, lamports)).await
+}
+
+pub(crate) async fn bounded<T, F, Fut>(
+    count: usize,
+    what: &str,
+    make: F,
+) -> Result<Vec<T>>
+where
+    F: Fn(usize) -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    use futures_util::{StreamExt, TryFutureExt, TryStreamExt};
+    futures_util::stream::iter(0..count)
+        .map(|index| {
+            make(index).map_err(move |error| {
+                DynError::from(format!(
+                    "preparing {what} {index} of {count}: {error}"
+                ))
+            })
+        })
+        .buffered(PREP_CONCURRENCY)
+        .try_collect()
+        .await
+}
+
+pub fn payer_from_bytes(bytes: &[u8]) -> Keypair {
+    Keypair::try_from(bytes).expect("payer bytes round-trip")
 }
 
 pub struct EscrowedPayer {
@@ -87,19 +114,6 @@ pub async fn escrowed_payer(
     })
 }
 
-pub async fn escrowed_payers(
-    ctx: &impl ChainCtx,
-    count: usize,
-    validator: Pubkey,
-    lamports: u64,
-) -> Result<Vec<EscrowedPayer>> {
-    let mut payers = Vec::with_capacity(count);
-    for _ in 0..count {
-        payers.push(escrowed_payer(ctx, validator, lamports).await?);
-    }
-    Ok(payers)
-}
-
 pub struct Committee {
     pub player: Keypair,
     pub pda: Pubkey,
@@ -140,19 +154,50 @@ pub async fn await_committee_clones(
     er: &ErCtx,
     committees: &[Committee],
 ) -> Result<()> {
-    for committee in committees {
+    let pdas: Vec<Pubkey> =
+        committees.iter().map(|committee| committee.pda).collect();
+    await_clones(er, &pdas, MainAccount::SIZE, COMMITTEE_CLONE_TIMEOUT).await
+}
+
+pub async fn await_clones(
+    er: &ErCtx,
+    pdas: &[Pubkey],
+    space: usize,
+    timeout: Duration,
+) -> Result<()> {
+    for pda in pdas {
         check::poll(
-            &format!("the ER clones committee {}", committee.pda),
-            COMMITTEE_CLONE_TIMEOUT,
+            &format!("the ER clones the delegated pda {pda}"),
+            timeout,
             || async {
-                matches!(
-                    er.account(&committee.pda).await,
-                    Ok(Some(clone)) if clone.data.len() == MainAccount::SIZE
-                )
+                matches!(er.account(pda).await, Ok(Some(acc)) if acc.data.len() == space)
             },
         )
         .await?;
     }
+    Ok(())
+}
+
+pub async fn await_cloned_payers(
+    er: &ErCtx,
+    payers: &[Pubkey],
+    timeout: Duration,
+) -> Result<()> {
+    bounded(payers.len(), "cloned payer", |index| {
+        let payer = payers[index];
+        async move {
+            check::poll(
+                &format!("the ER clones payer {payer}"),
+                timeout,
+                || async {
+                    matches!(er.account(&payer).await, Ok(Some(acc)) if acc.lamports > 0)
+                },
+            )
+            .await?;
+            Ok(())
+        }
+    })
+    .await?;
     Ok(())
 }
 
@@ -184,95 +229,4 @@ pub async fn delegated_payer(
         .into());
     }
     Ok(delegatee)
-}
-
-const PREP_PAIRS_PER_TX: usize = 3;
-
-pub async fn init_delegated_accounts_batched(
-    base: &impl ChainCtx,
-    payers: &[Keypair],
-    count: usize,
-    space: u32,
-    authority: Pubkey,
-) -> Result<Vec<Pubkey>> {
-    init_delegated_accounts_batched_at(
-        redline_interface::id(),
-        base,
-        payers,
-        count,
-        space,
-        authority,
-    )
-    .await
-}
-
-pub async fn init_delegated_accounts_batched_at(
-    program_id: Pubkey,
-    base: &impl ChainCtx,
-    payers: &[Keypair],
-    count: usize,
-    space: u32,
-    authority: Pubkey,
-) -> Result<Vec<Pubkey>> {
-    if payers.is_empty() {
-        return Err("at least one prep payer is required".into());
-    }
-    let per_payer = count.div_ceil(payers.len());
-    if per_payer > u8::MAX as usize + 1 {
-        return Err(format!(
-            "{count} accounts over {} payers exceeds the u8 seed namespace",
-            payers.len()
-        )
-        .into());
-    }
-
-    let batches =
-        futures_util::future::join_all(payers.iter().enumerate().map(
-            |(payer_index, payer)| async move {
-                let first_index = payer_index * per_payer;
-                let last_index = ((payer_index + 1) * per_payer).min(count);
-                let mut pdas =
-                    Vec::with_capacity(last_index.saturating_sub(first_index));
-                let mut pending = Vec::new();
-                for account_index in first_index..last_index {
-                    let seed = (account_index - first_index) as u8;
-                    let (init, pda) =
-                        redline_interface::instruction::build::init_account_at(
-                            program_id,
-                            payer.pubkey(),
-                            payer.pubkey(),
-                            space,
-                            seed,
-                            authority,
-                        );
-                    let delegate =
-                        redline_interface::instruction::build::delegate_at(
-                            program_id,
-                            payer.pubkey(),
-                            pda,
-                            payer.pubkey(),
-                            seed,
-                            authority,
-                        );
-                    pdas.push(pda);
-                    pending.push(init);
-                    pending.push(delegate);
-                    if pending.len() >= PREP_PAIRS_PER_TX * 2 {
-                        base.submit_and_confirm(payer, &pending).await?;
-                        pending.clear();
-                    }
-                }
-                if !pending.is_empty() {
-                    base.submit_and_confirm(payer, &pending).await?;
-                }
-                Ok::<Vec<Pubkey>, DynError>(pdas)
-            },
-        ))
-        .await;
-
-    let mut pdas = Vec::with_capacity(count);
-    for batch in batches {
-        pdas.extend(batch?);
-    }
-    Ok(pdas)
 }

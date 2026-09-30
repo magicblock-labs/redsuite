@@ -46,12 +46,11 @@ impl Scenario for CommitRoundtrip {
                 DELEGATION_PROGRAM_ID,
                 "a delegated pda must be dlp-owned on base"
             )?;
-            check::poll(
-                &format!("the ER clones the delegated pda {pda}"),
+            prep::await_clones(
+                er,
+                std::slice::from_ref(pda),
+                crate::ACCOUNT_SPACE as usize,
                 CLONE_TIMEOUT,
-                || async {
-                    matches!(er.account(pda).await, Ok(Some(clone)) if clone.data.len() == crate::ACCOUNT_SPACE as usize)
-                },
             )
             .await?;
         }

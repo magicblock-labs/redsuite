@@ -6,6 +6,7 @@ use std::{
 use async_trait::async_trait;
 use futures_util::future::join_all;
 use pubkey::Pubkey;
+use redsuite_core::redline::Accounts;
 use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, prep,
@@ -147,14 +148,9 @@ impl Scenario for EnsureGateStall {
             prep::funded_payers(base, profile.prep_payers, PREP_PAYER_LAMPORTS)
                 .await?;
         let prep_started = Instant::now();
-        let pool = crate::init_accounts_batched(
-            base,
-            &prep_payers,
-            profile.working_set,
-            ACCOUNT_SPACE,
-            er.identity(),
-        )
-        .await?;
+        let pool = Accounts::new(ACCOUNT_SPACE, er.identity())
+            .init_batched(base, &prep_payers, profile.working_set, false)
+            .await?;
         eprintln!(
             "[redsuite] {}: prepped {} non-delegated 2 KiB accounts in {:.1} s",
             self.name(),
