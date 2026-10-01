@@ -25,7 +25,7 @@ pub mod system;
 pub mod topology;
 pub mod transport;
 
-pub use api::{Api, BatchBody, Metrics, MetricsDelta};
+pub use api::{Api, Metrics, MetricsDelta, SendBody};
 pub use check::CheckError;
 pub use context::{BaseCtx, ChainCtx, ErClient, ErCtx, TxSender};
 pub use report::ScenarioReport;
