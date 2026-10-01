@@ -5,7 +5,6 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    thread::JoinHandle,
     time::{Duration, Instant},
 };
 
@@ -14,9 +13,9 @@ use futures_util::future::join_all;
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::redline::Accounts;
-use redsuite_core::report::Unit;
+use redsuite_core::report::Unit::{Count, Micros, Ratio, Seconds, Tps};
 use redsuite_core::{
-    api, check, check_eq, prep,
+    check, check_eq, prep,
     profile::{self, ProfileValues},
     redline::causal::{
         chain_ixs, hex, independent_ixs, PairModel, Step, HASH_INIT, STEPS,
@@ -26,6 +25,7 @@ use redsuite_core::{
         execute_until_raw, merge_outcomes, spawn_workers, split_budget, Pacing,
         RawRunOutcome, RunOutcome, Worker, Workers,
     },
+    sampler::{MeanMax, Sampled, Sampler, Trailing},
     stats::{ObservationsStats, StreamingStats},
     transport::ws::SignatureConfirmations,
     BaseCtx, ChainCtx, CheckError, ErClient, ErCtx, Metrics, MetricsDelta,
@@ -337,96 +337,34 @@ async fn join_load(handles: Workers<RawRunOutcome>) -> Result<RunOutcome> {
     Ok(merge_outcomes(handles.join_async().await?))
 }
 
+#[derive(Default)]
 struct Samples {
-    busy_mean: f64,
-    busy_max: f64,
+    busy: MeanMax,
     blocked_max: f64,
     max_stall: Duration,
-    count: usize,
 }
 
-struct Sampler {
-    stop: Arc<AtomicBool>,
-    handle: Option<JoinHandle<Samples>>,
-}
-
-impl Sampler {
-    fn spawn(metrics_url: String) -> Self {
-        let stop = Arc::new(AtomicBool::new(false));
-        let flag = stop.clone();
-        let handle = std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("sampler runtime build is infallible");
-            runtime.block_on(async move {
-                let mut busy_sum = 0.0f64;
-                let mut busy_max = 0.0f64;
-                let mut blocked_max = 0.0f64;
-                let mut count = 0usize;
-                let mut last_txs: Option<f64> = None;
-                let mut last_progress = Instant::now();
-                let mut max_stall = Duration::ZERO;
-                while !flag.load(Ordering::Relaxed) {
-                    if let Ok(metrics) = api::scrape_metrics(&metrics_url).await
-                    {
-                        if let Some(busy) = metrics.get(BUSY_EXECUTORS) {
-                            busy_sum += busy;
-                            busy_max = busy_max.max(busy);
-                            count += 1;
-                        }
-                        if let Some(blocked) = metrics.get(BLOCKED_TRANSACTIONS)
-                        {
-                            blocked_max = blocked_max.max(blocked);
-                        }
-                        if let Some(txs) = metrics.get(TX_COUNT) {
-                            if last_txs.is_none_or(|last| txs > last) {
-                                last_progress = Instant::now();
-                            }
-                            last_txs = Some(txs);
-                            max_stall = max_stall.max(last_progress.elapsed());
-                        }
-                    }
-                    tokio::time::sleep(SAMPLE_INTERVAL).await;
-                }
-                Samples {
-                    busy_mean: if count > 0 {
-                        busy_sum / count as f64
-                    } else {
-                        0.0
-                    },
-                    busy_max,
-                    blocked_max,
-                    max_stall,
-                    count,
-                }
-            })
-        });
-        Self {
-            stop,
-            handle: Some(handle),
-        }
-    }
-
-    fn finish(mut self) -> Samples {
-        self.stop.store(true, Ordering::Relaxed);
-        self.handle
-            .take()
-            .and_then(|handle| handle.join().ok())
-            .unwrap_or(Samples {
-                busy_mean: 0.0,
-                busy_max: 0.0,
-                blocked_max: 0.0,
-                max_stall: Duration::ZERO,
-                count: 0,
-            })
-    }
-}
-
-impl Drop for Sampler {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-    }
+fn spawn_sampler(er: &ErCtx) -> Sampler<Samples> {
+    let mut last_txs: Option<f64> = None;
+    let mut last_progress = Instant::now();
+    Sampler::spawn(
+        er.metrics().clone(),
+        SAMPLE_INTERVAL,
+        Trailing::Skip,
+        move |metrics: &Metrics, samples: &mut Samples| {
+            let busy = metrics.get(BUSY_EXECUTORS)?;
+            let blocked = metrics.get(BLOCKED_TRANSACTIONS)?;
+            let txs = metrics.get(TX_COUNT)?;
+            samples.busy.push(busy);
+            samples.blocked_max = samples.blocked_max.max(blocked);
+            if last_txs.is_none_or(|last| txs > last) {
+                last_progress = Instant::now();
+            }
+            last_txs = Some(txs);
+            samples.max_stall = samples.max_stall.max(last_progress.elapsed());
+            Some(())
+        },
+    )
 }
 
 struct DrainState {
@@ -528,7 +466,7 @@ struct PhaseOutcome {
     chain_txs: u64,
     send: ObservationsStats,
     load: RunOutcome,
-    samples: Samples,
+    samples: Sampled<Samples>,
     wall: Duration,
 }
 
@@ -587,7 +525,7 @@ async fn run_phase(
         plan.independent_iters,
     ));
     await_load_reaching_executors(er, &mut handles).await?;
-    let sampler = Sampler::spawn(er.metrics_url().to_owned());
+    let sampler = spawn_sampler(er);
 
     let phase_started = tokio::time::Instant::now();
     let (first, last) = plan.range;
@@ -615,7 +553,7 @@ async fn run_phase(
         Some(handles) => join_load(handles).await?,
         None => return Err("independent load driver already joined".into()),
     };
-    let samples = sampler.finish();
+    let samples = sampler.finish_complete("scheduler").await?;
     chain_result?;
     Ok(PhaseOutcome {
         label: plan.mode.label(),
@@ -874,20 +812,20 @@ impl Scenario for ConflictOrdering {
             profile.independent_iters,
         ));
         await_load_reaching_executors(er, &mut handles).await?;
-        let sampler = Sampler::spawn(er.metrics_url().to_owned());
+        let sampler = spawn_sampler(er);
         tokio::time::sleep(CALIBRATION).await;
         let calibration = match handles.take() {
             Some(handles) => join_load(handles).await?,
             None => return Err("calibration load already joined".into()),
         };
-        let calibration_samples = sampler.finish();
+        let calibration_samples = sampler.finish_complete("scheduler").await?;
         check_eq!(
             calibration.failed,
             0,
             "calibration deliveries failed: {:?}",
             calibration.first_error
         )?;
-        let executors = calibration_samples.busy_max;
+        let executors = calibration_samples.value.busy.max;
         check!(
             executors >= MIN_EXECUTORS,
             "saturating open-loop high-cu load kept at most {executors:.0} \
@@ -907,7 +845,7 @@ impl Scenario for ConflictOrdering {
              contention phases use {contention_lanes} lanes",
             self.name(),
             executors,
-            calibration_samples.busy_mean,
+            calibration_samples.value.busy.mean(),
             calibration.delivered,
             calibration.delivered as f64 / calibration.wall.as_secs_f64(),
             calibration_drain.elapsed.as_secs_f64(),
@@ -966,6 +904,7 @@ impl Scenario for ConflictOrdering {
                     phase.label,
                     phase.load.first_error
                 )?;
+                let samples = &phase.samples.value;
                 eprintln!(
                     "[redsuite] {}: batch {batch} {}: {} chain txs (send p50 \
                      {} us / p95 {} us) beside {} independent txs in {:.1} s; \
@@ -978,11 +917,11 @@ impl Scenario for ConflictOrdering {
                     phase.send.quantile95,
                     phase.load.delivered,
                     phase.wall.as_secs_f64(),
-                    phase.samples.busy_mean,
-                    phase.samples.busy_max,
-                    phase.samples.count,
-                    phase.samples.blocked_max,
-                    phase.samples.max_stall.as_secs_f64(),
+                    samples.busy.mean(),
+                    samples.busy.max,
+                    samples.busy.count,
+                    samples.blocked_max,
+                    samples.max_stall.as_secs_f64(),
                 );
                 phases.push(phase);
             }
@@ -1013,27 +952,28 @@ impl Scenario for ConflictOrdering {
             };
 
             for phase in &outcome.phases {
+                let samples = &phase.samples.value;
                 check!(
-                    phase.samples.busy_max >= MIN_EXECUTORS,
+                    samples.busy.max >= MIN_EXECUTORS,
                     "batch {batch} {}: at most {:.0} executor was busy at \
                      once — independent work did not spread across executors",
                     phase.label,
-                    phase.samples.busy_max
+                    samples.busy.max
                 )?;
                 check!(
-                    phase.samples.busy_mean > 1.0,
+                    samples.busy.mean() > 1.0,
                     "batch {batch} {}: busy executors averaged {:.2} — \
                      independent work ran effectively serially",
                     phase.label,
-                    phase.samples.busy_mean
+                    samples.busy.mean()
                 )?;
                 check!(
-                    phase.samples.max_stall <= STALL_BOUND,
+                    samples.max_stall <= STALL_BOUND,
                     "batch {batch} {}: the engine transaction count stood \
                      still for {:.1} s under load, longer than the {:.0} s \
                      progress bound",
                     phase.label,
-                    phase.samples.max_stall.as_secs_f64(),
+                    samples.max_stall.as_secs_f64(),
                     STALL_BOUND.as_secs_f64()
                 )?;
             }
@@ -1104,104 +1044,78 @@ impl Scenario for ConflictOrdering {
                     .setting("executors", executors)
                     .setting("contention lanes", contention_lanes)
                     .setting("open concurrency", OPEN_CONCURRENCY)
-                    .metric(
-                        "chain txs",
-                        Unit::Count,
-                        outcome.chain_txs() as f64,
-                    )
+                    .metric("chain txs", Count, outcome.chain_txs() as f64)
                     .metric(
                         "independent txs",
-                        Unit::Count,
+                        Count,
                         outcome.independent_txs() as f64,
                     )
-                    .metric("engine txs in window", Unit::Count, engine_txs)
+                    .metric("engine txs in window", Count, engine_txs)
                     .metric(
                         "engine txs beyond workload",
-                        Unit::Count,
+                        Count,
                         engine_txs - workload as f64,
                     )
-                    .metric("ordering dependencies", Unit::Count, dependencies)
+                    .metric("ordering dependencies", Count, dependencies)
                     .metric(
                         "dependencies per chain",
-                        Unit::Ratio,
+                        Ratio,
                         dependencies
                             / (outcome.chains() * profile.pairs as u64) as f64,
                     )
                     .metric(
                         "drain s",
-                        Unit::Seconds,
+                        Seconds,
                         outcome.drained.elapsed.as_secs_f64(),
                     )
-                    .metric(
-                        "blocked at drain",
-                        Unit::Count,
-                        outcome.drained.blocked,
-                    )
-                    .metric("busy at drain", Unit::Count, outcome.drained.busy)
-                    .metric(
-                        "pending at drain",
-                        Unit::Count,
-                        outcome.drained.pending,
-                    )
-                    .metric_if("dropped txs", Unit::Count, outcome.dropped)
+                    .metric("blocked at drain", Count, outcome.drained.blocked)
+                    .metric("busy at drain", Count, outcome.drained.busy)
+                    .metric("pending at drain", Count, outcome.drained.pending)
+                    .metric_if("dropped txs", Count, outcome.dropped)
                     .metric_if(
                         "execution failed txs",
-                        Unit::Count,
+                        Count,
                         outcome.execution_failed,
                     );
             for phase in &outcome.phases {
+                let samples = &phase.samples.value;
                 cell = cell
+                    .setting(format!("{} scrapes", phase.label), &phase.samples)
                     .observe(
                         format!("{} chain send us", phase.label),
-                        Unit::Micros,
+                        Micros,
                         phase.send,
                     )
                     .observe(
                         format!("{} independent delivery us", phase.label),
-                        Unit::Micros,
+                        Micros,
                         phase.load.delivery,
-                    )
-                    .metric(
-                        format!("{} chain txs", phase.label),
-                        Unit::Count,
-                        phase.chain_txs as f64,
-                    )
-                    .metric(
-                        format!("{} independent txs", phase.label),
-                        Unit::Count,
-                        phase.load.delivered as f64,
-                    )
-                    .metric(
-                        format!("{} independent tps", phase.label),
-                        Unit::Tps,
+                    );
+                for (label, unit, value) in [
+                    ("chain txs", Count, phase.chain_txs as f64),
+                    ("independent txs", Count, phase.load.delivered as f64),
+                    (
+                        "independent tps",
+                        Tps,
                         phase.load.delivered as f64
                             / phase.load.wall.as_secs_f64().max(1e-9),
-                    )
-                    .metric(
-                        format!("{} busy executors mean", phase.label),
-                        Unit::Count,
-                        phase.samples.busy_mean,
-                    )
-                    .metric(
-                        format!("{} busy executors max", phase.label),
-                        Unit::Count,
-                        phase.samples.busy_max,
-                    )
-                    .metric(
-                        format!("{} blocked max", phase.label),
-                        Unit::Count,
-                        phase.samples.blocked_max,
-                    )
-                    .metric(
-                        format!("{} longest stall s", phase.label),
-                        Unit::Seconds,
-                        phase.samples.max_stall.as_secs_f64(),
-                    )
-                    .metric(
-                        format!("{} wall s", phase.label),
-                        Unit::Seconds,
-                        phase.wall.as_secs_f64(),
+                    ),
+                    ("busy executors mean", Count, samples.busy.mean()),
+                    ("busy executors max", Count, samples.busy.max),
+                    ("blocked max", Count, samples.blocked_max),
+                    (
+                        "longest stall s",
+                        Seconds,
+                        samples.max_stall.as_secs_f64(),
+                    ),
+                    ("wall s", Seconds, phase.wall.as_secs_f64()),
+                ] {
+                    cell = cell.metric(
+                        format!("{} {label}", phase.label),
+                        unit,
+                        value,
                     );
+                }
             }
             match report::persist_cell(self.name(), &cell) {
                 Ok(path) => {
@@ -1230,7 +1144,7 @@ impl Scenario for ConflictOrdering {
         let longest_stall = batches
             .iter()
             .flat_map(|batch| batch.phases.iter())
-            .map(|phase| phase.samples.max_stall)
+            .map(|phase| phase.samples.value.max_stall)
             .max()
             .unwrap_or_default();
         let slowest_drain = batches
@@ -1269,70 +1183,52 @@ impl Scenario for ConflictOrdering {
                 }
                 .shape(),
             )
-            .metric("chains", Unit::Count, chains as f64)
-            .metric("chain txs", Unit::Count, chain_txs as f64)
-            .metric("independent txs", Unit::Count, independent_txs as f64)
-            .metric("engine txs", Unit::Count, engine_txs)
-            .metric("ordering dependencies", Unit::Count, dependencies)
+            .metric("chains", Count, chains as f64)
+            .metric("chain txs", Count, chain_txs as f64)
+            .metric("independent txs", Count, independent_txs as f64)
+            .metric("engine txs", Count, engine_txs)
+            .metric("ordering dependencies", Count, dependencies)
             .metric(
                 "dependencies per chain",
-                Unit::Ratio,
+                Ratio,
                 dependencies / chains.max(1) as f64,
             )
-            .metric(
-                "longest stall s",
-                Unit::Seconds,
-                longest_stall.as_secs_f64(),
-            )
-            .metric(
-                "slowest drain s",
-                Unit::Seconds,
-                slowest_drain.as_secs_f64(),
-            );
+            .metric("longest stall s", Seconds, longest_stall.as_secs_f64())
+            .metric("slowest drain s", Seconds, slowest_drain.as_secs_f64());
         for (index, batch) in batches.iter().enumerate() {
             summary = summary
                 .metric(
                     format!("batch{index} ordering dependencies"),
-                    Unit::Count,
+                    Count,
                     batch.dependencies,
                 )
                 .metric(
                     format!("batch{index} drain s"),
-                    Unit::Seconds,
+                    Seconds,
                     batch.drained.elapsed.as_secs_f64(),
                 );
             for phase in &batch.phases {
-                summary = summary
-                    .metric(
-                        format!(
-                            "batch{index} {} chain send p50 us",
-                            phase.label
-                        ),
-                        Unit::Micros,
-                        phase.send.median as f64,
-                    )
-                    .metric(
-                        format!(
-                            "batch{index} {} chain send p95 us",
-                            phase.label
-                        ),
-                        Unit::Micros,
-                        phase.send.quantile95 as f64,
-                    )
-                    .metric(
-                        format!(
-                            "batch{index} {} busy executors mean",
-                            phase.label
-                        ),
-                        Unit::Count,
-                        phase.samples.busy_mean,
-                    )
-                    .metric(
-                        format!("batch{index} {} independent tps", phase.label),
-                        Unit::Tps,
+                for (label, unit, value) in [
+                    ("chain send p50 us", Micros, phase.send.median as f64),
+                    ("chain send p95 us", Micros, phase.send.quantile95 as f64),
+                    (
+                        "busy executors mean",
+                        Count,
+                        phase.samples.value.busy.mean(),
+                    ),
+                    (
+                        "independent tps",
+                        Tps,
                         phase.load.delivered as f64
                             / phase.load.wall.as_secs_f64().max(1e-9),
+                    ),
+                ] {
+                    summary = summary.metric(
+                        format!("batch{index} {} {label}", phase.label),
+                        unit,
+                        value,
                     );
+                }
             }
         }
         Ok(summary)

@@ -234,7 +234,7 @@ impl BaseCtx {
 pub struct ErCtx {
     api: Api,
     ws_url: String,
-    metrics_url: String,
+    metrics: api::MetricsCollector,
     identity: Pubkey,
     blockhash: Rc<BlockhashCache>,
 }
@@ -263,7 +263,7 @@ impl ErCtx {
         Self {
             api,
             ws_url,
-            metrics_url,
+            metrics: api::MetricsCollector::new(&metrics_url),
             identity,
             blockhash: Rc::new(BlockhashCache::new(ER_BLOCKHASH_TTL)),
         }
@@ -289,12 +289,12 @@ impl ErCtx {
         self.blockhash.reset();
     }
 
-    pub fn metrics_url(&self) -> &str {
-        &self.metrics_url
+    pub fn metrics(&self) -> &api::MetricsCollector {
+        &self.metrics
     }
 
     pub async fn scrape_metrics(&self) -> Result<Metrics> {
-        api::scrape_metrics(&self.metrics_url).await
+        self.metrics.scrape().await
     }
 }
 

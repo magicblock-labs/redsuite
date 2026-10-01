@@ -1,6 +1,9 @@
-use std::{cell::Cell, rc::Rc, time::Duration};
+use std::time::Duration;
 
-use crate::{api, Result};
+use crate::{
+    api::MetricsCollector,
+    sampler::{Sampler, Trailing},
+};
 
 // backlog must actually form before OVERLOAD is on the table
 const OVERLOAD_BACKLOG_FLOOR: f64 = 5.0;
@@ -16,13 +19,13 @@ pub struct MonitorSpec {
     pub window: Duration,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct SteadyStateSample {
     pub elapsed_secs: f64,
     pub arrivals_total: f64,
     pub drained_total: f64,
     pub backlog: f64,
-    pub busy: f64,
+    pub busy: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,94 +54,47 @@ pub struct SteadyStateOutcome {
     pub backlog_peak: f64,
     pub backlog_end: f64,
     pub outstanding_peak: f64,
-    pub busy_peak: f64,
+    pub busy_peak: Option<f64>,
     pub samples: Vec<SteadyStateSample>,
 }
 
-pub struct SteadyStateMonitor {
-    stop: Rc<Cell<bool>>,
-    task: tokio::task::JoinHandle<Vec<SteadyStateSample>>,
+pub fn start(
+    collector: MetricsCollector,
+    spec: MonitorSpec,
+) -> Sampler<Vec<SteadyStateSample>> {
+    let started = std::time::Instant::now();
+    Sampler::spawn(
+        collector,
+        spec.window,
+        Trailing::Sample,
+        move |metrics, samples: &mut Vec<SteadyStateSample>| {
+            samples.push(SteadyStateSample {
+                elapsed_secs: started.elapsed().as_secs_f64(),
+                arrivals_total: metrics.value_sum(&spec.arrival_counter)?,
+                drained_total: metrics.value_sum(&spec.drain_counter)?,
+                backlog: metrics.value_sum(&spec.backlog_gauge)?,
+                busy: spec
+                    .busy_gauge
+                    .as_deref()
+                    .and_then(|gauge| metrics.value_sum(gauge)),
+            });
+            Some(())
+        },
+    )
 }
 
-impl SteadyStateMonitor {
-    // Requires a LocalSet (the scenario executor provides one). Scrape failures skip
-    // the sample rather than killing the monitor.
-    pub fn start(metrics_url: String, spec: MonitorSpec) -> Self {
-        let stop = Rc::new(Cell::new(false));
-        let stop_flag = stop.clone();
-        let task = tokio::task::spawn_local(async move {
-            let started = tokio::time::Instant::now();
-            let mut samples = Vec::new();
-            loop {
-                if let Ok(metrics) = api::scrape_metrics(&metrics_url).await {
-                    samples.push(SteadyStateSample {
-                        elapsed_secs: started.elapsed().as_secs_f64(),
-                        arrivals_total: metrics
-                            .value_sum(&spec.arrival_counter)
-                            .unwrap_or(0.0),
-                        drained_total: metrics
-                            .value_sum(&spec.drain_counter)
-                            .unwrap_or(0.0),
-                        backlog: metrics
-                            .value_sum(&spec.backlog_gauge)
-                            .unwrap_or(0.0),
-                        busy: spec
-                            .busy_gauge
-                            .as_deref()
-                            .and_then(|gauge| metrics.value_sum(gauge))
-                            .unwrap_or(0.0),
-                    });
-                }
-                // a final fresh sample is taken after stop is requested
-                if stop_flag.get() {
-                    break;
-                }
-                tokio::time::sleep(spec.window).await;
-            }
-            samples
-        });
-        Self { stop, task }
-    }
-
-    pub async fn finish(self) -> Result<SteadyStateOutcome> {
-        self.stop.set(true);
-        let samples = self
-            .task
-            .await
-            .map_err(|join_error| format!("monitor task: {join_error}"))?;
-        Ok(judge(samples))
-    }
-}
-
-fn judge(samples: Vec<SteadyStateSample>) -> SteadyStateOutcome {
+pub fn judge(samples: Vec<SteadyStateSample>) -> SteadyStateOutcome {
     let backlog_peak = samples
         .iter()
         .map(|sample| sample.backlog)
         .fold(0.0, f64::max);
-    let busy_peak =
-        samples.iter().map(|sample| sample.busy).fold(0.0, f64::max);
-    let backlog_end =
-        samples.last().map(|sample| sample.backlog).unwrap_or(0.0);
-
-    let (Some(first), Some(last)) = (samples.first(), samples.last()) else {
-        return SteadyStateOutcome {
-            verdict: SteadyStateVerdict::Invalid,
-            arrival_rate: 0.0,
-            drain_rate: 0.0,
-            backlog_peak,
-            backlog_end,
-            outstanding_peak: 0.0,
-            busy_peak,
-            samples,
-        };
+    let first = samples.first().copied().unwrap_or_default();
+    let last = samples.last().copied().unwrap_or_default();
+    let outstanding = |sample: &SteadyStateSample| {
+        (sample.arrivals_total - first.arrivals_total)
+            - (sample.drained_total - first.drained_total)
     };
-    let outstanding_peak = samples
-        .iter()
-        .map(|sample| {
-            (sample.arrivals_total - first.arrivals_total)
-                - (sample.drained_total - first.drained_total)
-        })
-        .fold(0.0, f64::max);
+    let outstanding_peak = samples.iter().map(outstanding).fold(0.0, f64::max);
     let span_secs = last.elapsed_secs - first.elapsed_secs;
     let arrivals = last.arrivals_total - first.arrivals_total;
     let drained = last.drained_total - first.drained_total;
@@ -153,20 +109,16 @@ fn judge(samples: Vec<SteadyStateSample>) -> SteadyStateOutcome {
     for pair in samples.windows(2) {
         let window_arrivals = pair[1].arrivals_total - pair[0].arrivals_total;
         let window_drained = pair[1].drained_total - pair[0].drained_total;
-        let outstanding_end = (pair[1].arrivals_total - first.arrivals_total)
-            - (pair[1].drained_total - first.drained_total);
-        let queue_deep =
-            outstanding_end.max(pair[1].backlog) >= OVERLOAD_BACKLOG_FLOOR;
+        let queue_deep = outstanding(&pair[1]).max(pair[1].backlog)
+            >= OVERLOAD_BACKLOG_FLOOR;
         let drain_lagging = window_arrivals > 0.0
             && window_drained < window_arrivals * DRAIN_KEEPUP_FRACTION;
-        if queue_deep && drain_lagging {
-            lagging_streak += 1;
-            if lagging_streak >= OVERLOAD_STREAK {
-                overloaded = true;
-            }
+        lagging_streak = if queue_deep && drain_lagging {
+            lagging_streak + 1
         } else {
-            lagging_streak = 0;
-        }
+            0
+        };
+        overloaded |= lagging_streak >= OVERLOAD_STREAK;
     }
     let verdict = if samples.len() < 2 || arrivals <= 0.0 {
         // measured nothing — must never read as a pass (cross-cutting #5)
@@ -182,9 +134,12 @@ fn judge(samples: Vec<SteadyStateSample>) -> SteadyStateOutcome {
         arrival_rate,
         drain_rate,
         backlog_peak,
-        backlog_end,
+        backlog_end: last.backlog,
         outstanding_peak,
-        busy_peak,
+        busy_peak: samples
+            .iter()
+            .filter_map(|sample| sample.busy)
+            .reduce(f64::max),
         samples,
     }
 }
@@ -204,7 +159,7 @@ mod tests {
             arrivals_total,
             drained_total,
             backlog,
-            busy: 0.0,
+            busy: Some(0.0),
         }
     }
 

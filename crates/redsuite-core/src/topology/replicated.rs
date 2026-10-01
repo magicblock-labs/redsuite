@@ -64,7 +64,7 @@ pub struct Verifier {
     log: PathBuf,
     child: Option<Child>,
     record: Rc<ResourceRecord>,
-    metrics_url: String,
+    metrics: api::MetricsCollector,
     ports: process::PortLease,
 }
 
@@ -89,10 +89,6 @@ impl Verifier {
         self.plan.metrics_port
     }
 
-    pub fn metrics_url(&self) -> &str {
-        &self.metrics_url
-    }
-
     pub fn upstream_address(&self) -> String {
         self.plan.upstream_address()
     }
@@ -114,7 +110,7 @@ impl Verifier {
     }
 
     pub async fn scrape_metrics(&self) -> Result<Metrics> {
-        api::scrape_metrics(&self.metrics_url).await
+        self.metrics.scrape().await
     }
 
     pub async fn stream_connected(&self) -> bool {
@@ -485,7 +481,7 @@ pub async fn replicated(
             log,
             child: Some(child),
             record,
-            metrics_url,
+            metrics: api::MetricsCollector::new(&metrics_url),
             ports,
         };
         if let Err(error) = verifier.wait_ready(VERIFIER_READY_TIMEOUT).await {

@@ -119,8 +119,8 @@ pub async fn post_json(
     ok_text(url, response).await
 }
 
-pub async fn get_once(url: &str) -> Result<String> {
-    let response = client()
+pub async fn get(client: &reqwest::Client, url: &str) -> Result<String> {
+    let response = client
         .get(url)
         .send()
         .await
