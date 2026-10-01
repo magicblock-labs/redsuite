@@ -1,7 +1,5 @@
 use std::{
     path::{Path, PathBuf},
-    process::Child,
-    rc::Rc,
     time::{Duration, Instant},
 };
 
@@ -19,9 +17,8 @@ use crate::{
     api::{self, Metrics},
     console,
     context::BaseCtx,
-    host::proc_running,
     report,
-    resources::{LaunchRecord, ResourceRecord},
+    resources::LaunchRecord,
     Result,
 };
 
@@ -58,12 +55,9 @@ pub struct VerifierTiming {
 
 pub struct Verifier {
     index: usize,
-    label: String,
-    pid: u32,
+    proc: process::Owned,
     plan: VerifierPlan,
     log: PathBuf,
-    child: Option<Child>,
-    record: Rc<ResourceRecord>,
     metrics: api::MetricsCollector,
     ports: process::PortLease,
 }
@@ -74,11 +68,11 @@ impl Verifier {
     }
 
     pub fn label(&self) -> &str {
-        &self.label
+        self.proc.label()
     }
 
     pub fn pid(&self) -> u32 {
-        self.pid
+        self.proc.pid()
     }
 
     pub fn identity(&self) -> Pubkey {
@@ -106,7 +100,7 @@ impl Verifier {
     }
 
     pub fn is_running(&self) -> bool {
-        self.child.is_some() && proc_running(self.pid)
+        self.proc.is_running()
     }
 
     pub async fn scrape_metrics(&self) -> Result<Metrics> {
@@ -124,9 +118,9 @@ impl Verifier {
     pub async fn wait_ready(&self, timeout: Duration) -> Result<()> {
         process::wait_until(
             timeout,
-            &format!("verifier `{}` metrics answering", self.label),
+            &format!("verifier `{}` metrics answering", self.proc.label()),
             &self.log,
-            self.pid,
+            self.proc.pid(),
             || async { self.scrape_metrics().await.is_ok() },
         )
         .await
@@ -140,10 +134,10 @@ impl Verifier {
             timeout,
             &format!(
                 "verifier `{}` holding a live replication stream",
-                self.label
+                self.proc.label()
             ),
             &self.log,
-            self.pid,
+            self.proc.pid(),
             || self.stream_connected(),
         )
         .await?;
@@ -151,14 +145,14 @@ impl Verifier {
     }
 
     pub async fn stop(&mut self, hard_kill: bool) -> Result<VerifierStop> {
-        let child = self.child.as_mut().ok_or_else(|| {
-            format!("verifier `{}` has no running process to stop", self.label)
-        })?;
         let started = Instant::now();
         let (exit_status, needed_sigkill) =
-            process::terminate(child, self.pid, hard_kill).await?;
-        self.child = None;
-        self.record.mark_finished();
+            self.proc.terminate(hard_kill).await?.ok_or_else(|| {
+                format!(
+                    "verifier `{}` has no running process to stop",
+                    self.proc.label()
+                )
+            })?;
         Ok(VerifierStop {
             shutdown: started.elapsed(),
             needed_sigkill,
@@ -173,10 +167,10 @@ impl Verifier {
     // storage; wiping it lets the next start rejoin from the leader's
     // snapshot under the same identity, ports and configuration.
     pub fn reset_storage(&mut self) -> Result<()> {
-        if self.child.is_some() {
+        if self.proc.has_child() {
             return Err(format!(
                 "verifier `{}` must be stopped before its storage is reset",
-                self.label
+                self.proc.label()
             )
             .into());
         }
@@ -189,26 +183,25 @@ impl Verifier {
         state::remove_storage(&self.plan.storage_dir).map_err(|error| {
             format!(
                 "removing the storage of verifier `{}`: {error}",
-                self.label
+                self.proc.label()
             )
             .into()
         })
     }
 
     pub async fn start(&mut self, ready_timeout: Duration) -> Result<Duration> {
-        if self.child.is_some() {
+        if self.proc.has_child() {
             return Err(format!(
                 "verifier `{}` is already running (pid {})",
-                self.label, self.pid
+                self.proc.label(),
+                self.proc.pid()
             )
             .into());
         }
         let started = Instant::now();
-        let child = process::spawn_child(self.plan.command(), &self.log)?;
-        self.pid = child.id();
-        self.child = Some(child);
-        self.record.relaunched(self.pid);
-        self.wait_ready(ready_timeout).await?;
+        self.proc
+            .relaunch(process::spawn_child(self.plan.command(), &self.log))?;
+        self.proc.audit(self.wait_ready(ready_timeout).await)?;
         Ok(started.elapsed())
     }
 
@@ -221,7 +214,9 @@ impl Verifier {
         let started = Instant::now();
         let stop = self.stop(hard_kill).await?;
         let startup = self.start(ready_timeout).await?;
-        let connect = self.wait_connected(connect_timeout).await?;
+        let connect = self
+            .proc
+            .audit(self.wait_connected(connect_timeout).await)?;
         Ok(VerifierTiming {
             stop,
             startup,
@@ -231,64 +226,8 @@ impl Verifier {
     }
 
     async fn finish(&mut self) -> Result<()> {
-        if self.child.is_none() {
-            return Ok(());
-        }
-        let outcome = match self.stop(false).await {
-            Ok(_) => self.remove_storage(),
-            Err(error) => Err(error),
-        };
-        if let Err(error) = &outcome {
-            self.record.record_finish_error(error.to_string());
-        }
-        outcome
-    }
-}
-
-impl Drop for Verifier {
-    fn drop(&mut self) {
-        let Some(mut child) = self.child.take() else {
-            if !proc_running(self.pid) {
-                return;
-            }
-            console::debug(format_args!(
-                "stopping verifier `{}` (pid {})",
-                self.label, self.pid
-            ));
-            process::kill_pid(self.pid);
-            self.record.record_exit(
-                "terminated by cleanup, no child handle".to_owned(),
-            );
-            return;
-        };
-        match child.try_wait().ok().flatten() {
-            Some(status) => {
-                let exit = process::describe_exit(&status);
-                console::line(format_args!(
-                    "verifier `{}` (pid {}) had already exited before \
-                     cleanup: {exit}",
-                    self.label, self.pid
-                ));
-                self.record
-                    .record_exit(format!("died before cleanup: {exit}"));
-            }
-            None => {
-                console::debug(format_args!(
-                    "stopping verifier `{}` (pid {})",
-                    self.label, self.pid
-                ));
-                process::kill_pid(self.pid);
-                let exit = child
-                    .wait()
-                    .ok()
-                    .map(|status| process::describe_exit(&status));
-                self.record.record_exit(match exit {
-                    Some(exit) => format!("terminated by cleanup: {exit}"),
-                    None => "terminated by cleanup, status unknown".to_owned(),
-                });
-            }
-        }
-        self.record.mark_finished();
+        self.proc.terminate(false).await?;
+        self.proc.audit(self.remove_storage())
     }
 }
 
@@ -385,12 +324,6 @@ impl ReplicatedTopology {
     }
 }
 
-fn abort_verifier(mut child: Child, pid: u32, record: &Rc<ResourceRecord>) {
-    process::kill_pid(pid);
-    let _ = child.wait();
-    record.mark_finished();
-}
-
 pub async fn replicated(
     base: &BaseCtx,
     options: ReplicatedOptions,
@@ -475,22 +408,15 @@ pub async fn replicated(
         let metrics_url = format!("http://127.0.0.1:{metrics_port}");
         let verifier = Verifier {
             index,
-            label,
-            pid,
+            proc: process::Owned::new("verifier", label, child, record),
             plan,
             log,
-            child: Some(child),
-            record,
             metrics: api::MetricsCollector::new(&metrics_url),
             ports,
         };
-        if let Err(error) = verifier.wait_ready(VERIFIER_READY_TIMEOUT).await {
-            let mut verifier = verifier;
-            if let Some(child) = verifier.child.take() {
-                abort_verifier(child, verifier.pid, &verifier.record);
-            }
-            return Err(error);
-        }
+        verifier
+            .proc
+            .audit(verifier.wait_ready(VERIFIER_READY_TIMEOUT).await)?;
         verifiers.push(verifier);
     }
 
