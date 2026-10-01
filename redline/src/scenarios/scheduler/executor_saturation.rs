@@ -1,10 +1,6 @@
 use std::{
     rc::Rc,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, OnceLock,
-    },
-    thread::JoinHandle,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -12,9 +8,9 @@ use async_trait::async_trait;
 use instruction::Instruction;
 use pubkey::Pubkey;
 use redsuite_core::redline::Accounts;
-use redsuite_core::report::Unit;
+use redsuite_core::report::Unit::{Count, Micros, Ratio, Seconds, Tps};
 use redsuite_core::{
-    api, check, check_eq, host, prep,
+    check, check_eq, host, prep,
     profile::{self, ProfileValues},
     redline::causal::{compute_unit_limit, CU_LIMIT},
     report,
@@ -22,6 +18,7 @@ use redsuite_core::{
         execute_raw, merge_outcomes, spawn_workers, Pacing, RawRunOutcome,
         RunConfig, RunOutcome, WorkerBudgets,
     },
+    sampler::{MeanMax, Sampled, Sampler, Trailing},
     topology, Api, BaseCtx, BatchBody, ChainCtx, CheckError, ErClient, ErCtx,
     MetricsDelta, Result, Scenario, ScenarioReport, TxSender,
 };
@@ -357,70 +354,6 @@ async fn drain_processed(er: &ErCtx, target: f64) -> Result<Duration> {
     Ok(started.elapsed())
 }
 
-struct BusySampler {
-    stop: Arc<AtomicBool>,
-    handle: Option<JoinHandle<Vec<f64>>>,
-}
-
-struct BusySamples {
-    mean: f64,
-    max: f64,
-    count: usize,
-}
-
-impl BusySampler {
-    fn spawn(metrics_url: String) -> Self {
-        let stop = Arc::new(AtomicBool::new(false));
-        let flag = stop.clone();
-        let handle = std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("sampler runtime build is infallible");
-            runtime.block_on(async move {
-                let mut samples = Vec::new();
-                while !flag.load(Ordering::Relaxed) {
-                    if let Ok(metrics) = api::scrape_metrics(&metrics_url).await
-                    {
-                        if let Some(busy) = metrics.get(BUSY_EXECUTORS) {
-                            samples.push(busy);
-                        }
-                    }
-                    tokio::time::sleep(BUSY_SAMPLE_INTERVAL).await;
-                }
-                samples
-            })
-        });
-        Self {
-            stop,
-            handle: Some(handle),
-        }
-    }
-
-    fn finish(mut self) -> BusySamples {
-        self.stop.store(true, Ordering::Relaxed);
-        let samples = self
-            .handle
-            .take()
-            .and_then(|handle| handle.join().ok())
-            .unwrap_or_default();
-        let count = samples.len();
-        let mean = if count > 0 {
-            samples.iter().sum::<f64>() / count as f64
-        } else {
-            0.0
-        };
-        let max = samples.iter().copied().fold(0.0, f64::max);
-        BusySamples { mean, max, count }
-    }
-}
-
-impl Drop for BusySampler {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-    }
-}
-
 struct Cell {
     label: &'static str,
     iters: u32,
@@ -432,7 +365,7 @@ struct Cell {
     cores: f64,
     top_thread_cores: f64,
     busy_threads: usize,
-    busy: BusySamples,
+    busy: Sampled<MeanMax>,
     validator_txs: Option<f64>,
     dependencies: Option<f64>,
     blocked: Option<f64>,
@@ -538,7 +471,15 @@ impl Scenario for ExecutorSaturation {
             let probe: Arc<OnceLock<Signature>> = Arc::new(OnceLock::new());
             let before = er.scrape_metrics().await?;
             let cpu_before = host::cpu_sample(er_pid)?;
-            let sampler = BusySampler::spawn(er.metrics_url().to_owned());
+            let sampler = Sampler::spawn(
+                er.metrics().clone(),
+                BUSY_SAMPLE_INTERVAL,
+                Trailing::Skip,
+                |metrics, busy: &mut MeanMax| {
+                    busy.push(metrics.get(BUSY_EXECUTORS)?);
+                    Some(())
+                },
+            );
             let burst = execute_cell_burst(
                 er_rpc_url.clone(),
                 BurstConfig {
@@ -570,7 +511,7 @@ impl Scenario for ExecutorSaturation {
                 }
                 None => Duration::ZERO,
             };
-            let busy = sampler.finish();
+            let busy = sampler.finish_complete(BUSY_EXECUTORS).await?;
             let cpu_after = host::cpu_sample(er_pid)?;
             let after = er.scrape_metrics().await?;
             let delta = MetricsDelta::new(before, after);
@@ -649,6 +590,7 @@ impl Scenario for ExecutorSaturation {
                 dropped,
                 execution_failed,
             };
+            let busy = &cell.busy.value;
             eprintln!(
                 "[redsuite] {}: {label} (sha256 iters {iters}): signed in {:.1} s, \
                  blasted in {:.1} s ({:.0} tps delivered), {:.0} tps executed \
@@ -665,9 +607,9 @@ impl Scenario for ExecutorSaturation {
                 cell.outcome.delivery.median,
                 cell.outcome.delivery.quantile95,
                 cell.probe_cus,
-                cell.busy.mean,
-                cell.busy.max,
-                cell.busy.count,
+                busy.mean(),
+                busy.max,
+                busy.count,
                 cell.dependency_ratio().unwrap_or(f64::NAN),
                 cell.cores,
                 cell.top_thread_cores,
@@ -675,7 +617,7 @@ impl Scenario for ExecutorSaturation {
                 BUSY_THREAD_CORES,
             );
 
-            let cell_report =
+            let mut cell_report =
                 ScenarioReport::ok(&format!("{}/{label}", self.name()))
                     .setting("profile", profile.name)
                     .setting("sha256 iters", cell.iters)
@@ -690,56 +632,33 @@ impl Scenario for ExecutorSaturation {
                     .setting("rpc batch", profile.rpc_batch)
                     .setting("batch per thread", profile.batch)
                     .setting("concurrency", profile.cell_concurrency(label))
-                    .observe("delivery us", Unit::Micros, cell.outcome.delivery)
-                    .metric(
-                        "achieved tps",
-                        Unit::Tps,
-                        cell.outcome.achieved_rps(),
-                    )
-                    .metric(
-                        "executed tps",
-                        Unit::Tps,
-                        cell.executed_tps(cell_iterations),
-                    )
-                    .metric("sign s", Unit::Seconds, cell.sign_s)
-                    .metric("blast s", Unit::Seconds, cell.blast_s)
-                    .metric("drain s", Unit::Seconds, cell.drain.as_secs_f64())
-                    .metric("probe consumed cus", Unit::Count, cell.probe_cus)
-                    .metric("busy executors mean", Unit::Count, cell.busy.mean)
-                    .metric("busy executors max", Unit::Count, cell.busy.max)
-                    .metric_if(
-                        "dependency ratio",
-                        Unit::Ratio,
-                        cell.dependency_ratio(),
-                    )
-                    .metric_if(
-                        "ordering dependencies",
-                        Unit::Count,
-                        cell.dependencies,
-                    )
-                    .metric_if("blocked txs", Unit::Count, cell.blocked)
-                    .metric("validator cores", Unit::Count, cell.cores)
-                    .metric(
-                        "top thread cores",
-                        Unit::Count,
-                        cell.top_thread_cores,
-                    )
-                    .metric(
-                        "busy threads",
-                        Unit::Count,
-                        cell.busy_threads as f64,
-                    )
-                    .metric_if(
-                        "validator txs in window",
-                        Unit::Count,
-                        cell.validator_txs,
-                    )
-                    .metric_if("dropped txs", Unit::Count, cell.dropped)
-                    .metric_if(
-                        "execution failed txs",
-                        Unit::Count,
-                        cell.execution_failed,
-                    );
+                    .observe("delivery us", Micros, cell.outcome.delivery)
+                    .setting("metrics sampling", &cell.busy);
+            for (name, unit, value) in [
+                ("achieved tps", Tps, Some(cell.outcome.achieved_rps())),
+                (
+                    "executed tps",
+                    Tps,
+                    Some(cell.executed_tps(cell_iterations)),
+                ),
+                ("sign s", Seconds, Some(cell.sign_s)),
+                ("blast s", Seconds, Some(cell.blast_s)),
+                ("drain s", Seconds, Some(cell.drain.as_secs_f64())),
+                ("probe consumed cus", Count, Some(cell.probe_cus)),
+                ("busy executors mean", Count, Some(busy.mean())),
+                ("busy executors max", Count, Some(busy.max)),
+                ("dependency ratio", Ratio, cell.dependency_ratio()),
+                ("ordering dependencies", Count, cell.dependencies),
+                ("blocked txs", Count, cell.blocked),
+                ("validator cores", Count, Some(cell.cores)),
+                ("top thread cores", Count, Some(cell.top_thread_cores)),
+                ("busy threads", Count, Some(cell.busy_threads as f64)),
+                ("validator txs in window", Count, cell.validator_txs),
+                ("dropped txs", Count, cell.dropped),
+                ("execution failed txs", Count, cell.execution_failed),
+            ] {
+                cell_report = cell_report.metric_if(name, unit, value);
+            }
             match report::persist_cell(self.name(), &cell_report) {
                 Ok(path) => {
                     eprintln!("[redsuite]   cell report: {}", path.display())
@@ -794,10 +713,10 @@ impl Scenario for ExecutorSaturation {
             .setting("batch per thread", profile.batch)
             .setting("concurrency", profile.concurrency)
             .setting("heavy concurrency", profile.heavy_concurrency)
-            .metric("heavy/light probe cu ratio", Unit::Ratio, cu_ratio)
+            .metric("heavy/light probe cu ratio", Ratio, cu_ratio)
             .metric(
                 "heavy/light cores ratio",
-                Unit::Ratio,
+                Ratio,
                 if light.cores > 0.0 {
                     heavy.cores / light.cores
                 } else {
@@ -805,82 +724,42 @@ impl Scenario for ExecutorSaturation {
                 },
             );
         for cell in &cells {
-            summary = summary
-                .metric(
-                    format!("{} achieved tps", cell.label),
-                    Unit::Tps,
-                    cell.delivered_tps(),
-                )
-                .metric(
-                    format!("{} executed tps", cell.label),
-                    Unit::Tps,
-                    cell.executed_tps(cell.iterations),
-                )
-                .metric(
-                    format!("{} staged txs", cell.label),
-                    Unit::Count,
-                    cell.staged as f64,
-                )
-                .metric(
-                    format!("{} delivery p50 us", cell.label),
-                    Unit::Micros,
-                    cell.outcome.delivery.median as f64,
-                )
-                .metric(
-                    format!("{} delivery p95 us", cell.label),
-                    Unit::Micros,
-                    cell.outcome.delivery.quantile95 as f64,
-                )
-                .metric(
-                    format!("{} sign s", cell.label),
-                    Unit::Seconds,
-                    cell.sign_s,
-                )
-                .metric(
-                    format!("{} blast s", cell.label),
-                    Unit::Seconds,
-                    cell.blast_s,
-                )
-                .metric(
-                    format!("{} drain s", cell.label),
-                    Unit::Seconds,
-                    cell.drain.as_secs_f64(),
-                )
-                .metric(
-                    format!("{} probe consumed cus", cell.label),
-                    Unit::Count,
-                    cell.probe_cus,
-                )
-                .metric(
-                    format!("{} busy executors mean", cell.label),
-                    Unit::Count,
-                    cell.busy.mean,
-                )
-                .metric(
-                    format!("{} busy executors max", cell.label),
-                    Unit::Count,
-                    cell.busy.max,
-                )
-                .metric_if(
-                    format!("{} dependency ratio", cell.label),
-                    Unit::Ratio,
-                    cell.dependency_ratio(),
-                )
-                .metric(
-                    format!("{} validator cores", cell.label),
-                    Unit::Count,
-                    cell.cores,
-                )
-                .metric(
-                    format!("{} top thread cores", cell.label),
-                    Unit::Count,
-                    cell.top_thread_cores,
-                )
-                .metric(
-                    format!("{} busy threads", cell.label),
-                    Unit::Count,
-                    cell.busy_threads as f64,
+            let busy = &cell.busy.value;
+            for (name, unit, value) in [
+                ("achieved tps", Tps, Some(cell.delivered_tps())),
+                (
+                    "executed tps",
+                    Tps,
+                    Some(cell.executed_tps(cell.iterations)),
+                ),
+                ("staged txs", Count, Some(cell.staged as f64)),
+                (
+                    "delivery p50 us",
+                    Micros,
+                    Some(cell.outcome.delivery.median as f64),
+                ),
+                (
+                    "delivery p95 us",
+                    Micros,
+                    Some(cell.outcome.delivery.quantile95 as f64),
+                ),
+                ("sign s", Seconds, Some(cell.sign_s)),
+                ("blast s", Seconds, Some(cell.blast_s)),
+                ("drain s", Seconds, Some(cell.drain.as_secs_f64())),
+                ("probe consumed cus", Count, Some(cell.probe_cus)),
+                ("busy executors mean", Count, Some(busy.mean())),
+                ("busy executors max", Count, Some(busy.max)),
+                ("dependency ratio", Ratio, cell.dependency_ratio()),
+                ("validator cores", Count, Some(cell.cores)),
+                ("top thread cores", Count, Some(cell.top_thread_cores)),
+                ("busy threads", Count, Some(cell.busy_threads as f64)),
+            ] {
+                summary = summary.metric_if(
+                    format!("{} {name}", cell.label),
+                    unit,
+                    value,
                 );
+            }
         }
         Ok(summary)
     }

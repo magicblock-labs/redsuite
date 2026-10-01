@@ -11,7 +11,7 @@ use redsuite_core::redline::Accounts;
 use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq,
-    monitor::{MonitorSpec, SteadyStateMonitor},
+    monitor::{self, MonitorSpec, SteadyStateVerdict},
     prep,
     profile::{self, ProfileValues},
     receipt, report,
@@ -267,8 +267,8 @@ impl Scenario for CommitThroughputCeiling {
         let before = er.scrape_metrics().await?;
         let intents_before = before.value_sum(INTENTS_COUNTER).unwrap_or(0.0);
         let executed_before = before.value_sum(EXECUTED_COUNTER).unwrap_or(0.0);
-        let monitor = SteadyStateMonitor::start(
-            er.metrics_url().to_owned(),
+        let monitor = monitor::start(
+            er.metrics().clone(),
             MonitorSpec {
                 arrival_counter: INTENTS_COUNTER.to_owned(),
                 drain_counter: EXECUTED_COUNTER.to_owned(),
@@ -312,7 +312,9 @@ impl Scenario for CommitThroughputCeiling {
         )
         .await?;
         let span_wall = span_started.elapsed();
-        let steady_state = monitor.finish().await?;
+        let sampled = monitor.finish().await?;
+        let coverage = sampled.to_string();
+        let steady_state = monitor::judge(sampled.value);
         let after = er.scrape_metrics().await?;
         let delta = MetricsDelta::new(before, after);
 
@@ -348,9 +350,13 @@ impl Scenario for CommitThroughputCeiling {
             steady_state.verdict,
             steady_state.outstanding_peak,
             steady_state.backlog_peak,
-            steady_state.busy_peak,
+            steady_state.busy_peak.unwrap_or(f64::NAN),
         );
         if profile.deep_backlog {
+            check!(
+                steady_state.verdict != SteadyStateVerdict::Invalid,
+                "monitor samples must contain advancing arrivals ({coverage})"
+            )?;
             if drain_rate < 0.8 {
                 if steady_state.outstanding_peak <= 50.0 {
                     eprintln!(
@@ -361,15 +367,16 @@ impl Scenario for CommitThroughputCeiling {
                         steady_state.outstanding_peak
                     );
                 }
-                if steady_state.busy_peak < 40.0 {
+                if let Some(busy) =
+                    steady_state.busy_peak.filter(|busy| *busy < 40.0)
+                {
                     eprintln!(
                         "[redsuite] {}: warning: executor permits never \
-                         saturated (busy peak {:.0})",
-                        self.name(),
-                        steady_state.busy_peak
+                         saturated (busy peak {busy:.0})",
+                        self.name()
                     );
                 }
-                if steady_state.verdict.to_string() != "OVERLOAD" {
+                if steady_state.verdict != SteadyStateVerdict::Overload {
                     eprintln!(
                         "[redsuite] {}: warning: arrival outpaced drain with \
                          a deep queue yet the monitor verdict was {}",
@@ -434,6 +441,7 @@ impl Scenario for CommitThroughputCeiling {
             .setting("drain cap s", profile.drain_cap.as_secs())
             .setting("prewarmed", true)
             .setting("verdict", steady_state.verdict)
+            .setting("steady-state scrapes", coverage)
             .setting("fully drained", drain.fully_drained)
             .observe("delivery us", Unit::Micros, delivery_outcome.delivery)
             .metric("fresh drain intents/s", Unit::PerSecond, drain_rate)
@@ -467,7 +475,7 @@ impl Scenario for CommitThroughputCeiling {
                 Unit::Count,
                 steady_state.backlog_peak,
             )
-            .metric("busy peak", Unit::Count, steady_state.busy_peak)
+            .metric_if("busy peak", Unit::Count, steady_state.busy_peak)
             .metric_if(
                 "validator intent exec avg s",
                 Unit::Seconds,

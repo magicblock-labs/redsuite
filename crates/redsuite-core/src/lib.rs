@@ -18,6 +18,7 @@ pub mod redline;
 pub mod report;
 mod resources;
 pub mod runner;
+pub mod sampler;
 pub mod scenario;
 pub mod stats;
 pub mod system;

@@ -808,10 +808,23 @@ impl Metrics {
     }
 }
 
-pub async fn scrape_metrics(metrics_url: &str) -> Result<Metrics> {
-    let url = format!("{}/metrics", metrics_url.trim_end_matches('/'));
-    let text = http::get_once(&url).await?;
-    Ok(Metrics::parse(&text))
+#[derive(Clone)]
+pub struct MetricsCollector {
+    client: reqwest::Client,
+    url: String,
+}
+
+impl MetricsCollector {
+    pub fn new(metrics_url: &str) -> Self {
+        Self {
+            client: http::client(),
+            url: format!("{}/metrics", metrics_url.trim_end_matches('/')),
+        }
+    }
+
+    pub async fn scrape(&self) -> Result<Metrics> {
+        Ok(Metrics::parse(&http::get(&self.client, &self.url).await?))
+    }
 }
 
 #[derive(Debug)]
