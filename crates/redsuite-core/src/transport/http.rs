@@ -107,7 +107,7 @@ pub fn client_with_timeout(timeout: Duration) -> reqwest::Client {
 pub async fn post_json(
     client: &reqwest::Client,
     url: &str,
-    body: String,
+    body: impl Into<reqwest::Body>,
 ) -> Result<String> {
     let response = client
         .post(url)
