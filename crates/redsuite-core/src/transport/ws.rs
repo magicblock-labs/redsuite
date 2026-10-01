@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -51,6 +51,7 @@ struct Shared {
     subs_by_req: HashMap<u64, Pubkey>,
     account_by_subid: HashMap<u64, Pubkey>,
     pending: HashMap<u64, (Pubkey, Instant)>,
+    by_account: HashMap<Pubkey, BTreeSet<u64>>,
     // closed-loop per-id wake-ups, fired the moment an id settles
     waiters: HashMap<u64, oneshot::Sender<()>>,
     lag: StreamingStats,
@@ -59,7 +60,10 @@ struct Shared {
 }
 
 impl Shared {
-    fn settle_waiter(&mut self, id: u64) {
+    fn settle(&mut self, id: u64) {
+        if let Some((account, _)) = self.pending.remove(&id) {
+            self.by_account.entry(account).or_default().remove(&id);
+        }
         if let Some(tx) = self.waiters.remove(&id) {
             let _ = tx.send(());
         }
@@ -104,27 +108,24 @@ impl<E: Fn(&[u8]) -> Option<u64>> FrameHandler for AccountHandler<E> {
             return;
         };
         let mut shared = self.shared.borrow_mut();
-        if let Some((_, sent)) = shared.pending.remove(&id) {
+        if let Some((_, sent)) = shared.pending.get(&id).copied() {
             shared.lag.push(sent.elapsed().as_micros() as u32);
             shared.observed += 1;
-            shared.settle_waiter(id);
+            shared.settle(id);
         }
-        if let Some(account) =
-            shared.account_by_subid.get(&subscription).copied()
+        let Some(account) = shared.account_by_subid.get(&subscription).copied()
+        else {
+            return;
+        };
+        while let Some(pending_id) = shared
+            .by_account
+            .get(&account)
+            .and_then(BTreeSet::first)
+            .copied()
+            .filter(|&pending_id| pending_id < id)
         {
-            let settled: Vec<u64> = shared
-                .pending
-                .iter()
-                .filter(|(&pending_id, (acc, _))| {
-                    *acc == account && pending_id < id
-                })
-                .map(|(&pending_id, _)| pending_id)
-                .collect();
-            for pending_id in settled {
-                shared.pending.remove(&pending_id);
-                shared.superseded += 1;
-                shared.settle_waiter(pending_id);
-            }
+            shared.superseded += 1;
+            shared.settle(pending_id);
         }
     }
 
@@ -180,10 +181,13 @@ impl AccountUpdates {
     }
 
     pub fn track(&self, id: u64, account: Pubkey) {
-        self.shared
-            .borrow_mut()
-            .pending
-            .insert(id, (account, Instant::now()));
+        let mut shared = self.shared.borrow_mut();
+        if let Some((previous, _)) =
+            shared.pending.insert(id, (account, Instant::now()))
+        {
+            shared.by_account.entry(previous).or_default().remove(&id);
+        }
+        shared.by_account.entry(account).or_default().insert(id);
     }
 
     pub async fn await_observed(
