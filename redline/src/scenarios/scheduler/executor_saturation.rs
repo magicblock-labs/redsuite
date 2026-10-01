@@ -19,8 +19,8 @@ use redsuite_core::{
         RunConfig, RunOutcome, WorkerBudgets,
     },
     sampler::{MeanMax, Sampled, Sampler, Trailing},
-    topology, Api, BaseCtx, BatchBody, ChainCtx, CheckError, ErClient, ErCtx,
-    MetricsDelta, Result, Scenario, ScenarioReport, TxSender,
+    topology, Api, BaseCtx, ChainCtx, CheckError, ErClient, ErCtx,
+    MetricsDelta, Result, Scenario, ScenarioReport, SendBody, TxSender,
 };
 use signature::Signature;
 
@@ -74,9 +74,9 @@ impl Profile {
 
     fn mode(&self) -> &'static str {
         if self.rpc_batch > 0 {
-            "staged backlog, batched rpc"
+            "staged backlog, pre-encoded batch transport"
         } else {
-            "pre-signed burst"
+            "pre-encoded individual transport burst"
         }
     }
 }
@@ -248,62 +248,40 @@ async fn execute_cell_burst(
                     signed.push(tx);
                 }
                 staged += signed.len() as u64;
-                let bodies: Vec<Rc<BatchBody>> = if rpc_batch > 0 {
-                    signed
-                        .chunks(rpc_batch)
-                        .map(|chunk| {
-                            Rc::new(
-                                Api::batch_send_body(chunk)
-                                    .expect("batch body build is infallible"),
-                            )
-                        })
-                        .collect()
-                } else {
-                    Vec::new()
-                };
+                let bodies: Vec<Rc<SendBody>> = signed
+                    .chunks(rpc_batch.max(1))
+                    .map(|chunk| {
+                        Rc::new(
+                            Api::send_body(chunk)
+                                .expect("send body build is infallible"),
+                        )
+                    })
+                    .collect();
                 sign_s += sign_started.elapsed().as_secs_f64();
 
                 let blast_started = Instant::now();
-                let outcome = if rpc_batch > 0 {
-                    execute_raw(
-                        RunConfig {
-                            iterations: bodies.len() as u64,
-                            rate: Pacing::Unlimited,
-                            concurrency,
-                        },
-                        |index| {
-                            let body = bodies[(index - 1) as usize].clone();
-                            let api = api.clone();
-                            async move {
-                                match api.send_batch(&body).await {
-                                    Ok(0) => Ok(()),
-                                    Ok(rejected) => Err(format!(
-                                        "{rejected} batch entries rejected"
-                                    )
-                                    .into()),
-                                    Err(error) => Err(error),
+                let outcome = execute_raw(
+                    RunConfig {
+                        iterations: bodies.len() as u64,
+                        rate: Pacing::Unlimited,
+                        concurrency,
+                    },
+                    |index| {
+                        let body = bodies[(index - 1) as usize].clone();
+                        let api = api.clone();
+                        async move {
+                            match api.send_prepared(&body).await {
+                                Ok(0) => Ok(()),
+                                Ok(rejected) => {
+                                    Err(format!("{rejected} entries rejected")
+                                        .into())
                                 }
+                                Err(error) => Err(error),
                             }
-                        },
-                    )
-                    .await?
-                } else {
-                    execute_raw(
-                        RunConfig {
-                            iterations: signed.len() as u64,
-                            rate: Pacing::Unlimited,
-                            concurrency,
-                        },
-                        |batch_index| {
-                            let tx = signed[(batch_index - 1) as usize].clone();
-                            let api = api.clone();
-                            async move {
-                                api.send_transaction(&tx).await.map(|_| ())
-                            }
-                        },
-                    )
-                    .await?
-                };
+                        }
+                    },
+                )
+                .await?;
                 blast_s += blast_started.elapsed().as_secs_f64();
                 outcomes.push(outcome);
             }
@@ -592,7 +570,7 @@ impl Scenario for ExecutorSaturation {
             };
             let busy = &cell.busy.value;
             eprintln!(
-                "[redsuite] {}: {label} (sha256 iters {iters}): signed in {:.1} s, \
+                "[redsuite] {}: {label} (sha256 iters {iters}): sign+encode {:.1} s, \
                  blasted in {:.1} s ({:.0} tps delivered), {:.0} tps executed \
                  (drain {:.1} s), p50 {} us / p95 {} us, probe {:.0} cus, \
                  busy executors mean {:.1} / max {:.0} over {} samples, \
@@ -641,7 +619,7 @@ impl Scenario for ExecutorSaturation {
                     Tps,
                     Some(cell.executed_tps(cell_iterations)),
                 ),
-                ("sign s", Seconds, Some(cell.sign_s)),
+                ("sign+encode s", Seconds, Some(cell.sign_s)),
                 ("blast s", Seconds, Some(cell.blast_s)),
                 ("drain s", Seconds, Some(cell.drain.as_secs_f64())),
                 ("probe consumed cus", Count, Some(cell.probe_cus)),
@@ -743,7 +721,7 @@ impl Scenario for ExecutorSaturation {
                     Micros,
                     Some(cell.outcome.delivery.quantile95 as f64),
                 ),
-                ("sign s", Seconds, Some(cell.sign_s)),
+                ("sign+encode s", Seconds, Some(cell.sign_s)),
                 ("blast s", Seconds, Some(cell.blast_s)),
                 ("drain s", Seconds, Some(cell.drain.as_secs_f64())),
                 ("probe consumed cus", Count, Some(cell.probe_cus)),

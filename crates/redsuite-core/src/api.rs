@@ -320,19 +320,9 @@ struct SignaturesConfig {
     commitment: &'static str,
 }
 
-pub struct BatchBody {
-    body: String,
-    len: usize,
-}
-
-impl BatchBody {
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
+pub struct SendBody {
+    body: bytes::Bytes,
+    expect: Vec<Signature>,
 }
 
 #[derive(Clone)]
@@ -497,80 +487,106 @@ impl Api {
         Ok(Hash::from_str(&resp.value.blockhash)?)
     }
 
-    pub fn batch_send_body(transactions: &[Transaction]) -> Result<BatchBody> {
-        const CONFIG: &str = r#"{"encoding":"base64","skipPreflight":true,"preflightCommitment":"confirmed"}"#;
-        let mut body = String::from("[");
+    fn send_params(
+        tx: &Transaction,
+    ) -> Result<(String, SendTransactionConfig)> {
+        Ok((
+            base64::engine::general_purpose::STANDARD
+                .encode(bincode::serialize(tx)?),
+            SendTransactionConfig {
+                encoding: "base64",
+                skip_preflight: true,
+                preflight_commitment: Commitment::Confirmed.as_str(),
+            },
+        ))
+    }
+
+    pub fn send_body(transactions: &[Transaction]) -> Result<SendBody> {
+        let batched = transactions.len() != 1;
+        let mut body = String::new();
+        let mut expect = Vec::with_capacity(transactions.len());
+        if batched {
+            body.push('[');
+        }
         for (index, tx) in transactions.iter().enumerate() {
             if index > 0 {
                 body.push(',');
             }
-            let encoded = base64::engine::general_purpose::STANDARD
-                .encode(bincode::serialize(tx)?);
-            let params = format!(r#"["{encoded}",{CONFIG}]"#);
             body.push_str(&crate::transport::conn::request_text(
                 index as u64 + 1,
                 "sendTransaction",
-                &params,
+                &json::to_string(&Self::send_params(tx)?)?,
             ));
+            expect.push(
+                *tx.signatures
+                    .first()
+                    .ok_or("a transaction to send carries no signature")?,
+            );
         }
-        body.push(']');
-        Ok(BatchBody {
-            body,
-            len: transactions.len(),
+        if batched {
+            body.push(']');
+        }
+        Ok(SendBody {
+            body: body.into(),
+            expect,
         })
     }
 
-    pub async fn send_batch(&self, batch: &BatchBody) -> Result<usize> {
-        if batch.is_empty() {
+    pub async fn send_prepared(&self, body: &SendBody) -> Result<usize> {
+        let count = body.expect.len();
+        if count == 0 {
             return Ok(0);
         }
         let response =
-            http::post_json(&self.client, &self.url, batch.body.clone())
-                .await?;
-        let envelopes: Vec<Envelope<String>> = json::from_str(&response)
-            .map_err(|error| {
-                format!(
-                    "sendTransaction batch: unexpected response shape: \
-                     {error} ({response})"
-                )
-            })?;
-        if envelopes.len() != batch.len {
+            http::post_json(&self.client, &self.url, body.body.clone()).await?;
+        let envelopes: Vec<Envelope<String>> = match count {
+            1 => json::from_str(&response).map(|one| vec![one]),
+            _ => json::from_str(&response),
+        }
+        .map_err(|error| {
+            format!("sendTransaction: unexpected response shape: {error} ({response})")
+        })?;
+        if envelopes.len() != count {
             return Err(format!(
-                "sendTransaction batch: sent {} requests, got {} responses",
-                batch.len,
+                "sendTransaction: sent {count} requests, got {} responses",
                 envelopes.len()
             )
             .into());
         }
-        let mut answered = vec![false; batch.len];
+        let mut answered = vec![false; count];
         let mut rejected = 0;
         for envelope in &envelopes {
-            let id = envelope.id.ok_or_else(|| {
-                "sendTransaction batch: response entry carries no id"
-                    .to_string()
-            })?;
-            let index = usize::try_from(id)
-                .ok()
-                .filter(|id| (1..=batch.len).contains(id))
+            let id = envelope
+                .id
+                .and_then(|id| usize::try_from(id).ok())
+                .filter(|id| (1..=count).contains(id))
                 .ok_or_else(|| {
                     format!(
-                        "sendTransaction batch: response id {id} outside 1..={}",
-                        batch.len
+                        "sendTransaction: response id {:?} outside 1..={count}",
+                        envelope.id
                     )
-                })?
-                - 1;
-            if std::mem::replace(&mut answered[index], true) {
+                })?;
+            if std::mem::replace(&mut answered[id - 1], true) {
                 return Err(format!(
-                    "sendTransaction batch: duplicate response id {id}"
+                    "sendTransaction: duplicate response id {id}"
                 )
                 .into());
             }
             if envelope.error.is_some() {
                 rejected += 1;
-            } else if envelope.result.is_none() {
+                continue;
+            }
+            let signature = envelope.result.as_ref().ok_or_else(|| {
+                format!(
+                    "sendTransaction: id {id} carries neither result nor error"
+                )
+            })?;
+            let acknowledged = Signature::from_str(signature)?;
+            let expected = body.expect[id - 1];
+            if acknowledged != expected {
                 return Err(format!(
-                    "sendTransaction batch: response id {id} carries neither \
-                     result nor error"
+                    "sendTransaction: id {id} acknowledged \
+                     {acknowledged}, expected {expected}"
                 )
                 .into());
             }
@@ -582,17 +598,9 @@ impl Api {
         &self,
         tx: &Transaction,
     ) -> Result<Signature> {
-        let encoded = base64::engine::general_purpose::STANDARD
-            .encode(bincode::serialize(tx)?);
-        let params = (
-            encoded,
-            SendTransactionConfig {
-                encoding: "base64",
-                skip_preflight: true,
-                preflight_commitment: Commitment::Confirmed.as_str(),
-            },
-        );
-        let sig: String = self.call("sendTransaction", &params).await?;
+        let sig: String = self
+            .call("sendTransaction", &Self::send_params(tx)?)
+            .await?;
         Ok(Signature::from_str(&sig)?)
     }
 
