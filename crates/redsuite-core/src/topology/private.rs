@@ -1,8 +1,6 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::Child,
-    rc::Rc,
     time::Duration,
 };
 
@@ -18,9 +16,8 @@ use crate::{
     api::Api,
     console,
     context::{BaseCtx, ChainCtx, ErCtx},
-    host::proc_running,
     report,
-    resources::{LaunchRecord, ResourceRecord},
+    resources::LaunchRecord,
     Result,
 };
 
@@ -42,13 +39,10 @@ pub struct RestartTiming {
 }
 
 pub struct PrivateEr {
-    pid: u32,
-    label: String,
+    proc: process::Owned,
     plan: config::ErPlan,
     log: PathBuf,
-    child: Option<Child>,
     ctx: ErCtx,
-    record: Rc<ResourceRecord>,
     ports: process::PortLease,
 }
 
@@ -58,11 +52,11 @@ impl PrivateEr {
     }
 
     pub fn pid(&self) -> u32 {
-        self.pid
+        self.proc.pid()
     }
 
     pub fn label(&self) -> &str {
-        &self.label
+        self.proc.label()
     }
 
     pub fn identity(&self) -> Pubkey {
@@ -86,7 +80,7 @@ impl PrivateEr {
     }
 
     pub fn is_running(&self) -> bool {
-        self.child.is_some() && proc_running(self.pid)
+        self.proc.is_running()
     }
 
     pub fn storage_dir(&self) -> &Path {
@@ -109,7 +103,7 @@ impl PrivateEr {
             timeout,
             "private ER reaching /health/primary",
             &self.log,
-            self.pid,
+            self.proc.pid(),
             || api.primary_ready(),
         )
         .await
@@ -119,34 +113,25 @@ impl PrivateEr {
     // Stop the ER without a relaunch. hard_kill=true is the crash path the
     // ledger-restore scenarios use so nothing flushes on the way down.
     pub async fn stop(&mut self, hard_kill: bool) -> Result<()> {
-        let child = self
-            .child
-            .as_mut()
+        self.proc
+            .terminate(hard_kill)
+            .await?
             .ok_or("private ER has no running process to stop")?;
-        process::terminate(child, self.pid, hard_kill).await?;
-        self.child = None;
-        self.record.mark_finished();
         Ok(())
     }
 
     // The explicit teardown path: a graceful stop whose failure lands in the
     // run's teardown audit, not only in the caller's return value.
     pub async fn finish(mut self) -> Result<()> {
-        let outcome = match self.stop(false).await {
-            Ok(()) => self.remove_storage(),
-            Err(error) => Err(error),
-        };
-        if let Err(error) = &outcome {
-            self.record.record_finish_error(error.to_string());
-        }
-        outcome
+        self.proc.terminate(false).await?;
+        self.proc.audit(self.remove_storage())
     }
 
     fn remove_storage(&self) -> Result<()> {
         state::remove_storage(&self.plan.storage_dir).map_err(|error| {
             format!(
                 "removing the storage of private ER `{}`: {error}",
-                self.label
+                self.proc.label()
             )
             .into()
         })
@@ -161,15 +146,12 @@ impl PrivateEr {
     ) -> Result<RestartTiming> {
         let api = self.rpc_api();
         let slot_before = api.get_slot().await.ok();
-        let child = self
-            .child
-            .as_mut()
-            .ok_or("private ER has no running process to restart")?;
-
         let restart_started = std::time::Instant::now();
-        let (exit_status, needed_sigkill) =
-            process::terminate(child, self.pid, config.hard_kill).await?;
-        self.child = None;
+        let (exit_status, needed_sigkill) = self
+            .proc
+            .terminate(config.hard_kill)
+            .await?
+            .ok_or("private ER has no running process to restart")?;
         let shutdown = restart_started.elapsed();
         let exit_code = exit_status.code();
         let exit_signal =
@@ -177,20 +159,19 @@ impl PrivateEr {
 
         self.plan.reset = config.reset;
         let launch_started = std::time::Instant::now();
-        let new_child = process::spawn_child(self.plan.command(), &self.log)?;
-        self.pid = new_child.id();
-        self.child = Some(new_child);
-        self.record.relaunched(self.pid);
-        process::wait_until_every(
+        self.proc
+            .relaunch(process::spawn_child(self.plan.command(), &self.log))?;
+        let ready = process::wait_until_every(
             process::RESTART_POLL,
             config.ready_timeout,
             "restarted ER reaching /health/primary",
             &self.log,
-            self.pid,
+            self.proc.pid(),
             || api.primary_ready(),
         )
         .await
-        .map_err(|error| self.ports.failure(error))?;
+        .map_err(|error| self.ports.failure(error));
+        self.proc.audit(ready)?;
         let startup = launch_started.elapsed();
         let total = restart_started.elapsed();
         self.ctx.reset_blockhash();
@@ -206,53 +187,6 @@ impl PrivateEr {
             slot_before,
             slot_after,
         })
-    }
-}
-
-impl Drop for PrivateEr {
-    fn drop(&mut self) {
-        let Some(mut child) = self.child.take() else {
-            if !proc_running(self.pid) {
-                return;
-            }
-            console::debug(format_args!(
-                "stopping private ER `{}` (pid {})",
-                self.label, self.pid
-            ));
-            process::kill_pid(self.pid);
-            self.record.record_exit(
-                "terminated by cleanup, no child handle".to_owned(),
-            );
-            return;
-        };
-        match child.try_wait().ok().flatten() {
-            Some(status) => {
-                let exit = process::describe_exit(&status);
-                console::line(format_args!(
-                    "private ER `{}` (pid {}) had already exited before \
-                     cleanup: {exit}",
-                    self.label, self.pid
-                ));
-                self.record
-                    .record_exit(format!("died before cleanup: {exit}"));
-            }
-            None => {
-                console::debug(format_args!(
-                    "stopping private ER `{}` (pid {})",
-                    self.label, self.pid
-                ));
-                process::kill_pid(self.pid);
-                let exit = child
-                    .wait()
-                    .ok()
-                    .map(|status| process::describe_exit(&status));
-                self.record.record_exit(match exit {
-                    Some(exit) => format!("terminated by cleanup: {exit}"),
-                    None => "terminated by cleanup, status unknown".to_owned(),
-                });
-            }
-        }
-        self.record.mark_finished();
     }
 }
 
@@ -283,12 +217,6 @@ async fn await_magic_fee_vault(
         }
         tokio::time::sleep(VAULT_POLL).await;
     }
-}
-
-fn abort_boot(mut child: Child, pid: u32, record: &Rc<ResourceRecord>) {
-    process::kill_pid(pid);
-    let _ = child.wait();
-    record.mark_finished();
 }
 
 pub async fn private_er(
@@ -388,6 +316,7 @@ async fn launch(
         exit: None,
     });
 
+    let proc = process::Owned::new("private ER", options.label, child, record);
     let er_api = Api::new(format!("http://127.0.0.1:{rpc_port}"));
     let ready = process::wait_until(
         config::ER_READY_TIMEOUT,
@@ -396,18 +325,12 @@ async fn launch(
         pid,
         || async { er_api.server_alive().await },
     )
-    .await;
-    if let Err(e) = ready {
-        let error =
-            ports.failure(format_args!("private ER `{}`: {e}", options.label));
-        abort_boot(child, pid, &record);
-        return Err(error);
-    }
-
-    if let Err(e) = await_magic_fee_vault(base, &identity_pubkey).await {
-        abort_boot(child, pid, &record);
-        return Err(e);
-    }
+    .await
+    .map_err(|e| {
+        ports.failure(format_args!("private ER `{}`: {e}", proc.label()))
+    });
+    proc.audit(ready)?;
+    proc.audit(await_magic_fee_vault(base, &identity_pubkey).await)?;
 
     let ctx = ErCtx::new_with_timeout(
         format!("http://127.0.0.1:{rpc_port}"),
@@ -417,13 +340,10 @@ async fn launch(
         options.request_timeout,
     );
     Ok(PrivateEr {
-        pid,
-        label: options.label,
+        proc,
         plan,
         log,
-        child: Some(child),
         ctx,
-        record,
         ports,
     })
 }

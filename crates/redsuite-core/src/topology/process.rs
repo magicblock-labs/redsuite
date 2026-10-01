@@ -2,12 +2,13 @@ use std::{
     fs,
     path::Path,
     process::{Child, Command, ExitStatus, Stdio},
+    rc::Rc,
     time::Duration,
 };
 
 use rand::Rng;
 
-use crate::{host::proc_running, Result};
+use crate::{console, host::proc_running, resources::ResourceRecord, Result};
 
 pub(super) const KILL_GRACE: Duration = Duration::from_secs(5);
 pub(super) const POLL: Duration = Duration::from_millis(250);
@@ -562,6 +563,113 @@ fn tail(path: &Path, lines: usize) -> String {
     };
     let all: Vec<&str> = content.lines().collect();
     all[all.len().saturating_sub(lines)..].join("\n")
+}
+
+pub(super) struct Owned {
+    kind: &'static str,
+    label: String,
+    pid: u32,
+    child: Option<Child>,
+    record: Rc<ResourceRecord>,
+}
+
+impl Owned {
+    pub(super) fn new(
+        kind: &'static str,
+        label: String,
+        child: Child,
+        record: Rc<ResourceRecord>,
+    ) -> Self {
+        Self {
+            kind,
+            pid: child.id(),
+            label,
+            child: Some(child),
+            record,
+        }
+    }
+
+    pub(super) fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    pub(super) fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub(super) fn has_child(&self) -> bool {
+        self.child.is_some()
+    }
+
+    pub(super) fn is_running(&self) -> bool {
+        self.has_child() && proc_running(self.pid)
+    }
+
+    pub(super) async fn terminate(
+        &mut self,
+        hard_kill: bool,
+    ) -> Result<Option<(ExitStatus, bool)>> {
+        let Some(child) = self.child.as_mut() else {
+            return Ok(None);
+        };
+        let outcome = terminate(child, self.pid, hard_kill).await;
+        let outcome = self.audit(outcome)?;
+        self.child = None;
+        self.record.mark_finished();
+        Ok(Some(outcome))
+    }
+
+    pub(super) fn relaunch(&mut self, child: Result<Child>) -> Result<()> {
+        let child = self.audit(child)?;
+        self.pid = child.id();
+        self.child = Some(child);
+        self.record.relaunched(self.pid);
+        Ok(())
+    }
+
+    pub(super) fn audit<T, E: std::fmt::Display>(
+        &self,
+        outcome: std::result::Result<T, E>,
+    ) -> std::result::Result<T, E> {
+        outcome.inspect_err(|error| {
+            self.record.record_finish_error(error.to_string());
+        })
+    }
+}
+
+impl Drop for Owned {
+    fn drop(&mut self) {
+        let (kind, label, pid) = (self.kind, &self.label, self.pid);
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        match self.audit(child.try_wait()).ok().flatten() {
+            Some(status) => {
+                let exit = describe_exit(&status);
+                console::line(format_args!(
+                    "{kind} `{label}` (pid {pid}) had already exited before \
+                     cleanup: {exit}"
+                ));
+                self.record
+                    .record_exit(format!("died before cleanup: {exit}"));
+            }
+            None => {
+                console::debug(format_args!(
+                    "stopping {kind} `{label}` (pid {pid})"
+                ));
+                kill_pid(pid);
+                let exit = self
+                    .audit(child.wait())
+                    .ok()
+                    .map(|status| describe_exit(&status));
+                self.record.record_exit(match exit {
+                    Some(exit) => format!("terminated by cleanup: {exit}"),
+                    None => "terminated by cleanup, status unknown".to_owned(),
+                });
+            }
+        }
+        self.record.mark_finished();
+    }
 }
 
 #[derive(Default)]
