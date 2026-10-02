@@ -140,7 +140,6 @@ async fn run(args: &[String]) -> Result<()> {
         .into());
     }
 
-    let total_scenarios = scenarios.len();
     let mut names: Vec<_> =
         scenarios.iter().map(|entry| entry.name()).collect();
     names.sort();
@@ -180,6 +179,7 @@ async fn run(args: &[String]) -> Result<()> {
         .partition(|entry| entry.lane() == Lane::PrivateEr);
 
     let mut lanes = Vec::new();
+    let mut stop = Ok(false);
     if serial {
         let (private_benchmarks, shared_benchmarks): (Vec<_>, Vec<_>) =
             benchmarks
@@ -196,14 +196,19 @@ async fn run(args: &[String]) -> Result<()> {
             on_private_er.len()
         ));
         lanes.push(run_lane("shared serial", on_shared_er, 1, config).await);
-        if !on_private_er.is_empty() && topology::stop_shared_er().await? {
+        if !on_private_er.is_empty() {
+            stop = topology::stop_shared_er().await;
+        }
+        if matches!(stop, Ok(true)) {
             console::line(format_args!(
                 "stopped the shared ER before the private-ER scenarios"
             ));
         }
-        lanes.push(
-            run_lane("private-er serial", on_private_er, 1, config).await,
-        );
+        if stop.is_ok() {
+            lanes.push(
+                run_lane("private-er serial", on_private_er, 1, config).await,
+            );
+        }
     } else {
         console::debug(format_args!(
             "running {} shared-stack and {} private-ER scenarios in parallel",
@@ -236,7 +241,9 @@ async fn run(args: &[String]) -> Result<()> {
         }
         records.append(&mut runs);
     }
-    let outcome = summarize(&records, total_scenarios);
+    let outcome = stop
+        .map_err(|error| format!("stopping shared ER: {error}").into())
+        .and(summarize(&records));
     let cleanup = if serial && !keep_storage {
         topology::down()
     } else {
@@ -258,7 +265,8 @@ async fn run(args: &[String]) -> Result<()> {
     outcome.and(persisted)
 }
 
-fn summarize(records: &[RunRecord], total_scenarios: usize) -> Result<()> {
+fn summarize(records: &[RunRecord]) -> Result<()> {
+    let total_scenarios = records.len();
     let failed: Vec<&RunRecord> =
         records.iter().filter(|record| !record.passed()).collect();
     if !failed.is_empty() {
