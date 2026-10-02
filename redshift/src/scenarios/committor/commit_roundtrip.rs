@@ -3,16 +3,14 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use redsuite_core::report::Unit;
 use redsuite_core::{
-    check, check_eq, prep, receipt, BaseCtx, ChainCtx, CheckError, ErCtx,
-    Result, Scenario, ScenarioReport,
+    check, check_eq, prep, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
+    ScenarioReport,
 };
 use signer::Signer;
 
 use crate::program::{instruction::build, layout, DELEGATION_PROGRAM_ID};
 
 const CLONE_TIMEOUT: Duration = Duration::from_secs(15);
-const RECEIPT_TIMEOUT: Duration = Duration::from_secs(30);
-const BASE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(20);
 const BASE_STATE_TIMEOUT: Duration = Duration::from_secs(20);
 const UNDELEGATE_TIMEOUT: Duration = Duration::from_secs(30);
 const FIRST_WRITE: u64 = 21;
@@ -88,40 +86,15 @@ impl Scenario for CommitRoundtrip {
                 &[build::commit_accounts(1, payer.pubkey(), &accounts[..1])],
             )
             .await?;
-        let commit_receipt = receipt::fetch_commit_receipt(
-            er.api(),
+        let commit_receipt = crate::assert_commit_receipt(
+            base,
+            er,
             &commit_signature,
-            RECEIPT_TIMEOUT,
+            &accounts[..1],
+            false,
         )
         .await?;
-        let commit_tolerated = match &commit_receipt.error_message {
-            Some(message)
-                if commit_receipt.failure_is_duplicate_rejection() =>
-            {
-                receipt::warn_duplicate_rejection(self.name(), message);
-                true
-            }
-            Some(message) => {
-                return Err(CheckError::new("the commit intent succeeds")
-                    .actual(message)
-                    .into());
-            }
-            None => false,
-        };
-        if !commit_tolerated {
-            check_eq!(
-                commit_receipt.included,
-                vec![committed],
-                "the receipt must list exactly the committed account"
-            )?;
-            check!(
-                commit_receipt.excluded.is_empty(),
-                "nothing was eligible for exclusion"
-            )?;
-            check!(
-                !commit_receipt.requested_undelegation,
-                "a plain commit must not request undelegation"
-            )?;
+        if !commit_receipt.failure_is_duplicate_rejection() {
             check_eq!(
                 commit_receipt.payer,
                 Some(payer.pubkey()),
@@ -131,12 +104,6 @@ impl Scenario for CommitRoundtrip {
                 !commit_receipt.base_signatures.is_empty(),
                 "a commit receipt must name at least one base tx"
             )?;
-            receipt::confirm_base_signatures(
-                base.api(),
-                &commit_receipt,
-                BASE_CONFIRM_TIMEOUT,
-            )
-            .await?;
         }
         check::poll_for(
             "the committed base copy matches the er snapshot",
@@ -213,56 +180,19 @@ impl Scenario for CommitRoundtrip {
                 )],
             )
             .await?;
-        let undelegate_receipt = receipt::fetch_commit_receipt(
-            er.api(),
+        let undelegate_receipt = crate::assert_commit_receipt(
+            base,
+            er,
             &undelegate_signature,
-            RECEIPT_TIMEOUT,
+            &accounts,
+            true,
         )
         .await?;
-        let undelegate_tolerated = match &undelegate_receipt.error_message {
-            Some(message)
-                if undelegate_receipt.failure_is_duplicate_rejection() =>
-            {
-                receipt::warn_duplicate_rejection(self.name(), message);
-                true
-            }
-            Some(message) => {
-                return Err(CheckError::new(
-                    "the commit-undelegate intent succeeds",
-                )
-                .actual(message)
-                .into());
-            }
-            None => false,
-        };
-        if !undelegate_tolerated {
-            let mut included = undelegate_receipt.included.clone();
-            included.sort();
-            let mut expected = accounts.to_vec();
-            expected.sort();
-            check_eq!(
-                included,
-                expected,
-                "the receipt must list both undelegated accounts"
-            )?;
-            check!(
-                undelegate_receipt.excluded.is_empty(),
-                "nothing was eligible for exclusion"
-            )?;
-            check!(
-                undelegate_receipt.requested_undelegation,
-                "the receipt must record the undelegation request"
-            )?;
+        if !undelegate_receipt.failure_is_duplicate_rejection() {
             check!(
                 !undelegate_receipt.base_signatures.is_empty(),
                 "an undelegating commit must name at least one base tx"
             )?;
-            receipt::confirm_base_signatures(
-                base.api(),
-                &undelegate_receipt,
-                BASE_CONFIRM_TIMEOUT,
-            )
-            .await?;
         }
 
         for (pda, expected) in
@@ -337,24 +267,11 @@ impl Scenario for CommitRoundtrip {
         )?;
         let lockout_error =
             format!("{:?}", write_after_undelegate.unwrap_err());
-        let lockout_rejection = [
-            "InvalidWritableAccount",
-            "ExternalAccountDataModified",
-            "ProgramFailedToComplete",
-            "Immutable",
-        ]
-        .into_iter()
-        .find(|code| lockout_error.contains(code))
-        .ok_or_else(|| {
-            CheckError::new(
-                "the lockout write is rejected with an upstream code",
-            )
-            .expected(
-                "InvalidWritableAccount, ExternalAccountDataModified, \
-                 ProgramFailedToComplete or Immutable",
-            )
-            .actual(&lockout_error)
-        })?;
+        let lockout_rejection = crate::rejection_code(
+            "the write after undelegation",
+            &crate::LOCKOUT_REJECTIONS,
+            &lockout_error,
+        )?;
 
         Ok(ScenarioReport::ok(self.name())
             .setting("account space", crate::ACCOUNT_SPACE)

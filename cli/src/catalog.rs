@@ -170,11 +170,6 @@ pub mod redshift {
             resources: [Resource::Er],
             fixtures: [Fixture::RedlineProgram],
         },
-        commits => committor::commits::Commits {
-            topology: Shared,
-            resources: [Resource::Er],
-            fixtures: [Fixture::RedshiftProgram],
-        },
         commit_and_undelegate => committor::commit_and_undelegate::CommitAndUndelegate {
             topology: Shared,
             resources: [Resource::Er],

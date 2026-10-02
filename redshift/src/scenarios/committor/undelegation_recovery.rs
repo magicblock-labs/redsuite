@@ -9,8 +9,7 @@ use redsuite_core::{
     netfault::{self, BaseProxies, Selector},
     prep, topology,
     topology::{ErOptions, PrivateEr, RestartConfig, RestartTiming},
-    BaseCtx, ChainCtx, CheckError, ErCtx, PrivateErScenario, Result,
-    ScenarioReport,
+    BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result, ScenarioReport,
 };
 use signer::Signer;
 
@@ -24,12 +23,6 @@ const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(60);
 const REDELEGATE_TIMEOUT: Duration = Duration::from_secs(60);
 const POLL: Duration = Duration::from_millis(250);
 const HIDDEN: &str = "notification hidden by redsuite";
-const LOCKOUT_REJECTIONS: [&str; 4] = [
-    "InvalidWritableAccount",
-    "ExternalAccountDataModified",
-    "ProgramFailedToComplete",
-    "Immutable",
-];
 
 pub struct UndelegationRecovery;
 
@@ -109,16 +102,11 @@ async fn rejected_write(
          got {attempt:?}"
     )?;
     let error = format!("{:?}", attempt.unwrap_err());
-    let rejection = LOCKOUT_REJECTIONS
-        .into_iter()
-        .find(|code| error.contains(code))
-        .ok_or_else(|| {
-            CheckError::new(format!(
-                "the er write {when} is rejected with an upstream lockout code"
-            ))
-            .expected(LOCKOUT_REJECTIONS.join(", "))
-            .actual(&error)
-        })?;
+    let rejection = crate::rejection_code(
+        &format!("the er write {when}"),
+        &crate::LOCKOUT_REJECTIONS,
+        &error,
+    )?;
     let on_er = er
         .account(account)
         .await?

@@ -557,15 +557,13 @@ committor (ER → base commits):
   and checks it lands on base byte-for-byte while the other doesn't move.
   Then commits and undelegates both — the owning program gets its accounts
   back with the exact final bytes.
-- `commits` — commits one delegated account, then two of them together, and
-  checks that the receipt names exactly the accounts that were committed and
-  that a single base transaction carried them. Then it reaches for an account
-  delegated to a *different* validator: this ER owns neither the state nor
-  the right to release it, so committing it and undelegating it must both be
-  rejected.
 - `commit_and_undelegate` — walks the whole round trip and then back again:
   commit, undelegate, write to the account on base so that the program owns
-  it once more, and delegate it a second time. Along the way it pushes a 10 KB
+  it once more, and delegate it a second time. A plain commit of one and of
+  two accounts checks that the receipt names exactly what was committed and
+  that a single base transaction carried them, leaving the accounts delegated,
+  and an account delegated to a *different* validator must refuse both a
+  commit and an undelegation. Along the way it pushes a 10 KB
   order book through the same pipeline to check that large state is preserved
   byte-for-byte, and it files one undelegation so the owning program refuses
   it. The account then keeps its committed state but stays delegated, which is
