@@ -1,10 +1,13 @@
 mod catalog;
 
+use std::{process::Command, time::Instant};
+
 use futures_util::StreamExt;
 use redsuite_core::{
     catalog::{Lane, ScenarioEntry, Topology},
     console, frontend,
     profile::{self, ExecutionConfig, LoopMode, Profile},
+    report::{self, ScenarioReport, Unit},
     topology, Result, RunRecord,
 };
 
@@ -53,25 +56,25 @@ fn selected(target: &str) -> Vec<&'static ScenarioEntry> {
 }
 
 async fn run_lane(
+    lane: &'static str,
     scenarios: Vec<&'static ScenarioEntry>,
     limit: usize,
     config: ExecutionConfig,
-) -> Vec<RunRecord> {
-    if scenarios.is_empty() {
-        return Vec::new();
-    }
-    let limit = limit.clamp(1, scenarios.len());
-    futures_util::stream::iter(scenarios)
+) -> (Vec<RunRecord>, (&'static str, f64)) {
+    let started = Instant::now();
+    let records = futures_util::stream::iter(scenarios)
         .map(|entry| async move {
             console::debug(format_args!("starting {}", entry.name()));
             (entry.run)(config).await
         })
-        .buffer_unordered(limit)
+        .buffer_unordered(limit.max(1))
         .collect()
-        .await
+        .await;
+    (records, (lane, started.elapsed().as_secs_f64()))
 }
 
 async fn run(args: &[String]) -> Result<()> {
+    let suite_started = Instant::now();
     let Some(target) = args.first() else { usage() };
 
     let mut config = ExecutionConfig::from_env()?;
@@ -137,7 +140,37 @@ async fn run(args: &[String]) -> Result<()> {
         .into());
     }
 
-    let total_scenarios = scenarios.len();
+    let mut names: Vec<_> =
+        scenarios.iter().map(|entry| entry.name()).collect();
+    names.sort();
+    let hostname = std::env::var("HOSTNAME")
+        .or_else(|_| std::fs::read_to_string("/proc/sys/kernel/hostname"))
+        .ok()
+        .or_else(|| {
+            let output = Command::new("hostname").output().ok()?;
+            output
+                .status
+                .success()
+                .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+        })
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| format!("unknown-{}", report::run_id()));
+    let mut report = ScenarioReport::ok(&format!("suite/{target}"))
+        .setting("profile", requested_profile)
+        .setting("loop", config.loop_mode.name())
+        .setting(
+            "host",
+            format!(
+                "{} {} {} {} cpus",
+                hostname.trim(),
+                std::env::consts::OS,
+                std::env::consts::ARCH,
+                std::thread::available_parallelism().map_or(0, |n| n.get())
+            ),
+        )
+        .setting("serial", serial)
+        .setting("keep storage", keep_storage)
+        .setting("scenarios", names.join(","));
     let (benchmarks, functional): (Vec<_>, Vec<_>) = scenarios
         .into_iter()
         .partition(|entry| entry.lane() == Lane::Exclusive);
@@ -145,7 +178,8 @@ async fn run(args: &[String]) -> Result<()> {
         .into_iter()
         .partition(|entry| entry.lane() == Lane::PrivateEr);
 
-    let mut records = Vec::new();
+    let mut lanes = Vec::new();
+    let mut stop = Ok(false);
     if serial {
         let (private_benchmarks, shared_benchmarks): (Vec<_>, Vec<_>) =
             benchmarks
@@ -161,48 +195,78 @@ async fn run(args: &[String]) -> Result<()> {
             on_shared_er.len(),
             on_private_er.len()
         ));
-        records.append(&mut run_lane(on_shared_er, 1, config).await);
-        if !on_private_er.is_empty() && topology::stop_shared_er().await? {
+        lanes.push(run_lane("shared serial", on_shared_er, 1, config).await);
+        if !on_private_er.is_empty() {
+            stop = topology::stop_shared_er().await;
+        }
+        if matches!(stop, Ok(true)) {
             console::line(format_args!(
                 "stopped the shared ER before the private-ER scenarios"
             ));
         }
-        records.append(&mut run_lane(on_private_er, 1, config).await);
-        let outcome = summarize(&records, total_scenarios);
-        if !keep_storage {
-            topology::down()?;
+        if stop.is_ok() {
+            lanes.push(
+                run_lane("private-er serial", on_private_er, 1, config).await,
+            );
         }
-        return outcome;
-    }
-    if !shared.is_empty() || !private_er.is_empty() {
+    } else {
         console::debug(format_args!(
             "running {} shared-stack and {} private-ER scenarios in parallel",
             shared.len(),
             private_er.len()
         ));
         let shared_count = shared.len();
-        let (mut from_shared, mut from_private) = futures_util::future::join(
-            run_lane(shared, shared_count, config),
-            run_lane(private_er, PRIVATE_ER_CONCURRENCY, config),
+        let (shared, private) = futures_util::future::join(
+            run_lane("shared", shared, shared_count, config),
+            run_lane("private-er", private_er, PRIVATE_ER_CONCURRENCY, config),
         )
         .await;
-        records.append(&mut from_shared);
-        records.append(&mut from_private);
+        lanes.extend([shared, private]);
+        if !benchmarks.is_empty() {
+            console::debug(format_args!(
+                "running {} benchmark scenarios sequentially",
+                benchmarks.len()
+            ));
+            lanes.push(run_lane("benchmarks", benchmarks, 1, config).await);
+        }
     }
-
-    // Benchmarks run last and alone
-    if !benchmarks.is_empty() {
-        console::debug(format_args!(
-            "running {} benchmark scenarios sequentially",
-            benchmarks.len()
-        ));
-        records.append(&mut run_lane(benchmarks, 1, config).await);
+    let mut records = Vec::new();
+    for (mut runs, (lane, seconds)) in lanes {
+        if !runs.is_empty() {
+            report = report.metric(
+                format!("{lane} seconds"),
+                Unit::Seconds,
+                seconds,
+            );
+        }
+        records.append(&mut runs);
     }
-
-    summarize(&records, total_scenarios)
+    let outcome = stop
+        .map_err(|error| format!("stopping shared ER: {error}").into())
+        .and(summarize(&records));
+    let cleanup = if serial && !keep_storage {
+        topology::down()
+    } else {
+        Ok(())
+    };
+    if let Err(error) = &cleanup {
+        console::line(format_args!("suite cleanup failed: {error}"));
+    }
+    let outcome = outcome.and(cleanup);
+    report = report.metric(
+        "wall seconds",
+        Unit::Seconds,
+        suite_started.elapsed().as_secs_f64(),
+    );
+    let persisted = report::persist_summary(report, &outcome);
+    if let Err(error) = &persisted {
+        console::line(format_args!("suite report failed: {error}"));
+    }
+    outcome.and(persisted)
 }
 
-fn summarize(records: &[RunRecord], total_scenarios: usize) -> Result<()> {
+fn summarize(records: &[RunRecord]) -> Result<()> {
+    let total_scenarios = records.len();
     let failed: Vec<&RunRecord> =
         records.iter().filter(|record| !record.passed()).collect();
     if !failed.is_empty() {
