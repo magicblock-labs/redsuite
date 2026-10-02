@@ -3,6 +3,7 @@ use std::{rc::Rc, time::Duration};
 use async_trait::async_trait;
 use borsh::BorshDeserialize;
 use keypair::Keypair;
+use pubkey::Pubkey;
 use rand::{
     rngs::{OsRng, StdRng},
     Rng, RngCore, SeedableRng,
@@ -15,6 +16,7 @@ use redsuite_core::{
     check, check_eq, prep, receipt, BaseCtx, ChainCtx, CheckError, ErCtx,
     Result, Scenario, ScenarioReport,
 };
+use signature::Signature;
 use signer::Signer;
 
 use crate::program::DELEGATION_PROGRAM_ID;
@@ -29,6 +31,7 @@ const MOD_AFTER_REFUSAL: &str =
     "instruction modified data of an account it does not own";
 const TWICE_REFUSAL: &str =
     "is required to be writable and delegated in order to be undelegated";
+const FOREIGN_REJECTION: &str = "MissingAccount";
 const WRITE_REJECTIONS: [&str; 3] = [
     "InvalidWritableAccount",
     "ExternalAccountDataModified",
@@ -41,21 +44,97 @@ fn decoded_count(data: &[u8]) -> Result<u64> {
     Ok(MainAccount::try_from_slice(data)?.count)
 }
 
-fn rejection_code(error_text: &str) -> Result<&'static str> {
-    WRITE_REJECTIONS
-        .into_iter()
-        .find(|code| error_text.contains(code))
-        .ok_or_else(|| {
-            CheckError::new("the rejection uses a known write-rejection code")
-                .expected(format!("one of {WRITE_REJECTIONS:?}"))
-                .actual(error_text)
-                .into()
-        })
-}
-
 struct LifecycleOutcome {
+    commit_base_sigs: usize,
     er_lockout: &'static str,
     base_frozen: &'static str,
+}
+
+async fn commit(
+    er: &ErCtx,
+    payer: &Keypair,
+    players: &[Pubkey],
+    undelegates: bool,
+) -> Result<Signature> {
+    er.submit_and_confirm(
+        payer,
+        &[build::schedule_commit_cpi(
+            payer.pubkey(),
+            players.to_vec(),
+            true,
+            false,
+            if undelegates {
+                ScheduleCommitType::CommitFinalizeAndUndelegate
+            } else {
+                ScheduleCommitType::CommitFinalize
+            },
+            true,
+        )],
+    )
+    .await
+}
+
+async fn settled(
+    base: &BaseCtx,
+    er: &ErCtx,
+    pdas: &[Pubkey],
+    signature: &Signature,
+    undelegates: bool,
+    count: u64,
+) -> Result<receipt::CommitReceipt> {
+    let owner = if undelegates {
+        redshift_interface::id()
+    } else {
+        DELEGATION_PROGRAM_ID
+    };
+    let commit_receipt =
+        crate::assert_commit_receipt(base, er, signature, pdas, undelegates)
+            .await?;
+    if !commit_receipt.failure_is_duplicate_rejection() {
+        check_eq!(
+            commit_receipt.base_signatures.len(),
+            1,
+            "a single-stage commit must send exactly one base tx"
+        )?;
+    }
+    for pda in pdas {
+        check::poll_for(
+            &format!("{pda} settles on base after the commit"),
+            BASE_STATE_TIMEOUT,
+            || async {
+                match base.account(pda).await {
+                    Ok(Some(acc)) => match decoded_count(&acc.data) {
+                        Ok(seen) if acc.owner == owner && seen == count => {
+                            Ok(())
+                        }
+                        Ok(seen) => {
+                            Err(format!("owner {} count {seen}", acc.owner))
+                        }
+                        Err(error) => Err(format!(
+                            "owner {} undecodable state: {error}",
+                            acc.owner
+                        )),
+                    },
+                    Ok(None) => Err("absent from base".to_owned()),
+                    Err(error) => Err(format!("base read failed: {error}")),
+                }
+            },
+        )
+        .await
+        .map_err(|error| {
+            error.expected(format!("owner {owner} count {count}"))
+        })?;
+        let on_er = er
+            .account(pda)
+            .await?
+            .ok_or("the er clone is not present after the commit")?;
+        check_eq!(
+            decoded_count(&on_er.data)?,
+            count,
+            "ephem count after the commit for {pda}"
+        )?;
+    }
+    Ok(commit_receipt)
 }
 
 async fn commit_undelegate_lifecycle(
@@ -72,20 +151,13 @@ async fn commit_undelegate_lifecycle(
     let players: Vec<_> =
         committees.iter().map(|c| c.player.pubkey()).collect();
     let pdas: Vec<_> = committees.iter().map(|c| c.pda).collect();
+    let plain = commit(er, payer, &players, false).await?;
+    let commit_base_sigs = settled(base, er, &pdas, &plain, false, 1)
+        .await?
+        .base_signatures
+        .len();
 
-    let signature = er
-        .submit_and_confirm(
-            payer,
-            &[build::schedule_commit_cpi(
-                payer.pubkey(),
-                players.clone(),
-                true,
-                false,
-                ScheduleCommitType::CommitFinalizeAndUndelegate,
-                true,
-            )],
-        )
-        .await?;
+    let signature = commit(er, payer, &players, true).await?;
 
     let mut er_lockout = "";
     for player in &players {
@@ -96,51 +168,14 @@ async fn commit_undelegate_lifecycle(
             attempt.is_err(),
             "an er write must be rejected after undelegation is requested"
         )?;
-        er_lockout = rejection_code(&format!("{:?}", attempt.unwrap_err()))?;
-    }
-
-    let commit_receipt =
-        crate::assert_commit_receipt(base, er, &signature, &pdas, true).await?;
-    if !commit_receipt.failure_is_duplicate_rejection() {
-        check_eq!(
-            commit_receipt.base_signatures.len(),
-            1,
-            "a single-stage commit and undelegate must send exactly one base \
-             tx"
+        er_lockout = crate::rejection_code(
+            "the write",
+            &WRITE_REJECTIONS,
+            &format!("{:?}", attempt.unwrap_err()),
         )?;
     }
 
-    for pda in &pdas {
-        check::poll(
-            &format!("{pda} returns to its program owner on base"),
-            BASE_STATE_TIMEOUT,
-            || async {
-                matches!(
-                    base.account(pda).await,
-                    Ok(Some(acc)) if acc.owner == redshift_interface::id()
-                )
-            },
-        )
-        .await?;
-        let on_base = base
-            .account(pda)
-            .await?
-            .ok_or("the pda is not on base after the undelegation")?;
-        check_eq!(
-            decoded_count(&on_base.data)?,
-            1,
-            "base count after the commit and undelegate"
-        )?;
-        let on_er = er
-            .account(pda)
-            .await?
-            .ok_or("the er clone is not present after the undelegation")?;
-        check_eq!(
-            decoded_count(&on_er.data)?,
-            1,
-            "ephem count after the commit and undelegate"
-        )?;
-    }
+    settled(base, er, &pdas, &signature, true, 2).await?;
 
     for player in &players {
         base.submit_and_confirm(payer, &[build::increase_count(*player)])
@@ -153,7 +188,7 @@ async fn commit_undelegate_lifecycle(
             .ok_or("the pda is not on base after the chain write")?;
         check_eq!(
             decoded_count(&on_base.data)?,
-            2,
+            3,
             "an undelegated account must accept chain writes"
         )?;
     }
@@ -195,7 +230,11 @@ async fn commit_undelegate_lifecycle(
             attempt.is_err(),
             "a chain write must be rejected after the redelegation"
         )?;
-        base_frozen = rejection_code(&format!("{:?}", attempt.unwrap_err()))?;
+        base_frozen = crate::rejection_code(
+            "the write",
+            &WRITE_REJECTIONS,
+            &format!("{:?}", attempt.unwrap_err()),
+        )?;
     }
 
     for committee in &committees {
@@ -221,12 +260,13 @@ async fn commit_undelegate_lifecycle(
             .ok_or("the er clone is not present after the redelegation")?;
         check_eq!(
             decoded_count(&on_er.data)?,
-            3,
+            4,
             "ephem count after the redelegated write"
         )?;
     }
 
     Ok(LifecycleOutcome {
+        commit_base_sigs,
         er_lockout,
         base_frozen,
     })
@@ -443,6 +483,55 @@ async fn test_lifecycle_cell(
     .await
 }
 
+async fn test_foreign_ownership(base: &BaseCtx, er: &ErCtx) -> Result<Pubkey> {
+    let payer = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
+    let outsider = prep::delegated_payer(
+        base,
+        &payer,
+        er.identity(),
+        crate::PAYER_LAMPORTS,
+    )
+    .await?;
+    let validator = Keypair::new().pubkey();
+    for (commit_type, what) in [
+        (ScheduleCommitType::CommitFinalize, "commit"),
+        (
+            ScheduleCommitType::CommitFinalizeAndUndelegate,
+            "undelegation",
+        ),
+    ] {
+        let committees =
+            prep::init_committees(base, &payer, validator, 1).await?;
+        prep::await_committee_clones(er, &committees).await?;
+        let attempt = er
+            .submit_and_confirm(
+                &outsider,
+                &[build::schedule_commit_cpi(
+                    outsider.pubkey(),
+                    vec![committees[0].player.pubkey()],
+                    false,
+                    true,
+                    commit_type,
+                    what == "undelegation",
+                )],
+            )
+            .await;
+
+        check!(
+            attempt.is_err(),
+            "a {what} for an account delegated to another validator must fail"
+        )?;
+        let error = format!("{:?}", attempt.unwrap_err());
+        check!(
+            error.contains(FOREIGN_REJECTION),
+            "the foreign {what} for {} must be rejected with \
+             {FOREIGN_REJECTION}, got {error}",
+            committees[0].pda
+        )?;
+    }
+    Ok(validator)
+}
+
 async fn test_order_book_cell(
     base: &BaseCtx,
     er: &ErCtx,
@@ -586,7 +675,11 @@ async fn test_failed_undelegation_lockout(
         "the ephemeral must reject writes after the undelegation \
          request even when the base undelegation failed"
     )?;
-    rejection_code(&format!("{:?}", attempt.unwrap_err()))
+    crate::rejection_code(
+        "the write after the failed undelegation",
+        &WRITE_REJECTIONS,
+        &format!("{:?}", attempt.unwrap_err()),
+    )
 }
 
 #[async_trait(?Send)]
@@ -602,6 +695,7 @@ impl Scenario for CommitAndUndelegate {
         let (
             lifecycle_1,
             lifecycle_2,
+            foreign_validator,
             sigs_commit,
             sigs_undelegate,
             _,
@@ -611,6 +705,7 @@ impl Scenario for CommitAndUndelegate {
         ) = tokio::try_join!(
             test_lifecycle_cell(base, er, 1),
             test_lifecycle_cell(base, er, 2),
+            test_foreign_ownership(base, er),
             test_order_book_cell(
                 base,
                 er,
@@ -636,6 +731,10 @@ impl Scenario for CommitAndUndelegate {
             .setting("1-account base frozen rejection", lifecycle_1.base_frozen)
             .setting("2-account er lockout rejection", lifecycle_2.er_lockout)
             .setting("2-account base frozen rejection", lifecycle_2.base_frozen)
+            .setting("1-account commit base sigs", lifecycle_1.commit_base_sigs)
+            .setting("2-account commit base sigs", lifecycle_2.commit_base_sigs)
+            .setting("foreign validator", foreign_validator)
+            .setting("foreign rejection", FOREIGN_REJECTION)
             .setting("commit book seed", seed_commit)
             .setting("commit book base sigs", sigs_commit)
             .setting("undelegate book seed", seed_undelegate)

@@ -4,7 +4,6 @@ pub mod commit_blackout;
 pub mod commit_exactly_once;
 pub mod commit_roundtrip;
 pub mod commit_settlement_order;
-pub mod commits;
 pub mod delegation_session_isolation;
 pub mod table_mania;
 pub mod undelegation_recovery;

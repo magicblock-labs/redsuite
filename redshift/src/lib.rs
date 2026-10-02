@@ -62,6 +62,32 @@ pub async fn assert_commit_receipt(
     Ok(commit_receipt)
 }
 
+pub const LOCKOUT_REJECTIONS: [&str; 4] = [
+    "InvalidWritableAccount",
+    "ExternalAccountDataModified",
+    "ProgramFailedToComplete",
+    "Immutable",
+];
+
+pub fn rejection_code(
+    what: &str,
+    accepted: &[&'static str],
+    error_text: &str,
+) -> Result<&'static str> {
+    accepted
+        .iter()
+        .copied()
+        .find(|code| error_text.contains(code))
+        .ok_or_else(|| {
+            check::CheckError::new(format!(
+                "{what} is rejected with an upstream lockout code"
+            ))
+            .expected(accepted.join(", "))
+            .actual(error_text)
+            .into()
+        })
+}
+
 pub fn account_id(account: Option<account::Account>) -> Option<u64> {
     account.and_then(|account| written_id(&account.data))
 }
