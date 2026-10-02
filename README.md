@@ -100,6 +100,12 @@ workspace. Set `REDSUITE_ROOT` when it runs outside a checkout.
 private-ER scenarios beside them, then the redline family last and alone.
 Benchmarks must never share the box, so keep that last lane exclusive.
 
+Each CLI run records `suite/<target>` with its profile, host, full wall time,
+and lane durations. `redsuite report list` shows them; use
+`redsuite report compare suite/all` to compare full runs with matching settings.
+Shared and private lane times overlap; benchmarks follow both, and serial wall
+time includes teardown.
+
 Every ER preallocates its storage in multi-gigabyte steps, so a full parallel
 run needs room for about five validators at once. `--serial` trades wall
 time for disk: it runs every scenario that uses the shared ER one at a
