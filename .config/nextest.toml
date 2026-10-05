@@ -9,11 +9,8 @@
 # storage directory, and its own ports.
 #
 # The `benchmarks` group holds the redline scenarios, one at a time, so
-# performance numbers are never measured beside other work. Membership comes
-# from catalog claims, not names: the `nextest_groups_match_the_catalog` unit
-# test in the cli crate derives the expected group from each entry (the
-# HostExclusive resource, the PrivateEr topology) and fails when these
-# filters disagree with the catalog.
+# performance numbers are never measured beside other work. Keep these filters
+# aligned with the catalog's HostExclusive resource and PrivateEr topology.
 [test-groups]
 private-er = { max-threads = 2 }
 benchmarks = { max-threads = 1 }

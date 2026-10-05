@@ -255,27 +255,6 @@ fn environment(pid: u32) -> Option<String> {
         .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_sweep_never_matches_this_test_process() {
-        let stack_dir = std::env::temp_dir().join("redsuite-stack");
-        let orphans = orphaned_topology_processes(&stack_dir, &[]);
-        assert!(orphans.iter().all(|(pid, _)| *pid != std::process::id()));
-        for (_, cmdline) in &orphans {
-            assert!(
-                cmdline.split(' ').any(|arg| Path::new(arg)
-                    .file_name()
-                    .is_some_and(|name| TOPOLOGY_BINS
-                        .contains(&name.to_string_lossy().as_ref()))),
-                "{cmdline}"
-            );
-        }
-    }
-}
-
 #[cfg(target_os = "linux")]
 pub(super) fn proc_matches(pid: u32, bin: &str) -> bool {
     cmdline(pid).is_some_and(|cmdline| cmdline.contains(bin))

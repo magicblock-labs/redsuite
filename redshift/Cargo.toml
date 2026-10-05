@@ -34,5 +34,3 @@ json = { workspace = true }
 rand = { workspace = true }
 solana-address-lookup-table-interface = { version = "3.0", features = ["bincode", "bytemuck"] }
 sdk = { workspace = true, features = ["spl", "modular-sdk"] }
-
-[dev-dependencies]

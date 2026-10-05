@@ -1,7 +1,12 @@
 use borsh::{BorshDeserialize, BorshSerialize};
-use pubkey::{declare_id, Pubkey};
+use pubkey::Pubkey;
 
-declare_id!("BTczL2chGpVHw25pbmMtkFAD1t7rxoa8pVbaUjsybjiq");
+pub const ID: Pubkey =
+    Pubkey::from_str_const("BTczL2chGpVHw25pbmMtkFAD1t7rxoa8pVbaUjsybjiq");
+
+pub const fn id() -> Pubkey {
+    ID
+}
 
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
 pub enum SecurityInstruction {
