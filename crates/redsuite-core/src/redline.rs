@@ -30,8 +30,8 @@ impl Accounts {
         payer: &Keypair,
         seeds: Range<usize>,
         delegated: bool,
-        per_tx: usize,
     ) -> Result<Vec<Pubkey>> {
+        let per_tx = if delegated { 3 } else { 6 };
         let owner = payer.pubkey();
         let mut pdas = Vec::with_capacity(seeds.len());
         for first in seeds.clone().step_by(per_tx) {
@@ -79,9 +79,7 @@ impl Accounts {
         delegated: bool,
     ) -> Result<Pubkey> {
         let seed = usize::from(seed);
-        Ok(self
-            .prepare(base, payer, seed..seed + 1, delegated, 1)
-            .await?[0])
+        Ok(self.prepare(base, payer, seed..seed + 1, delegated).await?[0])
     }
 
     pub async fn init_delegated(
@@ -90,7 +88,7 @@ impl Accounts {
         payer: &Keypair,
         count: u8,
     ) -> Result<Vec<Pubkey>> {
-        self.prepare(base, payer, 0..count as usize, true, 1).await
+        self.prepare(base, payer, 0..count as usize, true).await
     }
 
     pub async fn init_batched(
@@ -117,13 +115,7 @@ impl Accounts {
             |index| {
                 let len =
                     per_payer.min(count.saturating_sub(index * per_payer));
-                self.prepare(
-                    base,
-                    &payers[index],
-                    0..len,
-                    delegated,
-                    if delegated { 3 } else { 6 },
-                )
+                self.prepare(base, &payers[index], 0..len, delegated)
             },
         )
         .await?;

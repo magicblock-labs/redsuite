@@ -288,6 +288,25 @@ pub fn persist_run(record: &RunRecord) -> Result<PathBuf> {
     )
 }
 
+pub fn persist_summary(
+    mut report: ScenarioReport,
+    outcome: &Result<()>,
+) -> Result<()> {
+    let dir = campaign_dir();
+    ensure_campaign(&dir)?;
+    report.passed = outcome.is_ok();
+    let failures: Vec<_> = outcome
+        .as_ref()
+        .err()
+        .map(|error| {
+            PersistedFailure::new("suite", "infrastructure", error.to_string())
+        })
+        .into_iter()
+        .collect();
+    write_scenario_run(&dir, &scenario_run_doc(&report, &failures, &[]))?;
+    Ok(())
+}
+
 pub fn persist_cell(parent: &str, report: &ScenarioReport) -> Result<PathBuf> {
     let dir = campaign_dir();
     ensure_campaign(&dir)?;

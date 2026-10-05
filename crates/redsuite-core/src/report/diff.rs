@@ -135,6 +135,14 @@ pub fn list() -> Result<()> {
                 scenario.run.passed,
                 profile_of(&scenario.run),
             );
+            if scenario.run.scenario.starts_with("suite/") {
+                print_host(&scenario.run);
+                for measurement in &scenario.run.measurements {
+                    if let Some(value) = measurement.scalar() {
+                        println!("    {}: {value:.3}", measurement.label);
+                    }
+                }
+            }
             for cell in &scenario.cells {
                 println!("    cell {}  passed={}", cell.scenario, cell.passed);
             }
@@ -271,7 +279,14 @@ fn config_gap(old: &[(String, String)], new: &[(String, String)]) -> String {
     "keys reordered".to_owned()
 }
 
+fn print_host(run: &ScenarioRun) {
+    if let Some((_, host)) = run.config.iter().find(|(key, _)| key == "host") {
+        println!("  profile={} host={host}", profile_of(run));
+    }
+}
+
 fn print_run_context(baseline: &RunView, latest: &RunView) {
+    print_host(latest.run);
     println!("  prev: {}", baseline.file);
     println!("  last: {}", latest.file);
     match (baseline.meta, latest.meta) {
