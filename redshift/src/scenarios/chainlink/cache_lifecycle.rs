@@ -344,8 +344,25 @@ impl PrivateErScenario for CacheLifecycle {
                 None
             };
             set_base(901, readonly).await?;
-            er.accounts(readonly).await?;
-            value(er, readonly, 901).await?;
+            let fetched = er.accounts(readonly).await?;
+            let local = crate::local_accounts(er, readonly).await?;
+            for ((key, fetched), local) in
+                readonly.iter().zip(fetched).zip(local)
+            {
+                check_eq!(
+                    crate::account_id(fetched),
+                    Some(901),
+                    "final fetch of {key}"
+                )?;
+                // Readonly entries may be evicted after the fetch.
+                if let Some(local) = local {
+                    check_eq!(
+                        crate::written_id(&local.data),
+                        Some(901),
+                        "retained local value of {key}"
+                    )?;
+                }
+            }
             done.set(true);
             Result::Ok((evictions - before, recovery))
         };
