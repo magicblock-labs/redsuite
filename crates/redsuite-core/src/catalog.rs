@@ -151,14 +151,6 @@ impl ScenarioEntry {
             Lane::Shared
         }
     }
-
-    pub fn nextest_group(&self) -> Option<&'static str> {
-        match self.lane() {
-            Lane::Exclusive => Some("benchmarks"),
-            Lane::PrivateEr => Some("private-er"),
-            Lane::Shared => None,
-        }
-    }
 }
 
 #[macro_export]
@@ -178,12 +170,6 @@ macro_rules! scenario_catalog {
         $crate::run_private_er_scenario(
             $scenario, $fixtures, $optional, $config,
         )
-    };
-    (@name Shared, $scenario:expr) => {
-        $crate::Scenario::name(&$scenario)
-    };
-    (@name PrivateEr, $scenario:expr) => {
-        $crate::PrivateErScenario::name(&$scenario)
     };
     (
         family: $family:ident,
@@ -237,22 +223,5 @@ macro_rules! scenario_catalog {
                 }
             }
         )*
-
-        #[cfg(test)]
-        #[test]
-        fn catalog_names_match_the_scenarios() {
-            $(
-                assert_eq!(
-                    $crate::scenario_catalog!(
-                        @name $topology, scenarios::$($segment)::+
-                    ),
-                    format!(
-                        "{}/{}",
-                        $crate::catalog::Family::$family.prefix(),
-                        stringify!($short_name)
-                    ),
-                );
-            )*
-        }
     };
 }

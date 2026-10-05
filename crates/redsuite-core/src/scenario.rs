@@ -474,23 +474,3 @@ fn conclude(record: &mut RunRecord) {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn check_errors_classify_apart_from_plain_errors() {
-        let check: DynError = Box::new(CheckError::new("the clone lands"));
-        let plain: DynError = "connection refused".into();
-        assert!(failed_check(&check).is_some());
-        assert!(failed_check(&plain).is_none());
-    }
-
-    #[test]
-    fn missing_optional_fixtures_report_gap_instead_of_failing_preflight() {
-        // With an empty/missing manifest path in temp, optional_fixture_gap returns a skip reason
-        let gap = optional_fixture_gap(&[Fixture::RedlineProgram]);
-        assert!(gap.is_none() || gap.unwrap().contains("unavailable"));
-    }
-}

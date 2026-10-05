@@ -1,6 +1,11 @@
-use pubkey::declare_id;
+use pubkey::Pubkey;
 
-declare_id!("AijneHkXJVVWyimuwfSJdrJktARZu2WiMaZBqHsq7CS5");
+pub const ID: Pubkey =
+    Pubkey::from_str_const("AijneHkXJVVWyimuwfSJdrJktARZu2WiMaZBqHsq7CS5");
+
+pub const fn id() -> Pubkey {
+    ID
+}
 
 pub mod flexi;
 

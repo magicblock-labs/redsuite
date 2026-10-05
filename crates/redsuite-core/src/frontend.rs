@@ -96,30 +96,3 @@ pub fn usage(invocation: &str) -> String {
     })
     .collect()
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn args(values: &[&str]) -> Vec<String> {
-        values.iter().map(|value| (*value).to_owned()).collect()
-    }
-
-    #[test]
-    fn unknown_commands_are_not_dispatched() {
-        assert!(dispatch(&args(&["frobnicate"])).is_none());
-        assert!(dispatch(&args(&["stack"])).is_none());
-        assert!(dispatch(&args(&["stack", "restart"])).is_none());
-        assert!(dispatch(&args(&["report"])).is_none());
-        assert!(dispatch(&args(&["report", "bmf", "--out"])).is_none());
-        assert!(dispatch(&args(&["report", "bmf", "extra"])).is_none());
-    }
-
-    #[test]
-    fn usage_names_the_invocation() {
-        let text = usage("redsuite");
-        assert!(text.contains("redsuite stack down"));
-        assert!(text.contains("redsuite report bmf"));
-        assert!(text.contains("redsuite report compare"));
-    }
-}

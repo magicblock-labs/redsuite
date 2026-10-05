@@ -18,5 +18,3 @@ signer = { workspace = true }
 sdk-ids = { workspace = true }
 signature = { workspace = true }
 json = { workspace = true }
-
-[dev-dependencies]

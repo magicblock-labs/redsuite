@@ -1,6 +1,11 @@
-use pubkey::declare_id;
+use pubkey::Pubkey;
 
-declare_id!("3JnJ727jWEmPVU8qfXwtH63sCNDX7nMgsLbg8qy8aaPX");
+pub const ID: Pubkey =
+    Pubkey::from_str_const("3JnJ727jWEmPVU8qfXwtH63sCNDX7nMgsLbg8qy8aaPX");
+
+pub const fn id() -> Pubkey {
+    ID
+}
 
 pub use sdk::{
     consts::DELEGATION_PROGRAM_ID,

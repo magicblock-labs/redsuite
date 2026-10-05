@@ -68,9 +68,8 @@ names the scenario's short name, its runner type, and its metadata
 entry the macro generates both ways to run the scenario: a `#[tokio::test]`
 function (so it runs under `cargo nextest`, named
 `catalog::<family>::<short_name>`) and a catalog record the `redsuite`
-binary dispatches from. Unit tests check the catalog against the `Scenario`
-impls and against the nextest groups, so a wrong or missing entry fails
-before anything boots.
+binary dispatches from. Keep scenario names and `.config/nextest.toml`
+groups in sync with the catalog.
 
 `profiles` defaults to every profile; write it only to narrow. `redsuite
 run` reads it before booting anything and skips a scenario whose profile
