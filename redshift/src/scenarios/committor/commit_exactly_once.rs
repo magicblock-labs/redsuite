@@ -18,13 +18,15 @@ use redsuite_core::{
 use signature::Signature;
 use signer::Signer;
 
-use crate::program::{instruction::build, DELEGATION_PROGRAM_ID};
+use crate::program::DELEGATION_PROGRAM_ID;
+
+use super::{
+    prove_landed, write_and_commit, BASE_CONFIRM_TIMEOUT, BASE_STATE_TIMEOUT,
+};
 
 const LABEL: &str = "commit-exactly-once";
 const CLONE_TIMEOUT: Duration = Duration::from_secs(30);
 const INTERCEPT_TIMEOUT: Duration = Duration::from_secs(60);
-const BASE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(30);
-const BASE_STATE_TIMEOUT: Duration = Duration::from_secs(30);
 const RECEIPT_TIMEOUT: Duration = Duration::from_secs(120);
 const BLACKOUT_WINDOW: Duration = Duration::from_secs(5);
 const SETTLE_WINDOW: Duration = Duration::from_secs(3);
@@ -62,71 +64,12 @@ struct ActionOutcome {
     seconds: f64,
 }
 
-async fn write_and_commit(
-    er: &ErCtx,
-    payer: &Keypair,
-    commit_id: u64,
-    write: u64,
-    account: &Pubkey,
-) -> Result<(Vec<u8>, Signature)> {
-    er.submit_and_confirm(payer, &[build::simple_byte_set(write, &[*account])])
-        .await?;
-    let snapshot = er
-        .account(account)
-        .await?
-        .ok_or("er copy vanished after the write")?
-        .data;
-    check_eq!(
-        crate::written_id(&snapshot),
-        Some(write),
-        "the er write must land before the commit"
-    )?;
-    let commit_signature = er
-        .submit_and_confirm(
-            payer,
-            &[build::commit_accounts(
-                commit_id,
-                payer.pubkey(),
-                &[*account],
-            )],
-        )
-        .await?;
-    Ok((snapshot, commit_signature))
-}
-
 async fn base_count(base: &BaseCtx, counter: &Pubkey) -> Result<u64> {
     let account = base
         .account(counter)
         .await?
         .ok_or("the base counter is missing")?;
     Ok(FlexiCounter::try_decode(&account.data)?.count)
-}
-
-async fn prove_landed(
-    base: &BaseCtx,
-    base_signature: &Signature,
-    account: &Pubkey,
-    snapshot: &[u8],
-) -> Result<()> {
-    let base_tx = base
-        .api()
-        .await_transaction(base_signature, BASE_CONFIRM_TIMEOUT)
-        .await?;
-    check!(
-        base_tx.err.is_none(),
-        "the intercepted base commit {base_signature} must succeed on base, \
-         got {:?}",
-        base_tx.err
-    )?;
-    check::poll(
-        "the base copy carries the er snapshot before the fault is applied",
-        BASE_STATE_TIMEOUT,
-        || async {
-            matches!(base.account(account).await, Ok(Some(acc)) if acc.data == snapshot)
-        },
-    )
-    .await?;
-    Ok(())
 }
 
 async fn hold_nonce(
@@ -459,18 +402,6 @@ async fn action_blackout(
     })
 }
 
-async fn await_clone(er: &ErCtx, account: &Pubkey) -> Result<()> {
-    check::poll(
-        &format!("the private er clones the delegated account {account}"),
-        CLONE_TIMEOUT,
-        || async {
-            matches!(er.account(account).await, Ok(Some(acc)) if acc.data.len() == crate::ACCOUNT_SPACE as usize)
-        },
-    )
-    .await?;
-    Ok(())
-}
-
 fn restart_settings(
     report: ScenarioReport,
     timing: &RestartTiming,
@@ -524,7 +455,13 @@ impl PrivateErScenario for CommitExactlyOnce {
             DELEGATION_PROGRAM_ID,
             "a delegated pda must be dlp-owned on base"
         )?;
-        await_clone(private.ctx(), &account).await?;
+        prep::await_clones(
+            private.ctx(),
+            &[account],
+            crate::ACCOUNT_SPACE as usize,
+            CLONE_TIMEOUT,
+        )
+        .await?;
 
         let warmup_nonce = follow_up_commit(
             base,

@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{rc::Rc, time::Duration};
 
 use keypair::Keypair;
 use pubkey::Pubkey;
@@ -8,7 +8,7 @@ use signer::Signer;
 use crate::{
     check,
     context::{BaseCtx, ChainCtx, ErCtx},
-    dlp, system, DynError, Result,
+    dlp, system, DynError, ErClient, Result, TxSender,
 };
 
 const ZERO_DATA_RENT_EXEMPT_LAMPORTS: u64 = 890_880;
@@ -63,6 +63,22 @@ where
 
 pub fn payer_from_bytes(bytes: &[u8]) -> Keypair {
     Keypair::try_from(bytes).expect("payer bytes round-trip")
+}
+
+// Each worker owns its client/cache and the same round-robin payer partition.
+pub fn worker_senders(
+    rpc_url: &str,
+    payers: &[[u8; 64]],
+    worker: usize,
+    threads: usize,
+) -> Vec<TxSender> {
+    let client = ErClient::new(rpc_url);
+    payers
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| index % threads == worker)
+        .map(|(_, bytes)| client.sender(Rc::new(payer_from_bytes(bytes))))
+        .collect()
 }
 
 pub struct EscrowedPayer {

@@ -1,6 +1,8 @@
 use instruction::Instruction;
 use pubkey::Pubkey;
-use redline_interface::{instruction::build, utils::fold_hash};
+use redline_interface::{instruction::build, layout, utils::fold_hash};
+
+use crate::{ChainCtx, CheckError, Result};
 
 pub const STEPS: u64 = 3;
 pub const CU_LIMIT: u32 = 1_400_000;
@@ -62,6 +64,51 @@ impl PairModel {
                 self.b_id = id;
             }
         }
+    }
+
+    pub async fn verify(
+        &self,
+        ctx: &impl ChainCtx,
+        keys: [Pubkey; 2],
+        scope: &str,
+    ) -> Result<()> {
+        for (label, address, expected_hash, expected_id) in [
+            ("A", keys[0], self.a, self.a_id),
+            ("B", keys[1], self.b, self.b_id),
+        ] {
+            let account = ctx.account(&address).await?.ok_or_else(|| {
+                format!("{scope}: account {label} {address} is missing")
+            })?;
+            let hash = account
+                .data
+                .get(
+                    layout::HASH_OFFSET
+                        ..layout::HASH_OFFSET + layout::HASH_SIZE,
+                )
+                .ok_or_else(|| {
+                    format!(
+                        "{scope}: account {label} holds {} bytes, fewer than \
+                         the {} the layout needs",
+                        account.data.len(),
+                        layout::HASH_OFFSET + layout::HASH_SIZE
+                    )
+                })?;
+            let id =
+                super::written_id(&account.data).expect("hash follows the id");
+            if hash != expected_hash || id != expected_id {
+                return Err(CheckError::new(format!(
+                    "{scope}: account {label} must hold the fold of its \
+                     accepted X/Y/Z history"
+                ))
+                .expected(format!(
+                    "id {expected_id}, hash {}",
+                    hex(&expected_hash)
+                ))
+                .actual(format!("id {id}, hash {}", hex(hash)))
+                .into());
+            }
+        }
+        Ok(())
     }
 }
 

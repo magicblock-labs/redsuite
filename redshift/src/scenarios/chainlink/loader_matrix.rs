@@ -163,16 +163,14 @@ async fn confirmed_logs(
     er: &ErCtx,
     signature: &Signature,
 ) -> Result<Vec<String>> {
-    let deadline = Instant::now() + LEDGER_VISIBILITY_TIMEOUT;
-    loop {
-        if let Some(info) = er.api().get_transaction(signature).await? {
-            return Ok(info.logs);
-        }
-        if Instant::now() >= deadline {
-            return Ok(Vec::new());
-        }
-        tokio::time::sleep(LEDGER_VISIBILITY_POLL).await;
-    }
+    Ok(redsuite_core::check::poll_until(
+        LEDGER_VISIBILITY_TIMEOUT,
+        LEDGER_VISIBILITY_POLL,
+        async || er.api().get_transaction(signature).await,
+    )
+    .await?
+    .map(|info| info.logs)
+    .unwrap_or_default())
 }
 
 async fn invoke_until(

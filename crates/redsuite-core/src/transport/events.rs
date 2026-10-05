@@ -6,8 +6,6 @@ use pubkey::Pubkey;
 use super::conn::{self, CloseReason, FrameHandler, Reader, Requester};
 use crate::Result;
 
-const AWAIT_POLL: Duration = Duration::from_millis(20);
-
 #[derive(Default)]
 struct Shared {
     error: Option<String>,
@@ -160,24 +158,13 @@ impl EventSubscriptions {
         what: &str,
         done: impl Fn(&Shared) -> bool,
     ) -> Result<()> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            {
-                let shared = self.shared.borrow();
-                if let Some(err) = &shared.error {
-                    return Err(format!("ws stream: {err}").into());
-                }
-                if done(&shared) {
-                    return Ok(());
-                }
+        conn::await_condition(timeout, what, || {
+            let shared = self.shared.borrow();
+            if let Some(err) = &shared.error {
+                return Err(format!("ws stream: {err}").into());
             }
-            if tokio::time::Instant::now() >= deadline {
-                return Err(format!(
-                    "timed out waiting for {what} ({timeout:?})"
-                )
-                .into());
-            }
-            tokio::time::sleep(AWAIT_POLL).await;
-        }
+            Ok(done(&shared))
+        })
+        .await
     }
 }

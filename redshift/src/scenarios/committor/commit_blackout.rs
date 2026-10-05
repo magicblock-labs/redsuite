@@ -1,7 +1,6 @@
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::report::Unit;
 use redsuite_core::{
@@ -13,15 +12,16 @@ use redsuite_core::{
     ScenarioReport,
 };
 use signature::Signature;
-use signer::Signer;
 
-use crate::program::{instruction::build, DELEGATION_PROGRAM_ID};
+use crate::program::DELEGATION_PROGRAM_ID;
+
+use super::{
+    prove_landed, write_and_commit, BASE_CONFIRM_TIMEOUT, BASE_STATE_TIMEOUT,
+};
 
 const LABEL: &str = "commit-blackout";
 const CLONE_TIMEOUT: Duration = Duration::from_secs(30);
 const INTERCEPT_TIMEOUT: Duration = Duration::from_secs(60);
-const BASE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(30);
-const BASE_STATE_TIMEOUT: Duration = Duration::from_secs(30);
 const RECEIPT_TIMEOUT: Duration = Duration::from_secs(120);
 const BLACKOUT_WINDOW: Duration = Duration::from_secs(5);
 const BLACKOUT_POLL: Duration = Duration::from_millis(200);
@@ -43,65 +43,6 @@ struct Commit {
     signature: Signature,
     base_signature: Signature,
     started: Instant,
-}
-
-async fn write_and_commit(
-    er: &ErCtx,
-    payer: &Keypair,
-    commit_id: u64,
-    write: u64,
-    account: &Pubkey,
-) -> Result<(Vec<u8>, Signature)> {
-    er.submit_and_confirm(payer, &[build::simple_byte_set(write, &[*account])])
-        .await?;
-    let snapshot = er
-        .account(account)
-        .await?
-        .ok_or("er copy vanished after the write")?
-        .data;
-    check_eq!(
-        crate::written_id(&snapshot),
-        Some(write),
-        "the er write must land before the commit"
-    )?;
-    let commit_signature = er
-        .submit_and_confirm(
-            payer,
-            &[build::commit_accounts(
-                commit_id,
-                payer.pubkey(),
-                &[*account],
-            )],
-        )
-        .await?;
-    Ok((snapshot, commit_signature))
-}
-
-async fn prove_landed(
-    base: &BaseCtx,
-    base_signature: &Signature,
-    account: &Pubkey,
-    snapshot: &[u8],
-) -> Result<()> {
-    let base_tx = base
-        .api()
-        .await_transaction(base_signature, BASE_CONFIRM_TIMEOUT)
-        .await?;
-    check!(
-        base_tx.err.is_none(),
-        "the intercepted base commit {base_signature} must succeed on base, \
-         got {:?}",
-        base_tx.err
-    )?;
-    check::poll(
-        "the base copy carries the er snapshot before the fault is applied",
-        BASE_STATE_TIMEOUT,
-        || async {
-            matches!(base.account(account).await, Ok(Some(acc)) if acc.data == snapshot)
-        },
-    )
-    .await?;
-    Ok(())
 }
 
 async fn await_convergence(
@@ -144,18 +85,6 @@ async fn await_convergence(
     })
 }
 
-async fn await_clone(er: &ErCtx, account: &Pubkey) -> Result<()> {
-    check::poll(
-        &format!("the private er clones the delegated account {account}"),
-        CLONE_TIMEOUT,
-        || async {
-            matches!(er.account(account).await, Ok(Some(acc)) if acc.data.len() == crate::ACCOUNT_SPACE as usize)
-        },
-    )
-    .await?;
-    Ok(())
-}
-
 #[async_trait(?Send)]
 impl PrivateErScenario for CommitBlackout {
     fn name(&self) -> &str {
@@ -185,7 +114,13 @@ impl PrivateErScenario for CommitBlackout {
             DELEGATION_PROGRAM_ID,
             "a delegated pda must be dlp-owned on base"
         )?;
-        await_clone(er, &account).await?;
+        prep::await_clones(
+            er,
+            &[account],
+            crate::ACCOUNT_SPACE as usize,
+            CLONE_TIMEOUT,
+        )
+        .await?;
 
         let submission_trap = proxies.intercept(
             Selector::method("sendTransaction")
@@ -279,7 +214,13 @@ impl PrivateErScenario for CommitBlackout {
         let reconnect_started = Instant::now();
         let fresh =
             crate::init_delegated_account(base, &payer, 1, identity).await?;
-        await_clone(er, &fresh).await?;
+        prep::await_clones(
+            er,
+            &[fresh],
+            crate::ACCOUNT_SPACE as usize,
+            CLONE_TIMEOUT,
+        )
+        .await?;
         let reconnect_clone_s = reconnect_started.elapsed().as_secs_f64();
         let (snapshot, commit_signature) =
             write_and_commit(er, &payer, 3, RECONNECT_WRITE, &fresh).await?;

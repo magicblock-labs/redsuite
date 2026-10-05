@@ -1,7 +1,7 @@
 use std::{rc::Rc, time::Duration};
 
 use async_trait::async_trait;
-use redsuite_core::redline::Accounts;
+use redsuite_core::redline::{copy_three, Accounts};
 use redsuite_core::report::Unit;
 use redsuite_core::{
     check_eq, prep,
@@ -12,7 +12,7 @@ use redsuite_core::{
     TxSender,
 };
 
-use crate::program::{instruction::build, layout};
+use crate::program::layout;
 
 const PAYER_LAMPORTS: u64 = 2_000_000_000;
 
@@ -96,22 +96,6 @@ impl Scenario for WarmIngress {
             .map(|payer| er.sender(Rc::new(payer)))
             .collect();
 
-        let shape = |id: u64| {
-            let len = pdas.len() as u64;
-            let base_index = ((id - 1) * 3) % len;
-            let source = pdas[base_index as usize];
-            let first_dest = pdas[((base_index + 1) % len) as usize];
-            let second_dest = pdas[((base_index + 2) % len) as usize];
-            (
-                build::account_data_copy(
-                    id,
-                    &[source],
-                    &[first_dest, second_dest],
-                ),
-                first_dest,
-            )
-        };
-
         let warmup = execute(
             RunConfig {
                 iterations: profile.warmup,
@@ -120,7 +104,7 @@ impl Scenario for WarmIngress {
             },
             |id| {
                 let sender = senders[(id as usize) % senders.len()].clone();
-                let (ix, _) = shape(id);
+                let (ix, _) = copy_three(&pdas, id);
                 async move { sender.submit(&[ix]).await.map(|_| ()) }
             },
         )
@@ -151,7 +135,7 @@ impl Scenario for WarmIngress {
         let request = |iteration: u64| {
             let id = offset + iteration;
             let sender = senders[(id as usize) % senders.len()].clone();
-            let (ix, tracked_dest) = shape(id);
+            let (ix, [tracked_dest, _]) = copy_three(&pdas, id);
             updates.track(id, tracked_dest);
             let sigs = sigs.clone();
             async move {

@@ -1,17 +1,15 @@
-use std::{rc::Rc, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use instruction::Instruction;
 use pubkey::Pubkey;
-use redsuite_core::redline::Accounts;
+use redsuite_core::redline::{copy_three, Accounts};
 use redsuite_core::report::Unit;
 use redsuite_core::{
     check_eq, prep,
     profile::{self, ProfileValues},
     report,
     runner::{execute_threaded, Pacing, RunOutcome, ThreadRunConfig},
-    BaseCtx, ChainCtx, ErClient, ErCtx, MetricsDelta, Result, Scenario,
-    ScenarioReport, TxSender,
+    BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
 };
 
 const PREP_PAYER_LAMPORTS: u64 = 4_000_000_000;
@@ -64,16 +62,6 @@ const PROFILES: ProfileValues<Profile> = ProfileValues {
     deep: None,
 };
 
-fn shape(pool: &[Pubkey], id: u64) -> Instruction {
-    use crate::program::instruction::build;
-    let len = pool.len() as u64;
-    let base_index = ((id - 1) * 3) % len;
-    let source = pool[base_index as usize];
-    let first_dest = pool[((base_index + 1) % len) as usize];
-    let second_dest = pool[((base_index + 2) % len) as usize];
-    build::account_data_copy(id, &[source], &[first_dest, second_dest])
-}
-
 fn run_cell(
     er_rpc_url: String,
     config: ThreadRunConfig,
@@ -83,20 +71,16 @@ fn run_cell(
 ) -> Result<RunOutcome> {
     let threads = config.threads;
     let factory = move |thread_index: usize| {
-        let client = ErClient::new(er_rpc_url.clone());
-        let senders: Vec<TxSender> = payer_bytes
-            .iter()
-            .enumerate()
-            .filter(|(payer_index, _)| payer_index % threads == thread_index)
-            .map(|(_, bytes)| {
-                let payer = prep::payer_from_bytes(bytes);
-                client.sender(Rc::new(payer))
-            })
-            .collect();
+        let senders = prep::worker_senders(
+            &er_rpc_url,
+            &payer_bytes,
+            thread_index,
+            threads,
+        );
         let pool = pool.clone();
         move |id: u64| {
             let sender = senders[(id as usize) % senders.len()].clone();
-            let ix = shape(&pool, id_offset + id);
+            let (ix, _) = copy_three(&pool, id_offset + id);
             async move { sender.submit(&[ix]).await.map(|_| ()) }
         }
     };

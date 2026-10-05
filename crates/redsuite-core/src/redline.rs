@@ -1,5 +1,6 @@
 use std::ops::Range;
 
+use instruction::Instruction;
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redline_interface::instruction::build;
@@ -8,6 +9,24 @@ use signer::Signer;
 use crate::{prep, ChainCtx, Result};
 
 pub mod causal;
+
+pub fn written_id(data: &[u8]) -> Option<u64> {
+    use redline_interface::layout::{ID_OFFSET, ID_SIZE};
+    let bytes = data.get(ID_OFFSET..ID_OFFSET + ID_SIZE)?;
+    Some(u64::from_le_bytes(bytes.try_into().ok()?))
+}
+
+pub fn copy_three(pool: &[Pubkey], id: u64) -> (Instruction, [Pubkey; 2]) {
+    let len = pool.len() as u64;
+    let base_index = ((id - 1) * 3) % len;
+    let source = pool[base_index as usize];
+    let first_dest = pool[((base_index + 1) % len) as usize];
+    let second_dest = pool[((base_index + 2) % len) as usize];
+    (
+        build::account_data_copy(id, &[source], &[first_dest, second_dest]),
+        [first_dest, second_dest],
+    )
+}
 
 pub struct Accounts {
     pub program_id: Pubkey,

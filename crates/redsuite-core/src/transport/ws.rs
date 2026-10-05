@@ -17,8 +17,6 @@ use crate::{
     Result,
 };
 
-const AWAIT_POLL: Duration = Duration::from_millis(20);
-
 #[derive(Deserialize)]
 struct AccountPayload {
     value: AccountValue,
@@ -247,25 +245,14 @@ impl AccountUpdates {
         what: &str,
         done: impl Fn(&Shared) -> bool,
     ) -> Result<()> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            {
-                let shared = self.shared.borrow();
-                if let Some(err) = &shared.error {
-                    return Err(format!("ws stream: {err}").into());
-                }
-                if done(&shared) {
-                    return Ok(());
-                }
+        conn::await_condition(timeout, what, || {
+            let shared = self.shared.borrow();
+            if let Some(err) = &shared.error {
+                return Err(format!("ws stream: {err}").into());
             }
-            if tokio::time::Instant::now() >= deadline {
-                return Err(format!(
-                    "timed out waiting for {what} ({timeout:?})"
-                )
-                .into());
-            }
-            tokio::time::sleep(AWAIT_POLL).await;
-        }
+            Ok(done(&shared))
+        })
+        .await
     }
 }
 
@@ -442,25 +429,14 @@ impl SignatureConfirmations {
     }
 
     pub async fn await_all(&self, timeout: Duration) -> Result<()> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            {
-                let shared = self.shared.borrow();
-                if let Some(err) = &shared.error {
-                    return Err(format!("ws stream: {err}").into());
-                }
-                if shared.pending.is_empty() {
-                    return Ok(());
-                }
+        conn::await_condition(timeout, "signature confirmations", || {
+            let shared = self.shared.borrow();
+            if let Some(err) = &shared.error {
+                return Err(format!("ws stream: {err}").into());
             }
-            if tokio::time::Instant::now() >= deadline {
-                return Err(format!(
-                    "timed out waiting for signature confirmations ({timeout:?})"
-                )
-                .into());
-            }
-            tokio::time::sleep(AWAIT_POLL).await;
-        }
+            Ok(shared.pending.is_empty())
+        })
+        .await
     }
 
     pub fn finalize(&self) -> SignatureOutcome {

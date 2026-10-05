@@ -35,14 +35,18 @@ pub trait ChainCtx {
         &self,
         payer: &Keypair,
         ixs: &[Instruction],
-    ) -> Result<Signature>;
+    ) -> Result<Signature> {
+        self.submit_and_confirm_with(payer, &[], ixs).await
+    }
     async fn submit_and_confirm_with(
         &self,
         payer: &Keypair,
         cosigners: &[&Keypair],
         ixs: &[Instruction],
     ) -> Result<Signature>;
-    async fn account(&self, pk: &Pubkey) -> Result<Option<Account>>;
+    async fn account(&self, pk: &Pubkey) -> Result<Option<Account>> {
+        self.api().get_account(pk).await
+    }
     async fn accounts(&self, pks: &[Pubkey]) -> Result<Vec<Option<Account>>> {
         self.api().get_multiple_accounts(pks).await
     }
@@ -304,40 +308,29 @@ async fn airdrop_and_confirm(
     lamports: u64,
 ) -> Result<()> {
     let before = api.get_balance(pk).await.unwrap_or(0);
-    let deadline = tokio::time::Instant::now() + AIRDROP_TIMEOUT;
     let mut requested = false;
-    loop {
+    crate::check::poll_until(AIRDROP_TIMEOUT, AIRDROP_POLL, async || {
         if !requested {
             // The faucet can lag the RPC service right after boot — retry
             // the request itself, not just the balance poll.
             requested = api.request_airdrop(pk, lamports).await.is_ok();
         }
-        if requested
-            && api.get_balance(pk).await.unwrap_or(0) >= before + lamports
-        {
-            return Ok(());
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(format!(
-                "airdrop of {lamports} lamports to {pk} not confirmed"
-            )
-            .into());
-        }
-        tokio::time::sleep(AIRDROP_POLL).await;
-    }
+        Ok::<_, crate::DynError>(
+            (requested
+                && api.get_balance(pk).await.unwrap_or(0) >= before + lamports)
+                .then_some(()),
+        )
+    })
+    .await?
+    .ok_or_else(|| {
+        format!("airdrop of {lamports} lamports to {pk} not confirmed").into()
+    })
 }
 
 #[async_trait(?Send)]
 impl ChainCtx for BaseCtx {
     fn api(&self) -> &Api {
         &self.api
-    }
-    async fn submit_and_confirm(
-        &self,
-        payer: &Keypair,
-        ixs: &[Instruction],
-    ) -> Result<Signature> {
-        submit_and_confirm(&self.api, &self.blockhash, payer, &[], ixs).await
     }
     async fn submit_and_confirm_with(
         &self,
@@ -347,9 +340,6 @@ impl ChainCtx for BaseCtx {
     ) -> Result<Signature> {
         submit_and_confirm(&self.api, &self.blockhash, payer, cosigners, ixs)
             .await
-    }
-    async fn account(&self, pk: &Pubkey) -> Result<Option<Account>> {
-        self.api.get_account(pk).await
     }
     async fn airdrop(&self, pk: &Pubkey, lamports: u64) -> Result<()> {
         airdrop_and_confirm(&self.api, pk, lamports).await
@@ -361,13 +351,6 @@ impl ChainCtx for ErCtx {
     fn api(&self) -> &Api {
         &self.api
     }
-    async fn submit_and_confirm(
-        &self,
-        payer: &Keypair,
-        ixs: &[Instruction],
-    ) -> Result<Signature> {
-        submit_and_confirm(&self.api, &self.blockhash, payer, &[], ixs).await
-    }
     async fn submit_and_confirm_with(
         &self,
         payer: &Keypair,
@@ -376,9 +359,6 @@ impl ChainCtx for ErCtx {
     ) -> Result<Signature> {
         submit_and_confirm(&self.api, &self.blockhash, payer, cosigners, ixs)
             .await
-    }
-    async fn account(&self, pk: &Pubkey) -> Result<Option<Account>> {
-        self.api.get_account(pk).await
     }
     async fn airdrop(&self, _pk: &Pubkey, _lamports: u64) -> Result<()> {
         Err("the ER has no faucet — airdrop on the base; clone-on-access pulls it in".into())

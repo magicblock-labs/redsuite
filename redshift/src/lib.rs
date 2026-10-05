@@ -5,6 +5,7 @@ use std::time::Duration;
 use keypair::Keypair;
 use pubkey::Pubkey;
 pub use redline_interface as program;
+pub use redsuite_core::redline::written_id;
 use redsuite_core::redline::Accounts;
 use redsuite_core::{
     check, check_eq, dlp, receipt, BaseCtx, ChainCtx, ErCtx, Result,
@@ -103,12 +104,6 @@ pub async fn local_accounts(
         accounts.extend(er.api().get_program_accounts(&owner).await?);
     }
     Ok(keys.iter().map(|key| accounts.get(key).cloned()).collect())
-}
-
-pub fn written_id(data: &[u8]) -> Option<u64> {
-    use program::layout::{ID_OFFSET, ID_SIZE};
-    let bytes = data.get(ID_OFFSET..ID_OFFSET + ID_SIZE)?;
-    Some(u64::from_le_bytes(bytes.try_into().ok()?))
 }
 
 pub async fn init_account(

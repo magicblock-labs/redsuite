@@ -1,19 +1,16 @@
-use std::{rc::Rc, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use pubkey::Pubkey;
-use redsuite_core::redline::Accounts;
+use redsuite_core::redline::{copy_three, Accounts};
 use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, prep,
     profile::{self, ProfileValues},
     report,
     runner::{execute_threaded, Pacing, RunOutcome, ThreadRunConfig},
-    BaseCtx, ChainCtx, ErClient, ErCtx, MetricsDelta, Result, Scenario,
-    ScenarioReport, TxSender,
+    BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
 };
-
-use crate::program::instruction::build;
 
 const PAYER_LAMPORTS: u64 = 2_000_000_000;
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(300);
@@ -76,31 +73,18 @@ fn execute_cell(
 ) -> Result<RunOutcome> {
     let threads = config.threads;
     let factory = move |thread_index: usize| {
-        let client = ErClient::new(er_rpc_url.clone());
-        let senders: Vec<TxSender> = payer_bytes
-            .iter()
-            .enumerate()
-            .filter(|(payer_index, _)| payer_index % threads == thread_index)
-            .map(|(_, bytes)| {
-                let payer = prep::payer_from_bytes(bytes);
-                client.sender(Rc::new(payer))
-            })
-            .collect();
+        let senders = prep::worker_senders(
+            &er_rpc_url,
+            &payer_bytes,
+            thread_index,
+            threads,
+        );
         let hot_set = hot_set.clone();
         // same read-write 3/tx shape as S1, confined to the hot set
         // (hot-set sizes are powers of two — coprime with the stride)
         move |id: u64| {
             let global_id = id_offset + id;
-            let len = hot_set.len() as u64;
-            let base_index = ((global_id - 1) * 3) % len;
-            let ix = build::account_data_copy(
-                global_id,
-                &[hot_set[base_index as usize]],
-                &[
-                    hot_set[((base_index + 1) % len) as usize],
-                    hot_set[((base_index + 2) % len) as usize],
-                ],
-            );
+            let (ix, _) = copy_three(&hot_set, global_id);
             let sender = senders[(global_id as usize) % senders.len()].clone();
             async move { sender.submit(&[ix]).await.map(|_| ()) }
         }
