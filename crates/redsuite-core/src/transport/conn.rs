@@ -1,4 +1,4 @@
-use std::{cell::Cell, fmt};
+use std::{cell::Cell, fmt, time::Duration};
 
 use futures_util::{
     stream::SplitSink, stream::SplitStream, SinkExt, Stream, StreamExt,
@@ -15,6 +15,18 @@ use tokio_tungstenite::{
 use crate::Result;
 
 pub type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+pub(super) async fn await_condition(
+    timeout: Duration,
+    what: &str,
+    mut condition: impl FnMut() -> Result<bool>,
+) -> Result<()> {
+    crate::check::poll_until(timeout, Duration::from_millis(20), async || {
+        condition().map(|ready| ready.then_some(()))
+    })
+    .await?
+    .ok_or_else(|| format!("timed out waiting for {what} ({timeout:?})").into())
+}
 
 #[derive(Debug, Clone)]
 pub enum CloseReason {

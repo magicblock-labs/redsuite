@@ -207,25 +207,15 @@ impl SubscriberPool {
         per_connection: usize,
         timeout: Duration,
     ) -> Result<()> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
+        conn::await_condition(timeout, "pool subscriptions", || {
             if let Some(error) = self.first_error() {
                 return Err(format!("subscriber pool: {error}").into());
             }
-            let ready = self.states.iter().all(|state| {
+            Ok(self.states.iter().all(|state| {
                 state.lock().unwrap().ready_subs >= per_connection
-            });
-            if ready {
-                return Ok(());
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return Err(format!(
-                    "timed out waiting for pool subscriptions ({timeout:?})"
-                )
-                .into());
-            }
-            tokio::time::sleep(AWAIT_POLL).await;
-        }
+            }))
+        })
+        .await
     }
 
     pub fn incomplete(&self, expected: &ExpectedWrites) -> usize {

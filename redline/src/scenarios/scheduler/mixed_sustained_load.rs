@@ -17,8 +17,8 @@ use redsuite_core::{
         execute_raw, merge_outcomes, spawn_workers, Pacing, RunConfig,
         RunOutcome,
     },
-    topology, BaseCtx, ChainCtx, ErClient, ErCtx, MetricsDelta, Result,
-    Scenario, ScenarioReport, TxSender,
+    topology, BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario,
+    ScenarioReport,
 };
 
 use crate::program::{instruction::build, layout, utils::hash_chain};
@@ -266,16 +266,8 @@ async fn execute(
         let pool = pool.clone();
         let payer_bytes = payer_bytes.clone();
         async move {
-            let client = ErClient::new(er_rpc_url);
-            let senders: Vec<TxSender> = payer_bytes
-                .iter()
-                .enumerate()
-                .filter(|(payer_index, _)| payer_index % threads == index)
-                .map(|(_, bytes)| {
-                    let payer = prep::payer_from_bytes(bytes);
-                    client.sender(Rc::new(payer))
-                })
-                .collect();
+            let senders =
+                prep::worker_senders(&er_rpc_url, &payer_bytes, index, threads);
             let locks: Rc<Vec<tokio::sync::Mutex<()>>> = Rc::new(
                 (0..span.len).map(|_| tokio::sync::Mutex::new(())).collect(),
             );

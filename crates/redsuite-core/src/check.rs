@@ -136,17 +136,13 @@ pub async fn poll<Fut>(
 where
     Fut: Future<Output = bool>,
 {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        if condition().await {
-            return Ok(());
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(CheckError::new(check)
-                .context("waited", format!("{timeout:?}")));
-        }
-        tokio::time::sleep(POLL_INTERVAL).await;
-    }
+    poll_until(timeout, POLL_INTERVAL, async || {
+        Ok::<_, CheckError>(condition().await.then_some(()))
+    })
+    .await?
+    .ok_or_else(|| {
+        CheckError::new(check).context("waited", format!("{timeout:?}"))
+    })
 }
 
 pub async fn poll_for<T, Observed, Fut>(
@@ -158,18 +154,40 @@ where
     Observed: fmt::Debug,
     Fut: Future<Output = std::result::Result<T, Observed>>,
 {
+    let mut last = None;
+    poll_until(timeout, POLL_INTERVAL, async || {
+        Ok::<_, CheckError>(match observe().await {
+            Ok(value) => Some(value),
+            Err(observed) => {
+                last = Some(observed);
+                None
+            }
+        })
+    })
+    .await?
+    .ok_or_else(|| {
+        CheckError::new(check)
+            .actual(format!("{:?}", last.expect("polled at least once")))
+            .context("waited", format!("{timeout:?}"))
+    })
+}
+
+// Observe once even at a zero deadline. A pending observation may be retried;
+// errors return immediately, and an in-flight observation is never cancelled.
+pub async fn poll_until<T, E>(
+    timeout: Duration,
+    interval: Duration,
+    mut observe: impl AsyncFnMut() -> Result<Option<T>, E>,
+) -> Result<Option<T>, E> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        let observed = match observe().await {
-            Ok(value) => return Ok(value),
-            Err(observed) => observed,
-        };
-        if tokio::time::Instant::now() >= deadline {
-            return Err(CheckError::new(check)
-                .actual(format!("{observed:?}"))
-                .context("waited", format!("{timeout:?}")));
+        if let Some(value) = observe().await? {
+            return Ok(Some(value));
         }
-        tokio::time::sleep(POLL_INTERVAL).await;
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        tokio::time::sleep(interval).await;
     }
 }
 

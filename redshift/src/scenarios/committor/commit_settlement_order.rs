@@ -236,18 +236,6 @@ async fn hold_nonces(
     }
 }
 
-async fn await_clone(er: &ErCtx, account: &Pubkey, space: u32) -> Result<()> {
-    check::poll(
-        &format!("the private er clones the delegated account {account}"),
-        CLONE_TIMEOUT,
-        || async {
-            matches!(er.account(account).await, Ok(Some(acc)) if acc.data.len() == space as usize)
-        },
-    )
-    .await?;
-    Ok(())
-}
-
 async fn prepare_accounts(
     base: &BaseCtx,
     er: &ErCtx,
@@ -271,7 +259,13 @@ async fn prepare_accounts(
             DELEGATION_PROGRAM_ID,
             "a delegated pda must be dlp-owned on base"
         )?;
-        await_clone(er, &account, variant.space).await?;
+        prep::await_clones(
+            er,
+            &[account],
+            variant.space as usize,
+            CLONE_TIMEOUT,
+        )
+        .await?;
         keys.push(account);
     }
     Ok(Accounts {

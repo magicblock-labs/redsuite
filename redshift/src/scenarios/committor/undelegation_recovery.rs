@@ -52,18 +52,6 @@ fn value(case: u64, step: u64) -> u64 {
     100 * case + step
 }
 
-async fn await_clone(er: &ErCtx, account: &Pubkey) -> Result<()> {
-    check::poll(
-        &format!("the private er clones the delegated account {account}"),
-        CLONE_TIMEOUT,
-        || async {
-            matches!(er.account(account).await, Ok(Some(acc)) if acc.data.len() == crate::ACCOUNT_SPACE as usize)
-        },
-    )
-    .await?;
-    Ok(())
-}
-
 async fn write(
     er: &ErCtx,
     payer: &Keypair,
@@ -244,7 +232,13 @@ async fn recover(
     let identity = private.identity();
     let account =
         crate::init_delegated_account(base, payer, seed, identity).await?;
-    await_clone(private.ctx(), &account).await?;
+    prep::await_clones(
+        private.ctx(),
+        &[account],
+        crate::ACCOUNT_SPACE as usize,
+        CLONE_TIMEOUT,
+    )
+    .await?;
     let snapshot =
         write(private.ctx(), payer, value(case, 1), &account).await?;
 

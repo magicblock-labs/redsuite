@@ -18,7 +18,7 @@ use redsuite_core::{
     check, check_eq, prep,
     profile::{self, ProfileValues},
     redline::causal::{
-        chain_ixs, hex, independent_ixs, PairModel, Step, HASH_INIT, STEPS,
+        chain_ixs, independent_ixs, PairModel, Step, HASH_INIT, STEPS,
     },
     report,
     runner::{
@@ -601,50 +601,30 @@ async fn verify_pairs(
     batch: usize,
 ) -> Result<()> {
     for (index, pair) in pairs.iter_mut().enumerate() {
-        let expectations = [
-            ("A", pair.a, pair.model.a, pair.model.a_id),
-            ("B", pair.b, pair.model.b, pair.model.b_id),
-        ];
-        for (label, address, expected_hash, expected_id) in expectations {
-            let account = er.account(&address).await?.ok_or(format!(
-                "pair {index} account {label} {address} is not on the ER"
-            ))?;
-            let data = &account.data;
-            if data.len() < layout::HASH_OFFSET + layout::HASH_SIZE {
-                return Err(format!(
-                    "pair {index} account {label} holds {} bytes, fewer than \
-                     the {} the layout needs",
-                    data.len(),
-                    layout::HASH_OFFSET + layout::HASH_SIZE
-                )
-                .into());
-            }
-            let hash = &data
-                [layout::HASH_OFFSET..layout::HASH_OFFSET + layout::HASH_SIZE];
-            let id_bytes =
-                &data[layout::ID_OFFSET..layout::ID_OFFSET + layout::ID_SIZE];
-            let id = u64::from_le_bytes(
-                id_bytes.try_into().expect("id slice is 8 bytes"),
-            );
-            if hash == expected_hash && id == expected_id {
-                continue;
-            }
-            let failed = first_failed_step(er, &pair.steps).await;
-            let error = CheckError::new(format!(
-                "batch {batch}: pair {index} account {label} must hold the \
-                 fold of its accepted X/Y/Z history — a conflicting \
-                 transaction executed out of accepted order, was skipped, \
-                 or failed"
-            ))
-            .expected(format!("id {expected_id}, hash {}", hex(&expected_hash)))
-            .actual(format!("id {id}, hash {}", hex(hash)))
-            .context(
-                "first failed step of this batch",
-                failed.unwrap_or_else(|| {
-                    "none — every step executed successfully".to_owned()
-                }),
-            );
-            return Err(error.into());
+        if let Err(error) = pair
+            .model
+            .verify(
+                er,
+                [pair.a, pair.b],
+                &format!("batch {batch}: pair {index} on the ER"),
+            )
+            .await
+        {
+            let error = match error.downcast::<CheckError>() {
+                Ok(error) => error
+                    .context(
+                        "first failed step of this batch",
+                        first_failed_step(er, &pair.steps)
+                            .await
+                            .unwrap_or_else(|| {
+                                "none — every step executed successfully"
+                                    .to_owned()
+                            }),
+                    )
+                    .into(),
+                Err(error) => error,
+            };
+            return Err(error);
         }
         pair.steps.clear();
     }

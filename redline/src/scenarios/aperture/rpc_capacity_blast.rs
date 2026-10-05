@@ -1,4 +1,4 @@
-use std::{rc::Rc, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use pubkey::Pubkey;
@@ -8,8 +8,7 @@ use redsuite_core::{
     check, check_eq, prep,
     profile::{self, ProfileValues},
     runner::{execute_threaded, Pacing, ThreadRunConfig},
-    BaseCtx, ChainCtx, ErClient, ErCtx, MetricsDelta, Result, Scenario,
-    ScenarioReport, TxSender,
+    BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
 };
 
 const PREP_PAYER_LAMPORTS: u64 = 4_000_000_000;
@@ -94,18 +93,12 @@ impl Scenario for RpcCapacityBlast {
             let pool = pool.clone();
             let payer_bytes = payer_bytes.clone();
             move |thread_index: usize| {
-                let client = ErClient::new(er_rpc_url.clone());
-                let senders: Vec<TxSender> = payer_bytes
-                    .iter()
-                    .enumerate()
-                    .filter(|(payer_index, _)| {
-                        payer_index % threads == thread_index
-                    })
-                    .map(|(_, bytes)| {
-                        let payer = prep::payer_from_bytes(bytes);
-                        client.sender(Rc::new(payer))
-                    })
-                    .collect();
+                let senders = prep::worker_senders(
+                    &er_rpc_url,
+                    &payer_bytes,
+                    thread_index,
+                    threads,
+                );
                 let pool = pool.clone();
                 move |id: u64| {
                     let sender = senders[(id as usize) % senders.len()].clone();

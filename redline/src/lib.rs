@@ -1,5 +1,6 @@
 pub mod scenarios;
 pub use redline_interface as program;
+pub use redsuite_core::redline::written_id as account_update_id;
 
 pub const ACCOUNT_SPACE: u32 = 256;
 
@@ -11,10 +12,4 @@ pub mod metrics {
         "mbv_transaction_skip_preflight_count";
     pub const FAILED_TRANSACTIONS: &str =
         "engine_processor_failed_transactions";
-}
-
-pub fn account_update_id(data: &[u8]) -> Option<u64> {
-    use program::layout::{ID_OFFSET, ID_SIZE};
-    let bytes = data.get(ID_OFFSET..ID_OFFSET + ID_SIZE)?;
-    Some(u64::from_le_bytes(bytes.try_into().ok()?))
 }

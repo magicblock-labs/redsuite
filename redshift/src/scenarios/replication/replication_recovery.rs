@@ -12,15 +12,13 @@ use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, prep,
     profile::{self, ProfileValues},
-    redline::causal::{chain_ixs, hex, PairModel, Step, STEPS},
+    redline::causal::{chain_ixs, PairModel, Step, STEPS},
     topology::{self, ReplicatedOptions, ReplicatedTopology, Verifier},
     BaseCtx, ChainCtx, CheckError, PrivateErScenario, Result, ScenarioReport,
     TxSender,
 };
 use signature::Signature;
 use signer::Signer;
-
-use crate::program::layout;
 
 const LABEL: &str = "replication-recovery";
 const PAYERS_PER_PAIR: usize = 3;
@@ -355,33 +353,13 @@ async fn verify_pairs(
 ) -> Result<()> {
     let leader = topology.leader().ctx();
     for (index, pair) in pairs.iter().enumerate() {
-        let expectations = [
-            ("A", pair.a, pair.model.a, pair.model.a_id),
-            ("B", pair.b, pair.model.b, pair.model.b_id),
-        ];
-        for (label, address, expected_hash, expected_id) in expectations {
-            let account = leader.account(&address).await?.ok_or(format!(
-                "pair {index} account {label} {address} is not on the leader"
-            ))?;
-            let data = &account.data;
-            let hash = &data
-                [layout::HASH_OFFSET..layout::HASH_OFFSET + layout::HASH_SIZE];
-            let id = u64::from_le_bytes(
-                data[layout::ID_OFFSET..layout::ID_OFFSET + layout::ID_SIZE]
-                    .try_into()
-                    .expect("id slice is 8 bytes"),
-            );
-            if hash == expected_hash && id == expected_id {
-                continue;
-            }
-            return Err(CheckError::new(format!(
-                "pair {index} account {label} on the leader must hold the \
-                 fold of its accepted X/Y/Z history"
-            ))
-            .expected(format!("id {expected_id}, hash {}", hex(&expected_hash)))
-            .actual(format!("id {id}, hash {}", hex(hash)))
-            .into());
-        }
+        pair.model
+            .verify(
+                leader,
+                [pair.a, pair.b],
+                &format!("pair {index} on the leader"),
+            )
+            .await?;
     }
     Ok(())
 }

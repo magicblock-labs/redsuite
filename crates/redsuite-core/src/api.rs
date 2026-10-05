@@ -609,27 +609,27 @@ impl Api {
         sig: &Signature,
         options: ConfirmOptions,
     ) -> Result<()> {
-        let deadline = tokio::time::Instant::now() + options.deadline;
-        loop {
+        crate::check::poll_until(options.deadline, options.poll, async || {
             if let Some(status) = self.get_signature_status(sig).await? {
                 if let Some(err) = status.err {
                     return Err(Box::new(TxError {
                         signature: *sig,
                         err,
-                    }));
+                    }) as crate::DynError);
                 }
                 if status.meets(options.commitment) {
-                    return Ok(());
+                    return Ok(Some(()));
                 }
             }
-            if tokio::time::Instant::now() >= deadline {
-                return Err(Box::new(ConfirmTimeout {
-                    signature: *sig,
-                    deadline: options.deadline,
-                }));
-            }
-            tokio::time::sleep(options.poll).await;
-        }
+            Ok(None)
+        })
+        .await?
+        .ok_or_else(|| {
+            Box::new(ConfirmTimeout {
+                signature: *sig,
+                deadline: options.deadline,
+            }) as crate::DynError
+        })
     }
 
     pub async fn get_signature_status(
@@ -733,19 +733,13 @@ impl Api {
         sig: &Signature,
         timeout: Duration,
     ) -> Result<TransactionInfo> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            if let Some(tx) = self.get_transaction(sig).await? {
-                return Ok(tx);
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return Err(format!(
-                    "transaction {sig} not found within {timeout:?}"
-                )
-                .into());
-            }
-            tokio::time::sleep(TX_POLL).await;
-        }
+        crate::check::poll_until(timeout, TX_POLL, async || {
+            self.get_transaction(sig).await
+        })
+        .await?
+        .ok_or_else(|| {
+            format!("transaction {sig} not found within {timeout:?}").into()
+        })
     }
 }
 

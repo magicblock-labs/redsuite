@@ -1,9 +1,8 @@
-use std::{collections::HashMap, rc::Rc, sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use instruction::Instruction;
 use pubkey::Pubkey;
-use redsuite_core::redline::Accounts;
+use redsuite_core::redline::{copy_three, Accounts};
 use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, prep,
@@ -14,8 +13,7 @@ use redsuite_core::{
     transport::subpool::{
         ConnReport, ExpectedWrites, ProducedLedger, SubscriberPool,
     },
-    BaseCtx, ChainCtx, ErClient, ErCtx, MetricsDelta, Result, Scenario,
-    ScenarioReport, TxSender,
+    BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
 };
 
 const PREP_PAYER_LAMPORTS: u64 = 4_000_000_000;
@@ -72,19 +70,6 @@ const PROFILES: ProfileValues<Profile> = ProfileValues {
     deep: None,
 };
 
-fn shape(pool: &[Pubkey], id: u64) -> (Instruction, [Pubkey; 2]) {
-    use crate::program::instruction::build;
-    let len = pool.len() as u64;
-    let base_index = ((id - 1) * 3) % len;
-    let source = pool[base_index as usize];
-    let first_dest = pool[((base_index + 1) % len) as usize];
-    let second_dest = pool[((base_index + 2) % len) as usize];
-    (
-        build::account_data_copy(id, &[source], &[first_dest, second_dest]),
-        [first_dest, second_dest],
-    )
-}
-
 fn cell_expected_writes(
     pool: &[Pubkey],
     first_id: u64,
@@ -92,7 +77,7 @@ fn cell_expected_writes(
 ) -> ExpectedWrites {
     let mut expected: ExpectedWrites = HashMap::new();
     for id in first_id + 1..=first_id + iterations {
-        let (_, dests) = shape(pool, id);
+        let (_, dests) = copy_three(pool, id);
         for dest in dests {
             expected.entry(dest).or_default().push(id);
         }
@@ -110,21 +95,17 @@ fn execute_cell(
 ) -> Result<RunOutcome> {
     let threads = config.threads;
     let factory = move |thread_index: usize| {
-        let client = ErClient::new(er_rpc_url.clone());
-        let senders: Vec<TxSender> = payer_bytes
-            .iter()
-            .enumerate()
-            .filter(|(payer_index, _)| payer_index % threads == thread_index)
-            .map(|(_, bytes)| {
-                let payer = prep::payer_from_bytes(bytes);
-                client.sender(Rc::new(payer))
-            })
-            .collect();
+        let senders = prep::worker_senders(
+            &er_rpc_url,
+            &payer_bytes,
+            thread_index,
+            threads,
+        );
         let pool = pool.clone();
         let produced = produced.clone();
         move |id: u64| {
             let global_id = id_offset + id;
-            let (ix, _) = shape(&pool, global_id);
+            let (ix, _) = copy_three(&pool, global_id);
             if let Some(ledger) = &produced {
                 ledger.record(global_id);
             }

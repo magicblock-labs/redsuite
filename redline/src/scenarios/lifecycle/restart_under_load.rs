@@ -319,24 +319,16 @@ async fn resolve(api: &Api, records: &mut [Record]) -> Result<()> {
         if !matches!(record.outcome, Outcome::Unresolved | Outcome::Rejected) {
             continue;
         }
-        let grace_ends = tokio::time::Instant::now() + RESOLVE_GRACE;
-        loop {
-            match api.get_transaction(&record.signature).await? {
-                Some(tx) => {
-                    record.outcome = if tx.err.is_none() {
-                        Outcome::Confirmed
-                    } else {
-                        Outcome::Failed
-                    };
-                    break;
-                }
-                None if tokio::time::Instant::now() >= grace_ends => {
-                    record.outcome = Outcome::Dropped;
-                    break;
-                }
-                None => tokio::time::sleep(RESOLVE_POLL).await,
-            }
-        }
+        record.outcome =
+            match check::poll_until(RESOLVE_GRACE, RESOLVE_POLL, async || {
+                api.get_transaction(&record.signature).await
+            })
+            .await?
+            {
+                Some(tx) if tx.err.is_none() => Outcome::Confirmed,
+                Some(_) => Outcome::Failed,
+                None => Outcome::Dropped,
+            };
     }
     Ok(())
 }
