@@ -241,16 +241,8 @@ impl ReplicatedTopology {
         &self.leader
     }
 
-    pub fn leader_mut(&mut self) -> &mut PrivateEr {
-        &mut self.leader
-    }
-
     pub fn verifiers(&self) -> &[Verifier] {
         &self.verifiers
-    }
-
-    pub fn verifiers_mut(&mut self) -> &mut [Verifier] {
-        &mut self.verifiers
     }
 
     pub fn verifier(&self, index: usize) -> &Verifier {
@@ -390,11 +382,7 @@ pub async fn replicated(
             bin_version: bin_version.clone(),
             bin_fingerprint: bin_fingerprint.clone(),
             identity: plan.identity.pubkey().to_string(),
-            launched_at: report::utc_stamp(),
-            rpc_port: None,
-            ws_port: None,
             metrics_port,
-            replication_port: None,
             upstream: Some(plan.upstream_address()),
             storage_dir: plan.storage_dir.display().to_string(),
             accountsdb_dir: state::split_accountsdb_dir(&plan.storage_dir)
@@ -402,8 +390,7 @@ pub async fn replicated(
             log: log.display().to_string(),
             config: Some(config_path.display().to_string()),
             pid,
-            relaunches: 0,
-            exit: None,
+            ..LaunchRecord::default()
         });
         let metrics_url = format!("http://127.0.0.1:{metrics_port}");
         let verifier = Verifier {

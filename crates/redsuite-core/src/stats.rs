@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use json::{Deserialize, Serialize};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 
@@ -160,16 +158,6 @@ impl Default for StreamingStats {
     fn default() -> Self {
         Self::new()
     }
-}
-
-#[derive(Serialize, Deserialize, Default)]
-#[serde(rename_all = "kebab-case")]
-pub struct BenchStatistics {
-    pub configuration: json::Value,
-    pub request_stats: HashMap<String, ObservationsStats>,
-    pub signature_confirmation_latency: ObservationsStats,
-    pub account_update_latency: ObservationsStats,
-    pub rps: ObservationsStats,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Copy, Default, PartialEq)]

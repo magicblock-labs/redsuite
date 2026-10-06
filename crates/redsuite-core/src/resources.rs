@@ -5,9 +5,9 @@ use std::{
 
 use json::{Deserialize, Serialize};
 
-use crate::{host, topology, DynError};
+use crate::{host, report, topology, DynError};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaunchRecord {
     pub label: String,
     pub role: String,
@@ -47,16 +47,13 @@ pub struct Resources {
 impl Resources {
     pub(crate) fn register_launch(
         &self,
-        launch: LaunchRecord,
+        mut launch: LaunchRecord,
     ) -> Rc<ResourceRecord> {
+        launch.launched_at = report::utc_stamp();
         let record = Rc::new(ResourceRecord {
-            label: launch.label.clone(),
-            pid: Cell::new(launch.pid),
             finished: Cell::new(false),
             finish_error: RefCell::new(None),
-            exit: RefCell::new(None),
-            launch,
-            relaunches: Cell::new(0),
+            launch: RefCell::new(launch),
         });
         self.records.borrow_mut().push(record.clone());
         record
@@ -66,13 +63,7 @@ impl Resources {
         self.records
             .borrow()
             .iter()
-            .map(|record| {
-                let mut launch = record.launch.clone();
-                launch.pid = record.pid.get();
-                launch.relaunches = record.relaunches.get();
-                launch.exit = record.exit.borrow().clone();
-                launch
-            })
+            .map(|record| record.launch.borrow().clone())
             .collect()
     }
 
@@ -82,19 +73,17 @@ impl Resources {
     pub(crate) fn audit(&self) -> Vec<DynError> {
         let mut errors: Vec<DynError> = Vec::new();
         for record in self.records.borrow().iter() {
+            let launch = record.launch.borrow();
             if let Some(message) = record.finish_error.borrow().as_deref() {
                 errors.push(
-                    format!("private ER `{}`: {message}", record.label).into(),
+                    format!("private ER `{}`: {message}", launch.label).into(),
                 );
-            } else if !record.finished.get()
-                && host::proc_running(record.pid.get())
-            {
+            } else if !record.finished.get() && host::proc_running(launch.pid) {
                 errors.push(
                     format!(
                         "private ER `{}` (pid {}) is still running after the \
                          scenario",
-                        record.label,
-                        record.pid.get()
+                        launch.label, launch.pid
                     )
                     .into(),
                 );
@@ -116,8 +105,8 @@ impl Resources {
     pub(crate) fn reclaim(&self) -> Vec<Reclaimed> {
         let mut reclaimed = Vec::new();
         for record in self.records.borrow().iter() {
-            let launch = &record.launch;
-            let pid = record.pid.get();
+            let launch = record.launch.borrow();
+            let pid = launch.pid;
             let killed = !record.finished.get() && host::proc_running(pid);
             if killed {
                 topology::kill_pid(pid);
@@ -138,7 +127,7 @@ impl Resources {
             }
             if killed || removed {
                 reclaimed.push(Reclaimed {
-                    label: record.label.clone(),
+                    label: launch.label.clone(),
                     storage_dir: launch.storage_dir.clone(),
                     killed,
                     removed,
@@ -150,20 +139,17 @@ impl Resources {
 }
 
 pub(crate) struct ResourceRecord {
-    label: String,
-    pid: Cell<u32>,
     finished: Cell<bool>,
     finish_error: RefCell<Option<String>>,
-    exit: RefCell<Option<String>>,
-    launch: LaunchRecord,
-    relaunches: Cell<u32>,
+    launch: RefCell<LaunchRecord>,
 }
 
 impl ResourceRecord {
     pub(crate) fn relaunched(&self, pid: u32) {
-        self.pid.set(pid);
+        let mut launch = self.launch.borrow_mut();
+        launch.pid = pid;
+        launch.relaunches += 1;
         self.finished.set(false);
-        self.relaunches.set(self.relaunches.get() + 1);
     }
 
     pub(crate) fn mark_finished(&self) {
@@ -175,6 +161,6 @@ impl ResourceRecord {
     }
 
     pub(crate) fn record_exit(&self, message: String) {
-        *self.exit.borrow_mut() = Some(message);
+        self.launch.borrow_mut().exit = Some(message);
     }
 }

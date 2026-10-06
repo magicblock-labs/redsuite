@@ -28,10 +28,6 @@ pub struct FixtureArtifact {
     pub content_hash: Hash,
 }
 
-pub fn manifest_path() -> PathBuf {
-    manifest_path_at(&topology::workspace_root())
-}
-
 fn manifest_path_at(root: &Path) -> PathBuf {
     root.join("target/deploy/fixtures.json")
 }

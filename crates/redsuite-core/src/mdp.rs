@@ -5,7 +5,6 @@ use crate::{system::system_id, topology::MDP_ID};
 
 pub const STATUS_ACTIVE: u8 = 0;
 pub const STATUS_DRAINING: u8 = 1;
-pub const STATUS_OFFLINE: u8 = 2;
 
 const RECORD_VERSION_V0: u8 = 0;
 const IX_REGISTER: u8 = 0;

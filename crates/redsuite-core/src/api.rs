@@ -42,12 +42,6 @@ pub struct TxError {
     pub err: json::Value,
 }
 
-impl TxError {
-    pub fn custom_code(&self) -> Option<u32> {
-        custom_error_code(&self.err)
-    }
-}
-
 impl std::fmt::Display for TxError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -210,14 +204,9 @@ struct RpcTransactionMeta {
     log_messages: Option<Vec<String>>,
 }
 
-#[derive(Deserialize)]
-struct RpcBlock {
-    #[serde(rename = "blockTime")]
-    block_time: Option<i64>,
-}
-
-#[derive(Debug)]
+#[derive(Debug, Deserialize)]
 pub struct BlockInfo {
+    #[serde(rename = "blockTime")]
     pub block_time: Option<i64>,
 }
 
@@ -703,11 +692,7 @@ impl Api {
                 max_supported_transaction_version: 0,
             },
         );
-        let raw: Option<RpcBlock> =
-            self.call_nullable("getBlock", &params).await?;
-        Ok(raw.map(|block| BlockInfo {
-            block_time: block.block_time,
-        }))
+        self.call_nullable("getBlock", &params).await
     }
 
     pub async fn get_signatures_for_address(
@@ -761,19 +746,27 @@ impl Metrics {
     }
 
     pub fn value_sum(&self, name: &str) -> Option<f64> {
+        self.sum_series(name, |_, value| value)
+    }
+
+    fn sum_series(
+        &self,
+        name: &str,
+        value: impl Fn(&str, f64) -> f64,
+    ) -> Option<f64> {
         let label_prefix = format!("{name}{{");
         let mut sum = 0.0;
         let mut matched = false;
-        for (key, value) in &self.0 {
+        for (key, sample) in &self.0 {
             if key.starts_with(&label_prefix) {
                 matched = true;
-                sum += value;
+                sum += value(key, *sample);
             }
         }
         if matched {
             Some(sum)
         } else {
-            self.get(name)
+            self.get(name).map(|sample| value(name, sample))
         }
     }
 
@@ -850,48 +843,36 @@ impl MetricsDelta {
     }
 
     pub fn histogram_avg(&self, name: &str) -> Option<f64> {
-        let count = self.counter(&suffixed(name, "_count"))?;
-        if count <= 0.0 {
-            return None;
-        }
-        let sum = self.counter(&suffixed(name, "_sum"))?;
-        Some(sum / count)
+        histogram_average(
+            self.counter(&suffixed(name, "_count"))?,
+            self.counter(&suffixed(name, "_sum"))?,
+        )
     }
 
     pub fn counter_all(&self, name: &str) -> Option<f64> {
-        let label_prefix = format!("{name}{{");
-        let mut sum = 0.0;
-        let mut matched = false;
-        for (key, after_value) in &self.after.0 {
-            if !key.starts_with(&label_prefix) {
-                continue;
-            }
-            matched = true;
-            sum += after_value - self.before.get(key).unwrap_or(0.0);
-        }
-        if matched {
-            Some(sum)
-        } else {
-            self.counter(name)
-        }
+        self.after.sum_series(name, |key, after| {
+            after - self.before.get(key).unwrap_or(0.0)
+        })
     }
 
     // Window average over ALL series of a (possibly labeled) histogram.
     pub fn histogram_avg_all(&self, name: &str) -> Option<f64> {
-        let count = self.counter_all(&format!("{name}_count"))?;
-        if count <= 0.0 {
-            return None;
-        }
-        let sum = self.counter_all(&format!("{name}_sum"))?;
-        Some(sum / count)
+        histogram_average(
+            self.counter_all(&format!("{name}_count"))?,
+            self.counter_all(&format!("{name}_sum"))?,
+        )
     }
 
     pub fn before(&self) -> &Metrics {
         &self.before
     }
+}
 
-    pub fn after(&self) -> &Metrics {
-        &self.after
+fn histogram_average(count: f64, sum: f64) -> Option<f64> {
+    if count <= 0.0 {
+        None
+    } else {
+        Some(sum / count)
     }
 }
 

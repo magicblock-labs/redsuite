@@ -28,25 +28,6 @@ pub trait PrivateErScenario {
     async fn run(&self, base: &BaseCtx) -> Result<ScenarioReport>;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Phase {
-    Preflight,
-    Topology,
-    Teardown,
-    Persist,
-}
-
-impl Phase {
-    pub fn name(self) -> &'static str {
-        match self {
-            Phase::Preflight => "preflight",
-            Phase::Topology => "topology",
-            Phase::Teardown => "teardown",
-            Phase::Persist => "persist",
-        }
-    }
-}
-
 #[derive(Debug)]
 pub enum RunError {
     Preflight(DynError),
@@ -56,12 +37,12 @@ pub enum RunError {
 }
 
 impl RunError {
-    pub fn phase(&self) -> Phase {
+    pub fn phase(&self) -> &'static str {
         match self {
-            RunError::Preflight(_) => Phase::Preflight,
-            RunError::Topology(_) => Phase::Topology,
-            RunError::Teardown(_) => Phase::Teardown,
-            RunError::Persist(_) => Phase::Persist,
+            RunError::Preflight(_) => "preflight",
+            RunError::Topology(_) => "topology",
+            RunError::Teardown(_) => "teardown",
+            RunError::Persist(_) => "persist",
         }
     }
 
@@ -77,19 +58,8 @@ impl RunError {
 
 impl std::fmt::Display for RunError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "{} failed: {}",
-            self.phase().name(),
-            self.error()
-        )
+        write!(formatter, "{} failed: {}", self.phase(), self.error())
     }
-}
-
-#[derive(Debug)]
-pub struct PhaseOutcome {
-    pub phase: Phase,
-    pub error: Option<RunError>,
 }
 
 #[derive(Debug)]
@@ -109,7 +79,7 @@ pub fn failed_check(error: &DynError) -> Option<&CheckError> {
 #[derive(Debug)]
 pub struct RunRecord {
     pub name: String,
-    pub phases: Vec<PhaseOutcome>,
+    pub errors: Vec<RunError>,
     pub scenario: ScenarioOutcome,
     pub wall_seconds: Option<f64>,
     pub launches: Vec<LaunchRecord>,
@@ -119,22 +89,11 @@ impl RunRecord {
     fn new(name: String) -> Self {
         Self {
             name,
-            phases: Vec::new(),
+            errors: Vec::new(),
             scenario: ScenarioOutcome::NotReached,
             wall_seconds: None,
             launches: Vec::new(),
         }
-    }
-
-    fn phase_ok(&mut self, phase: Phase) {
-        self.phases.push(PhaseOutcome { phase, error: None });
-    }
-
-    fn phase_failed(&mut self, error: RunError) {
-        self.phases.push(PhaseOutcome {
-            phase: error.phase(),
-            error: Some(error),
-        });
     }
 
     pub fn passed(&self) -> bool {
@@ -143,7 +102,7 @@ impl RunRecord {
             ScenarioOutcome::Skipped(_) => true,
             _ => false,
         };
-        passed && self.phases.iter().all(|outcome| outcome.error.is_none())
+        passed && self.errors.is_empty()
     }
 
     pub fn failure(&self) -> Option<String> {
@@ -160,11 +119,7 @@ impl RunRecord {
             | ScenarioOutcome::Skipped(_)
             | ScenarioOutcome::NotReached => {}
         }
-        for outcome in &self.phases {
-            if let Some(error) = &outcome.error {
-                lines.push(error.to_string());
-            }
-        }
+        lines.extend(self.errors.iter().map(ToString::to_string));
         if lines.is_empty() {
             return None;
         }
@@ -257,17 +212,16 @@ where
     let config = match config {
         Ok(config) => config,
         Err(error) => {
-            record.phase_failed(RunError::Preflight(error));
+            record.errors.push(RunError::Preflight(error));
             conclude(&mut record);
             return record;
         }
     };
     if let Err(error) = preflight(fixtures) {
-        record.phase_failed(RunError::Preflight(error));
+        record.errors.push(RunError::Preflight(error));
         conclude(&mut record);
         return record;
     }
-    record.phase_ok(Phase::Preflight);
     if let Some(reason) = optional_fixture_gap(optional_fixtures) {
         record.scenario = ScenarioOutcome::Skipped(reason);
         conclude(&mut record);
@@ -275,12 +229,9 @@ where
     }
 
     let provisioned = match provision(config).await {
-        Ok(provisioned) => {
-            record.phase_ok(Phase::Topology);
-            provisioned
-        }
+        Ok(provisioned) => provisioned,
         Err(error) => {
-            record.phase_failed(RunError::Topology(error));
+            record.errors.push(RunError::Topology(error));
             conclude(&mut record);
             return record;
         }
@@ -322,13 +273,9 @@ where
         Err(payload) => ScenarioOutcome::Panicked(panic_message(payload)),
     };
 
-    if teardown_errors.is_empty() {
-        record.phase_ok(Phase::Teardown);
-    } else {
-        for error in teardown_errors {
-            record.phase_failed(RunError::Teardown(error));
-        }
-    }
+    record
+        .errors
+        .extend(teardown_errors.into_iter().map(RunError::Teardown));
 
     conclude(&mut record);
     record
@@ -430,10 +377,8 @@ fn conclude(record: &mut RunRecord) {
             console::line(format_args!("{}: not run", record.name))
         }
     }
-    for outcome in &record.phases {
-        if let Some(error) = &outcome.error {
-            console::detail(format_args!("{error}"));
-        }
+    for error in &record.errors {
+        console::detail(format_args!("{error}"));
     }
     if show_details {
         for launch in &record.launches {
@@ -465,12 +410,11 @@ fn conclude(record: &mut RunRecord) {
             if show_details {
                 console::detail(format_args!("report: {}", path.display()));
             }
-            record.phase_ok(Phase::Persist);
         }
         Err(error) => {
             let error = RunError::Persist(error);
             console::detail(format_args!("{error}"));
-            record.phase_failed(error);
+            record.errors.push(error);
         }
     }
 }

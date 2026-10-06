@@ -16,6 +16,13 @@ use crate::Result;
 
 pub type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
+pub(super) fn check_stream(error: &Option<String>) -> Result<()> {
+    match error {
+        Some(error) => Err(format!("ws stream: {error}").into()),
+        None => Ok(()),
+    }
+}
+
 pub(super) async fn await_condition(
     timeout: Duration,
     what: &str,
@@ -270,9 +277,7 @@ pub fn logs_mentions_params(account: &Pubkey) -> String {
     format!(r#"[{{"mentions":["{account}"]}},{{"commitment":"confirmed"}}]"#)
 }
 
-pub fn program_params(program: &Pubkey) -> String {
-    format!(r#"["{program}",{{"encoding":"base64","commitment":"confirmed"}}]"#)
-}
+pub use account_params as program_params;
 
 pub fn signature_params(signature: &str) -> String {
     format!(r#"["{signature}",{{"commitment":"confirmed"}}]"#)

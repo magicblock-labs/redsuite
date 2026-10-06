@@ -360,14 +360,12 @@ fn run_failures(record: &RunRecord) -> Vec<PersistedFailure> {
         | ScenarioOutcome::Skipped(_)
         | ScenarioOutcome::NotReached => {}
     }
-    for outcome in &record.phases {
-        if let Some(error) = &outcome.error {
-            failures.push(PersistedFailure::new(
-                outcome.phase.name(),
-                "infrastructure",
-                error.error().to_string(),
-            ));
-        }
+    for error in &record.errors {
+        failures.push(PersistedFailure::new(
+            error.phase(),
+            "infrastructure",
+            error.error().to_string(),
+        ));
     }
     failures
 }

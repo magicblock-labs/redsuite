@@ -4,13 +4,15 @@ pub use dlp_api::args::{CommitStateArgs, DelegateArgs};
 use dlp_api::{
     args::DelegateEphemeralBalanceArgs,
     instruction_builder::{self, Encryptable},
-    pda,
 };
 pub use dlp_api::{
     pda::{
         delegate_buffer_pda_from_delegated_account_and_owner_program as delegate_buffer_pda,
         delegation_metadata_pda_from_delegated_account as delegation_metadata_pda,
         delegation_record_pda_from_delegated_account as delegation_record_pda,
+        ephemeral_balance_pda_from_payer as ephemeral_balance_pda,
+        magic_fee_vault_pda_from_validator as magic_fee_vault_pda,
+        validator_fees_vault_pda_from_validator as validator_fees_vault_pda,
     },
     ID as DELEGATION_PROGRAM_ID,
 };
@@ -21,38 +23,6 @@ use crate::Result;
 
 pub fn dlp_id() -> Pubkey {
     DELEGATION_PROGRAM_ID
-}
-
-pub fn ephemeral_balance_pda(payer: &Pubkey, index: u8) -> Pubkey {
-    pda::ephemeral_balance_pda_from_payer(payer, index)
-}
-
-pub fn commit_state_pda(delegated_account: &Pubkey) -> Pubkey {
-    pda::commit_state_pda_from_delegated_account(delegated_account)
-}
-
-pub fn commit_record_pda(delegated_account: &Pubkey) -> Pubkey {
-    pda::commit_record_pda_from_delegated_account(delegated_account)
-}
-
-pub fn undelegate_buffer_pda(delegated_account: &Pubkey) -> Pubkey {
-    pda::undelegate_buffer_pda_from_delegated_account(delegated_account)
-}
-
-pub fn program_config_pda(program_id: &Pubkey) -> Pubkey {
-    pda::program_config_from_program_id(program_id)
-}
-
-pub fn protocol_fees_vault_pda() -> Pubkey {
-    pda::fees_vault_pda()
-}
-
-pub fn validator_fees_vault_pda(validator: &Pubkey) -> Pubkey {
-    pda::validator_fees_vault_pda_from_validator(validator)
-}
-
-pub fn magic_fee_vault_pda(validator: &Pubkey) -> Pubkey {
-    pda::magic_fee_vault_pda_from_validator(validator)
 }
 
 fn delegate_args(commit_frequency_ms: u32, validator: &Pubkey) -> DelegateArgs {

@@ -6,7 +6,6 @@ pub mod context;
 pub mod dlp;
 pub mod frontend;
 pub mod host;
-pub mod loader_v4;
 pub mod manifest;
 pub mod mdp;
 pub mod monitor;
@@ -31,8 +30,8 @@ pub use context::{BaseCtx, ChainCtx, ErClient, ErCtx, TxSender};
 pub use report::ScenarioReport;
 pub use resources::LaunchRecord;
 pub use scenario::{
-    run_private_er_scenario, run_shared_scenario, Phase, PhaseOutcome,
-    PrivateErScenario, RunError, RunRecord, Scenario, ScenarioOutcome,
+    run_private_er_scenario, run_shared_scenario, PrivateErScenario, RunError,
+    RunRecord, Scenario, ScenarioOutcome,
 };
 pub use solana_rpc_client as rpc_client;
 pub use solana_rpc_client_api as rpc_client_api;
