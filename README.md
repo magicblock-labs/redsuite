@@ -2,9 +2,8 @@
 
 Black-box test harness for the MagicBlock validator. Scenarios drive a live
 base L1 + ephemeral rollup purely through the public surface — transactions,
-JSON-RPC, WebSocket and the Prometheus `/metrics` endpoint — and emit a
-performance / correctness / security report that can be diffed
-release-over-release.
+JSON-RPC, WebSocket and the Prometheus `/metrics` endpoint — and emit
+performance, correctness, and security reports with measurements and diagnostics.
 
 RedSuite is built on top of [redline](https://github.com/magicblock-labs/redline),
 the MagicBlock validator load-testing tool: redline's engine (transport pools,
@@ -89,7 +88,7 @@ benchmark hosts use — no cargo, no checkout of the tests:
     redsuite run all --serial                 # one at a time, storage wiped at the end
     redsuite stack status                     # ports, pids, health
     redsuite stack down                       # stop the shared stack and delete its storage
-    redsuite report compare                   # diff the latest run against its nearest baseline
+    redsuite report bmf --out redsuite-bmf.json # export benchmark measurements for Bencher
 
 It still needs `solana-test-validator` on PATH and the ER binary under test
 (`MAGICBLOCK_VALIDATOR_BIN`), and it reads the built programs from the
@@ -100,8 +99,7 @@ private-ER scenarios beside them, then the redline family last and alone.
 Benchmarks must never share the box, so keep that last lane exclusive.
 
 Each CLI run records `suite/<target>` with its profile, host, full wall time,
-and lane durations. `redsuite report list` shows them; use
-`redsuite report compare suite/all` to compare full runs with matching settings.
+and lane durations in `target/redsuite-reports/`.
 Shared and private lane times overlap; benchmarks follow both, and serial wall
 time includes teardown.
 

@@ -297,7 +297,7 @@ impl Scenario for HotAccountCliff {
             }
         }
         // cliff position = the widest hot-set whose p50 blows past the
-        // baseline; the release-diffed headline
+        // baseline.
         let cliff = cells
             .iter()
             .find(|cell| cell.p50_us > base_p50 * CLIFF_FACTOR)
