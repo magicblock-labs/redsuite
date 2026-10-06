@@ -18,14 +18,12 @@ pub enum SecurityInstruction {
     NonCpi,
     // Commits the PDAs directly via the magic program from a program that does
     // not own them (must fail).
-    DirectScheduleCommitCpi(Vec<Pubkey>),
+    DirectScheduleCommitCpi,
 }
 
 pub mod build {
     use instruction::{AccountMeta, Instruction};
-    use redshift_interface::schedulecommit::build::{
-        magic_context_id, magic_program_id,
-    };
+    use sdk::consts::{MAGIC_CONTEXT_ID, MAGIC_PROGRAM_ID};
 
     use super::*;
 
@@ -36,8 +34,8 @@ pub mod build {
     ) -> Vec<AccountMeta> {
         let mut metas = vec![
             AccountMeta::new(payer, true),
-            AccountMeta::new(magic_context_id(), false),
-            AccountMeta::new_readonly(magic_program_id(), false),
+            AccountMeta::new(MAGIC_CONTEXT_ID, false),
+            AccountMeta::new_readonly(MAGIC_PROGRAM_ID, false),
         ];
         if pass_schedulecommit_program {
             metas.push(AccountMeta::new_readonly(
@@ -74,11 +72,10 @@ pub mod build {
 
     pub fn nested_schedule_commit_cpi(
         payer: Pubkey,
-        players: &[Pubkey],
         pdas: &[Pubkey],
     ) -> Instruction {
         borsh_ix(
-            &SecurityInstruction::DirectScheduleCommitCpi(players.to_vec()),
+            &SecurityInstruction::DirectScheduleCommitCpi,
             with_pdas(payer, false, pdas),
         )
     }

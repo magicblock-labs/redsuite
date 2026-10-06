@@ -7,10 +7,7 @@ pub const fn id() -> Pubkey {
     ID
 }
 
-pub use sdk::{
-    consts::DELEGATION_PROGRAM_ID,
-    delegate_args::{DelegateAccountMetas, DelegateAccounts},
-};
+pub use sdk::consts::DELEGATION_PROGRAM_ID;
 
 pub mod layout {
     pub const OWNER_PUBKEY_SIZE: usize = 32;

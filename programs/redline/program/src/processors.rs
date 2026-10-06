@@ -10,7 +10,6 @@ use solana_program::{
     msg,
     program_error::ProgramError,
 };
-use solana_sdk_ids::system_program;
 
 use crate::layout::{
     DATA_OFFSET, HASH_OFFSET, HASH_SIZE, ID_OFFSET, OWNER_PUBKEY_SIZE,
@@ -71,9 +70,7 @@ pub fn init_account(
     let pda = next_account_info(iter)?;
     let base = next_account_info(iter)?;
     require_space(space as usize, OWNER_PUBKEY_SIZE)?;
-    let mut seeds = space.to_le_bytes().to_vec();
-    seeds.push(seed);
-    seeds.extend_from_slice(&authority.as_ref()[..16]);
+    let seeds = crate::utils::pda_seed(space, seed, &authority);
     let seeds = [base.key.as_ref(), &seeds, &[bump]];
 
     create_pda(
@@ -115,9 +112,11 @@ pub fn delegate_account(
     };
 
     verify_account_owner(payer, accounts.pda)?;
-    let mut seeds = (accounts.pda.data_len() as u32).to_le_bytes().to_vec();
-    seeds.push(seed);
-    seeds.extend_from_slice(&authority.as_ref()[..16]);
+    let seeds = crate::utils::pda_seed(
+        accounts.pda.data_len() as u32,
+        seed,
+        &authority,
+    );
     let seeds = [base.key.as_ref(), &seeds];
     let pda = *accounts.pda.key;
     let config = DelegateConfig {
@@ -227,7 +226,7 @@ pub fn account_data_copy(
     iter: &mut std::slice::Iter<AccountInfo>,
     id: u64,
 ) -> ProgramResult {
-    let accounts: Vec<_> = iter.collect();
+    let accounts = iter.as_slice();
     if accounts.is_empty() {
         return Err(ProgramError::NotEnoughAccountKeys);
     }
@@ -244,7 +243,7 @@ pub fn account_data_copy(
             continue;
         }
 
-        let src = sources[dest_idx % sources.len()];
+        let src = &sources[dest_idx % sources.len()];
         if src.lamports() == 0 {
             continue;
         }
@@ -298,13 +297,13 @@ pub fn hash_fold(
     id: u64,
     iters: u32,
 ) -> ProgramResult {
-    let accounts: Vec<_> = iter.collect();
+    let accounts = iter.as_slice();
     if accounts.is_empty() {
         return Err(ProgramError::NotEnoughAccountKeys);
     }
 
     let mut hashes = Vec::with_capacity(accounts.len());
-    for account in &accounts {
+    for account in accounts {
         if account.lamports() == 0 {
             return Err(ProgramError::UninitializedAccount);
         }
@@ -316,7 +315,7 @@ pub fn hash_fold(
     }
 
     let digest = crate::utils::fold_hash(id, &hashes, iters);
-    for account in &accounts {
+    for account in accounts {
         let mut data = account.try_borrow_mut_data()?;
         let mut index = ID_OFFSET;
         prepare_buffer(&mut index, &mut data, &id.to_le_bytes());
@@ -335,66 +334,24 @@ pub fn hash_fold(
 pub fn commit_accounts(
     iter: &mut std::slice::Iter<AccountInfo>,
     id: u64,
+    undelegate: bool,
 ) -> ProgramResult {
     let payer = next_account_info(iter)?;
     let magic_context = next_account_info(iter)?;
     let magic_program = next_account_info(iter)?;
     let accounts: Vec<_> = iter.collect();
     let count = accounts.len();
-    sdk::ephem::commit_accounts(
-        payer,
-        accounts,
-        magic_context,
-        magic_program,
-        None,
-    )?;
-    msg!("committed {} accounts to chain txn: {}", count, id);
-    Ok(())
-}
-
-pub fn commit_undelegate_accounts(
-    iter: &mut std::slice::Iter<AccountInfo>,
-    id: u64,
-) -> ProgramResult {
-    let payer = next_account_info(iter)?;
-    let magic_context = next_account_info(iter)?;
-    let magic_program = next_account_info(iter)?;
-    let accounts: Vec<_> = iter.collect();
-    let count = accounts.len();
-    sdk::ephem::commit_and_undelegate_accounts(
-        payer,
-        accounts,
-        magic_context,
-        magic_program,
-        None,
-    )?;
-    msg!("commit-undelegated {} accounts to chain txn: {}", count, id);
-    Ok(())
-}
-
-pub fn close_account(
-    iter: &mut std::slice::Iter<AccountInfo>,
-) -> ProgramResult {
-    let owner = next_account_info(iter)?;
-    let account_to_close = next_account_info(iter)?;
-
-    verify_account_owner(owner, account_to_close)?;
-
-    let lamports_to_transfer = account_to_close.lamports();
-    **account_to_close.lamports.borrow_mut() = 0;
-    **owner.lamports.borrow_mut() = owner
-        .lamports()
-        .checked_add(lamports_to_transfer)
-        .ok_or(ProgramError::ArithmeticOverflow)?;
-
-    account_to_close.assign(&system_program::ID);
-    account_to_close.resize(0)?;
-
-    msg!(
-        "closed account {} and refunded rent to {}",
-        account_to_close.key,
-        owner.key
-    );
+    let commit = if undelegate {
+        sdk::ephem::commit_and_undelegate_accounts
+    } else {
+        sdk::ephem::commit_accounts
+    };
+    commit(payer, accounts, magic_context, magic_program, None)?;
+    if undelegate {
+        msg!("commit-undelegated {} accounts to chain txn: {}", count, id);
+    } else {
+        msg!("committed {} accounts to chain txn: {}", count, id);
+    }
     Ok(())
 }
 

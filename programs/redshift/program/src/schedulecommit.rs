@@ -1,16 +1,14 @@
 use borsh::{BorshDeserialize, BorshSerialize};
 use redshift_interface::schedulecommit::*;
 use sdk::{
-    consts::DELEGATION_PROGRAM_ID,
     cpi::{
         delegate_account, undelegate_account, DelegateAccounts, DelegateConfig,
     },
     ephem::{
-        commit_accounts, commit_and_undelegate_accounts, CallHandler,
-        FoldableIntentBuilder, MagicIntentBundleBuilder,
+        commit_and_undelegate_accounts, FoldableIntentBuilder,
+        MagicIntentBundleBuilder,
     },
     utils::create_pda,
-    ActionArgs, ShortAccountMeta,
 };
 use solana_program::{
     account_info::{next_account_info, AccountInfo},
@@ -30,7 +28,6 @@ fn invoke_commit<'a, 'info>(
     committees: Vec<&'a AccountInfo<'info>>,
     magic_context: &'a AccountInfo<'info>,
     magic_program: &'a AccountInfo<'info>,
-    magic_fee_vault: Option<&'a AccountInfo<'info>>,
 ) -> ProgramResult {
     match commit_type {
         ScheduleCommitType::Commit => invoke_via_builder(
@@ -38,7 +35,6 @@ fn invoke_commit<'a, 'info>(
             committees,
             magic_context,
             magic_program,
-            magic_fee_vault,
             false,
         ),
         ScheduleCommitType::CommitAndUndelegate => invoke_via_builder(
@@ -46,7 +42,6 @@ fn invoke_commit<'a, 'info>(
             committees,
             magic_context,
             magic_program,
-            magic_fee_vault,
             true,
         ),
         ScheduleCommitType::CommitFinalize => invoke_schedule_commit_raw(
@@ -54,7 +49,6 @@ fn invoke_commit<'a, 'info>(
             committees,
             magic_context,
             magic_program,
-            magic_fee_vault,
         ),
         ScheduleCommitType::CommitFinalizeAndUndelegate => {
             commit_and_undelegate_accounts(
@@ -62,7 +56,7 @@ fn invoke_commit<'a, 'info>(
                 committees,
                 magic_context,
                 magic_program,
-                magic_fee_vault,
+                None,
             )
         }
     }
@@ -73,7 +67,6 @@ fn invoke_via_builder<'a, 'info>(
     committees: Vec<&'a AccountInfo<'info>>,
     magic_context: &'a AccountInfo<'info>,
     magic_program: &'a AccountInfo<'info>,
-    magic_fee_vault: Option<&'a AccountInfo<'info>>,
     undelegate: bool,
 ) -> ProgramResult {
     let builder = MagicIntentBundleBuilder::new(
@@ -81,10 +74,6 @@ fn invoke_via_builder<'a, 'info>(
         magic_context.clone(),
         magic_program.clone(),
     );
-    let builder = match magic_fee_vault {
-        Some(vault) => builder.magic_fee_vault(vault.clone()),
-        None => builder,
-    };
     let owned: Vec<_> = committees.into_iter().cloned().collect();
     if undelegate {
         builder.commit_and_undelegate(&owned).build_and_invoke()
@@ -98,7 +87,6 @@ fn invoke_schedule_commit_raw<'a, 'info>(
     committees: Vec<&'a AccountInfo<'info>>,
     magic_context: &'a AccountInfo<'info>,
     magic_program: &'a AccountInfo<'info>,
-    magic_fee_vault: Option<&'a AccountInfo<'info>>,
 ) -> ProgramResult {
     // The payer keeps its incoming writability so a readonly crank
     // signer can pay a crank-executed commit.
@@ -110,9 +98,6 @@ fn invoke_schedule_commit_raw<'a, 'info>(
         },
         AccountMeta::new(*magic_context.key, false),
     ];
-    if let Some(vault) = magic_fee_vault {
-        metas.push(AccountMeta::new(*vault.key, false));
-    }
     metas.extend(committees.iter().map(|committee| AccountMeta {
         pubkey: *committee.key,
         is_signer: committee.is_signer,
@@ -126,9 +111,6 @@ fn invoke_schedule_commit_raw<'a, 'info>(
     );
 
     let mut infos = vec![payer.clone(), magic_context.clone()];
-    if let Some(vault) = magic_fee_vault {
-        infos.push(vault.clone());
-    }
     infos.extend(committees.into_iter().cloned());
 
     invoke(&instruction, &infos)
@@ -152,9 +134,6 @@ pub fn process(
         ScheduleCommitCpi(args, commit_type) => {
             process_schedulecommit_cpi(accounts, args, commit_type)
         }
-        ScheduleCommitWithVaultCpi(args) => {
-            process_schedulecommit_with_vault_cpi(accounts, args)
-        }
         ScheduleCommitAndUndelegateCpiModAfter(players) => {
             process_commit_undelegate_mod_after(accounts, &players)
         }
@@ -169,14 +148,8 @@ pub fn process(
         }
         DelegateOrderBook(args) => process_delegate_order_book(accounts, args),
         UpdateOrderBook(update) => process_update_order_book(accounts, &update),
-        ScheduleCommitWithVaultAndOrderBookCpi(args) => {
-            process_commit_with_vault_and_order_book(accounts, &args)
-        }
         ScheduleCommitForOrderBook(commit_type) => {
             process_commit_for_order_book(accounts, commit_type)
-        }
-        RequestUndelegationCpi(player) => {
-            process_request_undelegation_cpi(accounts, &player)
         }
     }
 }
@@ -257,24 +230,10 @@ fn process_delegate_order_book(
     accounts: &[AccountInfo],
     args: DelegateOrderBookArgs,
 ) -> ProgramResult {
-    let [payer, order_book, owner_program, buffer, delegation_record, delegation_metadata, delegation_program, system_program] =
-        accounts
-    else {
-        return Err(ProgramError::NotEnoughAccountKeys);
-    };
-
+    let accounts = delegate_accounts(accounts)?;
     let seeds: [&[u8]; 2] = [ORDER_BOOK_SEED, args.book_manager.as_ref()];
     delegate_account(
-        DelegateAccounts {
-            payer,
-            pda: order_book,
-            owner_program,
-            buffer,
-            delegation_record,
-            delegation_metadata,
-            delegation_program,
-            system_program,
-        },
+        accounts,
         &seeds,
         DelegateConfig {
             commit_frequency_ms: args.commit_frequency_ms,
@@ -297,67 +256,6 @@ fn process_update_order_book(
     order_book_apply(&mut order_book.try_borrow_mut_data()?, update)
 }
 
-fn process_commit_with_vault_and_order_book(
-    accounts: &[AccountInfo],
-    args: &ScheduleCommitWithOrderBookArgs,
-) -> ProgramResult {
-    let iter = &mut accounts.iter();
-    let payer = next_account_info(iter)?;
-    let magic_context = next_account_info(iter)?;
-    let magic_program = next_account_info(iter)?;
-    let magic_fee_vault = next_account_info(iter)?;
-    let order_book = next_account_info(iter)?;
-    let committees: Vec<_> = iter.cloned().collect();
-
-    if committees.len() != args.players.len() {
-        msg!(
-            "players {} != committees {}",
-            args.players.len(),
-            committees.len()
-        );
-        return Err(ProgramError::InvalidArgument);
-    }
-
-    let mut builder = MagicIntentBundleBuilder::new(
-        payer.clone(),
-        magic_context.clone(),
-        magic_program.clone(),
-    )
-    .magic_fee_vault(magic_fee_vault.clone())
-    .commit(&committees);
-
-    if args.with_actions {
-        let update = ScheduleCommitInstruction::UpdateOrderBook(BookUpdate {
-            bids: vec![OrderLevel {
-                price: 100,
-                size: 10,
-            }],
-            asks: vec![],
-        });
-        let mut update_data = vec![crate::SCHEDULE_COMMIT_TAG];
-        update_data.extend(
-            borsh::to_vec(&update)
-                .map_err(|_| ProgramError::InvalidInstructionData)?,
-        );
-        let call_handler = CallHandler {
-            args: ActionArgs {
-                data: update_data,
-                escrow_index: 1,
-            },
-            compute_units: 50_000,
-            escrow_authority: payer.clone(),
-            destination_program: crate::ID,
-            accounts: vec![ShortAccountMeta {
-                pubkey: *order_book.key,
-                is_writable: true,
-            }],
-        };
-        builder = builder.add_post_commit_actions([call_handler]);
-    }
-
-    builder.build_and_invoke()
-}
-
 fn process_commit_for_order_book(
     accounts: &[AccountInfo],
     commit_type: ScheduleCommitType,
@@ -375,62 +273,6 @@ fn process_commit_for_order_book(
         vec![order_book],
         magic_context,
         magic_program,
-        None,
-    )
-}
-
-fn process_request_undelegation_cpi(
-    accounts: &[AccountInfo],
-    player: &Pubkey,
-) -> ProgramResult {
-    let [payer, delegated_account, owner_program, undelegation_request, delegation_record, delegation_metadata, system_program, delegation_program] =
-        accounts
-    else {
-        return Err(ProgramError::NotEnoughAccountKeys);
-    };
-    if !payer.is_signer {
-        return Err(ProgramError::MissingRequiredSignature);
-    }
-    if owner_program.key != &crate::ID
-        || delegation_program.key != &DELEGATION_PROGRAM_ID
-    {
-        return Err(ProgramError::InvalidArgument);
-    }
-
-    let (expected_pda, bump) = pda_and_bump(player);
-    if delegated_account.key != &expected_pda {
-        return Err(ProgramError::InvalidSeeds);
-    }
-
-    let instruction = Instruction {
-        program_id: *delegation_program.key,
-        accounts: vec![
-            AccountMeta::new(*payer.key, true),
-            AccountMeta::new_readonly(*delegated_account.key, true),
-            AccountMeta::new_readonly(*owner_program.key, false),
-            AccountMeta::new(*undelegation_request.key, false),
-            AccountMeta::new_readonly(*delegation_record.key, false),
-            AccountMeta::new(*delegation_metadata.key, false),
-            AccountMeta::new_readonly(*system_program.key, false),
-        ],
-        data: DLP_REQUEST_UNDELEGATION_TAG.to_le_bytes().to_vec(),
-    };
-
-    let bump_slice = [bump];
-    let seeds: [&[u8]; 3] = [PDA_SEED, player.as_ref(), &bump_slice];
-    invoke_signed(
-        &instruction,
-        &[
-            payer.clone(),
-            delegated_account.clone(),
-            owner_program.clone(),
-            undelegation_request.clone(),
-            delegation_record.clone(),
-            delegation_metadata.clone(),
-            system_program.clone(),
-            delegation_program.clone(),
-        ],
-        &[&seeds],
     )
 }
 
@@ -479,24 +321,10 @@ fn process_delegate_cpi(
     accounts: &[AccountInfo],
     args: DelegateCpiArgs,
 ) -> ProgramResult {
-    let [payer, pda, owner_program, buffer, delegation_record, delegation_metadata, delegation_program, system_program] =
-        accounts
-    else {
-        return Err(ProgramError::NotEnoughAccountKeys);
-    };
-
+    let accounts = delegate_accounts(accounts)?;
     let seeds: [&[u8]; 2] = [PDA_SEED, args.player.as_ref()];
     delegate_account(
-        DelegateAccounts {
-            payer,
-            pda,
-            owner_program,
-            buffer,
-            delegation_record,
-            delegation_metadata,
-            delegation_program,
-            system_program,
-        },
+        accounts,
         &seeds,
         DelegateConfig {
             commit_frequency_ms: args.commit_frequency_ms,
@@ -528,12 +356,7 @@ fn process_schedulecommit_cpi(
     let payer = next_account_info(iter)?;
     let magic_context = next_account_info(iter)?;
     let magic_program = next_account_info(iter)?;
-    let magic_fee_vault = if args.has_magic_vault {
-        Some(next_account_info(iter)?)
-    } else {
-        None
-    };
-    let remaining: Vec<_> = iter.cloned().collect();
+    let remaining = iter.as_slice();
 
     if remaining.len() != args.players.len() {
         msg!(
@@ -545,7 +368,7 @@ fn process_schedulecommit_cpi(
     }
 
     if args.modify_accounts {
-        increase_committee_counts(&remaining)?;
+        increase_committee_counts(remaining)?;
     }
 
     let mut committees: Vec<_> = remaining.iter().collect();
@@ -553,58 +376,7 @@ fn process_schedulecommit_cpi(
         committees.push(payer);
     }
 
-    invoke_commit(
-        commit_type,
-        payer,
-        committees,
-        magic_context,
-        magic_program,
-        magic_fee_vault,
-    )
-}
-
-fn process_schedulecommit_with_vault_cpi(
-    accounts: &[AccountInfo],
-    args: ScheduleCommitCpiWithVaultArgs,
-) -> ProgramResult {
-    let iter = &mut accounts.iter();
-    let payer = next_account_info(iter)?;
-    let magic_context = next_account_info(iter)?;
-    let magic_program = next_account_info(iter)?;
-    let magic_fee_vault = if args.has_magic_vault {
-        Some(next_account_info(iter)?)
-    } else {
-        None
-    };
-    let remaining: Vec<_> = iter.cloned().collect();
-
-    if remaining.len() != args.players.len() {
-        msg!(
-            "players {} != committees {}",
-            args.players.len(),
-            remaining.len()
-        );
-        return Err(ProgramError::InvalidArgument);
-    }
-
-    let committees: Vec<_> = remaining.iter().collect();
-    if args.undelegate {
-        commit_and_undelegate_accounts(
-            payer,
-            committees,
-            magic_context,
-            magic_program,
-            magic_fee_vault,
-        )
-    } else {
-        commit_accounts(
-            payer,
-            committees,
-            magic_context,
-            magic_program,
-            magic_fee_vault,
-        )
-    }
+    invoke_commit(commit_type, payer, committees, magic_context, magic_program)
 }
 
 fn process_commit_undelegate_mod_after(
@@ -615,7 +387,7 @@ fn process_commit_undelegate_mod_after(
     let payer = next_account_info(iter)?;
     let magic_context = next_account_info(iter)?;
     let magic_program = next_account_info(iter)?;
-    let remaining: Vec<_> = iter.cloned().collect();
+    let remaining = iter.as_slice();
 
     if remaining.len() != players.len() {
         return Err(ProgramError::InvalidArgument);
@@ -629,7 +401,7 @@ fn process_commit_undelegate_mod_after(
         None,
     )?;
 
-    increase_committee_counts(&remaining)
+    increase_committee_counts(remaining)
 }
 
 fn process_commit_undelegate_twice(
@@ -640,7 +412,7 @@ fn process_commit_undelegate_twice(
     let payer = next_account_info(iter)?;
     let magic_context = next_account_info(iter)?;
     let magic_program = next_account_info(iter)?;
-    let remaining: Vec<_> = iter.cloned().collect();
+    let remaining = iter.as_slice();
 
     if remaining.len() != players.len() {
         return Err(ProgramError::InvalidArgument);
@@ -694,14 +466,7 @@ fn process_commit_undelegate_twice(
 fn process_increase_count(accounts: &[AccountInfo]) -> ProgramResult {
     let iter = &mut accounts.iter();
     let account = next_account_info(iter)?;
-    let mut main_account = {
-        let data = account.try_borrow_data()?;
-        MainAccount::try_from_slice(&data)?
-    };
-    main_account.count += 1;
-    main_account
-        .serialize(&mut &mut account.try_borrow_mut_data()?.as_mut())?;
-    Ok(())
+    increase_committee_counts(std::slice::from_ref(account))
 }
 
 fn process_set_count(accounts: &[AccountInfo], value: u64) -> ProgramResult {
@@ -750,10 +515,28 @@ pub fn process_undelegate_request(
                 return Err(ProgramError::Custom(111));
             }
         }
-    } else if crate::flexi::undelegate_label_poison(&data) {
-        return Err(ProgramError::Custom(crate::flexi::FAIL_UNDELEGATION_CODE));
     } else if book_lens(&data).is_none() {
         msg!("the undelegated data is not a valid order book");
     }
     Ok(())
+}
+
+pub(crate) fn delegate_accounts<'a, 'info>(
+    accounts: &'a [AccountInfo<'info>],
+) -> Result<DelegateAccounts<'a, 'info>, ProgramError> {
+    let [payer, pda, owner_program, buffer, delegation_record, delegation_metadata, delegation_program, system_program] =
+        accounts
+    else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+    Ok(DelegateAccounts {
+        payer,
+        pda,
+        owner_program,
+        buffer,
+        delegation_record,
+        delegation_metadata,
+        delegation_program,
+        system_program,
+    })
 }

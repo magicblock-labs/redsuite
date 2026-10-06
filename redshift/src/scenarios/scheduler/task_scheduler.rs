@@ -126,7 +126,6 @@ async fn schedule(
             interval_ms,
             iterations,
             false,
-            false,
         )],
     )
     .await?;
@@ -215,7 +214,6 @@ async fn test_signed_refusal(
                 103,
                 TASK_INTERVAL_MS,
                 3,
-                false,
                 true,
             )],
         )

@@ -21,7 +21,6 @@ pub mod schedulecommit {
 
     pub const MAGIC_SCHEDULE_COMMIT_TAG: u32 = 1;
     pub const MAGIC_SCHEDULE_COMMIT_AND_UNDELEGATE_TAG: u32 = 2;
-    pub const DLP_REQUEST_UNDELEGATION_TAG: u64 = 26;
     const ORDER_BOOK_HEADER_SIZE: usize = 8;
     const ORDER_LEVEL_SIZE: usize = 16;
     pub const SYSTEM_TRANSFER_TAG: u32 = 2;
@@ -38,7 +37,6 @@ pub mod schedulecommit {
 
     #[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
     pub struct DelegateCpiArgs {
-        pub valid_until: i64,
         pub commit_frequency_ms: u32,
         pub player: Pubkey,
         pub validator: Option<Pubkey>,
@@ -49,14 +47,6 @@ pub mod schedulecommit {
         pub players: Vec<Pubkey>,
         pub modify_accounts: bool,
         pub commit_payer: bool,
-        pub has_magic_vault: bool,
-    }
-
-    #[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
-    pub struct ScheduleCommitCpiWithVaultArgs {
-        pub players: Vec<Pubkey>,
-        pub undelegate: bool,
-        pub has_magic_vault: bool,
     }
 
     #[derive(
@@ -87,29 +77,23 @@ pub mod schedulecommit {
         pub validator: Option<Pubkey>,
     }
 
+    // Keep the existing tags when retiring instruction families.
     #[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
-    pub struct ScheduleCommitWithOrderBookArgs {
-        pub players: Vec<Pubkey>,
-        pub with_actions: bool,
-    }
-
-    #[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+    #[repr(u8)]
+    #[borsh(use_discriminant = true)]
     pub enum ScheduleCommitInstruction {
-        Init,
-        DelegateCpi(DelegateCpiArgs),
-        ScheduleCommitCpi(ScheduleCommitCpiArgs, ScheduleCommitType),
-        ScheduleCommitWithVaultCpi(ScheduleCommitCpiWithVaultArgs),
-        ScheduleCommitAndUndelegateCpiModAfter(Vec<Pubkey>),
-        ScheduleCommitAndUndelegateCpiTwice(Vec<Pubkey>),
-        IncreaseCount,
-        SetCount(u64),
-        InitOrderBook,
-        GrowOrderBook(u64),
-        DelegateOrderBook(DelegateOrderBookArgs),
-        UpdateOrderBook(BookUpdate),
-        ScheduleCommitWithVaultAndOrderBookCpi(ScheduleCommitWithOrderBookArgs),
-        ScheduleCommitForOrderBook(ScheduleCommitType),
-        RequestUndelegationCpi(Pubkey),
+        Init = 0,
+        DelegateCpi(DelegateCpiArgs) = 1,
+        ScheduleCommitCpi(ScheduleCommitCpiArgs, ScheduleCommitType) = 2,
+        ScheduleCommitAndUndelegateCpiModAfter(Vec<Pubkey>) = 4,
+        ScheduleCommitAndUndelegateCpiTwice(Vec<Pubkey>) = 5,
+        IncreaseCount = 6,
+        SetCount(u64) = 7,
+        InitOrderBook = 8,
+        GrowOrderBook(u64) = 9,
+        DelegateOrderBook(DelegateOrderBookArgs) = 10,
+        UpdateOrderBook(BookUpdate) = 11,
+        ScheduleCommitForOrderBook(ScheduleCommitType) = 13,
     }
 
     pub fn book_lens(data: &[u8]) -> Option<(usize, usize, usize)> {
@@ -199,12 +183,7 @@ pub mod schedulecommit {
 
     pub mod build {
         use instruction::{AccountMeta, Instruction};
-        use sdk::{
-            consts::{
-                DELEGATION_PROGRAM_ID, MAGIC_CONTEXT_ID, MAGIC_PROGRAM_ID,
-            },
-            delegate_args::{DelegateAccountMetas, DelegateAccounts},
-        };
+        use sdk::consts::{MAGIC_CONTEXT_ID, MAGIC_PROGRAM_ID};
         use sdk_ids::system_program;
 
         use super::*;
@@ -223,14 +202,6 @@ pub mod schedulecommit {
                 accounts: metas,
                 data,
             }
-        }
-
-        pub fn magic_program_id() -> Pubkey {
-            MAGIC_PROGRAM_ID
-        }
-
-        pub fn magic_context_id() -> Pubkey {
-            MAGIC_CONTEXT_ID
         }
 
         // The raw magic-program ScheduleCommit (tag 1). The committees are
@@ -279,26 +250,13 @@ pub mod schedulecommit {
             validator: Option<Pubkey>,
         ) -> Instruction {
             let (pda, _) = pda_and_bump(&player);
-            let delegate_accounts = DelegateAccounts::new(pda, crate::id());
-            let delegate_metas = DelegateAccountMetas::from(delegate_accounts);
-            let metas = vec![
-                AccountMeta::new(payer, true),
-                delegate_metas.delegated_account,
-                delegate_metas.owner_program,
-                delegate_metas.delegate_buffer,
-                delegate_metas.delegation_record,
-                delegate_metas.delegation_metadata,
-                delegate_metas.delegation_program,
-                delegate_metas.system_program,
-            ];
             with_tag(
                 &ScheduleCommitInstruction::DelegateCpi(DelegateCpiArgs {
-                    valid_until: 0,
                     commit_frequency_ms,
                     player,
                     validator,
                 }),
-                metas,
+                crate::delegate_metas(payer, pda),
             )
         }
 
@@ -338,39 +296,8 @@ pub mod schedulecommit {
                         players,
                         modify_accounts,
                         commit_payer,
-                        has_magic_vault: false,
                     },
                     commit_type,
-                ),
-                metas,
-            )
-        }
-
-        pub fn schedule_commit_with_vault(
-            payer: Pubkey,
-            magic_fee_vault: Option<Pubkey>,
-            players: Vec<Pubkey>,
-            undelegate: bool,
-        ) -> Instruction {
-            let mut metas = vec![
-                AccountMeta::new(payer, true),
-                AccountMeta::new(MAGIC_CONTEXT_ID, false),
-                AccountMeta::new_readonly(MAGIC_PROGRAM_ID, false),
-            ];
-            if let Some(vault) = magic_fee_vault {
-                metas.push(AccountMeta::new(vault, false));
-            }
-            metas.extend(players.iter().map(|player| {
-                let (pda, _) = pda_and_bump(player);
-                AccountMeta::new(pda, false)
-            }));
-            with_tag(
-                &ScheduleCommitInstruction::ScheduleCommitWithVaultCpi(
-                    ScheduleCommitCpiWithVaultArgs {
-                        has_magic_vault: magic_fee_vault.is_some(),
-                        players,
-                        undelegate,
-                    },
                 ),
                 metas,
             )
@@ -460,18 +387,6 @@ pub mod schedulecommit {
             validator: Option<Pubkey>,
         ) -> Instruction {
             let (pda, _) = order_book_pda_and_bump(&book_manager);
-            let delegate_accounts = DelegateAccounts::new(pda, crate::id());
-            let delegate_metas = DelegateAccountMetas::from(delegate_accounts);
-            let metas = vec![
-                AccountMeta::new(payer, true),
-                delegate_metas.delegated_account,
-                delegate_metas.owner_program,
-                delegate_metas.delegate_buffer,
-                delegate_metas.delegation_record,
-                delegate_metas.delegation_metadata,
-                delegate_metas.delegation_program,
-                delegate_metas.system_program,
-            ];
             with_tag(
                 &ScheduleCommitInstruction::DelegateOrderBook(
                     DelegateOrderBookArgs {
@@ -480,7 +395,7 @@ pub mod schedulecommit {
                         validator,
                     },
                 ),
-                metas,
+                crate::delegate_metas(payer, pda),
             )
         }
 
@@ -513,65 +428,6 @@ pub mod schedulecommit {
                 &ScheduleCommitInstruction::ScheduleCommitForOrderBook(
                     commit_type,
                 ),
-                metas,
-            )
-        }
-
-        pub fn schedule_commit_with_vault_and_order_book(
-            payer: Pubkey,
-            magic_fee_vault: Pubkey,
-            book_manager: Pubkey,
-            players: Vec<Pubkey>,
-            with_actions: bool,
-        ) -> Instruction {
-            let (book, _) = order_book_pda_and_bump(&book_manager);
-            let mut metas = vec![
-                AccountMeta::new(payer, true),
-                AccountMeta::new(MAGIC_CONTEXT_ID, false),
-                AccountMeta::new_readonly(MAGIC_PROGRAM_ID, false),
-                AccountMeta::new(magic_fee_vault, false),
-                AccountMeta::new_readonly(book, false),
-            ];
-            metas.extend(players.iter().map(|player| {
-                let (pda, _) = pda_and_bump(player);
-                AccountMeta::new(pda, false)
-            }));
-            with_tag(
-                &ScheduleCommitInstruction::ScheduleCommitWithVaultAndOrderBookCpi(
-                    ScheduleCommitWithOrderBookArgs {
-                        players,
-                        with_actions,
-                    },
-                ),
-                metas,
-            )
-        }
-
-        pub fn request_undelegation(
-            payer: Pubkey,
-            player: Pubkey,
-        ) -> Instruction {
-            let (pda, _) = pda_and_bump(&player);
-            let delegate_accounts = DelegateAccounts::new(pda, crate::id());
-            let (request, _) = Pubkey::find_program_address(
-                &[b"undelegation-request", pda.as_ref()],
-                &DELEGATION_PROGRAM_ID,
-            );
-            let metas = vec![
-                AccountMeta::new(payer, true),
-                AccountMeta::new_readonly(pda, false),
-                AccountMeta::new_readonly(crate::id(), false),
-                AccountMeta::new(request, false),
-                AccountMeta::new_readonly(
-                    delegate_accounts.delegation_record,
-                    false,
-                ),
-                AccountMeta::new(delegate_accounts.delegation_metadata, false),
-                AccountMeta::new_readonly(system_program::ID, false),
-                AccountMeta::new_readonly(DELEGATION_PROGRAM_ID, false),
-            ];
-            with_tag(
-                &ScheduleCommitInstruction::RequestUndelegationCpi(player),
                 metas,
             )
         }
@@ -610,4 +466,21 @@ pub fn ephemeral_cpi(
     instruction.program_id = id();
     instruction.data.splice(..0, [EPHEMERAL_TAG, fill]);
     instruction
+}
+
+fn delegate_metas(payer: Pubkey, pda: Pubkey) -> Vec<instruction::AccountMeta> {
+    use instruction::AccountMeta;
+    use sdk::delegate_args::{DelegateAccountMetas, DelegateAccounts};
+
+    let metas = DelegateAccountMetas::from(DelegateAccounts::new(pda, ID));
+    vec![
+        AccountMeta::new(payer, true),
+        metas.delegated_account,
+        metas.owner_program,
+        metas.delegate_buffer,
+        metas.delegation_record,
+        metas.delegation_metadata,
+        metas.delegation_program,
+        metas.system_program,
+    ]
 }

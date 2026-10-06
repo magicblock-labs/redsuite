@@ -10,3 +10,4 @@ borsh = { workspace = true }
 redshift-interface = { workspace = true }
 pubkey = { workspace = true }
 instruction = { workspace = true }
+sdk = { workspace = true }

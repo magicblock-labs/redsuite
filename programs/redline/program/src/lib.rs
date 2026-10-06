@@ -59,11 +59,15 @@ fn process_instruction(
         Instruction::ReadAccountsData { id } => {
             read_accounts_data(&mut iter, id)?
         }
-        Instruction::CommitAccounts { id } => commit_accounts(&mut iter, id)?,
-        Instruction::CommitAndUndelegateAccounts { id } => {
-            commit_undelegate_accounts(&mut iter, id)?
+        Instruction::CommitAccounts { id } => {
+            commit_accounts(&mut iter, id, false)?
         }
-        Instruction::CloseAccount => close_account(&mut iter)?,
+        Instruction::CommitAndUndelegateAccounts { id } => {
+            commit_accounts(&mut iter, id, true)?
+        }
+        Instruction::Reserved9 => {
+            return Err(ProgramError::InvalidInstructionData)
+        }
         Instruction::HashFold { id, iters } => hash_fold(&mut iter, id, iters)?,
     }
 

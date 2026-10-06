@@ -45,9 +45,6 @@ pub fn process_instruction(
                 program_id, accounts, rest,
             );
         }
-        if discriminator == flexi::TRANSFER_CALLBACK_DISCRIMINATOR {
-            return flexi::process_transfer_callback(accounts, rest);
-        }
     }
 
     match instruction_data.split_first() {
