@@ -10,7 +10,7 @@ use redsuite_core::redline::Accounts;
 use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, host, prep,
-    profile::{self, ProfileValues},
+    profile::ProfileValues,
     runner::{execute, Pacing, RunConfig},
     topology,
     transport::wsraw::RawWs,
@@ -76,8 +76,6 @@ const FULL: Profile = Profile {
 const PROFILES: ProfileValues<Profile> = ProfileValues {
     lite: LITE,
     full: FULL,
-    soak: None,
-    deep: None,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -216,8 +214,7 @@ impl Scenario for SuperblockBoundaryLatency {
     }
 
     async fn run(&self, base: &BaseCtx, _er: &ErCtx) -> Result<ScenarioReport> {
-        let (profile, _) =
-            profile::select(self.name(), base.config(), &PROFILES);
+        let profile = PROFILES.select(base.config().profile);
 
         let prep_payers =
             prep::funded_payers(base, profile.payers, PREP_PAYER_LAMPORTS)

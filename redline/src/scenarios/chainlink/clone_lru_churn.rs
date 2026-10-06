@@ -7,7 +7,7 @@ use redsuite_core::redline::Accounts;
 use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, prep,
-    profile::{self, ProfileValues},
+    profile::ProfileValues,
     report,
     runner::{execute, Pacing, RunConfig},
     topology, BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario,
@@ -90,8 +90,6 @@ const FULL: Profile = Profile {
 const PROFILES: ProfileValues<Profile> = ProfileValues {
     lite: LITE,
     full: FULL,
-    soak: None,
-    deep: None,
 };
 
 fn pick_account(pool: &[Pubkey], seed: u64) -> Pubkey {
@@ -155,8 +153,7 @@ impl Scenario for CloneLruChurn {
     }
 
     async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
-        let (profile, _) =
-            profile::select(self.name(), base.config(), &PROFILES);
+        let profile = PROFILES.select(base.config().profile);
         let prep_payers =
             prep::funded_payers(base, profile.prep_payers, PREP_PAYER_LAMPORTS)
                 .await?;

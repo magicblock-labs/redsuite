@@ -11,7 +11,7 @@ use redsuite_core::redline::Accounts;
 use redsuite_core::report::Unit::{Count, Micros, Ratio, Seconds, Tps};
 use redsuite_core::{
     check, check_eq, host, prep,
-    profile::{self, ProfileValues},
+    profile::ProfileValues,
     redline::causal::{compute_unit_limit, CU_LIMIT},
     report,
     runner::{
@@ -109,25 +109,9 @@ const FULL: Profile = Profile {
     heavy_concurrency: 2_048,
 };
 
-const SOAK: Profile = Profile {
-    name: "soak",
-    accounts: 512,
-    heavy_iters: 180,
-    threads: 16,
-    warmup: 50_000,
-    iterations: 1_000_000,
-    heavy_iterations: 100_000,
-    batch: u64::MAX as usize,
-    rpc_batch: 500,
-    concurrency: 512,
-    heavy_concurrency: 8,
-};
-
 const PROFILES: ProfileValues<Profile> = ProfileValues {
     lite: LITE,
     full: FULL,
-    soak: Some(SOAK),
-    deep: None,
 };
 
 fn consumed_cus(logs: &[String]) -> Option<f64> {
@@ -377,8 +361,7 @@ impl Scenario for ExecutorSaturation {
     }
 
     async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
-        let (profile, _) =
-            profile::select(self.name(), base.config(), &PROFILES);
+        let profile = PROFILES.select(base.config().profile);
 
         let prep_started = Instant::now();
         let payers =

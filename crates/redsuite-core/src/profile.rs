@@ -1,40 +1,28 @@
-use std::{
-    collections::HashSet,
-    sync::{Mutex, OnceLock},
-};
-
 use crate::Result;
 
 pub const PROFILE_ENV: &str = "REDSUITE_PROFILE";
 pub const LOOP_ENV: &str = "REDSUITE_LOOP";
 
-pub const ALL: &[&str] = &["lite", "full", "soak", "deep"];
-
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Profile {
     Lite,
     Full,
-    Soak,
-    Deep,
 }
 
 impl Profile {
-    pub const ALL: [Profile; 4] =
-        [Profile::Lite, Profile::Full, Profile::Soak, Profile::Deep];
-
     pub fn name(self) -> &'static str {
         match self {
             Profile::Lite => "lite",
             Profile::Full => "full",
-            Profile::Soak => "soak",
-            Profile::Deep => "deep",
         }
     }
 
     pub fn parse(text: &str) -> Option<Profile> {
-        Profile::ALL
-            .into_iter()
-            .find(|profile| profile.name() == text)
+        match text {
+            "lite" => Some(Profile::Lite),
+            "full" => Some(Profile::Full),
+            _ => None,
+        }
     }
 }
 
@@ -72,14 +60,18 @@ pub struct ExecutionConfig {
 }
 
 impl ExecutionConfig {
-    pub fn from_env() -> Result<Self> {
+    pub fn from_env(redline: bool) -> Result<Self> {
         Ok(Self {
-            profile: parse_env(
-                PROFILE_ENV,
-                Profile::Lite,
-                Profile::parse,
-                "lite|full|soak|deep",
-            )?,
+            profile: if redline {
+                parse_env(
+                    PROFILE_ENV,
+                    Profile::Lite,
+                    Profile::parse,
+                    "lite|full",
+                )?
+            } else {
+                Profile::Lite
+            },
             loop_mode: parse_env(
                 LOOP_ENV,
                 LoopMode::Open,
@@ -107,54 +99,13 @@ fn parse_env<T>(
 pub struct ProfileValues<T> {
     pub lite: T,
     pub full: T,
-    pub soak: Option<T>,
-    pub deep: Option<T>,
 }
 
 impl<T> ProfileValues<T> {
-    // soak and deep never substitute for each other; both step down to full
-    fn resolve(&self, requested: Profile) -> (&T, Profile) {
-        match requested {
-            Profile::Lite => (&self.lite, Profile::Lite),
-            Profile::Full => (&self.full, Profile::Full),
-            Profile::Soak => self
-                .soak
-                .as_ref()
-                .map(|values| (values, Profile::Soak))
-                .unwrap_or((&self.full, Profile::Full)),
-            Profile::Deep => self
-                .deep
-                .as_ref()
-                .map(|values| (values, Profile::Deep))
-                .unwrap_or((&self.full, Profile::Full)),
+    pub fn select(&self, profile: Profile) -> &T {
+        match profile {
+            Profile::Lite => &self.lite,
+            Profile::Full => &self.full,
         }
-    }
-}
-
-pub fn select<'v, T>(
-    scenario: &str,
-    config: ExecutionConfig,
-    values: &'v ProfileValues<T>,
-) -> (&'v T, Profile) {
-    let (selected, level) = values.resolve(config.profile);
-    if level != config.profile {
-        announce(scenario, config.profile, level);
-    }
-    (selected, level)
-}
-
-fn announce(scenario: &str, requested: Profile, selected: Profile) {
-    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-    let mut seen = SEEN
-        .get_or_init(Mutex::default)
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if seen.insert(format!("{scenario}:{}", requested.name())) {
-        eprintln!(
-            "[redsuite] {scenario}: profile `{}` is not defined here, \
-             running `{}`",
-            requested.name(),
-            selected.name()
-        );
     }
 }

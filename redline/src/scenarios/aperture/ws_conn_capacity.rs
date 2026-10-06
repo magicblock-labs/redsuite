@@ -6,7 +6,7 @@ use pubkey::Pubkey;
 use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, host,
-    profile::{self, ProfileValues},
+    profile::ProfileValues,
     runner::{execute, Pacing, RunConfig},
     topology,
     transport::wsraw::RawWs,
@@ -42,8 +42,6 @@ const FULL: Profile = Profile {
 const PROFILES: ProfileValues<Profile> = ProfileValues {
     lite: LITE,
     full: FULL,
-    soak: None,
-    deep: None,
 };
 
 async fn open_connections(url: &str, count: usize) -> Result<Vec<RawWs>> {
@@ -93,8 +91,7 @@ impl Scenario for WsConnCapacity {
     }
 
     async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
-        let (profile, _) =
-            profile::select(self.name(), base.config(), &PROFILES);
+        let profile = PROFILES.select(base.config().profile);
         let shared_account: Pubkey = er.identity();
         let private = topology::private_er(
             base,

@@ -11,10 +11,10 @@ use redsuite_core::redline::Accounts;
 use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq,
-    monitor::{self, MonitorSpec, SteadyStateVerdict},
+    monitor::{self, MonitorSpec},
     prep,
-    profile::{self, ProfileValues},
-    receipt, report,
+    profile::ProfileValues,
+    receipt,
     runner::{execute, Pacing, RunConfig},
     BaseCtx, ChainCtx, CheckError, ErCtx, MetricsDelta, Result, Scenario,
     ScenarioReport,
@@ -55,9 +55,6 @@ struct Profile {
     concurrency: usize,
     drain_cap: Duration,
     monitor_window: Duration,
-    // reused-pool cell: hot ALTs, pins the fresh-key attribution
-    contrast: bool,
-    deep_backlog: bool,
 }
 
 const LITE: Profile = Profile {
@@ -68,8 +65,6 @@ const LITE: Profile = Profile {
     concurrency: 8,
     drain_cap: Duration::from_secs(240),
     monitor_window: Duration::from_secs(5),
-    contrast: false,
-    deep_backlog: false,
 };
 
 const FULL: Profile = Profile {
@@ -80,27 +75,11 @@ const FULL: Profile = Profile {
     concurrency: 8,
     drain_cap: Duration::from_secs(180),
     monitor_window: Duration::from_secs(5),
-    contrast: false,
-    deep_backlog: false,
-};
-
-const DEEP: Profile = Profile {
-    name: "deep",
-    fresh_commits: 150,
-    prep_payers: 12,
-    rate: 2,
-    concurrency: 8,
-    drain_cap: Duration::from_secs(900),
-    monitor_window: Duration::from_secs(10),
-    contrast: true,
-    deep_backlog: true,
 };
 
 const PROFILES: ProfileValues<Profile> = ProfileValues {
     lite: LITE,
     full: FULL,
-    soak: None,
-    deep: Some(DEEP),
 };
 
 async fn deliver_commits(
@@ -234,8 +213,7 @@ impl Scenario for CommitThroughputCeiling {
     }
 
     async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
-        let (profile, _) =
-            profile::select(self.name(), base.config(), &PROFILES);
+        let profile = PROFILES.select(base.config().profile);
         let pool_size = profile.fresh_commits as usize * COMMIT_WIDTH;
 
         let prep_payers =
@@ -352,48 +330,6 @@ impl Scenario for CommitThroughputCeiling {
             steady_state.backlog_peak,
             steady_state.busy_peak.unwrap_or(f64::NAN),
         );
-        if profile.deep_backlog {
-            check!(
-                steady_state.verdict != SteadyStateVerdict::Invalid,
-                "monitor samples must contain advancing arrivals ({coverage})"
-            )?;
-            if drain_rate < 0.8 {
-                if steady_state.outstanding_peak <= 50.0 {
-                    eprintln!(
-                        "[redsuite] {}: warning: deep-backlog cell never \
-                         exceeded 50 outstanding intents (peak {:.0}) — the \
-                         convoy was not pressured",
-                        self.name(),
-                        steady_state.outstanding_peak
-                    );
-                }
-                if let Some(busy) =
-                    steady_state.busy_peak.filter(|busy| *busy < 40.0)
-                {
-                    eprintln!(
-                        "[redsuite] {}: warning: executor permits never \
-                         saturated (busy peak {busy:.0})",
-                        self.name()
-                    );
-                }
-                if steady_state.verdict != SteadyStateVerdict::Overload {
-                    eprintln!(
-                        "[redsuite] {}: warning: arrival outpaced drain with \
-                         a deep queue yet the monitor verdict was {}",
-                        self.name(),
-                        steady_state.verdict
-                    );
-                }
-            } else {
-                eprintln!(
-                    "[redsuite] {}: fresh drain {drain_rate:.2}/s is past the \
-                     convoy band — the committor P0 fix likely landed; move \
-                     the asserts to the post-fix drain band",
-                    self.name()
-                );
-            }
-        }
-
         // drain measured a second, independent way: every scheduling tx's
         // receipt exists, succeeded, and its base txs confirm on chain
         let mut receipt_base_txs = 0usize;
@@ -502,169 +438,6 @@ impl Scenario for CommitThroughputCeiling {
             );
         }
 
-        if profile.contrast {
-            summary = self
-                .contrast_cell(
-                    base,
-                    er,
-                    &sender,
-                    payer_pubkey,
-                    drain_rate,
-                    summary,
-                )
-                .await?;
-        }
         Ok(summary)
-    }
-}
-
-impl CommitThroughputCeiling {
-    async fn contrast_cell(
-        &self,
-        base: &BaseCtx,
-        er: &ErCtx,
-        sender: &redsuite_core::TxSender,
-        payer_pubkey: Pubkey,
-        fresh_drain_rate: f64,
-        summary: ScenarioReport,
-    ) -> Result<ScenarioReport> {
-        const CONTRAST_SETS: usize = 30;
-        const ROUNDS: u64 = 3;
-        let (profile, _) =
-            profile::select(self.name(), base.config(), &PROFILES);
-        let commits: u64 = ROUNDS * CONTRAST_SETS as u64;
-        let contrast_payers =
-            prep::funded_payers(base, 4, PREP_PAYER_LAMPORTS).await?;
-        let contrast_pool = Accounts::new(ACCOUNT_SPACE, er.identity())
-            .init_batched(
-                base,
-                &contrast_payers,
-                CONTRAST_SETS * COMMIT_WIDTH,
-                true,
-            )
-            .await?;
-        prewarm(er, &contrast_pool).await?;
-        let set_for = |commit_index: usize| {
-            contrast_pool[(commit_index % CONTRAST_SETS) * COMMIT_WIDTH..]
-                [..COMMIT_WIDTH]
-                .to_vec()
-        };
-
-        // warm-up round: one commit per set creates that set's ALTs
-        let warmup_sets: Vec<Vec<Pubkey>> =
-            (0..CONTRAST_SETS).map(set_for).collect();
-        quiesce_committor(er).await?;
-        let warmup_executed_before = er
-            .scrape_metrics()
-            .await?
-            .value_sum(EXECUTED_COUNTER)
-            .unwrap_or(0.0);
-        deliver_commits(
-            sender,
-            payer_pubkey,
-            warmup_sets,
-            1_000_000,
-            profile.rate,
-            profile.concurrency,
-        )
-        .await?;
-        let warmup_drain = await_drain(
-            er,
-            warmup_executed_before,
-            CONTRAST_SETS as u64,
-            profile.drain_cap,
-        )
-        .await?;
-        if !warmup_drain.fully_drained {
-            return Err(CheckError::new(
-                "contrast warm-up round did not drain",
-            )
-            .into());
-        }
-
-        let measured_sets: Vec<Vec<Pubkey>> =
-            (0..commits as usize).map(set_for).collect();
-        quiesce_committor(er).await?;
-        let before = er.scrape_metrics().await?;
-        let executed_before = before.value_sum(EXECUTED_COUNTER).unwrap_or(0.0);
-        let span_started = Instant::now();
-        let (_, delivery_outcome) = deliver_commits(
-            sender,
-            payer_pubkey,
-            measured_sets,
-            2_000_000,
-            profile.rate,
-            profile.concurrency,
-        )
-        .await?;
-        let drain =
-            await_drain(er, executed_before, commits, profile.drain_cap)
-                .await?;
-        let span_wall = span_started.elapsed();
-        let after = er.scrape_metrics().await?;
-        let delta = MetricsDelta::new(before, after);
-        let failed_intents = delta
-            .counter_all("mbv_committor_failed_intents_count")
-            .unwrap_or(0.0);
-        check_eq!(failed_intents, 0.0, "reused-pool intents failed")?;
-        check!(
-            drain.drained > 0.0,
-            "INVALID: the reused-pool cell drained nothing"
-        )?;
-
-        let drain_rate = drain.drained / span_wall.as_secs_f64();
-        let contrast_ratio = if fresh_drain_rate > 0.0 {
-            drain_rate / fresh_drain_rate
-        } else {
-            0.0
-        };
-        eprintln!(
-            "[redsuite] {}: reused-pool drain {:.2} intents/s ({}/{} over \
-             {:.1} s span) — {:.2}x the fresh-key drain",
-            self.name(),
-            drain_rate,
-            drain.drained,
-            commits,
-            span_wall.as_secs_f64(),
-            contrast_ratio,
-        );
-
-        let cell_report =
-            ScenarioReport::ok(&format!("{}/reused", self.name()))
-                .setting("profile", profile.name)
-                .setting("width", COMMIT_WIDTH)
-                .setting("account space", ACCOUNT_SPACE)
-                .setting("commits", commits)
-                .setting("sets", CONTRAST_SETS)
-                .setting("rounds", ROUNDS)
-                .setting("alt warmup round", true)
-                .setting("fully drained", drain.fully_drained)
-                .observe("delivery us", Unit::Micros, delivery_outcome.delivery)
-                .metric("reused drain intents/s", Unit::PerSecond, drain_rate)
-                .metric("reused/fresh drain ratio", Unit::Ratio, contrast_ratio)
-                .metric(
-                    "delivery+drain span s",
-                    Unit::Seconds,
-                    span_wall.as_secs_f64(),
-                )
-                .metric_if(
-                    "validator intent exec avg s",
-                    Unit::Seconds,
-                    delta.histogram_avg_all(
-                        "mbv_committor_intent_execution_time_histogram_v2",
-                    ),
-                );
-        match report::persist_cell(self.name(), &cell_report) {
-            Ok(path) => {
-                eprintln!("[redsuite]   cell report: {}", path.display())
-            }
-            Err(e) => eprintln!(
-                "[redsuite]   warning: cell report not persisted: {e}"
-            ),
-        }
-
-        Ok(summary
-            .metric("reused drain intents/s", Unit::PerSecond, drain_rate)
-            .metric("reused/fresh drain ratio", Unit::Ratio, contrast_ratio))
     }
 }

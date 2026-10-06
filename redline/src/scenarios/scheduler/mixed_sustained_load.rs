@@ -11,7 +11,7 @@ use redsuite_core::redline::Accounts;
 use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, host, prep,
-    profile::{self, ProfileValues},
+    profile::ProfileValues,
     redline::causal::{compute_unit_limit, CU_LIMIT},
     runner::{
         execute_raw, merge_outcomes, spawn_workers, Pacing, RunConfig,
@@ -184,22 +184,9 @@ const FULL: Profile = Profile {
     high_cu_iters: 180,
 };
 
-const SOAK: Profile = Profile {
-    name: "soak",
-    payers: 64,
-    lanes: 2_047,
-    read_span: 4,
-    iterations: 40_000_000,
-    rate: 12_000,
-    threads: 8,
-    high_cu_iters: 180,
-};
-
 const PROFILES: ProfileValues<Profile> = ProfileValues {
     lite: LITE,
     full: FULL,
-    soak: Some(SOAK),
-    deep: None,
 };
 
 fn build_ixs(
@@ -412,8 +399,7 @@ impl Scenario for MixedSustainedLoad {
     }
 
     async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
-        let (profile, _) =
-            profile::select(self.name(), base.config(), &PROFILES);
+        let profile = PROFILES.select(base.config().profile);
 
         check_eq!(
             gcd(profile.lanes, MIX_PERIOD),

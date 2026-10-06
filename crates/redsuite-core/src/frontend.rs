@@ -40,7 +40,7 @@ pub const ENV_VARS: &[(&str, &str)] = &[
     ),
     (
         profile::PROFILE_ENV,
-        "scenario profile: lite (default), full, soak, deep",
+        "Redline workload: lite (default) or full; ignored by Redhat and Redshift",
     ),
     (profile::LOOP_ENV, "S1 loop mode: open (default) or closed"),
     (
