@@ -62,14 +62,6 @@ pub fn dispatch(args: &[String]) -> Option<Result<()>> {
     match (arg(0), arg(1)) {
         (Some("stack"), Some("status")) => Some(topology::status()),
         (Some("stack"), Some("down")) => Some(topology::down()),
-        (Some("report"), Some("list")) => Some(report::list()),
-        (Some("report"), Some("compare")) => {
-            let rest = &args[2..];
-            let strict = rest.iter().any(|flag| flag == "--strict");
-            let brief = rest.iter().any(|flag| flag == "--brief");
-            let filter = rest.iter().find(|value| !value.starts_with("--"));
-            Some(report::compare(filter.map(String::as_str), strict, brief))
-        }
         (Some("report"), Some("bmf")) => match (arg(2), arg(3)) {
             (Some("--out"), Some(path)) => Some(report::bmf(Some(path))),
             (None, _) => Some(report::bmf(None)),
@@ -81,14 +73,18 @@ pub fn dispatch(args: &[String]) -> Option<Result<()>> {
 
 pub fn usage(invocation: &str) -> String {
     [
-        ("stack status", "show the shared base+ER stack (booted on demand by tests)"),
-        ("stack down", "stop the shared stack, clear its state and delete its storage"),
-        ("report list", "list persisted scenario reports (target/redsuite-reports/)"),
         (
-            "report compare [scenario] [--strict] [--brief]",
-            "diff the latest run per scenario against its nearest comparable baseline (--strict: fail on regressions; --brief: changed metrics only)",
+            "stack status",
+            "show the shared base+ER stack (booted on demand by tests)",
         ),
-        ("report bmf [--out <path>]", "export the latest campaign as Bencher Metric Format JSON"),
+        (
+            "stack down",
+            "stop the shared stack, clear its state and delete its storage",
+        ),
+        (
+            "report bmf [--out <path>]",
+            "export the latest campaign as Bencher Metric Format JSON",
+        ),
     ]
     .into_iter()
     .map(|(command, description)| {

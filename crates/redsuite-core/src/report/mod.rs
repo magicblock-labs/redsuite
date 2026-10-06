@@ -1,4 +1,4 @@
-mod diff;
+mod bmf;
 mod store;
 use std::{
     fs,
@@ -12,7 +12,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-pub use diff::{bmf, compare, list};
+pub use bmf::bmf;
 use json::{Deserialize, Serialize};
 
 use crate::{
@@ -43,30 +43,6 @@ pub enum Unit {
     Ratio,
 }
 
-impl Unit {
-    pub fn default_direction(self) -> Direction {
-        match self {
-            Unit::Micros | Unit::Millis => Direction::LowerIsBetter,
-            Unit::Tps | Unit::Rps => Direction::HigherIsBetter,
-            Unit::Seconds
-            | Unit::PerSecond
-            | Unit::Count
-            | Unit::Kilobytes
-            | Unit::Megabytes
-            | Unit::Lamports
-            | Unit::Ratio => Direction::Info,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Direction {
-    LowerIsBetter,
-    HigherIsBetter,
-    Info,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum MeasureValue {
@@ -78,17 +54,7 @@ pub enum MeasureValue {
 pub struct Measurement {
     pub label: String,
     pub unit: Unit,
-    pub direction: Direction,
     pub value: MeasureValue,
-}
-
-impl Measurement {
-    pub fn scalar(&self) -> Option<f64> {
-        match self.value {
-            MeasureValue::Scalar(value) => Some(value),
-            MeasureValue::Distribution(_) => None,
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -134,7 +100,6 @@ impl ScenarioReport {
         self.measurements.push(Measurement {
             label: label.into(),
             unit,
-            direction: unit.default_direction(),
             value: MeasureValue::Distribution(stats),
         });
         self
@@ -149,7 +114,6 @@ impl ScenarioReport {
         self.measurements.push(Measurement {
             label: label.into(),
             unit,
-            direction: unit.default_direction(),
             value: MeasureValue::Scalar(value),
         });
         self
