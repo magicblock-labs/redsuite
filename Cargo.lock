@@ -2668,7 +2668,7 @@ dependencies = [
 
 [[package]]
 name = "redhat"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "borsh 1.7.0",
@@ -2690,7 +2690,7 @@ dependencies = [
 
 [[package]]
 name = "redhat-interface"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "borsh 1.7.0",
  "redshift-interface",
@@ -2700,7 +2700,7 @@ dependencies = [
 
 [[package]]
 name = "redhat-program"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "borsh 1.7.0",
  "redhat-interface",
@@ -2710,7 +2710,7 @@ dependencies = [
 
 [[package]]
 name = "redline"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -2728,7 +2728,7 @@ dependencies = [
 
 [[package]]
 name = "redline-interface"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "bincode",
  "ephemeral-rollups-sdk",
@@ -2741,7 +2741,7 @@ dependencies = [
 
 [[package]]
 name = "redline-program"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "bincode",
  "borsh 1.7.0",
@@ -2763,7 +2763,7 @@ dependencies = [
 
 [[package]]
 name = "redshift"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2797,7 +2797,7 @@ dependencies = [
 
 [[package]]
 name = "redshift-interface"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "bincode",
  "borsh 1.7.0",
@@ -2811,7 +2811,7 @@ dependencies = [
 
 [[package]]
 name = "redshift-program"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "bincode",
  "borsh 1.7.0",
@@ -2825,7 +2825,7 @@ dependencies = [
 
 [[package]]
 name = "redsuite"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "futures-util",
  "redhat",
@@ -2837,7 +2837,7 @@ dependencies = [
 
 [[package]]
 name = "redsuite-core"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -6880,7 +6880,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "redsuite-core",
 ]
