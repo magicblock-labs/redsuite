@@ -36,7 +36,8 @@ pub enum Instruction {
     ReadAccountsData {
         id: u64,
     },
-    CloseAccount,
+    // Bincode uses variant positions; retired tag 9 must not shift HashFold.
+    Reserved9,
     HashFold {
         id: u64,
         iters: u32,
@@ -241,14 +242,6 @@ pub mod build {
             &Instruction::CommitAndUndelegateAccounts { id },
             commit_metas(payer, accounts),
         )
-    }
-
-    pub fn close_account(owner: Pubkey, account: Pubkey) -> SolanaInstruction {
-        let metas = vec![
-            AccountMeta::new(owner, true),
-            AccountMeta::new(account, false),
-        ];
-        with_bincode(&Instruction::CloseAccount, metas)
     }
 
     pub fn hash_fold(

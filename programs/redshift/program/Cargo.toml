@@ -13,7 +13,7 @@ default = ["schedulecommit"]
 schedulecommit = [
     "dep:borsh",
     "dep:sdk",
-    "dep:solana-sdk-ids",
+    "dep:sdk-ids",
     "dep:magic-api",
     "dep:bincode",
 ]
@@ -25,6 +25,6 @@ redline-interface = { workspace = true }
 borsh = { workspace = true, optional = true }
 sdk = { workspace = true, optional = true }
 solana-program = { workspace = true }
-solana-sdk-ids = { version = "3", optional = true }
-magic-api = { package = "magicblock-magic-program-api", version = "0.10.1", default-features = false, optional = true }
+sdk-ids = { workspace = true, optional = true }
+magic-api = { workspace = true, optional = true }
 bincode = { workspace = true, optional = true }

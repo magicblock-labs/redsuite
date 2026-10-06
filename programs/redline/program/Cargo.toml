@@ -12,7 +12,6 @@ crate-type = ["cdylib", "lib"]
 borsh = { workspace = true }
 redline-interface = { workspace = true }
 solana-program = { workspace = true }
-solana-sdk-ids = "3"
 pubkey = { workspace = true }
 bincode = { workspace = true }
 sdk = { workspace = true }

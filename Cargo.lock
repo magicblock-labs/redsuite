@@ -2693,6 +2693,7 @@ name = "redhat-interface"
 version = "0.6.0"
 dependencies = [
  "borsh 1.7.0",
+ "ephemeral-rollups-sdk",
  "redshift-interface",
  "solana-instruction 3.4.0",
  "solana-pubkey 4.2.0",
@@ -2749,7 +2750,6 @@ dependencies = [
  "redline-interface",
  "solana-program 3.0.0",
  "solana-pubkey 4.2.0",
- "solana-sdk-ids 3.1.0",
 ]
 
 [[package]]
@@ -2799,10 +2799,8 @@ dependencies = [
 name = "redshift-interface"
 version = "0.6.0"
 dependencies = [
- "bincode",
  "borsh 1.7.0",
  "ephemeral-rollups-sdk",
- "magicblock-magic-program-api",
  "solana-instruction 3.4.0",
  "solana-program-error 3.0.1",
  "solana-pubkey 4.2.0",

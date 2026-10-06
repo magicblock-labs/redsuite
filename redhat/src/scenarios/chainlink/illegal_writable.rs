@@ -124,7 +124,6 @@ impl Scenario for IllegalWritable {
                 ),
                 redhat_interface::build::nested_schedule_commit_cpi(
                     payer.pubkey(),
-                    &players,
                     &pdas,
                 ),
             ],

@@ -53,6 +53,9 @@ redsuite.
     programs/               on-chain SBF programs, one per family
     xtask/                  cargo xtask automation (SBF builds, stack control, reports)
 
+Fixture instruction consumers and wire contracts are documented in
+[programs/README.md](programs/README.md).
+
 ## Writing a scenario
 
 Scenarios live in the family libraries under `<family>/src/scenarios/
