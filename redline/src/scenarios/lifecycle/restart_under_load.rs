@@ -12,7 +12,7 @@ use redsuite_core::redline::Accounts;
 use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, host, prep,
-    profile::{self, ProfileValues},
+    profile::ProfileValues,
     topology::{self, RestartConfig, RestartTiming},
     Api, BaseCtx, ChainCtx, ErCtx, Result, Scenario, ScenarioReport, TxSender,
 };
@@ -62,18 +62,9 @@ const FULL: Profile = Profile {
     resume_timeout: Duration::from_secs(90),
 };
 
-const DEEP: Profile = Profile {
-    name: "deep",
-    lanes: 96,
-    fill: 120_000,
-    resume_timeout: Duration::from_secs(120),
-};
-
 const PROFILES: ProfileValues<Profile> = ProfileValues {
     lite: LITE,
     full: FULL,
-    soak: None,
-    deep: Some(DEEP),
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -845,8 +836,7 @@ impl Scenario for RestartUnderLoad {
     }
 
     async fn run(&self, base: &BaseCtx, _er: &ErCtx) -> Result<ScenarioReport> {
-        let (profile, _) =
-            profile::select(self.name(), base.config(), &PROFILES);
+        let profile = PROFILES.select(base.config().profile);
         let started = Instant::now();
         let graceful = run_mode(base, profile, Mode::Graceful).await?;
         let sigkill = run_mode(base, profile, Mode::Sigkill).await?;

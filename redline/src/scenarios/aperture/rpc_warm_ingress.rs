@@ -5,7 +5,7 @@ use redsuite_core::redline::{copy_three, Accounts};
 use redsuite_core::report::Unit;
 use redsuite_core::{
     check_eq, prep,
-    profile::{self, LoopMode, ProfileValues},
+    profile::{LoopMode, ProfileValues},
     runner::{execute, execute_and_sync, Pacing, RunConfig},
     transport::ws::{AccountUpdates, SignatureConfirmations},
     BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
@@ -48,23 +48,9 @@ const FULL: Profile = Profile {
     concurrency: 256,
 };
 
-// scheduled/nightly sustain window (~60 s warmup + ~300 s measured) —
-// catches degradation over time that a 30 s window can't
-const SOAK: Profile = Profile {
-    name: "soak",
-    payers: 64,
-    accounts: 64,
-    warmup: 60_000,
-    iterations: 300_000,
-    rate: 1_000,
-    concurrency: 256,
-};
-
 const PROFILES: ProfileValues<Profile> = ProfileValues {
     lite: LITE,
     full: FULL,
-    soak: Some(SOAK),
-    deep: None,
 };
 
 pub struct WarmIngress;
@@ -76,8 +62,7 @@ impl Scenario for WarmIngress {
     }
 
     async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
-        let (profile, _) =
-            profile::select(self.name(), base.config(), &PROFILES);
+        let profile = PROFILES.select(base.config().profile);
         let payers =
             prep::funded_payers(base, profile.payers, PAYER_LAMPORTS).await?;
         let pdas = Accounts::new(crate::ACCOUNT_SPACE, er.identity())

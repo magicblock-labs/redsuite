@@ -63,16 +63,12 @@ teardown. See `redshift/src/scenarios/harness/example.rs`.
 Registration is one declaration: an entry in the catalog
 (`cli/src/catalog.rs`, one `scenario_catalog!` block per family). The entry
 names the scenario's short name, its runner type, and its metadata
-(topology, resources, fixtures, and optionally profiles). From that one
+(topology, resources, and fixtures). From that one
 entry the macro generates both ways to run the scenario: a `#[tokio::test]`
 function (so it runs under `cargo nextest`, named
 `catalog::<family>::<short_name>`) and a catalog record the `redsuite`
 binary dispatches from. Keep scenario names and `.config/nextest.toml`
 groups in sync with the catalog.
-
-`profiles` defaults to every profile; write it only to narrow. `redsuite
-run` reads it before booting anything and skips a scenario whose profile
-set excludes the requested profile.
 
 ## The redsuite binary
 
@@ -98,8 +94,9 @@ workspace. Set `REDSUITE_ROOT` when it runs outside a checkout.
 private-ER scenarios beside them, then the redline family last and alone.
 Benchmarks must never share the box, so keep that last lane exclusive.
 
-Each CLI run records `suite/<target>` with its profile, host, full wall time,
+Each CLI run records `suite/<target>` with its host, full wall time,
 and lane durations in `target/redsuite-reports/`.
+Selections containing Redline also record its workload profile.
 Shared and private lane times overlap; benchmarks follow both, and serial wall
 time includes teardown.
 
@@ -213,7 +210,7 @@ even when the scenario fails early.
 | `REDSUITE_STACK_DIR` | where the stack lives: every validator's ledger, the base ledger, state and logs; defaults to `target/redsuite-stack` under the workspace root |
 | `REDSUITE_ACCOUNTSDB_DIR` | root for every validator's accountsdb, when it should live on another disk than the ledger; by default it sits inside each validator's storage dir |
 | `REDSUITE_CLONE_URL` | where a cold boot clones base programs from; defaults to mainnet-beta |
-| `REDSUITE_PROFILE` | scenario profile: `lite` (default), `full`, `soak`, or `deep` |
+| `REDSUITE_PROFILE` | Redline workload: `lite` (default) or `full`; ignored by Redhat and Redshift |
 | `REDSUITE_LOOP` | S1 loop mode: `open` (default) or `closed` |
 | `REDSUITE_VERBOSE` | set to print stack boot, reuse and per-scenario detail lines for passing scenarios too; by default those appear only for failures |
 | `REDSUITE_YELLOWSTONE_PLUGIN` | a prebuilt `libyellowstone_grpc_geyser.so` to load instead of the cached upstream release |
@@ -255,8 +252,11 @@ the feed is missing or pointed at a dead port.
 ## redline scenarios
 
 The performance tests, one file each under `redline/src/scenarios/<subsystem>/`.
-`REDSUITE_PROFILE=lite` (default) is a quick local run, `full` produces the
-real numbers.
+`lite` (default) provides shorter benchmark runs; `full` uses the larger
+workloads. Select one with `--profile` or `REDSUITE_PROFILE`. The flag is
+accepted only when the selection includes Redline.
+`redsuite run all --profile full` runs every scenario and changes only Redline's workload.
+Redhat and Redshift use fixed workloads. Other profile names are rejected.
 
 aperture (RPC / websocket ingress):
 
@@ -320,8 +320,8 @@ committor (ER → base commits):
 - `commit_width_envelope` — commits 1, 2 and 4 accounts back to the base
   chain and records what each input costs: round-trip latency and number of
   base transactions.
-- `commit_throughput_ceiling` — schedules 150 wide commits over
-  never-committed accounts, faster than the committor can process them.
+- `commit_throughput_ceiling` — schedules wide commits over never-committed
+  accounts and measures the committor's drain rate.
 
 storage:
 
@@ -377,7 +377,6 @@ p95/max tail long before the average moves.
 |-----------------------------------------------------|---------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------|
 | `achieved tps` vs `offered tps`                     | We *tried* to send at some rate — did we actually manage to?                                      | A gap means something saturated — and every other result was measured under less load than the test claims. |
 | `base txs per commit`                               | How many base-chain transactions one commit costs.                                                | Commits got more expensive — worse batching, or lookup tables aren't being reused.                          |
-| `fresh drain intents/s` vs `reused drain intents/s` | Commit speed for brand-new accounts (setup needed) vs already-committed ones (setup exists).      | These are two different code paths — this tells you which one regressed.                                    |
 | `cliff at ws conns`                                 | At how many websocket connections update delivery fell over.                                      | The capacity edge moved closer. 0 means we never hit an edge — good, or the test didn't push far enough.    |
 | `thrash p50 slowdown x`                             | How many times slower a typical read gets once the account cache starts thrashing.                | Going over the cache limit hurts more than it used to.                                                      |
 | `heavy/light validator avg ratio`                   | Did compute-heavy transactions take proportionally longer inside the validator than trivial ones? | A ratio near 1.0 proves the validator *didn't actually do the work*.                                        |
@@ -693,7 +692,7 @@ replication (leader + verifiers):
 - `replication_recovery` — one leader and two verifiers under a steady stream of
   `X(A) -> Y(A,B) -> Z(B)` hash-fold chains. Both verifiers must keep up,
   one is restarted while its cursor is still retained and must catch up
-  under load, and in the full profile the other is kept offline until the
+  under load, and the other is kept offline until the
   leader's retention has purged its history, so it must install a snapshot
   and replay the tail. At the final sealed boundary both verifiers hold
   exactly the leader's transactions, report zero sealed-checksum mismatches,

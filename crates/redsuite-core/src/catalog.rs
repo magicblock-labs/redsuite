@@ -2,10 +2,7 @@ use std::{future::Future, pin::Pin};
 
 use pubkey::Pubkey;
 
-use crate::{
-    profile::{self, ExecutionConfig},
-    scenario::RunRecord,
-};
+use crate::{profile::ExecutionConfig, scenario::RunRecord};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Family {
@@ -113,23 +110,11 @@ impl Fixture {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct ProfileSet(pub &'static [&'static str]);
-
-impl ProfileSet {
-    pub const ALL: ProfileSet = ProfileSet(profile::ALL);
-
-    pub fn contains(&self, name: &str) -> bool {
-        self.0.contains(&name)
-    }
-}
-
 pub type ScenarioFuture = Pin<Box<dyn Future<Output = RunRecord>>>;
 
 pub struct ScenarioEntry {
     pub family: Family,
     pub short_name: &'static str,
-    pub profiles: ProfileSet,
     pub topology: Topology,
     pub resources: &'static [Resource],
     pub fixtures: &'static [Fixture],
@@ -155,12 +140,6 @@ impl ScenarioEntry {
 
 #[macro_export]
 macro_rules! scenario_catalog {
-    (@profiles) => {
-        $crate::catalog::ProfileSet::ALL
-    };
-    (@profiles $profiles:expr) => {
-        $profiles
-    };
     (@execute Shared, $scenario:expr, $fixtures:expr, $optional:expr,
      $config:expr) => {
         $crate::run_shared_scenario($scenario, $fixtures, $optional, $config)
@@ -174,7 +153,6 @@ macro_rules! scenario_catalog {
     (
         family: $family:ident,
         $($short_name:ident => $($segment:ident)::+ {
-            $(profiles: $profiles:expr,)?
             topology: $topology:ident,
             resources: [$($resource:expr),* $(,)?],
             fixtures: [$($fixture:expr),* $(,)?]
@@ -186,7 +164,6 @@ macro_rules! scenario_catalog {
             $($crate::catalog::ScenarioEntry {
                 family: $crate::catalog::Family::$family,
                 short_name: stringify!($short_name),
-                profiles: $crate::scenario_catalog!(@profiles $($profiles)?),
                 topology: $crate::catalog::Topology::$topology,
                 resources: &[$($resource),*],
                 fixtures: &[$($fixture),*],
@@ -210,7 +187,10 @@ macro_rules! scenario_catalog {
                     scenarios::$($segment)::+,
                     &[$($fixture),*],
                     &[$($($optional),*)?],
-                    $crate::profile::ExecutionConfig::from_env()
+                    $crate::profile::ExecutionConfig::from_env(
+                        $crate::catalog::Family::$family
+                            == $crate::catalog::Family::Redline
+                    )
                 )
                 .await;
                 if !record.passed() {

@@ -11,7 +11,6 @@ use pubkey::Pubkey;
 use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, prep,
-    profile::{self, ProfileValues},
     redline::causal::{chain_ixs, PairModel, Step, STEPS},
     topology::{self, ReplicatedOptions, ReplicatedTopology, Verifier},
     BaseCtx, ChainCtx, CheckError, PrivateErScenario, Result, ScenarioReport,
@@ -21,10 +20,13 @@ use signature::Signature;
 use signer::Signer;
 
 const LABEL: &str = "replication-recovery";
+const PAIRS: usize = 4;
+const CHAIN_GAP: Duration = Duration::from_millis(100);
+const HEAVY_ITERS: u32 = 30;
+const STEADY: Duration = Duration::from_secs(8);
 const PAYERS_PER_PAIR: usize = 3;
 const SUPERBLOCK_SLOTS: u64 = 128;
 const LEDGER_SIZE_LIMIT_BYTES: u64 = 1;
-const TRUNCATIONS_TO_OUTRUN: f64 = 2.0;
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(90);
 const CATCH_UP_TIMEOUT: Duration = Duration::from_secs(120);
@@ -43,40 +45,6 @@ const CLIENT_SNAPSHOTS: &str = r#"engine_replicator_operation_duration_micros_co
 const SERVER_SNAPSHOTS: &str = r#"engine_replicator_operation_duration_micros_count{op="server_send_snapshot"}"#;
 const TRUNCATIONS: &str =
     r#"engine_ledger_operation_duration_micros_count{op="truncate"}"#;
-
-struct Profile {
-    name: &'static str,
-    pairs: usize,
-    chain_gap: Duration,
-    heavy_iters: u32,
-    steady: Duration,
-    snapshot_recovery: bool,
-}
-
-const LITE: Profile = Profile {
-    name: "lite",
-    pairs: 4,
-    chain_gap: Duration::from_millis(100),
-    heavy_iters: 30,
-    steady: Duration::from_secs(8),
-    snapshot_recovery: false,
-};
-
-const FULL: Profile = Profile {
-    name: "full",
-    pairs: 8,
-    chain_gap: Duration::from_millis(50),
-    heavy_iters: 60,
-    steady: Duration::from_secs(15),
-    snapshot_recovery: true,
-};
-
-const PROFILES: ProfileValues<Profile> = ProfileValues {
-    lite: LITE,
-    full: FULL,
-    soak: None,
-    deep: None,
-};
 
 struct Pair {
     a: Pubkey,
@@ -451,17 +419,14 @@ struct RestartOutcome {
 async fn restart_with_retained_cursor(
     topology: &mut ReplicatedTopology,
     index: usize,
-    prune_active: bool,
 ) -> Result<RestartOutcome> {
-    if prune_active {
-        await_leader_advance(
-            topology,
-            BLOCKS,
-            SUPERBLOCK_SLOTS as f64,
-            "a fresh superblock boundary before the retained-cursor restart",
-        )
-        .await?;
-    }
+    await_leader_advance(
+        topology,
+        BLOCKS,
+        SUPERBLOCK_SLOTS as f64,
+        "a fresh superblock boundary before the retained-cursor restart",
+    )
+    .await?;
     let stopped_at = Instant::now();
     let stop = topology.verifier_mut(index).stop(false).await?;
     check_eq!(
@@ -471,13 +436,11 @@ async fn restart_with_retained_cursor(
     )?;
     topology.verifier_mut(index).start(READY_TIMEOUT).await?;
     let offline = stopped_at.elapsed();
-    if prune_active {
-        check!(
-            offline <= RESTART_AFTER_SEAL_BUDGET,
-            "verifier {index} was offline {offline:?}, too long to be sure \
-             its cursor survived the next retention check"
-        )?;
-    }
+    check!(
+        offline <= RESTART_AFTER_SEAL_BUDGET,
+        "verifier {index} was offline {offline:?}, too long to be sure \
+         its cursor survived the next retention check"
+    )?;
     let reconnect = topology
         .verifier(index)
         .wait_connected(CONNECT_TIMEOUT)
@@ -520,6 +483,7 @@ async fn recover_from_snapshot(
 ) -> Result<RecoveryOutcome> {
     let server_snapshots_before =
         leader_count(topology, SERVER_SNAPSHOTS).await?;
+    let truncations_before = leader_count(topology, TRUNCATIONS).await?;
     let stopped_at = Instant::now();
     let stop = topology.verifier_mut(index).stop(false).await?;
     check_eq!(
@@ -527,13 +491,22 @@ async fn recover_from_snapshot(
         Some(0),
         "verifier {index} must stop cleanly before falling behind retention"
     )?;
-    let truncations_target = await_leader_advance(
-        topology,
-        TRUNCATIONS,
-        TRUNCATIONS_TO_OUTRUN,
-        "retention purging the history behind the offline verifier",
-    )
-    .await?;
+    // A block produced after shutdown is beyond the stopped cursor. Observe
+    // it before waiting for retention to remove its superblock.
+    let slot = topology.leader().ctx().api().get_slot().await? + 1;
+    for (retained, timeout) in
+        [(true, SEAL_TIMEOUT), (false, RETENTION_TIMEOUT)]
+    {
+        check::poll(
+            &format!("leader block {slot} retained={retained} after verifier {index} stopped"),
+            timeout,
+            || async {
+                topology.leader().ctx().api().get_block(slot).await
+                    .is_ok_and(|block| block.is_some() == retained)
+            },
+        )
+        .await?;
+    }
     let offline = stopped_at.elapsed();
     topology.verifier_mut(index).start(READY_TIMEOUT).await?;
     let reconnect = topology
@@ -544,8 +517,8 @@ async fn recover_from_snapshot(
         verifier_count(topology.verifier(index), CLIENT_SNAPSHOTS).await?;
     check!(
         client_snapshots >= 1.0,
-        "verifier {index} rejoined after {truncations_target:.0} retention \
-         purges without installing a snapshot"
+        "verifier {index} rejoined after leader block {slot} was pruned \
+         without installing a snapshot"
     )?;
     let server_snapshots = leader_count(topology, SERVER_SNAPSHOTS).await?
         - server_snapshots_before;
@@ -563,7 +536,8 @@ async fn recover_from_snapshot(
     .await?;
     Ok(RecoveryOutcome {
         offline,
-        truncations: truncations_target,
+        truncations: leader_count(topology, TRUNCATIONS).await?
+            - truncations_before,
         reconnect,
         catch_up,
         client_snapshots,
@@ -580,19 +554,16 @@ impl PrivateErScenario for ReplicationRecovery {
     }
 
     async fn run(&self, base: &BaseCtx) -> Result<ScenarioReport> {
-        let (profile, _) =
-            profile::select(self.name(), base.config(), &PROFILES);
-
-        let mut leader_env = vec![(
-            "MBV_ENGINE__BLOCKSTORE__SUPERBLOCK".to_owned(),
-            SUPERBLOCK_SLOTS.to_string(),
-        )];
-        if profile.snapshot_recovery {
-            leader_env.push((
+        let leader_env = vec![
+            (
+                "MBV_ENGINE__BLOCKSTORE__SUPERBLOCK".to_owned(),
+                SUPERBLOCK_SLOTS.to_string(),
+            ),
+            (
                 "MBV_ENGINE__LEDGER__SIZE_LIMIT".to_owned(),
                 LEDGER_SIZE_LIMIT_BYTES.to_string(),
-            ));
-        }
+            ),
+        ];
         let boot_started = Instant::now();
         let mut topology = topology::replicated(
             base,
@@ -624,10 +595,9 @@ impl PrivateErScenario for ReplicationRecovery {
             boot.as_secs_f64(),
         );
 
-        let pairs = prepare_pairs(base, &topology, profile.pairs).await?;
-        let workload =
-            Workload::start(pairs, profile.chain_gap, profile.heavy_iters);
-        let lag = sample_lag(&topology, profile.steady).await?;
+        let pairs = prepare_pairs(base, &topology, PAIRS).await?;
+        let workload = Workload::start(pairs, CHAIN_GAP, HEAVY_ITERS);
+        let lag = sample_lag(&topology, STEADY).await?;
         let steady_target = leader_metric(&topology, TRANSACTIONS).await?;
         let mut steady_catch_up = Duration::ZERO;
         for verifier in topology.verifiers() {
@@ -647,7 +617,7 @@ impl PrivateErScenario for ReplicationRecovery {
              lag {:.0} / {:.0} txs over {} samples, both verifiers within \
              {} ms of the leader's {steady_target:.0}",
             self.name(),
-            profile.steady.as_secs_f64(),
+            STEADY.as_secs_f64(),
             workload.sent(),
             lag.max_lag[0],
             lag.max_lag[1],
@@ -655,12 +625,7 @@ impl PrivateErScenario for ReplicationRecovery {
             steady_catch_up.as_millis(),
         );
 
-        let restart = restart_with_retained_cursor(
-            &mut topology,
-            0,
-            profile.snapshot_recovery,
-        )
-        .await?;
+        let restart = restart_with_retained_cursor(&mut topology, 0).await?;
         verify_no_mismatch(&topology).await?;
         eprintln!(
             "[redsuite] {}: verifier 0 restarted on its retained cursor: \
@@ -673,26 +638,21 @@ impl PrivateErScenario for ReplicationRecovery {
             restart.snapshots,
         );
 
-        let recovery = if profile.snapshot_recovery {
-            let recovery = recover_from_snapshot(&mut topology, 1).await?;
-            verify_no_mismatch(&topology).await?;
-            eprintln!(
-                "[redsuite] {}: verifier 1 fell behind retention ({:.0} \
-                 purges, offline {:.1} s), installed {} snapshot(s) (leader \
-                 served {}), reconnected after {} ms and replayed the tail in \
-                 {} ms",
-                self.name(),
-                recovery.truncations,
-                recovery.offline.as_secs_f64(),
-                recovery.client_snapshots,
-                recovery.server_snapshots,
-                recovery.reconnect.as_millis(),
-                recovery.catch_up.as_millis(),
-            );
-            Some(recovery)
-        } else {
-            None
-        };
+        let recovery = recover_from_snapshot(&mut topology, 1).await?;
+        verify_no_mismatch(&topology).await?;
+        eprintln!(
+            "[redsuite] {}: verifier 1 fell behind retention ({:.0} \
+             purges, offline {:.1} s), installed {} snapshot(s) (leader \
+             served {}), reconnected after {} ms and replayed the tail in \
+             {} ms",
+            self.name(),
+            recovery.truncations,
+            recovery.offline.as_secs_f64(),
+            recovery.client_snapshots,
+            recovery.server_snapshots,
+            recovery.reconnect.as_millis(),
+            recovery.catch_up.as_millis(),
+        );
 
         let (pairs, chain_txs) = workload.stop(&topology).await?;
         let final_txs = leader_metric(&topology, TRANSACTIONS).await?;
@@ -761,20 +721,12 @@ impl PrivateErScenario for ReplicationRecovery {
 
         topology.finish().await?;
 
-        let mut report = ScenarioReport::ok(self.name())
-            .setting("profile", profile.name)
-            .setting("pairs", profile.pairs)
-            .setting("chain gap ms", profile.chain_gap.as_millis())
-            .setting("heavy step iters", profile.heavy_iters)
+        Ok(ScenarioReport::ok(self.name())
+            .setting("pairs", PAIRS)
+            .setting("chain gap ms", CHAIN_GAP.as_millis())
+            .setting("heavy step iters", HEAVY_ITERS)
             .setting("superblock slots", SUPERBLOCK_SLOTS)
-            .setting(
-                "ledger size limit bytes",
-                if profile.snapshot_recovery {
-                    LEDGER_SIZE_LIMIT_BYTES.to_string()
-                } else {
-                    "default".to_owned()
-                },
-            )
+            .setting("ledger size limit bytes", LEDGER_SIZE_LIMIT_BYTES)
             .setting("leader executors", leader_executors)
             .setting("verifier0 executors", executors[0])
             .setting("verifier1 executors", executors[1])
@@ -823,40 +775,32 @@ impl PrivateErScenario for ReplicationRecovery {
                 "verifier1 superblocks",
                 Unit::Count,
                 verifier_superblocks[1],
-            );
-        if let Some(recovery) = recovery {
-            report = report
-                .metric(
-                    "snapshot recovery offline s",
-                    Unit::Seconds,
-                    recovery.offline.as_secs_f64(),
-                )
-                .metric(
-                    "snapshot recovery purges",
-                    Unit::Count,
-                    recovery.truncations,
-                )
-                .metric(
-                    "snapshot recovery reconnect ms",
-                    Unit::Millis,
-                    recovery.reconnect.as_secs_f64() * 1e3,
-                )
-                .metric(
-                    "snapshot recovery tail replay ms",
-                    Unit::Millis,
-                    recovery.catch_up.as_secs_f64() * 1e3,
-                )
-                .metric(
-                    "snapshots installed",
-                    Unit::Count,
-                    recovery.client_snapshots,
-                )
-                .metric(
-                    "snapshots served",
-                    Unit::Count,
-                    recovery.server_snapshots,
-                );
-        }
-        Ok(report)
+            )
+            .metric(
+                "snapshot recovery offline s",
+                Unit::Seconds,
+                recovery.offline.as_secs_f64(),
+            )
+            .metric(
+                "snapshot recovery purges",
+                Unit::Count,
+                recovery.truncations,
+            )
+            .metric(
+                "snapshot recovery reconnect ms",
+                Unit::Millis,
+                recovery.reconnect.as_secs_f64() * 1e3,
+            )
+            .metric(
+                "snapshot recovery tail replay ms",
+                Unit::Millis,
+                recovery.catch_up.as_secs_f64() * 1e3,
+            )
+            .metric(
+                "snapshots installed",
+                Unit::Count,
+                recovery.client_snapshots,
+            )
+            .metric("snapshots served", Unit::Count, recovery.server_snapshots))
     }
 }

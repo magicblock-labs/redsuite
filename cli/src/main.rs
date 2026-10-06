@@ -4,9 +4,9 @@ use std::{process::Command, time::Instant};
 
 use futures_util::StreamExt;
 use redsuite_core::{
-    catalog::{Lane, ScenarioEntry, Topology},
+    catalog::{Family, Lane, ScenarioEntry, Topology},
     console, frontend,
-    profile::{self, ExecutionConfig, LoopMode, Profile},
+    profile::{ExecutionConfig, LoopMode, Profile},
     report::{self, ScenarioReport, Unit},
     topology, Result, RunRecord,
 };
@@ -26,7 +26,7 @@ const USAGE_HEAD: &str = "\
 usage:
   redsuite list [family]                                  list scenarios (family: redline|redshift|redhat)
   redsuite run <scenario|family|all> [opts]               run scenarios (benchmarks last, alone)
-      --profile <lite|full|soak|deep>                     scenario profile (default lite)
+      --profile <lite|full>                               Redline workload; requires Redline in the selection (default lite)
       --loop <open|closed>                                S1 loop mode
       --serial                                            one scenario at a time, then stack down
       --keep-storage                                      with --serial: leave the stack and its storage up
@@ -77,7 +77,17 @@ async fn run(args: &[String]) -> Result<()> {
     let suite_started = Instant::now();
     let Some(target) = args.first() else { usage() };
 
-    let mut config = ExecutionConfig::from_env()?;
+    let scenarios = selected(target);
+    if scenarios.is_empty() {
+        return Err(format!(
+            "unknown scenario `{target}` — `redsuite list` shows what exists"
+        )
+        .into());
+    }
+    let redline = scenarios
+        .iter()
+        .any(|entry| entry.family == Family::Redline);
+    let mut config = ExecutionConfig::from_env(redline)?;
     let mut serial = false;
     let mut keep_storage = false;
     let mut options = args[1..].iter();
@@ -96,11 +106,14 @@ async fn run(args: &[String]) -> Result<()> {
         let value = options.next().unwrap_or_else(|| usage());
         match flag.as_str() {
             "--profile" => {
+                if !redline {
+                    return Err(
+                        "--profile requires a selection containing Redline"
+                            .into(),
+                    );
+                }
                 config.profile = Profile::parse(value).ok_or_else(|| {
-                    format!(
-                        "unknown profile `{value}` (expected {})",
-                        profile::ALL.join("|")
-                    )
+                    format!("unknown profile `{value}` (expected lite|full)")
                 })?
             }
             "--loop" => {
@@ -112,32 +125,6 @@ async fn run(args: &[String]) -> Result<()> {
             }
             _ => usage(),
         }
-    }
-
-    let scenarios = selected(target);
-    if scenarios.is_empty() {
-        return Err(format!(
-            "unknown scenario `{target}` — `redsuite list` shows what exists"
-        )
-        .into());
-    }
-
-    let requested_profile = config.profile.name();
-    let (scenarios, unsupported): (Vec<_>, Vec<_>) = scenarios
-        .into_iter()
-        .partition(|entry| entry.profiles.contains(requested_profile));
-    for entry in unsupported {
-        eprintln!(
-            "[redsuite] skipping {}: profile {requested_profile} is not in \
-             its profile set",
-            entry.name()
-        );
-    }
-    if scenarios.is_empty() {
-        return Err(format!(
-            "no selected scenario runs under profile `{requested_profile}`"
-        )
-        .into());
     }
 
     let mut names: Vec<_> =
@@ -156,7 +143,6 @@ async fn run(args: &[String]) -> Result<()> {
         .filter(|name| !name.trim().is_empty())
         .unwrap_or_else(|| format!("unknown-{}", report::run_id()));
     let mut report = ScenarioReport::ok(&format!("suite/{target}"))
-        .setting("profile", requested_profile)
         .setting("loop", config.loop_mode.name())
         .setting(
             "host",
@@ -171,6 +157,9 @@ async fn run(args: &[String]) -> Result<()> {
         .setting("serial", serial)
         .setting("keep storage", keep_storage)
         .setting("scenarios", names.join(","));
+    if redline {
+        report = report.setting("redline profile", config.profile.name());
+    }
     let (benchmarks, functional): (Vec<_>, Vec<_>) = scenarios
         .into_iter()
         .partition(|entry| entry.lane() == Lane::Exclusive);

@@ -6,7 +6,7 @@ use redsuite_core::redline::Accounts;
 use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, prep,
-    profile::{self, ProfileValues},
+    profile::ProfileValues,
     runner::{execute_threaded, Pacing, ThreadRunConfig},
     BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
 };
@@ -52,8 +52,6 @@ const FULL: Profile = Profile {
 const PROFILES: ProfileValues<Profile> = ProfileValues {
     lite: LITE,
     full: FULL,
-    soak: None,
-    deep: None,
 };
 
 pub struct RpcCapacityBlast;
@@ -65,8 +63,7 @@ impl Scenario for RpcCapacityBlast {
     }
 
     async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
-        let (profile, _) =
-            profile::select(self.name(), base.config(), &PROFILES);
+        let profile = PROFILES.select(base.config().profile);
         let prep_payers =
             prep::funded_payers(base, profile.payers, PREP_PAYER_LAMPORTS)
                 .await?;

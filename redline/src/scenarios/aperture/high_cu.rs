@@ -10,7 +10,7 @@ use redsuite_core::redline::Accounts;
 use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, prep,
-    profile::{self, ProfileValues},
+    profile::ProfileValues,
     report,
     runner::{execute, Pacing, RunConfig, RunOutcome},
     transport::ws::{AccountUpdates, UpdateOutcome},
@@ -64,8 +64,6 @@ const FULL: Profile = Profile {
 const PROFILES: ProfileValues<Profile> = ProfileValues {
     lite: LITE,
     full: FULL,
-    soak: None,
-    deep: None,
 };
 
 fn consumed_cus(logs: &[String]) -> Option<f64> {
@@ -271,8 +269,7 @@ impl Scenario for HighCu {
     }
 
     async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
-        let (profile, _) =
-            profile::select(self.name(), base.config(), &PROFILES);
+        let profile = PROFILES.select(base.config().profile);
         let payers =
             prep::funded_payers(base, profile.payers, PAYER_LAMPORTS).await?;
         let pdas = Accounts::new(crate::ACCOUNT_SPACE, er.identity())

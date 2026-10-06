@@ -12,7 +12,7 @@ use redsuite_core::report::Unit;
 use redsuite_core::{
     api::custom_error_code,
     check, check_eq, prep,
-    profile::{self, ProfileValues},
+    profile::ProfileValues,
     receipt, report,
     runner::{execute, Pacing, RunConfig},
     stats::StreamingStats,
@@ -69,8 +69,6 @@ const FULL: Profile = Profile {
 const PROFILES: ProfileValues<Profile> = ProfileValues {
     lite: LITE,
     full: FULL,
-    soak: None,
-    deep: None,
 };
 
 #[derive(Default)]
@@ -202,8 +200,7 @@ impl Scenario for CommitWidthEnvelope {
     }
 
     async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
-        let (profile, _) =
-            profile::select(self.name(), base.config(), &PROFILES);
+        let profile = PROFILES.select(base.config().profile);
         let payer = prep::funded_payer(base, PAYER_LAMPORTS).await?;
         let payer_pubkey = payer.pubkey();
         let pdas = Accounts::new(ACCOUNT_SPACE, er.identity())

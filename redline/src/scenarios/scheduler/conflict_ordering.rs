@@ -16,7 +16,7 @@ use redsuite_core::redline::Accounts;
 use redsuite_core::report::Unit::{Count, Micros, Ratio, Seconds, Tps};
 use redsuite_core::{
     check, check_eq, prep,
-    profile::{self, ProfileValues},
+    profile::ProfileValues,
     redline::causal::{
         chain_ixs, independent_ixs, PairModel, Step, HASH_INIT, STEPS,
     },
@@ -99,23 +99,9 @@ const FULL: Profile = Profile {
     phase_span: Duration::from_secs(10),
 };
 
-const SOAK: Profile = Profile {
-    name: "soak",
-    pairs: 64,
-    chains: 400,
-    batches: 12,
-    heavy_iters: 180,
-    independent_accounts: 1024,
-    independent_iters: 180,
-    driver_threads: 8,
-    phase_span: Duration::from_secs(20),
-};
-
 const PROFILES: ProfileValues<Profile> = ProfileValues {
     lite: LITE,
     full: FULL,
-    soak: Some(SOAK),
-    deep: None,
 };
 
 fn heavy_step(chain: u64) -> Step {
@@ -686,8 +672,7 @@ impl Scenario for ConflictOrdering {
     }
 
     async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
-        let (profile, _) =
-            profile::select(self.name(), base.config(), &PROFILES);
+        let profile = PROFILES.select(base.config().profile);
         check!(
             profile.chains >= 2,
             "profile {}: at least two chains per pair are needed to split a \
