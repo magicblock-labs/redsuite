@@ -215,9 +215,7 @@ impl AccountUpdates {
     pub async fn await_id(&self, id: u64) -> Result<()> {
         let rx = {
             let mut shared = self.shared.borrow_mut();
-            if let Some(err) = &shared.error {
-                return Err(format!("ws stream: {err}").into());
-            }
+            conn::check_stream(&shared.error)?;
             if !shared.pending.contains_key(&id) {
                 return Ok(());
             }
@@ -247,9 +245,7 @@ impl AccountUpdates {
     ) -> Result<()> {
         conn::await_condition(timeout, what, || {
             let shared = self.shared.borrow();
-            if let Some(err) = &shared.error {
-                return Err(format!("ws stream: {err}").into());
-            }
+            conn::check_stream(&shared.error)?;
             Ok(done(&shared))
         })
         .await
@@ -396,9 +392,7 @@ impl SignatureConfirmations {
         let req = self.requester.mint();
         {
             let mut shared = self.shared.borrow_mut();
-            if let Some(err) = &shared.error {
-                return Err(format!("ws stream: {err}").into());
-            }
+            conn::check_stream(&shared.error)?;
             shared.id_by_req.insert(req, id);
             shared.pending.insert(id, Instant::now());
         }
@@ -414,9 +408,7 @@ impl SignatureConfirmations {
     pub async fn await_id(&self, id: u64) -> Result<()> {
         let rx = {
             let mut shared = self.shared.borrow_mut();
-            if let Some(err) = &shared.error {
-                return Err(format!("ws stream: {err}").into());
-            }
+            conn::check_stream(&shared.error)?;
             if !shared.pending.contains_key(&id) {
                 return Ok(());
             }
@@ -431,9 +423,7 @@ impl SignatureConfirmations {
     pub async fn await_all(&self, timeout: Duration) -> Result<()> {
         conn::await_condition(timeout, "signature confirmations", || {
             let shared = self.shared.borrow();
-            if let Some(err) = &shared.error {
-                return Err(format!("ws stream: {err}").into());
-            }
+            conn::check_stream(&shared.error)?;
             Ok(shared.pending.is_empty())
         })
         .await

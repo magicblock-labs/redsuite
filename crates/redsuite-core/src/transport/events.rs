@@ -160,9 +160,7 @@ impl EventSubscriptions {
     ) -> Result<()> {
         conn::await_condition(timeout, what, || {
             let shared = self.shared.borrow();
-            if let Some(err) = &shared.error {
-                return Err(format!("ws stream: {err}").into());
-            }
+            conn::check_stream(&shared.error)?;
             Ok(done(&shared))
         })
         .await

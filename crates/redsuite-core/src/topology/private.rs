@@ -242,7 +242,7 @@ async fn launch(
 ) -> Result<PrivateEr> {
     let dir = state::stack_dir();
     fs::create_dir_all(&dir)?;
-    let er_bin = config::find_er_bin()?;
+    let er_bin = config::er_bin_path()?;
     let er_identity = identity::identity_for_label(&options.label)?;
     identity::ensure_identity_funded(base, &er_identity.pubkey()).await?;
 
@@ -300,20 +300,16 @@ async fn launch(
         bin_version,
         bin_fingerprint,
         identity: identity_pubkey.to_string(),
-        launched_at: report::utc_stamp(),
         rpc_port: Some(rpc_port),
         ws_port: Some(ws_port),
         metrics_port,
         replication_port: Some(replication_port),
-        upstream: None,
         storage_dir: plan.storage_dir.display().to_string(),
         accountsdb_dir: state::split_accountsdb_dir(&plan.storage_dir)
             .map(|dir| dir.display().to_string()),
         log: log.display().to_string(),
-        config: None,
         pid,
-        relaunches: 0,
-        exit: None,
+        ..LaunchRecord::default()
     });
 
     let proc = process::Owned::new("private ER", options.label, child, record);

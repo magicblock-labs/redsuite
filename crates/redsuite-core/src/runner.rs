@@ -51,7 +51,7 @@ pub enum JobOutcome {
 }
 
 #[derive(Debug, Default)]
-pub struct RunOutcome {
+pub struct RunOutcome<S = ObservationsStats> {
     pub delivered: u64,
     // every admitted iteration that did not end Delivered; panicked and
     // cancelled below break this count down, so delivered + failed == admitted
@@ -59,9 +59,9 @@ pub struct RunOutcome {
     pub panicked: u64,
     pub cancelled: u64,
     pub first_error: Option<String>,
-    pub delivery: ObservationsStats,
+    pub delivery: S,
     // closed loop only: send-start → all confirmations for the id
-    pub sync: Option<ObservationsStats>,
+    pub sync: Option<S>,
     pub offered: Pacing,
     pub rps: ObservationsStats,
     pub wall: std::time::Duration,
@@ -73,19 +73,7 @@ impl RunOutcome {
     }
 }
 
-#[derive(Debug, Default)]
-pub struct RawRunOutcome {
-    pub delivered: u64,
-    pub failed: u64,
-    pub panicked: u64,
-    pub cancelled: u64,
-    pub first_error: Option<String>,
-    pub delivery: StreamingStats,
-    pub sync: Option<StreamingStats>,
-    pub offered: Pacing,
-    pub rps: ObservationsStats,
-    pub wall: std::time::Duration,
-}
+pub type RawRunOutcome = RunOutcome<StreamingStats>;
 
 impl RawRunOutcome {
     pub fn merge(&mut self, other: RawRunOutcome) {
@@ -121,30 +109,6 @@ impl RawRunOutcome {
             offered: self.offered,
             rps: self.rps,
             wall: self.wall,
-        }
-    }
-}
-
-struct Tally {
-    delivered: u64,
-    failed: u64,
-    panicked: u64,
-    cancelled: u64,
-    first_error: Option<String>,
-    delivery: StreamingStats,
-    sync: Option<StreamingStats>,
-}
-
-impl Tally {
-    fn new(closed_loop: bool) -> Self {
-        Self {
-            delivered: 0,
-            failed: 0,
-            panicked: 0,
-            cancelled: 0,
-            first_error: None,
-            delivery: StreamingStats::new(),
-            sync: closed_loop.then(StreamingStats::new),
         }
     }
 
@@ -236,7 +200,10 @@ where
     SyncFut: Future<Output = Result<()>> + 'static,
 {
     let mut throttle = Throttle::new(pacing, concurrency)?;
-    let tally = Rc::new(RefCell::new(Tally::new(sync.is_some())));
+    let tally = Rc::new(RefCell::new(RawRunOutcome {
+        sync: sync.is_some().then(StreamingStats::new),
+        ..RawRunOutcome::default()
+    }));
     let started = Instant::now();
 
     let mut jobs = JoinSet::new();
@@ -289,21 +256,15 @@ where
         .unwrap_or_else(|_| panic!("execute jobs still hold the tally"))
         .into_inner();
     Ok(RawRunOutcome {
-        delivered: tally.delivered,
-        failed: tally.failed,
-        panicked: tally.panicked,
-        cancelled: tally.cancelled,
-        first_error: tally.first_error,
-        delivery: tally.delivery,
-        sync: tally.sync,
         offered: pacing,
         rps,
         wall: started.elapsed(),
+        ..tally
     })
 }
 
 fn record_join(
-    tally: &Rc<RefCell<Tally>>,
+    tally: &Rc<RefCell<RawRunOutcome>>,
     joined: std::result::Result<(), JoinError>,
 ) {
     if let Err(join_error) = joined {

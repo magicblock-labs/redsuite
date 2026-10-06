@@ -145,7 +145,7 @@ async fn er_healthy(state: &StackState) -> bool {
 async fn boot_base(config: ExecutionConfig) -> Result<StackState> {
     let dir = state::stack_dir();
     let base_bin = config::find_base_bin()?;
-    let er_bin = config::find_er_bin()?;
+    let er_bin = config::er_bin_path()?;
 
     let mut base_ports = process::PortLease::default();
     let (base_rpc_port, base_ws_port) = base_ports.pair()?;
@@ -292,7 +292,7 @@ async fn attach_er(
     config: ExecutionConfig,
 ) -> Result<StackState> {
     let dir = state::stack_dir();
-    let er_bin = config::find_er_bin()?;
+    let er_bin = config::er_bin_path()?;
     let er_identity = Keypair::try_from(&state.er_identity_keypair[..])
         .map_err(|e| {
             format!("corrupt state.json: bad er_identity_keypair: {e}")

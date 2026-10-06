@@ -5,8 +5,8 @@ use instruction::{AccountMeta, Instruction};
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    check, check_eq, loader_v4, prep, topology, BaseCtx, ChainCtx, CheckError,
-    ErCtx, Result, Scenario, ScenarioReport,
+    check, check_eq, prep, topology, BaseCtx, ChainCtx, CheckError, ErCtx,
+    Result, Scenario, ScenarioReport,
 };
 use signature::Signature;
 
@@ -72,7 +72,7 @@ impl Scenario for LoaderMatrix {
         let (v2_owner, v2_data) = cloned_program(er, &memo_v2).await?;
         check_eq!(
             v2_owner,
-            loader_v4::loader_v4_id(),
+            sdk_ids::loader_v4::ID,
             "the cloned memo v2 must land under LoaderV4 ownership"
         )?;
         check!(
@@ -102,7 +102,7 @@ impl Scenario for LoaderMatrix {
         let (v3_owner, v3_data) = cloned_program(er, &v3_id).await?;
         check_eq!(
             v3_owner,
-            loader_v4::loader_v4_id(),
+            sdk_ids::loader_v4::ID,
             "the cloned v3 program must land under LoaderV4 ownership"
         )?;
         check!(

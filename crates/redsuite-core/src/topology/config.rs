@@ -113,17 +113,21 @@ pub(super) fn find_base_bin() -> Result<PathBuf> {
     })
 }
 
-pub(super) fn find_er_bin() -> Result<PathBuf> {
-    if let Some(explicit) = std::env::var_os(ER_BIN_ENV) {
-        let explicit = PathBuf::from(explicit);
-        return if explicit.exists() {
-            Ok(explicit)
-        } else {
-            Err(
-                format!("{ER_BIN_ENV}={} does not exist", explicit.display())
-                    .into(),
-            )
-        };
+fn explicit_bin(name: &str) -> Result<Option<PathBuf>> {
+    let path = std::env::var_os(name).map(PathBuf::from);
+    if let Some(path) = &path {
+        if !path.exists() {
+            return Err(
+                format!("{name}={} does not exist", path.display()).into()
+            );
+        }
+    }
+    Ok(path)
+}
+
+pub fn er_bin_path() -> Result<PathBuf> {
+    if let Some(explicit) = explicit_bin(ER_BIN_ENV)? {
+        return Ok(explicit);
     }
     which(ER_BIN).ok_or_else(|| {
         format!("{ER_BIN} not found — set {ER_BIN_ENV} to the built binary or put it on PATH")
@@ -131,26 +135,13 @@ pub(super) fn find_er_bin() -> Result<PathBuf> {
     })
 }
 
-pub fn er_bin_path() -> Result<PathBuf> {
-    find_er_bin()
-}
-
 // The verifier ships beside the ER binary in the validator build tree; an
 // explicit env override wins, PATH is the last resort.
 pub(super) fn find_verifier_bin() -> Result<PathBuf> {
-    if let Some(explicit) = std::env::var_os(VERIFIER_BIN_ENV) {
-        let explicit = PathBuf::from(explicit);
-        return if explicit.exists() {
-            Ok(explicit)
-        } else {
-            Err(format!(
-                "{VERIFIER_BIN_ENV}={} does not exist",
-                explicit.display()
-            )
-            .into())
-        };
+    if let Some(explicit) = explicit_bin(VERIFIER_BIN_ENV)? {
+        return Ok(explicit);
     }
-    if let Some(sibling) = find_er_bin()
+    if let Some(sibling) = er_bin_path()
         .ok()
         .and_then(|er| er.parent().map(|dir| dir.join(VERIFIER_BIN)))
         .filter(|candidate| candidate.is_file())
@@ -165,10 +156,6 @@ pub(super) fn find_verifier_bin() -> Result<PathBuf> {
         )
         .into()
     })
-}
-
-pub fn verifier_bin_path() -> Result<PathBuf> {
-    find_verifier_bin()
 }
 
 fn which(bin: &str) -> Option<PathBuf> {
