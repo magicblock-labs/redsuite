@@ -153,6 +153,13 @@ struct Record {
 }
 
 impl Record {
+    async fn submit(er: &ErCtx, tx: Transaction) -> Result<Self> {
+        let api = er.api();
+        api.send_transaction(&tx).await?;
+        let info = api.await_transaction(&tx.signatures[0], TIMEOUT).await?;
+        Ok(Self { tx, info })
+    }
+
     fn check(
         &self,
         keys: &[Pubkey],
@@ -326,14 +333,8 @@ impl Workload<'_> {
             "{label}: before"
         )?;
         let error_index = instructions.len() - 1;
-        let tx = self.prepare(instructions).await?;
-        self.er.api().send_transaction(&tx).await?;
-        let info = self
-            .er
-            .api()
-            .await_transaction(&tx.signatures[0], TIMEOUT)
-            .await?;
-        let record = Record { tx, info };
+        let record =
+            Record::submit(self.er, self.prepare(instructions).await?).await?;
         let before = self.expected.clone();
         let mut after = before.clone();
         let expected_error = match effect {
@@ -571,14 +572,9 @@ impl PrivateErScenario for EphemeralAccounts {
             }
             let records = try_join_all(prepared.into_iter().map(
                 |(action, tx)| async move {
-                    er.api().send_transaction(&tx).await?;
-                    let info = er
-                        .api()
-                        .await_transaction(&tx.signatures[0], TIMEOUT)
-                        .await?;
                     Ok::<_, redsuite_core::DynError>((
                         action,
-                        Record { tx, info },
+                        Record::submit(er, tx).await?,
                     ))
                 },
             ))

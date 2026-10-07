@@ -2671,7 +2671,6 @@ name = "redhat"
 version = "0.6.0"
 dependencies = [
  "async-trait",
- "borsh 1.7.0",
  "ephemeral-rollups-sdk",
  "futures-util",
  "magicblock-magic-program-api",
@@ -2685,7 +2684,6 @@ dependencies = [
  "solana-signer",
  "solana-transaction 4.1.6",
  "sonic-rs",
- "tokio",
 ]
 
 [[package]]

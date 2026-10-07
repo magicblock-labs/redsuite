@@ -13,8 +13,6 @@ json = { workspace = true }
 magic-api = { workspace = true }
 sdk = { workspace = true }
 transaction = { workspace = true }
-borsh = { workspace = true }
-tokio = { workspace = true }
 redsuite-core = { workspace = true }
 redshift-interface = { workspace = true }
 redhat-interface = { workspace = true }
