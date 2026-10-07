@@ -14,9 +14,7 @@ use crate::{
 };
 
 pub async fn shared(config: ExecutionConfig) -> Result<(BaseCtx, ErCtx)> {
-    let dir = state::stack_dir();
-    fs::create_dir_all(&dir)?;
-    let _lock = state::acquire_lock(dir.join("lock")).await?;
+    let _lock = state::acquire_lock().await?;
 
     let state = ensure_base(config).await?;
     let state = ensure_er(state, config).await?;
@@ -31,7 +29,7 @@ pub fn running_base_programs() -> Option<Vec<String>> {
 
 pub async fn stop_shared_er() -> Result<bool> {
     let dir = state::stack_dir();
-    let _lock = state::acquire_lock(dir.join("lock")).await?;
+    let _lock = state::acquire_lock().await?;
     let Some(state) = state::read_state() else {
         return Ok(false);
     };
@@ -51,9 +49,7 @@ pub async fn stop_shared_er() -> Result<bool> {
 }
 
 pub async fn base_only(config: ExecutionConfig) -> Result<BaseCtx> {
-    let dir = state::stack_dir();
-    fs::create_dir_all(&dir)?;
-    let _lock = state::acquire_lock(dir.join("lock")).await?;
+    let _lock = state::acquire_lock().await?;
 
     let state = ensure_base(config).await?;
     Ok(base_ctx(&state, config))

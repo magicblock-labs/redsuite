@@ -1,3 +1,5 @@
+use super::hold_nonces;
+
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -25,7 +27,6 @@ const BASE_STATE_TIMEOUT: Duration = Duration::from_secs(30);
 const RECEIPT_TIMEOUT: Duration = Duration::from_secs(120);
 const BUFFER_CLEANUP_TIMEOUT: Duration = Duration::from_secs(60);
 const HOLD_WINDOW: Duration = Duration::from_secs(5);
-const SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
 const HISTORY_LIMIT: usize = 32;
 const SMALL_SPACE: u32 = crate::ACCOUNT_SPACE;
 const LARGE_SPACE: u32 = 2048;
@@ -160,11 +161,7 @@ async fn settled(
         RECEIPT_TIMEOUT,
     )
     .await?;
-    check!(
-        receipt.succeeded(),
-        "{phase}: the bundle must settle, got {:?}",
-        receipt.error_message
-    )?;
+    super::require_settled(&receipt, phase)?;
     let mut included = receipt.included.clone();
     included.sort();
     let mut expected = expected.to_vec();
@@ -173,10 +170,6 @@ async fn settled(
         included,
         expected,
         "{phase}: the receipt must list exactly the bundled accounts"
-    )?;
-    check!(
-        !receipt.base_signatures.is_empty(),
-        "{phase}: a settled bundle must name its base transactions"
     )?;
     receipt::confirm_base_signatures(
         base.api(),
@@ -209,31 +202,6 @@ async fn history_position(
             format!("base history of {account} does not list {signature}")
                 .into()
         })
-}
-
-async fn hold_nonces(
-    base: &BaseCtx,
-    accounts: &[Pubkey],
-    expected: &[u64],
-    window: Duration,
-    phase: &str,
-) -> Result<()> {
-    let deadline = Instant::now() + window;
-    loop {
-        for (account, expected) in accounts.iter().zip(expected) {
-            let nonce = crate::last_commit_id(base, account).await?;
-            check_eq!(
-                nonce,
-                *expected,
-                "{phase}: the nonce of {account} must not move while the \
-                 first bundle is held"
-            )?;
-        }
-        if Instant::now() >= deadline {
-            return Ok(());
-        }
-        tokio::time::sleep(SAMPLE_INTERVAL).await;
-    }
 }
 
 async fn prepare_accounts(

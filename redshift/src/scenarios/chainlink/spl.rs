@@ -1,6 +1,10 @@
 use instruction::{AccountMeta, Instruction};
 use pubkey::Pubkey;
-use redsuite_core::{dlp, system, ChainCtx, Result};
+use redsuite_core::{system, ChainCtx, Result};
+use sdk::spl::builders::{
+    DelegateEphemeralAtaBuilder, DepositSplTokensBuilder,
+    InitializeEphemeralAtaBuilder, InitializeGlobalVaultBuilder,
+};
 
 pub(crate) const MINT_LEN: u64 = 82;
 pub(crate) const MINT_RENT: u64 = 2_000_000;
@@ -39,6 +43,10 @@ pub(crate) fn derive_ata(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
         &ata_program(),
     )
     .0
+}
+
+pub(crate) fn allocate_mint(payer: &Pubkey, mint: &Pubkey) -> Instruction {
+    system::create_account(payer, mint, MINT_RENT, MINT_LEN, &token_program())
 }
 
 pub(crate) fn initialize_mint(
@@ -151,21 +159,11 @@ pub(crate) fn initialize_global_vault(
     payer: &Pubkey,
     mint: &Pubkey,
 ) -> Instruction {
-    let vault = derive_global_vault(mint);
-    Instruction {
-        program_id: eata_program(),
-        accounts: vec![
-            AccountMeta::new(vault, false),
-            AccountMeta::new(*payer, true),
-            AccountMeta::new_readonly(*mint, false),
-            AccountMeta::new(derive_eata(&vault, mint), false),
-            AccountMeta::new(derive_ata(&vault, mint), false),
-            AccountMeta::new_readonly(token_program(), false),
-            AccountMeta::new_readonly(ata_program(), false),
-            AccountMeta::new_readonly(system::system_id(), false),
-        ],
-        data: vec![1],
+    InitializeGlobalVaultBuilder {
+        payer: *payer,
+        mint: *mint,
     }
+    .instruction()
 }
 
 pub(crate) fn initialize_eata(
@@ -173,17 +171,12 @@ pub(crate) fn initialize_eata(
     user: &Pubkey,
     mint: &Pubkey,
 ) -> Instruction {
-    Instruction {
-        program_id: eata_program(),
-        accounts: vec![
-            AccountMeta::new(derive_eata(user, mint), false),
-            AccountMeta::new(*payer, true),
-            AccountMeta::new_readonly(*user, false),
-            AccountMeta::new_readonly(*mint, false),
-            AccountMeta::new_readonly(system::system_id(), false),
-        ],
-        data: vec![0],
+    InitializeEphemeralAtaBuilder {
+        payer: *payer,
+        user: *user,
+        mint: *mint,
     }
+    .instruction()
 }
 
 pub(crate) fn deposit_spl_tokens(
@@ -191,22 +184,13 @@ pub(crate) fn deposit_spl_tokens(
     mint: &Pubkey,
     amount: u64,
 ) -> Instruction {
-    let vault = derive_global_vault(mint);
-    let mut data = vec![2u8];
-    data.extend_from_slice(&amount.to_le_bytes());
-    Instruction {
-        program_id: eata_program(),
-        accounts: vec![
-            AccountMeta::new(derive_eata(user, mint), false),
-            AccountMeta::new_readonly(vault, false),
-            AccountMeta::new_readonly(*mint, false),
-            AccountMeta::new(derive_ata(user, mint), false),
-            AccountMeta::new(derive_ata(&vault, mint), false),
-            AccountMeta::new_readonly(*user, true),
-            AccountMeta::new_readonly(token_program(), false),
-        ],
-        data,
+    DepositSplTokensBuilder {
+        authority: *user,
+        user: *user,
+        mint: *mint,
+        amount,
     }
+    .instruction()
 }
 
 pub(crate) fn withdraw_spl_tokens(
@@ -238,24 +222,11 @@ pub(crate) fn delegate_eata(
     mint: &Pubkey,
     validator: &Pubkey,
 ) -> Instruction {
-    let eata = derive_eata(user, mint);
-    let mut data = vec![4u8];
-    data.extend_from_slice(validator.as_ref());
-    Instruction {
-        program_id: eata_program(),
-        accounts: vec![
-            AccountMeta::new(*payer, true),
-            AccountMeta::new(eata, false),
-            AccountMeta::new_readonly(eata_program(), false),
-            AccountMeta::new(
-                dlp::delegate_buffer_pda(&eata, &eata_program()),
-                false,
-            ),
-            AccountMeta::new(dlp::delegation_record_pda(&eata), false),
-            AccountMeta::new(dlp::delegation_metadata_pda(&eata), false),
-            AccountMeta::new_readonly(dlp::dlp_id(), false),
-            AccountMeta::new_readonly(system::system_id(), false),
-        ],
-        data,
+    DelegateEphemeralAtaBuilder {
+        payer: *payer,
+        user: *user,
+        mint: *mint,
+        validator: Some(*validator),
     }
+    .instruction()
 }

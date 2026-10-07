@@ -154,8 +154,8 @@ private ERs. `ephemeral_accounts`, `task_scheduler`, `config_gates`, `rpc_compat
 `commit_blackout`, `commit_exactly_once`,
 `commit_settlement_order`, `undelegation_recovery`,
 `delegation_session_isolation`, `projected_token_lifecycle`,
-`transaction_retry_cold_fetch`, `transaction_retry_success`,
-`transaction_retry_failure`, `transaction_retry_subscriptions`,
+`transaction_retry_cold_fetch`, `transaction_retry_concurrent`,
+`transaction_retry_subscriptions`,
 `transaction_retry_expiry_restart`,
 `verifier_lifecycle`, and `replication_recovery`
 run on
@@ -166,7 +166,9 @@ with two verifiers replicating from it); `restart_under_load`,
 `superblock_boundary_latency` boot theirs beside the shared stack. Each takes
 its own identity from a 64-slot pool minted at genesis, so private ERs never
 collide with the shared one or each other.
-The five retry cases share their implementation in `transaction_retries`.
+The four retry entrypoints share their implementation in `transaction_retries`.
+`api_invariants`, `claim_fees`, and `table_mania` use the same private-scenario
+runner to provision only the base; they do not start an ER.
 
 The harness needs two binaries, and a third for replicated topologies:
 
@@ -424,9 +426,9 @@ chainlink (account cloning):
   one account at a time and then in mixed batches. Every balance has to match
   the base chain exactly, a top-up on base has to show through on the next ER
   read, and an account that does not exist has to be considered as missing.
-- `parallel_cloning` — funds ten wallets on base and then reads all ten for
-  the first time at once, through five overlapping requests. The validator is
-  cloning ten accounts it has never seen.
+  A cold-read case funds ten fresh wallets and reads them through three
+  concurrent batches (3/2/3 accounts) and two single-account requests, checking
+  exact response lengths and balances.
 - `cache_lifecycle` — combines eviction, reconnecting subscriptions, delayed
   stale observations, and continuous ER writes; protects delegated and
   undelegating state, refreshes base reads, and discovers undelegation completion.
@@ -462,7 +464,9 @@ chainlink (account cloning):
 - `aml_gate` — screens the owner of an incoming token account against a risk
   API before the tokens are merged. An owner scored above the threshold never
   gets a merge: no transaction goes near the destination, and the account is
-  handed back undelegated.
+  handed back undelegated. A second, low-risk owner must get a merge attempt;
+  tokens move only if the deployed program accepts it. Both owners use the
+  same ER and mock server, with separate token fixtures and owner-query counts.
 - `activation_single_shot` — boots a private ER behind the base-chain
   proxies and delegates an account whose post-delegation action bumps a
   delegated counter and names a never-cloned dependency. The proxy stalls
@@ -580,16 +584,20 @@ committor (ER → base commits):
   one the committor uses when a commit outgrows a single transaction.
   Creates a table, extends it to the 256-key cap, decodes the account and
   requires the stored keys to match what was put in, then refuses the key that
-  would overflow it and deactivates the table.
+  would overflow it. One authority creates a second table for the remaining
+  addresses and a separate empty table for deactivation.
 
 aperture (JSON-RPC surface):
 
-- `transaction_retry_cold_fetch`, `transaction_retry_success`,
-  `transaction_retry_failure`, `transaction_retry_subscriptions`, and
+- `transaction_retry_cold_fetch`, `transaction_retry_concurrent`,
+  `transaction_retry_subscriptions`, and
   `transaction_retry_expiry_restart` — reuse identical signed bytes across
   fetch failures, concurrent submissions, expiry, and same-storage restart.
   Check exact counter effects, rollback, payer fees, ledger occurrences, and
   signature notifications registered before, during, and after submission.
+  The concurrent case runs eight success rounds and eight failure rounds on
+  one private ER, each with 32 identical submissions. Each outcome uses fresh
+  payer/counter state and its own ledger window.
   The subscription case queues conflicting readers and requires registrations
   acknowledged after submission but before terminal status for both outcomes.
   Accepted submissions drain through block publication before assertions;
@@ -607,8 +615,10 @@ aperture (JSON-RPC surface):
   exercised on the way in, `simulateTransaction` must leave no trace in state
   or status, and the MagicBlock-specific `getBlockhashForAccounts` and
   `getDelegationStatus` are called raw. Block publication is polled with a
-  bound before history is read. Reports the burst wall time and the send
-  failure count without a throughput verdict.
+  bound before history is read. Ten additional transfers span advancing slots;
+  after each settles for ten slots, transaction/block timestamps must agree
+  with `getBlockTime`, be positive, and not be in the future. Reports the burst
+  wall time and send failure count without a throughput verdict.
 - `rpc_token_queries` — builds realistic SPL state on base and lets the ER
   materialize it: two mints, two owners, an approved delegate, plain ATAs
   and eATA-backed projections delegated to the ER, plus one account that is
@@ -647,9 +657,8 @@ aperture (JSON-RPC surface):
 
 harness:
 
-- `api_invariants` — reads each transaction's block timestamp three
-  different ways and checks all three agree, every time. Also registers,
-  updates and removes a validator record in the domain registry.
+- `api_invariants` — registers, updates and removes a validator record in the
+  domain registry on base. The update changes fields and grows the record.
 - `config_gates` — boots two private ERs: one whose allow list contains
   a single program, and one with no list at all. The restricted validator has
   to clone the program it was instructed. Neither of them may create a lookup table on base,
@@ -666,7 +675,9 @@ scheduler:
   one, cancel removes it, a cancelled task id can be reused and lands on the
   same account with the new schedule, another authority's identical task id
   gets its own account, a signer in the payload is refused, and the validator
-  identity sponsors the account and is refunded on cancel. The scheduler
+  identity sponsors the account and is refunded on cancel. Lifecycle cases
+  reuse one actor, with a second authority for isolation and an empty task
+  store between cases. The scheduler
   program is cloned from `REDSUITE_CLONE_URL` into the base chain at a cold
   boot like dlp, and the private ER clones it on first use, so the scenario
   runs against the deployed bytes and no program binary lives in this repo.

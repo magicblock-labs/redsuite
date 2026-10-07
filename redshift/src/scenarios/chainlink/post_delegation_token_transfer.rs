@@ -49,13 +49,7 @@ impl Scenario for PostDelegationTokenTransfer {
             &fee_payer,
             &[&mint, &source_authority],
             &[
-                system::create_account(
-                    &fee_payer.pubkey(),
-                    &mint_key,
-                    spl::MINT_RENT,
-                    spl::MINT_LEN,
-                    &spl::token_program(),
-                ),
+                spl::allocate_mint(&fee_payer.pubkey(), &mint_key),
                 spl::initialize_mint(&mint_key, &source),
                 spl::create_ata_idempotent(
                     &fee_payer.pubkey(),
@@ -164,16 +158,14 @@ impl Scenario for PostDelegationTokenTransfer {
             &[transfer_action],
         );
 
-        base.submit_and_confirm_with(
-            &fee_payer,
-            &[&delegated_account],
-            &[system::assign(&delegated_account.pubkey(), &dlp::dlp_id())],
-        )
-        .await?;
+        // Publish the owner change with its record so discovery sees both.
         base.submit_and_confirm_with(
             &fee_payer,
             &[&delegated_account, &source_authority],
-            &[delegate_ix],
+            &[
+                system::assign(&delegated_account.pubkey(), &dlp::dlp_id()),
+                delegate_ix,
+            ],
         )
         .await?;
 
@@ -300,14 +292,11 @@ impl Scenario for PostDelegationTokenTransfer {
         );
         base.submit_and_confirm_with(
             &fee_payer,
-            &[&failing_account],
-            &[system::assign(&failing_account.pubkey(), &dlp::dlp_id())],
-        )
-        .await?;
-        base.submit_and_confirm_with(
-            &fee_payer,
             &[&failing_account, &source_authority],
-            &[failing_delegate],
+            &[
+                system::assign(&failing_account.pubkey(), &dlp::dlp_id()),
+                failing_delegate,
+            ],
         )
         .await?;
         check::poll(

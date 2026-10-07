@@ -21,7 +21,8 @@ use signer::Signer;
 use crate::program::DELEGATION_PROGRAM_ID;
 
 use super::{
-    prove_landed, write_and_commit, BASE_CONFIRM_TIMEOUT, BASE_STATE_TIMEOUT,
+    hold_nonces, prove_landed, write_and_commit, BASE_CONFIRM_TIMEOUT,
+    BASE_STATE_TIMEOUT,
 };
 
 const LABEL: &str = "commit-exactly-once";
@@ -70,29 +71,6 @@ async fn base_count(base: &BaseCtx, counter: &Pubkey) -> Result<u64> {
         .await?
         .ok_or("the base counter is missing")?;
     Ok(FlexiCounter::try_decode(&account.data)?.count)
-}
-
-async fn hold_nonce(
-    base: &BaseCtx,
-    account: &Pubkey,
-    expected: u64,
-    window: Duration,
-    phase: &str,
-) -> Result<()> {
-    let deadline = Instant::now() + window;
-    loop {
-        let nonce = crate::last_commit_id(base, account).await?;
-        check_eq!(
-            nonce,
-            expected,
-            "{phase}: the base commit nonce must not move once the commit \
-             has settled"
-        )?;
-        if Instant::now() >= deadline {
-            return Ok(());
-        }
-        tokio::time::sleep(SAMPLE_INTERVAL).await;
-    }
 }
 
 async fn hold_count(
@@ -167,17 +145,7 @@ async fn settled_receipt(
          alone, got {:?}",
         receipt.error_message
     )?;
-    check!(
-        receipt.succeeded(),
-        "{phase}: the receipt must report the settled commit as succeeded, \
-         got {:?}",
-        receipt.error_message
-    )?;
-    check!(
-        !receipt.base_signatures.is_empty(),
-        "{phase}: a succeeded receipt must name the base transaction that \
-         settled the commit"
-    )?;
+    super::require_settled(&receipt, phase)?;
     receipt::confirm_base_signatures(
         base.api(),
         &receipt,
@@ -243,7 +211,7 @@ async fn commit_blackout(
     // must reconcile that landed transaction instead of producing another base
     // effect for the same intent.
     let settled = nonce;
-    hold_nonce(base, &account, settled, BLACKOUT_WINDOW, phase).await?;
+    hold_nonces(base, &[account], &[settled], BLACKOUT_WINDOW, phase).await?;
     for rule in confirmations {
         rule.remove();
     }
@@ -261,7 +229,7 @@ async fn commit_blackout(
          ({landed}), got {:?}",
         receipt.base_signatures
     )?;
-    hold_nonce(base, &account, settled, SETTLE_WINDOW, phase).await?;
+    hold_nonces(base, &[account], &[settled], SETTLE_WINDOW, phase).await?;
     let on_base = base
         .account(&account)
         .await?

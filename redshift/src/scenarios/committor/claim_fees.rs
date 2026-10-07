@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use redsuite_core::report::Unit;
 use redsuite_core::{
-    check, dlp, topology, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
+    check, dlp, topology, BaseCtx, ChainCtx, PrivateErScenario, Result,
     ScenarioReport,
 };
 use signer::Signer;
@@ -11,13 +11,15 @@ const TEST_FEE_LAMPORTS: u64 = 1_000_000;
 pub struct ClaimFees;
 
 #[async_trait(?Send)]
-impl Scenario for ClaimFees {
+impl PrivateErScenario for ClaimFees {
     fn name(&self) -> &str {
         "redshift/claim_fees"
     }
 
-    async fn run(&self, base: &BaseCtx, _er: &ErCtx) -> Result<ScenarioReport> {
+    async fn run(&self, base: &BaseCtx) -> Result<ScenarioReport> {
         let validator = topology::er_identity_keypair()?;
+        base.airdrop(&validator.pubkey(), crate::PAYER_LAMPORTS)
+            .await?;
         let vault = dlp::validator_fees_vault_pda(&validator.pubkey());
         let vault_at_boot = base.api().get_balance(&vault).await?;
         check!(

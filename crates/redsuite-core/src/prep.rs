@@ -1,7 +1,9 @@
 use std::{rc::Rc, time::Duration};
 
+use instruction::Instruction;
 use keypair::Keypair;
 use pubkey::Pubkey;
+use redshift_interface::flexi::build as flexi;
 use redshift_interface::schedulecommit::{build, MainAccount};
 use signer::Signer;
 
@@ -217,20 +219,64 @@ pub async fn await_cloned_payers(
     Ok(())
 }
 
+pub async fn await_program_clone(
+    er: &ErCtx,
+    program: &Pubkey,
+    timeout: Duration,
+) -> Result<()> {
+    check::poll(
+        &format!("the er clones the program {program} as executable"),
+        timeout,
+        || async {
+            matches!(er.account(program).await, Ok(Some(clone)) if clone.executable)
+        },
+    ).await?;
+    Ok(())
+}
+
+pub fn flexi_counter(
+    owner: Pubkey,
+    label: &str,
+    validator: Pubkey,
+    commit_frequency_ms: u32,
+) -> (Pubkey, [Instruction; 2]) {
+    let (init, counter) = flexi::init_counter(owner, label);
+    (
+        counter,
+        [
+            init,
+            flexi::delegate_counter(
+                owner,
+                commit_frequency_ms,
+                Some(validator),
+            ),
+        ],
+    )
+}
+
 pub async fn delegated_payer(
     ctx: &impl ChainCtx,
     funder: &Keypair,
     validator: Pubkey,
     lamports: u64,
 ) -> Result<Keypair> {
-    let delegatee = Keypair::new();
+    let delegatee = funded_payer(ctx, lamports).await?;
+    delegate_payer(ctx, funder, &delegatee, validator).await?;
+    Ok(delegatee)
+}
+
+pub async fn delegate_payer(
+    ctx: &impl ChainCtx,
+    funder: &Keypair,
+    delegatee: &Keypair,
+    validator: Pubkey,
+) -> Result<()> {
     let delegatee_pubkey = delegatee.pubkey();
-    ctx.airdrop(&delegatee_pubkey, lamports).await?;
     let delegate_setup = [
         system::assign(&delegatee_pubkey, &dlp::dlp_id()),
         dlp::delegate_account(&funder.pubkey(), &delegatee_pubkey, &validator),
     ];
-    ctx.submit_and_confirm_with(funder, &[&delegatee], &delegate_setup)
+    ctx.submit_and_confirm_with(funder, &[delegatee], &delegate_setup)
         .await?;
     let on_chain = ctx
         .account(&delegatee_pubkey)
@@ -244,5 +290,5 @@ pub async fn delegated_payer(
         )
         .into());
     }
-    Ok(delegatee)
+    Ok(())
 }

@@ -7,7 +7,7 @@ use pubkey::Pubkey;
 use redshift_interface::flexi::{build as flexi, FlexiCounter};
 use redsuite_core::{
     api::{ConfirmOptions, TxError},
-    check, check_eq, dlp, prep, system, topology, BaseCtx, ChainCtx, ErCtx,
+    check, check_eq, prep, topology, BaseCtx, ChainCtx, ErCtx,
     PrivateErScenario, Result, ScenarioReport,
 };
 use signer::Signer;
@@ -38,30 +38,16 @@ async fn scheduled_actor(
     funder: &Keypair,
 ) -> Result<Actor> {
     let payer = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
-    let (init, counter) = flexi::init_counter(payer.pubkey(), LABEL);
-    base.submit_and_confirm(&payer, &[init]).await?;
-    base.submit_and_confirm(
-        &payer,
-        &[flexi::delegate_counter(
-            payer.pubkey(),
-            prep::COMMIT_FREQUENCY_MS,
-            Some(er.identity()),
-        )],
-    )
-    .await?;
-    base.submit_and_confirm_with(
-        funder,
-        &[&payer],
-        &[
-            system::assign(&payer.pubkey(), &dlp::dlp_id()),
-            dlp::delegate_account(
-                &funder.pubkey(),
-                &payer.pubkey(),
-                &er.identity(),
-            ),
-        ],
-    )
-    .await?;
+    let (counter, setup) = prep::flexi_counter(
+        payer.pubkey(),
+        LABEL,
+        er.identity(),
+        prep::COMMIT_FREQUENCY_MS,
+    );
+    for instruction in setup {
+        base.submit_and_confirm(&payer, &[instruction]).await?;
+    }
+    prep::delegate_payer(base, funder, &payer, er.identity()).await?;
     check::poll("the ER clones the counter", TIMEOUT, || async {
         matches!(er.account(&counter).await, Ok(Some(account)) if !account.data.is_empty())
     })
@@ -155,36 +141,26 @@ fn tx_failure(attempt: Result<()>, context: &str) -> Result<Box<TxError>> {
     })
 }
 
-async fn test_schedule_and_cancel(
-    base: &BaseCtx,
-    er: &ErCtx,
-    funder: &Keypair,
-) -> Result<usize> {
-    let actor = scheduled_actor(base, er, funder).await?;
-    schedule(er, &actor, 101, TASK_INTERVAL_MS, 3).await?;
+async fn test_schedule_and_cancel(er: &ErCtx, actor: &Actor) -> Result<usize> {
+    schedule(er, actor, 101, TASK_INTERVAL_MS, 3).await?;
     let created = await_tasks(er, 1).await?;
     let size = created[0].1.data.len();
-    cancel(er, &actor, 101).await?;
+    cancel(er, actor, 101).await?;
     await_tasks(er, 0).await?;
     check_eq!(
-        er_count(er, &actor).await?,
+        er_count(er, actor).await?,
         0,
         "the validator itself never executes the scheduled payload"
     )?;
     Ok(size)
 }
 
-async fn test_reschedule(
-    base: &BaseCtx,
-    er: &ErCtx,
-    funder: &Keypair,
-) -> Result<()> {
-    let actor = scheduled_actor(base, er, funder).await?;
-    schedule(er, &actor, 102, TASK_INTERVAL_MS, 2).await?;
+async fn test_reschedule(er: &ErCtx, actor: &Actor) -> Result<()> {
+    schedule(er, actor, 102, TASK_INTERVAL_MS, 2).await?;
     let (address, original) = await_tasks(er, 1).await?.remove(0);
-    cancel(er, &actor, 102).await?;
+    cancel(er, actor, 102).await?;
     await_tasks(er, 0).await?;
-    schedule(er, &actor, 102, 2 * TASK_INTERVAL_MS, 2).await?;
+    schedule(er, actor, 102, 2 * TASK_INTERVAL_MS, 2).await?;
     let (readdress, replacement) = await_tasks(er, 1).await?.remove(0);
     check_eq!(
         readdress,
@@ -195,17 +171,12 @@ async fn test_reschedule(
         replacement.data != original.data,
         "the reused task id carries the new schedule"
     )?;
-    cancel(er, &actor, 102).await?;
+    cancel(er, actor, 102).await?;
     await_tasks(er, 0).await?;
     Ok(())
 }
 
-async fn test_signed_refusal(
-    base: &BaseCtx,
-    er: &ErCtx,
-    funder: &Keypair,
-) -> Result<String> {
-    let actor = scheduled_actor(base, er, funder).await?;
+async fn test_signed_refusal(er: &ErCtx, actor: &Actor) -> Result<String> {
     let error = tx_failure(
         er.submit_and_confirm(
             &actor.payer,
@@ -238,10 +209,10 @@ async fn test_authority_isolation(
     base: &BaseCtx,
     er: &ErCtx,
     funder: &Keypair,
+    owner: &Actor,
 ) -> Result<()> {
-    let owner = scheduled_actor(base, er, funder).await?;
     let other = scheduled_actor(base, er, funder).await?;
-    schedule(er, &owner, 106, TASK_INTERVAL_MS, 3).await?;
+    schedule(er, owner, 106, TASK_INTERVAL_MS, 3).await?;
     let owners = await_tasks(er, 1).await?;
     schedule(er, &other, 106, 2 * TASK_INTERVAL_MS, 3).await?;
     let both = await_tasks(er, 2).await?;
@@ -249,7 +220,7 @@ async fn test_authority_isolation(
         both.iter().any(|(address, _)| *address == owners[0].0),
         "another authority scheduling the same task id leaves the original task untouched"
     )?;
-    cancel(er, &owner, 106).await?;
+    cancel(er, owner, 106).await?;
     let remaining = await_tasks(er, 1).await?;
     check!(
         remaining[0].0 != owners[0].0,
@@ -260,15 +231,10 @@ async fn test_authority_isolation(
     Ok(())
 }
 
-async fn test_cancel_ongoing(
-    base: &BaseCtx,
-    er: &ErCtx,
-    funder: &Keypair,
-) -> Result<()> {
-    let actor = scheduled_actor(base, er, funder).await?;
-    schedule(er, &actor, 108, TASK_INTERVAL_MS, i64::MAX).await?;
+async fn test_cancel_ongoing(er: &ErCtx, actor: &Actor) -> Result<()> {
+    schedule(er, actor, 108, TASK_INTERVAL_MS, i64::MAX).await?;
     await_tasks(er, 1).await?;
-    cancel(er, &actor, 108).await?;
+    cancel(er, actor, 108).await?;
     await_tasks(er, 0).await?;
     Ok(())
 }
@@ -281,26 +247,21 @@ async fn sponsor_balance(er: &ErCtx) -> Result<u64> {
         .lamports)
 }
 
-async fn test_sponsor_refund(
-    base: &BaseCtx,
-    er: &ErCtx,
-    funder: &Keypair,
-) -> Result<u64> {
-    let actor = scheduled_actor(base, er, funder).await?;
+async fn test_sponsor_refund(er: &ErCtx, actor: &Actor) -> Result<u64> {
     er.submit_and_confirm(
         &actor.payer,
         &[flexi::add_unsigned(actor.pubkey(), 0)],
     )
     .await?;
     let before = sponsor_balance(er).await?;
-    schedule(er, &actor, 109, TASK_INTERVAL_MS, 3).await?;
+    schedule(er, actor, 109, TASK_INTERVAL_MS, 3).await?;
     await_tasks(er, 1).await?;
     let funded = sponsor_balance(er).await?;
     check!(
         funded < before,
         "the validator identity sponsors the scheduled task ({funded} < {before})"
     )?;
-    cancel(er, &actor, 109).await?;
+    cancel(er, actor, 109).await?;
     await_tasks(er, 0).await?;
     check::poll(
         "cancellation refunds the validator identity in full",
@@ -340,12 +301,13 @@ impl PrivateErScenario for TaskScheduler {
             "a fresh ER holds no scheduled tasks"
         )?;
 
-        let size = test_schedule_and_cancel(base, er, &funder).await?;
-        let signed_error = test_signed_refusal(base, er, &funder).await?;
-        test_authority_isolation(base, er, &funder).await?;
-        test_cancel_ongoing(base, er, &funder).await?;
-        let sponsored = test_sponsor_refund(base, er, &funder).await?;
-        test_reschedule(base, er, &funder).await?;
+        let actor = scheduled_actor(base, er, &funder).await?;
+        let size = test_schedule_and_cancel(er, &actor).await?;
+        let signed_error = test_signed_refusal(er, &actor).await?;
+        test_authority_isolation(base, er, &funder, &actor).await?;
+        test_cancel_ongoing(er, &actor).await?;
+        let sponsored = test_sponsor_refund(er, &actor).await?;
+        test_reschedule(er, &actor).await?;
 
         Ok(ScenarioReport::ok(self.name())
             .setting("task store", "scheduler program accounts")

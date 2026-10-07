@@ -18,7 +18,7 @@ use redsuite_core::{
         request::TokenAccountsFilter,
         response::RpcKeyedAccount,
     },
-    system, BaseCtx, ChainCtx, ErCtx, Result, Scenario, ScenarioReport,
+    BaseCtx, ChainCtx, ErCtx, Result, Scenario, ScenarioReport,
 };
 use signer::Signer;
 use solana_account_decoder_client_types::{
@@ -56,7 +56,7 @@ struct Fixture {
     ata_unrelated: Pubkey,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 enum Query {
     ProgramAccountsByMint,
     ProgramAccountsByOwner,
@@ -272,45 +272,32 @@ async fn run_query(
                 "getProgramAccounts filtered by mint must list exactly the \
                  materialized token accounts of that mint"
             )?;
-            for (pubkey, account) in &accounts {
-                let data = raw_data(account)?;
-                check_eq!(
-                    data.len(),
-                    spl::TOKEN_ACCOUNT_LEN,
-                    "getProgramAccounts base64 data length for {pubkey}"
-                )?;
-                check_eq!(
-                    read_pubkey(&data, spl::MINT_OFFSET),
-                    Some(fixture.mint),
-                    "getProgramAccounts mint bytes for {pubkey}"
-                )?;
-                let (owner, amount, delegate) = if *pubkey == fixture.ata_a {
-                    (fixture.owner_a, OWNER_A_BALANCE, Some(fixture.delegate))
+            for (pubkey, account) in accounts {
+                let (owner, amount, delegate) = if pubkey == fixture.ata_a {
+                    (
+                        fixture.owner_a,
+                        OWNER_A_BALANCE,
+                        Some((&fixture.delegate, DELEGATED_AMOUNT)),
+                    )
                 } else {
                     (fixture.owner_b, OWNER_B_BALANCE, None)
                 };
+                let entry = RpcKeyedAccount {
+                    pubkey: pubkey.to_string(),
+                    account,
+                };
                 check_eq!(
-                    read_pubkey(&data, spl::OWNER_OFFSET),
-                    Some(owner),
-                    "getProgramAccounts owner bytes for {pubkey}"
+                    check_token_account(
+                        &format!("getProgramAccounts {pubkey}"),
+                        &entry,
+                        &fixture.mint,
+                        &owner,
+                        amount,
+                        delegate
+                    )?,
+                    "base64",
+                    "getProgramAccounts supplies raw token bytes for {pubkey}"
                 )?;
-                check_eq!(
-                    read_u64(&data, 64),
-                    Some(amount),
-                    "getProgramAccounts amount bytes for {pubkey}"
-                )?;
-                check_eq!(
-                    read_delegate(&data),
-                    delegate,
-                    "getProgramAccounts delegate bytes for {pubkey}"
-                )?;
-                if delegate.is_some() {
-                    check_eq!(
-                        read_u64(&data, DELEGATED_AMOUNT_OFFSET),
-                        Some(DELEGATED_AMOUNT),
-                        "getProgramAccounts delegated amount bytes for {pubkey}"
-                    )?;
-                }
             }
         }
         Query::ProgramAccountsByOwner => {
@@ -357,44 +344,45 @@ async fn run_query(
                 "getTokenAccountBalance decimals for {ata}"
             )?;
         }
-        Query::OwnerAByMint => {
-            let accounts = client
-                .get_token_accounts_by_owner_with_commitment(
-                    &fixture.owner_a,
+        Query::OwnerAByMint
+        | Query::OwnerAByProgram
+        | Query::OwnerBByMint
+        | Query::UnrelatedOwnerByMint => {
+            let label = format!("getTokenAccountsByOwner {query:?}");
+            let (owner, filter, wanted) = match query {
+                Query::OwnerAByMint => (
+                    fixture.owner_a,
                     TokenAccountsFilter::Mint(fixture.mint),
-                    confirmed(),
-                )
-                .await?
-                .value;
-            check_eq!(
-                keys(&accounts),
-                expected(&[fixture.ata_a]),
-                "getTokenAccountsByOwner(A, mint) must list exactly A's account \
-                 of that mint"
-            )?;
-            encoding = Some(check_token_account(
-                "getTokenAccountsByOwner(A, mint)",
-                &accounts[0],
-                &fixture.mint,
-                &fixture.owner_a,
-                OWNER_A_BALANCE,
-                Some((&fixture.delegate, DELEGATED_AMOUNT)),
-            )?);
-        }
-        Query::OwnerAByProgram => {
+                    vec![fixture.ata_a],
+                ),
+                Query::OwnerAByProgram => (
+                    fixture.owner_a,
+                    TokenAccountsFilter::ProgramId(spl::token_program()),
+                    vec![fixture.ata_a, fixture.ata_a_other],
+                ),
+                Query::OwnerBByMint => (
+                    fixture.owner_b,
+                    TokenAccountsFilter::Mint(fixture.mint),
+                    vec![fixture.ata_b],
+                ),
+                _ => (
+                    fixture.unrelated_owner,
+                    TokenAccountsFilter::Mint(fixture.mint),
+                    vec![],
+                ),
+            };
             let accounts = client
                 .get_token_accounts_by_owner_with_commitment(
-                    &fixture.owner_a,
-                    TokenAccountsFilter::ProgramId(spl::token_program()),
+                    &owner,
+                    filter,
                     confirmed(),
                 )
                 .await?
                 .value;
             check_eq!(
                 keys(&accounts),
-                expected(&[fixture.ata_a, fixture.ata_a_other]),
-                "getTokenAccountsByOwner(A, program) must list both of A's \
-                 token accounts"
+                expected(&wanted),
+                "{label}: exactly the materialized accounts"
             )?;
             for entry in &accounts {
                 let (mint, amount, delegate) =
@@ -404,41 +392,15 @@ async fn run_query(
                             OWNER_A_BALANCE,
                             Some((&fixture.delegate, DELEGATED_AMOUNT)),
                         )
+                    } else if entry.pubkey == fixture.ata_b.to_string() {
+                        (fixture.mint, OWNER_B_BALANCE, None)
                     } else {
                         (fixture.other_mint, OTHER_MINT_BALANCE, None)
                     };
                 encoding = Some(check_token_account(
-                    "getTokenAccountsByOwner(A, program)",
-                    entry,
-                    &mint,
-                    &fixture.owner_a,
-                    amount,
-                    delegate,
+                    &label, entry, &mint, &owner, amount, delegate,
                 )?);
             }
-        }
-        Query::OwnerBByMint => {
-            let accounts = client
-                .get_token_accounts_by_owner_with_commitment(
-                    &fixture.owner_b,
-                    TokenAccountsFilter::Mint(fixture.mint),
-                    confirmed(),
-                )
-                .await?
-                .value;
-            check_eq!(
-                keys(&accounts),
-                expected(&[fixture.ata_b]),
-                "getTokenAccountsByOwner(B, mint) must list exactly B's account"
-            )?;
-            encoding = Some(check_token_account(
-                "getTokenAccountsByOwner(B, mint)",
-                &accounts[0],
-                &fixture.mint,
-                &fixture.owner_b,
-                OWNER_B_BALANCE,
-                None,
-            )?);
         }
         Query::DelegateByMint | Query::DelegateByProgram => {
             let filter = match query {
@@ -469,22 +431,6 @@ async fn run_query(
                 OWNER_A_BALANCE,
                 Some((&fixture.delegate, DELEGATED_AMOUNT)),
             )?);
-        }
-        Query::UnrelatedOwnerByMint => {
-            let accounts = client
-                .get_token_accounts_by_owner_with_commitment(
-                    &fixture.unrelated_owner,
-                    TokenAccountsFilter::Mint(fixture.mint),
-                    confirmed(),
-                )
-                .await?
-                .value;
-            check!(
-                accounts.is_empty(),
-                "an owner whose account was never materialized must not appear \
-                 in getTokenAccountsByOwner, got {:?}",
-                keys(&accounts)
-            )?;
         }
     }
     Ok(encoding)
@@ -566,21 +512,9 @@ impl Scenario for RpcTokenQueries {
             &fee_payer,
             &[&mint, &other_mint, &owner_a],
             &[
-                system::create_account(
-                    &payer,
-                    &fixture.mint,
-                    spl::MINT_RENT,
-                    spl::MINT_LEN,
-                    &spl::token_program(),
-                ),
+                spl::allocate_mint(&payer, &fixture.mint),
                 spl::initialize_mint(&fixture.mint, &fixture.owner_a),
-                system::create_account(
-                    &payer,
-                    &fixture.other_mint,
-                    spl::MINT_RENT,
-                    spl::MINT_LEN,
-                    &spl::token_program(),
-                ),
+                spl::allocate_mint(&payer, &fixture.other_mint),
                 spl::initialize_mint(&fixture.other_mint, &fixture.owner_a),
                 spl::create_ata_idempotent(
                     &payer,

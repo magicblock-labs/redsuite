@@ -30,23 +30,18 @@ async fn await_event_where(
     what: &str,
     matches: impl Fn(&json::Value) -> bool,
 ) -> Result<json::Value> {
-    let deadline = tokio::time::Instant::now() + EVENT_TIMEOUT;
-    loop {
-        if let Some(event) =
-            events.events(key).into_iter().find(|event| matches(event))
-        {
-            return Ok(event);
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(CheckError::new(format!(
-                "timed out waiting for {what}"
-            ))
+    check::poll_until(EVENT_TIMEOUT, EVENT_POLL, async || {
+        Ok::<_, CheckError>(
+            events.events(key).into_iter().find(|event| matches(event)),
+        )
+    })
+    .await?
+    .ok_or_else(|| {
+        CheckError::new(format!("timed out waiting for {what}"))
             .actual(format!("{:?}", events.events(key)))
             .context("waited", format!("{EVENT_TIMEOUT:?}"))
-            .into());
-        }
-        tokio::time::sleep(EVENT_POLL).await;
-    }
+            .into()
+    })
 }
 
 fn event_lamports(event: &json::Value) -> Option<u64> {
@@ -326,101 +321,45 @@ impl Scenario for PubsubContracts {
 
         let mut raw = RawWs::connect(er.ws_url()).await?;
 
-        let account_sub = raw.account_subscribe(&account1_pubkey).await?;
-        transfer(
-            &sender,
-            &account1_pubkey,
-            &account2_pubkey,
-            TRANSFER_LAMPORTS,
-        )
-        .await?;
-        check!(
-            raw.next_notification(RAW_FIRST_TIMEOUT).await?.is_some(),
-            "no account notification before unsubscribe"
-        )?;
-        check!(
-            raw.account_unsubscribe(account_sub).await?,
-            "the account unsubscribe must return true"
-        )?;
-        while raw.next_notification(RAW_DRAIN_TIMEOUT).await?.is_some() {}
-        let after_account_unsub = sender
-            .submit_fresh(&[system::transfer(
+        for case in ["account", "logs", "program"] {
+            let subscription = match case {
+                "account" => raw.account_subscribe(&account1_pubkey).await?,
+                "logs" => raw.logs_subscribe_mentions(&account1_pubkey).await?,
+                _ => raw.program_subscribe(&system_program).await?,
+            };
+            transfer(
+                &sender,
                 &account1_pubkey,
                 &account2_pubkey,
                 TRANSFER_LAMPORTS,
-            )])
+            )
             .await?;
-        er.api()
-            .await_transaction(&after_account_unsub, Duration::from_secs(5))
-            .await?;
-        check!(
-            raw.next_notification(RAW_SILENCE_TIMEOUT).await?.is_none(),
-            "account notifications continued after unsubscribe"
-        )?;
-
-        let logs_sub = raw.logs_subscribe_mentions(&account1_pubkey).await?;
-        transfer(
-            &sender,
-            &account1_pubkey,
-            &account2_pubkey,
-            TRANSFER_LAMPORTS,
-        )
-        .await?;
-        check!(
-            raw.next_notification(RAW_FIRST_TIMEOUT).await?.is_some(),
-            "no logs notification before unsubscribe"
-        )?;
-        check!(
-            raw.logs_unsubscribe(logs_sub).await?,
-            "the logs unsubscribe must return true"
-        )?;
-        while raw.next_notification(RAW_DRAIN_TIMEOUT).await?.is_some() {}
-        let after_logs_unsub = sender
-            .submit_fresh(&[system::transfer(
-                &account1_pubkey,
-                &account2_pubkey,
-                TRANSFER_LAMPORTS,
-            )])
-            .await?;
-        er.api()
-            .await_transaction(&after_logs_unsub, Duration::from_secs(5))
-            .await?;
-        check!(
-            raw.next_notification(RAW_SILENCE_TIMEOUT).await?.is_none(),
-            "logs notifications continued after unsubscribe"
-        )?;
-
-        let program_sub = raw.program_subscribe(&system_program).await?;
-        transfer(
-            &sender,
-            &account1_pubkey,
-            &account2_pubkey,
-            TRANSFER_LAMPORTS,
-        )
-        .await?;
-        check!(
-            raw.next_notification(RAW_FIRST_TIMEOUT).await?.is_some(),
-            "no program notification before unsubscribe"
-        )?;
-        check!(
-            raw.program_unsubscribe(program_sub).await?,
-            "the program unsubscribe must return true"
-        )?;
-        while raw.next_notification(RAW_DRAIN_TIMEOUT).await?.is_some() {}
-        let after_program_unsub = sender
-            .submit_fresh(&[system::transfer(
-                &account1_pubkey,
-                &account2_pubkey,
-                TRANSFER_LAMPORTS,
-            )])
-            .await?;
-        er.api()
-            .await_transaction(&after_program_unsub, Duration::from_secs(5))
-            .await?;
-        check!(
-            raw.next_notification(RAW_SILENCE_TIMEOUT).await?.is_none(),
-            "program notifications continued after unsubscribe"
-        )?;
+            check!(
+                raw.next_notification(RAW_FIRST_TIMEOUT).await?.is_some(),
+                "no {case} notification before unsubscribe"
+            )?;
+            let removed = match case {
+                "account" => raw.account_unsubscribe(subscription).await?,
+                "logs" => raw.logs_unsubscribe(subscription).await?,
+                _ => raw.program_unsubscribe(subscription).await?,
+            };
+            check!(removed, "the {case} unsubscribe must return true")?;
+            while raw.next_notification(RAW_DRAIN_TIMEOUT).await?.is_some() {}
+            let signature = sender
+                .submit_fresh(&[system::transfer(
+                    &account1_pubkey,
+                    &account2_pubkey,
+                    TRANSFER_LAMPORTS,
+                )])
+                .await?;
+            er.api()
+                .await_transaction(&signature, Duration::from_secs(5))
+                .await?;
+            check!(
+                raw.next_notification(RAW_SILENCE_TIMEOUT).await?.is_none(),
+                "{case} notifications continued after unsubscribe ({signature})"
+            )?;
+        }
 
         let slot_sub = raw.slot_subscribe().await?;
         check!(

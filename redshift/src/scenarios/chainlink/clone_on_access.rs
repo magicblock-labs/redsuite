@@ -173,18 +173,9 @@ impl Scenario for CloneOnAccess {
         // redelegation continuity — undelegate + redelegate-to-us composed
         // in ONE base transaction (validator-signed dlp undelegate, then
         // assign + delegate) must never interrupt the er clone.
-        let wallet = Keypair::new();
-        base.airdrop(&wallet.pubkey(), WALLET_LAMPORTS).await?;
-        let delegate_setup = [
-            system::assign(&wallet.pubkey(), &dlp::dlp_id()),
-            dlp::delegate_account(
-                &payer.pubkey(),
-                &wallet.pubkey(),
-                &er.identity(),
-            ),
-        ];
-        base.submit_and_confirm_with(&payer, &[&wallet], &delegate_setup)
-            .await?;
+        let wallet =
+            prep::delegated_payer(base, &payer, er.identity(), WALLET_LAMPORTS)
+                .await?;
         check::poll(
             "the ER clones the delegated wallet at full balance",
             CLONE_TIMEOUT,

@@ -1,3 +1,5 @@
+use super::{await_catch_up, leader_metric, verifier_metric};
+
 use std::{
     collections::HashSet,
     path::PathBuf,
@@ -25,48 +27,6 @@ const PROBES: usize = 4;
 const BLOCKS: &str = "engine_ledger_blocks";
 const TRANSACTIONS: &str = "engine_ledger_transactions";
 
-async fn verifier_gauge(verifier: &Verifier, name: &str) -> Result<f64> {
-    verifier.scrape_metrics().await?.get(name).ok_or_else(|| {
-        format!("verifier `{}` exposes no {name} metric", verifier.label())
-            .into()
-    })
-}
-
-async fn leader_gauge(
-    topology: &ReplicatedTopology,
-    name: &str,
-) -> Result<f64> {
-    topology
-        .leader()
-        .ctx()
-        .scrape_metrics()
-        .await?
-        .get(name)
-        .ok_or_else(|| format!("the leader exposes no {name} metric").into())
-}
-
-async fn await_catch_up(
-    verifier: &Verifier,
-    name: &str,
-    target: f64,
-) -> Result<Duration> {
-    let started = Instant::now();
-    check::poll(
-        &format!(
-            "verifier `{}` {name} reaching the leader's {target:.0}",
-            verifier.label()
-        ),
-        CATCH_UP_TIMEOUT,
-        || async {
-            verifier_gauge(verifier, name)
-                .await
-                .is_ok_and(|value| value >= target)
-        },
-    )
-    .await?;
-    Ok(started.elapsed())
-}
-
 async fn await_leader_connections(
     topology: &ReplicatedTopology,
     expected: usize,
@@ -86,9 +46,9 @@ async fn await_leader_connections(
 }
 
 async fn blocks_advance(verifier: &Verifier, moment: &str) -> Result<f64> {
-    let before = verifier_gauge(verifier, BLOCKS).await?;
+    let before = verifier_metric(verifier, BLOCKS).await?;
     tokio::time::sleep(ADVANCE_WINDOW).await;
-    let after = verifier_gauge(verifier, BLOCKS).await?;
+    let after = verifier_metric(verifier, BLOCKS).await?;
     check!(
         after > before,
         "{moment}: verifier `{}` stayed at {before:.0} blocks for \
@@ -208,13 +168,28 @@ impl PrivateErScenario for VerifierLifecycle {
         verify_isolation(&topology).await?;
 
         probe_clones(base, &topology).await?;
-        let leader_txs = leader_gauge(&topology, TRANSACTIONS).await?;
-        let leader_blocks = leader_gauge(&topology, BLOCKS).await?;
+        let leader_txs = leader_metric(&topology, TRANSACTIONS).await?;
+        let leader_blocks = leader_metric(&topology, BLOCKS).await?;
         let mut initial_catch_up = Duration::ZERO;
         for verifier in topology.verifiers() {
-            await_catch_up(verifier, TRANSACTIONS, leader_txs).await?;
-            initial_catch_up = initial_catch_up
-                .max(await_catch_up(verifier, BLOCKS, leader_blocks).await?);
+            await_catch_up(
+                verifier,
+                TRANSACTIONS,
+                leader_txs,
+                "startup",
+                CATCH_UP_TIMEOUT,
+            )
+            .await?;
+            initial_catch_up = initial_catch_up.max(
+                await_catch_up(
+                    verifier,
+                    BLOCKS,
+                    leader_blocks,
+                    "startup",
+                    CATCH_UP_TIMEOUT,
+                )
+                .await?,
+            );
         }
         eprintln!(
             "[redsuite] {}: leader + {VERIFIERS} verifiers up in {:.1} s, \
@@ -251,11 +226,13 @@ impl PrivateErScenario for VerifierLifecycle {
         let startup = topology.verifier_mut(0).start(READY_TIMEOUT).await?;
         let reconnect =
             topology.verifier(0).wait_connected(CONNECT_TIMEOUT).await?;
-        let leader_blocks_at_restart = leader_gauge(&topology, BLOCKS).await?;
+        let leader_blocks_at_restart = leader_metric(&topology, BLOCKS).await?;
         let catch_up = await_catch_up(
             topology.verifier(0),
             BLOCKS,
             leader_blocks_at_restart,
+            "restart",
+            CATCH_UP_TIMEOUT,
         )
         .await?;
         await_leader_connections(&topology, VERIFIERS).await?;
@@ -291,11 +268,13 @@ impl PrivateErScenario for VerifierLifecycle {
             "the leader's slot stood at {slot_before} with a verifier offline"
         )?;
         probe_clones(base, &topology).await?;
-        let leader_txs_final = leader_gauge(&topology, TRANSACTIONS).await?;
+        let leader_txs_final = leader_metric(&topology, TRANSACTIONS).await?;
         let final_catch_up = await_catch_up(
             topology.verifier(0),
             TRANSACTIONS,
             leader_txs_final,
+            "survivor",
+            CATCH_UP_TIMEOUT,
         )
         .await?;
         check!(
@@ -317,11 +296,23 @@ impl PrivateErScenario for VerifierLifecycle {
         topology.verifier_mut(1).reset_storage()?;
         topology.verifier_mut(1).start(READY_TIMEOUT).await?;
         topology.verifier(1).wait_connected(CONNECT_TIMEOUT).await?;
-        let leader_blocks_at_rejoin = leader_gauge(&topology, BLOCKS).await?;
-        await_catch_up(topology.verifier(1), BLOCKS, leader_blocks_at_rejoin)
-            .await?;
-        await_catch_up(topology.verifier(1), TRANSACTIONS, leader_txs_final)
-            .await?;
+        let leader_blocks_at_rejoin = leader_metric(&topology, BLOCKS).await?;
+        await_catch_up(
+            topology.verifier(1),
+            BLOCKS,
+            leader_blocks_at_rejoin,
+            "wiped rejoin",
+            CATCH_UP_TIMEOUT,
+        )
+        .await?;
+        await_catch_up(
+            topology.verifier(1),
+            TRANSACTIONS,
+            leader_txs_final,
+            "wiped rejoin",
+            CATCH_UP_TIMEOUT,
+        )
+        .await?;
         let rejoin = rejoin_started.elapsed();
         await_leader_connections(&topology, VERIFIERS).await?;
         eprintln!(
@@ -347,7 +338,7 @@ impl PrivateErScenario for VerifierLifecycle {
             .collect();
         topology.finish().await?;
 
-        Ok(ScenarioReport::ok(self.name())
+        let mut report = ScenarioReport::ok(self.name())
             .setting("verifiers", VERIFIERS)
             .setting("leader identity", leader_identity)
             .setting("leader rpc port", leader_rpc_port)
@@ -355,51 +346,26 @@ impl PrivateErScenario for VerifierLifecycle {
             .metric("boot s", Unit::Seconds, boot.as_secs_f64())
             .metric("connect s", Unit::Seconds, connect.as_secs_f64())
             .metric(
-                "initial catch up ms",
-                Unit::Millis,
-                initial_catch_up.as_secs_f64() * 1e3,
-            )
-            .metric(
-                "verifier0 stop ms",
-                Unit::Millis,
-                stopped.shutdown.as_secs_f64() * 1e3,
-            )
-            .metric(
-                "verifier0 restart ms",
-                Unit::Millis,
-                startup.as_secs_f64() * 1e3,
-            )
-            .metric(
-                "verifier0 reconnect ms",
-                Unit::Millis,
-                reconnect.as_secs_f64() * 1e3,
-            )
-            .metric(
-                "verifier0 catch up ms",
-                Unit::Millis,
-                catch_up.as_secs_f64() * 1e3,
-            )
-            .metric(
                 "verifier1 blocks while alone",
                 Unit::Count,
                 survivor_blocks,
             )
             .metric("verifier0 blocks while alone", Unit::Count, lone_blocks)
-            .metric(
-                "verifier1 kill ms",
-                Unit::Millis,
-                killed.shutdown.as_secs_f64() * 1e3,
-            )
-            .metric(
-                "final catch up ms",
-                Unit::Millis,
-                final_catch_up.as_secs_f64() * 1e3,
-            )
-            .metric(
-                "verifier1 rejoin ms",
-                Unit::Millis,
-                rejoin.as_secs_f64() * 1e3,
-            )
-            .metric("leader txs", Unit::Count, leader_txs_final))
+            .metric("leader txs", Unit::Count, leader_txs_final);
+        for (label, elapsed) in [
+            ("initial catch up ms", initial_catch_up),
+            ("verifier0 stop ms", stopped.shutdown),
+            ("verifier0 restart ms", startup),
+            ("verifier0 reconnect ms", reconnect),
+            ("verifier0 catch up ms", catch_up),
+            ("verifier1 kill ms", killed.shutdown),
+            ("final catch up ms", final_catch_up),
+            ("verifier1 rejoin ms", rejoin),
+        ] {
+            report =
+                report.metric(label, Unit::Millis, elapsed.as_secs_f64() * 1e3);
+        }
+
+        Ok(report)
     }
 }

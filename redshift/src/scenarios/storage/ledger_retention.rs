@@ -1,7 +1,4 @@
-use std::{
-    cell::RefCell,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use keypair::Keypair;
@@ -9,7 +6,7 @@ use pubkey::Pubkey;
 use redshift_interface::flexi::{build, FlexiCounter};
 use redsuite_core::report::Unit;
 use redsuite_core::{
-    check, check_eq, dlp, prep, system, topology,
+    check, check_eq, prep, topology,
     topology::{ErOptions, RestartConfig},
     BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result, ScenarioReport,
 };
@@ -63,45 +60,22 @@ async fn superblocks(er: &ErCtx) -> Result<u64> {
     Ok(metrics.get(SUPERBLOCKS).unwrap_or(0.0) as u64)
 }
 
-async fn await_program_clone(er: &ErCtx, program: &Pubkey) -> Result<()> {
-    check::poll(
-        &format!("the er clones the program {program} as executable"),
-        PROGRAM_CLONE_TIMEOUT,
-        || async {
-            matches!(er.account(program).await, Ok(Some(clone)) if clone.executable)
-        },
-    )
-    .await?;
-    Ok(())
-}
-
 async fn delegate_counter(
     base: &BaseCtx,
     er: &ErCtx,
     payer: &Keypair,
 ) -> Result<Pubkey> {
     let payer_chain = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
-    let (init, counter) = build::init_counter(payer.pubkey(), LABEL);
-    base.submit_and_confirm(payer, &[init]).await?;
-    base.submit_and_confirm(
-        payer,
-        &[build::delegate_counter(
-            payer.pubkey(),
-            prep::COMMIT_FREQUENCY_MS,
-            Some(er.identity()),
-        )],
-    )
-    .await?;
-    let delegate_payer = [
-        system::assign(&payer.pubkey(), &dlp::dlp_id()),
-        dlp::delegate_account(
-            &payer_chain.pubkey(),
-            &payer.pubkey(),
-            &er.identity(),
-        ),
-    ];
-    base.submit_and_confirm_with(&payer_chain, &[payer], &delegate_payer)
-        .await?;
+    let (counter, setup) = prep::flexi_counter(
+        payer.pubkey(),
+        LABEL,
+        er.identity(),
+        prep::COMMIT_FREQUENCY_MS,
+    );
+    for instruction in setup {
+        base.submit_and_confirm(payer, &[instruction]).await?;
+    }
+    prep::delegate_payer(base, &payer_chain, payer, er.identity()).await?;
     Ok(counter)
 }
 
@@ -110,29 +84,23 @@ async fn seed_history(
     counter: &Pubkey,
     sent: &mut Vec<Sent>,
 ) -> Result<()> {
-    let listed = RefCell::new(Vec::new());
-    check::poll(
+    let listed = check::poll_for(
         "the er records the clone of the delegated counter",
         PROGRAM_CLONE_TIMEOUT,
         || async {
-            if !matches!(er.account(counter).await, Ok(Some(_))) {
-                return false;
-            }
-            match er
+            check!(
+                er.account(counter).await?.is_some(),
+                "counter {counter} not cloned"
+            )?;
+            let signatures = er
                 .api()
                 .get_signatures_for_address(counter, SIGNATURE_WINDOW)
-                .await
-            {
-                Ok(signatures) if !signatures.is_empty() => {
-                    *listed.borrow_mut() = signatures;
-                    true
-                }
-                _ => false,
-            }
+                .await?;
+            check!(!signatures.is_empty(), "counter {counter} has no history")?;
+            Ok::<_, redsuite_core::DynError>(signatures)
         },
     )
     .await?;
-    let listed = listed.into_inner();
     for signature in listed.iter().rev() {
         let signature: Signature = signature.parse()?;
         let tx =
@@ -320,7 +288,12 @@ impl PrivateErScenario for LedgerRetention {
         let before;
         {
             let er = private.ctx();
-            await_program_clone(er, &redshift_interface::id()).await?;
+            prep::await_program_clone(
+                er,
+                &redshift_interface::id(),
+                PROGRAM_CLONE_TIMEOUT,
+            )
+            .await?;
             counter = delegate_counter(base, er, &payer).await?;
             seed_history(er, &counter, &mut sent).await?;
 

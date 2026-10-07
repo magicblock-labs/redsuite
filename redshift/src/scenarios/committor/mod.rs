@@ -8,7 +8,7 @@ pub mod delegation_session_isolation;
 pub mod table_mania;
 pub mod undelegation_recovery;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use keypair::Keypair;
 use pubkey::Pubkey;
@@ -77,5 +77,46 @@ async fn prove_landed(
         },
     )
     .await?;
+    Ok(())
+}
+
+async fn hold_nonces(
+    base: &BaseCtx,
+    accounts: &[Pubkey],
+    expected: &[u64],
+    window: Duration,
+    phase: &str,
+) -> Result<()> {
+    let deadline = Instant::now() + window;
+    loop {
+        for (account, expected) in accounts.iter().zip(expected) {
+            let nonce = crate::last_commit_id(base, account).await?;
+            check_eq!(
+                nonce,
+                *expected,
+                "{phase}: the nonce of {account} must remain unchanged throughout the window"
+            )?;
+        }
+        if Instant::now() >= deadline {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+// Duplicate rejection is not settlement evidence for exactly-once, ordering,
+// or projected-token checks. Confirmation and target checks stay at the caller.
+pub(super) fn require_settled(
+    receipt: &redsuite_core::receipt::CommitReceipt,
+    phase: &str,
+) -> Result<()> {
+    check!(
+        receipt.succeeded(),
+        "{phase}: settlement failed: {receipt:?}"
+    )?;
+    check!(
+        !receipt.base_signatures.is_empty(),
+        "{phase}: a settled receipt names its base transactions"
+    )?;
     Ok(())
 }

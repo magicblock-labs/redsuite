@@ -112,19 +112,20 @@ pub(super) fn remove_state() {
 
 pub(super) struct LockGuard(#[allow(dead_code)] std::fs::File);
 
-pub(super) async fn acquire_lock(path: PathBuf) -> Result<LockGuard> {
-    let file = tokio::task::spawn_blocking(
-        move || -> std::io::Result<std::fs::File> {
+pub(super) async fn acquire_lock() -> Result<LockGuard> {
+    let file =
+        tokio::task::spawn_blocking(|| -> std::io::Result<std::fs::File> {
+            let dir = stack_dir();
+            fs::create_dir_all(&dir)?;
             let file = fs::OpenOptions::new()
                 .create(true)
                 .truncate(false)
                 .write(true)
-                .open(&path)?;
+                .open(dir.join("lock"))?;
             file.lock()?;
             Ok(file)
-        },
-    )
-    .await
-    .map_err(|e| format!("lock task panicked: {e}"))??;
+        })
+        .await
+        .map_err(|e| format!("lock task panicked: {e}"))??;
     Ok(LockGuard(file))
 }

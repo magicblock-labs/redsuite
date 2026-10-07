@@ -4,8 +4,8 @@ use async_trait::async_trait;
 use keypair::Keypair;
 use redsuite_core::report::Unit;
 use redsuite_core::{
-    check, check_eq, dlp, prep, system, BaseCtx, ChainCtx, ErCtx, Result,
-    Scenario, ScenarioReport,
+    check, check_eq, prep, system, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
+    ScenarioReport,
 };
 use signer::Signer;
 
@@ -124,33 +124,11 @@ impl Scenario for EscrowCloning {
         let funder = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
         let spender =
             prep::escrowed_payer(base, er.identity(), ESCROW_FUNDING).await?;
-        let delegate_spender = [
-            system::assign(&spender.payer.pubkey(), &dlp::dlp_id()),
-            dlp::delegate_account(
-                &funder.pubkey(),
-                &spender.payer.pubkey(),
-                &er.identity(),
-            ),
-        ];
-        base.submit_and_confirm_with(
-            &funder,
-            &[&spender.payer],
-            &delegate_spender,
-        )
-        .await?;
-
-        let receiver = Keypair::new();
-        base.airdrop(&receiver.pubkey(), RENT_EXEMPT).await?;
-        let delegate_receiver = [
-            system::assign(&receiver.pubkey(), &dlp::dlp_id()),
-            dlp::delegate_account(
-                &funder.pubkey(),
-                &receiver.pubkey(),
-                &er.identity(),
-            ),
-        ];
-        base.submit_and_confirm_with(&funder, &[&receiver], &delegate_receiver)
+        prep::delegate_payer(base, &funder, &spender.payer, er.identity())
             .await?;
+        let receiver =
+            prep::delegated_payer(base, &funder, er.identity(), RENT_EXEMPT)
+                .await?;
         check::poll(
             "the ER clones the delegated receiver at its rent-exempt balance",
             CLONE_TIMEOUT,
