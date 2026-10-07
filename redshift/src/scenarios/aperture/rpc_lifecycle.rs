@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
-    time::{Duration, Instant},
+    rc::Rc,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
@@ -18,7 +19,8 @@ use redsuite_core::{
         RpcBlockConfig, RpcSendTransactionConfig, RpcSimulateTransactionConfig,
         RpcTransactionConfig,
     },
-    BaseCtx, ChainCtx, ErCtx, Result, Scenario, ScenarioReport,
+    system, BaseCtx, ChainCtx, CheckError, ErCtx, Result, Scenario,
+    ScenarioReport,
 };
 use serde::Deserialize;
 use signature::Signature;
@@ -30,6 +32,10 @@ use solana_transaction_status_client_types::{
 use transaction::Transaction;
 
 use crate::program::instruction::build;
+
+const CLOCK_ITERATIONS: usize = 10;
+const LEDGER_SETTLE_SLOTS: u64 = 10;
+const LEDGER_SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
 
 const WRITES: usize = 256;
 const PAYERS: usize = 32;
@@ -183,6 +189,69 @@ async fn await_publication(client: &RpcClient, slot: u64) -> Result<()> {
         )?;
         tokio::time::sleep(POLL).await;
     }
+}
+
+// The burst can fit in one slot. These transfers deliberately span advancing
+// slots, then reread the ledger after ten more slots have settled.
+async fn advancing_clock(base: &BaseCtx, er: &ErCtx) -> Result<()> {
+    let funder = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
+    let from =
+        prep::delegated_payer(base, &funder, er.identity(), 1_000_000_000)
+            .await?;
+    let to = prep::delegated_payer(base, &funder, er.identity(), 1_000_000_000)
+        .await?;
+    let sender = er.sender(Rc::new(from));
+    for iteration in 0..CLOCK_ITERATIONS {
+        let signature = sender
+            .submit_fresh(&[system::transfer(
+                &sender.payer().pubkey(),
+                &to.pubkey(),
+                1_000_000,
+            )])
+            .await?;
+        let confirmed = er
+            .api()
+            .await_transaction(&signature, Duration::from_secs(5))
+            .await?;
+        check!(
+            confirmed.err.is_none(),
+            "clock {iteration}: {signature} failed: {:?}",
+            confirmed.err
+        )?;
+        let slot = confirmed.slot;
+        let settled =
+            check::poll_until(LEDGER_SETTLE_TIMEOUT, POLL, async || {
+                Ok::<_, redsuite_core::DynError>(
+                    (er.api().get_slot().await? >= slot + LEDGER_SETTLE_SLOTS)
+                        .then_some(()),
+                )
+            })
+            .await?;
+        check!(settled.is_some(), "clock {iteration}: slot never reached {} within {LEDGER_SETTLE_TIMEOUT:?}", slot + LEDGER_SETTLE_SLOTS)?;
+        let time = er.api().get_block_time(slot).await?.ok_or_else(|| {
+            CheckError::new(format!(
+                "clock {iteration}: getBlockTime({slot}) returned null"
+            ))
+        })?;
+        let block = er.api().get_block(slot).await?.ok_or_else(|| {
+            CheckError::new(format!(
+                "clock {iteration}: getBlock({slot}) returned null"
+            ))
+        })?;
+        let transaction =
+            er.api().get_transaction(&signature).await?.ok_or_else(|| {
+                format!("clock {iteration}: settled {signature} vanished")
+            })?;
+        check_eq!(
+            (block.block_time, transaction.block_time),
+            (Some(time), Some(time)),
+            "clock {iteration}: block and transaction {signature} agree with getBlockTime({slot})"
+        )?;
+        let now =
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+        check!(time > 0 && time <= now, "clock {iteration}: timestamp {time} is positive and not in the future (now {now})")?;
+    }
+    Ok(())
 }
 
 #[async_trait(?Send)]
@@ -526,7 +595,12 @@ impl Scenario for RpcLifecycle {
             "getDelegationStatus must report a plain payer as not delegated"
         )?;
 
+        advancing_clock(base, er).await?;
+
         Ok(ScenarioReport::ok(self.name())
+            .setting("clock iterations", CLOCK_ITERATIONS)
+            .setting("ledger settle slots", LEDGER_SETTLE_SLOTS)
+            .metric("transfers", Unit::Count, CLOCK_ITERATIONS as f64)
             .setting("writes", WRITES)
             .setting("payers", PAYERS)
             .setting("fee lamports", fee)

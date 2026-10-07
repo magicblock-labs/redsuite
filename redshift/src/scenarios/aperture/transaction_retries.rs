@@ -29,8 +29,7 @@ const COPIES: usize = 32;
 
 pub enum TransactionRetries {
     ColdFetch,
-    ConcurrentSuccess,
-    ConcurrentFailure,
+    Concurrent,
     Subscriptions,
     ExpiryRestart,
 }
@@ -143,8 +142,18 @@ impl Signed {
                 .ok_or_else(|| redsuite_core::DynError::from("transaction missing"))
         })
         .await?;
-        check_eq!(tx["meta"]["err"], self.error, "execution result")?;
-        check_eq!(tx["meta"]["fee"].as_u64(), Some(self.fee), "execution fee")?;
+        check_eq!(
+            tx["meta"]["err"],
+            self.error,
+            "{} execution result",
+            self.signature
+        )?;
+        check_eq!(
+            tx["meta"]["fee"].as_u64(),
+            Some(self.fee),
+            "{} execution fee",
+            self.signature
+        )?;
         tx["slot"]
             .as_u64()
             .ok_or_else(|| "transaction slot missing".into())
@@ -153,8 +162,12 @@ impl Signed {
 
 async fn state(er: &ErCtx, keys: &[Pubkey; 2]) -> Result<(u64, FlexiCounter)> {
     let accounts = er.accounts(keys).await?;
-    let payer = accounts[0].as_ref().ok_or("payer missing")?;
-    let counter = accounts[1].as_ref().ok_or("counter missing")?;
+    let payer = accounts[0]
+        .as_ref()
+        .ok_or_else(|| format!("payer {} missing", keys[0]))?;
+    let counter = accounts[1]
+        .as_ref()
+        .ok_or_else(|| format!("counter {} missing", keys[1]))?;
     Ok((payer.lamports, FlexiCounter::try_decode(&counter.data)?))
 }
 
@@ -307,8 +320,7 @@ impl PrivateErScenario for TransactionRetries {
     fn name(&self) -> &str {
         match self {
             Self::ColdFetch => "redshift/transaction_retry_cold_fetch",
-            Self::ConcurrentSuccess => "redshift/transaction_retry_success",
-            Self::ConcurrentFailure => "redshift/transaction_retry_failure",
+            Self::Concurrent => "redshift/transaction_retry_concurrent",
             Self::Subscriptions => "redshift/transaction_retry_subscriptions",
             Self::ExpiryRestart => "redshift/transaction_retry_expiry_restart",
         }
@@ -325,21 +337,47 @@ impl PrivateErScenario for TransactionRetries {
             },
         )
         .await?;
+        let mut report = ScenarioReport::ok(self.name());
+        let phases: &[&str] = if matches!(self, Self::Concurrent) {
+            &["success", "failure"]
+        } else {
+            &["case"]
+        };
+        for &phase in phases {
+            // Each outcome owns fresh payer/counter state and its ledger window.
+            report = self
+                .run_case(base, &proxies, &mut private, phase, report)
+                .await
+                .map_err(|error| -> redsuite_core::DynError {
+                    match error.downcast::<redsuite_core::CheckError>() {
+                        Ok(error) => error.context("case", phase).into(),
+                        Err(error) => format!("{phase}: {error}").into(),
+                    }
+                })?;
+        }
+        private.finish().await?;
+        Ok(netfault::report_events(report, &proxies.finish()?))
+    }
+}
+
+impl TransactionRetries {
+    async fn run_case(
+        &self,
+        base: &BaseCtx,
+        proxies: &BaseProxies,
+        private: &mut topology::PrivateEr,
+        phase: &str,
+        mut report: ScenarioReport,
+    ) -> Result<ScenarioReport> {
         let er = private.ctx();
         let owner = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
-        let (init, counter) = build::init_counter(owner.pubkey(), self.name());
-        base.submit_and_confirm(
-            &owner,
-            &[
-                init,
-                build::delegate_counter(
-                    owner.pubkey(),
-                    u32::MAX,
-                    Some(er.identity()),
-                ),
-            ],
-        )
-        .await?;
+        let (counter, setup) = prep::flexi_counter(
+            owner.pubkey(),
+            self.name(),
+            er.identity(),
+            u32::MAX,
+        );
+        base.submit_and_confirm(&owner, &setup).await?;
         let payer = prep::delegated_payer(
             base,
             &owner,
@@ -368,12 +406,13 @@ impl PrivateErScenario for TransactionRetries {
         check_eq!(
             (expected.1.count, expected.1.updates),
             (0, 0),
-            "fresh counter"
+            "{phase}: fresh counter {}",
+            keys[1]
         )?;
-        let mut report = ScenarioReport::ok(self.name())
-            .setting("payer", keys[0])
-            .setting("counter", keys[1])
-            .setting("before", format!("{expected:?}"));
+        report = report
+            .setting(format!("{phase} payer"), keys[0])
+            .setting(format!("{phase} counter"), keys[1])
+            .setting(format!("{phase} before"), format!("{expected:?}"));
         let mut start = er.api().get_slot().await?;
 
         match self {
@@ -432,12 +471,10 @@ impl PrivateErScenario for TransactionRetries {
                 expected.1.updates += 1;
                 report = report.setting("signature", tx.signature);
             }
-            Self::ConcurrentSuccess
-            | Self::ConcurrentFailure
-            | Self::Subscriptions => {
+            Self::Concurrent | Self::Subscriptions => {
                 let mut pending_results = [false; 2];
                 for round in 1..=8 {
-                    let fail = matches!(self, Self::ConcurrentFailure)
+                    let fail = phase == "failure"
                         || matches!(self, Self::Subscriptions)
                             && round % 2 == 0;
                     let copies = if matches!(self, Self::Subscriptions) {
@@ -466,12 +503,14 @@ impl PrivateErScenario for TransactionRetries {
                     check_eq!(
                         state(er, &keys).await?,
                         expected,
-                        "round {round}: exact effect and fee"
+                        "{phase} round {round}: {} counter {} exact effect and fee",
+                        tx.signature,
+                        keys[1]
                     )?;
                     let pending = notifications?;
                     pending_results[usize::from(fail)] |= pending;
                     report = report.setting(
-                        format!("round_{round}"),
+                        format!("{phase} round_{round}"),
                         format!(
                             "{} fee={} pending_subscription={pending} {expected:?}",
                             tx.signature, tx.fee
@@ -605,8 +644,8 @@ impl PrivateErScenario for TransactionRetries {
             expected,
             "final effect and payer balance"
         )?;
-        report = report.setting("after", format!("{expected:?}"));
-        private.finish().await?;
-        Ok(netfault::report_events(report, &proxies.finish()?))
+        report =
+            report.setting(format!("{phase} after"), format!("{expected:?}"));
+        Ok(report)
     }
 }

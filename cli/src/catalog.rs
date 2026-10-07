@@ -215,12 +215,7 @@ pub mod redshift {
             resources: [Resource::Er],
             fixtures: [Fixture::RedshiftProgram],
         },
-        transaction_retry_success => aperture::transaction_retries::TransactionRetries::ConcurrentSuccess {
-            topology: PrivateEr,
-            resources: [Resource::Er],
-            fixtures: [Fixture::RedshiftProgram],
-        },
-        transaction_retry_failure => aperture::transaction_retries::TransactionRetries::ConcurrentFailure {
+        transaction_retry_concurrent => aperture::transaction_retries::TransactionRetries::Concurrent {
             topology: PrivateEr,
             resources: [Resource::Er],
             fixtures: [Fixture::RedshiftProgram],
@@ -254,13 +249,13 @@ pub mod redshift {
             optional_fixtures: [],
         },
         api_invariants => harness::api_invariants::ApiInvariants {
-            topology: Shared,
-            resources: [Resource::Er],
+            topology: PrivateEr,
+            resources: [],
             fixtures: [],
         },
         claim_fees => committor::claim_fees::ClaimFees {
-            topology: Shared,
-            resources: [Resource::Er],
+            topology: PrivateEr,
+            resources: [],
             fixtures: [],
         },
         pubsub_contracts => pubsub::pubsub_contracts::PubsubContracts {
@@ -274,11 +269,6 @@ pub mod redshift {
             fixtures: [],
         },
         escrow_cloning => chainlink::escrow_cloning::EscrowCloning {
-            topology: Shared,
-            resources: [Resource::Er],
-            fixtures: [],
-        },
-        parallel_cloning => chainlink::parallel_cloning::ParallelCloning {
             topology: Shared,
             resources: [Resource::Er],
             fixtures: [],
@@ -319,8 +309,8 @@ pub mod redshift {
             fixtures: [Fixture::RedshiftProgram],
         },
         table_mania => committor::table_mania::TableManiaScenario {
-            topology: Shared,
-            resources: [Resource::Er],
+            topology: PrivateEr,
+            resources: [],
             fixtures: [],
         },
     }

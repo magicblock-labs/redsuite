@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use pubkey::Pubkey;
 use redshift_interface::flexi::{build, FlexiCounter};
 use redsuite_core::{
-    check, check_eq, dlp, prep, system, topology, BaseCtx, ChainCtx, ErCtx,
+    check, check_eq, prep, topology, BaseCtx, ChainCtx, ErCtx,
     PrivateErScenario, Result, ScenarioReport,
 };
 use signer::Signer;
@@ -67,18 +67,6 @@ async fn alt_transactions_since(
     Ok(found)
 }
 
-async fn await_program_clone(er: &ErCtx, program: &Pubkey) -> Result<()> {
-    check::poll(
-        &format!("the er clones the program {program} as executable"),
-        PROGRAM_CLONE_TIMEOUT,
-        || async {
-            matches!(er.account(program).await, Ok(Some(clone)) if clone.executable)
-        },
-    )
-    .await?;
-    Ok(())
-}
-
 async fn assert_program_blocked(er: &ErCtx, program: &Pubkey) -> Result<()> {
     let first = er.account(program).await?;
     check!(
@@ -101,33 +89,18 @@ async fn delegate_and_clone_counter(
     let payer_chain = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
     let payer_ephem = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
 
-    let (init, counter) = build::init_counter(payer_ephem.pubkey(), LABEL);
-    base.submit_and_confirm(&payer_ephem, &[init]).await?;
-    base.submit_and_confirm(
-        &payer_ephem,
-        &[build::delegate_counter(
-            payer_ephem.pubkey(),
-            prep::COMMIT_FREQUENCY_MS,
-            Some(er.identity()),
-        )],
-    )
-    .await?;
-
-    let delegate_setup = [
-        system::assign(&payer_ephem.pubkey(), &dlp::dlp_id()),
-        dlp::delegate_account(
-            &payer_chain.pubkey(),
-            &payer_ephem.pubkey(),
-            &er.identity(),
-        ),
-    ];
-    base.submit_and_confirm_with(
-        &payer_chain,
-        &[&payer_ephem],
-        &delegate_setup,
-    )
-    .await?;
-
+    let (counter, setup) = prep::flexi_counter(
+        payer_ephem.pubkey(),
+        LABEL,
+        er.identity(),
+        prep::COMMIT_FREQUENCY_MS,
+    );
+    for instruction in setup {
+        base.submit_and_confirm(&payer_ephem, &[instruction])
+            .await?;
+    }
+    prep::delegate_payer(base, &payer_chain, &payer_ephem, er.identity())
+        .await?;
     er.submit_and_confirm(&payer_ephem, &[build::add(payer_ephem.pubkey(), 1)])
         .await?;
     let clone = er
@@ -165,7 +138,12 @@ impl PrivateErScenario for ConfigGates {
             },
         )
         .await?;
-        await_program_clone(restricted.ctx(), &allowed).await?;
+        prep::await_program_clone(
+            restricted.ctx(),
+            &allowed,
+            PROGRAM_CLONE_TIMEOUT,
+        )
+        .await?;
         assert_program_blocked(restricted.ctx(), &blocked).await?;
         restricted.finish().await?;
 
@@ -192,8 +170,10 @@ impl PrivateErScenario for ConfigGates {
              got {after_start:?}"
         )?;
 
-        await_program_clone(open.ctx(), &allowed).await?;
-        await_program_clone(open.ctx(), &blocked).await?;
+        prep::await_program_clone(open.ctx(), &allowed, PROGRAM_CLONE_TIMEOUT)
+            .await?;
+        prep::await_program_clone(open.ctx(), &blocked, PROGRAM_CLONE_TIMEOUT)
+            .await?;
 
         let counter = delegate_and_clone_counter(base, open.ctx()).await?;
 

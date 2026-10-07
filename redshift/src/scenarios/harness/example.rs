@@ -1,13 +1,11 @@
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use instruction::{AccountMeta, Instruction};
 use keypair::Keypair;
-use pubkey::Pubkey;
 use redsuite_core::report::Unit;
 use redsuite_core::{
-    check, prep, stats::StreamingStats, BaseCtx, ChainCtx, CheckError, ErCtx,
-    Result, Scenario, ScenarioReport,
+    check, prep, stats::StreamingStats, system, BaseCtx, ChainCtx, CheckError,
+    ErCtx, Result, Scenario, ScenarioReport,
 };
 use signer::Signer;
 
@@ -33,7 +31,8 @@ impl Scenario for Example {
         // every transaction must differ somewhere (here: the amount)
         for unique in 1..=TRANSFERS {
             let lamports = LAMPORTS_PER_TRANSFER + unique;
-            let transfer = transfer_ix(payer.pubkey(), recipient, lamports);
+            let transfer =
+                system::transfer(&payer.pubkey(), &recipient, lamports);
             let sent = Instant::now();
             base.submit_and_confirm(&payer, &[transfer]).await?;
             latency.push(sent.elapsed().as_micros() as u32);
@@ -76,15 +75,4 @@ impl Scenario for Example {
                 metrics.get("mbv_monitored_accounts_gauge"),
             ))
     }
-}
-
-fn transfer_ix(from: Pubkey, to: Pubkey, lamports: u64) -> Instruction {
-    let system_program = Pubkey::default();
-    let mut data = 2u32.to_le_bytes().to_vec();
-    data.extend_from_slice(&lamports.to_le_bytes());
-    Instruction::new_with_bytes(
-        system_program,
-        &data,
-        vec![AccountMeta::new(from, true), AccountMeta::new(to, false)],
-    )
 }

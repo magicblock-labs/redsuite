@@ -10,7 +10,7 @@ use pubkey::Pubkey;
 use redshift_interface::schedulecommit::{build, ORDER_BOOK_INIT_SIZE};
 use redsuite_core::report::Unit;
 use redsuite_core::{
-    check, check_eq, dlp, prep, system, topology,
+    check, check_eq, prep, topology,
     topology::{ErOptions, RestartConfig},
     Api, BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result, ScenarioReport,
 };
@@ -94,25 +94,6 @@ async fn metric(er: &ErCtx, name: &str) -> Result<u64> {
     Ok(metrics.get(name).unwrap_or(0.0) as u64)
 }
 
-async fn delegate_payer(
-    base: &BaseCtx,
-    er: &ErCtx,
-    payer: &Keypair,
-) -> Result<()> {
-    let sponsor = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
-    let ixs = [
-        system::assign(&payer.pubkey(), &dlp::dlp_id()),
-        dlp::delegate_account(
-            &sponsor.pubkey(),
-            &payer.pubkey(),
-            &er.identity(),
-        ),
-    ];
-    base.submit_and_confirm_with(&sponsor, &[payer], &ixs)
-        .await?;
-    Ok(())
-}
-
 async fn delegate_books(
     base: &BaseCtx,
     er: &ErCtx,
@@ -133,20 +114,9 @@ async fn delegate_books(
             .await?;
         books.push(Book { manager, address });
     }
-    for book in &books {
-        let address = book.address;
-        check::poll(
-            &format!("the er clones the delegated order book {address}"),
-            CLONE_TIMEOUT,
-            || async {
-                matches!(
-                    er.account(&address).await,
-                    Ok(Some(clone)) if clone.data.len() == ORDER_BOOK_INIT_SIZE
-                )
-            },
-        )
+    let addresses: Vec<_> = books.iter().map(|book| book.address).collect();
+    prep::await_clones(er, &addresses, ORDER_BOOK_INIT_SIZE, CLONE_TIMEOUT)
         .await?;
-    }
     Ok(books)
 }
 
@@ -212,19 +182,16 @@ impl PrivateErScenario for SnapshotReadRace {
         let grows_before;
         {
             let er = private.ctx();
-            check::poll(
-                "the er clones the redshift program as executable",
+            prep::await_program_clone(
+                er,
+                &redshift_interface::id(),
                 CLONE_TIMEOUT,
-                || async {
-                    matches!(
-                        er.account(&redshift_interface::id()).await,
-                        Ok(Some(clone)) if clone.executable
-                    )
-                },
             )
             .await?;
             books = delegate_books(base, er, &payer).await?;
-            delegate_payer(base, er, &payer).await?;
+            let sponsor =
+                prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
+            prep::delegate_payer(base, &sponsor, &payer, er.identity()).await?;
             let addresses: Vec<Pubkey> =
                 books.iter().map(|book| book.address).collect();
 

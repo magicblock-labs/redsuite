@@ -224,19 +224,13 @@ impl PrivateErScenario for CheckpointDurability {
         )
         .await?;
         let owner = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
-        let (init, counter) = build::init_counter(owner.pubkey(), self.name());
-        base.submit_and_confirm(
-            &owner,
-            &[
-                init,
-                build::delegate_counter(
-                    owner.pubkey(),
-                    u32::MAX,
-                    Some(private.identity()),
-                ),
-            ],
-        )
-        .await?;
+        let (counter, setup) = prep::flexi_counter(
+            owner.pubkey(),
+            self.name(),
+            private.identity(),
+            u32::MAX,
+        );
+        base.submit_and_confirm(&owner, &setup).await?;
         let payer = prep::delegated_payer(
             base,
             &owner,

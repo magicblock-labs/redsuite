@@ -1,16 +1,7 @@
-# All scenario tests share one boot-once base+ER stack (the first test boots
-# it, the rest reuse it — see crates/redsuite-core/src/topology/stack.rs).
-# Shared-stack scenarios run in parallel.
-#
-# Scenarios that boot dedicated private ER validator processes are bounded
-# rather than serialized: each one is a full validator process, so running them
-# all at once would put roughly seven validators on the box. They no longer
-# conflict on state — each takes its own identity from the genesis pool, its own
-# storage directory, and its own ports.
-#
-# The `benchmarks` group holds the redline scenarios, one at a time, so
-# performance numbers are never measured beside other work. Keep these filters
-# aligned with the catalog's HostExclusive resource and PrivateEr topology.
+# Shared scenarios reuse one base+ER stack. Private scenarios reuse the base
+# and own their ERs, with isolated identities, storage and ports.
+# Base-only scenarios use the PrivateEr runner without launching an ER.
+# Keep filters aligned with the catalog's topology and HostExclusive entries.
 [test-groups]
 private-er = { max-threads = 2 }
 benchmarks = { max-threads = 1 }
@@ -20,5 +11,5 @@ filter = "test(catalog::redline::)"
 test-group = "benchmarks"
 
 [[profile.default.overrides]]
-filter = "test(undelegation_grpc_redundancy) or test(ephemeral_accounts) or test(aml_gate) or test(activation_single_shot) or test(program_upgrade) or test(cache_lifecycle) or test(undelegation_reconnect_gap) or test(rpc_compat_methods) or test(config_gates) or test(task_scheduler) or test(checkpoint_durability) or test(ledger_retention) or test(snapshot_read_race) or test(commit_blackout) or test(commit_exactly_once) or test(commit_settlement_order) or test(undelegation_recovery) or test(delegation_session_isolation) or test(verifier_lifecycle) or test(replication_recovery) or test(projected_token_lifecycle) or test(transaction_retry_)"
+filter = "test(api_invariants) or test(claim_fees) or test(table_mania) or test(undelegation_grpc_redundancy) or test(ephemeral_accounts) or test(aml_gate) or test(activation_single_shot) or test(program_upgrade) or test(cache_lifecycle) or test(undelegation_reconnect_gap) or test(rpc_compat_methods) or test(config_gates) or test(task_scheduler) or test(checkpoint_durability) or test(ledger_retention) or test(snapshot_read_race) or test(commit_blackout) or test(commit_exactly_once) or test(commit_settlement_order) or test(undelegation_recovery) or test(delegation_session_isolation) or test(verifier_lifecycle) or test(replication_recovery) or test(projected_token_lifecycle) or test(transaction_retry_)"
 test-group = "private-er"

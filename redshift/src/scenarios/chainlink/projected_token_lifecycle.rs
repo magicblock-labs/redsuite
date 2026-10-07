@@ -6,7 +6,7 @@ use pubkey::Pubkey;
 use redsuite_core::{
     check, check_eq, dlp,
     netfault::{self, BaseProxies, Selector},
-    prep, receipt, system, topology,
+    prep, receipt, topology,
     topology::ErOptions,
     BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result, ScenarioReport,
 };
@@ -155,7 +155,10 @@ async fn settled(
     let mut receipt =
         receipt::fetch_commit_receipt(er.api(), signature, RECEIPT_TIMEOUT)
             .await?;
-    check!(receipt.succeeded(), "commit failed: {receipt:?}")?;
+    crate::scenarios::committor::require_settled(
+        &receipt,
+        "projected-token commit",
+    )?;
     receipt.included.sort();
     let mut expected = expected.to_vec();
     expected.sort();
@@ -165,7 +168,6 @@ async fn settled(
         "settlement targets eATAs, not base ATAs"
     )?;
     check!(receipt.excluded.is_empty(), "no eATA may be excluded")?;
-    check!(!receipt.base_signatures.is_empty(), "missing base txs")?;
     check_eq!(
         receipt.requested_undelegation,
         undelegate,
@@ -245,13 +247,7 @@ impl PrivateErScenario for ProjectedTokenLifecycle {
             &payer,
             &[&mint],
             &[
-                system::create_account(
-                    &funder,
-                    &mint_key,
-                    spl::MINT_RENT,
-                    spl::MINT_LEN,
-                    &spl::token_program(),
-                ),
+                spl::allocate_mint(&funder, &mint_key),
                 spl::initialize_mint(&mint_key, &funder),
                 spl::initialize_global_vault(&funder, &mint_key),
             ],

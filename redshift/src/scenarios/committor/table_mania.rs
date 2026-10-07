@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use pubkey::Pubkey;
 use redsuite_core::{
-    check, check_eq, check_ne, prep, BaseCtx, ChainCtx, ErCtx, Result,
-    Scenario, ScenarioReport,
+    check, check_eq, check_ne, prep, BaseCtx, ChainCtx, PrivateErScenario,
+    Result, ScenarioReport,
 };
 use signer::Signer;
 use solana_address_lookup_table_interface::{
@@ -20,25 +20,124 @@ const NOT_DEACTIVATED: u64 = u64::MAX;
 pub struct TableManiaScenario;
 
 #[async_trait(?Send)]
-impl Scenario for TableManiaScenario {
+impl PrivateErScenario for TableManiaScenario {
     fn name(&self) -> &str {
         "redshift/table_mania"
     }
 
-    async fn run(&self, base: &BaseCtx, _er: &ErCtx) -> Result<ScenarioReport> {
-        let report = ScenarioReport::ok(self.name());
+    async fn run(&self, base: &BaseCtx) -> Result<ScenarioReport> {
+        let authority = prep::funded_payer(base, AIRDROP_LAMPORTS).await?;
+        let first = create_table(base, &authority).await?;
+        let created = read_table(base, &first).await?;
+        check_eq!(
+            created.authority,
+            Some(authority.pubkey()),
+            "new table {first} authority"
+        )?;
+        check_eq!(
+            created.deactivation_slot,
+            NOT_DEACTIVATED,
+            "new table {first} is active"
+        )?;
+        check!(created.addresses.is_empty(), "new table {first} is empty")?;
 
-        // Part 1: Lookup table creation, extension & meta verification
-        run_lookup_table_lifecycle(base).await?;
+        let keys = unique_pubkeys(TOTAL_PUBKEYS);
+        let mut start = 0;
+        for end in [10, 60, LOOKUP_TABLE_MAX_ADDRESSES] {
+            extend_table_in_chunks(base, &authority, first, &keys[start..end])
+                .await?;
+            let table = read_table(base, &first).await?;
+            check_eq!(
+                sorted(&table.addresses),
+                sorted(&keys[..end]),
+                "table {first}: exactly {end} staged addresses"
+            )?;
+            check_eq!(
+                table.deactivation_slot,
+                NOT_DEACTIVATED,
+                "extending table {first} leaves it active"
+            )?;
+            start = end;
+        }
+        let overflow = extend_lookup_table(
+            first,
+            authority.pubkey(),
+            Some(authority.pubkey()),
+            unique_pubkeys(1),
+        );
+        check!(
+            base.submit_and_confirm(&authority, &[overflow])
+                .await
+                .is_err(),
+            "table {first} rejects an address past capacity"
+        )?;
 
-        // Part 2: Address cap enforcement & spill into a second table
-        run_multi_table_allocation(base).await?;
+        let second = create_table(base, &authority).await?;
+        check_ne!(second, first, "overflow uses a distinct second table")?;
+        extend_table_in_chunks(
+            base,
+            &authority,
+            second,
+            &keys[LOOKUP_TABLE_MAX_ADDRESSES..],
+        )
+        .await?;
+        let spilled = read_table(base, &second).await?;
+        check_eq!(
+            sorted(&spilled.addresses),
+            sorted(&keys[LOOKUP_TABLE_MAX_ADDRESSES..]),
+            "table {second} contains exactly the spilled addresses"
+        )?;
+        check_eq!(
+            LOOKUP_TABLE_MAX_ADDRESSES + spilled.addresses.len(),
+            TOTAL_PUBKEYS,
+            "the two tables hold all addresses"
+        )?;
 
-        // Part 3: Deactivation marks the table on chain
-        run_deactivation_lifecycle(base).await?;
-
-        Ok(report)
+        // Empty-table deactivation is a separate contract from filled tables.
+        let empty = create_table(base, &authority).await?;
+        let before = read_table(base, &empty).await?;
+        check!(
+            before.addresses.is_empty(),
+            "deactivation starts with an empty table {empty}"
+        )?;
+        check_eq!(
+            before.deactivation_slot,
+            NOT_DEACTIVATED,
+            "table {empty} is active before deactivation"
+        )?;
+        base.submit_and_confirm(
+            &authority,
+            &[deactivate_lookup_table(empty, authority.pubkey())],
+        )
+        .await?;
+        let after = read_table(base, &empty).await?;
+        check_ne!(
+            after.deactivation_slot,
+            NOT_DEACTIVATED,
+            "table {empty} records its deactivation slot"
+        )?;
+        check_eq!(
+            after.authority,
+            Some(authority.pubkey()),
+            "deactivation preserves table {empty}'s authority"
+        )?;
+        Ok(ScenarioReport::ok(self.name())
+            .setting("tables", 3)
+            .setting("addresses", TOTAL_PUBKEYS))
     }
+}
+
+async fn create_table(
+    base: &BaseCtx,
+    authority: &keypair::Keypair,
+) -> Result<Pubkey> {
+    let (instruction, table) = create_lookup_table(
+        authority.pubkey(),
+        authority.pubkey(),
+        base.api().get_slot().await?,
+    );
+    base.submit_and_confirm(authority, &[instruction]).await?;
+    Ok(table)
 }
 
 struct TableState {
@@ -73,63 +172,6 @@ fn sorted(pubkeys: &[Pubkey]) -> Vec<Pubkey> {
     copy
 }
 
-async fn run_lookup_table_lifecycle(base: &BaseCtx) -> Result<()> {
-    let authority = prep::funded_payer(base, AIRDROP_LAMPORTS).await?;
-    let recent_slot = base.api().get_slot().await?;
-
-    let (create_ix, table_pda) = create_lookup_table(
-        authority.pubkey(),
-        authority.pubkey(),
-        recent_slot,
-    );
-    base.submit_and_confirm(&authority, &[create_ix]).await?;
-
-    let created = read_table(base, &table_pda).await?;
-    check_eq!(
-        created.authority,
-        Some(authority.pubkey()),
-        "the new lookup table does not carry the expected authority"
-    )?;
-    check_eq!(
-        created.deactivation_slot,
-        NOT_DEACTIVATED,
-        "the new lookup table is already deactivated"
-    )?;
-    check!(
-        created.addresses.is_empty(),
-        "the new lookup table already holds addresses"
-    )?;
-
-    let first_batch = unique_pubkeys(10);
-    extend_table_in_chunks(base, &authority, table_pda, &first_batch).await?;
-
-    let after_first = read_table(base, &table_pda).await?;
-    check_eq!(
-        sorted(&after_first.addresses),
-        sorted(&first_batch),
-        "the lookup table does not hold exactly the first batch of addresses"
-    )?;
-
-    let second_batch = unique_pubkeys(50);
-    extend_table_in_chunks(base, &authority, table_pda, &second_batch).await?;
-
-    let mut expected = first_batch;
-    expected.extend_from_slice(&second_batch);
-    let after_second = read_table(base, &table_pda).await?;
-    check_eq!(
-        sorted(&after_second.addresses),
-        sorted(&expected),
-        "the lookup table does not hold exactly both batches of addresses"
-    )?;
-    check_eq!(
-        after_second.deactivation_slot,
-        NOT_DEACTIVATED,
-        "extending the lookup table deactivated it"
-    )?;
-
-    Ok(())
-}
-
 async fn extend_table_in_chunks(
     base: &BaseCtx,
     authority: &keypair::Keypair,
@@ -145,108 +187,5 @@ async fn extend_table_in_chunks(
         );
         base.submit_and_confirm(authority, &[ix]).await?;
     }
-    Ok(())
-}
-
-async fn run_multi_table_allocation(base: &BaseCtx) -> Result<()> {
-    let authority = prep::funded_payer(base, AIRDROP_LAMPORTS).await?;
-
-    let first_slot = base.api().get_slot().await?;
-    let (first_create_ix, first_table) =
-        create_lookup_table(authority.pubkey(), authority.pubkey(), first_slot);
-    base.submit_and_confirm(&authority, &[first_create_ix])
-        .await?;
-
-    let first_keys = unique_pubkeys(LOOKUP_TABLE_MAX_ADDRESSES);
-    extend_table_in_chunks(base, &authority, first_table, &first_keys).await?;
-
-    let filled = read_table(base, &first_table).await?;
-    check_eq!(
-        sorted(&filled.addresses),
-        sorted(&first_keys),
-        "the filled lookup table does not hold exactly the addresses that were added"
-    )?;
-    check_eq!(
-        filled.addresses.len(),
-        LOOKUP_TABLE_MAX_ADDRESSES,
-        "the filled lookup table does not hold the maximum address count"
-    )?;
-
-    let overflow_ix = extend_lookup_table(
-        first_table,
-        authority.pubkey(),
-        Some(authority.pubkey()),
-        unique_pubkeys(1),
-    );
-    check!(
-        base.submit_and_confirm(&authority, &[overflow_ix])
-            .await
-            .is_err(),
-        "the lookup table accepted an address past the maximum count"
-    )?;
-
-    let second_slot = base.api().get_slot().await?;
-    let (second_create_ix, second_table) = create_lookup_table(
-        authority.pubkey(),
-        authority.pubkey(),
-        second_slot,
-    );
-    base.submit_and_confirm(&authority, &[second_create_ix])
-        .await?;
-
-    let second_keys =
-        unique_pubkeys(TOTAL_PUBKEYS - LOOKUP_TABLE_MAX_ADDRESSES);
-    extend_table_in_chunks(base, &authority, second_table, &second_keys)
-        .await?;
-
-    let spilled = read_table(base, &second_table).await?;
-    check_eq!(
-        sorted(&spilled.addresses),
-        sorted(&second_keys),
-        "the second lookup table does not hold exactly the spilled addresses"
-    )?;
-    check_eq!(
-        filled.addresses.len() + spilled.addresses.len(),
-        TOTAL_PUBKEYS,
-        "the two lookup tables do not hold all the addresses"
-    )?;
-
-    Ok(())
-}
-
-async fn run_deactivation_lifecycle(base: &BaseCtx) -> Result<()> {
-    let authority = prep::funded_payer(base, AIRDROP_LAMPORTS).await?;
-    let recent_slot = base.api().get_slot().await?;
-
-    let (create_ix, table_pda) = create_lookup_table(
-        authority.pubkey(),
-        authority.pubkey(),
-        recent_slot,
-    );
-    base.submit_and_confirm(&authority, &[create_ix]).await?;
-
-    let before = read_table(base, &table_pda).await?;
-    check_eq!(
-        before.deactivation_slot,
-        NOT_DEACTIVATED,
-        "the lookup table is deactivated before the deactivate instruction"
-    )?;
-
-    let deactivate_ix = deactivate_lookup_table(table_pda, authority.pubkey());
-    base.submit_and_confirm(&authority, &[deactivate_ix])
-        .await?;
-
-    let after = read_table(base, &table_pda).await?;
-    check_ne!(
-        after.deactivation_slot,
-        NOT_DEACTIVATED,
-        "the lookup table did not record a deactivation slot"
-    )?;
-    check_eq!(
-        after.authority,
-        Some(authority.pubkey()),
-        "the deactivation changed the lookup table authority"
-    )?;
-
     Ok(())
 }

@@ -3,7 +3,7 @@ use std::{
     io::{Read, Write},
     net::TcpListener,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, Ordering},
         Arc, RwLock,
     },
     thread,
@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    check, check_eq, dlp, prep, system, topology, BaseCtx, ChainCtx, ErCtx,
+    check, check_eq, dlp, prep, topology, BaseCtx, ChainCtx, ErCtx,
     PrivateErScenario, Result, ScenarioReport,
 };
 use sdk::spl::{
@@ -45,7 +45,6 @@ const RISK_THRESHOLD: u64 = 5;
 // magicblock-aml deserializes.
 pub struct MockRiskServer {
     base_url: String,
-    request_count: Arc<AtomicUsize>,
     shutdown: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
     risks: Arc<RwLock<HashMap<String, u64>>>,
@@ -57,9 +56,7 @@ impl MockRiskServer {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         listener.set_nonblocking(true)?;
         let addr = listener.local_addr()?;
-        let request_count = Arc::new(AtomicUsize::new(0));
         let shutdown = Arc::new(AtomicBool::new(false));
-        let worker_request_count = Arc::clone(&request_count);
         let worker_shutdown = Arc::clone(&shutdown);
         let risks = Arc::new(RwLock::new(HashMap::new()));
         let requested_addresses = Arc::new(RwLock::new(Vec::new()));
@@ -94,7 +91,6 @@ impl MockRiskServer {
                                 .get(address)
                                 .copied()
                                 .unwrap_or(0);
-                            worker_request_count.fetch_add(1, Ordering::SeqCst);
                             let is_risky = risk_score >= RISK_THRESHOLD;
                             format!(r#"{{"isRisky":{is_risky}}}"#)
                         } else {
@@ -124,7 +120,6 @@ impl MockRiskServer {
 
         Ok(Self {
             base_url: format!("http://{addr}"),
-            request_count,
             shutdown,
             worker: Some(worker),
             risks,
@@ -150,12 +145,14 @@ impl MockRiskServer {
         &self.base_url
     }
 
-    pub fn request_count(&self) -> usize {
-        self.request_count.load(Ordering::SeqCst)
-    }
-
-    pub fn requested_addresses(&self) -> Vec<String> {
-        self.requested_addresses.read().unwrap().clone()
+    fn query_count(&self, owner: &Pubkey) -> usize {
+        let owner = owner.to_string();
+        self.requested_addresses
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|address| **address == owner)
+            .count()
     }
 }
 
@@ -175,15 +172,38 @@ impl PrivateErScenario for AmlGate {
 
     async fn run(&self, base: &BaseCtx) -> Result<ScenarioReport> {
         let report = ScenarioReport::ok(self.name());
+        let server = MockRiskServer::start()?;
+        // No api key or threshold: both belong to the risk server now; loopback
+        // http is the one plaintext scheme magicblock-aml accepts.
+        let private = topology::private_er(
+            base,
+            topology::ErOptions {
+                label: "aml-gate".to_owned(),
+                env: vec![
+                    (
+                        "MBV_CHAINLINK__RISK__ENABLED".to_owned(),
+                        "true".to_owned(),
+                    ),
+                    (
+                        "MBV_CHAINLINK__RISK__RISK_SERVER_URL".to_owned(),
+                        server.base_url().to_owned(),
+                    ),
+                ],
+                ..Default::default()
+            },
+        )
+        .await?;
+        private.wait_ready(READY_TIMEOUT).await?;
 
         // High-risk owner (score 9): the merge is blocked, no tokens move,
         // and the shuttle ATA is undelegated on base.
-        let risky = run_risk_case(base, 9, false, "aml-risky").await?;
+        let risky =
+            run_risk_case(base, private.ctx(), &server, 9, false).await?;
 
-        // Low-risk owner (score 1): the merge executes and the shuttle
-        // tokens land in the destination on the er.
-        let low = run_risk_case(base, 1, true, "aml-low-risk").await?;
+        // Low-risk owner (score 1): the gate allows a merge attempt.
+        let low = run_risk_case(base, private.ctx(), &server, 1, true).await?;
 
+        private.finish().await?;
         Ok(report
             .setting("high-risk owner", risky.owner)
             .setting("high-risk queries", risky.queries)
@@ -208,34 +228,15 @@ struct RiskCaseOutcome {
 
 async fn run_risk_case(
     base: &BaseCtx,
+    er_ctx: &ErCtx,
+    server: &MockRiskServer,
     owner_risk: u64,
     expect_allowed: bool,
-    label: &str,
 ) -> Result<RiskCaseOutcome> {
-    let mut server = MockRiskServer::start()?;
+    let er_identity = er_ctx.identity();
     let owner = Keypair::new();
     let owner_pk = owner.pubkey();
     server.set_risk(&owner_pk.to_string(), owner_risk);
-
-    // No api key or threshold: both belong to the risk server now; loopback
-    // http is the one plaintext scheme magicblock-aml accepts.
-    let mut private = topology::private_er(
-        base,
-        topology::ErOptions {
-            label: label.to_owned(),
-            env: vec![
-                ("MBV_CHAINLINK__RISK__ENABLED".to_owned(), "true".to_owned()),
-                (
-                    "MBV_CHAINLINK__RISK__RISK_SERVER_URL".to_owned(),
-                    server.base_url().to_owned(),
-                ),
-            ],
-            ..Default::default()
-        },
-    )
-    .await?;
-    private.wait_ready(READY_TIMEOUT).await?;
-    let er_identity = private.ctx().identity();
 
     let fee_payer = prep::funded_payer(base, AIRDROP).await?;
     base.airdrop(&owner_pk, AIRDROP).await?;
@@ -252,13 +253,7 @@ async fn run_risk_case(
 
     // 1. Create mint, source ATA, destination ATA, and mint tokens
     let setup_ixs = vec![
-        system::create_account(
-            &fee_payer.pubkey(),
-            &mint.pubkey(),
-            spl::MINT_RENT,
-            spl::MINT_LEN,
-            &spl::token_program(),
-        ),
+        spl::allocate_mint(&fee_payer.pubkey(), &mint.pubkey()),
         spl::initialize_mint(&mint.pubkey(), &owner_pk),
         spl::create_ata_idempotent(
             &fee_payer.pubkey(),
@@ -301,7 +296,6 @@ async fn run_risk_case(
          base — genesis did not supply one for this pool slot"
     )?;
 
-    let er_ctx = private.ctx();
     let _ = er_ctx.account(&source_ata).await;
     let _ = er_ctx.account(&destination_ata).await;
 
@@ -328,38 +322,17 @@ async fn run_risk_case(
 
     // 5. Wait for the risk server query
     check::poll(
-        "the risk server receives the shuttle owner query",
+        &format!("the risk server receives the shuttle owner {owner_pk} query"),
         QUERY_TIMEOUT,
-        || async {
-            server.request_count() > 0
-                && server.requested_addresses().contains(&owner_pk.to_string())
-        },
+        || async { server.query_count(&owner_pk) > 0 },
     )
     .await?;
-    check!(
-        server.requested_addresses().contains(&owner_pk.to_string()),
-        "the risk server did not check the shuttle owner"
-    )?;
 
-    // 6. Verify the gate decision through the merge itself: an allowed merge
-    // moves the shuttle tokens into the destination on the er, a blocked
-    // merge moves nothing and the shuttle ATA is undelegated on base.
-    // Delegation-record persistence is NOT a discriminator for the allowed
-    // side on this stack — record it as an observation only.
-    // 6. Verify the gate decision through the merge ATTEMPT: an allowed
-    // owner gets the merge executed on the er (one er transaction that
-    // references both the shuttle ATA and the destination), a blocked owner
-    // gets the action dropped — no such transaction exists — and the shuttle
-    // ATA is undelegated on base. The merge's OUTCOME is version-adaptive:
-    // the mainnet-deployed eATA build differs from the build upstream tests
-    // against, and under the mainnet pairing the attempt fails with
-    // IllegalOwner, which routes the account into the same
-    // failing-action-undelegates path. Delegation-record persistence is
-    // therefore NOT a discriminator for the allowed side — the attempt is.
+    // The gate controls attempts. An allowed action can still fail in the
+    // deployed token program; only a successful action must move the tokens.
     let (merge_error, destination_tokens) = if expect_allowed {
         check::poll(
-            "a merge attempt referencing the shuttle and destination \
-             appears on the er",
+            &format!("low-risk owner {owner_pk}: a merge attempt references {shuttle_ata} and {destination_ata}"),
             MERGE_TIMEOUT,
             || async {
                 matches!(
@@ -374,8 +347,7 @@ async fn run_risk_case(
             .ok_or("the merge attempt vanished after the poll")?;
         let tokens = if attempt.is_none() {
             check::poll(
-                "the executed merge lands the shuttle tokens in the \
-                 destination",
+                &format!("low-risk owner {owner_pk}: the executed merge lands tokens in {destination_ata}"),
                 MERGE_TIMEOUT,
                 || async {
                     matches!(
@@ -389,8 +361,7 @@ async fn run_risk_case(
             check_eq!(
                 amount,
                 SHUTTLE_AMOUNT,
-                "an executed merge must move the shuttle tokens to the \
-                 destination"
+                "low-risk owner {owner_pk}: the executed merge moves tokens to {destination_ata}"
             )?;
             amount
         } else {
@@ -398,14 +369,14 @@ async fn run_risk_case(
             check_eq!(
                 amount,
                 0,
-                "a failed merge attempt must not move the shuttle tokens"
+                "low-risk owner {owner_pk}: a failed merge leaves {destination_ata} unchanged"
             )?;
             amount
         };
         (attempt.unwrap_or_else(|| "none".to_owned()), tokens)
     } else {
         check::poll(
-            "the high-risk shuttle ATA undelegates on base",
+            &format!("high-risk owner {owner_pk}: shuttle {shuttle_ata} undelegates on base"),
             UNDELEGATION_TIMEOUT,
             || async {
                 !delegation_record_exists(base, &shuttle_ata)
@@ -416,27 +387,25 @@ async fn run_risk_case(
         .await?;
         check!(
             !delegation_record_exists(base, &shuttle_ata).await?,
-            "the high-risk shuttle ATA must be undelegated on base"
+            "high-risk owner {owner_pk}: shuttle {shuttle_ata} is undelegated on base"
         )?;
         check!(
             merge_attempt(er_ctx, &shuttle_ata, &destination_ata)
                 .await?
                 .is_none(),
-            "a blocked owner must not get a merge attempt on the er"
+            "high-risk owner {owner_pk}: no merge attempt for {shuttle_ata} and {destination_ata}"
         )?;
         let amount = er_token_amount(er_ctx, &destination_ata).await?;
         check_eq!(
             amount,
             0,
-            "the blocked merge must not move the shuttle tokens"
+            "high-risk owner {owner_pk}: the blocked merge leaves {destination_ata} unchanged"
         )?;
         ("blocked".to_owned(), amount)
     };
     let record_at_end = delegation_record_exists(base, &shuttle_ata).await?;
 
-    let queries = server.request_count();
-    private.stop(true).await?;
-    server.stop();
+    let queries = server.query_count(&owner_pk);
 
     Ok(RiskCaseOutcome {
         queries,

@@ -9,9 +9,7 @@ use async_trait::async_trait;
 use instruction::{AccountMeta, Instruction};
 use keypair::Keypair;
 use pubkey::Pubkey;
-use redshift_interface::flexi::{
-    build as flexi, tagged, FlexiCounter, FlexiInstruction,
-};
+use redshift_interface::flexi::{build as flexi, FlexiCounter};
 use redsuite_core::{
     check, check_eq,
     dlp::{self, delegate_with_actions, DelegateArgs},
@@ -68,12 +66,7 @@ struct Settled {
 
 struct Activation {
     discovery: Settled,
-    activation_s: f64,
-}
-
-struct Rescue {
-    discovery: Settled,
-    rescue_s: f64,
+    after_release_s: f64,
 }
 
 fn counter_action(
@@ -82,20 +75,15 @@ fn counter_action(
     count: u8,
     fail: bool,
 ) -> Instruction {
-    let (counter, _) = FlexiCounter::pda_and_bump(actor);
-    let instruction = if fail {
-        FlexiInstruction::AddError { count }
+    let mut instruction = if fail {
+        flexi::add_error(*actor, count)
     } else {
-        FlexiInstruction::AddUnsigned { count }
+        flexi::add_unsigned(*actor, count)
     };
-    Instruction {
-        program_id: redshift_interface::id(),
-        accounts: vec![
-            AccountMeta::new(counter, false),
-            AccountMeta::new_readonly(*dependency, false),
-        ],
-        data: tagged(&instruction),
-    }
+    instruction
+        .accounts
+        .push(AccountMeta::new_readonly(*dependency, false));
+    instruction
 }
 
 async fn counter_state(er: &ErCtx, counter: &Pubkey) -> Result<CounterState> {
@@ -164,12 +152,6 @@ async fn delegate_trigger(
 ) -> Result<Keypair> {
     let trigger = Keypair::new();
     base.airdrop(&trigger.pubkey(), AIRDROP).await?;
-    base.submit_and_confirm_with(
-        funder,
-        &[&trigger],
-        &[system::assign(&trigger.pubkey(), &dlp::dlp_id())],
-    )
-    .await?;
     let delegate = delegate_with_actions(
         &funder.pubkey(),
         &trigger.pubkey(),
@@ -181,8 +163,13 @@ async fn delegate_trigger(
         },
         &[action],
     );
-    base.submit_and_confirm_with(funder, &[&trigger], &[delegate])
-        .await?;
+    // Publish the owner change with its record so discovery sees both.
+    base.submit_and_confirm_with(
+        funder,
+        &[&trigger],
+        &[system::assign(&trigger.pubkey(), &dlp::dlp_id()), delegate],
+    )
+    .await?;
     Ok(trigger)
 }
 
@@ -302,15 +289,17 @@ async fn settle_discovery(
     Ok(settled)
 }
 
-async fn activate_once(
+async fn run_action(
     base: &BaseCtx,
     proxies: &BaseProxies,
     er: &ErCtx,
     funder: &Keypair,
     er_payer: &Rc<Keypair>,
     actor: &Pubkey,
-    counter: &Pubkey,
+    fail: bool,
 ) -> Result<(Pubkey, Activation)> {
+    let (counter, _) = FlexiCounter::pda_and_bump(actor);
+    let counter = &counter;
     let before = counter_state(er, counter).await?;
     let dependency = fund_dependency(base).await?;
     let stall = proxies.stall(dependency_fetch(&dependency));
@@ -318,7 +307,7 @@ async fn activate_once(
         base,
         funder,
         er.identity(),
-        counter_action(actor, &dependency, ACTION_COUNT, false),
+        counter_action(actor, &dependency, ACTION_COUNT, fail),
     )
     .await?;
     await_fetch_held(proxies, &dependency).await?;
@@ -336,95 +325,58 @@ async fn activate_once(
     stall.remove();
     let discovery =
         settle_discovery(discovery, held_fetches(proxies, &dependency)).await?;
-    let expected = CounterState {
-        count: before.count + u64::from(ACTION_COUNT),
-        updates: before.updates + 1,
+    let after_release_s = if fail {
+        check::poll_for(
+            "the failed activation completes the rescue undelegation on base",
+            RESCUE_TIMEOUT,
+            || async {
+                let owner = base
+                    .account(&trigger.pubkey())
+                    .await?
+                    .map(|account| account.owner);
+                check_eq!(
+                    owner,
+                    Some(system::system_id()),
+                    "rescued trigger {} owner",
+                    trigger.pubkey()
+                )?;
+                Ok::<_, redsuite_core::DynError>(())
+            },
+        )
+        .await?;
+        let elapsed = released.elapsed().as_secs_f64();
+        check_eq!(
+            counter_state(er, counter).await?,
+            before,
+            "failed activation leaves counter {counter} unchanged"
+        )?;
+        elapsed
+    } else {
+        let expected = CounterState {
+            count: before.count + u64::from(ACTION_COUNT),
+            updates: before.updates + 1,
+        };
+        await_counter(
+            er,
+            counter,
+            expected,
+            "the released activation applies the counter action exactly once",
+            ACTIVATION_TIMEOUT,
+        )
+        .await?;
+        let elapsed = released.elapsed().as_secs_f64();
+        check!(
+            er.account(&trigger.pubkey()).await?.is_some(),
+            "activated trigger {} is present on the er",
+            trigger.pubkey()
+        )?;
+        elapsed
     };
-    await_counter(
-        er,
-        counter,
-        expected,
-        "the released activation applies the counter action exactly once",
-        ACTIVATION_TIMEOUT,
-    )
-    .await?;
-    let activation_s = released.elapsed().as_secs_f64();
-    check!(
-        er.account(&trigger.pubkey()).await?.is_some(),
-        "the activated trigger account must be present on the er"
-    )?;
     Ok((
         trigger.pubkey(),
         Activation {
             discovery,
-            activation_s,
-        },
-    ))
-}
-
-async fn rescue_once(
-    base: &BaseCtx,
-    proxies: &BaseProxies,
-    er: &ErCtx,
-    funder: &Keypair,
-    er_payer: &Rc<Keypair>,
-    actor: &Pubkey,
-    counter: &Pubkey,
-) -> Result<(Pubkey, Rescue)> {
-    let before = counter_state(er, counter).await?;
-    let dependency = fund_dependency(base).await?;
-    let stall = proxies.stall(dependency_fetch(&dependency));
-    let trigger = delegate_trigger(
-        base,
-        funder,
-        er.identity(),
-        counter_action(actor, &dependency, ACTION_COUNT, true),
-    )
-    .await?;
-    await_fetch_held(proxies, &dependency).await?;
-    let discovery = race_discovery(
-        base,
-        er,
-        funder,
-        er_payer,
-        &trigger.pubkey(),
-        counter,
-        before,
-    )
-    .await?;
-    let released = Instant::now();
-    stall.remove();
-    let discovery =
-        settle_discovery(discovery, held_fetches(proxies, &dependency)).await?;
-    check::poll_for(
-        "the failed activation completes the rescue undelegation on base",
-        RESCUE_TIMEOUT,
-        || async {
-            match base.account(&trigger.pubkey()).await {
-                Ok(Some(account)) if account.owner == system::system_id() => {
-                    Ok(())
-                }
-                Ok(Some(account)) => Err(format!("owner {}", account.owner)),
-                Ok(None) => Err("absent".to_owned()),
-                Err(error) => Err(format!("read failed: {error}")),
-            }
-        },
-    )
-    .await
-    .map_err(|error| {
-        error.expected(format!("owner {}", system::system_id()))
-    })?;
-    let rescue_s = released.elapsed().as_secs_f64();
-    check_eq!(
-        counter_state(er, counter).await?,
-        before,
-        "a failed activation must leave no action effects on the counter"
-    )?;
-    Ok((
-        trigger.pubkey(),
-        Rescue {
-            discovery,
-            rescue_s,
+            after_release_s,
         },
     ))
 }
@@ -460,18 +412,15 @@ impl PrivateErScenario for ActivationSingleShot {
             .await?,
         );
 
-        let (init, counter) =
-            flexi::init_counter(actor.pubkey(), COUNTER_LABEL);
-        base.submit_and_confirm(&actor, &[init]).await?;
-        base.submit_and_confirm(
-            &actor,
-            &[flexi::delegate_counter(
-                actor.pubkey(),
-                prep::COMMIT_FREQUENCY_MS,
-                Some(er.identity()),
-            )],
-        )
-        .await?;
+        let (counter, setup) = prep::flexi_counter(
+            actor.pubkey(),
+            COUNTER_LABEL,
+            er.identity(),
+            prep::COMMIT_FREQUENCY_MS,
+        );
+        for instruction in setup {
+            base.submit_and_confirm(&actor, &[instruction]).await?;
+        }
         let zero = CounterState {
             count: 0,
             updates: 0,
@@ -485,14 +434,14 @@ impl PrivateErScenario for ActivationSingleShot {
         )
         .await?;
 
-        let (trigger, activation) = activate_once(
+        let (trigger, activation) = run_action(
             base,
             &proxies,
             er,
             &funder,
             &er_payer,
             &actor.pubkey(),
-            &counter,
+            false,
         )
         .await?;
         let applied = CounterState {
@@ -551,14 +500,14 @@ impl PrivateErScenario for ActivationSingleShot {
         )
         .await?;
 
-        let (failing_trigger, rescue) = rescue_once(
+        let (failing_trigger, rescue) = run_action(
             base,
             &proxies,
             er,
             &funder,
             &er_payer,
             &actor.pubkey(),
-            &counter,
+            true,
         )
         .await?;
         hold_steady(er, &counter, applied, STEADY_WINDOW, "after the rescue")
@@ -606,7 +555,7 @@ impl PrivateErScenario for ActivationSingleShot {
             .metric(
                 "activation after release s",
                 Unit::Seconds,
-                activation.activation_s,
+                activation.after_release_s,
             )
             .metric("rescue held s", Unit::Seconds, rescue.discovery.held_s)
             .metric(
@@ -624,13 +573,18 @@ impl PrivateErScenario for ActivationSingleShot {
                 Unit::Count,
                 rescue.discovery.submissions_ok as f64,
             )
-            .metric("rescue after release s", Unit::Seconds, rescue.rescue_s)
+            .metric(
+                "rescue after release s",
+                Unit::Seconds,
+                rescue.after_release_s,
+            )
             .metric(
                 "restart startup s",
                 Unit::Seconds,
                 restart.startup.as_secs_f64(),
             )
             .metric("fault events", Unit::Count, events.len() as f64);
+
         Ok(netfault::report_events(report, &events))
     }
 }

@@ -1,3 +1,5 @@
+use super::{await_catch_up, leader_metric, verifier_metric};
+
 use std::{
     cell::Cell,
     fs,
@@ -158,19 +160,6 @@ impl Workload {
     }
 }
 
-async fn leader_metric(
-    topology: &ReplicatedTopology,
-    name: &str,
-) -> Result<f64> {
-    topology
-        .leader()
-        .ctx()
-        .scrape_metrics()
-        .await?
-        .get(name)
-        .ok_or_else(|| format!("the leader exposes no {name} metric").into())
-}
-
 async fn leader_count(
     topology: &ReplicatedTopology,
     name: &str,
@@ -184,38 +173,8 @@ async fn leader_count(
         .unwrap_or(0.0))
 }
 
-async fn verifier_metric(verifier: &Verifier, name: &str) -> Result<f64> {
-    verifier.scrape_metrics().await?.get(name).ok_or_else(|| {
-        format!("verifier `{}` exposes no {name} metric", verifier.label())
-            .into()
-    })
-}
-
 async fn verifier_count(verifier: &Verifier, name: &str) -> Result<f64> {
     Ok(verifier.scrape_metrics().await?.get(name).unwrap_or(0.0))
-}
-
-async fn await_catch_up(
-    verifier: &Verifier,
-    name: &str,
-    target: f64,
-    moment: &str,
-) -> Result<Duration> {
-    let started = Instant::now();
-    check::poll(
-        &format!(
-            "{moment}: verifier `{}` {name} reaching the leader's {target:.0}",
-            verifier.label()
-        ),
-        CATCH_UP_TIMEOUT,
-        || async {
-            verifier_metric(verifier, name)
-                .await
-                .is_ok_and(|value| value >= target)
-        },
-    )
-    .await?;
-    Ok(started.elapsed())
 }
 
 async fn await_leader_advance(
@@ -458,6 +417,7 @@ async fn restart_with_retained_cursor(
         TRANSACTIONS,
         target,
         "after the retained-cursor restart",
+        CATCH_UP_TIMEOUT,
     )
     .await?;
     Ok(RestartOutcome {
@@ -532,6 +492,7 @@ async fn recover_from_snapshot(
         TRANSACTIONS,
         target,
         "after the snapshot recovery",
+        CATCH_UP_TIMEOUT,
     )
     .await?;
     Ok(RecoveryOutcome {
@@ -607,6 +568,7 @@ impl PrivateErScenario for ReplicationRecovery {
                     TRANSACTIONS,
                     steady_target,
                     "under steady load",
+                    CATCH_UP_TIMEOUT,
                 )
                 .await?,
             );
@@ -678,6 +640,7 @@ impl PrivateErScenario for ReplicationRecovery {
                     TRANSACTIONS,
                     leader_txs,
                     "at the final sealed boundary",
+                    CATCH_UP_TIMEOUT,
                 )
                 .await?,
             );
@@ -686,6 +649,7 @@ impl PrivateErScenario for ReplicationRecovery {
                 BLOCKS,
                 leader_blocks,
                 "at the final sealed boundary",
+                CATCH_UP_TIMEOUT,
             )
             .await?;
             check_eq!(
@@ -721,7 +685,7 @@ impl PrivateErScenario for ReplicationRecovery {
 
         topology.finish().await?;
 
-        Ok(ScenarioReport::ok(self.name())
+        let mut report = ScenarioReport::ok(self.name())
             .setting("pairs", PAIRS)
             .setting("chain gap ms", CHAIN_GAP.as_millis())
             .setting("heavy step iters", HEAVY_ITERS)
@@ -746,27 +710,6 @@ impl PrivateErScenario for ReplicationRecovery {
             .metric("steady verifier0 max lag txs", Unit::Count, lag.max_lag[0])
             .metric("steady verifier1 max lag txs", Unit::Count, lag.max_lag[1])
             .metric(
-                "steady catch up ms",
-                Unit::Millis,
-                steady_catch_up.as_secs_f64() * 1e3,
-            )
-            .metric(
-                "cursor restart offline ms",
-                Unit::Millis,
-                restart.offline.as_secs_f64() * 1e3,
-            )
-            .metric(
-                "cursor restart reconnect ms",
-                Unit::Millis,
-                restart.reconnect.as_secs_f64() * 1e3,
-            )
-            .metric(
-                "cursor restart catch up ms",
-                Unit::Millis,
-                restart.catch_up.as_secs_f64() * 1e3,
-            )
-            .metric("final drain ms", Unit::Millis, drain.as_secs_f64() * 1e3)
-            .metric(
                 "verifier0 superblocks",
                 Unit::Count,
                 verifier_superblocks[0],
@@ -787,20 +730,24 @@ impl PrivateErScenario for ReplicationRecovery {
                 recovery.truncations,
             )
             .metric(
-                "snapshot recovery reconnect ms",
-                Unit::Millis,
-                recovery.reconnect.as_secs_f64() * 1e3,
-            )
-            .metric(
-                "snapshot recovery tail replay ms",
-                Unit::Millis,
-                recovery.catch_up.as_secs_f64() * 1e3,
-            )
-            .metric(
                 "snapshots installed",
                 Unit::Count,
                 recovery.client_snapshots,
             )
-            .metric("snapshots served", Unit::Count, recovery.server_snapshots))
+            .metric("snapshots served", Unit::Count, recovery.server_snapshots);
+        for (label, elapsed) in [
+            ("steady catch up ms", steady_catch_up),
+            ("cursor restart offline ms", restart.offline),
+            ("cursor restart reconnect ms", restart.reconnect),
+            ("cursor restart catch up ms", restart.catch_up),
+            ("final drain ms", drain),
+            ("snapshot recovery reconnect ms", recovery.reconnect),
+            ("snapshot recovery tail replay ms", recovery.catch_up),
+        ] {
+            report =
+                report.metric(label, Unit::Millis, elapsed.as_secs_f64() * 1e3);
+        }
+
+        Ok(report)
     }
 }

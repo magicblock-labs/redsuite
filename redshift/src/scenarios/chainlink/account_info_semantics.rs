@@ -14,6 +14,7 @@ const REFRESH_TIMEOUT: Duration = Duration::from_secs(15);
 const FIRST_AIRDROP: u64 = 2_000_000_000;
 const SECOND_AIRDROP: u64 = 1_000_000_000;
 const ESCROW_FUNDING: u64 = 4_000_000_000;
+const COLD_WALLETS: usize = 10;
 
 pub struct AccountInfoSemantics;
 
@@ -24,6 +25,42 @@ impl Scenario for AccountInfoSemantics {
     }
 
     async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
+        // These keys must stay cold until all five requests are in flight.
+        let wallets: Vec<_> =
+            (0..COLD_WALLETS).map(|_| Keypair::new().pubkey()).collect();
+        for wallet in &wallets {
+            base.airdrop(wallet, FIRST_AIRDROP).await?;
+        }
+        let fan_out = Instant::now();
+        let (a, single_a, b, c, single_b) = tokio::join!(
+            er.accounts(&wallets[0..3]),
+            er.account(&wallets[3]),
+            er.accounts(&wallets[4..6]),
+            er.accounts(&wallets[6..9]),
+            er.account(&wallets[9]),
+        );
+        let concurrent_ms = fan_out.elapsed().as_secs_f64() * 1e3;
+        for (case, entries, keys) in [
+            ("batch a", a?, &wallets[0..3]),
+            ("single a", vec![single_a?], &wallets[3..4]),
+            ("batch b", b?, &wallets[4..6]),
+            ("batch c", c?, &wallets[6..9]),
+            ("single b", vec![single_b?], &wallets[9..10]),
+        ] {
+            check_eq!(
+                entries.len(),
+                keys.len(),
+                "cold {case}: response length"
+            )?;
+            for (entry, key) in entries.iter().zip(keys) {
+                check_eq!(
+                    entry.as_ref().map(|account| account.lamports),
+                    Some(FIRST_AIRDROP),
+                    "cold {case}: wallet {key} carries its airdrop"
+                )?;
+            }
+        }
+
         let ghost = Keypair::new().pubkey();
         check!(
             er.account(&ghost).await?.is_none(),
@@ -132,6 +169,12 @@ impl Scenario for AccountInfoSemantics {
         )?;
 
         Ok(ScenarioReport::ok(self.name())
+            .setting("concurrent cold wallets", COLD_WALLETS)
+            .metric(
+                "concurrent first-touch wall ms",
+                Unit::Millis,
+                concurrent_ms,
+            )
             .setting("escrow funding lamports", ESCROW_FUNDING)
             .metric("first clone read ms", Unit::Millis, first_read_ms)
             .metric("non-delegated refresh ms", Unit::Millis, refresh_ms))
