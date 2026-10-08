@@ -5,7 +5,6 @@ use std::{
 };
 
 use async_trait::async_trait;
-use futures_util::future::join_all;
 use pubkey::Pubkey;
 use redsuite_core::redline::Accounts;
 use redsuite_core::report::Unit;
@@ -16,8 +15,7 @@ use redsuite_core::{
     profile::ProfileValues,
     receipt,
     runner::{execute, Pacing, RunConfig},
-    BaseCtx, ChainCtx, CheckError, ErCtx, MetricsDelta, Result, Scenario,
-    ScenarioReport,
+    BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
 };
 use signature::Signature;
 use signer::Signer;
@@ -37,7 +35,6 @@ const RECEIPT_TIMEOUT: Duration = Duration::from_secs(20);
 const BASE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(20);
 const DRAIN_POLL: Duration = Duration::from_secs(2);
 const CLONE_TIMEOUT: Duration = Duration::from_secs(15);
-const PREWARM_CONCURRENCY: usize = 16;
 const QUIESCE_TIMEOUT: Duration = Duration::from_secs(120);
 
 const INTENTS_COUNTER: &str = "mbv_committor_intents_count";
@@ -133,15 +130,6 @@ async fn deliver_commits(
     Ok((delivered, outcome))
 }
 
-async fn prewarm(er: &ErCtx, pool: &[Pubkey]) -> Result<()> {
-    for window in pool.chunks(PREWARM_CONCURRENCY) {
-        let touches = window.iter().map(|pda| er.account(pda));
-        let _ = join_all(touches).await;
-    }
-    prep::await_clones(er, pool, ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
-    Ok(())
-}
-
 async fn quiesce_committor(er: &ErCtx) -> Result<()> {
     check::poll(
         "the committor drains its backlog before the measured window",
@@ -230,7 +218,7 @@ impl Scenario for CommitThroughputCeiling {
             prep_started.elapsed().as_secs_f64(),
         );
 
-        prewarm(er, &pool).await?;
+        prep::prewarm(er, &pool, ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
 
         let payer = prep::funded_payer(base, PAYER_LAMPORTS).await?;
         let payer_pubkey = payer.pubkey();
@@ -335,19 +323,13 @@ impl Scenario for CommitThroughputCeiling {
         let mut receipt_base_txs = 0usize;
         if drain.fully_drained {
             for (id, commit_signature) in &delivered {
-                let commit_receipt = receipt::fetch_commit_receipt(
+                let commit_receipt = super::settled_receipt(
                     er.api(),
                     commit_signature,
                     RECEIPT_TIMEOUT,
+                    format!("fresh commit {id} intent"),
                 )
                 .await?;
-                if let Some(message) = &commit_receipt.error_message {
-                    return Err(CheckError::new(format!(
-                        "fresh commit {id} intent succeeds"
-                    ))
-                    .actual(message)
-                    .into());
-                }
                 receipt::confirm_base_signatures(
                     base.api(),
                     &commit_receipt,

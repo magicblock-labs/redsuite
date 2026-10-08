@@ -6,18 +6,17 @@ use std::{
 
 use async_trait::async_trait;
 use json::JsonValueTrait;
-use redsuite_core::redline::Accounts;
+use redsuite_core::redline::{copy_three, Accounts};
 use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, host, prep,
     profile::ProfileValues,
     runner::{execute, Pacing, RunConfig},
+    sampler::{Sampler, Trailing},
     topology,
     transport::wsraw::RawWs,
-    BaseCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport, TxSender,
+    BaseCtx, MetricsDelta, PrivateErScenario, Result, ScenarioReport, TxSender,
 };
-
-use super::storage_prodsize_sustain::shape;
 
 const PREP_PAYER_LAMPORTS: u64 = 4_000_000_000;
 const CLONE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -33,9 +32,13 @@ const BLOCKED_TRANSACTIONS: &str = "engine_processor_blocked_transactions";
 const BUSY_EXECUTORS: &str = "engine_processor_busy_executors";
 const PENDING_TRANSACTIONS: &str = "engine_ledger_pending_transactions";
 const ORDERING_DEPENDENCIES: &str = "engine_processor_ordering_dependencies";
-const KEEPER_OPERATION: &str = "engine_keeper_operation_duration_micros";
-const ACCOUNTSDB_OPERATION: &str =
-    "engine_accountsdb_operation_duration_micros";
+const FINALIZE_SUPERBLOCK: &str =
+    r#"engine_keeper_operation_duration_micros{op="finalize_superblock"}"#;
+const FINALIZE_SUPERBLOCK_COUNT: &str = r#"engine_keeper_operation_duration_micros_count{op="finalize_superblock"}"#;
+const SNAPSHOT: &str =
+    r#"engine_accountsdb_operation_duration_micros{op="snapshot"}"#;
+const CHECKSUM: &str =
+    r#"engine_accountsdb_operation_duration_micros{op="checksum"}"#;
 
 struct Profile {
     name: &'static str,
@@ -120,33 +123,11 @@ fn timings(mut samples: Vec<u32>) -> Timings {
     }
 }
 
-fn operation_mean_us(
-    delta: &MetricsDelta,
-    metric: &str,
-    op: &str,
-) -> Option<f64> {
-    let count = delta.counter(&format!("{metric}_count{{op=\"{op}\"}}"))?;
-    if count <= 0.0 {
-        return None;
-    }
-    let sum = delta.counter(&format!("{metric}_sum{{op=\"{op}\"}}"))?;
-    Some(sum / count)
-}
-
-fn operation_count(
-    delta: &MetricsDelta,
-    metric: &str,
-    op: &str,
-) -> Option<f64> {
-    delta.counter(&format!("{metric}_count{{op=\"{op}\"}}"))
-}
-
 #[derive(Default)]
 struct Health {
     blocked_peak: f64,
     busy_peak: f64,
     pending_peak: f64,
-    samples: usize,
 }
 
 async fn observe_slots(
@@ -186,34 +167,15 @@ async fn observe_slots(
     Ok(intervals)
 }
 
-async fn observe_health(er: &ErCtx, stop: Rc<Cell<bool>>) -> Health {
-    let mut health = Health::default();
-    while !stop.get() {
-        if let Ok(metrics) = er.scrape_metrics().await {
-            let peak = |name: &str, current: f64| {
-                metrics.value_sum(name).unwrap_or_default().max(current)
-            };
-            health.blocked_peak =
-                peak(BLOCKED_TRANSACTIONS, health.blocked_peak);
-            health.busy_peak = peak(BUSY_EXECUTORS, health.busy_peak);
-            health.pending_peak =
-                peak(PENDING_TRANSACTIONS, health.pending_peak);
-            health.samples += 1;
-        }
-        tokio::time::sleep(HEALTH_SAMPLE_INTERVAL).await;
-    }
-    health
-}
-
 pub struct SuperblockBoundaryLatency;
 
 #[async_trait(?Send)]
-impl Scenario for SuperblockBoundaryLatency {
+impl PrivateErScenario for SuperblockBoundaryLatency {
     fn name(&self) -> &str {
         "redline/superblock_boundary_latency"
     }
 
-    async fn run(&self, base: &BaseCtx, _er: &ErCtx) -> Result<ScenarioReport> {
+    async fn run(&self, base: &BaseCtx) -> Result<ScenarioReport> {
         let profile = PROFILES.select(base.config().profile);
 
         let prep_payers =
@@ -271,7 +233,7 @@ impl Scenario for SuperblockBoundaryLatency {
             },
             |id| {
                 let sender = senders[(id as usize) % senders.len()].clone();
-                let ix = shape(&pool, id);
+                let (ix, _) = copy_three(&pool, id);
                 async move { sender.submit(&[ix]).await.map(|_| ()) }
             },
         )
@@ -282,22 +244,10 @@ impl Scenario for SuperblockBoundaryLatency {
             "fill deliveries failed: {:?}",
             fill.first_error
         )?;
-        check::poll(
-            &format!(
-                "the ledger records the {} fill transactions",
-                profile.fill
-            ),
+        crate::await_executed(
+            cell_er,
+            ledger_txs_at_boot + profile.fill as f64,
             LEDGER_FILL_TIMEOUT,
-            || async {
-                matches!(
-                    cell_er.scrape_metrics().await,
-                    Ok(metrics) if metrics
-                        .get(LEDGER_TRANSACTIONS)
-                        .unwrap_or(0.0)
-                        - ledger_txs_at_boot
-                        >= profile.fill as f64
-                )
-            },
         )
         .await?;
 
@@ -309,7 +259,22 @@ impl Scenario for SuperblockBoundaryLatency {
             profile.superblock_slots,
             stop.clone(),
         );
-        let health = observe_health(cell_er, stop.clone());
+        let health = Sampler::spawn(
+            cell_er.metrics().clone(),
+            HEALTH_SAMPLE_INTERVAL,
+            Trailing::Skip,
+            |metrics, health: &mut Health| {
+                let peak = |name: &str, current: f64| {
+                    metrics.value_sum(name).unwrap_or_default().max(current)
+                };
+                health.blocked_peak =
+                    peak(BLOCKED_TRANSACTIONS, health.blocked_peak);
+                health.busy_peak = peak(BUSY_EXECUTORS, health.busy_peak);
+                health.pending_peak =
+                    peak(PENDING_TRANSACTIONS, health.pending_peak);
+                Some(())
+            },
+        );
         let load = async {
             let outcome: Result<_> = execute(
                 RunConfig {
@@ -319,17 +284,18 @@ impl Scenario for SuperblockBoundaryLatency {
                 },
                 |id| {
                     let sender = senders[(id as usize) % senders.len()].clone();
-                    let ix = shape(&pool, profile.fill + id);
+                    let (ix, _) = copy_three(&pool, profile.fill + id);
                     async move { sender.submit(&[ix]).await.map(|_| ()) }
                 },
             )
             .await;
             stop.set(true);
-            outcome
+            (outcome, health.finish().await)
         };
-        let (outcome, intervals, health) = tokio::join!(load, observer, health);
+        let ((outcome, health), intervals) = tokio::join!(load, observer);
         let outcome = outcome?;
         let intervals = intervals?;
+        let health = health?;
         let after = cell_er.scrape_metrics().await?;
         let delta = MetricsDelta::new(before, after);
         let storage_after = host::dir_size_bytes(private.storage_dir())?;
@@ -368,14 +334,10 @@ impl Scenario for SuperblockBoundaryLatency {
         )?;
 
         let sealed = delta.counter(SUPERBLOCKS).unwrap_or_default();
-        let finalize_us =
-            operation_mean_us(&delta, KEEPER_OPERATION, "finalize_superblock");
-        let finalize_count =
-            operation_count(&delta, KEEPER_OPERATION, "finalize_superblock");
-        let snapshot_us =
-            operation_mean_us(&delta, ACCOUNTSDB_OPERATION, "snapshot");
-        let checksum_us =
-            operation_mean_us(&delta, ACCOUNTSDB_OPERATION, "checksum");
+        let finalize_us = delta.histogram_avg(FINALIZE_SUPERBLOCK);
+        let finalize_count = delta.counter(FINALIZE_SUPERBLOCK_COUNT);
+        let snapshot_us = delta.histogram_avg(SNAPSHOT);
+        let checksum_us = delta.histogram_avg(CHECKSUM);
         let snapshot_bytes = delta.gauge(SNAPSHOT_SIZE).unwrap_or_default();
         let storage_growth = storage_after.saturating_sub(storage_before);
         let stall_ratio = if normal.p50 > 0 {
@@ -452,10 +414,10 @@ impl Scenario for SuperblockBoundaryLatency {
                 Unit::Micros,
                 outcome.delivery.quantile95 as f64,
             )
-            .metric("blocked peak", Unit::Count, health.blocked_peak)
-            .metric("busy peak", Unit::Count, health.busy_peak)
-            .metric("pending peak", Unit::Count, health.pending_peak)
-            .metric("health samples", Unit::Count, health.samples as f64)
+            .metric("blocked peak", Unit::Count, health.value.blocked_peak)
+            .metric("busy peak", Unit::Count, health.value.busy_peak)
+            .metric("pending peak", Unit::Count, health.value.pending_peak)
+            .metric("health samples", Unit::Count, health.observations as f64)
             .metric_if(
                 "ordering dependencies",
                 Unit::Count,

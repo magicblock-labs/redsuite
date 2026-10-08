@@ -1,13 +1,12 @@
 use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use pubkey::Pubkey;
-use redsuite_core::redline::Accounts;
+use redsuite_core::redline::{execute_kernel, Accounts};
 use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, prep,
     profile::ProfileValues,
-    runner::{execute_threaded, Pacing, ThreadRunConfig},
+    runner::{Pacing, ThreadRunConfig},
     BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
 };
 
@@ -79,44 +78,25 @@ impl Scenario for RpcCapacityBlast {
             CLONE_TIMEOUT,
         )
         .await?;
-        let payer_bytes: Arc<Vec<[u8; 64]>> = Arc::new(
-            prep_payers.iter().map(|payer| payer.to_bytes()).collect(),
-        );
-        let er_rpc_url = er.api().url().to_owned();
         let threads = profile.threads;
 
         let before = er.scrape_metrics().await?;
-        let factory = {
-            let pool = pool.clone();
-            let payer_bytes = payer_bytes.clone();
-            move |thread_index: usize| {
-                let senders = prep::worker_senders(
-                    &er_rpc_url,
-                    &payer_bytes,
-                    thread_index,
-                    threads,
-                );
-                let pool = pool.clone();
-                move |id: u64| {
-                    let sender = senders[(id as usize) % senders.len()].clone();
-                    let account: Pubkey = pool[(id as usize) % pool.len()];
-                    let ix =
-                        crate::program::instruction::build::simple_byte_set(
-                            id,
-                            &[account],
-                        );
-                    async move { sender.submit(&[ix]).await.map(|_| ()) }
-                }
-            }
-        };
-        let outcome = execute_threaded(
+        let outcome = execute_kernel(
             ThreadRunConfig {
                 threads,
                 iterations: profile.requests,
                 rate: Pacing::PerSecond(profile.offered),
                 concurrency: profile.concurrency,
             },
-            factory,
+            er.api().url().to_owned(),
+            prep::payer_bytes(&prep_payers),
+            0,
+            move |id| {
+                crate::program::instruction::build::simple_byte_set(
+                    id,
+                    &[pool[(id as usize) % pool.len()]],
+                )
+            },
         )?;
         if let Some(ledger_txs_before) =
             before.get(crate::metrics::ENGINE_TRANSACTIONS)

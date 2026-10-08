@@ -160,10 +160,11 @@ private ERs. `ephemeral_accounts`, `task_scheduler`, `config_gates`, `rpc_compat
 `verifier_lifecycle`, and `replication_recovery`
 run on
 one instead of the shared ER (the last two boot their private ER as a leader
-with two verifiers replicating from it); `restart_under_load`,
+with two verifiers replicating from it); `restart_under_load` and
+`superblock_boundary_latency` do the same without ever booting the shared ER;
 `ws_conn_capacity`, `clone_lru_churn`, `cold_hydration_tail`,
-`ensure_gate_stall`, `storage_prodsize_sustain`, and
-`superblock_boundary_latency` boot theirs beside the shared stack. Each takes
+`ensure_gate_stall`, and `storage_prodsize_sustain` boot theirs beside the
+shared stack, whose identity their accounts are delegated to. Each takes
 its own identity from a 64-slot pool minted at genesis, so private ERs never
 collide with the shared one or each other.
 The four retry entrypoints share their implementation in `transaction_retries`.
@@ -312,7 +313,10 @@ chainlink (account cloning / subscriptions):
 - `clone_lru_churn` — makes the validator track more accounts than its
   configured cap and keeps reading random ones. Every miss forces an evict +
   refetch cycle; the test checks evictions and refetches match one-to-one
-  and measures how fast that churn can go.
+  and measures how fast that churn can go. The cache rounds a cap up to a
+  power of two with a floor of 256, so each rung is a distinct effective
+  capacity: lite 360 and 200 (512 and 256), full 900, 500 and 125 (1024, 512
+  and 256).
 - `ensure_gate_stall` — same oversubscription (working set 8x
   the cap) with multi-account transactions: each transaction waits until all
   its accounts are present.

@@ -2,13 +2,13 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use pubkey::Pubkey;
-use redsuite_core::redline::{copy_three, Accounts};
+use redsuite_core::redline::{copy_three, execute_kernel, Accounts};
 use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, prep,
     profile::ProfileValues,
     report,
-    runner::{execute_threaded, Pacing, RunOutcome, ThreadRunConfig},
+    runner::{Pacing, RunOutcome, ThreadRunConfig},
     stats::{ObservationsStats, StreamingStats},
     transport::subpool::{
         ConnReport, ExpectedWrites, ProducedLedger, SubscriberPool,
@@ -91,34 +91,18 @@ fn execute_cell(
     payer_bytes: Arc<Vec<[u8; 64]>>,
     produced: Option<Arc<ProducedLedger>>,
 ) -> Result<RunOutcome> {
-    let threads = config.threads;
-    let factory = move |thread_index: usize| {
-        let senders = prep::worker_senders(
-            &er_rpc_url,
-            &payer_bytes,
-            thread_index,
-            threads,
-        );
-        let pool = pool.clone();
-        let produced = produced.clone();
-        move |id: u64| {
-            let global_id = id_offset + id;
-            let (ix, _) = copy_three(&pool, global_id);
-            if let Some(ledger) = &produced {
-                ledger.record(global_id);
-            }
-            let sender = senders[(global_id as usize) % senders.len()].clone();
-            async move { sender.submit(&[ix]).await.map(|_| ()) }
+    execute_kernel(config, er_rpc_url, payer_bytes, id_offset, move |id| {
+        let (ix, _) = copy_three(&pool, id);
+        if let Some(ledger) = &produced {
+            ledger.record(id);
         }
-    };
-    execute_threaded(config, factory)
+        ix
+    })
 }
 
 struct CellOutcome {
     connections: usize,
-    delivered: u64,
-    failed: u64,
-    achieved_tps: f64,
+    outcome: RunOutcome,
     missing_final: usize,
     incomplete: usize,
     received_min: u64,
@@ -151,9 +135,7 @@ impl Scenario for WsFanoutThreshold {
             CLONE_TIMEOUT,
         )
         .await?;
-        let payer_bytes: Arc<Vec<[u8; 64]>> = Arc::new(
-            prep_payers.iter().map(|payer| payer.to_bytes()).collect(),
-        );
+        let payer_bytes = prep::payer_bytes(&prep_payers);
         let pool: Arc<Vec<Pubkey>> = Arc::new(pool);
         let er_rpc_url = er.api().url().to_owned();
 
@@ -259,9 +241,7 @@ impl Scenario for WsFanoutThreshold {
 
             let cell_outcome = CellOutcome {
                 connections,
-                delivered: outcome.delivered,
-                failed: outcome.failed,
-                achieved_tps: outcome.achieved_rps(),
+                outcome,
                 missing_final,
                 incomplete,
                 received_min,
@@ -275,7 +255,7 @@ impl Scenario for WsFanoutThreshold {
                  received {}..{} per conn ({} total), missing finals {}, incomplete pairs {}, >1s {}",
                 self.name(),
                 connections,
-                cell_outcome.achieved_tps,
+                cell_outcome.outcome.achieved_rps(),
                 cell_outcome.lag.median,
                 cell_outcome.lag.quantile95,
                 cell_outcome.lag.max,
@@ -303,12 +283,16 @@ impl Scenario for WsFanoutThreshold {
                     .setting("offered tps", profile.rate)
                     .setting("concurrency", profile.concurrency)
                     .setting("drain timeout s", DRAIN_TIMEOUT.as_secs())
-                    .observe("delivery us", Unit::Micros, outcome.delivery)
+                    .observe(
+                        "delivery us",
+                        Unit::Micros,
+                        cell_outcome.outcome.delivery,
+                    )
                     .observe("fanout lag us", Unit::Micros, cell_outcome.lag)
                     .metric(
                         "achieved tps",
                         Unit::Tps,
-                        cell_outcome.achieved_tps,
+                        cell_outcome.outcome.achieved_rps(),
                     )
                     .metric(
                         "writes produced",
@@ -362,14 +346,7 @@ impl Scenario for WsFanoutThreshold {
                             .histogram_avg("mbv_transaction_processing_time")
                             .map(|seconds| seconds * 1e6),
                     );
-            match report::persist_cell(self.name(), &cell_report) {
-                Ok(path) => {
-                    eprintln!("[redsuite]   cell report: {}", path.display())
-                }
-                Err(e) => eprintln!(
-                    "[redsuite]   warning: cell report not persisted: {e}"
-                ),
-            }
+            report::persist_cell(self.name(), &cell_report);
             if let Some(failed_txs) =
                 delta.counter_all(crate::metrics::FAILED_TRANSACTIONS)
             {
@@ -415,7 +392,7 @@ impl Scenario for WsFanoutThreshold {
 
         for cell in &cells {
             check!(
-                cell.delivered > 0,
+                cell.outcome.delivered > 0,
                 "INVALID: ws{} delivered nothing",
                 cell.connections
             )?;
@@ -491,7 +468,7 @@ impl Scenario for WsFanoutThreshold {
                 .metric(
                     format!("{cell_name} achieved tps"),
                     Unit::Tps,
-                    cell.achieved_tps,
+                    cell.outcome.achieved_rps(),
                 )
                 .metric(
                     format!("{cell_name} received spread"),
@@ -521,7 +498,7 @@ impl Scenario for WsFanoutThreshold {
                 .metric(
                     format!("{cell_name} failed"),
                     Unit::Count,
-                    cell.failed as f64,
+                    cell.outcome.failed as f64,
                 );
         }
         Ok(summary)

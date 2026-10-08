@@ -1,8 +1,4 @@
-use std::{
-    cell::RefCell,
-    rc::Rc,
-    time::{Duration, Instant},
-};
+use std::{cell::RefCell, rc::Rc, time::Duration};
 
 use async_trait::async_trait;
 use pubkey::Pubkey;
@@ -11,11 +7,12 @@ use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, prep,
     profile::ProfileValues,
+    redline::causal::HASH_INIT,
     report,
     runner::{execute, Pacing, RunConfig, RunOutcome},
     transport::ws::{AccountUpdates, UpdateOutcome},
-    BaseCtx, ChainCtx, CheckError, ErCtx, MetricsDelta, Result, Scenario,
-    ScenarioReport, TxSender,
+    BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
+    TxSender,
 };
 use signature::Signature;
 
@@ -24,9 +21,7 @@ use crate::program::{instruction::build, layout, utils::hash_chain};
 const PAYER_LAMPORTS: u64 = 2_000_000_000;
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(300);
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(20);
-const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const TX_COUNT: &str = crate::metrics::ENGINE_TRANSACTIONS;
-const HASH_INIT: Pubkey = Pubkey::new_from_array([7u8; 32]);
 const LIGHT_ITERS: u32 = 1;
 const HEAVY_ITERS: u32 = 20;
 const CU_CONTRAST_FLOOR: f64 = 10.0;
@@ -66,17 +61,6 @@ const PROFILES: ProfileValues<Profile> = ProfileValues {
     full: FULL,
 };
 
-fn consumed_cus(logs: &[String]) -> Option<f64> {
-    logs.iter().find_map(|line| {
-        let (_, rest) = line.split_once(" consumed ")?;
-        let (cus, tail) = rest.split_once(" of ")?;
-        if !tail.contains("compute units") {
-            return None;
-        }
-        cus.parse().ok()
-    })
-}
-
 struct Cell {
     label: &'static str,
     iters: u32,
@@ -92,21 +76,6 @@ impl Cell {
     fn executed_tps(&self, iterations: u64) -> f64 {
         iterations as f64 / (self.outcome.wall + self.drain).as_secs_f64()
     }
-}
-
-async fn drain_processed(er: &ErCtx, target: f64) -> Result<()> {
-    check::poll(
-        &format!("the validator transaction count reaches {target}"),
-        DRAIN_TIMEOUT,
-        || async {
-            matches!(
-                er.scrape_metrics().await.ok().and_then(|metrics| metrics.get(TX_COUNT)),
-                Some(count) if count >= target
-            )
-        },
-    )
-    .await?;
-    Ok(())
 }
 
 async fn run_cell(
@@ -147,7 +116,8 @@ async fn run_cell(
         warm.first_error
     )?;
     if let Some(seen) = count_before_warmup {
-        drain_processed(er, seen + profile.warmup as f64).await?;
+        crate::await_executed(er, seen + profile.warmup as f64, DRAIN_TIMEOUT)
+            .await?;
     }
 
     let updates = Rc::new(
@@ -198,34 +168,24 @@ async fn run_cell(
         "{label} measured deliveries failed: {:?}",
         outcome.first_error
     )?;
-    let drain_started = Instant::now();
-    if let Some(seen) = before.get(TX_COUNT) {
-        drain_processed(er, seen + profile.iterations as f64).await?;
-    }
-    let drain = drain_started.elapsed();
+    let drain = match before.get(TX_COUNT) {
+        Some(seen) => {
+            crate::await_executed(
+                er,
+                seen + profile.iterations as f64,
+                DRAIN_TIMEOUT,
+            )
+            .await?
+        }
+        None => Duration::ZERO,
+    };
 
     let probe_sig = probe
         .borrow()
         .as_ref()
         .cloned()
         .ok_or("no probe signature captured")?;
-    let probe_tx = er
-        .api()
-        .await_transaction(&probe_sig, PROBE_TIMEOUT)
-        .await?;
-    check!(
-        probe_tx.err.is_none(),
-        "{label} probe tx failed on-chain (sha256 iters {iters} over the \
-         compute budget?): {:?}\nlogs: {:#?}",
-        probe_tx.err,
-        probe_tx.logs
-    )?;
-    let probe_cus = consumed_cus(&probe_tx.logs).ok_or_else(|| {
-        CheckError::new(format!(
-            "{label} probe logs carry no `consumed .. compute units` line"
-        ))
-        .actual(format!("{:#?}", probe_tx.logs))
-    })?;
+    let probe_cus = crate::probe_cus(er, &probe_sig, label, iters).await?;
 
     updates.await_settled(SETTLE_TIMEOUT).await?;
     let after = er.scrape_metrics().await?;
@@ -351,14 +311,7 @@ impl Scenario for HighCu {
                         Unit::Count,
                         cell.validator_txs,
                     );
-            match report::persist_cell(self.name(), &cell_report) {
-                Ok(path) => {
-                    eprintln!("[redsuite]   cell report: {}", path.display())
-                }
-                Err(err) => eprintln!(
-                    "[redsuite]   warning: cell report not persisted: {err}"
-                ),
-            }
+            report::persist_cell(self.name(), &cell_report);
             cells.push(cell);
         }
 
@@ -378,11 +331,9 @@ impl Scenario for HighCu {
                 continue;
             }
             let on_er = er.account(pda).await?.ok_or("pda not on er")?;
-            let id_bytes = &on_er.data
-                [layout::ID_OFFSET..layout::ID_OFFSET + layout::ID_SIZE];
             check_eq!(
-                id_bytes,
-                last_id.to_le_bytes(),
+                crate::account_update_id(&on_er.data),
+                Some(last_id),
                 "er copy must hold the last id written to pda {index}"
             )?;
             let hash_bytes = &on_er.data

@@ -1,4 +1,4 @@
-use std::ops::Range;
+use std::{ops::Range, sync::Arc};
 
 use instruction::Instruction;
 use keypair::Keypair;
@@ -6,7 +6,11 @@ use pubkey::Pubkey;
 use redline_interface::instruction::build;
 use signer::Signer;
 
-use crate::{prep, ChainCtx, Result};
+use crate::{
+    prep,
+    runner::{execute_threaded, RunOutcome, ThreadRunConfig},
+    ChainCtx, Result,
+};
 
 pub mod causal;
 
@@ -26,6 +30,29 @@ pub fn copy_three(pool: &[Pubkey], id: u64) -> (Instruction, [Pubkey; 2]) {
         build::account_data_copy(id, &[source], &[first_dest, second_dest]),
         [first_dest, second_dest],
     )
+}
+
+pub fn execute_kernel<K>(
+    config: ThreadRunConfig,
+    rpc_url: String,
+    payers: Arc<Vec<[u8; 64]>>,
+    first_id: u64,
+    kernel: K,
+) -> Result<RunOutcome>
+where
+    K: Fn(u64) -> Instruction + Clone + Send + 'static,
+{
+    let threads = config.threads;
+    execute_threaded(config, move |worker| {
+        let senders = prep::worker_senders(&rpc_url, &payers, worker, threads);
+        let kernel = kernel.clone();
+        move |id: u64| {
+            let id = first_id + id;
+            let ix = kernel(id);
+            let sender = senders[(id as usize) % senders.len()].clone();
+            async move { sender.submit(&[ix]).await.map(|_| ()) }
+        }
+    })
 }
 
 pub struct Accounts {

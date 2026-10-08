@@ -12,15 +12,15 @@ use redsuite_core::report::Unit::{Count, Micros, Ratio, Seconds, Tps};
 use redsuite_core::{
     check, check_eq, host, prep,
     profile::ProfileValues,
-    redline::causal::{compute_unit_limit, CU_LIMIT},
+    redline::causal::{compute_unit_limit, CU_LIMIT, HASH_INIT},
     report,
     runner::{
         execute_raw, merge_outcomes, spawn_workers, Pacing, RawRunOutcome,
         RunConfig, RunOutcome, WorkerBudgets,
     },
     sampler::{MeanMax, Sampled, Sampler, Trailing},
-    topology, Api, BaseCtx, ChainCtx, CheckError, ErClient, ErCtx,
-    MetricsDelta, Result, Scenario, ScenarioReport, SendBody, TxSender,
+    topology, Api, BaseCtx, ChainCtx, ErClient, ErCtx, MetricsDelta, Result,
+    Scenario, ScenarioReport, SendBody, TxSender,
 };
 use signature::Signature;
 
@@ -28,7 +28,6 @@ use crate::program::{instruction::build, layout, utils::hash_chain};
 
 const PAYER_LAMPORTS: u64 = 200_000_000;
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(900);
-const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const CLONE_TIMEOUT: Duration = Duration::from_secs(60);
 const BUSY_SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
 const TX_COUNT: &str = crate::metrics::ENGINE_TRANSACTIONS;
@@ -36,7 +35,6 @@ const BUSY_EXECUTORS: &str = "engine_processor_busy_executors";
 const ORDERING_DEPENDENCIES: &str = "engine_processor_ordering_dependencies";
 const BLOCKED_TRANSACTIONS: &str = "engine_processor_blocked_transactions";
 const PROGRAM: Pubkey = crate::program::ID;
-const HASH_INIT: Pubkey = Pubkey::new_from_array([7u8; 32]);
 const LIGHT_ITERS: u32 = 1;
 const CU_CONTRAST_FLOOR: f64 = 10.0;
 const BUSY_THREAD_CORES: f64 = 0.5;
@@ -113,17 +111,6 @@ const PROFILES: ProfileValues<Profile> = ProfileValues {
     lite: LITE,
     full: FULL,
 };
-
-fn consumed_cus(logs: &[String]) -> Option<f64> {
-    logs.iter().find_map(|line| {
-        let (_, rest) = line.split_once(" consumed ")?;
-        let (cus, tail) = rest.split_once(" of ")?;
-        if !tail.contains("compute units") {
-            return None;
-        }
-        cus.parse().ok()
-    })
-}
 
 fn slot_of(global_id: u64, len: usize) -> usize {
     (global_id - 1) as usize % len
@@ -300,22 +287,6 @@ async fn execute_cell_burst(
     })
 }
 
-async fn drain_processed(er: &ErCtx, target: f64) -> Result<Duration> {
-    let started = Instant::now();
-    check::poll(
-        &format!("the validator transaction count reaches {target:.0}"),
-        DRAIN_TIMEOUT,
-        || async {
-            matches!(
-                er.scrape_metrics().await.ok().and_then(|metrics| metrics.get(TX_COUNT)),
-                Some(count) if count >= target
-            )
-        },
-    )
-    .await?;
-    Ok(started.elapsed())
-}
-
 struct Cell {
     label: &'static str,
     iters: u32,
@@ -387,8 +358,7 @@ impl Scenario for ExecutorSaturation {
             prep_started.elapsed().as_secs_f64(),
         );
         let accounts = Arc::new(accounts);
-        let payer_bytes: Arc<Vec<[u8; 64]>> =
-            Arc::new(payers.iter().map(|payer| payer.to_bytes()).collect());
+        let payer_bytes = prep::payer_bytes(&payers);
         let er_rpc_url = er.api().url().to_owned();
         let er_pid = topology::current_state()
             .ok_or("no shared stack state")?
@@ -419,7 +389,12 @@ impl Scenario for ExecutorSaturation {
             warm.outcome.first_error
         )?;
         if let Some(seen) = count_before_warmup {
-            drain_processed(er, seen + profile.warmup as f64).await?;
+            crate::await_executed(
+                er,
+                seen + profile.warmup as f64,
+                DRAIN_TIMEOUT,
+            )
+            .await?;
         }
 
         let mut offset = profile.warmup;
@@ -468,7 +443,12 @@ impl Scenario for ExecutorSaturation {
             )?;
             let drain = match before.get(TX_COUNT) {
                 Some(seen) => {
-                    drain_processed(er, seen + cell_iterations as f64).await?
+                    crate::await_executed(
+                        er,
+                        seen + cell_iterations as f64,
+                        DRAIN_TIMEOUT,
+                    )
+                    .await?
                 }
                 None => Duration::ZERO,
             };
@@ -508,24 +488,8 @@ impl Scenario for ExecutorSaturation {
 
             let probe_sig =
                 probe.get().copied().ok_or("no probe signature captured")?;
-            let probe_tx = er
-                .api()
-                .await_transaction(&probe_sig, PROBE_TIMEOUT)
-                .await?;
-            check!(
-                probe_tx.err.is_none(),
-                "{label}: probe tx failed on-chain (sha256 iters {iters} \
-                 over the compute budget?): {:?}\nlogs: {:#?}",
-                probe_tx.err,
-                probe_tx.logs
-            )?;
-            let probe_cus = consumed_cus(&probe_tx.logs).ok_or_else(|| {
-                CheckError::new(format!(
-                    "{label}: probe logs carry no `consumed .. compute \
-                     units` line"
-                ))
-                .actual(format!("{:#?}", probe_tx.logs))
-            })?;
+            let probe_cus =
+                crate::probe_cus(er, &probe_sig, label, iters).await?;
 
             let thread_cores = cpu_after.thread_cores_since(&cpu_before);
             let cell = Cell {
@@ -620,14 +584,7 @@ impl Scenario for ExecutorSaturation {
             ] {
                 cell_report = cell_report.metric_if(name, unit, value);
             }
-            match report::persist_cell(self.name(), &cell_report) {
-                Ok(path) => {
-                    eprintln!("[redsuite]   cell report: {}", path.display())
-                }
-                Err(err) => eprintln!(
-                    "[redsuite]   warning: cell report not persisted: {err}"
-                ),
-            }
+            report::persist_cell(self.name(), &cell_report);
             cells.push(cell);
         }
 

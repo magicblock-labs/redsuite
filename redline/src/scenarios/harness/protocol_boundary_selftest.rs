@@ -2,13 +2,13 @@ use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use pubkey::Pubkey;
-use redsuite_core::redline::{copy_three, Accounts};
+use redsuite_core::redline::{copy_three, execute_kernel, Accounts};
 use redsuite_core::report::Unit;
 use redsuite_core::{
     check_eq, prep,
     profile::ProfileValues,
     report,
-    runner::{execute_threaded, Pacing, RunOutcome, ThreadRunConfig},
+    runner::{Pacing, RunOutcome, ThreadRunConfig},
     BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
 };
 
@@ -67,22 +67,9 @@ fn run_cell(
     pool: Arc<Vec<Pubkey>>,
     payer_bytes: Arc<Vec<[u8; 64]>>,
 ) -> Result<RunOutcome> {
-    let threads = config.threads;
-    let factory = move |thread_index: usize| {
-        let senders = prep::worker_senders(
-            &er_rpc_url,
-            &payer_bytes,
-            thread_index,
-            threads,
-        );
-        let pool = pool.clone();
-        move |id: u64| {
-            let sender = senders[(id as usize) % senders.len()].clone();
-            let (ix, _) = copy_three(&pool, id_offset + id);
-            async move { sender.submit(&[ix]).await.map(|_| ()) }
-        }
-    };
-    execute_threaded(config, factory)
+    execute_kernel(config, er_rpc_url, payer_bytes, 0, move |id| {
+        copy_three(&pool, id_offset + id).0
+    })
 }
 
 struct CellOutcome {
@@ -116,9 +103,7 @@ impl Scenario for ProtocolBoundarySelftest {
             CLONE_TIMEOUT,
         )
         .await?;
-        let payer_bytes: Arc<Vec<[u8; 64]>> = Arc::new(
-            prep_payers.iter().map(|payer| payer.to_bytes()).collect(),
-        );
+        let payer_bytes = prep::payer_bytes(&prep_payers);
         let er_rpc_url = er.api().url().to_owned();
 
         let warmup = run_cell(
@@ -207,14 +192,7 @@ impl Scenario for ProtocolBoundarySelftest {
                 Unit::Micros,
                 cell.tx_processing_avg_us,
             );
-            match report::persist_cell(self.name(), &cell_report) {
-                Ok(path) => {
-                    eprintln!("[redsuite]   cell report: {}", path.display())
-                }
-                Err(e) => eprintln!(
-                    "[redsuite]   warning: cell report not persisted: {e}"
-                ),
-            }
+            report::persist_cell(self.name(), &cell_report);
             cells.push(cell);
         }
 

@@ -12,8 +12,6 @@ use redsuite_core::{
     TxSender,
 };
 
-use crate::program::layout;
-
 const PAYER_LAMPORTS: u64 = 2_000_000_000;
 
 const CONFIRM_TIMEOUT: Duration = Duration::from_secs(20);
@@ -224,26 +222,16 @@ impl Scenario for WarmIngress {
         )?;
 
         for (idx, pda) in pdas.iter().enumerate() {
-            let len = pdas.len() as u64;
-            let idx = idx as u64;
-            let mut last_id = 0;
-            for id in offset + 1..=offset + profile.iterations {
-                let base_index = ((id - 1) * 3) % len;
-                if (base_index + 1) % len == idx
-                    || (base_index + 2) % len == idx
-                {
-                    last_id = id;
-                }
-            }
-            if last_id == 0 {
+            let last_id = (offset + 1..=offset + profile.iterations)
+                .rev()
+                .find(|&id| copy_three(&pdas, id).1.contains(pda));
+            let Some(last_id) = last_id else {
                 continue;
-            }
+            };
             let on_er = er.account(pda).await?.ok_or("pda not on er")?;
-            let id_bytes = &on_er.data
-                [layout::ID_OFFSET..layout::ID_OFFSET + layout::ID_SIZE];
             check_eq!(
-                id_bytes,
-                last_id.to_le_bytes(),
+                crate::account_update_id(&on_er.data),
+                Some(last_id),
                 "er copy must hold the last id written to pda {idx}"
             )?;
         }
