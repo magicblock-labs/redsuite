@@ -42,14 +42,14 @@ impl Scenario for SimpleLoad {
                 DELEGATION_PROGRAM_ID,
                 "delegated pda must be dlp-owned on base"
             )?;
-            prep::await_clones(
-                er,
-                std::slice::from_ref(pda),
-                crate::ACCOUNT_SPACE as usize,
-                Duration::from_secs(15),
-            )
-            .await?;
         }
+        prep::await_clones(
+            er,
+            &pdas,
+            crate::ACCOUNT_SPACE as usize,
+            Duration::from_secs(15),
+        )
+        .await?;
 
         let updates =
             AccountUpdates::connect(er.ws_url(), crate::account_update_id)
@@ -84,11 +84,9 @@ impl Scenario for SimpleLoad {
         for (i, pda) in pdas.iter().enumerate() {
             let last_id = ITERATIONS - ACCOUNTS as u64 + 1 + i as u64;
             let on_er = er.account(pda).await?.ok_or("pda not on er")?;
-            let id_bytes = &on_er.data
-                [layout::ID_OFFSET..layout::ID_OFFSET + layout::ID_SIZE];
             check_eq!(
-                id_bytes,
-                last_id.to_le_bytes(),
+                crate::account_update_id(&on_er.data),
+                Some(last_id),
                 "er copy must hold the last id written to pda {i}"
             )?;
 

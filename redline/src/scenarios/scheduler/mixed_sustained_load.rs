@@ -12,10 +12,10 @@ use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, host, prep,
     profile::ProfileValues,
-    redline::causal::{compute_unit_limit, CU_LIMIT},
+    redline::causal::{compute_unit_limit, CU_LIMIT, HASH_INIT},
     runner::{
-        execute_raw, merge_outcomes, spawn_workers, Pacing, RunConfig,
-        RunOutcome,
+        execute_raw, merge_outcomes, spawn_workers, split_iterations, Pacing,
+        RunConfig, RunOutcome,
     },
     topology, BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario,
     ScenarioReport,
@@ -27,7 +27,6 @@ const PAYER_LAMPORTS: u64 = 4_000_000_000;
 const CLONE_TIMEOUT: Duration = Duration::from_secs(60);
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(1_800);
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(60);
-const HASH_INIT: Pubkey = Pubkey::new_from_array([7u8; 32]);
 
 use crate::metrics::{
     ENGINE_TRANSACTIONS, RPC_ACCEPTED_TRANSACTIONS, RPC_HANDLED_TRANSACTIONS,
@@ -109,22 +108,6 @@ fn gcd(a: u64, b: u64) -> u64 {
 struct LaneSpan {
     lo: u64,
     len: u64,
-}
-
-fn lane_spans(lanes: u64, threads: usize) -> Vec<LaneSpan> {
-    let threads = threads.max(1) as u64;
-    let base = lanes / threads;
-    let remainder = lanes % threads;
-    let mut lo = 0;
-    (0..threads)
-        .map(|index| {
-            let len = base + u64::from(index < remainder);
-            let span = LaneSpan { lo, len };
-            lo += len;
-            span
-        })
-        .filter(|span| span.len > 0)
-        .collect()
 }
 
 impl LaneSpan {
@@ -235,8 +218,9 @@ async fn execute(
     payer_bytes: Arc<Vec<[u8; 64]>>,
 ) -> Result<RunOutcome> {
     let threads = config.threads.max(1);
-    let spans: Vec<LaneSpan> = lane_spans(config.lanes, threads)
+    let spans: Vec<LaneSpan> = split_iterations(config.lanes, threads)
         .into_iter()
+        .map(|(lo, len)| LaneSpan { lo, len })
         .take_while(|span| span.jobs(config.lanes, config.total) > 0)
         .collect();
     let rates = Pacing::PerSecond(config.rate).partition(spans.len())?;
@@ -293,20 +277,7 @@ struct DrainState {
 
 async fn drain(er: &ErCtx, target: f64) -> Result<DrainState> {
     let started = Instant::now();
-    check::poll(
-        &format!("the engine transaction count reaches {target:.0}"),
-        DRAIN_TIMEOUT,
-        || async {
-            matches!(
-                er.scrape_metrics()
-                    .await
-                    .ok()
-                    .and_then(|m| m.get(ENGINE_TRANSACTIONS)),
-                Some(count) if count >= target
-            )
-        },
-    )
-    .await?;
+    crate::await_executed(er, target, DRAIN_TIMEOUT).await?;
     check::poll(
         "the execution pipeline goes idle (nothing blocked, busy or pending)",
         SETTLE_TIMEOUT,
@@ -345,12 +316,10 @@ async fn verify_final_state(
         };
         let account = er.account(pda).await?.ok_or("pda not on er")?;
         let data = &account.data;
-        let id_bytes =
-            &data[layout::ID_OFFSET..layout::ID_OFFSET + layout::ID_SIZE];
         let mode = mode_for(last_id);
         check_eq!(
-            id_bytes,
-            last_id.to_le_bytes(),
+            crate::account_update_id(data),
+            Some(last_id),
             "lane {index} must hold id {last_id}, the last {} write",
             mode.label()
         )?;
@@ -464,8 +433,7 @@ impl Scenario for MixedSustainedLoad {
         );
 
         let pool = Arc::new(pool);
-        let payer_bytes: Arc<Vec<[u8; 64]>> =
-            Arc::new(payers.iter().map(|payer| payer.to_bytes()).collect());
+        let payer_bytes = prep::payer_bytes(&payers);
         let er_pid = topology::current_state()
             .ok_or("no shared stack state")?
             .er_pid;

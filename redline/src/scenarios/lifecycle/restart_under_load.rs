@@ -13,8 +13,10 @@ use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, host, prep,
     profile::ProfileValues,
+    redline::causal::HASH_INIT,
     topology::{self, RestartConfig, RestartTiming},
-    Api, BaseCtx, ChainCtx, ErCtx, Result, Scenario, ScenarioReport, TxSender,
+    Api, BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result, ScenarioReport,
+    TxSender,
 };
 use signature::Signature;
 
@@ -32,7 +34,6 @@ const LANE_BACKOFF: Duration = Duration::from_millis(100);
 const BLOCKTIME_MS: u64 = 50;
 const SUPERBLOCK_SLOTS: u64 = 100;
 const HASH_ITERS: u32 = 1;
-const HASH_INIT: Pubkey = Pubkey::new_from_array([7u8; 32]);
 const PROGRAM: Pubkey = crate::program::ID;
 const VERIFY_CAP: usize = 4_000;
 const SIGKILL: i32 = 9;
@@ -539,16 +540,13 @@ async fn run_mode(
         let pool = Accounts::new(crate::ACCOUNT_SPACE, er.identity())
             .init_batched(base, &prep_payers, profile.lanes, true)
             .await?;
-        for pda in &pool {
-            check::poll(
-                &format!("the ER clones the delegated pda {pda}"),
-                CLONE_TIMEOUT,
-                || async {
-                    matches!(er.account(pda).await, Ok(Some(acc)) if acc.data.len() == crate::ACCOUNT_SPACE as usize)
-                },
-            )
-            .await?;
-        }
+        prep::await_clones(
+            er,
+            &pool,
+            crate::ACCOUNT_SPACE as usize,
+            CLONE_TIMEOUT,
+        )
+        .await?;
         Rc::new(pool)
     };
     let senders: Vec<TxSender> = prep_payers
@@ -830,12 +828,12 @@ fn report_mode(
 pub struct RestartUnderLoad;
 
 #[async_trait(?Send)]
-impl Scenario for RestartUnderLoad {
+impl PrivateErScenario for RestartUnderLoad {
     fn name(&self) -> &str {
         "redline/restart_under_load"
     }
 
-    async fn run(&self, base: &BaseCtx, _er: &ErCtx) -> Result<ScenarioReport> {
+    async fn run(&self, base: &BaseCtx) -> Result<ScenarioReport> {
         let profile = PROFILES.select(base.config().profile);
         let started = Instant::now();
         let graceful = run_mode(base, profile, Mode::Graceful).await?;

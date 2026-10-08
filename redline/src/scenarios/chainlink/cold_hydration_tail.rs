@@ -13,7 +13,7 @@ use redsuite_core::{
     check_eq, prep,
     profile::ProfileValues,
     report,
-    runner::{execute, Pacing, RunConfig},
+    runner::{execute, Pacing, RunConfig, RunOutcome},
     stats::{ObservationsStats, StreamingStats},
     topology, BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario,
     ScenarioReport, TxSender,
@@ -82,10 +82,7 @@ async fn touch_pass(er: &ErCtx, pool: &[Pubkey]) -> Result<ObservationsStats> {
 }
 
 struct BurstOutcome {
-    delivered: u64,
-    failed: u64,
-    first_error: Option<String>,
-    delivery: ObservationsStats,
+    outcome: RunOutcome,
     slow: u64,
     wall_s: f64,
     ensure_avg_s: Option<f64>,
@@ -166,10 +163,7 @@ async fn burst_cell(
     let delta = MetricsDelta::new(before, after);
 
     Ok(BurstOutcome {
-        delivered: outcome.delivered,
-        failed: outcome.failed,
-        first_error: outcome.first_error,
-        delivery: outcome.delivery,
+        outcome,
         slow: slow.get(),
         wall_s,
         ensure_avg_s: delta.histogram_avg(ENSURE_TX_HISTOGRAM),
@@ -262,14 +256,7 @@ impl Scenario for ColdHydrationTail {
                     Unit::Seconds,
                     touch_delta.histogram_avg(ENSURE_ACCOUNT_HISTOGRAM),
                 );
-        match report::persist_cell(self.name(), &touch_report) {
-            Ok(path) => {
-                eprintln!("[redsuite]   cell report: {}", path.display())
-            }
-            Err(e) => eprintln!(
-                "[redsuite]   warning: cell report not persisted: {e}"
-            ),
-        }
+        report::persist_cell(self.name(), &touch_report);
 
         let burst_payers: Vec<Rc<Keypair>> =
             prep::funded_payers(base, profile.burst_payers, PAYER_LAMPORTS)
@@ -309,24 +296,24 @@ impl Scenario for ColdHydrationTail {
                  p50 {} us / p95 {} us / max {} us, >100ms {} of {}, ensure avg {}",
                 self.name(),
                 cell_name,
-                outcome.delivered,
-                outcome.failed,
+                outcome.outcome.delivered,
+                outcome.outcome.failed,
                 outcome.wall_s,
-                outcome.delivery.median,
-                outcome.delivery.quantile95,
-                outcome.delivery.max,
+                outcome.outcome.delivery.median,
+                outcome.outcome.delivery.quantile95,
+                outcome.outcome.delivery.max,
                 outcome.slow,
-                outcome.delivered + outcome.failed,
+                outcome.outcome.delivered + outcome.outcome.failed,
                 outcome
                     .ensure_avg_s
                     .map(|seconds| format!("{seconds:.6} s"))
                     .unwrap_or_else(|| "n/a".to_owned()),
             );
             check_eq!(
-                outcome.failed,
+                outcome.outcome.failed,
                 0,
                 "{cell_name}: deliveries failed: {:?}",
-                outcome.first_error
+                outcome.outcome.first_error
             )?;
         }
         if warm_deps.slow > cold_deps.slow {
@@ -351,8 +338,16 @@ impl Scenario for ColdHydrationTail {
                     .setting("concurrency", profile.burst_concurrency)
                     .setting("account space", ACCOUNT_SPACE)
                     .setting("slow threshold ms", SLOW_THRESHOLD.as_millis())
-                    .observe("delivery us", Unit::Micros, outcome.delivery)
-                    .metric("delivered", Unit::Count, outcome.delivered as f64)
+                    .observe(
+                        "delivery us",
+                        Unit::Micros,
+                        outcome.outcome.delivery,
+                    )
+                    .metric(
+                        "delivered",
+                        Unit::Count,
+                        outcome.outcome.delivered as f64,
+                    )
                     .metric("slow (>100ms)", Unit::Count, outcome.slow as f64)
                     .metric("burst wall s", Unit::Seconds, outcome.wall_s)
                     .metric_if(
@@ -360,14 +355,7 @@ impl Scenario for ColdHydrationTail {
                         Unit::Seconds,
                         outcome.ensure_avg_s,
                     );
-            match report::persist_cell(self.name(), &cell_report) {
-                Ok(path) => {
-                    eprintln!("[redsuite]   cell report: {}", path.display())
-                }
-                Err(e) => eprintln!(
-                    "[redsuite]   warning: cell report not persisted: {e}"
-                ),
-            }
+            report::persist_cell(self.name(), &cell_report);
         }
 
         Ok(ScenarioReport::ok(self.name())
@@ -384,12 +372,12 @@ impl Scenario for ColdHydrationTail {
             .metric(
                 "burst cold-deps p95 us",
                 Unit::Micros,
-                cold_deps.delivery.quantile95 as f64,
+                cold_deps.outcome.delivery.quantile95 as f64,
             )
             .metric(
                 "burst warm-deps p95 us",
                 Unit::Micros,
-                warm_deps.delivery.quantile95 as f64,
+                warm_deps.outcome.delivery.quantile95 as f64,
             )
             .metric(
                 "burst cold-deps >100ms",

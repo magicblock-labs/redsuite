@@ -2,13 +2,13 @@ use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use pubkey::Pubkey;
-use redsuite_core::redline::{copy_three, Accounts};
+use redsuite_core::redline::{copy_three, execute_kernel, Accounts};
 use redsuite_core::report::Unit;
 use redsuite_core::{
-    check, check_eq, prep,
+    check_eq, prep,
     profile::ProfileValues,
     report,
-    runner::{execute_threaded, Pacing, RunOutcome, ThreadRunConfig},
+    runner::{Pacing, RunOutcome, ThreadRunConfig},
     BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
 };
 
@@ -62,6 +62,8 @@ const PROFILES: ProfileValues<Profile> = ProfileValues {
     full: FULL,
 };
 
+// same read-write 3/tx shape as S1, confined to the hot set
+// (hot-set sizes are powers of two — coprime with the stride)
 fn execute_cell(
     er_rpc_url: String,
     config: ThreadRunConfig,
@@ -69,47 +71,14 @@ fn execute_cell(
     hot_set: Arc<Vec<Pubkey>>,
     payer_bytes: Arc<Vec<[u8; 64]>>,
 ) -> Result<RunOutcome> {
-    let threads = config.threads;
-    let factory = move |thread_index: usize| {
-        let senders = prep::worker_senders(
-            &er_rpc_url,
-            &payer_bytes,
-            thread_index,
-            threads,
-        );
-        let hot_set = hot_set.clone();
-        // same read-write 3/tx shape as S1, confined to the hot set
-        // (hot-set sizes are powers of two — coprime with the stride)
-        move |id: u64| {
-            let global_id = id_offset + id;
-            let (ix, _) = copy_three(&hot_set, global_id);
-            let sender = senders[(global_id as usize) % senders.len()].clone();
-            async move { sender.submit(&[ix]).await.map(|_| ()) }
-        }
-    };
-    execute_threaded(config, factory)
-}
-
-async fn drain_intake(er: &ErCtx, target: f64) -> Result<()> {
-    check::poll(
-        &format!("the validator transaction count reaches {target:.0}"),
-        DRAIN_TIMEOUT,
-        || async {
-            matches!(
-                er.scrape_metrics().await.ok().and_then(|metrics| metrics.get(TX_COUNT)),
-                Some(count) if count >= target
-            )
-        },
-    )
-    .await?;
-    Ok(())
+    execute_kernel(config, er_rpc_url, payer_bytes, id_offset, move |id| {
+        copy_three(&hot_set, id).0
+    })
 }
 
 struct CellResult {
     hot: u8,
-    p50_us: f64,
-    p95_us: f64,
-    achieved: f64,
+    outcome: RunOutcome,
 }
 
 pub struct HotAccountCliff;
@@ -135,8 +104,7 @@ impl Scenario for HotAccountCliff {
             Duration::from_secs(15),
         )
         .await?;
-        let payer_bytes: Arc<Vec<[u8; 64]>> =
-            Arc::new(payers.iter().map(|payer| payer.to_bytes()).collect());
+        let payer_bytes = prep::payer_bytes(&payers);
         let er_rpc_url = er.api().url().to_owned();
 
         let mut offset = 0u64;
@@ -166,7 +134,12 @@ impl Scenario for HotAccountCliff {
             )?;
             offset += profile.warmup;
             if let Some(seen) = count_before_warmup {
-                drain_intake(er, seen + profile.warmup as f64).await?;
+                crate::await_executed(
+                    er,
+                    seen + profile.warmup as f64,
+                    DRAIN_TIMEOUT,
+                )
+                .await?;
             }
 
             let before = er.scrape_metrics().await?;
@@ -190,7 +163,12 @@ impl Scenario for HotAccountCliff {
                 outcome.first_error
             )?;
             if let Some(seen) = before.get(TX_COUNT) {
-                drain_intake(er, seen + profile.iterations as f64).await?;
+                crate::await_executed(
+                    er,
+                    seen + profile.iterations as f64,
+                    DRAIN_TIMEOUT,
+                )
+                .await?;
             }
             let after = er.scrape_metrics().await?;
             let delta = MetricsDelta::new(before, after);
@@ -204,18 +182,13 @@ impl Scenario for HotAccountCliff {
                 )?;
             }
 
-            let cell = CellResult {
-                hot,
-                p50_us: outcome.delivery.median as f64,
-                p95_us: outcome.delivery.quantile95 as f64,
-                achieved: outcome.achieved_rps(),
-            };
+            let cell = CellResult { hot, outcome };
             eprintln!(
-                "[redsuite] {}: hot{hot}: p50 {:.0} us / p95 {:.0} us, {:.0} tps of {} offered",
+                "[redsuite] {}: hot{hot}: p50 {} us / p95 {} us, {:.0} tps of {} offered",
                 self.name(),
-                cell.p50_us,
-                cell.p95_us,
-                cell.achieved,
+                cell.outcome.delivery.median,
+                cell.outcome.delivery.quantile95,
+                cell.outcome.achieved_rps(),
                 profile.rate,
             );
 
@@ -231,8 +204,12 @@ impl Scenario for HotAccountCliff {
                     .setting("measured iters", profile.iterations)
                     .setting("offered tps", profile.rate)
                     .setting("concurrency", profile.concurrency)
-                    .observe("delivery us", Unit::Micros, outcome.delivery)
-                    .metric("achieved tps", Unit::Tps, cell.achieved)
+                    .observe("delivery us", Unit::Micros, cell.outcome.delivery)
+                    .metric(
+                        "achieved tps",
+                        Unit::Tps,
+                        cell.outcome.achieved_rps(),
+                    )
                     .metric_if(
                         "validator tx processing avg us",
                         Unit::Micros,
@@ -250,14 +227,7 @@ impl Scenario for HotAccountCliff {
                         Unit::Count,
                         delta.counter(crate::metrics::ENGINE_TRANSACTIONS),
                     );
-            match report::persist_cell(self.name(), &cell_report) {
-                Ok(path) => {
-                    eprintln!("[redsuite]   cell report: {}", path.display())
-                }
-                Err(e) => eprintln!(
-                    "[redsuite]   warning: cell report not persisted: {e}"
-                ),
-            }
+            report::persist_cell(self.name(), &cell_report);
             cells.push(cell);
         }
 
@@ -266,7 +236,8 @@ impl Scenario for HotAccountCliff {
         // sweep is INVALID (saturated baseline = measuring the harness,
         // not the scheduler; check `validator tx processing avg us` in the
         // cell report to attribute, then lower the offered rate)
-        let base_p50 = cells[0].p50_us;
+        let p50 = |cell: &CellResult| cell.outcome.delivery.median as f64;
+        let base_p50 = p50(&cells[0]);
         if base_p50 > HEALTHY_P50_US {
             eprintln!(
                 "[redsuite] {}: warning: baseline hot{} p50 {:.0} us is \
@@ -280,13 +251,13 @@ impl Scenario for HotAccountCliff {
         }
         for cell in cells.iter().filter(|cell| cell.hot >= 16) {
             let bound = (base_p50 * FLAT_FACTOR).max(HEALTHY_P50_US);
-            if cell.p50_us > bound {
+            if p50(cell) > bound {
                 eprintln!(
                     "[redsuite] {}: warning: hot{} p50 {:.0} us exceeds the \
                      healthy bound {:.0} us (baseline hot{} p50 {:.0} us)",
                     self.name(),
                     cell.hot,
-                    cell.p50_us,
+                    p50(cell),
                     bound,
                     cells[0].hot,
                     base_p50,
@@ -297,7 +268,7 @@ impl Scenario for HotAccountCliff {
         // baseline.
         let cliff = cells
             .iter()
-            .find(|cell| cell.p50_us > base_p50 * CLIFF_FACTOR)
+            .find(|cell| p50(cell) > base_p50 * CLIFF_FACTOR)
             .map(|cell| cell.hot);
 
         let cell_names: Vec<String> =
@@ -321,17 +292,17 @@ impl Scenario for HotAccountCliff {
                 .metric(
                     format!("hot{} delivery p50 us", cell.hot),
                     Unit::Micros,
-                    cell.p50_us,
+                    p50(cell),
                 )
                 .metric(
                     format!("hot{} delivery p95 us", cell.hot),
                     Unit::Micros,
-                    cell.p95_us,
+                    cell.outcome.delivery.quantile95 as f64,
                 )
                 .metric(
                     format!("hot{} achieved tps", cell.hot),
                     Unit::Tps,
-                    cell.achieved,
+                    cell.outcome.achieved_rps(),
                 );
         }
         Ok(summary)

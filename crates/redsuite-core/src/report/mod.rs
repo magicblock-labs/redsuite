@@ -16,7 +16,7 @@ pub use bmf::bmf;
 use json::{Deserialize, Serialize};
 
 use crate::{
-    api,
+    api, console,
     resources::LaunchRecord,
     scenario::{failed_check, RunRecord, ScenarioOutcome},
     stats::ObservationsStats,
@@ -264,10 +264,19 @@ pub fn persist_summary(
     Ok(())
 }
 
-pub fn persist_cell(parent: &str, report: &ScenarioReport) -> Result<PathBuf> {
+pub fn persist_cell(parent: &str, report: &ScenarioReport) {
     let dir = campaign_dir();
-    ensure_campaign(&dir)?;
-    append_cell(&dir, parent, &scenario_run_doc(report, &[], &[]))
+    let persisted = ensure_campaign(&dir).and_then(|()| {
+        append_cell(&dir, parent, &scenario_run_doc(report, &[], &[]))
+    });
+    match persisted {
+        Ok(path) => {
+            console::detail(format_args!("cell report: {}", path.display()))
+        }
+        Err(error) => console::detail(format_args!(
+            "warning: cell report not persisted: {error}"
+        )),
+    }
 }
 
 fn scenario_run_doc(

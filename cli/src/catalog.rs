@@ -89,13 +89,13 @@ pub mod redline {
             fixtures: [Fixture::RedlineProgram],
         },
         superblock_boundary_latency => storage::superblock_boundary_latency::SuperblockBoundaryLatency {
-            topology: Shared,
-            resources: [Resource::Er, Resource::HostExclusive],
+            topology: PrivateEr,
+            resources: [Resource::HostExclusive],
             fixtures: [Fixture::RedlineProgram],
         },
         restart_under_load => lifecycle::restart_under_load::RestartUnderLoad {
-            topology: Shared,
-            resources: [Resource::Er, Resource::HostExclusive],
+            topology: PrivateEr,
+            resources: [Resource::HostExclusive],
             fixtures: [Fixture::RedlineProgram],
         },
         protocol_boundary_selftest => harness::protocol_boundary_selftest::ProtocolBoundarySelftest {

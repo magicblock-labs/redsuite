@@ -374,17 +374,7 @@ fn is_idle(metrics: &Metrics) -> bool {
 
 async fn drain(er: &ErCtx, target: f64) -> Result<DrainState> {
     let started = Instant::now();
-    check::poll(
-        &format!("the engine transaction count reaches {target:.0}"),
-        DRAIN_TIMEOUT,
-        || async {
-            matches!(
-                er.scrape_metrics().await.ok().and_then(|m| m.get(TX_COUNT)),
-                Some(count) if count >= target
-            )
-        },
-    )
-    .await?;
+    crate::await_executed(er, target, DRAIN_TIMEOUT).await?;
     check::poll(
         "the execution pipeline goes idle (nothing blocked, busy or pending)",
         SETTLE_TIMEOUT,
@@ -757,12 +747,7 @@ impl Scenario for ConflictOrdering {
             })
             .collect();
         let independent = Arc::new(independent);
-        let independent_payer_bytes: Arc<Vec<[u8; 64]>> = Arc::new(
-            independent_payers
-                .iter()
-                .map(|payer| payer.to_bytes())
-                .collect(),
-        );
+        let independent_payer_bytes = prep::payer_bytes(independent_payers);
 
         let calibration_before = er.scrape_metrics().await?;
         let mut handles = Some(spawn_load(
@@ -1082,14 +1067,7 @@ impl Scenario for ConflictOrdering {
                     );
                 }
             }
-            match report::persist_cell(self.name(), &cell) {
-                Ok(path) => {
-                    eprintln!("[redsuite]   cell report: {}", path.display())
-                }
-                Err(err) => eprintln!(
-                    "[redsuite]   warning: cell report not persisted: {err}"
-                ),
-            }
+            report::persist_cell(self.name(), &cell);
             batches.push(outcome);
         }
 

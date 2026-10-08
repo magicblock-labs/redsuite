@@ -4,7 +4,6 @@ use std::{
 };
 
 use async_trait::async_trait;
-use futures_util::future::join_all;
 use pubkey::Pubkey;
 use redsuite_core::redline::Accounts;
 use redsuite_core::report::Unit;
@@ -12,9 +11,8 @@ use redsuite_core::{
     check, check_eq, prep,
     profile::ProfileValues,
     report,
-    runner::{execute, Pacing, RunConfig},
-    topology, BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario,
-    ScenarioReport,
+    runner::{execute, Pacing, RunConfig, RunOutcome},
+    topology, BaseCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
 };
 
 use crate::program::instruction::build;
@@ -27,7 +25,6 @@ const PREP_PAYER_LAMPORTS: u64 = 4_000_000_000;
 
 const STALL_REQUEST_TIMEOUT: Duration = Duration::from_secs(75);
 const CLONE_TIMEOUT: Duration = Duration::from_secs(15);
-const PREWARM_CONCURRENCY: usize = 16;
 
 const MONITORED_GAUGE: &str = "engine_keeper_account_cache_entries";
 const EVICTED_COUNTER: &str = "engine_keeper_account_cache_evictions";
@@ -91,24 +88,6 @@ fn sample_accounts(pool: &[Pubkey], seed: u64, width: usize) -> Vec<Pubkey> {
     chosen.into_iter().map(|index| pool[index]).collect()
 }
 
-async fn prewarm(er: &ErCtx, pool: &[Pubkey]) -> Result<()> {
-    for window in pool.chunks(PREWARM_CONCURRENCY) {
-        let touches = window.iter().map(|pda| er.account(pda));
-        let _ = join_all(touches).await;
-    }
-    for pda in pool {
-        check::poll(
-            &format!("the ER clones the pool account {pda}"),
-            CLONE_TIMEOUT,
-            || async {
-                matches!(er.account(pda).await, Ok(Some(acc)) if acc.data.len() == ACCOUNT_SPACE as usize)
-            },
-        )
-        .await?;
-    }
-    Ok(())
-}
-
 struct Cell {
     name: &'static str,
     cap: usize,
@@ -119,13 +98,7 @@ struct Cell {
 struct CellOutcome {
     name: &'static str,
     cap: usize,
-    delivered: u64,
-    failed: u64,
-    first_error: Option<String>,
-    p50_us: f64,
-    p95_us: f64,
-    max_us: f64,
-    achieved_tps: f64,
+    outcome: RunOutcome,
     ensure_avg_s: Option<f64>,
     monitored_end: f64,
     evictions: f64,
@@ -196,7 +169,13 @@ impl Scenario for EnsureGateStall {
             .await?;
             let cell_er = private.ctx();
             if cell.prewarm {
-                prewarm(cell_er, &pool).await?;
+                prep::prewarm(
+                    cell_er,
+                    &pool,
+                    ACCOUNT_SPACE as usize,
+                    CLONE_TIMEOUT,
+                )
+                .await?;
             }
             let sender = cell_er.sender(payer.clone());
 
@@ -225,13 +204,7 @@ impl Scenario for EnsureGateStall {
             let cell_outcome = CellOutcome {
                 name: cell.name,
                 cap: cell.cap,
-                delivered: outcome.delivered,
-                failed: outcome.failed,
-                first_error: outcome.first_error.clone(),
-                p50_us: outcome.delivery.median as f64,
-                p95_us: outcome.delivery.quantile95 as f64,
-                max_us: outcome.delivery.max as f64,
-                achieved_tps: outcome.achieved_rps(),
+                outcome,
                 ensure_avg_s: delta.histogram_avg(ENSURE_HISTOGRAM),
                 // recorded for context only: the gauge refreshes on the
                 // 60 s subscription reconciler, so short windows read stale
@@ -239,16 +212,16 @@ impl Scenario for EnsureGateStall {
                 evictions: delta.counter(EVICTED_COUNTER).unwrap_or(0.0),
             };
             eprintln!(
-                "[redsuite] {}: {} (cap {}): {:.0} tx/s, p50 {:.0} us / p95 {:.0} us, \
+                "[redsuite] {}: {} (cap {}): {:.0} tx/s, p50 {} us / p95 {} us, \
                  {} delivered / {} failed, ensure avg {}, monitored {:.0}, evictions {:.0}",
                 self.name(),
                 cell_outcome.name,
                 cell_outcome.cap,
-                cell_outcome.achieved_tps,
-                cell_outcome.p50_us,
-                cell_outcome.p95_us,
-                cell_outcome.delivered,
-                cell_outcome.failed,
+                cell_outcome.outcome.achieved_rps(),
+                cell_outcome.outcome.delivery.median,
+                cell_outcome.outcome.delivery.quantile95,
+                cell_outcome.outcome.delivered,
+                cell_outcome.outcome.failed,
                 cell_outcome
                     .ensure_avg_s
                     .map(|seconds| format!("{seconds:.6} s"))
@@ -272,18 +245,26 @@ impl Scenario for EnsureGateStall {
                         "request timeout s",
                         STALL_REQUEST_TIMEOUT.as_secs(),
                     )
-                    .observe("delivery us", Unit::Micros, outcome.delivery)
+                    .observe(
+                        "delivery us",
+                        Unit::Micros,
+                        cell_outcome.outcome.delivery,
+                    )
                     .metric(
                         "achieved tps",
                         Unit::Tps,
-                        cell_outcome.achieved_tps,
+                        cell_outcome.outcome.achieved_rps(),
                     )
                     .metric(
                         "delivered",
                         Unit::Count,
-                        cell_outcome.delivered as f64,
+                        cell_outcome.outcome.delivered as f64,
                     )
-                    .metric("failed", Unit::Count, cell_outcome.failed as f64)
+                    .metric(
+                        "failed",
+                        Unit::Count,
+                        cell_outcome.outcome.failed as f64,
+                    )
                     .metric_if(
                         "validator ensure avg s",
                         Unit::Seconds,
@@ -299,14 +280,7 @@ impl Scenario for EnsureGateStall {
                         Unit::Count,
                         cell_outcome.evictions,
                     );
-            match report::persist_cell(self.name(), &cell_report) {
-                Ok(path) => {
-                    eprintln!("[redsuite]   cell report: {}", path.display())
-                }
-                Err(e) => eprintln!(
-                    "[redsuite]   warning: cell report not persisted: {e}"
-                ),
-            }
+            report::persist_cell(self.name(), &cell_report);
             cells.push(cell_outcome);
             drop(private);
         }
@@ -315,17 +289,17 @@ impl Scenario for EnsureGateStall {
         let thrash = &cells[1];
 
         check_eq!(
-            healthy.failed,
+            healthy.outcome.failed,
             0,
             "healthy cell requests failed: {:?}",
-            healthy.first_error
+            healthy.outcome.first_error
         )?;
-        if healthy.p50_us >= 1_000_000.0 {
+        if healthy.outcome.delivery.median >= 1_000_000 {
             eprintln!(
-                "[redsuite] {}: warning: healthy cell p50 {:.0} us left the \
+                "[redsuite] {}: warning: healthy cell p50 {} us left the \
                  sub-second range",
                 self.name(),
-                healthy.p50_us
+                healthy.outcome.delivery.median
             );
         }
         if let Some(ensure_avg) = healthy.ensure_avg_s {
@@ -349,7 +323,7 @@ impl Scenario for EnsureGateStall {
         )?;
 
         check!(
-            thrash.delivered > 0,
+            thrash.outcome.delivered > 0,
             "INVALID: the thrash cell delivered nothing"
         )?;
         check!(
@@ -357,8 +331,9 @@ impl Scenario for EnsureGateStall {
             "INVALID: no evictions — the cap knob did not engage"
         )?;
 
-        let slowdown = if healthy.p50_us > 0.0 {
-            thrash.p50_us / healthy.p50_us
+        let slowdown = if healthy.outcome.delivery.median > 0 {
+            thrash.outcome.delivery.median as f64
+                / healthy.outcome.delivery.median as f64
         } else {
             0.0
         };
@@ -388,27 +363,27 @@ impl Scenario for EnsureGateStall {
                 .metric(
                     format!("{} achieved tps", cell.name),
                     Unit::Tps,
-                    cell.achieved_tps,
+                    cell.outcome.achieved_rps(),
                 )
                 .metric(
                     format!("{} p50 us", cell.name),
                     Unit::Micros,
-                    cell.p50_us,
+                    cell.outcome.delivery.median as f64,
                 )
                 .metric(
                     format!("{} p95 us", cell.name),
                     Unit::Micros,
-                    cell.p95_us,
+                    cell.outcome.delivery.quantile95 as f64,
                 )
                 .metric(
                     format!("{} max us", cell.name),
                     Unit::Micros,
-                    cell.max_us,
+                    cell.outcome.delivery.max as f64,
                 )
                 .metric(
                     format!("{} failed", cell.name),
                     Unit::Count,
-                    cell.failed as f64,
+                    cell.outcome.failed as f64,
                 )
                 .metric(
                     format!("{} evictions", cell.name),

@@ -1,5 +1,6 @@
-use std::{rc::Rc, time::Duration};
+use std::{rc::Rc, sync::Arc, time::Duration};
 
+use futures_util::future::join_all;
 use instruction::Instruction;
 use keypair::Keypair;
 use pubkey::Pubkey;
@@ -194,6 +195,26 @@ pub async fn await_clones(
         .await?;
     }
     Ok(())
+}
+
+pub fn payer_bytes(payers: &[Keypair]) -> Arc<Vec<[u8; 64]>> {
+    Arc::new(payers.iter().map(Keypair::to_bytes).collect())
+}
+
+pub async fn touch(er: &ErCtx, accounts: &[Pubkey]) {
+    for window in accounts.chunks(16) {
+        join_all(window.iter().map(|account| er.account(account))).await;
+    }
+}
+
+pub async fn prewarm(
+    er: &ErCtx,
+    accounts: &[Pubkey],
+    space: usize,
+    timeout: Duration,
+) -> Result<()> {
+    touch(er, accounts).await;
+    await_clones(er, accounts, space, timeout).await
 }
 
 pub async fn await_cloned_payers(

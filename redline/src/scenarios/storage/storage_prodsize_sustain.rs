@@ -1,9 +1,8 @@
 use std::{rc::Rc, time::Duration};
 
 use async_trait::async_trait;
-use instruction::Instruction;
 use pubkey::Pubkey;
-use redsuite_core::redline::Accounts;
+use redsuite_core::redline::{copy_three, Accounts};
 use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, host, prep,
@@ -62,16 +61,6 @@ const PROFILES: ProfileValues<Profile> = ProfileValues {
     full: FULL,
 };
 
-pub(crate) fn shape(pool: &[Pubkey], id: u64) -> Instruction {
-    use crate::program::instruction::build;
-    let len = pool.len() as u64;
-    let base_index = ((id - 1) * 3) % len;
-    let source = pool[base_index as usize];
-    let first_dest = pool[((base_index + 1) % len) as usize];
-    let second_dest = pool[((base_index + 2) % len) as usize];
-    build::account_data_copy(id, &[source], &[first_dest, second_dest])
-}
-
 struct WindowOutcome {
     outcome: RunOutcome,
     tx_processing_avg_us: Option<f64>,
@@ -97,7 +86,7 @@ async fn execute_window(
         |iteration| {
             let id = first_id + iteration;
             let sender = senders[(id as usize) % senders.len()].clone();
-            let ix = shape(pool, id);
+            let (ix, _) = copy_three(pool, id);
             async move { sender.submit(&[ix]).await.map(|_| ()) }
         },
     )
@@ -194,7 +183,7 @@ impl Scenario for StorageProdsizeSustain {
                 },
                 |id| {
                     let sender = senders[(id as usize) % senders.len()].clone();
-                    let ix = shape(&pool, id);
+                    let (ix, _) = copy_three(&pool, id);
                     async move { sender.submit(&[ix]).await.map(|_| ()) }
                 },
             )
@@ -332,14 +321,7 @@ impl Scenario for StorageProdsizeSustain {
                         window.tx_processing_avg_us,
                     );
             }
-            match report::persist_cell(self.name(), &cell_report) {
-                Ok(path) => {
-                    eprintln!("[redsuite]   cell report: {}", path.display())
-                }
-                Err(e) => eprintln!(
-                    "[redsuite]   warning: cell report not persisted: {e}"
-                ),
-            }
+            report::persist_cell(self.name(), &cell_report);
             cells.push(cell);
             drop(private);
         }

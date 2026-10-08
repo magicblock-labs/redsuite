@@ -236,19 +236,13 @@ impl Scenario for CommitWidthEnvelope {
                             .borrow_mut()
                             .er_delivery
                             .push(started.elapsed().as_micros() as u32);
-                        let commit_receipt = receipt::fetch_commit_receipt(
+                        let commit_receipt = super::settled_receipt(
                             &er_api,
                             &commit_signature,
                             RECEIPT_TIMEOUT,
+                            format!("commit {id} intent"),
                         )
                         .await?;
-                        if let Some(message) = &commit_receipt.error_message {
-                            return Err(CheckError::new(format!(
-                                "commit {id} intent succeeds"
-                            ))
-                            .actual(message)
-                            .into());
-                        }
                         let round_trip_us =
                             started.elapsed().as_micros() as u32;
                         receipt::confirm_base_signatures(
@@ -443,14 +437,7 @@ impl Scenario for CommitWidthEnvelope {
                         Unit::Count,
                         delta.counter("mbv_committor_intents_count"),
                     );
-            match report::persist_cell(self.name(), &cell_report) {
-                Ok(path) => {
-                    eprintln!("[redsuite]   cell report: {}", path.display())
-                }
-                Err(e) => eprintln!(
-                    "[redsuite]   warning: cell report not persisted: {e}"
-                ),
-            }
+            report::persist_cell(self.name(), &cell_report);
 
             cells.push(CellSummary {
                 width,
@@ -502,19 +489,13 @@ impl Scenario for CommitWidthEnvelope {
                         ));
                     }
                     SchedulingOutcome::Confirmed => {
-                        let alt_receipt = receipt::fetch_commit_receipt(
+                        let alt_receipt = super::settled_receipt(
                             er.api(),
                             &commit_signature,
                             PROBE_RECEIPT_TIMEOUT,
+                            "the width-15 probe intent",
                         )
                         .await?;
-                        if let Some(message) = &alt_receipt.error_message {
-                            return Err(CheckError::new(
-                                "the width-15 probe intent succeeds",
-                            )
-                            .actual(message)
-                            .into());
-                        }
                         receipt::confirm_base_signatures(
                             base.api(),
                             &alt_receipt,
@@ -696,20 +677,16 @@ impl Scenario for CommitWidthEnvelope {
                         &[probe_account],
                     );
                     let commit_signature = probe_sender.submit(&[ix]).await?;
-                    let limit_receipt = receipt::fetch_commit_receipt(
+                    super::settled_receipt(
                         er.api(),
                         &commit_signature,
                         RECEIPT_TIMEOUT,
+                        format!(
+                            "sponsored commit {commit_round}/{}",
+                            receipt::SPONSORED_COMMIT_LIMIT
+                        ),
                     )
                     .await?;
-                    if let Some(message) = &limit_receipt.error_message {
-                        return Err(CheckError::new(format!(
-                            "sponsored commit {commit_round}/{} succeeds",
-                            receipt::SPONSORED_COMMIT_LIMIT
-                        ))
-                        .actual(message)
-                        .into());
-                    }
                 }
                 offset += 1;
                 let ix = build::commit_accounts(
@@ -717,36 +694,23 @@ impl Scenario for CommitWidthEnvelope {
                     probe_payer_pubkey,
                     &[probe_account],
                 );
-                let rejected_tx = probe_sender.prepare(&[ix]).await?;
-                let rejected_signature =
-                    probe_sender.submit_prepared(&rejected_tx).await?;
-                let deadline = tokio::time::Instant::now() + REJECTION_TIMEOUT;
-                let rejection_code = loop {
-                    if let Some(status) = er
-                        .api()
-                        .get_signature_status(&rejected_signature)
-                        .await?
-                    {
-                        if let Some(err) = &status.err {
-                            break custom_error_code(err);
-                        }
-                        if status.confirmed {
-                            return Err(CheckError::new(format!(
-                                "commit {} past the sponsored allowance \
-                                 unexpectedly succeeded",
-                                receipt::SPONSORED_COMMIT_LIMIT + 1
-                            ))
-                            .into());
-                        }
-                    }
-                    if tokio::time::Instant::now() >= deadline {
+                let rejected_signature = probe_sender.submit(&[ix]).await?;
+                let rejection_code = match scheduling_outcome(
+                    er.api(),
+                    &rejected_signature,
+                    REJECTION_TIMEOUT,
+                )
+                .await?
+                {
+                    SchedulingOutcome::Rejected(code) => code,
+                    SchedulingOutcome::Confirmed => {
                         return Err(CheckError::new(format!(
-                            "no status for the over-limit commit within \
-                             {REJECTION_TIMEOUT:?}"
+                            "commit {} past the sponsored allowance \
+                             unexpectedly succeeded",
+                            receipt::SPONSORED_COMMIT_LIMIT + 1
                         ))
-                        .into());
+                        .into())
                     }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
                 };
                 check_eq!(
                     rejection_code,
