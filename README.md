@@ -30,11 +30,12 @@ One-time setup:
 
 Then, in this repo:
 
-    cargo xtask programs      # build the family SBF programs
-    cargo nextest run         # run everything
+    cargo xtask programs                 # build the family SBF programs
+    cargo build --release -p redsuite    # build the runner
+    target/release/redsuite run all      # run everything
 
-The first test boots the base + ER; every other test — and every later run —
-reuses them. `cargo xtask stack down` stops the stack.
+The first scenario boots the base + ER; every other scenario — and every later
+run — reuses them. `cargo xtask stack down` stops the stack.
 
 Scenarios run on Linux and macOS. Process supervision (readiness, graceful
 stop, hard kill, restart, orphan cleanup) and the ER measurements (per-thread
@@ -70,23 +71,23 @@ return the measurements that land in `target/redsuite-reports/`.
 Registration is one declaration: an entry in the catalog
 (`cli/src/catalog.rs`, one `scenario_catalog!` block per family). The entry
 names the scenario's short name, its runner type, and its metadata
-(topology, resources, and fixtures). From that one
-entry the macro generates both ways to run the scenario: a `#[tokio::test]`
-function (so it runs under `cargo nextest`, named
-`catalog::<family>::<short_name>`) and a catalog record the `redsuite`
-binary dispatches from. Keep scenario names and `.config/nextest.toml`
-groups in sync with the catalog.
+(topology, resources, and fixtures); the `redsuite` binary dispatches from
+that record and is the only scenario runner. Cargo tests do not execute
+scenarios.
 
 ## The redsuite binary
 
-The whole suite also builds into one executable, which is what CI and
-benchmark hosts use — no cargo, no checkout of the tests:
+The whole suite runs through one executable, which is also what CI and
+benchmark hosts use — no cargo, no checkout:
 
     cargo build --release -p redsuite
 
     redsuite list                             # every scenario
+    redsuite list redshift/rpc_               # what a selection would run
     redsuite run redline/high_cu              # one scenario (short names work too)
     redsuite run redline --profile full       # a whole family
+    redsuite run redshift/rpc_                # every scenario under a name prefix
+    redsuite run commit_                      # a prefix across families (benchmarks last)
     redsuite run all                          # everything (redline last, alone)
     redsuite run all --serial                 # one at a time, storage wiped at the end
     redsuite stack status                     # ports, pids, health
@@ -129,19 +130,20 @@ the run log names what was reclaimed.
 
 ## Running
 
-    cargo nextest run commit_roundtrip                    # one scenario
-    cargo nextest run -E 'test(catalog::redline::)'       # one family
-    cargo nextest run -E 'test(/catalog::redshift::rpc_/)' # the RPC-surface scenarios
-    cargo nextest run                                     # everything
+    redsuite run commit_roundtrip       # one scenario
+    redsuite run redline                # one family
+    redsuite run redshift/rpc_          # the RPC-surface scenarios
+    redsuite run all                    # everything
 
-Use cargo-nextest. The concurrency limits live in `.config/nextest.toml`:
-private-ER scenarios run two at a time, and the redline family runs alone.
-`cargo test` ignores those limits, so it can start a benchmark next to a
-neighbour that spoils it. Run one suite invocation at a time either way.
+A selection is `all`, a family, a scenario (full or short name), or a name
+prefix; an exact name wins over the prefix it also matches. The runner owns
+the concurrency limits: shared-stack scenarios run together, private-ER
+scenarios two at a time, and the redline family last and alone. Run one suite
+invocation at a time.
 
-All scenarios share **one boot-once stack**: the first test to need it boots
+All scenarios share **one boot-once stack**: the first scenario to need it boots
 base + ER on dynamically allocated ports and leaves them running; every later
-test — in the same run or the next — health-checks and reuses them. A dead or
+scenario — in the same run or the next — health-checks and reuses them. A dead or
 unhealthy stack is killed and rebooted transparently. Coordination lives in
 `target/redsuite-stack/` (`state.json`, `identity-pool.json`, a cross-process
 flock, `genesis-accounts/`, logs, ledgers).
@@ -656,7 +658,7 @@ aperture (JSON-RPC surface):
   unknown method must fail with the JSON-RPC method-not-found code. The burst
   carries no throughput verdict.
   RPC-surface scenarios carry the `rpc_` prefix so they can be run together:
-  `cargo nextest run -E 'test(/catalog::redshift::rpc_/)'`.
+  `redsuite run redshift/rpc_`.
 
 harness:
 

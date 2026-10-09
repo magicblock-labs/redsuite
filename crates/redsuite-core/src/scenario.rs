@@ -152,7 +152,7 @@ pub async fn run_shared_scenario<V: Verdict>(
     scenario: impl Scenario<V>,
     fixtures: &[Fixture],
     optional_fixtures: &[Fixture],
-    config: Result<ExecutionConfig>,
+    config: ExecutionConfig,
 ) -> RunRecord {
     // A LocalSet so contexts and transports can spawn_local background work
     // (WS readers) on the test's current-thread runtime.
@@ -177,7 +177,7 @@ pub async fn run_private_er_scenario<V: Verdict>(
     scenario: impl PrivateErScenario<V>,
     fixtures: &[Fixture],
     optional_fixtures: &[Fixture],
-    config: Result<ExecutionConfig>,
+    config: ExecutionConfig,
 ) -> RunRecord {
     let local = tokio::task::LocalSet::new();
     local
@@ -218,7 +218,7 @@ async fn execute<V: Verdict, Provisioned, ProvisionFut, Body, BodyFut>(
     name: String,
     fixtures: &[Fixture],
     optional_fixtures: &[Fixture],
-    config: Result<ExecutionConfig>,
+    config: ExecutionConfig,
     provision: impl FnOnce(ExecutionConfig) -> ProvisionFut,
     body: Body,
 ) -> RunRecord
@@ -230,14 +230,6 @@ where
 {
     let mut record = RunRecord::new(name);
 
-    let config = match config {
-        Ok(config) => config,
-        Err(error) => {
-            record.errors.push(RunError::Preflight(error));
-            conclude(&mut record, V::REPORTS);
-            return record;
-        }
-    };
     if let Err(error) = preflight(fixtures) {
         record.errors.push(RunError::Preflight(error));
         conclude(&mut record, V::REPORTS);

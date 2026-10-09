@@ -36,8 +36,7 @@ pub const STACK_DIR_ENV: &str = "REDSUITE_STACK_DIR";
 pub const ACCOUNTSDB_ROOT_ENV: &str = "REDSUITE_ACCOUNTSDB_DIR";
 
 pub fn workspace_root() -> PathBuf {
-    // `REDSUITE_ROOT` covers test binaries relocated after compilation
-    // (e.g. `cargo nextest archive`).
+    // `REDSUITE_ROOT` covers the binary running outside the checkout.
     if let Some(root) = std::env::var_os(ROOT_ENV) {
         return PathBuf::from(root);
     }
