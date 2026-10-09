@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use pubkey::Pubkey;
 use redsuite_core::{
     check, check_eq, check_ne, prep, BaseCtx, ChainCtx, PrivateErScenario,
-    Result, ScenarioReport,
+    Result,
 };
 use signer::Signer;
 use solana_address_lookup_table_interface::{
@@ -25,7 +25,7 @@ impl PrivateErScenario for TableManiaScenario {
         "redshift/table_mania"
     }
 
-    async fn run(&self, base: &BaseCtx) -> Result<ScenarioReport> {
+    async fn run(&self, base: &BaseCtx) -> Result<()> {
         let authority = prep::funded_payer(base, AIRDROP_LAMPORTS).await?;
         let first = create_table(base, &authority).await?;
         let created = read_table(base, &first).await?;
@@ -121,9 +121,7 @@ impl PrivateErScenario for TableManiaScenario {
             Some(authority.pubkey()),
             "deactivation preserves table {empty}'s authority"
         )?;
-        Ok(ScenarioReport::ok(self.name())
-            .setting("tables", 3)
-            .setting("addresses", TOTAL_PUBKEYS))
+        Ok(())
     }
 }
 

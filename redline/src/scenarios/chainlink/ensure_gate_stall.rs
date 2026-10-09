@@ -107,7 +107,7 @@ struct CellOutcome {
 pub struct EnsureGateStall;
 
 #[async_trait(?Send)]
-impl Scenario for EnsureGateStall {
+impl Scenario<ScenarioReport> for EnsureGateStall {
     fn name(&self) -> &str {
         "redline/ensure_gate_stall"
     }

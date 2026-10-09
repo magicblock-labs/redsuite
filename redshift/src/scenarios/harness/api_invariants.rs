@@ -2,7 +2,6 @@ use async_trait::async_trait;
 use keypair::Keypair;
 use redsuite_core::{
     check, check_eq, mdp, BaseCtx, ChainCtx, PrivateErScenario, Result,
-    ScenarioReport,
 };
 use signer::Signer;
 
@@ -16,7 +15,7 @@ impl PrivateErScenario for ApiInvariants {
         "redshift/api_invariants"
     }
 
-    async fn run(&self, base: &BaseCtx) -> Result<ScenarioReport> {
+    async fn run(&self, base: &BaseCtx) -> Result<()> {
         let validator = Keypair::new();
         base.airdrop(&validator.pubkey(), DELEGATED_LAMPORTS)
             .await?;
@@ -80,9 +79,6 @@ impl PrivateErScenario for ApiInvariants {
             "domain record still present after unregister"
         )?;
 
-        Ok(ScenarioReport::ok(self.name()).setting(
-            "record bytes",
-            format!("{} -> {}", registered.data.len(), synced.data.len()),
-        ))
+        Ok(())
     }
 }

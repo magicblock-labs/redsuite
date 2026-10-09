@@ -8,11 +8,10 @@ use std::{
 
 use async_trait::async_trait;
 use pubkey::Pubkey;
-use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, prep,
     topology::{self, ReplicatedOptions, ReplicatedTopology, Verifier},
-    BaseCtx, ChainCtx, PrivateErScenario, Result, ScenarioReport,
+    BaseCtx, ChainCtx, PrivateErScenario, Result,
 };
 use signer::Signer;
 
@@ -150,7 +149,7 @@ impl PrivateErScenario for VerifierLifecycle {
         "redshift/verifier_lifecycle"
     }
 
-    async fn run(&self, base: &BaseCtx) -> Result<ScenarioReport> {
+    async fn run(&self, base: &BaseCtx) -> Result<()> {
         let boot_started = Instant::now();
         let mut topology = topology::replicated(
             base,
@@ -170,7 +169,6 @@ impl PrivateErScenario for VerifierLifecycle {
         probe_clones(base, &topology).await?;
         let leader_txs = leader_metric(&topology, TRANSACTIONS).await?;
         let leader_blocks = leader_metric(&topology, BLOCKS).await?;
-        let mut initial_catch_up = Duration::ZERO;
         for verifier in topology.verifiers() {
             await_catch_up(
                 verifier,
@@ -180,16 +178,14 @@ impl PrivateErScenario for VerifierLifecycle {
                 CATCH_UP_TIMEOUT,
             )
             .await?;
-            initial_catch_up = initial_catch_up.max(
-                await_catch_up(
-                    verifier,
-                    BLOCKS,
-                    leader_blocks,
-                    "startup",
-                    CATCH_UP_TIMEOUT,
-                )
-                .await?,
-            );
+            await_catch_up(
+                verifier,
+                BLOCKS,
+                leader_blocks,
+                "startup",
+                CATCH_UP_TIMEOUT,
+            )
+            .await?;
         }
         eprintln!(
             "[redsuite] {}: leader + {VERIFIERS} verifiers up in {:.1} s, \
@@ -322,50 +318,7 @@ impl PrivateErScenario for VerifierLifecycle {
             rejoin.as_millis(),
         );
 
-        let leader_identity = topology.leader().identity().to_string();
-        let leader_rpc_port = topology.leader().rpc_port();
-        let verifier_summary: Vec<String> = topology
-            .verifiers()
-            .iter()
-            .map(|verifier| {
-                format!(
-                    "{} identity {} metrics 127.0.0.1:{}",
-                    verifier.label(),
-                    verifier.identity(),
-                    verifier.metrics_port()
-                )
-            })
-            .collect();
         topology.finish().await?;
-
-        let mut report = ScenarioReport::ok(self.name())
-            .setting("verifiers", VERIFIERS)
-            .setting("leader identity", leader_identity)
-            .setting("leader rpc port", leader_rpc_port)
-            .setting("verifier nodes", verifier_summary.join("; "))
-            .metric("boot s", Unit::Seconds, boot.as_secs_f64())
-            .metric("connect s", Unit::Seconds, connect.as_secs_f64())
-            .metric(
-                "verifier1 blocks while alone",
-                Unit::Count,
-                survivor_blocks,
-            )
-            .metric("verifier0 blocks while alone", Unit::Count, lone_blocks)
-            .metric("leader txs", Unit::Count, leader_txs_final);
-        for (label, elapsed) in [
-            ("initial catch up ms", initial_catch_up),
-            ("verifier0 stop ms", stopped.shutdown),
-            ("verifier0 restart ms", startup),
-            ("verifier0 reconnect ms", reconnect),
-            ("verifier0 catch up ms", catch_up),
-            ("verifier1 kill ms", killed.shutdown),
-            ("final catch up ms", final_catch_up),
-            ("verifier1 rejoin ms", rejoin),
-        ] {
-            report =
-                report.metric(label, Unit::Millis, elapsed.as_secs_f64() * 1e3);
-        }
-
-        Ok(report)
+        Ok(())
     }
 }

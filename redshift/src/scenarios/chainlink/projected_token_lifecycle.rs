@@ -5,10 +5,10 @@ use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
     check, check_eq, dlp,
-    netfault::{self, BaseProxies, Selector},
+    netfault::{BaseProxies, Selector},
     prep, receipt, topology,
     topology::ErOptions,
-    BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result, ScenarioReport,
+    BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result,
 };
 use sdk::spl::builders::UndelegateEphemeralAtaBuilder;
 use signature::Signature;
@@ -182,7 +182,7 @@ impl PrivateErScenario for ProjectedTokenLifecycle {
         "redshift/projected_token_lifecycle"
     }
 
-    async fn run(&self, base: &BaseCtx) -> Result<ScenarioReport> {
+    async fn run(&self, base: &BaseCtx) -> Result<()> {
         let proxies = BaseProxies::spawn(base).await?;
         let private = topology::private_er(
             base,
@@ -236,12 +236,6 @@ impl PrivateErScenario for ProjectedTokenLifecycle {
                 base.submit_and_confirm(payer, &[ix]).await?;
                 owner_is(wallet, dlp::dlp_id()).await
             };
-        let mut report = ScenarioReport::ok(self.name())
-            .setting("mint", mint_key)
-            .setting("balance order", NAMES.join(", "))
-            .setting("vault ATA", vault[0])
-            .setting("vault eATA", vault[1])
-            .setting("commit authority", identity);
 
         base.submit_and_confirm_with(
             &payer,
@@ -265,21 +259,15 @@ impl PrivateErScenario for ProjectedTokenLifecycle {
                     .push(spl::initialize_eata(&funder, &owner, &mint_key));
             }
             base.submit_and_confirm(&payer, &instructions).await?;
-            report = report
-                .setting(format!("{} ATA", NAMES[i]), wallet.ata)
-                .setting(format!("{} eATA", NAMES[i]), wallet.eata);
         }
-        let mut record = async |phase: &str,
-                                expected: &Balances,
-                                delegated: bool|
+        let record = async |phase: &str,
+                            expected: &Balances,
+                            delegated: bool|
                -> Result<()> {
             let observed = balances(base, er, &wallets, &vault).await?;
             eprintln!("[redsuite] {LABEL}: {phase}: {observed:?}");
             check_eq!(&observed, expected, "{phase}: token balances")?;
             observed.conserved(delegated)?;
-            report
-                .config
-                .push((phase.to_owned(), format!("{observed:?}")));
             Ok(())
         };
         let mut expected = Balances {
@@ -418,12 +406,8 @@ impl PrivateErScenario for ProjectedTokenLifecycle {
         expected.eatas[..2].copy_from_slice(&[Some(125), Some(155)]);
         record("final committed balances", &expected, true).await?;
 
-        let events = proxies.finish()?;
+        proxies.finish()?;
         private.finish().await?;
-        report = report.setting("intercepted base commit", landed)
-            .setting("foreign validator", foreign_validator)
-            .setting("mint supply", SUPPLY)
-            .setting("recovery", "base executed; send response and confirmation channels lost; reconnect");
-        Ok(netfault::report_events(report, &events))
+        Ok(())
     }
 }

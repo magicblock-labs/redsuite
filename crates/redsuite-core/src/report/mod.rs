@@ -39,7 +39,6 @@ pub enum Unit {
     Count,
     Kilobytes,
     Megabytes,
-    Lamports,
     Ratio,
 }
 
@@ -218,15 +217,8 @@ pub fn persist_run(record: &RunRecord) -> Result<PathBuf> {
 
     let fallback;
     let report = match &record.scenario {
-        ScenarioOutcome::Passed(report) => report,
-        ScenarioOutcome::Skipped(reason) => {
-            return Err(
-                format!("skipped runs are not persisted ({reason})").into()
-            )
-        }
-        ScenarioOutcome::Failed(_)
-        | ScenarioOutcome::Panicked(_)
-        | ScenarioOutcome::NotReached => {
+        ScenarioOutcome::Passed(Some(report)) => report,
+        _ => {
             fallback = ScenarioReport::failed(&record.name).metric_if(
                 "wall seconds",
                 Unit::Seconds,
@@ -238,7 +230,6 @@ pub fn persist_run(record: &RunRecord) -> Result<PathBuf> {
 
     let dir = campaign_dir();
     ensure_campaign(&dir)?;
-    warn_on_stack_skew();
     write_scenario_run(
         &dir,
         &scenario_run_doc(report, &failures, &record.launches),
@@ -478,7 +469,7 @@ fn er_identity() -> (String, String, String) {
     (er_bin, er_version, er_fingerprint)
 }
 
-fn warn_on_stack_skew() {
+pub(crate) fn warn_on_stack_skew() {
     let running_exe = running_stack_exe();
     let resolved = topology::er_bin_path().ok();
     if let (Some(running), Some(resolved)) =

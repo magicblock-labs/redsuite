@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, path::Path, time::Duration};
+use std::{path::Path, time::Duration};
 
 use async_trait::async_trait;
 use keypair::Keypair;
@@ -7,9 +7,8 @@ use redshift_interface::flexi::{build, FlexiCounter};
 use redsuite_core::{
     api::TransactionInfo,
     check, check_eq, prep,
-    report::Unit,
     topology::{self, ErOptions, RestartConfig},
-    BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result, ScenarioReport,
+    BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result,
 };
 use signature::Signature;
 use signer::Signer;
@@ -204,7 +203,7 @@ impl PrivateErScenario for CheckpointDurability {
         "redshift/checkpoint_durability"
     }
 
-    async fn run(&self, base: &BaseCtx) -> Result<ScenarioReport> {
+    async fn run(&self, base: &BaseCtx) -> Result<()> {
         let mut private = topology::private_er(
             base,
             ErOptions {
@@ -257,11 +256,6 @@ impl PrivateErScenario for CheckpointDurability {
         };
         let mut protected = Vec::new();
         let mut previous_boundary = 0;
-        let mut report = ScenarioReport::ok(self.name())
-            .setting("rounds", ROUNDS)
-            .setting("superblock slots", SUPERBLOCK_SLOTS)
-            .setting("payer", keys[0])
-            .setting("counter", keys[1]);
 
         for round in 1..=ROUNDS {
             let er = private.ctx();
@@ -274,17 +268,6 @@ impl PrivateErScenario for CheckpointDurability {
             verify(er, boundary, &protected).await?;
             workload.check(er).await?;
             let baseline = workload.expected.clone();
-            report = report
-                .setting(format!("round {round} checkpoint"), boundary)
-                .setting(
-                    format!("round {round} state"),
-                    format!("{baseline:?}"),
-                )
-                .metric(
-                    format!("round {round} protected transactions"),
-                    Unit::Count,
-                    protected.len() as f64,
-                );
 
             let mut tail = Vec::new();
             for index in 0..16 {
@@ -305,17 +288,8 @@ impl PrivateErScenario for CheckpointDurability {
             let er = private.ctx();
             verify(er, boundary, &protected).await?;
             workload.expected = baseline;
-            let mut outcomes = BTreeMap::<_, usize>::new();
             for mut record in tail {
                 let found = er.api().get_transaction(&record.signature).await?;
-                let category =
-                    match (record.evidence.is_some(), found.is_some()) {
-                        (true, true) => "confirmed survived",
-                        (true, false) => "confirmed lost",
-                        (false, true) => "unconfirmed survived",
-                        (false, false) => "unconfirmed absent",
-                    };
-                *outcomes.entry(category).or_default() += 1;
                 if let Some(evidence) = found {
                     record.check(&evidence)?;
                     workload.expected.apply(&record, &evidence)?;
@@ -324,22 +298,11 @@ impl PrivateErScenario for CheckpointDurability {
                 }
             }
             workload.check(er).await?;
-            report = report
-                .setting(format!("round {round} tail"), format!("{outcomes:?}"))
-                .metric(
-                    format!("round {round} restart ms"),
-                    Unit::Millis,
-                    timing.total.as_secs_f64() * 1e3,
-                );
             for _ in 0..2 {
                 protected.push(workload.submit(er, true).await?);
             }
         }
         private.finish().await?;
-        Ok(report.metric(
-            "fresh recovery executions",
-            Unit::Count,
-            (2 * ROUNDS) as f64,
-        ))
+        Ok(())
     }
 }

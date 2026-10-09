@@ -85,7 +85,7 @@ struct RungOutcome {
 pub struct WsConnCapacity;
 
 #[async_trait(?Send)]
-impl Scenario for WsConnCapacity {
+impl Scenario<ScenarioReport> for WsConnCapacity {
     fn name(&self) -> &str {
         "redline/ws_conn_capacity"
     }

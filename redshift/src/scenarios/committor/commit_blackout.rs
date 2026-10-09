@@ -2,14 +2,12 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use pubkey::Pubkey;
-use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq,
-    netfault::{self, BaseProxies, Selector},
+    netfault::{BaseProxies, Selector},
     prep, receipt, topology,
     topology::ErOptions,
     BaseCtx, ChainCtx, CheckError, ErCtx, PrivateErScenario, Result,
-    ScenarioReport,
 };
 use signature::Signature;
 
@@ -31,18 +29,10 @@ const RECONNECT_WRITE: u64 = 43;
 
 pub struct CommitBlackout;
 
-struct Convergence {
-    receipt_base_signatures: usize,
-    resubmitted: bool,
-    seconds: f64,
-}
-
 struct Commit {
     account: Pubkey,
     snapshot: Vec<u8>,
     signature: Signature,
-    base_signature: Signature,
-    started: Instant,
 }
 
 async fn await_convergence(
@@ -50,7 +40,7 @@ async fn await_convergence(
     base: &BaseCtx,
     er: &ErCtx,
     commit: &Commit,
-) -> Result<Convergence> {
+) -> Result<()> {
     let receipt = receipt::fetch_commit_receipt(
         er.api(),
         &commit.signature,
@@ -78,11 +68,7 @@ async fn await_convergence(
         },
     )
     .await?;
-    Ok(Convergence {
-        receipt_base_signatures: receipt.base_signatures.len(),
-        resubmitted: !receipt.base_signatures.contains(&commit.base_signature),
-        seconds: commit.started.elapsed().as_secs_f64(),
-    })
+    Ok(())
 }
 
 #[async_trait(?Send)]
@@ -91,7 +77,7 @@ impl PrivateErScenario for CommitBlackout {
         "redshift/commit_blackout"
     }
 
-    async fn run(&self, base: &BaseCtx) -> Result<ScenarioReport> {
+    async fn run(&self, base: &BaseCtx) -> Result<()> {
         let proxies = BaseProxies::spawn(base).await?;
         let private = topology::private_er(
             base,
@@ -128,14 +114,13 @@ impl PrivateErScenario for CommitBlackout {
                 .response()
                 .account(&account),
         );
-        let submission_started = Instant::now();
         let (snapshot, commit_signature) =
             write_and_commit(er, &payer, 1, SUBMISSION_WRITE, &account).await?;
         let held = submission_trap.wait(INTERCEPT_TIMEOUT).await?;
         let base_signature = held.operation.signature()?;
         prove_landed(base, &base_signature, &account, &snapshot).await?;
         held.discard();
-        let submission = await_convergence(
+        await_convergence(
             self.name(),
             base,
             er,
@@ -143,8 +128,6 @@ impl PrivateErScenario for CommitBlackout {
                 account,
                 snapshot,
                 signature: commit_signature,
-                base_signature,
-                started: submission_started,
             },
         )
         .await?;
@@ -155,7 +138,6 @@ impl PrivateErScenario for CommitBlackout {
                 .response()
                 .account(&account),
         );
-        let confirmation_started = Instant::now();
         let (snapshot, commit_signature) =
             write_and_commit(er, &payer, 2, CONFIRMATION_WRITE, &account)
                 .await?;
@@ -196,7 +178,7 @@ impl PrivateErScenario for CommitBlackout {
         }
         held.release();
         status_blackout.remove();
-        let confirmation = await_convergence(
+        await_convergence(
             self.name(),
             base,
             er,
@@ -204,14 +186,11 @@ impl PrivateErScenario for CommitBlackout {
                 account,
                 snapshot,
                 signature: commit_signature,
-                base_signature,
-                started: confirmation_started,
             },
         )
         .await?;
 
         proxies.close_connections();
-        let reconnect_started = Instant::now();
         let fresh =
             crate::init_delegated_account(base, &payer, 1, identity).await?;
         prep::await_clones(
@@ -221,7 +200,6 @@ impl PrivateErScenario for CommitBlackout {
             CLONE_TIMEOUT,
         )
         .await?;
-        let reconnect_clone_s = reconnect_started.elapsed().as_secs_f64();
         let (snapshot, commit_signature) =
             write_and_commit(er, &payer, 3, RECONNECT_WRITE, &fresh).await?;
         let plain = receipt::fetch_commit_receipt(
@@ -250,39 +228,8 @@ impl PrivateErScenario for CommitBlackout {
         )
         .await?;
 
-        let events = proxies.finish()?;
+        proxies.finish()?;
         private.finish().await?;
-
-        let report = ScenarioReport::ok(self.name())
-            .setting("er", LABEL)
-            .setting("delegated account", account)
-            .setting("submission fault", "sendTransaction response discarded")
-            .setting(
-                "confirmation fault",
-                "signatureNotification held, getSignatureStatuses stalled",
-            )
-            .setting("submission resubmitted", submission.resubmitted)
-            .setting(
-                "submission receipt base sigs",
-                submission.receipt_base_signatures,
-            )
-            .setting("confirmation resubmitted", confirmation.resubmitted)
-            .setting(
-                "confirmation receipt base sigs",
-                confirmation.receipt_base_signatures,
-            )
-            .metric(
-                "submission blackout convergence s",
-                Unit::Seconds,
-                submission.seconds,
-            )
-            .metric(
-                "confirmation blackout convergence s",
-                Unit::Seconds,
-                confirmation.seconds,
-            )
-            .metric("reconnect clone s", Unit::Seconds, reconnect_clone_s)
-            .metric("fault events", Unit::Count, events.len() as f64);
-        Ok(netfault::report_events(report, &events))
+        Ok(())
     }
 }

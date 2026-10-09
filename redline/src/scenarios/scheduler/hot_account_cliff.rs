@@ -84,7 +84,7 @@ struct CellResult {
 pub struct HotAccountCliff;
 
 #[async_trait(?Send)]
-impl Scenario for HotAccountCliff {
+impl Scenario<ScenarioReport> for HotAccountCliff {
     fn name(&self) -> &str {
         "redline/hot_account_cliff"
     }

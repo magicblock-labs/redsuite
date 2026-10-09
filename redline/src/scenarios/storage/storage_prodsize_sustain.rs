@@ -114,7 +114,7 @@ struct CellOutcome {
 pub struct StorageProdsizeSustain;
 
 #[async_trait(?Send)]
-impl Scenario for StorageProdsizeSustain {
+impl Scenario<ScenarioReport> for StorageProdsizeSustain {
     fn name(&self) -> &str {
         "redline/storage_prodsize_sustain"
     }

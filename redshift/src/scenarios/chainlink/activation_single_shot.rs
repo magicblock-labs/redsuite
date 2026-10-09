@@ -13,12 +13,10 @@ use redshift_interface::flexi::{build as flexi, FlexiCounter};
 use redsuite_core::{
     check, check_eq,
     dlp::{self, delegate_with_actions, DelegateArgs},
-    netfault::{self, Action, BaseProxies, Selector},
-    prep,
-    report::Unit,
-    system, topology,
+    netfault::{Action, BaseProxies, Selector},
+    prep, system, topology,
     topology::{ErOptions, RestartConfig},
-    BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result, ScenarioReport,
+    BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result,
 };
 use signature::Signature;
 use signer::Signer;
@@ -52,21 +50,6 @@ struct CounterState {
 struct Discovery {
     reads: Vec<JoinHandle<Result<Option<Account>>>>,
     submissions: Vec<JoinHandle<Result<Signature>>>,
-    held_s: f64,
-}
-
-struct Settled {
-    held_fetches: usize,
-    reads_ok: usize,
-    reads_err: usize,
-    submissions_ok: usize,
-    submissions_err: usize,
-    held_s: f64,
-}
-
-struct Activation {
-    discovery: Settled,
-    after_release_s: f64,
 }
 
 fn counter_action(
@@ -104,8 +87,7 @@ async fn await_counter(
     expected: CounterState,
     what: &str,
     timeout: Duration,
-) -> Result<f64> {
-    let started = Instant::now();
+) -> Result<()> {
     check::poll_for(what, timeout, || async {
         match counter_state(er, counter).await {
             Ok(state) if state == expected => Ok(()),
@@ -115,7 +97,7 @@ async fn await_counter(
     })
     .await
     .map_err(|error| error.expected(format!("{expected:?}")))?;
-    Ok(started.elapsed().as_secs_f64())
+    Ok(())
 }
 
 async fn hold_steady(
@@ -255,38 +237,16 @@ async fn race_discovery(
         )?;
         tokio::time::sleep(POLL).await;
     }
-    Ok(Discovery {
-        reads,
-        submissions,
-        held_s: started.elapsed().as_secs_f64(),
-    })
+    Ok(Discovery { reads, submissions })
 }
 
-async fn settle_discovery(
-    discovery: Discovery,
-    held_fetches: usize,
-) -> Result<Settled> {
-    let mut settled = Settled {
-        held_fetches,
-        reads_ok: 0,
-        reads_err: 0,
-        submissions_ok: 0,
-        submissions_err: 0,
-        held_s: discovery.held_s,
-    };
+async fn settle_discovery(discovery: Discovery) {
     for read in discovery.reads {
-        match tokio::time::timeout(SETTLE_TIMEOUT, read).await {
-            Ok(Ok(Ok(_))) => settled.reads_ok += 1,
-            _ => settled.reads_err += 1,
-        }
+        let _ = tokio::time::timeout(SETTLE_TIMEOUT, read).await;
     }
     for submission in discovery.submissions {
-        match tokio::time::timeout(SETTLE_TIMEOUT, submission).await {
-            Ok(Ok(Ok(_))) => settled.submissions_ok += 1,
-            _ => settled.submissions_err += 1,
-        }
+        let _ = tokio::time::timeout(SETTLE_TIMEOUT, submission).await;
     }
-    Ok(settled)
 }
 
 async fn run_action(
@@ -297,7 +257,7 @@ async fn run_action(
     er_payer: &Rc<Keypair>,
     actor: &Pubkey,
     fail: bool,
-) -> Result<(Pubkey, Activation)> {
+) -> Result<Pubkey> {
     let (counter, _) = FlexiCounter::pda_and_bump(actor);
     let counter = &counter;
     let before = counter_state(er, counter).await?;
@@ -321,11 +281,9 @@ async fn run_action(
         before,
     )
     .await?;
-    let released = Instant::now();
     stall.remove();
-    let discovery =
-        settle_discovery(discovery, held_fetches(proxies, &dependency)).await?;
-    let after_release_s = if fail {
+    settle_discovery(discovery).await;
+    if fail {
         check::poll_for(
             "the failed activation completes the rescue undelegation on base",
             RESCUE_TIMEOUT,
@@ -344,13 +302,11 @@ async fn run_action(
             },
         )
         .await?;
-        let elapsed = released.elapsed().as_secs_f64();
         check_eq!(
             counter_state(er, counter).await?,
             before,
             "failed activation leaves counter {counter} unchanged"
         )?;
-        elapsed
     } else {
         let expected = CounterState {
             count: before.count + u64::from(ACTION_COUNT),
@@ -364,21 +320,13 @@ async fn run_action(
             ACTIVATION_TIMEOUT,
         )
         .await?;
-        let elapsed = released.elapsed().as_secs_f64();
         check!(
             er.account(&trigger.pubkey()).await?.is_some(),
             "activated trigger {} is present on the er",
             trigger.pubkey()
         )?;
-        elapsed
-    };
-    Ok((
-        trigger.pubkey(),
-        Activation {
-            discovery,
-            after_release_s,
-        },
-    ))
+    }
+    Ok(trigger.pubkey())
 }
 
 #[async_trait(?Send)]
@@ -387,7 +335,7 @@ impl PrivateErScenario for ActivationSingleShot {
         "redshift/activation_single_shot"
     }
 
-    async fn run(&self, base: &BaseCtx) -> Result<ScenarioReport> {
+    async fn run(&self, base: &BaseCtx) -> Result<()> {
         let proxies = BaseProxies::spawn(base).await?;
         let mut private = topology::private_er(
             base,
@@ -434,7 +382,7 @@ impl PrivateErScenario for ActivationSingleShot {
         )
         .await?;
 
-        let (trigger, activation) = run_action(
+        let trigger = run_action(
             base,
             &proxies,
             er,
@@ -500,7 +448,7 @@ impl PrivateErScenario for ActivationSingleShot {
         )
         .await?;
 
-        let (failing_trigger, rescue) = run_action(
+        run_action(
             base,
             &proxies,
             er,
@@ -513,78 +461,8 @@ impl PrivateErScenario for ActivationSingleShot {
         hold_steady(er, &counter, applied, STEADY_WINDOW, "after the rescue")
             .await?;
 
-        let events = proxies.finish()?;
+        proxies.finish()?;
         private.finish().await?;
-
-        let report = ScenarioReport::ok(self.name())
-            .setting("er", LABEL)
-            .setting("counter", counter)
-            .setting("trigger", trigger)
-            .setting("failing trigger", failing_trigger)
-            .setting("action count", ACTION_COUNT)
-            .metric(
-                "activation held s",
-                Unit::Seconds,
-                activation.discovery.held_s,
-            )
-            .metric(
-                "activation held fetches",
-                Unit::Count,
-                activation.discovery.held_fetches as f64,
-            )
-            .metric(
-                "activation reads ok",
-                Unit::Count,
-                activation.discovery.reads_ok as f64,
-            )
-            .metric(
-                "activation reads err",
-                Unit::Count,
-                activation.discovery.reads_err as f64,
-            )
-            .metric(
-                "activation submissions ok",
-                Unit::Count,
-                activation.discovery.submissions_ok as f64,
-            )
-            .metric(
-                "activation submissions err",
-                Unit::Count,
-                activation.discovery.submissions_err as f64,
-            )
-            .metric(
-                "activation after release s",
-                Unit::Seconds,
-                activation.after_release_s,
-            )
-            .metric("rescue held s", Unit::Seconds, rescue.discovery.held_s)
-            .metric(
-                "rescue held fetches",
-                Unit::Count,
-                rescue.discovery.held_fetches as f64,
-            )
-            .metric(
-                "rescue reads ok",
-                Unit::Count,
-                rescue.discovery.reads_ok as f64,
-            )
-            .metric(
-                "rescue submissions ok",
-                Unit::Count,
-                rescue.discovery.submissions_ok as f64,
-            )
-            .metric(
-                "rescue after release s",
-                Unit::Seconds,
-                rescue.after_release_s,
-            )
-            .metric(
-                "restart startup s",
-                Unit::Seconds,
-                restart.startup.as_secs_f64(),
-            )
-            .metric("fault events", Unit::Count, events.len() as f64);
-
-        Ok(netfault::report_events(report, &events))
+        Ok(())
     }
 }

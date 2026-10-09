@@ -8,7 +8,7 @@ use redshift_interface::flexi::{build as flexi, FlexiCounter};
 use redsuite_core::{
     api::{ConfirmOptions, TxError},
     check, check_eq, prep, topology, BaseCtx, ChainCtx, ErCtx,
-    PrivateErScenario, Result, ScenarioReport,
+    PrivateErScenario, Result,
 };
 use signer::Signer;
 use transaction::Transaction;
@@ -141,10 +141,9 @@ fn tx_failure(attempt: Result<()>, context: &str) -> Result<Box<TxError>> {
     })
 }
 
-async fn test_schedule_and_cancel(er: &ErCtx, actor: &Actor) -> Result<usize> {
+async fn test_schedule_and_cancel(er: &ErCtx, actor: &Actor) -> Result<()> {
     schedule(er, actor, 101, TASK_INTERVAL_MS, 3).await?;
-    let created = await_tasks(er, 1).await?;
-    let size = created[0].1.data.len();
+    await_tasks(er, 1).await?;
     cancel(er, actor, 101).await?;
     await_tasks(er, 0).await?;
     check_eq!(
@@ -152,7 +151,7 @@ async fn test_schedule_and_cancel(er: &ErCtx, actor: &Actor) -> Result<usize> {
         0,
         "the validator itself never executes the scheduled payload"
     )?;
-    Ok(size)
+    Ok(())
 }
 
 async fn test_reschedule(er: &ErCtx, actor: &Actor) -> Result<()> {
@@ -176,7 +175,7 @@ async fn test_reschedule(er: &ErCtx, actor: &Actor) -> Result<()> {
     Ok(())
 }
 
-async fn test_signed_refusal(er: &ErCtx, actor: &Actor) -> Result<String> {
+async fn test_signed_refusal(er: &ErCtx, actor: &Actor) -> Result<()> {
     let error = tx_failure(
         er.submit_and_confirm(
             &actor.payer,
@@ -202,7 +201,7 @@ async fn test_signed_refusal(er: &ErCtx, actor: &Actor) -> Result<String> {
         0,
         "a refused schedule creates no task account"
     )?;
-    Ok(detail)
+    Ok(())
 }
 
 async fn test_authority_isolation(
@@ -247,7 +246,7 @@ async fn sponsor_balance(er: &ErCtx) -> Result<u64> {
         .lamports)
 }
 
-async fn test_sponsor_refund(er: &ErCtx, actor: &Actor) -> Result<u64> {
+async fn test_sponsor_refund(er: &ErCtx, actor: &Actor) -> Result<()> {
     er.submit_and_confirm(
         &actor.payer,
         &[flexi::add_unsigned(actor.pubkey(), 0)],
@@ -269,7 +268,7 @@ async fn test_sponsor_refund(er: &ErCtx, actor: &Actor) -> Result<u64> {
         || async { sponsor_balance(er).await.ok() == Some(before) },
     )
     .await?;
-    Ok(before - funded)
+    Ok(())
 }
 
 #[async_trait(?Send)]
@@ -278,7 +277,7 @@ impl PrivateErScenario for TaskScheduler {
         "redshift/task_scheduler"
     }
 
-    async fn run(&self, base: &BaseCtx) -> Result<ScenarioReport> {
+    async fn run(&self, base: &BaseCtx) -> Result<()> {
         check!(
             matches!(base.account(&SCHEDULER_PROGRAM).await?, Some(program) if program.executable),
             "the base chain hosts the ephemeral scheduler program"
@@ -302,18 +301,12 @@ impl PrivateErScenario for TaskScheduler {
         )?;
 
         let actor = scheduled_actor(base, er, &funder).await?;
-        let size = test_schedule_and_cancel(er, &actor).await?;
-        let signed_error = test_signed_refusal(er, &actor).await?;
+        test_schedule_and_cancel(er, &actor).await?;
+        test_signed_refusal(er, &actor).await?;
         test_authority_isolation(base, er, &funder, &actor).await?;
         test_cancel_ongoing(er, &actor).await?;
-        let sponsored = test_sponsor_refund(er, &actor).await?;
+        test_sponsor_refund(er, &actor).await?;
         test_reschedule(er, &actor).await?;
-
-        Ok(ScenarioReport::ok(self.name())
-            .setting("task store", "scheduler program accounts")
-            .setting("task account bytes", size)
-            .setting("sponsored lamports", sponsored)
-            .setting("signed task refusal", signed_error)
-            .setting("task interval ms", TASK_INTERVAL_MS))
+        Ok(())
     }
 }

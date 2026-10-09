@@ -7,10 +7,10 @@ use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
     check, check_eq,
-    netfault::{self, Action, BaseProxies, Selector},
+    netfault::{Action, BaseProxies, Selector},
     prep, system, topology,
     topology::ErOptions,
-    BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result, ScenarioReport,
+    BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result,
 };
 use signer::Signer;
 
@@ -54,7 +54,7 @@ impl PrivateErScenario for CacheLifecycle {
         }
     }
 
-    async fn run(&self, base: &BaseCtx) -> Result<ScenarioReport> {
+    async fn run(&self, base: &BaseCtx) -> Result<()> {
         let (label, churn_cycles) = match self {
             Self::Churn => ("cache-lifecycle", 3),
             Self::UndelegationReconnectGap => ("undelegation-reconnect-gap", 0),
@@ -364,33 +364,18 @@ impl PrivateErScenario for CacheLifecycle {
                 }
             }
             done.set(true);
-            Result::Ok((evictions - before, recovery))
+            Result::Ok(recovery)
         };
-        let (_, (evictions, recovery)) = tokio::time::timeout(
+        let (_, recovery) = tokio::time::timeout(
             Duration::from_secs(180),
             try_join(traffic, faults),
         )
         .await??;
         let actual = base.accounts(delegated).await?;
         check_eq!(actual, base_delegated, "base unchanged by ER-only writes")?;
-        let mut report = ScenarioReport::ok(self.name())
-            .setting("cache evictions", evictions)
-            .setting("warmed transactions", progress.get())
-            .setting(
-                "reconnects",
-                churn_cycles + usize::from(reconnect_before_settlement),
-            );
-        if let Some(recovery) = &recovery {
-            let recovered_after = match recovery {
-                Ok(elapsed) => format!("{elapsed:.1?}"),
-                Err(_) => format!("not within {RECOVERY_OBSERVATION:?}"),
-            };
-            report = report.setting("er recovered after", recovered_after);
-        }
         private.finish().await?;
-        let mut events = http.finish()?;
-        events.extend(ws.finish()?);
-        let report = netfault::report_events(report, &events);
+        http.finish()?;
+        ws.finish()?;
         if let Some(recovery) = recovery {
             let elapsed = recovery?;
             check!(
@@ -398,6 +383,6 @@ impl PrivateErScenario for CacheLifecycle {
                 "ER discovered the completed undelegation only after {elapsed:.1?}"
             )?;
         }
-        Ok(report)
+        Ok(())
     }
 }

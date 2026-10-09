@@ -18,7 +18,7 @@ use redsuite_core::{
     api::TransactionInfo,
     check, check_eq, manifest, prep, system,
     topology::{self, ErOptions},
-    BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result, ScenarioReport,
+    BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result,
 };
 use sdk::{consts::EPHEMERAL_VAULT_ID, ephemeral_accounts::rent};
 use signer::Signer;
@@ -259,7 +259,6 @@ struct Workload<'a> {
     signers: Vec<Keypair>,
     keys: [Pubkey; 5],
     expected: Vec<Account>,
-    report: ScenarioReport,
     nonce: usize,
     failures: Vec<String>,
 }
@@ -291,34 +290,6 @@ impl Workload<'_> {
             .collect();
         tx.try_sign(&signers, self.er.api().get_latest_blockhash().await?)?;
         Ok(tx)
-    }
-
-    fn record(
-        &mut self,
-        label: &str,
-        record: &Record,
-        before: &[Account],
-        after: &[Account],
-    ) {
-        self.report.config.push((
-            label.into(),
-            format!(
-                "{} {}; fee={}; {} -> {}; payer={} -> {}; substitute={} -> {}",
-                record.tx.signatures[0],
-                record
-                    .info
-                    .err
-                    .as_ref()
-                    .map_or_else(|| "success".into(), ToString::to_string),
-                record.info.fee,
-                observation(before),
-                observation(after),
-                before[PAYER].lamports,
-                after[PAYER].lamports,
-                before[SUBSTITUTE].lamports,
-                after[SUBSTITUTE].lamports,
-            ),
-        ));
     }
 
     async fn run(
@@ -365,7 +336,6 @@ impl Workload<'_> {
                 record.tx.signatures[0]
             ));
         }
-        self.record(label, &record, &before, &after);
         self.expected = after;
         Ok(())
     }
@@ -377,7 +347,7 @@ impl PrivateErScenario for EphemeralAccounts {
         "redhat/ephemeral_accounts"
     }
 
-    async fn run(&self, base: &BaseCtx) -> Result<ScenarioReport> {
+    async fn run(&self, base: &BaseCtx) -> Result<()> {
         let private = topology::private_er(
             base,
             ErOptions {
@@ -415,16 +385,6 @@ impl PrivateErScenario for EphemeralAccounts {
             signers,
             keys,
             expected: state(er, &keys).await?,
-            report: ScenarioReport::ok(self.name())
-                .setting(
-                    "accounts (payer, sponsor, target, vault, substitute)",
-                    format!("{keys:?}"),
-                )
-                .setting("foreign caller", foreign)
-                .setting(
-                    "state columns",
-                    "owner bytes lamports sponsor vault data-hash",
-                ),
             nonce: 0,
             failures: Vec::new(),
         };
@@ -552,7 +512,7 @@ impl PrivateErScenario for EphemeralAccounts {
             close.caller = caller;
             workload.step("recreate: close", &close).await?;
         }
-        for round in 0..3 {
+        for _ in 0..3 {
             let mut create = Action::new(Create { data_len: 40 });
             create.fill = 0x5a;
             workload.step("conflicts: initialize", &create).await?;
@@ -585,21 +545,10 @@ impl PrivateErScenario for EphemeralAccounts {
                     .ok_or("conflicts have no valid serialized outcome")?;
             for index in order {
                 let (action, record) = &records[index];
-                let before = workload.expected.clone();
                 if record.info.err.is_none() {
                     action.apply(&mut workload.expected);
                 }
                 workload.expected[PAYER].lamports -= record.info.fee;
-                let current = workload.expected.clone();
-                workload.record(
-                    &format!(
-                        "conflict {round}/{index}: {:?}",
-                        action.operation
-                    ),
-                    record,
-                    &before,
-                    &current,
-                );
             }
             check_eq!(workload.expected, after, "serialized final state")?;
             if after[TARGET].owner != system::system_id() {
@@ -607,16 +556,13 @@ impl PrivateErScenario for EphemeralAccounts {
                 workload.step("conflicts: close", &close).await?;
             }
         }
-        let Workload {
-            mut report,
-            failures,
-            nonce,
-            ..
-        } = workload;
+        let failures = workload.failures;
         private.finish().await?;
-        report.passed = failures.is_empty();
-        Ok(report
-            .setting("transactions inspected", nonce)
-            .setting("failures", failures.join("; ")))
+        check!(
+            failures.is_empty(),
+            "ephemeral transactions with mismatched receipts or accounting: {}",
+            failures.join("; ")
+        )?;
+        Ok(())
     }
 }

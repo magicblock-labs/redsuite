@@ -54,7 +54,7 @@ const PROFILES: ProfileValues<Profile> = ProfileValues {
 pub struct WarmIngress;
 
 #[async_trait(?Send)]
-impl Scenario for WarmIngress {
+impl Scenario<ScenarioReport> for WarmIngress {
     fn name(&self) -> &str {
         "redline/rpc_warm_ingress"
     }

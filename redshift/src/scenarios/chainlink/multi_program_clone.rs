@@ -1,10 +1,6 @@
-use std::time::Instant;
-
 use async_trait::async_trait;
-use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, topology, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
-    ScenarioReport,
 };
 
 use crate::program::instruction::build;
@@ -20,7 +16,7 @@ impl Scenario for MultiProgramClone {
         "redshift/multi_program_clone"
     }
 
-    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
+    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<()> {
         let [(first_program, _), (second_program, _)] =
             topology::redline_loader_v3_pair();
 
@@ -44,7 +40,6 @@ impl Scenario for MultiProgramClone {
         )
         .await?;
 
-        let multi_clone_tx = Instant::now();
         er.submit_and_confirm(
             &payer,
             &[
@@ -61,7 +56,6 @@ impl Scenario for MultiProgramClone {
             ],
         )
         .await?;
-        let multi_clone_ms = multi_clone_tx.elapsed().as_secs_f64() * 1e3;
 
         for (program, label) in
             [(first_program, "first"), (second_program, "second")]
@@ -95,12 +89,6 @@ impl Scenario for MultiProgramClone {
             "the second program must have executed its write"
         )?;
 
-        Ok(ScenarioReport::ok(self.name())
-            .setting("loaders", "v3,v3")
-            .metric(
-                "two-program clone tx wall ms",
-                Unit::Millis,
-                multi_clone_ms,
-            ))
+        Ok(())
     }
 }

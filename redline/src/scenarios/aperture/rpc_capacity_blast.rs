@@ -56,7 +56,7 @@ const PROFILES: ProfileValues<Profile> = ProfileValues {
 pub struct RpcCapacityBlast;
 
 #[async_trait(?Send)]
-impl Scenario for RpcCapacityBlast {
+impl Scenario<ScenarioReport> for RpcCapacityBlast {
     fn name(&self) -> &str {
         "redline/rpc_capacity_blast"
     }

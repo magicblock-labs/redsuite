@@ -195,7 +195,7 @@ async fn await_drain(
 pub struct CommitThroughputCeiling;
 
 #[async_trait(?Send)]
-impl Scenario for CommitThroughputCeiling {
+impl Scenario<ScenarioReport> for CommitThroughputCeiling {
     fn name(&self) -> &str {
         "redline/commit_throughput_ceiling"
     }

@@ -6,14 +6,13 @@ use pubkey::Pubkey;
 use redshift_interface::flexi::{
     build as flexi, FlexiCounter, ACTOR_ESCROW_INDEX,
 };
-use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, dlp,
-    netfault::{self, BaseProxies, RuleHandle, Selector},
+    netfault::{BaseProxies, RuleHandle, Selector},
     prep,
     receipt::{self, CommitReceipt},
-    topology::{self, ErOptions, PrivateEr, RestartConfig, RestartTiming},
-    BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result, ScenarioReport,
+    topology::{self, ErOptions, PrivateEr, RestartConfig},
+    BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result,
 };
 use signature::Signature;
 use signer::Signer;
@@ -48,21 +47,6 @@ struct FaultedCommit<'a> {
     commit_id: u64,
     write: u64,
     restart: bool,
-}
-
-struct Settled {
-    landed: Signature,
-    nonce: u64,
-    receipt_base_signatures: usize,
-    seconds: f64,
-    restart: Option<RestartTiming>,
-}
-
-struct ActionOutcome {
-    landed: Signature,
-    receipt_succeeded: bool,
-    receipt_error: Option<String>,
-    seconds: f64,
 }
 
 async fn base_count(base: &BaseCtx, counter: &Pubkey) -> Result<u64> {
@@ -162,14 +146,13 @@ async fn commit_blackout(
     payer: &Keypair,
     account: Pubkey,
     faulted: FaultedCommit<'_>,
-) -> Result<Settled> {
+) -> Result<()> {
     let FaultedCommit {
         phase,
         commit_id,
         write,
         restart,
     } = faulted;
-    let started = Instant::now();
     let nonce_before = crate::last_commit_id(base, &account).await?;
     let submission = proxies.intercept(
         Selector::method("sendTransaction")
@@ -201,11 +184,9 @@ async fn commit_blackout(
         None
     };
     let confirmations = withhold_confirmations(proxies, &landed);
-    let restart_timing = if restart {
-        Some(private.restart(RestartConfig::default()).await?)
-    } else {
-        None
-    };
+    if restart {
+        private.restart(RestartConfig::default()).await?;
+    }
     held.discard();
     // The base transaction already landed and advanced the DLP nonce. Recovery
     // must reconcile that landed transaction instead of producing another base
@@ -238,13 +219,7 @@ async fn commit_blackout(
         on_base.data == snapshot,
         "{phase}: the base copy must still carry the settled er snapshot"
     )?;
-    Ok(Settled {
-        landed,
-        nonce: settled,
-        receipt_base_signatures: receipt.base_signatures.len(),
-        seconds: started.elapsed().as_secs_f64(),
-        restart: restart_timing,
-    })
+    Ok(())
 }
 
 async fn follow_up_commit(
@@ -255,7 +230,7 @@ async fn follow_up_commit(
     commit_id: u64,
     write: u64,
     phase: &str,
-) -> Result<u64> {
+) -> Result<()> {
     let nonce_before = crate::last_commit_id(base, &account).await?;
     let (snapshot, commit_signature) =
         write_and_commit(er, payer, commit_id, write, &account).await?;
@@ -274,15 +249,14 @@ async fn follow_up_commit(
         nonce_before + 1,
         "{phase}: the follow-up commit advances the base nonce exactly once"
     )?;
-    Ok(nonce)
+    Ok(())
 }
 
 async fn action_blackout(
     proxies: &BaseProxies,
     base: &BaseCtx,
     er: &ErCtx,
-) -> Result<ActionOutcome> {
-    let started = Instant::now();
+) -> Result<()> {
     let payer = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
     let (init, counter) = flexi::init_counter(payer.pubkey(), LABEL);
     base.submit_and_confirm(
@@ -362,37 +336,7 @@ async fn action_blackout(
         .await?;
     }
     hold_count(base, &counter, 1, SETTLE_WINDOW, "action settle").await?;
-    Ok(ActionOutcome {
-        landed,
-        receipt_succeeded: receipt.succeeded(),
-        receipt_error: receipt.error_message,
-        seconds: started.elapsed().as_secs_f64(),
-    })
-}
-
-fn restart_settings(
-    report: ScenarioReport,
-    timing: &RestartTiming,
-) -> ScenarioReport {
-    report
-        .setting("restart needed sigkill", timing.needed_sigkill)
-        .setting(
-            "restart exit",
-            format!(
-                "code={:?} signal={:?}",
-                timing.exit_code, timing.exit_signal
-            ),
-        )
-        .metric(
-            "restart shutdown s",
-            Unit::Seconds,
-            timing.shutdown.as_secs_f64(),
-        )
-        .metric(
-            "restart startup s",
-            Unit::Seconds,
-            timing.startup.as_secs_f64(),
-        )
+    Ok(())
 }
 
 #[async_trait(?Send)]
@@ -401,7 +345,7 @@ impl PrivateErScenario for CommitExactlyOnce {
         "redshift/commit_exactly_once"
     }
 
-    async fn run(&self, base: &BaseCtx) -> Result<ScenarioReport> {
+    async fn run(&self, base: &BaseCtx) -> Result<()> {
         let proxies = BaseProxies::spawn(base).await?;
         let mut private = topology::private_er(
             base,
@@ -431,7 +375,7 @@ impl PrivateErScenario for CommitExactlyOnce {
         )
         .await?;
 
-        let warmup_nonce = follow_up_commit(
+        follow_up_commit(
             base,
             private.ctx(),
             &payer,
@@ -441,7 +385,7 @@ impl PrivateErScenario for CommitExactlyOnce {
             "warm-up",
         )
         .await?;
-        let blackout = commit_blackout(
+        commit_blackout(
             &proxies,
             base,
             &mut private,
@@ -455,7 +399,7 @@ impl PrivateErScenario for CommitExactlyOnce {
             },
         )
         .await?;
-        let recovery_nonce = follow_up_commit(
+        follow_up_commit(
             base,
             private.ctx(),
             &payer,
@@ -465,8 +409,8 @@ impl PrivateErScenario for CommitExactlyOnce {
             "post-blackout",
         )
         .await?;
-        let action = action_blackout(&proxies, base, private.ctx()).await?;
-        let restarted = commit_blackout(
+        action_blackout(&proxies, base, private.ctx()).await?;
+        commit_blackout(
             &proxies,
             base,
             &mut private,
@@ -480,7 +424,7 @@ impl PrivateErScenario for CommitExactlyOnce {
             },
         )
         .await?;
-        let restart_recovery_nonce = follow_up_commit(
+        follow_up_commit(
             base,
             private.ctx(),
             &payer,
@@ -491,45 +435,8 @@ impl PrivateErScenario for CommitExactlyOnce {
         )
         .await?;
 
-        let events = proxies.finish()?;
+        proxies.finish()?;
         private.finish().await?;
-
-        let mut report = ScenarioReport::ok(self.name())
-            .setting("er", LABEL)
-            .setting("delegated account", account)
-            .setting(
-                "fault",
-                "sendTransaction response discarded, getSignatureStatuses and \
-                 signatureNotification withheld",
-            )
-            .setting("warm-up nonce", warmup_nonce)
-            .setting("blackout landed", blackout.landed)
-            .setting("blackout nonce", blackout.nonce)
-            .setting(
-                "blackout receipt base sigs",
-                blackout.receipt_base_signatures,
-            )
-            .setting("post-blackout nonce", recovery_nonce)
-            .setting("restart landed", restarted.landed)
-            .setting("restart nonce", restarted.nonce)
-            .setting(
-                "restart receipt base sigs",
-                restarted.receipt_base_signatures,
-            )
-            .setting("post-restart nonce", restart_recovery_nonce)
-            .setting("action landed", action.landed)
-            .setting("action receipt succeeded", action.receipt_succeeded)
-            .setting(
-                "action receipt error",
-                action.receipt_error.unwrap_or_else(|| "none".to_owned()),
-            )
-            .metric("blackout settlement s", Unit::Seconds, blackout.seconds)
-            .metric("restart settlement s", Unit::Seconds, restarted.seconds)
-            .metric("action settlement s", Unit::Seconds, action.seconds)
-            .metric("fault events", Unit::Count, events.len() as f64);
-        if let Some(timing) = &restarted.restart {
-            report = restart_settings(report, timing);
-        }
-        Ok(netfault::report_events(report, &events))
+        Ok(())
     }
 }

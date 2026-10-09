@@ -115,7 +115,7 @@ struct CellOutcome {
 pub struct WsFanoutThreshold;
 
 #[async_trait(?Send)]
-impl Scenario for WsFanoutThreshold {
+impl Scenario<ScenarioReport> for WsFanoutThreshold {
     fn name(&self) -> &str {
         "redline/ws_fanout_threshold"
     }

@@ -173,7 +173,7 @@ async fn burst_cell(
 pub struct ColdHydrationTail;
 
 #[async_trait(?Send)]
-impl Scenario for ColdHydrationTail {
+impl Scenario<ScenarioReport> for ColdHydrationTail {
     fn name(&self) -> &str {
         "redline/cold_hydration_tail"
     }

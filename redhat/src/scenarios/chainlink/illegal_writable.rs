@@ -5,7 +5,7 @@ use instruction::Instruction;
 use redshift_interface::schedulecommit::{build, ScheduleCommitType};
 use redsuite_core::{
     check, check_eq, dlp, prep, system, BaseCtx, ChainCtx, ErCtx, Result,
-    Scenario, ScenarioReport,
+    Scenario,
 };
 use signer::Signer;
 
@@ -23,7 +23,7 @@ impl Scenario for IllegalWritable {
         "redhat/illegal_writable"
     }
 
-    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
+    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<()> {
         let funder = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
         let committees =
             prep::init_committees(base, &funder, er.identity(), 2).await?;
@@ -116,9 +116,6 @@ impl Scenario for IllegalWritable {
             )?;
         }
 
-        Ok(ScenarioReport::ok(self.name())
-            .setting("committees", pdas.len())
-            .setting("direct refusal", PROGRAM_ID_NOT_FOUND)
-            .setting("malicious cpi refusal", NEEDS_TO_BE_OWNED))
+        Ok(())
     }
 }

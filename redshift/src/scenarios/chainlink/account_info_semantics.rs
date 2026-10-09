@@ -1,11 +1,9 @@
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use keypair::Keypair;
-use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, prep, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
-    ScenarioReport,
 };
 use signer::Signer;
 
@@ -24,14 +22,13 @@ impl Scenario for AccountInfoSemantics {
         "redshift/account_info_semantics"
     }
 
-    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
+    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<()> {
         // These keys must stay cold until all five requests are in flight.
         let wallets: Vec<_> =
             (0..COLD_WALLETS).map(|_| Keypair::new().pubkey()).collect();
         for wallet in &wallets {
             base.airdrop(wallet, FIRST_AIRDROP).await?;
         }
-        let fan_out = Instant::now();
         let (a, single_a, b, c, single_b) = tokio::join!(
             er.accounts(&wallets[0..3]),
             er.account(&wallets[3]),
@@ -39,7 +36,6 @@ impl Scenario for AccountInfoSemantics {
             er.accounts(&wallets[6..9]),
             er.account(&wallets[9]),
         );
-        let concurrent_ms = fan_out.elapsed().as_secs_f64() * 1e3;
         for (case, entries, keys) in [
             ("batch a", a?, &wallets[0..3]),
             ("single a", vec![single_a?], &wallets[3..4]),
@@ -73,7 +69,6 @@ impl Scenario for AccountInfoSemantics {
 
         let wallet = Keypair::new().pubkey();
         base.airdrop(&wallet, FIRST_AIRDROP).await?;
-        let first_read = Instant::now();
         check::poll(
             "the ER clones the airdropped wallet on first read",
             CLONE_TIMEOUT,
@@ -82,9 +77,7 @@ impl Scenario for AccountInfoSemantics {
             },
         )
         .await?;
-        let first_read_ms = first_read.elapsed().as_secs_f64() * 1e3;
         base.airdrop(&wallet, SECOND_AIRDROP).await?;
-        let refresh_started = Instant::now();
         check::poll(
             "the non-delegated wallet clone refreshes to the new balance",
             REFRESH_TIMEOUT,
@@ -93,7 +86,6 @@ impl Scenario for AccountInfoSemantics {
             },
         )
         .await?;
-        let refresh_ms = refresh_started.elapsed().as_secs_f64() * 1e3;
 
         let escrowed =
             prep::escrowed_payer(base, er.identity(), ESCROW_FUNDING).await?;
@@ -168,15 +160,6 @@ impl Scenario for AccountInfoSemantics {
             "the batch read must see the exact escrow balance"
         )?;
 
-        Ok(ScenarioReport::ok(self.name())
-            .setting("concurrent cold wallets", COLD_WALLETS)
-            .metric(
-                "concurrent first-touch wall ms",
-                Unit::Millis,
-                concurrent_ms,
-            )
-            .setting("escrow funding lamports", ESCROW_FUNDING)
-            .metric("first clone read ms", Unit::Millis, first_read_ms)
-            .metric("non-delegated refresh ms", Unit::Millis, refresh_ms))
+        Ok(())
     }
 }

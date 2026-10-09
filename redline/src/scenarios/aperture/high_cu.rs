@@ -223,7 +223,7 @@ async fn run_cell(
 pub struct HighCu;
 
 #[async_trait(?Send)]
-impl Scenario for HighCu {
+impl Scenario<ScenarioReport> for HighCu {
     fn name(&self) -> &str {
         "redline/high_cu"
     }

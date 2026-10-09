@@ -3,10 +3,9 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use keypair::Keypair;
 use redsuite_core::dlp::{commit_state, finalize, undelegate, CommitStateArgs};
-use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, dlp, prep, system, topology, BaseCtx, ChainCtx, ErCtx,
-    Result, Scenario, ScenarioReport,
+    Result, Scenario,
 };
 use signer::Signer;
 
@@ -32,7 +31,7 @@ impl Scenario for CloneOnAccess {
         "redshift/clone_on_access"
     }
 
-    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
+    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<()> {
         let payer = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
 
         let ghost = Keypair::new().pubkey();
@@ -58,7 +57,6 @@ impl Scenario for CloneOnAccess {
         )
         .await?;
 
-        let first_access = Instant::now();
         check::poll(
             "the ER clones the plain account on first access",
             CLONE_TIMEOUT,
@@ -67,7 +65,6 @@ impl Scenario for CloneOnAccess {
             },
         )
         .await?;
-        let clone_visibility_ms = first_access.elapsed().as_secs_f64() * 1e3;
         let plain_clone =
             er.account(&plain).await?.ok_or("plain clone vanished")?;
         let plain_on_base =
@@ -93,7 +90,6 @@ impl Scenario for CloneOnAccess {
             &[build::simple_byte_set(POST_CLONE_WRITE, &[plain])],
         )
         .await?;
-        let mutation_confirmed = Instant::now();
         check::poll(
             "the base write propagates to the existing ER clone",
             PROPAGATION_TIMEOUT,
@@ -102,7 +98,6 @@ impl Scenario for CloneOnAccess {
             },
         )
         .await?;
-        let propagation_ms = mutation_confirmed.elapsed().as_secs_f64() * 1e3;
 
         let undelegated_write = er
             .submit_and_confirm(
@@ -251,14 +246,6 @@ impl Scenario for CloneOnAccess {
         )
         .await?;
 
-        Ok(ScenarioReport::ok(self.name())
-            .setting("account space", crate::ACCOUNT_SPACE)
-            .setting("redelegation continuity window ms", 2_000u64)
-            .metric(
-                "fresh clone visibility ms",
-                Unit::Millis,
-                clone_visibility_ms,
-            )
-            .metric("base-to-er propagation ms", Unit::Millis, propagation_ms))
+        Ok(())
     }
 }

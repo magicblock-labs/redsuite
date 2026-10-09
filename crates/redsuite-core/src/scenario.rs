@@ -16,16 +16,35 @@ use crate::{
     topology, DynError, Result,
 };
 
-#[async_trait(?Send)]
-pub trait Scenario {
-    fn name(&self) -> &str;
-    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport>;
+pub trait Verdict {
+    const REPORTS: bool;
+    fn into_report(self) -> Option<ScenarioReport>;
+}
+
+impl Verdict for () {
+    const REPORTS: bool = false;
+    fn into_report(self) -> Option<ScenarioReport> {
+        None
+    }
+}
+
+impl Verdict for ScenarioReport {
+    const REPORTS: bool = true;
+    fn into_report(self) -> Option<ScenarioReport> {
+        Some(self)
+    }
 }
 
 #[async_trait(?Send)]
-pub trait PrivateErScenario {
+pub trait Scenario<V: Verdict = ()> {
     fn name(&self) -> &str;
-    async fn run(&self, base: &BaseCtx) -> Result<ScenarioReport>;
+    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<V>;
+}
+
+#[async_trait(?Send)]
+pub trait PrivateErScenario<V: Verdict = ()> {
+    fn name(&self) -> &str;
+    async fn run(&self, base: &BaseCtx) -> Result<V>;
 }
 
 #[derive(Debug)]
@@ -64,7 +83,7 @@ impl std::fmt::Display for RunError {
 
 #[derive(Debug)]
 pub enum ScenarioOutcome {
-    Passed(ScenarioReport),
+    Passed(Option<ScenarioReport>),
     Skipped(String),
     Failed(DynError),
     Panicked(String),
@@ -98,7 +117,9 @@ impl RunRecord {
 
     pub fn passed(&self) -> bool {
         let passed = match &self.scenario {
-            ScenarioOutcome::Passed(report) => report.passed,
+            ScenarioOutcome::Passed(report) => {
+                report.as_ref().is_none_or(|report| report.passed)
+            }
             ScenarioOutcome::Skipped(_) => true,
             _ => false,
         };
@@ -127,8 +148,8 @@ impl RunRecord {
     }
 }
 
-pub async fn run_shared_scenario(
-    scenario: impl Scenario,
+pub async fn run_shared_scenario<V: Verdict>(
+    scenario: impl Scenario<V>,
     fixtures: &[Fixture],
     optional_fixtures: &[Fixture],
     config: Result<ExecutionConfig>,
@@ -152,8 +173,8 @@ pub async fn run_shared_scenario(
         .await
 }
 
-pub async fn run_private_er_scenario(
-    scenario: impl PrivateErScenario,
+pub async fn run_private_er_scenario<V: Verdict>(
+    scenario: impl PrivateErScenario<V>,
     fixtures: &[Fixture],
     optional_fixtures: &[Fixture],
     config: Result<ExecutionConfig>,
@@ -193,7 +214,7 @@ impl ProvidesResources for (BaseCtx, ErCtx) {
     }
 }
 
-async fn execute<Provisioned, ProvisionFut, Body, BodyFut>(
+async fn execute<V: Verdict, Provisioned, ProvisionFut, Body, BodyFut>(
     name: String,
     fixtures: &[Fixture],
     optional_fixtures: &[Fixture],
@@ -205,7 +226,7 @@ where
     Provisioned: ProvidesResources,
     ProvisionFut: Future<Output = Result<Provisioned>>,
     Body: FnOnce(Provisioned) -> BodyFut,
-    BodyFut: Future<Output = Result<ScenarioReport>>,
+    BodyFut: Future<Output = Result<V>>,
 {
     let mut record = RunRecord::new(name);
 
@@ -213,18 +234,18 @@ where
         Ok(config) => config,
         Err(error) => {
             record.errors.push(RunError::Preflight(error));
-            conclude(&mut record);
+            conclude(&mut record, V::REPORTS);
             return record;
         }
     };
     if let Err(error) = preflight(fixtures) {
         record.errors.push(RunError::Preflight(error));
-        conclude(&mut record);
+        conclude(&mut record, V::REPORTS);
         return record;
     }
     if let Some(reason) = optional_fixture_gap(optional_fixtures) {
         record.scenario = ScenarioOutcome::Skipped(reason);
-        conclude(&mut record);
+        conclude(&mut record, V::REPORTS);
         return record;
     }
 
@@ -232,7 +253,7 @@ where
         Ok(provisioned) => provisioned,
         Err(error) => {
             record.errors.push(RunError::Topology(error));
-            conclude(&mut record);
+            conclude(&mut record, V::REPORTS);
             return record;
         }
     };
@@ -264,11 +285,11 @@ where
     record.launches = resources.launches();
     record.wall_seconds = Some(wall_seconds);
     record.scenario = match outcome {
-        Ok(Ok(report)) => ScenarioOutcome::Passed(report.metric(
-            "wall seconds",
-            Unit::Seconds,
-            wall_seconds,
-        )),
+        Ok(Ok(verdict)) => {
+            ScenarioOutcome::Passed(verdict.into_report().map(|report| {
+                report.metric("wall seconds", Unit::Seconds, wall_seconds)
+            }))
+        }
         Ok(Err(error)) => ScenarioOutcome::Failed(error),
         Err(payload) => ScenarioOutcome::Panicked(panic_message(payload)),
     };
@@ -277,7 +298,7 @@ where
         .errors
         .extend(teardown_errors.into_iter().map(RunError::Teardown));
 
-    conclude(&mut record);
+    conclude(&mut record, V::REPORTS);
     record
 }
 
@@ -322,17 +343,17 @@ fn optional_fixture_gap(optional_fixtures: &[Fixture]) -> Option<String> {
     None
 }
 
-fn conclude(record: &mut RunRecord) {
+fn conclude(record: &mut RunRecord, reports: bool) {
     let passed = record.passed();
     let show_details = !passed || console::verbose();
     match &record.scenario {
         ScenarioOutcome::Passed(report) => {
             console::line(format_args!(
                 "{}: {}",
-                report.scenario,
+                record.name,
                 if passed { "passed" } else { "failed" }
             ));
-            if show_details {
+            if let Some(report) = report.as_ref().filter(|_| show_details) {
                 if !report.config.is_empty() {
                     let knobs: Vec<String> = report
                         .config
@@ -403,6 +424,10 @@ fn conclude(record: &mut RunRecord) {
         }
     }
     if matches!(record.scenario, ScenarioOutcome::Skipped(_)) {
+        return;
+    }
+    crate::report::warn_on_stack_skew();
+    if !reports {
         return;
     }
     match crate::report::persist_run(record) {

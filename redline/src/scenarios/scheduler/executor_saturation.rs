@@ -326,7 +326,7 @@ impl Cell {
 pub struct ExecutorSaturation;
 
 #[async_trait(?Send)]
-impl Scenario for ExecutorSaturation {
+impl Scenario<ScenarioReport> for ExecutorSaturation {
     fn name(&self) -> &str {
         "redline/executor_saturation"
     }

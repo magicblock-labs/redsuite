@@ -6,7 +6,7 @@ use pubkey::Pubkey;
 use redsuite_core::{
     check, check_eq,
     dlp::{self, delegate_with_actions, DelegateArgs},
-    prep, system, BaseCtx, ChainCtx, ErCtx, Result, Scenario, ScenarioReport,
+    prep, system, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
 use signer::Signer;
 
@@ -30,7 +30,7 @@ impl Scenario for PostDelegationTokenTransfer {
         "redshift/post_delegation_token_transfer"
     }
 
-    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
+    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<()> {
         let fee_payer = prep::funded_payer(base, AIRDROP).await?;
         let delegated_account = Keypair::new();
         let source_authority = Keypair::new();
@@ -326,21 +326,7 @@ impl Scenario for PostDelegationTokenTransfer {
             "the failing action must not move tokens"
         )?;
 
-        Ok(ScenarioReport::ok(self.name())
-            .setting("mint decimals", 0u64)
-            .setting("transfer amount", TRANSFER_AMOUNT)
-            .setting(
-                "source after",
-                token_balance(er, &source_ata).await.unwrap_or_default(),
-            )
-            .setting(
-                "destination after",
-                token_balance(er, &destination_ata)
-                    .await
-                    .unwrap_or_default(),
-            )
-            .setting("plain ata on er", PLAIN_BALANCE)
-            .setting("foreign-delegated ata on er", 0u64))
+        Ok(())
     }
 }
 

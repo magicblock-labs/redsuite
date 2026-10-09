@@ -194,7 +194,7 @@ async fn own_lookup_table_txs(
 pub struct CommitWidthEnvelope;
 
 #[async_trait(?Send)]
-impl Scenario for CommitWidthEnvelope {
+impl Scenario<ScenarioReport> for CommitWidthEnvelope {
     fn name(&self) -> &str {
         "redline/commit_width_envelope"
     }

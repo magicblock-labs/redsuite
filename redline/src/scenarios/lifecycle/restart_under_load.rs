@@ -828,7 +828,7 @@ fn report_mode(
 pub struct RestartUnderLoad;
 
 #[async_trait(?Send)]
-impl PrivateErScenario for RestartUnderLoad {
+impl PrivateErScenario<ScenarioReport> for RestartUnderLoad {
     fn name(&self) -> &str {
         "redline/restart_under_load"
     }

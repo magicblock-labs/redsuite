@@ -1,4 +1,4 @@
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::future::join_all;
@@ -7,14 +7,13 @@ use pubkey::Pubkey;
 use redsuite_core::{
     api::RpcError,
     check, check_eq,
-    report::Unit,
     rpc_client::nonblocking::rpc_client::RpcClient,
     rpc_client_api::{
         config::RpcLargestAccountsConfig, request::RpcRequest,
         response::RpcBlockCommitment,
     },
     topology::{self, ErOptions},
-    BaseCtx, ChainCtx, PrivateErScenario, Result, ScenarioReport,
+    BaseCtx, ChainCtx, PrivateErScenario, Result,
 };
 use signer::Signer;
 use solana_commitment_config::CommitmentConfig;
@@ -403,7 +402,7 @@ impl PrivateErScenario for RpcCompatMethods {
         "redshift/rpc_compat_methods"
     }
 
-    async fn run(&self, base: &BaseCtx) -> Result<ScenarioReport> {
+    async fn run(&self, base: &BaseCtx) -> Result<()> {
         let private = topology::private_er(
             base,
             ErOptions {
@@ -440,7 +439,6 @@ impl PrivateErScenario for RpcCompatMethods {
             slot_floor,
         };
 
-        let burst_started = Instant::now();
         let requests = join_all((0..REQUESTS).map(|index| {
             run_method(&client, &fixture, CYCLE[index % CYCLE.len()])
         }));
@@ -452,7 +450,6 @@ impl PrivateErScenario for RpcCompatMethods {
                      {BURST_DEADLINE:?}"
                 )
             })?;
-        let burst_elapsed = burst_started.elapsed();
         let slot_ceiling = client.get_slot().await?;
 
         let mut failures = 0u64;
@@ -560,20 +557,7 @@ impl PrivateErScenario for RpcCompatMethods {
             }
         }
 
-        let report = ScenarioReport::ok(self.name())
-            .setting("superblock slots", SUPERBLOCK_SLOTS)
-            .setting("requests", REQUESTS)
-            .setting("method kinds", CYCLE.len())
-            .setting("identity", fixture.identity)
-            .setting("slot floor", fixture.slot_floor)
-            .setting("slot ceiling", slot_ceiling)
-            .metric(
-                "burst elapsed ms",
-                Unit::Millis,
-                burst_elapsed.as_secs_f64() * 1e3,
-            )
-            .metric("burst failures", Unit::Count, failures as f64);
         private.finish().await?;
-        Ok(report)
+        Ok(())
     }
 }
