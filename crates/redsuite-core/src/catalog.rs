@@ -173,35 +173,11 @@ macro_rules! scenario_catalog {
                         scenarios::$($segment)::+,
                         &[$($fixture),*],
                         &[$($($optional),*)?],
-                        ::core::result::Result::Ok(config)
+                        config
                     ))
                 },
             },)*
         ];
 
-        $(
-            #[cfg(test)]
-            #[tokio::test]
-            async fn $short_name() {
-                let record = $crate::scenario_catalog!(@execute $topology,
-                    scenarios::$($segment)::+,
-                    &[$($fixture),*],
-                    &[$($($optional),*)?],
-                    $crate::profile::ExecutionConfig::from_env(
-                        $crate::catalog::Family::$family
-                            == $crate::catalog::Family::Redline
-                    )
-                )
-                .await;
-                if !record.passed() {
-                    panic!(
-                        "{}",
-                        record.failure().unwrap_or_else(|| format!(
-                            "{} did not pass", record.name
-                        ))
-                    );
-                }
-            }
-        )*
     };
 }

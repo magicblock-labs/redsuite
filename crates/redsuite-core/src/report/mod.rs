@@ -188,20 +188,7 @@ pub fn reports_dir() -> PathBuf {
 
 pub fn run_id() -> &'static str {
     static RUN_ID: OnceLock<String> = OnceLock::new();
-    RUN_ID.get_or_init(|| {
-        std::env::var("NEXTEST_RUN_ID")
-            .ok()
-            .map(|inherited| {
-                inherited
-                    .chars()
-                    .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-')
-                    .collect::<String>()
-            })
-            .filter(|inherited| !inherited.is_empty())
-            .unwrap_or_else(|| {
-                format!("{}-{}", utc_stamp(), std::process::id())
-            })
-    })
+    RUN_ID.get_or_init(|| format!("{}-{}", utc_stamp(), std::process::id()))
 }
 
 fn campaign_dir() -> PathBuf {

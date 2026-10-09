@@ -24,8 +24,8 @@ fn entries() -> impl Iterator<Item = &'static ScenarioEntry> {
 
 const USAGE_HEAD: &str = "\
 usage:
-  redsuite list [family]                                  list scenarios (family: redline|redshift|redhat)
-  redsuite run <scenario|family|all> [opts]               run scenarios (benchmarks last, alone)
+  redsuite list [selection]                               list scenarios (selection as for run)
+  redsuite run <scenario|family|prefix|all> [opts]        run scenarios (benchmarks last, alone)
       --profile <lite|full>                               Redline workload; requires Redline in the selection (default lite)
       --loop <open|closed>                                S1 loop mode
       --serial                                            one scenario at a time, then stack down
@@ -50,9 +50,19 @@ fn selected(target: &str) -> Vec<&'static ScenarioEntry> {
             .filter(|entry| entry.family.prefix() == target)
             .collect();
     }
-    entries()
-        .filter(|entry| entry.name() == target || entry.short_name == target)
-        .collect()
+    let (exact, prefixed): (Vec<_>, Vec<_>) = entries()
+        .filter(|entry| {
+            entry.name().starts_with(target)
+                || entry.short_name.starts_with(target)
+        })
+        .partition(|entry| {
+            entry.name() == target || entry.short_name == target
+        });
+    if exact.is_empty() {
+        prefixed
+    } else {
+        exact
+    }
 }
 
 async fn run_lane(
@@ -80,7 +90,7 @@ async fn run(args: &[String]) -> Result<()> {
     let scenarios = selected(target);
     if scenarios.is_empty() {
         return Err(format!(
-            "unknown scenario `{target}` — `redsuite list` shows what exists"
+            "nothing matches `{target}` — `redsuite list` shows what exists"
         )
         .into());
     }
@@ -277,11 +287,9 @@ fn summarize(records: &[RunRecord]) -> Result<()> {
     Ok(())
 }
 
-fn list(family: Option<&str>) {
-    for entry in entries() {
-        if family.is_none_or(|want| entry.family.prefix() == want) {
-            println!("{}", entry.name());
-        }
+fn list(selection: Option<&str>) {
+    for entry in selection.map_or_else(|| entries().collect(), selected) {
+        println!("{}", entry.name());
     }
 }
 
