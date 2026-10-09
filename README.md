@@ -2,8 +2,9 @@
 
 Black-box test harness for the MagicBlock validator. Scenarios drive a live
 base L1 + ephemeral rollup purely through the public surface — transactions,
-JSON-RPC, WebSocket and the Prometheus `/metrics` endpoint — and emit
-performance, correctness, and security reports with measurements and diagnostics.
+JSON-RPC, WebSocket and the Prometheus `/metrics` endpoint. Redline emits
+performance reports with measurements; Redshift and Redhat are correctness
+and security gates that pass or fail with diagnostics.
 
 RedSuite is built on top of [redline](https://github.com/magicblock-labs/redline),
 the MagicBlock validator load-testing tool: redline's engine (transport pools,
@@ -61,7 +62,10 @@ Fixture instruction consumers and wire contracts are documented in
 Scenarios live in the family libraries under `<family>/src/scenarios/
 <subsystem>/<name>.rs`: one `Scenario` impl each, exported from the
 subsystem's `mod.rs`. The harness owns process spawning, ports, funding and
-teardown. See `redshift/src/scenarios/harness/example.rs`.
+teardown. See `redshift/src/scenarios/harness/example.rs`. A correctness or
+security scenario returns `Result<()>`: its checks are the verdict and nothing
+is persisted. Redline benchmarks implement `Scenario<ScenarioReport>` and
+return the measurements that land in `target/redsuite-reports/`.
 
 Registration is one declaration: an entry in the catalog
 (`cli/src/catalog.rs`, one `scenario_catalog!` block per family). The entry
@@ -97,9 +101,9 @@ workspace. Set `REDSUITE_ROOT` when it runs outside a checkout.
 private-ER scenarios beside them, then the redline family last and alone.
 Benchmarks must never share the box, so keep that last lane exclusive.
 
-Each CLI run records `suite/<target>` with its host, full wall time,
-and lane durations in `target/redsuite-reports/`.
-Selections containing Redline also record its workload profile.
+A CLI run whose selection contains Redline records `suite/<target>` with its
+host, workload profile, full wall time and lane durations in
+`target/redsuite-reports/`; Redshift- and Redhat-only runs persist nothing.
 Shared and private lane times overlap; benchmarks follow both, and serial wall
 time includes teardown.
 
@@ -186,10 +190,11 @@ verifier gets its own identity, generated TOML, storage directory, log and
 metrics port, and a scenario can stop, start or restart each one on its own
 while the others keep following (a verifier killed before it archived a
 snapshot cannot reopen its storage; `reset_storage` wipes it so the next
-start rejoins from the leader's snapshot). Each launch is recorded in the run's
-report under `launches` (binary, version, identity, ports, storage, log,
-config, pid and relaunch count), and `redsuite stack down` reaps any
-leader, verifier or private ER a crashed run left behind.
+start rejoins from the leader's snapshot). Each launch is listed in a failing
+or verbose run's console details and, for Redline benchmarks, persisted in the
+run's report under `launches` (binary, version, identity, ports, storage, log,
+config, pid and relaunch count); `redsuite stack down` reaps any leader,
+verifier or private ER a crashed run left behind.
 
 A private ER can also be booted behind RedSuite-owned base-chain proxies
 (`netfault::BaseProxies`): one HTTP and one WebSocket listener that forward
@@ -201,8 +206,8 @@ until removed; and every proxied connection can be closed at once. The
 scenario's own base client never goes through the proxies, so it can verify
 what base executed independently. The proxies only hold, drop, reject or
 disconnect real traffic and never fabricate account contents or slots. Each
-hold, release, discard, rejection, disconnect and restore is stamped and
-lands in the report, an interception that never fires fails the scenario,
+hold, release, discard, rejection, disconnect and restore is recorded for the
+scenario's own checks, an interception that never fires fails the scenario,
 and dropping the proxies releases pending work and closes their connections
 even when the scenario fails early.
 
@@ -493,9 +498,7 @@ committor (ER → base commits):
   same signature, no receipt may appear while the confirmation is withheld,
   and traffic is restored. Finally every proxied connection is closed and a
   fresh account must still clone and commit. Each commit has to converge on
-  the ER with the base copy matching the ER snapshot, and the report lists
-  every held, released, discarded, stalled and closed operation with its
-  timestamp.
+  the ER with the base copy matching the ER snapshot.
 - `commit_exactly_once` — boots a private ER behind the base-chain proxies
   and proves a base commit is never applied twice because the ER missed the
   response confirming it landed. Each faulted commit forwards the base
@@ -515,8 +518,7 @@ committor (ER → base commits):
   increments a base-chain counter
   through a standalone base action under the same fault: the counter must
   read one before and after recovery, and a succeeded receipt must name a
-  base transaction that actually landed. Reports the nonce after every
-  phase, the restart timings and every fault event.
+  base transaction that actually landed.
 - `commit_settlement_order` — boots a private ER behind the base-chain
   proxies and proves a delayed commit cannot be overtaken by a later
   conflicting one while unrelated commits keep flowing. Four delegated
@@ -534,9 +536,7 @@ committor (ER → base commits):
   small accounts and with accounts large enough that delivery goes through
   temporary commit buffers, which must appear on base as committor-owned
   accounts while the first bundle is held and be gone once every bundle
-  settled. Reports how long D took to settle during the hold, the retry
-  gap, per-bundle base slots, the buffer count seen during the hold, and
-  every fault event.
+  settled.
 - `undelegation_recovery` — boots a private ER behind the base-chain
   proxies and proves an account stays locked while its undelegation is
   pending but is released once base completes it, even when the ER missed
@@ -621,8 +621,8 @@ aperture (JSON-RPC surface):
   `getDelegationStatus` are called raw. Block publication is polled with a
   bound before history is read. Ten additional transfers span advancing slots;
   after each settles for ten slots, transaction/block timestamps must agree
-  with `getBlockTime`, be positive, and not be in the future. Reports the burst
-  wall time and send failure count without a throughput verdict.
+  with `getBlockTime`, be positive, and not be in the future. The burst carries
+  no throughput verdict.
 - `rpc_token_queries` — builds realistic SPL state on base and lets the ER
   materialize it: two mints, two owners, an approved delegate, plain ATAs
   and eATA-backed projections delegated to the ER, plus one account that is
@@ -633,8 +633,7 @@ aperture (JSON-RPC surface):
   program filters. Every answer must name exactly the expected accounts with
   the right owners, delegates, balances and encodings, and the untouched
   account must never appear. Missing mints and invalid token program ids
-  must be rejected within a bound. Reports the burst wall time and failure
-  count without a throughput verdict.
+  must be rejected within a bound. The burst carries no throughput verdict.
 - `rpc_compat_methods` — checks compatibility methods through the official
   `solana-rpc-client` on a private ER. Fires 256 concurrent,
   unpaced typed requests under a bounded deadline, cycling `getBlockCommitment`,
@@ -654,8 +653,8 @@ aperture (JSON-RPC surface):
   well formed. Afterwards
   `requestAirdrop` must be rejected with the disabled-faucet message, the
   MagicBlock-specific `getRoutes` must answer an empty list raw, and an
-  unknown method must fail with the JSON-RPC method-not-found code. Reports
-  the burst wall time and failure count without a throughput verdict.
+  unknown method must fail with the JSON-RPC method-not-found code. The burst
+  carries no throughput verdict.
   RPC-surface scenarios carry the `rpc_` prefix so they can be run together:
   `cargo nextest run -E 'test(/catalog::redshift::rpc_/)'`.
 

@@ -8,11 +8,10 @@ use async_trait::async_trait;
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redshift_interface::schedulecommit::{build, ORDER_BOOK_INIT_SIZE};
-use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, prep, topology,
     topology::{ErOptions, RestartConfig},
-    Api, BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result, ScenarioReport,
+    Api, BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result,
 };
 use signer::Signer;
 
@@ -26,8 +25,6 @@ const GROW_INTERVAL: Duration = Duration::from_millis(40);
 const CHURN_BEFORE_RESTART: Duration = Duration::from_secs(6);
 const CHURN_AFTER_RESTART: Duration = Duration::from_secs(12);
 const CLONE_TIMEOUT: Duration = Duration::from_secs(20);
-const RESIZES: &str = "engine_accountsdb_persisted_resizes";
-const COMPACTIONS: &str = "engine_accountsdb_persisted_compactions";
 
 pub struct SnapshotReadRace;
 
@@ -73,7 +70,7 @@ impl Readers {
         Self { stop, task }
     }
 
-    async fn stop(self, phase: &str) -> Result<u64> {
+    async fn stop(self, phase: &str) -> Result<()> {
         self.stop.set(true);
         let (reads, failure) = self
             .task
@@ -85,13 +82,8 @@ impl Readers {
              superblocks; {reads} reads then: {}",
             failure.unwrap_or_default()
         )?;
-        Ok(reads)
+        Ok(())
     }
-}
-
-async fn metric(er: &ErCtx, name: &str) -> Result<u64> {
-    let metrics = er.scrape_metrics().await?;
-    Ok(metrics.get(name).unwrap_or(0.0) as u64)
 }
 
 async fn delegate_books(
@@ -127,7 +119,7 @@ async fn churn(
     sizes: &mut [u64],
     duration: Duration,
     phase: &str,
-) -> Result<u64> {
+) -> Result<()> {
     let started = Instant::now();
     let mut grows = 0u64;
     while started.elapsed() < duration {
@@ -151,7 +143,7 @@ async fn churn(
         grows += 1;
         tokio::time::sleep(GROW_INTERVAL).await;
     }
-    Ok(grows)
+    Ok(())
 }
 
 #[async_trait(?Send)]
@@ -160,7 +152,7 @@ impl PrivateErScenario for SnapshotReadRace {
         "redshift/snapshot_read_race"
     }
 
-    async fn run(&self, base: &BaseCtx) -> Result<ScenarioReport> {
+    async fn run(&self, base: &BaseCtx) -> Result<()> {
         let mut private = topology::private_er(
             base,
             ErOptions {
@@ -178,8 +170,6 @@ impl PrivateErScenario for SnapshotReadRace {
         let payer = prep::funded_payer(base, PAYER_LAMPORTS).await?;
         let books;
         let mut sizes = vec![ORDER_BOOK_INIT_SIZE as u64; BOOKS];
-        let reads_before;
-        let grows_before;
         {
             let er = private.ctx();
             prep::await_program_clone(
@@ -196,7 +186,7 @@ impl PrivateErScenario for SnapshotReadRace {
                 books.iter().map(|book| book.address).collect();
 
             let readers = Readers::start(er.api().clone(), addresses.clone());
-            grows_before = churn(
+            churn(
                 er,
                 &payer,
                 &books,
@@ -205,7 +195,7 @@ impl PrivateErScenario for SnapshotReadRace {
                 "before restart",
             )
             .await?;
-            reads_before = readers.stop("before restart").await?;
+            readers.stop("before restart").await?;
         }
 
         let timing = private.restart(RestartConfig::default()).await?;
@@ -219,7 +209,7 @@ impl PrivateErScenario for SnapshotReadRace {
         let addresses: Vec<Pubkey> =
             books.iter().map(|book| book.address).collect();
         let readers = Readers::start(er.api().clone(), addresses.clone());
-        let grows_after = churn(
+        churn(
             er,
             &payer,
             &books,
@@ -228,7 +218,7 @@ impl PrivateErScenario for SnapshotReadRace {
             "after restart",
         )
         .await?;
-        let reads_after = readers.stop("after restart").await?;
+        readers.stop("after restart").await?;
 
         let observed: Vec<u64> = er
             .accounts(&addresses)
@@ -241,24 +231,7 @@ impl PrivateErScenario for SnapshotReadRace {
             sizes,
             "every order book must reflect all of its grows"
         )?;
-        let resizes = metric(er, RESIZES).await?;
-        let compactions = metric(er, COMPACTIONS).await?;
         private.finish().await?;
-
-        Ok(ScenarioReport::ok(self.name())
-            .setting("superblock slots", SUPERBLOCK_SLOTS)
-            .setting("order books", BOOKS)
-            .setting("grow bytes", GROW_BYTES)
-            .metric("grows before restart", Unit::Count, grows_before as f64)
-            .metric("grows after restart", Unit::Count, grows_after as f64)
-            .metric("reads before restart", Unit::Count, reads_before as f64)
-            .metric("reads after restart", Unit::Count, reads_after as f64)
-            .metric("storage resizes", Unit::Count, resizes as f64)
-            .metric("storage compactions", Unit::Count, compactions as f64)
-            .metric(
-                "restart startup ms",
-                Unit::Millis,
-                timing.startup.as_secs_f64() * 1e3,
-            ))
+        Ok(())
     }
 }

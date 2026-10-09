@@ -127,39 +127,38 @@ async fn run(args: &[String]) -> Result<()> {
         }
     }
 
-    let mut names: Vec<_> =
-        scenarios.iter().map(|entry| entry.name()).collect();
-    names.sort();
-    let hostname = std::env::var("HOSTNAME")
-        .or_else(|_| std::fs::read_to_string("/proc/sys/kernel/hostname"))
-        .ok()
-        .or_else(|| {
-            let output = Command::new("hostname").output().ok()?;
-            output
-                .status
-                .success()
-                .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
-        })
-        .filter(|name| !name.trim().is_empty())
-        .unwrap_or_else(|| format!("unknown-{}", report::run_id()));
-    let mut report = ScenarioReport::ok(&format!("suite/{target}"))
-        .setting("loop", config.loop_mode.name())
-        .setting(
-            "host",
-            format!(
-                "{} {} {} {} cpus",
-                hostname.trim(),
-                std::env::consts::OS,
-                std::env::consts::ARCH,
-                std::thread::available_parallelism().map_or(0, |n| n.get())
-            ),
-        )
-        .setting("serial", serial)
-        .setting("keep storage", keep_storage)
-        .setting("scenarios", names.join(","));
-    if redline {
-        report = report.setting("redline profile", config.profile.name());
-    }
+    let mut report = redline.then(|| {
+        let mut names: Vec<_> =
+            scenarios.iter().map(|entry| entry.name()).collect();
+        names.sort();
+        let hostname = std::env::var("HOSTNAME")
+            .or_else(|_| std::fs::read_to_string("/proc/sys/kernel/hostname"))
+            .ok()
+            .or_else(|| {
+                let output = Command::new("hostname").output().ok()?;
+                output.status.success().then(|| {
+                    String::from_utf8_lossy(&output.stdout).into_owned()
+                })
+            })
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| format!("unknown-{}", report::run_id()));
+        ScenarioReport::ok(&format!("suite/{target}"))
+            .setting("loop", config.loop_mode.name())
+            .setting(
+                "host",
+                format!(
+                    "{} {} {} {} cpus",
+                    hostname.trim(),
+                    std::env::consts::OS,
+                    std::env::consts::ARCH,
+                    std::thread::available_parallelism().map_or(0, |n| n.get())
+                ),
+            )
+            .setting("serial", serial)
+            .setting("keep storage", keep_storage)
+            .setting("scenarios", names.join(","))
+            .setting("redline profile", config.profile.name())
+    });
     let (benchmarks, functional): (Vec<_>, Vec<_>) = scenarios
         .into_iter()
         .partition(|entry| entry.lane() == Lane::Exclusive);
@@ -222,11 +221,9 @@ async fn run(args: &[String]) -> Result<()> {
     let mut records = Vec::new();
     for (mut runs, (lane, seconds)) in lanes {
         if !runs.is_empty() {
-            report = report.metric(
-                format!("{lane} seconds"),
-                Unit::Seconds,
-                seconds,
-            );
+            report = report.map(|report| {
+                report.metric(format!("{lane} seconds"), Unit::Seconds, seconds)
+            });
         }
         records.append(&mut runs);
     }
@@ -242,7 +239,10 @@ async fn run(args: &[String]) -> Result<()> {
         console::line(format_args!("suite cleanup failed: {error}"));
     }
     let outcome = outcome.and(cleanup);
-    report = report.metric(
+    let Some(report) = report else {
+        return outcome;
+    };
+    let report = report.metric(
         "wall seconds",
         Unit::Seconds,
         suite_started.elapsed().as_secs_f64(),

@@ -1,7 +1,4 @@
-use std::{
-    collections::BTreeSet,
-    time::{Duration, Instant},
-};
+use std::{collections::BTreeSet, time::Duration};
 
 use async_trait::async_trait;
 use base64::Engine;
@@ -10,7 +7,6 @@ use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
     check, check_eq, prep,
-    report::Unit,
     rpc_client::nonblocking::rpc_client::RpcClient,
     rpc_client_api::{
         config::{RpcAccountInfoConfig, RpcProgramAccountsConfig},
@@ -18,7 +14,7 @@ use redsuite_core::{
         request::TokenAccountsFilter,
         response::RpcKeyedAccount,
     },
-    BaseCtx, ChainCtx, ErCtx, Result, Scenario, ScenarioReport,
+    BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
 use signer::Signer;
 use solana_account_decoder_client_types::{
@@ -246,8 +242,7 @@ async fn run_query(
     client: &RpcClient,
     fixture: &Fixture,
     query: Query,
-) -> Result<Option<&'static str>> {
-    let mut encoding = None;
+) -> Result<()> {
     match query {
         Query::ProgramAccountsByMint => {
             let accounts = client
@@ -397,9 +392,9 @@ async fn run_query(
                     } else {
                         (fixture.other_mint, OTHER_MINT_BALANCE, None)
                     };
-                encoding = Some(check_token_account(
+                check_token_account(
                     &label, entry, &mint, &owner, amount, delegate,
-                )?);
+                )?;
             }
         }
         Query::DelegateByMint | Query::DelegateByProgram => {
@@ -423,17 +418,17 @@ async fn run_query(
                 "getTokenAccountsByDelegate must list exactly the account \
                  approved to the delegate"
             )?;
-            encoding = Some(check_token_account(
+            check_token_account(
                 "getTokenAccountsByDelegate",
                 &accounts[0],
                 &fixture.mint,
                 &fixture.owner_a,
                 OWNER_A_BALANCE,
                 Some((&fixture.delegate, DELEGATED_AMOUNT)),
-            )?);
+            )?;
         }
     }
-    Ok(encoding)
+    Ok(())
 }
 
 async fn expect_rejection<T: std::fmt::Debug>(
@@ -473,7 +468,7 @@ impl Scenario for RpcTokenQueries {
         "redshift/rpc_token_queries"
     }
 
-    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
+    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<()> {
         let client = RpcClient::new_with_commitment(
             er.api().url().to_owned(),
             confirmed(),
@@ -664,7 +659,6 @@ impl Scenario for RpcTokenQueries {
         )
         .await?;
 
-        let burst_started = Instant::now();
         let reads = join_all((0..READS).map(|index| {
             run_query(&client, &fixture, CYCLE[index % CYCLE.len()])
         }));
@@ -675,15 +669,10 @@ impl Scenario for RpcTokenQueries {
                     "the burst of {READS} reads exceeded {BURST_DEADLINE:?}"
                 )
             })?;
-        let burst_elapsed = burst_started.elapsed();
         let mut failures = 0u64;
-        let mut encodings = BTreeSet::new();
         for (index, outcome) in outcomes.iter().enumerate() {
             match outcome {
-                Ok(Some(encoding)) => {
-                    encodings.insert(*encoding);
-                }
-                Ok(None) => {}
+                Ok(()) => {}
                 Err(error) => {
                     failures += 1;
                     eprintln!(
@@ -752,21 +741,6 @@ impl Scenario for RpcTokenQueries {
         )
         .await?;
 
-        Ok(ScenarioReport::ok(self.name())
-            .setting("reads", READS)
-            .setting("query kinds", CYCLE.len())
-            .setting("mint", fixture.mint)
-            .setting("delegate", fixture.delegate)
-            .setting("unrelated account", fixture.ata_unrelated)
-            .setting(
-                "token account encoding served",
-                encodings.into_iter().collect::<Vec<_>>().join(","),
-            )
-            .metric(
-                "burst elapsed ms",
-                Unit::Millis,
-                burst_elapsed.as_secs_f64() * 1e3,
-            )
-            .metric("burst failures", Unit::Count, failures as f64))
+        Ok(())
     }
 }

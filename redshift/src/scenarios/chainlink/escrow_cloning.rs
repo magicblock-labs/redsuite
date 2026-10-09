@@ -1,11 +1,9 @@
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use keypair::Keypair;
-use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, prep, system, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
-    ScenarioReport,
 };
 use signer::Signer;
 
@@ -25,11 +23,10 @@ impl Scenario for EscrowCloning {
         "redshift/escrow_cloning"
     }
 
-    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
+    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<()> {
         let escrowed =
             prep::escrowed_payer(base, er.identity(), ESCROW_FUNDING).await?;
 
-        let first_access = Instant::now();
         check::poll(
             "the ER clones the escrow pda on first access",
             CLONE_TIMEOUT,
@@ -38,7 +35,6 @@ impl Scenario for EscrowCloning {
             },
         )
         .await?;
-        let clone_visibility_ms = first_access.elapsed().as_secs_f64() * 1e3;
         let initial = er
             .account(&escrowed.escrow)
             .await?
@@ -199,13 +195,6 @@ impl Scenario for EscrowCloning {
             "an EXECUTED er transfer must not touch escrow data"
         )?;
 
-        Ok(ScenarioReport::ok(self.name())
-            .setting("escrow funding lamports", ESCROW_FUNDING)
-            .setting("executed transfer lamports", EXECUTED_TRANSFER)
-            .metric(
-                "escrow clone visibility ms",
-                Unit::Millis,
-                clone_visibility_ms,
-            ))
+        Ok(())
     }
 }

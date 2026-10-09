@@ -3,13 +3,12 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use keypair::Keypair;
 use pubkey::Pubkey;
-use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq,
-    netfault::{self, BaseProxies, Selector},
+    netfault::{BaseProxies, Selector},
     prep, topology,
-    topology::{ErOptions, PrivateEr, RestartConfig, RestartTiming},
-    BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result, ScenarioReport,
+    topology::{ErOptions, PrivateEr, RestartConfig},
+    BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result,
 };
 use signer::Signer;
 
@@ -39,13 +38,6 @@ impl Recovery {
             Self::Restart => "restart",
         }
     }
-}
-
-struct Outcome {
-    lockout_rejection: &'static str,
-    completion_s: f64,
-    discovery_s: f64,
-    restart: Option<RestartTiming>,
 }
 
 fn value(case: u64, step: u64) -> u64 {
@@ -80,7 +72,7 @@ async fn rejected_write(
     account: &Pubkey,
     snapshot: &[u8],
     when: &str,
-) -> Result<&'static str> {
+) -> Result<()> {
     let attempt = er
         .submit_and_confirm(payer, &[build::simple_byte_set(id, &[*account])])
         .await;
@@ -90,7 +82,7 @@ async fn rejected_write(
          got {attempt:?}"
     )?;
     let error = format!("{:?}", attempt.unwrap_err());
-    let rejection = crate::rejection_code(
+    crate::rejection_code(
         &format!("the er write {when}"),
         &crate::LOCKOUT_REJECTIONS,
         &error,
@@ -104,7 +96,7 @@ async fn rejected_write(
         snapshot,
         "the rejected write {when} must leave the er copy untouched"
     )?;
-    Ok(rejection)
+    Ok(())
 }
 
 async fn await_ownership_return(
@@ -112,7 +104,7 @@ async fn await_ownership_return(
     account: &Pubkey,
     owner: &Pubkey,
     snapshot: &[u8],
-) -> Result<f64> {
+) -> Result<()> {
     let started = Instant::now();
     loop {
         let on_base = base
@@ -126,7 +118,7 @@ async fn await_ownership_return(
                 "the latest committed value must reach base before ownership \
                  returns to the program"
             )?;
-            return Ok(started.elapsed().as_secs_f64());
+            return Ok(());
         }
         check_eq!(
             on_base.owner,
@@ -148,8 +140,7 @@ async fn await_er_value(
     account: &Pubkey,
     id: u64,
     what: &str,
-) -> Result<f64> {
-    let started = Instant::now();
+) -> Result<()> {
     check::poll_for(what, DISCOVERY_TIMEOUT, || async {
         match er.account(account).await {
             Ok(Some(acc)) if crate::written_id(&acc.data) == Some(id) => Ok(()),
@@ -164,7 +155,7 @@ async fn await_er_value(
     })
     .await
     .map_err(|error| error.expected(format!("written id {id}")))?;
-    Ok(started.elapsed().as_secs_f64())
+    Ok(())
 }
 
 async fn redelegate_and_write(
@@ -227,7 +218,7 @@ async fn recover(
     payer: &Keypair,
     seed: u8,
     mode: Recovery,
-) -> Result<Outcome> {
+) -> Result<()> {
     let case = u64::from(seed);
     let identity = private.identity();
     let account =
@@ -260,7 +251,7 @@ async fn recover(
         )
         .await?;
     let held = submission.wait(INTERCEPT_TIMEOUT).await?;
-    let lockout_rejection = rejected_write(
+    rejected_write(
         private.ctx(),
         payer,
         value(case, 2),
@@ -302,19 +293,13 @@ async fn recover(
     );
     proxies.close_connections();
     held.release();
-    let completion_s = await_ownership_return(
-        base,
-        &account,
-        &crate::program::id(),
-        &snapshot,
-    )
-    .await?;
+    await_ownership_return(base, &account, &crate::program::id(), &snapshot)
+        .await?;
 
-    let restart = match mode {
+    match mode {
         Recovery::Reconnect => {
             blind.remove();
             proxies.close_connections();
-            None
         }
         Recovery::Restart => {
             let timing = private.restart(RestartConfig::default()).await?;
@@ -324,9 +309,8 @@ async fn recover(
                 "the er must stop cleanly before the same-storage relaunch"
             )?;
             blind.remove();
-            Some(timing)
         }
-    };
+    }
 
     let er = private.ctx();
     let base_write = value(case, 5);
@@ -335,7 +319,7 @@ async fn recover(
         &[build::simple_byte_set(base_write, &[account])],
     )
     .await?;
-    let discovery_s = await_er_value(
+    await_er_value(
         er,
         &account,
         base_write,
@@ -348,13 +332,7 @@ async fn recover(
     .await?;
     redelegate_and_write(base, er, payer, &account, seed, value(case, 6))
         .await?;
-
-    Ok(Outcome {
-        lockout_rejection,
-        completion_s,
-        discovery_s,
-        restart,
-    })
+    Ok(())
 }
 
 #[async_trait(?Send)]
@@ -363,7 +341,7 @@ impl PrivateErScenario for UndelegationRecovery {
         "redshift/undelegation_recovery"
     }
 
-    async fn run(&self, base: &BaseCtx) -> Result<ScenarioReport> {
+    async fn run(&self, base: &BaseCtx) -> Result<()> {
         let proxies = BaseProxies::spawn(base).await?;
         let mut private = topology::private_er(
             base,
@@ -377,58 +355,13 @@ impl PrivateErScenario for UndelegationRecovery {
         .await?;
         let payer = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
 
-        let reconnect = recover(
-            base,
-            &mut private,
-            &proxies,
-            &payer,
-            1,
-            Recovery::Reconnect,
-        )
-        .await?;
-        let restart =
-            recover(base, &mut private, &proxies, &payer, 2, Recovery::Restart)
-                .await?;
+        recover(base, &mut private, &proxies, &payer, 1, Recovery::Reconnect)
+            .await?;
+        recover(base, &mut private, &proxies, &payer, 2, Recovery::Restart)
+            .await?;
 
-        let events = proxies.finish()?;
+        proxies.finish()?;
         private.finish().await?;
-
-        let timing = restart
-            .restart
-            .as_ref()
-            .ok_or("the restart case recorded no restart timing")?;
-        let report = ScenarioReport::ok(self.name())
-            .setting("er", LABEL)
-            .setting("reconnect lockout rejection", reconnect.lockout_rejection)
-            .setting("restart lockout rejection", restart.lockout_rejection)
-            .setting("restart exit code", timing.exit_code.unwrap_or(-1))
-            .metric(
-                "reconnect base completion s",
-                Unit::Seconds,
-                reconnect.completion_s,
-            )
-            .metric(
-                "reconnect discovery s",
-                Unit::Seconds,
-                reconnect.discovery_s,
-            )
-            .metric(
-                "restart base completion s",
-                Unit::Seconds,
-                restart.completion_s,
-            )
-            .metric("restart discovery s", Unit::Seconds, restart.discovery_s)
-            .metric(
-                "restart shutdown s",
-                Unit::Seconds,
-                timing.shutdown.as_secs_f64(),
-            )
-            .metric(
-                "restart startup s",
-                Unit::Seconds,
-                timing.startup.as_secs_f64(),
-            )
-            .metric("fault events", Unit::Count, events.len() as f64);
-        Ok(netfault::report_events(report, &events))
+        Ok(())
     }
 }

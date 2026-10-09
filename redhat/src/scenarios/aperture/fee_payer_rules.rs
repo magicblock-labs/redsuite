@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use redshift_interface::schedulecommit::build;
 use redsuite_core::{
     check, dlp, prep, receipt, system, BaseCtx, ChainCtx, CheckError, ErCtx,
-    Result, Scenario, ScenarioReport,
+    Result, Scenario,
 };
 use signer::Signer;
 
@@ -19,7 +19,7 @@ impl Scenario for FeePayerRules {
         "redhat/fee_payer_rules"
     }
 
-    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
+    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<()> {
         let funder = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
 
         // A delegated (mapped-signing) fee payer may commit ITSELF directly
@@ -100,15 +100,6 @@ impl Scenario for FeePayerRules {
              payer, got {fee_error}"
         )?;
 
-        Ok(ScenarioReport::ok(self.name())
-            .setting("magic fee vault", vault)
-            .setting(
-                "self commit base sigs",
-                commit_receipt.base_signatures.len(),
-            )
-            .setting(
-                "non-delegated fee refusal",
-                "InvalidAccountForFee | Immutable",
-            ))
+        Ok(())
     }
 }

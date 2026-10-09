@@ -5,7 +5,7 @@ use pubkey::Pubkey;
 use redshift_interface::flexi::{build, FlexiCounter};
 use redsuite_core::{
     check, check_eq, prep, topology, BaseCtx, ChainCtx, ErCtx,
-    PrivateErScenario, Result, ScenarioReport,
+    PrivateErScenario, Result,
 };
 use signer::Signer;
 use solana_address_lookup_table_interface::instruction::create_lookup_table;
@@ -82,10 +82,7 @@ async fn assert_program_blocked(er: &ErCtx, program: &Pubkey) -> Result<()> {
     Ok(())
 }
 
-async fn delegate_and_clone_counter(
-    base: &BaseCtx,
-    er: &ErCtx,
-) -> Result<Pubkey> {
+async fn delegate_and_clone_counter(base: &BaseCtx, er: &ErCtx) -> Result<()> {
     let payer_chain = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
     let payer_ephem = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
 
@@ -112,7 +109,7 @@ async fn delegate_and_clone_counter(
         1,
         "the er clone must show the add"
     )?;
-    Ok(counter)
+    Ok(())
 }
 
 #[async_trait(?Send)]
@@ -121,7 +118,7 @@ impl PrivateErScenario for ConfigGates {
         "redshift/config_gates"
     }
 
-    async fn run(&self, base: &BaseCtx) -> Result<ScenarioReport> {
+    async fn run(&self, base: &BaseCtx) -> Result<()> {
         let allowed = redshift_interface::id();
         let blocked = committor_id();
 
@@ -175,7 +172,7 @@ impl PrivateErScenario for ConfigGates {
         prep::await_program_clone(open.ctx(), &blocked, PROGRAM_CLONE_TIMEOUT)
             .await?;
 
-        let counter = delegate_and_clone_counter(base, open.ctx()).await?;
+        delegate_and_clone_counter(base, open.ctx()).await?;
 
         tokio::time::sleep(ALT_SETTLE).await;
         let after_clone =
@@ -188,7 +185,7 @@ impl PrivateErScenario for ConfigGates {
         open.finish().await?;
 
         let recent_slot = base.api().get_slot().await?;
-        let (create_ix, table) =
+        let (create_ix, _) =
             create_lookup_table(open_pubkey, open_pubkey, recent_slot);
         base.submit_and_confirm(&open_identity, &[create_ix])
             .await?;
@@ -201,11 +198,6 @@ impl PrivateErScenario for ConfigGates {
              created, got {control:?}"
         )?;
 
-        Ok(ScenarioReport::ok(self.name())
-            .setting("allowed program", allowed)
-            .setting("blocked program", blocked)
-            .setting("cloned counter", counter)
-            .setting("open er identity", open_pubkey)
-            .setting("control lookup table", table))
+        Ok(())
     }
 }

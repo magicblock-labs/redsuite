@@ -656,7 +656,7 @@ impl BatchOutcome {
 pub struct ConflictOrdering;
 
 #[async_trait(?Send)]
-impl Scenario for ConflictOrdering {
+impl Scenario<ScenarioReport> for ConflictOrdering {
     fn name(&self) -> &str {
         "redline/conflict_ordering"
     }

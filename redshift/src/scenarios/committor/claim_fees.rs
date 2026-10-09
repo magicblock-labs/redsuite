@@ -1,8 +1,6 @@
 use async_trait::async_trait;
-use redsuite_core::report::Unit;
 use redsuite_core::{
     check, dlp, topology, BaseCtx, ChainCtx, PrivateErScenario, Result,
-    ScenarioReport,
 };
 use signer::Signer;
 
@@ -16,7 +14,7 @@ impl PrivateErScenario for ClaimFees {
         "redshift/claim_fees"
     }
 
-    async fn run(&self, base: &BaseCtx) -> Result<ScenarioReport> {
+    async fn run(&self, base: &BaseCtx) -> Result<()> {
         let validator = topology::er_identity_keypair()?;
         base.airdrop(&validator.pubkey(), crate::PAYER_LAMPORTS)
             .await?;
@@ -58,14 +56,6 @@ impl PrivateErScenario for ClaimFees {
              {claimer_after}"
         )?;
 
-        Ok(ScenarioReport::ok(self.name())
-            .setting("vault", vault)
-            .metric(
-                "test fee lamports",
-                Unit::Lamports,
-                TEST_FEE_LAMPORTS as f64,
-            )
-            .metric("claimed lamports", Unit::Lamports, claimed as f64)
-            .metric("vault floor lamports", Unit::Lamports, vault_after as f64))
+        Ok(())
     }
 }

@@ -4,11 +4,10 @@ use async_trait::async_trait;
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redshift_interface::flexi::{build, FlexiCounter};
-use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, prep, topology,
     topology::{ErOptions, RestartConfig},
-    BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result, ScenarioReport,
+    BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result,
 };
 use signature::Signature;
 use signer::Signer;
@@ -256,7 +255,7 @@ impl PrivateErScenario for LedgerRetention {
         "redshift/ledger_retention"
     }
 
-    async fn run(&self, base: &BaseCtx) -> Result<ScenarioReport> {
+    async fn run(&self, base: &BaseCtx) -> Result<()> {
         let mut private = topology::private_er(
             base,
             ErOptions {
@@ -412,44 +411,7 @@ impl PrivateErScenario for LedgerRetention {
             total,
         )
         .await?;
-        let superblocks_allocated = superblocks(er).await?;
         private.finish().await?;
-
-        Ok(ScenarioReport::ok(self.name())
-            .setting("superblock slots", SUPERBLOCK_SLOTS)
-            .setting("ledger size limit bytes", LEDGER_SIZE_LIMIT_BYTES)
-            .setting("counter", counter)
-            .metric("retention events", Unit::Count, events as f64)
-            .metric(
-                "first event pruning scenario history",
-                Unit::Count,
-                first_pruning_event.unwrap_or(0) as f64,
-            )
-            .metric("transactions sent", Unit::Count, sent.len() as f64)
-            .metric(
-                "pruned transactions",
-                Unit::Count,
-                final_view.pruned.len() as f64,
-            )
-            .metric(
-                "retained transactions",
-                Unit::Count,
-                final_view.retained.len() as f64,
-            )
-            .metric(
-                "superblocks allocated",
-                Unit::Count,
-                superblocks_allocated as f64,
-            )
-            .metric(
-                "restart shutdown ms",
-                Unit::Millis,
-                timing.shutdown.as_secs_f64() * 1e3,
-            )
-            .metric(
-                "restart startup ms",
-                Unit::Millis,
-                timing.startup.as_secs_f64() * 1e3,
-            ))
+        Ok(())
     }
 }

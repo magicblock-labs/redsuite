@@ -170,7 +170,7 @@ async fn observe_slots(
 pub struct SuperblockBoundaryLatency;
 
 #[async_trait(?Send)]
-impl PrivateErScenario for SuperblockBoundaryLatency {
+impl PrivateErScenario<ScenarioReport> for SuperblockBoundaryLatency {
     fn name(&self) -> &str {
         "redline/superblock_boundary_latency"
     }

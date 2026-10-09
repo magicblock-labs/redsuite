@@ -24,7 +24,7 @@ const PAYER_LAMPORTS: u64 = 2_000_000_000;
 pub struct SimpleLoad;
 
 #[async_trait(?Send)]
-impl Scenario for SimpleLoad {
+impl Scenario<ScenarioReport> for SimpleLoad {
     fn name(&self) -> &str {
         "redline/simple_load"
     }

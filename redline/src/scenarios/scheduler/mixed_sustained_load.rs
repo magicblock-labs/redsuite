@@ -362,7 +362,7 @@ async fn verify_final_state(
 pub struct MixedSustainedLoad;
 
 #[async_trait(?Send)]
-impl Scenario for MixedSustainedLoad {
+impl Scenario<ScenarioReport> for MixedSustainedLoad {
     fn name(&self) -> &str {
         "redline/mixed_sustained_load"
     }

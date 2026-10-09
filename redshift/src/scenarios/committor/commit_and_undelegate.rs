@@ -14,7 +14,7 @@ use redshift_interface::schedulecommit::{
 };
 use redsuite_core::{
     check, check_eq, prep, receipt, BaseCtx, ChainCtx, CheckError, ErCtx,
-    Result, Scenario, ScenarioReport,
+    Result, Scenario,
 };
 use signature::Signature;
 use signer::Signer;
@@ -32,22 +32,11 @@ const MOD_AFTER_REFUSAL: &str =
 const TWICE_REFUSAL: &str =
     "is required to be writable and delegated in order to be undelegated";
 const FOREIGN_REJECTION: &str = "MissingAccount";
-const WRITE_REJECTIONS: [&str; 3] = [
-    "InvalidWritableAccount",
-    "ExternalAccountDataModified",
-    "ProgramFailedToComplete",
-];
 
 pub struct CommitAndUndelegate;
 
 fn decoded_count(data: &[u8]) -> Result<u64> {
     Ok(MainAccount::try_from_slice(data)?.count)
-}
-
-struct LifecycleOutcome {
-    commit_base_sigs: usize,
-    er_lockout: &'static str,
-    base_frozen: &'static str,
 }
 
 async fn commit(
@@ -144,7 +133,7 @@ async fn commit_undelegate_lifecycle(
     er_fee_payer: &Keypair,
     base_negative_payer: &Keypair,
     count: usize,
-) -> Result<LifecycleOutcome> {
+) -> Result<()> {
     let committees =
         prep::init_committees(base, payer, er.identity(), count).await?;
     prep::await_committee_clones(er, &committees).await?;
@@ -152,14 +141,10 @@ async fn commit_undelegate_lifecycle(
         committees.iter().map(|c| c.player.pubkey()).collect();
     let pdas: Vec<_> = committees.iter().map(|c| c.pda).collect();
     let plain = commit(er, payer, &players, false).await?;
-    let commit_base_sigs = settled(base, er, &pdas, &plain, false, 1)
-        .await?
-        .base_signatures
-        .len();
+    settled(base, er, &pdas, &plain, false, 1).await?;
 
     let signature = commit(er, payer, &players, true).await?;
 
-    let mut er_lockout = "";
     for player in &players {
         let attempt = er
             .submit_and_confirm(er_fee_payer, &[build::increase_count(*player)])
@@ -168,9 +153,9 @@ async fn commit_undelegate_lifecycle(
             attempt.is_err(),
             "an er write must be rejected after undelegation is requested"
         )?;
-        er_lockout = crate::rejection_code(
+        crate::rejection_code(
             "the write",
-            &WRITE_REJECTIONS,
+            &crate::LOCKOUT_REJECTIONS,
             &format!("{:?}", attempt.unwrap_err()),
         )?;
     }
@@ -218,7 +203,6 @@ async fn commit_undelegate_lifecycle(
         )?;
     }
 
-    let mut base_frozen = "";
     for player in &players {
         let attempt = base
             .submit_and_confirm(
@@ -230,9 +214,9 @@ async fn commit_undelegate_lifecycle(
             attempt.is_err(),
             "a chain write must be rejected after the redelegation"
         )?;
-        base_frozen = crate::rejection_code(
+        crate::rejection_code(
             "the write",
-            &WRITE_REJECTIONS,
+            &crate::LOCKOUT_REJECTIONS,
             &format!("{:?}", attempt.unwrap_err()),
         )?;
     }
@@ -265,11 +249,7 @@ async fn commit_undelegate_lifecycle(
         )?;
     }
 
-    Ok(LifecycleOutcome {
-        commit_base_sigs,
-        er_lockout,
-        base_frozen,
-    })
+    Ok(())
 }
 
 fn random_book_update(seed: u64) -> BookUpdate {
@@ -318,7 +298,7 @@ async fn order_book_cell(
     commit_type: ScheduleCommitType,
     undelegates: bool,
     seed: u64,
-) -> Result<usize> {
+) -> Result<()> {
     let manager = Keypair::new();
     let (init, book) = build::init_order_book(payer.pubkey(), manager.pubkey());
     let delegate = build::delegate_order_book(
@@ -374,14 +354,8 @@ async fn order_book_cell(
         )
         .await?;
 
-    let commit_receipt = crate::assert_commit_receipt(
-        base,
-        er,
-        &signature,
-        &[book],
-        undelegates,
-    )
-    .await?;
+    crate::assert_commit_receipt(base, er, &signature, &[book], undelegates)
+        .await?;
 
     let on_er = er
         .account(&book)
@@ -419,8 +393,7 @@ async fn order_book_cell(
         expected_owner,
         "the order book owner on base after the commit (seed {seed})"
     )?;
-
-    Ok(commit_receipt.base_signatures.len())
+    Ok(())
 }
 
 async fn rejected_intent_cell(
@@ -460,7 +433,7 @@ async fn test_lifecycle_cell(
     base: &BaseCtx,
     er: &ErCtx,
     count: usize,
-) -> Result<LifecycleOutcome> {
+) -> Result<()> {
     let payer = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
     let er_fee_payer = prep::delegated_payer(
         base,
@@ -483,7 +456,7 @@ async fn test_lifecycle_cell(
     .await
 }
 
-async fn test_foreign_ownership(base: &BaseCtx, er: &ErCtx) -> Result<Pubkey> {
+async fn test_foreign_ownership(base: &BaseCtx, er: &ErCtx) -> Result<()> {
     let payer = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
     let outsider = prep::delegated_payer(
         base,
@@ -529,7 +502,7 @@ async fn test_foreign_ownership(base: &BaseCtx, er: &ErCtx) -> Result<Pubkey> {
             committees[0].pda
         )?;
     }
-    Ok(validator)
+    Ok(())
 }
 
 async fn test_order_book_cell(
@@ -538,7 +511,7 @@ async fn test_order_book_cell(
     commit_type: ScheduleCommitType,
     undelegates: bool,
     seed: u64,
-) -> Result<usize> {
+) -> Result<()> {
     let payer = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
     order_book_cell(base, er, &payer, commit_type, undelegates, seed).await
 }
@@ -597,7 +570,7 @@ async fn test_twice_rejection(base: &BaseCtx, er: &ErCtx) -> Result<()> {
 async fn test_failed_undelegation_lockout(
     base: &BaseCtx,
     er: &ErCtx,
-) -> Result<&'static str> {
+) -> Result<()> {
     let payer = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
     let er_fee_payer = prep::delegated_payer(
         base,
@@ -677,9 +650,10 @@ async fn test_failed_undelegation_lockout(
     )?;
     crate::rejection_code(
         "the write after the failed undelegation",
-        &WRITE_REJECTIONS,
+        &crate::LOCKOUT_REJECTIONS,
         &format!("{:?}", attempt.unwrap_err()),
-    )
+    )?;
+    Ok(())
 }
 
 #[async_trait(?Send)]
@@ -688,21 +662,11 @@ impl Scenario for CommitAndUndelegate {
         "redshift/commit_and_undelegate"
     }
 
-    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
+    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<()> {
         let seed_commit = OsRng.next_u64();
         let seed_undelegate = OsRng.next_u64();
 
-        let (
-            lifecycle_1,
-            lifecycle_2,
-            foreign_validator,
-            sigs_commit,
-            sigs_undelegate,
-            _,
-            _,
-            _,
-            failed_undelegation_lockout,
-        ) = tokio::try_join!(
+        tokio::try_join!(
             test_lifecycle_cell(base, er, 1),
             test_lifecycle_cell(base, er, 2),
             test_foreign_ownership(base, er),
@@ -725,23 +689,6 @@ impl Scenario for CommitAndUndelegate {
             test_twice_rejection(base, er),
             test_failed_undelegation_lockout(base, er),
         )?;
-
-        let report = ScenarioReport::ok(self.name())
-            .setting("1-account er lockout rejection", lifecycle_1.er_lockout)
-            .setting("1-account base frozen rejection", lifecycle_1.base_frozen)
-            .setting("2-account er lockout rejection", lifecycle_2.er_lockout)
-            .setting("2-account base frozen rejection", lifecycle_2.base_frozen)
-            .setting("1-account commit base sigs", lifecycle_1.commit_base_sigs)
-            .setting("2-account commit base sigs", lifecycle_2.commit_base_sigs)
-            .setting("foreign validator", foreign_validator)
-            .setting("foreign rejection", FOREIGN_REJECTION)
-            .setting("commit book seed", seed_commit)
-            .setting("commit book base sigs", sigs_commit)
-            .setting("undelegate book seed", seed_undelegate)
-            .setting("undelegate book base sigs", sigs_undelegate)
-            .setting("failed undelegation lockout", failed_undelegation_lockout)
-            .setting("commit frequency ms", prep::COMMIT_FREQUENCY_MS);
-
-        Ok(report)
+        Ok(())
     }
 }

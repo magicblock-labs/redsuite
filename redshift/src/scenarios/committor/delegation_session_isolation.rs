@@ -7,13 +7,12 @@ use pubkey::Pubkey;
 use redshift_interface::schedulecommit::{
     build as sc, MainAccount, ScheduleCommitType,
 };
-use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, dlp,
-    netfault::{self, BaseProxies, Selector},
+    netfault::{BaseProxies, Selector},
     prep, receipt, topology,
-    topology::{ErOptions, PrivateEr, RestartConfig, RestartTiming},
-    BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result, ScenarioReport,
+    topology::{ErOptions, PrivateEr, RestartConfig},
+    BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result,
 };
 use serde::Deserialize;
 use signer::Signer;
@@ -44,14 +43,6 @@ impl Target {
             Self::OtherValidator => "reassignment",
         }
     }
-}
-
-struct Outcome {
-    session_a_recovery: String,
-    completion_s: f64,
-    restart: RestartTiming,
-    fresh_commit_s: f64,
-    old_validator_rejection: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -152,8 +143,7 @@ async fn await_base(
     owner: Pubkey,
     id: u64,
     what: &str,
-) -> Result<f64> {
-    let started = Instant::now();
+) -> Result<()> {
     check::poll_for(what, COMPLETION_TIMEOUT, || async {
         match base_state(base, account).await {
             Ok((current_owner, written))
@@ -169,7 +159,7 @@ async fn await_base(
     })
     .await
     .map_err(|error| error.expected(format!("owner {owner} count {id}")))?;
-    Ok(started.elapsed().as_secs_f64())
+    Ok(())
 }
 
 struct SessionB<'a> {
@@ -247,7 +237,7 @@ async fn recover_session_a_commit_after_lost_response(
     player: &Pubkey,
     account: &Pubkey,
     expected_id: u64,
-) -> Result<String> {
+) -> Result<()> {
     let submission = proxies.intercept(
         Selector::method("sendTransaction")
             .http()
@@ -297,10 +287,7 @@ async fn recover_session_a_commit_after_lost_response(
          got {:?}",
         receipt.error_message
     )?;
-    Ok(format!(
-        "lost response recovered with {} base signature(s)",
-        receipt.base_signatures.len()
-    ))
+    Ok(())
 }
 
 async fn isolate(
@@ -310,7 +297,7 @@ async fn isolate(
     er_b: Option<&PrivateEr>,
     payer: &Keypair,
     target: Target,
-) -> Result<Outcome> {
+) -> Result<()> {
     let case = u64::from(target == Target::OtherValidator) + 1;
     let committee = prep::init_committees(base, payer, er_a.identity(), 1)
         .await?
@@ -323,7 +310,7 @@ async fn isolate(
 
     let staged = value(case, 1);
     write(er_a.ctx(), payer, &player, &account, staged).await?;
-    let session_a_recovery = recover_session_a_commit_after_lost_response(
+    recover_session_a_commit_after_lost_response(
         base,
         er_a.ctx(),
         proxies,
@@ -355,7 +342,7 @@ async fn isolate(
         "the session-a undelegation must complete, got {:?}",
         undelegated.error_message
     )?;
-    let completion_s = await_base(
+    await_base(
         base,
         &account,
         redshift_interface::id(),
@@ -443,9 +430,8 @@ async fn isolate(
     )
     .await?;
 
-    let old_validator_rejection = match target {
-        Target::SameValidator => None,
-        Target::OtherValidator => {
+    if target == Target::OtherValidator {
+        {
             let stale_write = er_a
                 .ctx()
                 .submit_and_confirm(
@@ -465,31 +451,25 @@ async fn isolate(
                 ScheduleCommitType::Commit,
             )
             .await;
-            let rejection = match stale_commit {
-                Err(error) => error.to_string(),
-                Ok(signature) => {
-                    let receipt = receipt::fetch_commit_receipt(
-                        er_a.ctx().api(),
-                        &signature,
-                        RECEIPT_TIMEOUT,
-                    )
-                    .await?;
-                    receipt.error_message.ok_or(
-                        "the old validator must not commit the reassigned \
-                         account",
-                    )?
-                }
-            };
+            if let Ok(signature) = stale_commit {
+                let receipt = receipt::fetch_commit_receipt(
+                    er_a.ctx().api(),
+                    &signature,
+                    RECEIPT_TIMEOUT,
+                )
+                .await?;
+                receipt.error_message.ok_or(
+                    "the old validator must not commit the reassigned account",
+                )?;
+            }
             check_eq!(
                 base_state(base, &account).await?,
                 (dlp::dlp_id(), Some(base_value)),
                 "rejected old work must leave base untouched"
             )?;
-            Some(rejection)
         }
-    };
+    }
 
-    let fresh_started = Instant::now();
     let fresh =
         schedule_commit(session_b, payer, &player, ScheduleCommitType::Commit)
             .await?;
@@ -510,15 +490,7 @@ async fn isolate(
         "the session-b commit reaches base",
     )
     .await?;
-    let fresh_commit_s = fresh_started.elapsed().as_secs_f64();
-
-    Ok(Outcome {
-        session_a_recovery,
-        completion_s,
-        restart,
-        fresh_commit_s,
-        old_validator_rejection,
-    })
+    Ok(())
 }
 
 #[async_trait(?Send)]
@@ -527,7 +499,7 @@ impl PrivateErScenario for DelegationSessionIsolation {
         "redshift/delegation_session_isolation"
     }
 
-    async fn run(&self, base: &BaseCtx) -> Result<ScenarioReport> {
+    async fn run(&self, base: &BaseCtx) -> Result<()> {
         let proxies = BaseProxies::spawn(base).await?;
         let mut er_a = topology::private_er(
             base,
@@ -551,7 +523,7 @@ impl PrivateErScenario for DelegationSessionIsolation {
         .await?;
         let payer = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
 
-        let same = isolate(
+        isolate(
             base,
             &proxies,
             &mut er_a,
@@ -560,7 +532,7 @@ impl PrivateErScenario for DelegationSessionIsolation {
             Target::SameValidator,
         )
         .await?;
-        let other = isolate(
+        isolate(
             base,
             &proxies,
             &mut er_a,
@@ -570,53 +542,9 @@ impl PrivateErScenario for DelegationSessionIsolation {
         )
         .await?;
 
-        let events = proxies.finish()?;
+        proxies.finish()?;
         er_b.finish().await?;
         er_a.finish().await?;
-
-        let report = ScenarioReport::ok(self.name())
-            .setting("session-a er", LABEL_A)
-            .setting("session-b er", LABEL_B)
-            .setting("redelegation session-a recovery", same.session_a_recovery)
-            .setting(
-                "reassignment session-a recovery",
-                other.session_a_recovery,
-            )
-            .setting(
-                "old validator rejection",
-                other.old_validator_rejection.unwrap_or_default(),
-            )
-            .metric(
-                "redelegation undelegation s",
-                Unit::Seconds,
-                same.completion_s,
-            )
-            .metric(
-                "reassignment undelegation s",
-                Unit::Seconds,
-                other.completion_s,
-            )
-            .metric(
-                "redelegation fresh commit s",
-                Unit::Seconds,
-                same.fresh_commit_s,
-            )
-            .metric(
-                "reassignment fresh commit s",
-                Unit::Seconds,
-                other.fresh_commit_s,
-            )
-            .metric(
-                "redelegation restart startup s",
-                Unit::Seconds,
-                same.restart.startup.as_secs_f64(),
-            )
-            .metric(
-                "reassignment restart startup s",
-                Unit::Seconds,
-                other.restart.startup.as_secs_f64(),
-            )
-            .metric("fault events", Unit::Count, events.len() as f64);
-        Ok(netfault::report_events(report, &events))
+        Ok(())
     }
 }

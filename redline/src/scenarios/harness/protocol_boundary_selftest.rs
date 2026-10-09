@@ -81,7 +81,7 @@ struct CellOutcome {
 pub struct ProtocolBoundarySelftest;
 
 #[async_trait(?Send)]
-impl Scenario for ProtocolBoundarySelftest {
+impl Scenario<ScenarioReport> for ProtocolBoundarySelftest {
     fn name(&self) -> &str {
         "redline/protocol_boundary_selftest"
     }

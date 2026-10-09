@@ -12,11 +12,11 @@ use redshift_interface::flexi::{build, FlexiCounter};
 use redsuite_core::{
     api::RpcError,
     check, check_eq,
-    netfault::{self, BaseProxies, Selector},
+    netfault::{BaseProxies, Selector},
     prep, topology,
     topology::{ErOptions, RestartConfig},
     transport::wsraw::RawWs,
-    BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result, ScenarioReport,
+    BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result,
 };
 use serde_json::{json, Value};
 use signature::Signature;
@@ -326,7 +326,7 @@ impl PrivateErScenario for TransactionRetries {
         }
     }
 
-    async fn run(&self, base: &BaseCtx) -> Result<ScenarioReport> {
+    async fn run(&self, base: &BaseCtx) -> Result<()> {
         let proxies = BaseProxies::spawn(base).await?;
         let mut private = topology::private_er(
             base,
@@ -337,7 +337,6 @@ impl PrivateErScenario for TransactionRetries {
             },
         )
         .await?;
-        let mut report = ScenarioReport::ok(self.name());
         let phases: &[&str] = if matches!(self, Self::Concurrent) {
             &["success", "failure"]
         } else {
@@ -345,8 +344,7 @@ impl PrivateErScenario for TransactionRetries {
         };
         for &phase in phases {
             // Each outcome owns fresh payer/counter state and its ledger window.
-            report = self
-                .run_case(base, &proxies, &mut private, phase, report)
+            self.run_case(base, &proxies, &mut private, phase)
                 .await
                 .map_err(|error| -> redsuite_core::DynError {
                     match error.downcast::<redsuite_core::CheckError>() {
@@ -356,7 +354,8 @@ impl PrivateErScenario for TransactionRetries {
                 })?;
         }
         private.finish().await?;
-        Ok(netfault::report_events(report, &proxies.finish()?))
+        proxies.finish()?;
+        Ok(())
     }
 }
 
@@ -367,8 +366,7 @@ impl TransactionRetries {
         proxies: &BaseProxies,
         private: &mut topology::PrivateEr,
         phase: &str,
-        mut report: ScenarioReport,
-    ) -> Result<ScenarioReport> {
+    ) -> Result<()> {
         let er = private.ctx();
         let owner = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
         let (counter, setup) = prep::flexi_counter(
@@ -409,10 +407,6 @@ impl TransactionRetries {
             "{phase}: fresh counter {}",
             keys[1]
         )?;
-        report = report
-            .setting(format!("{phase} payer"), keys[0])
-            .setting(format!("{phase} counter"), keys[1])
-            .setting(format!("{phase} before"), format!("{expected:?}"));
         let mut start = er.api().get_slot().await?;
 
         match self {
@@ -469,7 +463,6 @@ impl TransactionRetries {
                 expected.0 -= tx.fee;
                 expected.1.count += 7;
                 expected.1.updates += 1;
-                report = report.setting("signature", tx.signature);
             }
             Self::Concurrent | Self::Subscriptions => {
                 let mut pending_results = [false; 2];
@@ -509,13 +502,6 @@ impl TransactionRetries {
                     )?;
                     let pending = notifications?;
                     pending_results[usize::from(fail)] |= pending;
-                    report = report.setting(
-                        format!("{phase} round_{round}"),
-                        format!(
-                            "{} fee={} pending_subscription={pending} {expected:?}",
-                            tx.signature, tx.fee
-                        ),
-                    );
                 }
                 if matches!(self, Self::Subscriptions) {
                     check_eq!(
@@ -552,10 +538,6 @@ impl TransactionRetries {
                         } else {
                             None
                         };
-                        report = report.setting(
-                            format!("input_{epoch}_{i}"),
-                            tx.signature,
-                        );
                         probes.push((tx, slot));
                     }
                     let appended: Vec<_> = probes[first..]
@@ -644,8 +626,6 @@ impl TransactionRetries {
             expected,
             "final effect and payer balance"
         )?;
-        report =
-            report.setting(format!("{phase} after"), format!("{expected:?}"));
-        Ok(report)
+        Ok(())
     }
 }

@@ -1,18 +1,17 @@
 use super::hold_nonces;
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use keypair::Keypair;
 use pubkey::Pubkey;
-use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq,
-    netfault::{self, BaseProxies, Selector},
+    netfault::{BaseProxies, Selector},
     prep,
     receipt::{self, CommitReceipt},
     topology::{self, ErOptions},
-    BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result, ScenarioReport,
+    BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result,
 };
 use signature::Signature;
 use signer::Signer;
@@ -75,17 +74,6 @@ impl Accounts {
 struct Bundle {
     receipt: CommitReceipt,
     slot: u64,
-}
-
-struct Outcome {
-    variant: &'static str,
-    d_settled_during_hold_s: f64,
-    retry_gap_s: f64,
-    first_slot: u64,
-    second_slot: u64,
-    buffers_during_hold: usize,
-    base_signatures: [usize; 4],
-    seconds: f64,
 }
 
 async fn buffer_accounts(base: &BaseCtx) -> Result<usize> {
@@ -250,9 +238,8 @@ async fn run_variant(
     er: &ErCtx,
     identity: Pubkey,
     variant: Variant,
-) -> Result<Outcome> {
+) -> Result<()> {
     let phase = variant.name;
-    let started = Instant::now();
     let payer = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
     let accounts =
         prepare_accounts(base, er, &payer, identity, variant).await?;
@@ -290,11 +277,7 @@ async fn run_variant(
         write(er, &payer, value(11 + offset as u64), account).await?;
     }
 
-    let hold_started = Instant::now();
-    let third_bundle =
-        settled(base, er, &third, &[accounts.d], &format!("{phase} {{D}}"))
-            .await?;
-    let d_settled_during_hold_s = hold_started.elapsed().as_secs_f64();
+    settled(base, er, &third, &[accounts.d], &format!("{phase} {{D}}")).await?;
     await_base(
         base,
         &accounts.d,
@@ -339,10 +322,8 @@ async fn run_variant(
             .request()
             .account(&accounts.a),
     );
-    let dropped_at = Instant::now();
     held_first.discard();
     let held_retry = retry_submission.wait(INTERCEPT_TIMEOUT).await?;
-    let retry_gap_s = dropped_at.elapsed().as_secs_f64();
     let retry_held_at = held_retry.held_at;
     held_retry.release();
 
@@ -451,7 +432,7 @@ async fn run_variant(
             .push(write(er, &payer, value(21 + offset as u64), account).await?);
     }
     let fourth = schedule(er, &payer, 4, &accounts.all()).await?;
-    let fourth_bundle = settled(
+    settled(
         base,
         er,
         &fourth,
@@ -474,54 +455,7 @@ async fn run_variant(
         || async { matches!(buffer_accounts(base).await, Ok(count) if count <= buffers_before) },
     )
     .await?;
-
-    Ok(Outcome {
-        variant: phase,
-        d_settled_during_hold_s,
-        retry_gap_s,
-        first_slot: first_bundle.slot,
-        second_slot: second_bundle.slot,
-        buffers_during_hold,
-        base_signatures: [
-            first_bundle.receipt.base_signatures.len(),
-            second_bundle.receipt.base_signatures.len(),
-            third_bundle.receipt.base_signatures.len(),
-            fourth_bundle.receipt.base_signatures.len(),
-        ],
-        seconds: started.elapsed().as_secs_f64(),
-    })
-}
-
-fn report_outcome(report: ScenarioReport, outcome: &Outcome) -> ScenarioReport {
-    let prefix = outcome.variant;
-    report
-        .setting(
-            format!("{prefix} base slots {{A,B}} {{B,C}}"),
-            format!("{} {}", outcome.first_slot, outcome.second_slot),
-        )
-        .setting(
-            format!("{prefix} base sigs per bundle"),
-            format!("{:?}", outcome.base_signatures),
-        )
-        .setting(
-            format!("{prefix} buffers during hold"),
-            outcome.buffers_during_hold,
-        )
-        .metric(
-            format!("{prefix} d settled during hold s"),
-            Unit::Seconds,
-            outcome.d_settled_during_hold_s,
-        )
-        .metric(
-            format!("{prefix} retry gap s"),
-            Unit::Seconds,
-            outcome.retry_gap_s,
-        )
-        .metric(
-            format!("{prefix} variant s"),
-            Unit::Seconds,
-            outcome.seconds,
-        )
+    Ok(())
 }
 
 #[async_trait(?Send)]
@@ -530,7 +464,7 @@ impl PrivateErScenario for CommitSettlementOrder {
         "redshift/commit_settlement_order"
     }
 
-    async fn run(&self, base: &BaseCtx) -> Result<ScenarioReport> {
+    async fn run(&self, base: &BaseCtx) -> Result<()> {
         let proxies = BaseProxies::spawn(base).await?;
         let private = topology::private_er(
             base,
@@ -544,31 +478,13 @@ impl PrivateErScenario for CommitSettlementOrder {
         .await?;
         let identity = private.identity();
 
-        let mut outcomes = Vec::with_capacity(VARIANTS.len());
         for variant in VARIANTS {
-            outcomes.push(
-                run_variant(&proxies, base, private.ctx(), identity, variant)
-                    .await?,
-            );
+            run_variant(&proxies, base, private.ctx(), identity, variant)
+                .await?;
         }
 
-        let events = proxies.finish()?;
+        proxies.finish()?;
         private.finish().await?;
-
-        let mut report = ScenarioReport::ok(self.name())
-            .setting("er", LABEL)
-            .setting(
-                "fault",
-                "first bundle's sendTransaction held before base, then \
-                 dropped to force a retry",
-            )
-            .setting("small account bytes", SMALL_SPACE)
-            .setting("large account bytes", LARGE_SPACE);
-        for outcome in &outcomes {
-            report = report_outcome(report, outcome);
-        }
-        report =
-            report.metric("fault events", Unit::Count, events.len() as f64);
-        Ok(netfault::report_events(report, &events))
+        Ok(())
     }
 }

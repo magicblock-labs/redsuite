@@ -1,10 +1,8 @@
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use async_trait::async_trait;
-use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, prep, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
-    ScenarioReport,
 };
 use signer::Signer;
 
@@ -25,7 +23,7 @@ impl Scenario for CommitRoundtrip {
         "redshift/commit_roundtrip"
     }
 
-    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
+    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<()> {
         let payer = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
         let committed =
             crate::init_delegated_account(base, &payer, 0, er.identity())
@@ -35,7 +33,6 @@ impl Scenario for CommitRoundtrip {
                 .await?;
         let accounts = [committed, sibling];
 
-        let clone_started = Instant::now();
         for pda in &accounts {
             let on_base =
                 base.account(pda).await?.ok_or("pda missing on base")?;
@@ -52,7 +49,6 @@ impl Scenario for CommitRoundtrip {
             )
             .await?;
         }
-        let clone_visibility_ms = clone_started.elapsed().as_secs_f64() * 1e3;
 
         er.submit_and_confirm(
             &payer,
@@ -79,7 +75,6 @@ impl Scenario for CommitRoundtrip {
             )?;
         }
 
-        let commit_started = Instant::now();
         let commit_signature = er
             .submit_and_confirm(
                 &payer,
@@ -128,7 +123,6 @@ impl Scenario for CommitRoundtrip {
                 &committed_state[..48.min(committed_state.len())]
             ))
         })?;
-        let commit_roundtrip_s = commit_started.elapsed().as_secs_f64();
 
         let committed_on_base = base
             .account(&committed)
@@ -169,7 +163,6 @@ impl Scenario for CommitRoundtrip {
             "the second er write must land before the undelegating commit"
         )?;
 
-        let undelegate_started = Instant::now();
         let undelegate_signature = er
             .submit_and_confirm(
                 &payer,
@@ -234,7 +227,6 @@ impl Scenario for CommitRoundtrip {
                 ))
             })?;
         }
-        let undelegate_roundtrip_s = undelegate_started.elapsed().as_secs_f64();
 
         check::poll(
             "the er re-clones the undelegated account with its base owner",
@@ -267,28 +259,12 @@ impl Scenario for CommitRoundtrip {
         )?;
         let lockout_error =
             format!("{:?}", write_after_undelegate.unwrap_err());
-        let lockout_rejection = crate::rejection_code(
+        crate::rejection_code(
             "the write after undelegation",
             &crate::LOCKOUT_REJECTIONS,
             &lockout_error,
         )?;
 
-        Ok(ScenarioReport::ok(self.name())
-            .setting("account space", crate::ACCOUNT_SPACE)
-            .setting("accounts", accounts.len())
-            .setting("commit base sigs", commit_receipt.base_signatures.len())
-            .setting(
-                "undelegate base sigs",
-                undelegate_receipt.base_signatures.len(),
-            )
-            .setting("commit id", commit_receipt.commit_id.unwrap_or_default())
-            .setting("lockout rejection", lockout_rejection)
-            .metric("clone visibility ms", Unit::Millis, clone_visibility_ms)
-            .metric("commit roundtrip s", Unit::Seconds, commit_roundtrip_s)
-            .metric(
-                "commit-undelegate roundtrip s",
-                Unit::Seconds,
-                undelegate_roundtrip_s,
-            ))
+        Ok(())
     }
 }

@@ -12,10 +12,10 @@ use redsuite_core::{
     api::{custom_error_code, RpcError},
     catalog::Fixture,
     check, check_eq, manifest,
-    netfault::{self, Action, BaseProxies, Selector, Stage},
+    netfault::{Action, BaseProxies, Selector, Stage},
     prep, topology,
     topology::ErOptions,
-    BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result, ScenarioReport,
+    BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result,
 };
 use signer::Signer;
 use solana_loader_v3_interface::{
@@ -77,7 +77,7 @@ impl PrivateErScenario for ProgramUpgrade {
         "redshift/program_upgrade"
     }
 
-    async fn run(&self, base: &BaseCtx) -> Result<ScenarioReport> {
+    async fn run(&self, base: &BaseCtx) -> Result<()> {
         let mut a =
             std::fs::read(manifest::resolve(Fixture::RedshiftProgramSlim)?)?;
         let mut b = std::fs::read(manifest::resolve(
@@ -188,7 +188,7 @@ impl PrivateErScenario for ProgramUpgrade {
                     FETCH_FAILURE,
                 ),
             );
-            let mut convergence = None;
+            let mut converged = false;
             let mut accounts: Vec<_> = keys
                 .iter()
                 .map(|key| AccountMeta::new(*key, false))
@@ -291,9 +291,7 @@ impl PrivateErScenario for ProgramUpgrade {
                             )?;
                             tally[current][3] += 1;
                         }
-                        if current == 3 && convergence.is_none() {
-                            convergence = Some((signature, outcome.slot));
-                        }
+                        converged |= current == 3;
                     }
                 }
                 check_eq!(
@@ -306,7 +304,8 @@ impl PrivateErScenario for ProgramUpgrade {
                 }
                 counts.set(tally);
             }
-            Result::Ok(convergence.ok_or("missing convergence transaction")?)
+            check!(converged, "missing convergence transaction")?;
+            Result::Ok(())
         };
         let upgrade = async {
             progressed(0, 4).await?;
@@ -325,19 +324,16 @@ impl PrivateErScenario for ProgramUpgrade {
                 )
             });
             phase.set(1);
-            let signature = base
-                .submit_and_confirm(
-                    &funder,
-                    &[loader::upgrade(
-                        &program_id,
-                        &b_buffer.pubkey(),
-                        &authority,
-                        &authority,
-                    )],
-                )
-                .await?;
-            let evidence =
-                base.api().await_transaction(&signature, TIMEOUT).await?;
+            base.submit_and_confirm(
+                &funder,
+                &[loader::upgrade(
+                    &program_id,
+                    &b_buffer.pubkey(),
+                    &authority,
+                    &authority,
+                )],
+            )
+            .await?;
             let data = base
                 .account(&programdata)
                 .await?
@@ -378,9 +374,9 @@ impl PrivateErScenario for ProgramUpgrade {
             phase.set(3);
             progressed(3, 12).await?;
             done.set(true);
-            Result::Ok((signature, evidence.slot))
+            Result::Ok(())
         };
-        let ((first_b, er_slot), (upgrade, base_slot)) = tokio::time::timeout(
+        tokio::time::timeout(
             Duration::from_secs(180),
             try_join(traffic, upgrade),
         )
@@ -390,18 +386,8 @@ impl PrivateErScenario for ProgramUpgrade {
             base_state,
             "ER writes stay off base"
         )?;
-        let mut report = ScenarioReport::ok(self.name())
-            .setting("program", program_id)
-            .setting("programdata", programdata)
-            .setting("base upgrade", format!("{upgrade} at slot {base_slot}"))
-            .setting("cold clone requests", 3)
-            .setting("convergence", format!("B bytes materialized; first subsequent transaction {first_b} at ER slot {er_slot}"));
-        for (phase, [a, b, failures, loading]) in
-            PHASES.into_iter().zip(counts.get())
-        {
-            report = report.setting(phase, format!("A={a}, B={b}, rolled back={failures}, loading failures={loading}"));
-        }
         try_join(hot.finish(), cold.finish()).await?;
-        Ok(netfault::report_events(report, &proxies.finish()?))
+        proxies.finish()?;
+        Ok(())
     }
 }

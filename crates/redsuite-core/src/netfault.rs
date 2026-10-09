@@ -23,7 +23,6 @@ use transaction::versioned::VersionedTransaction;
 use crate::{
     console,
     context::{BaseCtx, ChainCtx},
-    report::{self, ScenarioReport},
     topology::BaseEndpoints,
     transport::http::{self, TransportError},
     Result,
@@ -82,19 +81,6 @@ impl Operation {
             .first()
             .ok_or("the intercepted operation carries no signature")?;
         Ok(first.parse()?)
-    }
-}
-
-impl fmt::Display for Operation {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} {} {}", self.transport, self.stage, self.method)?;
-        if let Some(signature) = self.signatures.first() {
-            write!(f, " sig={signature}")?;
-        }
-        if let Some(account) = self.accounts.first() {
-            write!(f, " account={account}")?;
-        }
-        Ok(())
     }
 }
 
@@ -207,41 +193,10 @@ pub enum Action {
     Restored,
 }
 
-impl fmt::Display for Action {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Action::Held => "held",
-            Action::Released => "released",
-            Action::Discarded => "discarded",
-            Action::Rejected => "rejected",
-            Action::ConnectionsClosed => "connections closed",
-            Action::Restored => "restored",
-        })
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct FaultEvent {
-    pub at: Duration,
-    pub stamp: String,
     pub action: Action,
     pub operation: Option<Operation>,
-}
-
-impl fmt::Display for FaultEvent {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{} at +{:.3}s ({})",
-            self.action,
-            self.at.as_secs_f64(),
-            self.stamp
-        )?;
-        if let Some(operation) = &self.operation {
-            write!(f, ": {operation}")?;
-        }
-        Ok(())
-    }
 }
 
 enum Decision {
@@ -288,12 +243,7 @@ type Shared = Rc<RefCell<State>>;
 
 impl State {
     fn record(&mut self, action: Action, operation: Option<Operation>) {
-        self.events.push(FaultEvent {
-            at: self.started.elapsed(),
-            stamp: report::utc_stamp(),
-            action,
-            operation,
-        });
+        self.events.push(FaultEvent { action, operation });
     }
 
     fn track(&mut self, handle: JoinHandle<()>) {
@@ -605,7 +555,7 @@ impl BaseProxies {
         self.shared.borrow().events.clone()
     }
 
-    pub fn finish(mut self) -> Result<Vec<FaultEvent>> {
+    pub fn finish(mut self) -> Result<()> {
         self.shutdown();
         let unfired = self.shared.borrow().unfired.clone();
         if !unfired.is_empty() {
@@ -615,7 +565,7 @@ impl BaseProxies {
             )
             .into());
         }
-        Ok(self.events())
+        Ok(())
     }
 
     fn shutdown(&mut self) {
@@ -634,16 +584,6 @@ impl Drop for BaseProxies {
     fn drop(&mut self) {
         self.shutdown();
     }
-}
-
-pub fn report_events(
-    mut report: ScenarioReport,
-    events: &[FaultEvent],
-) -> ScenarioReport {
-    for (index, event) in events.iter().enumerate() {
-        report = report.setting(format!("fault {:02}", index + 1), event);
-    }
-    report
 }
 
 fn collect_strings(value: &json::Value, into: &mut Vec<String>) {

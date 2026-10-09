@@ -10,13 +10,11 @@ use std::{
 
 use async_trait::async_trait;
 use pubkey::Pubkey;
-use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, prep,
     redline::causal::{chain_ixs, PairModel, Step, STEPS},
     topology::{self, ReplicatedOptions, ReplicatedTopology, Verifier},
-    BaseCtx, ChainCtx, CheckError, PrivateErScenario, Result, ScenarioReport,
-    TxSender,
+    BaseCtx, ChainCtx, CheckError, PrivateErScenario, Result, TxSender,
 };
 use signature::Signature;
 use signer::Signer;
@@ -514,7 +512,7 @@ impl PrivateErScenario for ReplicationRecovery {
         "redshift/replication_recovery"
     }
 
-    async fn run(&self, base: &BaseCtx) -> Result<ScenarioReport> {
+    async fn run(&self, base: &BaseCtx) -> Result<()> {
         let leader_env = vec![
             (
                 "MBV_ENGINE__BLOCKSTORE__SUPERBLOCK".to_owned(),
@@ -684,70 +682,6 @@ impl PrivateErScenario for ReplicationRecovery {
         );
 
         topology.finish().await?;
-
-        let mut report = ScenarioReport::ok(self.name())
-            .setting("pairs", PAIRS)
-            .setting("chain gap ms", CHAIN_GAP.as_millis())
-            .setting("heavy step iters", HEAVY_ITERS)
-            .setting("superblock slots", SUPERBLOCK_SLOTS)
-            .setting("ledger size limit bytes", LEDGER_SIZE_LIMIT_BYTES)
-            .setting("leader executors", leader_executors)
-            .setting("verifier0 executors", executors[0])
-            .setting("verifier1 executors", executors[1])
-            .setting(
-                "verifier state equality",
-                "the follower recomputes every sealed superblock checksum and \
-                 aborts on a mismatch; zero mismatches over the run's seals is \
-                 the account-equality evidence, the leader's accounts are \
-                 compared against the client-side model directly",
-            )
-            .metric("boot s", Unit::Seconds, boot.as_secs_f64())
-            .metric("chains", Unit::Count, chains as f64)
-            .metric("chain txs", Unit::Count, chain_txs as f64)
-            .metric("leader txs", Unit::Count, leader_txs)
-            .metric("leader blocks", Unit::Count, leader_blocks)
-            .metric("leader superblocks", Unit::Count, leader_superblocks)
-            .metric("steady verifier0 max lag txs", Unit::Count, lag.max_lag[0])
-            .metric("steady verifier1 max lag txs", Unit::Count, lag.max_lag[1])
-            .metric(
-                "verifier0 superblocks",
-                Unit::Count,
-                verifier_superblocks[0],
-            )
-            .metric(
-                "verifier1 superblocks",
-                Unit::Count,
-                verifier_superblocks[1],
-            )
-            .metric(
-                "snapshot recovery offline s",
-                Unit::Seconds,
-                recovery.offline.as_secs_f64(),
-            )
-            .metric(
-                "snapshot recovery purges",
-                Unit::Count,
-                recovery.truncations,
-            )
-            .metric(
-                "snapshots installed",
-                Unit::Count,
-                recovery.client_snapshots,
-            )
-            .metric("snapshots served", Unit::Count, recovery.server_snapshots);
-        for (label, elapsed) in [
-            ("steady catch up ms", steady_catch_up),
-            ("cursor restart offline ms", restart.offline),
-            ("cursor restart reconnect ms", restart.reconnect),
-            ("cursor restart catch up ms", restart.catch_up),
-            ("final drain ms", drain),
-            ("snapshot recovery reconnect ms", recovery.reconnect),
-            ("snapshot recovery tail replay ms", recovery.catch_up),
-        ] {
-            report =
-                report.metric(label, Unit::Millis, elapsed.as_secs_f64() * 1e3);
-        }
-
-        Ok(report)
+        Ok(())
     }
 }

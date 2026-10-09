@@ -15,7 +15,7 @@ use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
     check, check_eq, dlp, prep, topology, BaseCtx, ChainCtx, ErCtx,
-    PrivateErScenario, Result, ScenarioReport,
+    PrivateErScenario, Result,
 };
 use sdk::spl::{
     builders::{
@@ -170,8 +170,7 @@ impl PrivateErScenario for AmlGate {
         "redshift/aml_gate"
     }
 
-    async fn run(&self, base: &BaseCtx) -> Result<ScenarioReport> {
-        let report = ScenarioReport::ok(self.name());
+    async fn run(&self, base: &BaseCtx) -> Result<()> {
         let server = MockRiskServer::start()?;
         // No api key or threshold: both belong to the risk server now; loopback
         // http is the one plaintext scheme magicblock-aml accepts.
@@ -197,33 +196,14 @@ impl PrivateErScenario for AmlGate {
 
         // High-risk owner (score 9): the merge is blocked, no tokens move,
         // and the shuttle ATA is undelegated on base.
-        let risky =
-            run_risk_case(base, private.ctx(), &server, 9, false).await?;
+        run_risk_case(base, private.ctx(), &server, 9, false).await?;
 
         // Low-risk owner (score 1): the gate allows a merge attempt.
-        let low = run_risk_case(base, private.ctx(), &server, 1, true).await?;
+        run_risk_case(base, private.ctx(), &server, 1, true).await?;
 
         private.finish().await?;
-        Ok(report
-            .setting("high-risk owner", risky.owner)
-            .setting("high-risk queries", risky.queries)
-            .setting("high-risk merge", risky.merge_error)
-            .setting("high-risk destination tokens", risky.destination_tokens)
-            .setting("high-risk record at end", risky.record_at_end)
-            .setting("low-risk owner", low.owner)
-            .setting("low-risk queries", low.queries)
-            .setting("low-risk merge", low.merge_error)
-            .setting("low-risk destination tokens", low.destination_tokens)
-            .setting("low-risk record at end", low.record_at_end))
+        Ok(())
     }
-}
-
-struct RiskCaseOutcome {
-    queries: usize,
-    owner: Pubkey,
-    merge_error: String,
-    destination_tokens: u64,
-    record_at_end: bool,
 }
 
 async fn run_risk_case(
@@ -232,7 +212,7 @@ async fn run_risk_case(
     server: &MockRiskServer,
     owner_risk: u64,
     expect_allowed: bool,
-) -> Result<RiskCaseOutcome> {
+) -> Result<()> {
     let er_identity = er_ctx.identity();
     let owner = Keypair::new();
     let owner_pk = owner.pubkey();
@@ -330,7 +310,7 @@ async fn run_risk_case(
 
     // The gate controls attempts. An allowed action can still fail in the
     // deployed token program; only a successful action must move the tokens.
-    let (merge_error, destination_tokens) = if expect_allowed {
+    if expect_allowed {
         check::poll(
             &format!("low-risk owner {owner_pk}: a merge attempt references {shuttle_ata} and {destination_ata}"),
             MERGE_TIMEOUT,
@@ -345,7 +325,7 @@ async fn run_risk_case(
         let attempt = merge_attempt(er_ctx, &shuttle_ata, &destination_ata)
             .await?
             .ok_or("the merge attempt vanished after the poll")?;
-        let tokens = if attempt.is_none() {
+        if attempt.is_none() {
             check::poll(
                 &format!("low-risk owner {owner_pk}: the executed merge lands tokens in {destination_ata}"),
                 MERGE_TIMEOUT,
@@ -357,23 +337,18 @@ async fn run_risk_case(
                 },
             )
             .await?;
-            let amount = er_token_amount(er_ctx, &destination_ata).await?;
             check_eq!(
-                amount,
+                er_token_amount(er_ctx, &destination_ata).await?,
                 SHUTTLE_AMOUNT,
                 "low-risk owner {owner_pk}: the executed merge moves tokens to {destination_ata}"
             )?;
-            amount
         } else {
-            let amount = er_token_amount(er_ctx, &destination_ata).await?;
             check_eq!(
-                amount,
+                er_token_amount(er_ctx, &destination_ata).await?,
                 0,
                 "low-risk owner {owner_pk}: a failed merge leaves {destination_ata} unchanged"
             )?;
-            amount
-        };
-        (attempt.unwrap_or_else(|| "none".to_owned()), tokens)
+        }
     } else {
         check::poll(
             &format!("high-risk owner {owner_pk}: shuttle {shuttle_ata} undelegates on base"),
@@ -395,25 +370,13 @@ async fn run_risk_case(
                 .is_none(),
             "high-risk owner {owner_pk}: no merge attempt for {shuttle_ata} and {destination_ata}"
         )?;
-        let amount = er_token_amount(er_ctx, &destination_ata).await?;
         check_eq!(
-            amount,
+            er_token_amount(er_ctx, &destination_ata).await?,
             0,
             "high-risk owner {owner_pk}: the blocked merge leaves {destination_ata} unchanged"
         )?;
-        ("blocked".to_owned(), amount)
-    };
-    let record_at_end = delegation_record_exists(base, &shuttle_ata).await?;
-
-    let queries = server.query_count(&owner_pk);
-
-    Ok(RiskCaseOutcome {
-        queries,
-        owner: owner_pk,
-        merge_error,
-        destination_tokens,
-        record_at_end,
-    })
+    }
+    Ok(())
 }
 
 // The merge attempt is the er transaction that references both the shuttle

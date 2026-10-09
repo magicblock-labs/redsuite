@@ -10,7 +10,6 @@ use pubkey::Pubkey;
 use redsuite_core::redline::Accounts;
 use redsuite_core::{
     check, check_eq, prep,
-    report::Unit,
     rpc_client::{
         nonblocking::rpc_client::RpcClient,
         rpc_client::GetConfirmedSignaturesForAddress2Config,
@@ -20,7 +19,6 @@ use redsuite_core::{
         RpcTransactionConfig,
     },
     system, BaseCtx, ChainCtx, CheckError, ErCtx, Result, Scenario,
-    ScenarioReport,
 };
 use serde::Deserialize;
 use signature::Signature;
@@ -260,7 +258,7 @@ impl Scenario for RpcLifecycle {
         "redshift/rpc_lifecycle"
     }
 
-    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
+    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<()> {
         let client = RpcClient::new_with_commitment(
             er.api().url().to_owned(),
             confirmed(),
@@ -317,7 +315,7 @@ impl Scenario for RpcLifecycle {
         let signatures: Vec<Signature> =
             writes.iter().map(|write| write.signature).collect();
         let probe = &writes[0];
-        let fee = client
+        client
             .get_fee_for_message(&probe.transaction.message)
             .await?;
         let simulation = client
@@ -360,7 +358,6 @@ impl Scenario for RpcLifecycle {
             preflight_commitment: Some(confirmed().commitment),
             ..RpcSendTransactionConfig::default()
         };
-        let burst_started = Instant::now();
         let sends = join_all(writes.iter().map(|write| {
             client.send_transaction_with_config(&write.transaction, send_config)
         }));
@@ -371,7 +368,6 @@ impl Scenario for RpcLifecycle {
                 )
             },
         )?;
-        let burst_elapsed = burst_started.elapsed();
         let mut failures = 0u64;
         for (write, sent) in writes.iter().zip(sends) {
             match sent {
@@ -596,22 +592,6 @@ impl Scenario for RpcLifecycle {
         )?;
 
         advancing_clock(base, er).await?;
-
-        Ok(ScenarioReport::ok(self.name())
-            .setting("clock iterations", CLOCK_ITERATIONS)
-            .setting("ledger settle slots", LEDGER_SETTLE_SLOTS)
-            .metric("transfers", Unit::Count, CLOCK_ITERATIONS as f64)
-            .setting("writes", WRITES)
-            .setting("payers", PAYERS)
-            .setting("fee lamports", fee)
-            .setting("first slot", min_slot)
-            .setting("last slot", max_slot)
-            .metric(
-                "burst elapsed ms",
-                Unit::Millis,
-                burst_elapsed.as_secs_f64() * 1e3,
-            )
-            .metric("burst failures", Unit::Count, failures as f64)
-            .metric("distinct slots", Unit::Count, by_slot.len() as f64))
+        Ok(())
     }
 }

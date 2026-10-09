@@ -7,9 +7,8 @@ use redsuite_core::{
     check,
     netfault::{Action, BaseProxies, Selector},
     prep,
-    report::Unit,
     topology::{self, ErOptions},
-    BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result, ScenarioReport,
+    BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result,
 };
 use signer::Signer;
 
@@ -56,8 +55,8 @@ impl PrivateErScenario for GrpcRedundancy {
         "redshift/undelegation_grpc_redundancy"
     }
 
-    async fn run(&self, shared: &BaseCtx) -> Result<ScenarioReport> {
-        let (grpc_url, plugin) = shared.grpc().ok_or(
+    async fn run(&self, shared: &BaseCtx) -> Result<()> {
+        let (grpc_url, _) = shared.grpc().ok_or(
             "the base L1 is serving no Yellowstone gRPC feed, so this \
              scenario cannot compare transports; run `redsuite stack down` \
              and retry on a host where the plugin resolves",
@@ -175,7 +174,7 @@ impl PrivateErScenario for GrpcRedundancy {
             REFRESHED_ON_BASE,
         )
         .await?;
-        let undelegation = match pushed_to(
+        if let Err(error) = pushed_to(
             er,
             "the er observes the completed undelegation while websocket is cut",
             pending,
@@ -183,37 +182,24 @@ impl PrivateErScenario for GrpcRedundancy {
         )
         .await
         {
-            Ok(elapsed) => elapsed,
-            Err(error) => {
-                let served: Vec<_> = er
-                    .accounts(pending)
-                    .await?
-                    .into_iter()
-                    .map(crate::account_id)
-                    .collect();
-                return Err(format!(
-                    "{error}; the cloned account did refresh over grpc after \
-                     {refresh:.1?}, and a direct client read returns {served:?}"
-                )
-                .into());
-            }
-        };
+            let served: Vec<_> = er
+                .accounts(pending)
+                .await?
+                .into_iter()
+                .map(crate::account_id)
+                .collect();
+            return Err(format!(
+                "{error}; the cloned account did refresh over grpc after \
+                 {refresh:.1?}, and a direct client read returns {served:?}"
+            )
+            .into());
+        }
 
-        let held = |proxies: &BaseProxies, methods: &[&str]| {
-            proxies
-                .events()
-                .iter()
-                .filter(|event| event.action == Action::Held)
-                .filter(|event| {
-                    methods.is_empty()
-                        || event.operation.as_ref().is_some_and(|op| {
-                            methods.contains(&op.method.as_str())
-                        })
-                })
-                .count()
-        };
-        let ws_held = held(&ws, &[]);
-        let http_held = held(&http, &FETCHES);
+        let ws_held = ws
+            .events()
+            .iter()
+            .filter(|event| event.action == Action::Held)
+            .count();
         check!(
             ws_held > 0,
             "the websocket proxy held nothing, so the blackout this run \
@@ -225,28 +211,9 @@ impl PrivateErScenario for GrpcRedundancy {
         ws.restore();
         http.restore();
 
-        let report = ScenarioReport::ok(self.name())
-            .setting("yellowstone plugin", plugin)
-            .setting("undelegated accounts", pending.len())
-            .setting(
-                "held during the blackout",
-                format!(
-                    "{ws_held} websocket messages, {http_held} account fetches"
-                ),
-            )
-            .metric(
-                "cloned account refreshed after ms",
-                Unit::Millis,
-                refresh.as_secs_f64() * 1e3,
-            )
-            .metric(
-                "undelegation observed after ms",
-                Unit::Millis,
-                undelegation.as_secs_f64() * 1e3,
-            );
         private.finish().await?;
-        let mut events = http.finish()?;
-        events.extend(ws.finish()?);
-        Ok(redsuite_core::netfault::report_events(report, &events))
+        http.finish()?;
+        ws.finish()?;
+        Ok(())
     }
 }

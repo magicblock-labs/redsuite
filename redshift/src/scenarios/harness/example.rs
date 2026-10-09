@@ -1,11 +1,9 @@
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use keypair::Keypair;
-use redsuite_core::report::Unit;
 use redsuite_core::{
-    check, prep, stats::StreamingStats, system, BaseCtx, ChainCtx, CheckError,
-    ErCtx, Result, Scenario, ScenarioReport,
+    check, prep, system, BaseCtx, ChainCtx, CheckError, ErCtx, Result, Scenario,
 };
 use signer::Signer;
 
@@ -21,11 +19,10 @@ impl Scenario for Example {
         "redshift/example"
     }
 
-    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
+    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<()> {
         let payer = prep::funded_payer(base, PAYER_LAMPORTS).await?;
         let recipient = Keypair::new().pubkey();
 
-        let mut latency = StreamingStats::new();
         let mut expected = 0;
         // identical transactions share a signature and get deduplicated —
         // every transaction must differ somewhere (here: the amount)
@@ -33,9 +30,7 @@ impl Scenario for Example {
             let lamports = LAMPORTS_PER_TRANSFER + unique;
             let transfer =
                 system::transfer(&payer.pubkey(), &recipient, lamports);
-            let sent = Instant::now();
             base.submit_and_confirm(&payer, &[transfer]).await?;
-            latency.push(sent.elapsed().as_micros() as u32);
             expected += lamports;
         }
         let on_base = base
@@ -62,17 +57,6 @@ impl Scenario for Example {
             },
         )
         .await?;
-
-        let metrics = er.scrape_metrics().await?;
-
-        Ok(ScenarioReport::ok(self.name())
-            .setting("transfers", TRANSFERS)
-            .observe("send+confirm us", Unit::Micros, latency.finalize(false))
-            .metric("lamports delivered", Unit::Lamports, expected as f64)
-            .metric_if(
-                "er monitored accounts",
-                Unit::Count,
-                metrics.get("mbv_monitored_accounts_gauge"),
-            ))
+        Ok(())
     }
 }

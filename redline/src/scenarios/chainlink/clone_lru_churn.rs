@@ -118,7 +118,7 @@ struct CellOutcome {
 pub struct CloneLruChurn;
 
 #[async_trait(?Send)]
-impl Scenario for CloneLruChurn {
+impl Scenario<ScenarioReport> for CloneLruChurn {
     fn name(&self) -> &str {
         "redline/clone_lru_churn"
     }

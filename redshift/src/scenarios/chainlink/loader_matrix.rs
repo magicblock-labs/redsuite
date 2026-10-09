@@ -6,7 +6,7 @@ use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
     check, check_eq, prep, topology, BaseCtx, ChainCtx, CheckError, ErCtx,
-    Result, Scenario, ScenarioReport,
+    Result, Scenario,
 };
 use signature::Signature;
 
@@ -29,7 +29,7 @@ impl Scenario for LoaderMatrix {
         "redshift/loader_matrix"
     }
 
-    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
+    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<()> {
         let funder = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
         let payer = &prep::delegated_payer(
             base,
@@ -117,13 +117,7 @@ impl Scenario for LoaderMatrix {
             "the v3 program invocation must emit its LogMsg line"
         )?;
 
-        Ok(ScenarioReport::ok(self.name())
-            .setting("loaders", "v1,v2,v3")
-            .setting(
-                "clone representation",
-                "bare ELF, no LoaderV4State header",
-            )
-            .setting("v1 owner", v1_owner.to_string()))
+        Ok(())
     }
 }
 

@@ -3,12 +3,10 @@ use std::{rc::Rc, time::Duration};
 use async_trait::async_trait;
 use json::{JsonContainerTrait, JsonValueTrait};
 use pubkey::Pubkey;
-use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, prep, system,
     transport::{events::EventSubscriptions, wsraw::RawWs},
-    BaseCtx, ChainCtx, CheckError, ErCtx, Result, Scenario, ScenarioReport,
-    TxSender,
+    BaseCtx, ChainCtx, CheckError, ErCtx, Result, Scenario, TxSender,
 };
 use signer::Signer;
 
@@ -77,7 +75,7 @@ impl Scenario for PubsubContracts {
         "redshift/pubsub_contracts"
     }
 
-    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
+    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<()> {
         let funder = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
         let account1 = prep::delegated_payer(
             base,
@@ -407,10 +405,6 @@ impl Scenario for PubsubContracts {
         )?;
         raw.close().await?;
 
-        Ok(ScenarioReport::ok(self.name())
-            .setting("transfer lamports", TRANSFER_LAMPORTS)
-            .setting("sequential transfers", SEQUENTIAL_TRANSFERS)
-            .metric("account 1 drained to", Unit::Count, drained as f64)
-            .metric("slot events", Unit::Count, slot_events.len() as f64))
+        Ok(())
     }
 }
