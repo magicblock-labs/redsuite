@@ -28,6 +28,7 @@ impl Family {
 pub struct ErGroup {
     pub label: &'static str,
     pub env: &'static [(&'static str, &'static str)],
+    pub proxied: bool,
 }
 
 impl ErGroup {

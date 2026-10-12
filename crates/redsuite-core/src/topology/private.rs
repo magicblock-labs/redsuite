@@ -1,6 +1,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    rc::Rc,
     time::Duration,
 };
 
@@ -16,6 +17,7 @@ use crate::{
     api::Api,
     console,
     context::{BaseCtx, ChainCtx, ErCtx},
+    netfault::BaseProxies,
     report,
     resources::LaunchRecord,
     Result,
@@ -49,6 +51,11 @@ pub struct PrivateEr {
 impl PrivateEr {
     pub fn ctx(&self) -> &ErCtx {
         &self.ctx
+    }
+
+    pub fn with_proxies(mut self, proxies: Rc<BaseProxies>) -> Self {
+        self.ctx.proxies = Some(proxies);
+        self
     }
 
     pub fn pid(&self) -> u32 {

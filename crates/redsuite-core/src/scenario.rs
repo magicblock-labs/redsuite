@@ -170,7 +170,14 @@ pub async fn run_shared_scenario<V: Verdict>(
                     let er = er?;
                     Ok((topology::base_only(config).await?, er))
                 },
-                |(base, er)| async move { scenario.run(&base, &er).await },
+                |(base, er)| async move {
+                    let outcome = scenario.run(&base, &er).await;
+                    let faults = match er.proxies() {
+                        Some(proxies) => proxies.reset().await,
+                        None => Ok(()),
+                    };
+                    outcome.and_then(|verdict| faults.map(|()| verdict))
+                },
             )
             .await
         })

@@ -1,11 +1,12 @@
 mod catalog;
 
-use std::{future::Future, process::Command, time::Instant};
+use std::{future::Future, process::Command, rc::Rc, time::Instant};
 
 use futures_util::{future::join_all, StreamExt};
 use redsuite_core::{
     catalog::{Er, ErGroup, Family, ScenarioEntry},
     console, frontend,
+    netfault::BaseProxies,
     profile::{ExecutionConfig, LoopMode, Profile},
     report::{self, ScenarioReport, Unit},
     topology::{self, PrivateEr, ER_READY_TIMEOUT},
@@ -70,6 +71,7 @@ fn selected(target: &str) -> Vec<&'static ScenarioEntry> {
 struct GroupEr {
     group: &'static ErGroup,
     er: Option<PrivateEr>,
+    proxies: Option<Rc<BaseProxies>>,
     failure: Option<String>,
     tainted: bool,
 }
@@ -79,6 +81,7 @@ impl GroupEr {
         Self {
             group,
             er: None,
+            proxies: None,
             failure: None,
             tainted: false,
         }
@@ -129,10 +132,22 @@ impl GroupEr {
     }
 
     async fn boot(&mut self, base: &BaseCtx) -> Result<ErCtx> {
-        let er = topology::private_er(base, self.group.options()).await?;
+        let mut options = self.group.options();
+        let proxies = if self.group.proxied {
+            let proxies = BaseProxies::spawn(base).await?;
+            options.base_endpoints = Some(proxies.endpoints());
+            Some(Rc::new(proxies))
+        } else {
+            None
+        };
+        let mut er = topology::private_er(base, options).await?;
+        if let Some(proxies) = &proxies {
+            er = er.with_proxies(proxies.clone());
+        }
         er.wait_ready(ER_READY_TIMEOUT).await?;
         let ctx = er.ctx().clone();
         self.er = Some(er);
+        self.proxies = proxies;
         Ok(ctx)
     }
 
@@ -144,6 +159,16 @@ impl GroupEr {
                     self.group.label
                 ));
             }
+        }
+        let proxies = self
+            .proxies
+            .take()
+            .and_then(|proxies| Rc::try_unwrap(proxies).ok());
+        if let Some(Err(error)) = proxies.map(BaseProxies::finish) {
+            console::line(format_args!(
+                "group ER `{}` proxies: {error}",
+                self.group.label
+            ));
         }
     }
 }
@@ -486,12 +511,13 @@ async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let arg = |index: usize| args.get(index).map(String::as_str);
 
+    let local = tokio::task::LocalSet::new();
     let outcome = match arg(0) {
         Some("list") => {
             list(arg(1));
             Ok(())
         }
-        Some("run") => run(&args[1..]).await,
+        Some("run") => local.run_until(run(&args[1..])).await,
         _ => match frontend::dispatch(&args) {
             Some(outcome) => outcome,
             None => usage(),
