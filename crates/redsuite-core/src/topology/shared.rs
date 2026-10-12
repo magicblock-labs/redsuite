@@ -1,51 +1,21 @@
 use std::{fs, path::Path};
 
 use keypair::Keypair;
-use pubkey::Pubkey;
 use signer::Signer;
 
 use super::{config, identity, process, state, state::StackState};
 use crate::{
     api::Api,
     console,
-    context::{BaseCtx, ChainCtx, ErCtx},
+    context::{BaseCtx, ChainCtx},
     profile::ExecutionConfig,
     Result,
 };
-
-pub async fn shared(config: ExecutionConfig) -> Result<(BaseCtx, ErCtx)> {
-    let _lock = state::acquire_lock().await?;
-
-    let state = ensure_base(config).await?;
-    let state = ensure_er(state, config).await?;
-    contexts(&state, config)
-}
 
 pub fn running_base_programs() -> Option<Vec<String>> {
     let state = state::read_state()?;
     process::proc_matches(state.base_pid, &state.base_bin)
         .then_some(state.base_programs)
-}
-
-pub async fn stop_shared_er() -> Result<bool> {
-    let dir = state::stack_dir();
-    let _lock = state::acquire_lock().await?;
-    let Some(state) = state::read_state() else {
-        return Ok(false);
-    };
-    if state.er_pid == 0 {
-        return Ok(false);
-    }
-    process::kill_matching(&[(state.er_pid, state.er_bin.as_str())]);
-    let _ = state::remove_storage(&dir.join("er-storage"));
-    state::write_state(&StackState {
-        er_rpc_port: 0,
-        er_ws_port: 0,
-        er_metrics_port: 0,
-        er_pid: 0,
-        ..state
-    })?;
-    Ok(true)
 }
 
 pub async fn base_only(config: ExecutionConfig) -> Result<BaseCtx> {
@@ -76,27 +46,6 @@ async fn ensure_base(config: ExecutionConfig) -> Result<StackState> {
     }
 }
 
-async fn ensure_er(
-    state: StackState,
-    config: ExecutionConfig,
-) -> Result<StackState> {
-    if state.er_pid != 0 {
-        if process::proc_matches(state.er_pid, &state.er_bin)
-            && er_healthy(&state).await
-        {
-            console::debug(format_args!(
-                "reusing shared ER on 127.0.0.1:{}",
-                state.er_rpc_port
-            ));
-            return Ok(state);
-        }
-        kill_stack(&state);
-        let state = boot_base(config).await?;
-        return attach_er(state, config).await;
-    }
-    attach_er(state, config).await
-}
-
 fn base_ctx(state: &StackState, config: ExecutionConfig) -> BaseCtx {
     BaseCtx::new(
         format!("http://127.0.0.1:{}", state.base_rpc_port),
@@ -111,31 +60,9 @@ fn base_ctx(state: &StackState, config: ExecutionConfig) -> BaseCtx {
     )
 }
 
-fn contexts(
-    state: &StackState,
-    config: ExecutionConfig,
-) -> Result<(BaseCtx, ErCtx)> {
-    let base = base_ctx(state, config);
-    let er = ErCtx::new(
-        format!("http://127.0.0.1:{}", state.er_rpc_port),
-        format!("ws://127.0.0.1:{}", state.er_ws_port),
-        format!("http://127.0.0.1:{}", state.er_metrics_port),
-        state
-            .er_identity
-            .parse::<Pubkey>()
-            .map_err(|e| format!("corrupt state.json: bad er_identity: {e}"))?,
-    );
-    Ok((base, er))
-}
-
 async fn base_healthy(state: &StackState) -> bool {
     let base = Api::new(format!("http://127.0.0.1:{}", state.base_rpc_port));
     matches!(base.get_health().await.as_deref(), Ok("ok"))
-}
-
-async fn er_healthy(state: &StackState) -> bool {
-    let er = Api::new(format!("http://127.0.0.1:{}", state.er_rpc_port));
-    er.server_alive().await
 }
 
 async fn boot_base(config: ExecutionConfig) -> Result<StackState> {
@@ -149,7 +76,6 @@ async fn boot_base(config: ExecutionConfig) -> Result<StackState> {
     let base_gossip_port = base_ports.single()?;
     let feed_port = base_ports.single()?;
 
-    let identity = Keypair::new();
     let identity_pool: Vec<Keypair> = (0..identity::IDENTITY_POOL_SIZE)
         .map(|_| Keypair::new())
         .collect();
@@ -170,7 +96,6 @@ async fn boot_base(config: ExecutionConfig) -> Result<StackState> {
         .await?;
         let _ = fs::remove_dir_all(&plan.genesis_accounts);
         fs::create_dir_all(&plan.genesis_accounts)?;
-        identity::write_vault_dump(&plan.genesis_accounts, &identity.pubkey())?;
         for reserved in &identity_pool {
             identity::write_vault_dump(
                 &plan.genesis_accounts,
@@ -194,13 +119,6 @@ async fn boot_base(config: ExecutionConfig) -> Result<StackState> {
             base_plugin: plan.plugin.clone(),
             base_pid,
             base_bin: config::bin_name(&plan.bin),
-            er_rpc_port: 0,
-            er_ws_port: 0,
-            er_metrics_port: 0,
-            er_pid: 0,
-            er_bin: config::bin_name(&er_bin),
-            er_identity: identity.pubkey().to_string(),
-            er_identity_keypair: identity.to_bytes().to_vec(),
             er_identity_pool: identity_pool
                 .iter()
                 .map(|reserved| reserved.to_bytes().to_vec())
@@ -213,11 +131,10 @@ async fn boot_base(config: ExecutionConfig) -> Result<StackState> {
             Ok(()) => {
                 state::write_state(&state)?;
                 console::debug(format_args!(
-                    "base up: 127.0.0.1:{} (ws {}, grpc {}), identity {}",
+                    "base up: 127.0.0.1:{} (ws {}, grpc {})",
                     state.base_rpc_port,
                     state.base_ws_port,
                     state.base_grpc_port,
-                    state.er_identity,
                 ));
                 return Ok(state);
             }
@@ -257,9 +174,7 @@ async fn await_base_ready(
     .await?;
 
     let base = base_ctx(state, config);
-    let mut required = vec![crate::dlp::validator_fees_vault_pda(
-        &state.er_identity.parse()?,
-    )];
+    let mut required = Vec::new();
     for id in config::CLONED_ACCOUNTS {
         required.push(id.parse()?);
     }
@@ -283,88 +198,7 @@ async fn await_base_ready(
     Ok(())
 }
 
-async fn attach_er(
-    state: StackState,
-    config: ExecutionConfig,
-) -> Result<StackState> {
-    let dir = state::stack_dir();
-    let er_bin = config::er_bin_path()?;
-    let er_identity = Keypair::try_from(&state.er_identity_keypair[..])
-        .map_err(|e| {
-            format!("corrupt state.json: bad er_identity_keypair: {e}")
-        })?;
-    let base = base_ctx(&state, config);
-    identity::ensure_identity_funded(&base, &er_identity.pubkey()).await?;
-
-    let mut er_ports = process::PortLease::default();
-    let (er_rpc_port, er_ws_port) = er_ports.pair()?;
-    let er_metrics_port = er_ports.single()?;
-    let er_replication_port = er_ports.single()?;
-
-    // a fresh base is a new chain — prior-generation ER state is invalid
-    let storage_dir = dir.join("er-storage");
-    let _ = state::remove_storage(&storage_dir);
-
-    let plan = config::ErPlan {
-        bin: er_bin,
-        identity: er_identity,
-        base_rpc_url: format!("http://127.0.0.1:{}", state.base_rpc_port),
-        base_ws_url: format!("ws://127.0.0.1:{}", state.base_ws_port),
-        base_grpc_url: None,
-        listen_port: er_rpc_port,
-        metrics_port: er_metrics_port,
-        replication_port: er_replication_port,
-        accountsdb_dir: state::accountsdb_dir(&storage_dir),
-        storage_dir,
-        env: Vec::new(),
-        reset: true,
-        allowed_followers: Vec::new(),
-    };
-    console::debug(format_args!("booting ER on 127.0.0.1:{er_rpc_port} …"));
-    let er_log = dir.join("er.log");
-    er_ports.release();
-    let er_pid = process::spawn_detached(plan.command(), &er_log)?;
-
-    let er_api = Api::new(format!("http://127.0.0.1:{er_rpc_port}"));
-    let ready = process::wait_until(
-        config::ER_READY_TIMEOUT,
-        "ER RPC answering",
-        &er_log,
-        er_pid,
-        || async { er_api.server_alive().await },
-    )
-    .await;
-    if let Err(e) = ready {
-        let e = er_ports.failure(e);
-        process::kill_pid(er_pid);
-        return Err(e);
-    }
-
-    let state = StackState {
-        er_rpc_port,
-        er_ws_port,
-        er_metrics_port,
-        er_pid,
-        er_bin: config::bin_name(&plan.bin),
-        ..state
-    };
-    state::write_state(&state)?;
-    console::debug(format_args!(
-        "stack up: base 127.0.0.1:{} (ws {}), er 127.0.0.1:{} (ws {}, metrics {}), identity {}",
-        state.base_rpc_port,
-        state.base_ws_port,
-        state.er_rpc_port,
-        state.er_ws_port,
-        state.er_metrics_port,
-        state.er_identity,
-    ));
-    Ok(state)
-}
-
 fn kill_stack(state: &StackState) {
-    process::kill_matching(&[
-        (state.er_pid, state.er_bin.as_str()),
-        (state.base_pid, state.base_bin.as_str()),
-    ]);
+    process::kill_matching(&[(state.base_pid, state.base_bin.as_str())]);
     state::remove_state();
 }

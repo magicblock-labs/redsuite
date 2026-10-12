@@ -15,10 +15,8 @@ use magic_api::instruction::{
 use pubkey::Pubkey;
 use redshift_interface::{ephemeral_cpi, log_msg_data};
 use redsuite_core::{
-    api::TransactionInfo,
-    check, check_eq, manifest, prep, system,
-    topology::{self, ErOptions},
-    BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result,
+    api::TransactionInfo, check, check_eq, manifest, prep, system, topology,
+    BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
 use sdk::{consts::EPHEMERAL_VAULT_ID, ephemeral_accounts::rent};
 use signer::Signer;
@@ -342,21 +340,12 @@ impl Workload<'_> {
 }
 
 #[async_trait(?Send)]
-impl PrivateErScenario for EphemeralAccounts {
+impl Scenario for EphemeralAccounts {
     fn name(&self) -> &str {
         "redhat/ephemeral_accounts"
     }
 
-    async fn run(&self, base: &BaseCtx) -> Result<()> {
-        let private = topology::private_er(
-            base,
-            ErOptions {
-                label: "ephemeral-accounts".into(),
-                ..ErOptions::default()
-            },
-        )
-        .await?;
-        let er = private.ctx();
+    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<()> {
         let funder = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
         let mut signers = Vec::new();
         for _ in 0..3 {
@@ -557,7 +546,6 @@ impl PrivateErScenario for EphemeralAccounts {
             }
         }
         let failures = workload.failures;
-        private.finish().await?;
         check!(
             failures.is_empty(),
             "ephemeral transactions with mismatched receipts or accounting: {}",

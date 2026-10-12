@@ -17,8 +17,7 @@ use redsuite_core::{
         execute_raw, merge_outcomes, spawn_workers, split_iterations, Pacing,
         RunConfig, RunOutcome,
     },
-    topology, BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario,
-    ScenarioReport,
+    BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
 };
 
 use crate::program::{instruction::build, layout, utils::hash_chain};
@@ -434,9 +433,7 @@ impl Scenario<ScenarioReport> for MixedSustainedLoad {
 
         let pool = Arc::new(pool);
         let payer_bytes = prep::payer_bytes(&payers);
-        let er_pid = topology::current_state()
-            .ok_or("no shared stack state")?
-            .er_pid;
+        let er_pid = er.pid();
 
         let before = er.scrape_metrics().await?;
         let engine_txs_before =

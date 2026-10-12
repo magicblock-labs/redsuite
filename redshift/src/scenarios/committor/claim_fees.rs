@@ -15,7 +15,7 @@ impl PrivateErScenario for ClaimFees {
     }
 
     async fn run(&self, base: &BaseCtx) -> Result<()> {
-        let validator = topology::er_identity_keypair()?;
+        let validator = topology::identity_for_label("claim-fees")?;
         base.airdrop(&validator.pubkey(), crate::PAYER_LAMPORTS)
             .await?;
         let vault = dlp::validator_fees_vault_pda(&validator.pubkey());

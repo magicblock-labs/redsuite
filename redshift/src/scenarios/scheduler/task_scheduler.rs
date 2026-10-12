@@ -7,8 +7,8 @@ use pubkey::Pubkey;
 use redshift_interface::flexi::{build as flexi, FlexiCounter};
 use redsuite_core::{
     api::{ConfirmOptions, TxError},
-    check, check_eq, prep, topology, BaseCtx, ChainCtx, ErCtx,
-    PrivateErScenario, Result,
+    check, check_eq, prep, topology, BaseCtx, ChainCtx, ErCtx, Result,
+    Scenario,
 };
 use signer::Signer;
 use transaction::Transaction;
@@ -272,32 +272,21 @@ async fn test_sponsor_refund(er: &ErCtx, actor: &Actor) -> Result<()> {
 }
 
 #[async_trait(?Send)]
-impl PrivateErScenario for TaskScheduler {
+impl Scenario for TaskScheduler {
     fn name(&self) -> &str {
         "redshift/task_scheduler"
     }
 
-    async fn run(&self, base: &BaseCtx) -> Result<()> {
+    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<()> {
         check!(
             matches!(base.account(&SCHEDULER_PROGRAM).await?, Some(program) if program.executable),
             "the base chain hosts the ephemeral scheduler program"
         )?;
-        let private = topology::private_er(
-            base,
-            topology::ErOptions {
-                label: "task-scheduler".to_owned(),
-                env: Vec::new(),
-                request_timeout: None,
-                base_endpoints: None,
-            },
-        )
-        .await?;
-        let er = private.ctx();
         let funder = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
         check_eq!(
             tasks(er).await?.len(),
             0,
-            "a fresh ER holds no scheduled tasks"
+            "the ER holds no scheduled tasks before the scenario"
         )?;
 
         let actor = scheduled_actor(base, er, &funder).await?;

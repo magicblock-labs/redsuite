@@ -153,6 +153,7 @@ pub async fn run_shared_scenario<V: Verdict>(
     fixtures: &[Fixture],
     optional_fixtures: &[Fixture],
     config: ExecutionConfig,
+    er: std::result::Result<ErCtx, String>,
 ) -> RunRecord {
     // A LocalSet so contexts and transports can spawn_local background work
     // (WS readers) on the test's current-thread runtime.
@@ -165,7 +166,10 @@ pub async fn run_shared_scenario<V: Verdict>(
                 fixtures,
                 optional_fixtures,
                 config,
-                topology::shared,
+                |config| async move {
+                    let er = er?;
+                    Ok((topology::base_only(config).await?, er))
+                },
                 |(base, er)| async move { scenario.run(&base, &er).await },
             )
             .await
@@ -256,24 +260,7 @@ where
     // audit and the persisted report instead of aborting sibling scenarios
     let outcome = AssertUnwindSafe(body(provisioned)).catch_unwind().await;
     let wall_seconds = started.elapsed().as_secs_f64();
-    for reclaimed in resources.reclaim() {
-        let stopped = if reclaimed.killed { "stopped" } else { "" };
-        let removed = if reclaimed.removed {
-            format!("removed {}", reclaimed.storage_dir)
-        } else {
-            String::new()
-        };
-        let joiner = if reclaimed.killed && reclaimed.removed {
-            ", "
-        } else {
-            ""
-        };
-        console::line(format_args!(
-            "{}: reclaimed private ER `{}`: {stopped}{joiner}{removed}",
-            record.name, reclaimed.label
-        ));
-    }
-    let teardown_errors = resources.audit();
+    let teardown_errors = resources.reclaim_and_audit(&record.name);
     record.launches = resources.launches();
     record.wall_seconds = Some(wall_seconds);
     record.scenario = match outcome {
@@ -418,7 +405,6 @@ fn conclude(record: &mut RunRecord, reports: bool) {
     if matches!(record.scenario, ScenarioOutcome::Skipped(_)) {
         return;
     }
-    crate::report::warn_on_stack_skew();
     if !reports {
         return;
     }

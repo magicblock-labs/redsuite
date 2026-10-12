@@ -428,47 +428,14 @@ fn scenario_failure(error: &DynError) -> PersistedFailure {
     PersistedFailure::new("scenario", "infrastructure", error.to_string())
 }
 
-fn running_stack_exe() -> Option<PathBuf> {
-    topology::current_state()
-        .map(|state| PathBuf::from(format!("/proc/{}/exe", state.er_pid)))
-        .filter(|exe| exe.exists())
-}
-
 fn er_identity() -> (String, String, String) {
-    let running_exe = running_stack_exe();
-    let resolved = topology::er_bin_path().ok();
-    let er = running_exe.clone().or(resolved);
-
-    let er_bin = running_exe
-        .as_deref()
-        .and_then(|exe| fs::read_link(exe).ok())
-        .or(er.clone())
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|| "unknown".into());
-    let er_version = er
-        .as_deref()
-        .map(binary_version)
-        .unwrap_or_else(|| "unknown".into());
-    let er_fingerprint = er
-        .as_deref()
-        .map(fingerprint)
-        .unwrap_or_else(|| "unknown".into());
-    (er_bin, er_version, er_fingerprint)
-}
-
-pub(crate) fn warn_on_stack_skew() {
-    let running_exe = running_stack_exe();
-    let resolved = topology::er_bin_path().ok();
-    if let (Some(running), Some(resolved)) =
-        (running_exe.as_deref(), resolved.as_deref())
-    {
-        if fingerprint(running) != fingerprint(resolved) {
-            eprintln!(
-                "[redsuite] warning: the shared stack is not running {} — \
-                 rebuilt or re-pointed since boot; `cargo xtask stack down` to pick it up",
-                resolved.display()
-            );
-        }
+    match topology::er_bin_path() {
+        Ok(er) => (
+            er.display().to_string(),
+            binary_version(&er),
+            fingerprint(&er),
+        ),
+        Err(_) => ("unknown".into(), "unknown".into(), "unknown".into()),
     }
 }
 

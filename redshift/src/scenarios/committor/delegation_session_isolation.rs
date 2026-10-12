@@ -12,13 +12,12 @@ use redsuite_core::{
     netfault::{BaseProxies, Selector},
     prep, receipt, topology,
     topology::{ErOptions, PrivateEr, RestartConfig},
-    BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result,
+    BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
 use serde::Deserialize;
 use signer::Signer;
 
 const LABEL_A: &str = "session-isolation-a";
-const LABEL_B: &str = "session-isolation-b";
 const CLONE_TIMEOUT: Duration = Duration::from_secs(30);
 const INTERCEPT_TIMEOUT: Duration = Duration::from_secs(60);
 const RECEIPT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -294,7 +293,7 @@ async fn isolate(
     base: &BaseCtx,
     proxies: &BaseProxies,
     er_a: &mut PrivateEr,
-    er_b: Option<&PrivateEr>,
+    er_b: Option<&ErCtx>,
     payer: &Keypair,
     target: Target,
 ) -> Result<()> {
@@ -357,7 +356,7 @@ async fn isolate(
     let session_b = match target {
         Target::SameValidator => er_a.ctx(),
         Target::OtherValidator => {
-            er_b.ok_or("the reassignment case needs a second er")?.ctx()
+            er_b.ok_or("the reassignment case needs a second er")?
         }
     };
     base.submit_and_confirm(
@@ -413,7 +412,7 @@ async fn isolate(
     let session_b = match target {
         Target::SameValidator => er_a.ctx(),
         Target::OtherValidator => {
-            er_b.ok_or("the reassignment case needs a second er")?.ctx()
+            er_b.ok_or("the reassignment case needs a second er")?
         }
     };
     hold_steady(
@@ -494,12 +493,12 @@ async fn isolate(
 }
 
 #[async_trait(?Send)]
-impl PrivateErScenario for DelegationSessionIsolation {
+impl Scenario for DelegationSessionIsolation {
     fn name(&self) -> &str {
         "redshift/delegation_session_isolation"
     }
 
-    async fn run(&self, base: &BaseCtx) -> Result<()> {
+    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<()> {
         let proxies = BaseProxies::spawn(base).await?;
         let mut er_a = topology::private_er(
             base,
@@ -508,16 +507,6 @@ impl PrivateErScenario for DelegationSessionIsolation {
                 env: Vec::new(),
                 request_timeout: None,
                 base_endpoints: Some(proxies.endpoints()),
-            },
-        )
-        .await?;
-        let er_b = topology::private_er(
-            base,
-            ErOptions {
-                label: LABEL_B.to_owned(),
-                env: Vec::new(),
-                request_timeout: None,
-                base_endpoints: None,
             },
         )
         .await?;
@@ -536,14 +525,13 @@ impl PrivateErScenario for DelegationSessionIsolation {
             base,
             &proxies,
             &mut er_a,
-            Some(&er_b),
+            Some(er),
             &payer,
             Target::OtherValidator,
         )
         .await?;
 
         proxies.finish()?;
-        er_b.finish().await?;
         er_a.finish().await?;
         Ok(())
     }

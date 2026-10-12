@@ -83,6 +83,10 @@ impl PrivateEr {
         self.proc.is_running()
     }
 
+    pub async fn healthy(&self) -> bool {
+        self.is_running() && self.rpc_api().primary_ready().await
+    }
+
     pub fn storage_dir(&self) -> &Path {
         &self.plan.storage_dir
     }
@@ -174,6 +178,7 @@ impl PrivateEr {
         self.proc.audit(ready)?;
         let startup = launch_started.elapsed();
         let total = restart_started.elapsed();
+        self.ctx.pid = self.proc.pid();
         self.ctx.reset_blockhash();
         let slot_after = api.get_slot().await.ok();
 
@@ -328,12 +333,13 @@ async fn launch(
     proc.audit(ready)?;
     proc.audit(await_magic_fee_vault(base, &identity_pubkey).await)?;
 
-    let ctx = ErCtx::new_with_timeout(
+    let ctx = ErCtx::new(
         format!("http://127.0.0.1:{rpc_port}"),
         format!("ws://127.0.0.1:{ws_port}"),
         format!("http://127.0.0.1:{metrics_port}"),
         identity_pubkey,
         options.request_timeout,
+        pid,
     );
     Ok(PrivateEr {
         proc,

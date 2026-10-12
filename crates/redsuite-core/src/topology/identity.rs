@@ -3,6 +3,7 @@ use std::{collections::BTreeMap, fs, path::Path, time::Duration};
 use base64::Engine;
 use keypair::Keypair;
 use pubkey::Pubkey;
+use signer::Signer;
 
 use super::{config::DLP_ID, state};
 use crate::{context::BaseCtx, ChainCtx, Result};
@@ -17,12 +18,18 @@ const VAULT_LAMPORTS: u64 = 10_000_000;
 const IDENTITY_FUNDING_LAMPORTS: u64 = 20 * 1_000_000_000;
 const FUNDING_POLL: Duration = Duration::from_millis(250);
 
-pub fn er_identity_keypair() -> Result<Keypair> {
+pub fn identity_keypair(identity: &Pubkey) -> Result<Keypair> {
     let state = state::read_state()
         .ok_or("no shared stack state — boot the shared stack first")?;
-    Keypair::try_from(&state.er_identity_keypair[..]).map_err(|e| {
-        format!("corrupt state.json: bad er_identity_keypair: {e}").into()
-    })
+    state
+        .er_identity_pool
+        .iter()
+        .filter_map(|bytes| Keypair::try_from(&bytes[..]).ok())
+        .find(|keypair| keypair.pubkey() == *identity)
+        .ok_or_else(|| {
+            format!("{identity} is not one of this stack's ER identities")
+                .into()
+        })
 }
 
 fn vault_dump_json(vault: &Pubkey) -> String {

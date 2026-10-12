@@ -18,7 +18,7 @@ use crate::{
     api::{self, Api, ConfirmOptions, Metrics},
     profile::ExecutionConfig,
     resources::Resources,
-    Result,
+    DynError, Result,
 };
 
 const AIRDROP_TIMEOUT: Duration = Duration::from_secs(60);
@@ -212,6 +212,10 @@ impl BaseCtx {
         self.resources.clone()
     }
 
+    pub fn reclaim(&self, owner: &str) -> Vec<DynError> {
+        self.resources.reclaim_and_audit(owner)
+    }
+
     pub fn grpc(&self) -> Option<(&str, &str)> {
         self.grpc
             .as_ref()
@@ -235,12 +239,14 @@ impl BaseCtx {
     }
 }
 
+#[derive(Clone)]
 pub struct ErCtx {
     api: Api,
     ws_url: String,
     metrics: api::MetricsCollector,
     identity: Pubkey,
     blockhash: Rc<BlockhashCache>,
+    pub(crate) pid: u32,
 }
 
 impl ErCtx {
@@ -249,16 +255,8 @@ impl ErCtx {
         ws_url: String,
         metrics_url: String,
         identity: Pubkey,
-    ) -> Self {
-        Self::new_with_timeout(rpc_url, ws_url, metrics_url, identity, None)
-    }
-
-    pub(crate) fn new_with_timeout(
-        rpc_url: String,
-        ws_url: String,
-        metrics_url: String,
-        identity: Pubkey,
         request_timeout: Option<Duration>,
+        pid: u32,
     ) -> Self {
         let api = match request_timeout {
             Some(timeout) => Api::with_timeout(rpc_url, timeout),
@@ -270,7 +268,12 @@ impl ErCtx {
             metrics: api::MetricsCollector::new(&metrics_url),
             identity,
             blockhash: Rc::new(BlockhashCache::new(ER_BLOCKHASH_TTL)),
+            pid,
         }
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.pid
     }
 
     pub fn ws_url(&self) -> &str {
