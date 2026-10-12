@@ -75,11 +75,11 @@ pub fn usage(invocation: &str) -> String {
     [
         (
             "stack status",
-            "show the shared base+ER stack (booted on demand by tests)",
+            "show the shared base L1 (booted on demand) and leftover ERs",
         ),
         (
             "stack down",
-            "stop the shared stack, clear its state and delete its storage",
+            "stop the base and leftover ERs, clear the state, delete storage",
         ),
         (
             "report bmf [--out <path>]",

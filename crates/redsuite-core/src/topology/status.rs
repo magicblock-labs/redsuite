@@ -3,8 +3,7 @@ use std::{fs, path::PathBuf};
 use super::{process, state};
 use crate::Result;
 
-const STACK_STORAGE: &[&str] =
-    &["base-ledger", "er-storage", "genesis-accounts"];
+const STACK_STORAGE: &[&str] = &["base-ledger", "genesis-accounts"];
 
 pub fn status() -> Result<()> {
     let Some(state) = state::read_state() else {
@@ -15,32 +14,25 @@ pub fn status() -> Result<()> {
         describe_orphans(&[]);
         return Ok(());
     };
-    let describe = |name: &str, pid: u32, bin: &str, port: u16| {
-        let proc_state = if process::proc_matches(pid, bin) {
-            "running"
-        } else {
-            "DEAD"
-        };
-        let rpc_state = if process::rpc_listening(port) {
-            "rpc up"
-        } else {
-            "rpc DOWN"
-        };
-        println!("{name:5} pid {pid:<8} {proc_state:8} 127.0.0.1:{port:<6} {rpc_state}   ({bin})");
-    };
-    describe("base", state.base_pid, &state.base_bin, state.base_rpc_port);
-    if state.er_pid == 0 {
-        println!("er    not booted — the first shared-stack scenario boots it");
+    let proc_state = if process::proc_matches(state.base_pid, &state.base_bin) {
+        "running"
     } else {
-        describe("er", state.er_pid, &state.er_bin, state.er_rpc_port);
-        println!(
-            "er metrics    http://127.0.0.1:{}/metrics",
-            state.er_metrics_port
-        );
-    }
-    println!("er identity   {}", state.er_identity);
+        "DEAD"
+    };
+    let rpc_state = if process::rpc_listening(state.base_rpc_port) {
+        "rpc up"
+    } else {
+        "rpc DOWN"
+    };
+    println!(
+        "base  pid {:<8} {proc_state:8} 127.0.0.1:{:<6} {rpc_state}   ({})",
+        state.base_pid, state.base_rpc_port, state.base_bin
+    );
+    println!(
+        "ers   booted by each run for its ER groups, stopped when it ends"
+    );
     println!("logs          {}", state::stack_dir().display());
-    describe_orphans(&[state.base_pid, state.er_pid]);
+    describe_orphans(&[state.base_pid]);
     Ok(())
 }
 
@@ -65,16 +57,11 @@ pub fn down() -> Result<()> {
     match state::read_state() {
         None => println!("no shared stack to stop"),
         Some(state) => {
-            for (name, pid, bin) in [
-                ("er", state.er_pid, state.er_bin.as_str()),
-                ("base", state.base_pid, state.base_bin.as_str()),
-            ] {
-                if process::proc_matches(pid, bin) {
-                    println!("stopping {name} (pid {pid})");
-                    process::kill_pid(pid);
-                }
-                known.push(pid);
+            if process::proc_matches(state.base_pid, &state.base_bin) {
+                println!("stopping base (pid {})", state.base_pid);
+                process::kill_pid(state.base_pid);
             }
+            known.push(state.base_pid);
             if let Err(error) = fs::remove_file(state::state_path()) {
                 if error.kind() != std::io::ErrorKind::NotFound {
                     return Err(error.into());

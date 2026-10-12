@@ -1,14 +1,15 @@
 mod catalog;
 
-use std::{process::Command, time::Instant};
+use std::{future::Future, process::Command, time::Instant};
 
-use futures_util::StreamExt;
+use futures_util::{future::join_all, StreamExt};
 use redsuite_core::{
-    catalog::{Family, Lane, ScenarioEntry, Topology},
+    catalog::{Er, ErGroup, Family, ScenarioEntry},
     console, frontend,
     profile::{ExecutionConfig, LoopMode, Profile},
     report::{self, ScenarioReport, Unit},
-    topology, Result, RunRecord,
+    topology::{self, PrivateEr, ER_READY_TIMEOUT},
+    BaseCtx, ErCtx, Result, RunRecord,
 };
 
 const FAMILIES: &[&[ScenarioEntry]] = &[
@@ -16,7 +17,8 @@ const FAMILIES: &[&[ScenarioEntry]] = &[
     catalog::redshift::SCENARIOS,
     catalog::redhat::SCENARIOS,
 ];
-const PRIVATE_ER_CONCURRENCY: usize = 2;
+const FRESH_CONCURRENCY: usize = 2;
+const NO_GROUP: &str = "the catalog entry declares no ER group";
 
 fn entries() -> impl Iterator<Item = &'static ScenarioEntry> {
     FAMILIES.iter().flat_map(|scenarios| scenarios.iter())
@@ -65,22 +67,158 @@ fn selected(target: &str) -> Vec<&'static ScenarioEntry> {
     }
 }
 
+struct GroupEr {
+    group: &'static ErGroup,
+    er: Option<PrivateEr>,
+    failure: Option<String>,
+    tainted: bool,
+}
+
+impl GroupEr {
+    fn new(group: &'static ErGroup) -> Self {
+        Self {
+            group,
+            er: None,
+            failure: None,
+            tainted: false,
+        }
+    }
+
+    fn owns(&self, entry: &ScenarioEntry) -> bool {
+        entry
+            .er
+            .group()
+            .is_some_and(|group| group.label == self.group.label)
+    }
+
+    fn note(&mut self, records: &[RunRecord]) {
+        self.tainted |= records.iter().any(|record| !record.passed());
+    }
+
+    async fn provide(
+        &mut self,
+        base: &Result<BaseCtx>,
+    ) -> std::result::Result<ErCtx, String> {
+        let label = self.group.label;
+        if let Some(er) = &self.er {
+            let why = if self.tainted {
+                "a scenario failed on it"
+            } else if !er.healthy().await {
+                "it is no longer healthy"
+            } else {
+                return Ok(er.ctx().clone());
+            };
+            console::line(format_args!(
+                "group ER `{label}`: {why}; replacing it with a fresh one"
+            ));
+            self.finish().await;
+        } else if let Some(failure) = &self.failure {
+            return Err(failure.clone());
+        }
+        self.tainted = false;
+        let booted = match base {
+            Ok(base) => self.boot(base).await,
+            Err(error) => Err(error.to_string().into()),
+        };
+        booted.map_err(|error| {
+            let failure = format!("group ER `{label}` did not boot: {error}");
+            console::line(format_args!("{failure}"));
+            self.failure = Some(failure.clone());
+            failure
+        })
+    }
+
+    async fn boot(&mut self, base: &BaseCtx) -> Result<ErCtx> {
+        let er = topology::private_er(base, self.group.options()).await?;
+        er.wait_ready(ER_READY_TIMEOUT).await?;
+        let ctx = er.ctx().clone();
+        self.er = Some(er);
+        Ok(ctx)
+    }
+
+    async fn finish(&mut self) {
+        if let Some(er) = self.er.take() {
+            if let Err(error) = er.finish().await {
+                console::line(format_args!(
+                    "group ER `{}`: {error}",
+                    self.group.label
+                ));
+            }
+        }
+    }
+}
+
+type Lane = (String, f64, Vec<RunRecord>);
+
+async fn timed(lane: &str, run: impl Future<Output = Vec<RunRecord>>) -> Lane {
+    let started = Instant::now();
+    let records = run.await;
+    (lane.to_owned(), started.elapsed().as_secs_f64(), records)
+}
+
+async fn run_one(
+    entry: &'static ScenarioEntry,
+    config: ExecutionConfig,
+    er: std::result::Result<ErCtx, String>,
+) -> RunRecord {
+    console::debug(format_args!("starting {}", entry.name()));
+    (entry.run)(config, er).await
+}
+
 async fn run_lane(
-    lane: &'static str,
     scenarios: Vec<&'static ScenarioEntry>,
     limit: usize,
     config: ExecutionConfig,
-) -> (Vec<RunRecord>, (&'static str, f64)) {
-    let started = Instant::now();
-    let records = futures_util::stream::iter(scenarios)
-        .map(|entry| async move {
-            console::debug(format_args!("starting {}", entry.name()));
-            (entry.run)(config).await
-        })
+    er: std::result::Result<ErCtx, String>,
+) -> Vec<RunRecord> {
+    futures_util::stream::iter(scenarios)
+        .map(|entry| run_one(entry, config, er.clone()))
         .buffer_unordered(limit.max(1))
         .collect()
-        .await;
-    (records, (lane, started.elapsed().as_secs_f64()))
+        .await
+}
+
+async fn run_group(
+    group: &mut GroupEr,
+    members: Vec<&'static ScenarioEntry>,
+    base: &Result<BaseCtx>,
+    config: ExecutionConfig,
+    serial: bool,
+) -> Vec<RunRecord> {
+    let (shared, exclusive): (Vec<_>, Vec<_>) = members
+        .into_iter()
+        .partition(|entry| matches!(entry.er, Er::Shared(_)));
+    let (batch, mut sequential) = if serial {
+        (Vec::new(), shared)
+    } else {
+        (shared, Vec::new())
+    };
+    sequential.extend(exclusive);
+    let mut records = Vec::new();
+    if !batch.is_empty() {
+        let er = group.provide(base).await;
+        let limit = batch.len();
+        let mut done = run_lane(batch, limit, config, er).await;
+        group.note(&done);
+        records.append(&mut done);
+    }
+    for entry in sequential {
+        let er = group.provide(base).await;
+        let record = run_one(entry, config, er).await;
+        group.note(std::slice::from_ref(&record));
+        records.push(record);
+    }
+    records
+}
+
+fn members(
+    group: &GroupEr,
+    pool: &[&'static ScenarioEntry],
+) -> Vec<&'static ScenarioEntry> {
+    pool.iter()
+        .copied()
+        .filter(|entry| group.owns(entry))
+        .collect()
 }
 
 async fn run(args: &[String]) -> Result<()> {
@@ -169,67 +307,110 @@ async fn run(args: &[String]) -> Result<()> {
             .setting("scenarios", names.join(","))
             .setting("redline profile", config.profile.name())
     });
-    let (benchmarks, functional): (Vec<_>, Vec<_>) = scenarios
-        .into_iter()
-        .partition(|entry| entry.lane() == Lane::Exclusive);
-    let (private_er, shared): (Vec<_>, Vec<_>) = functional
-        .into_iter()
-        .partition(|entry| entry.lane() == Lane::PrivateEr);
 
-    let mut lanes = Vec::new();
-    let mut stop = Ok(false);
-    if serial {
-        let (private_benchmarks, shared_benchmarks): (Vec<_>, Vec<_>) =
-            benchmarks
-                .into_iter()
-                .partition(|entry| entry.topology == Topology::PrivateEr);
-        let mut on_shared_er = shared;
-        on_shared_er.extend(shared_benchmarks);
-        let mut on_private_er = private_er;
-        on_private_er.extend(private_benchmarks);
-        console::debug(format_args!(
-            "running {} shared-ER scenarios, then {} private-ER scenarios, \
-             one at a time",
-            on_shared_er.len(),
-            on_private_er.len()
-        ));
-        lanes.push(run_lane("shared serial", on_shared_er, 1, config).await);
-        if !on_private_er.is_empty() {
-            stop = topology::stop_shared_er().await;
-        }
-        if matches!(stop, Ok(true)) {
-            console::line(format_args!(
-                "stopped the shared ER before the private-ER scenarios"
-            ));
-        }
-        if stop.is_ok() {
-            lanes.push(
-                run_lane("private-er serial", on_private_er, 1, config).await,
-            );
-        }
-    } else {
-        console::debug(format_args!(
-            "running {} shared-stack and {} private-ER scenarios in parallel",
-            shared.len(),
-            private_er.len()
-        ));
-        let shared_count = shared.len();
-        let (shared, private) = futures_util::future::join(
-            run_lane("shared", shared, shared_count, config),
-            run_lane("private-er", private_er, PRIVATE_ER_CONCURRENCY, config),
-        )
-        .await;
-        lanes.extend([shared, private]);
-        if !benchmarks.is_empty() {
-            console::debug(format_args!(
-                "running {} benchmark scenarios sequentially",
-                benchmarks.len()
-            ));
-            lanes.push(run_lane("benchmarks", benchmarks, 1, config).await);
+    let base = topology::base_only(config).await;
+    let mut groups: Vec<GroupEr> = Vec::new();
+    for group in scenarios.iter().filter_map(|entry| entry.er.group()) {
+        if !groups.iter().any(|known| known.group.label == group.label) {
+            groups.push(GroupEr::new(group));
         }
     }
+    let (benchmarks, functional): (Vec<_>, Vec<_>) = scenarios
+        .into_iter()
+        .partition(|entry| entry.host_exclusive);
+    let (grouped, fresh): (Vec<_>, Vec<_>) = functional
+        .into_iter()
+        .partition(|entry| entry.er.group().is_some());
+    console::debug(format_args!(
+        "running {} ER group(s), {} fresh-ER scenarios and {} benchmarks{}",
+        groups.len(),
+        fresh.len(),
+        benchmarks.len(),
+        if serial { ", one at a time" } else { "" }
+    ));
+
+    let mut lanes = Vec::new();
+    if serial {
+        for group in &mut groups {
+            let mut mine = members(group, &grouped);
+            mine.extend(members(group, &benchmarks));
+            let lane = format!("{} serial", group.group.label);
+            lanes.push(
+                timed(&lane, run_group(group, mine, &base, config, true)).await,
+            );
+            group.finish().await;
+        }
+        let mut rest = fresh;
+        rest.extend(
+            benchmarks
+                .iter()
+                .copied()
+                .filter(|entry| entry.er.group().is_none()),
+        );
+        lanes.push(
+            timed(
+                "fresh serial",
+                run_lane(rest, 1, config, Err(NO_GROUP.to_owned())),
+            )
+            .await,
+        );
+    } else {
+        let group_lanes = join_all(groups.iter_mut().map(|group| {
+            let mine = members(group, &grouped);
+            let keep = benchmarks.iter().any(|entry| group.owns(entry));
+            let base = &base;
+            async move {
+                let lane = timed(
+                    group.group.label,
+                    run_group(group, mine, base, config, false),
+                )
+                .await;
+                if !keep {
+                    group.finish().await;
+                }
+                lane
+            }
+        }));
+        let fresh_lane = timed(
+            "fresh",
+            run_lane(
+                fresh,
+                FRESH_CONCURRENCY,
+                config,
+                Err(NO_GROUP.to_owned()),
+            ),
+        );
+        let (group_lanes, fresh_lane) =
+            futures_util::future::join(group_lanes, fresh_lane).await;
+        lanes.extend(group_lanes);
+        lanes.push(fresh_lane);
+        if !benchmarks.is_empty() {
+            let benchmark_lane = async {
+                let mut records = Vec::new();
+                for entry in benchmarks {
+                    let mut group =
+                        groups.iter_mut().find(|group| group.owns(entry));
+                    let er = match &mut group {
+                        Some(group) => group.provide(&base).await,
+                        None => Err(NO_GROUP.to_owned()),
+                    };
+                    let record = run_one(entry, config, er).await;
+                    if let Some(group) = group {
+                        group.note(std::slice::from_ref(&record));
+                    }
+                    records.push(record);
+                }
+                records
+            };
+            lanes.push(timed("benchmarks", benchmark_lane).await);
+        }
+        for group in &mut groups {
+            group.finish().await;
+        }
+    }
+
     let mut records = Vec::new();
-    for (mut runs, (lane, seconds)) in lanes {
+    for (lane, seconds, mut runs) in lanes {
         if !runs.is_empty() {
             report = report.map(|report| {
                 report.metric(format!("{lane} seconds"), Unit::Seconds, seconds)
@@ -237,9 +418,16 @@ async fn run(args: &[String]) -> Result<()> {
         }
         records.append(&mut runs);
     }
-    let outcome = stop
-        .map_err(|error| format!("stopping shared ER: {error}").into())
-        .and(summarize(&records));
+    let reclaim_errors: Vec<String> = base
+        .iter()
+        .flat_map(|base| base.reclaim(&format!("suite/{target}")))
+        .map(|error| error.to_string())
+        .collect();
+    let outcome = summarize(&records).and(if reclaim_errors.is_empty() {
+        Ok(())
+    } else {
+        Err(reclaim_errors.join("; ").into())
+    });
     let cleanup = if serial && !keep_storage {
         topology::down()
     } else {

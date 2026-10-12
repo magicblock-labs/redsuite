@@ -5,7 +5,7 @@ use std::{
 
 use json::{Deserialize, Serialize};
 
-use crate::{host, report, topology, DynError};
+use crate::{console, host, report, topology, DynError};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaunchRecord {
@@ -135,6 +135,29 @@ impl Resources {
             }
         }
         reclaimed
+    }
+}
+
+impl Resources {
+    pub(crate) fn reclaim_and_audit(&self, owner: &str) -> Vec<DynError> {
+        for reclaimed in self.reclaim() {
+            let stopped = if reclaimed.killed { "stopped" } else { "" };
+            let removed = if reclaimed.removed {
+                format!("removed {}", reclaimed.storage_dir)
+            } else {
+                String::new()
+            };
+            let joiner = if reclaimed.killed && reclaimed.removed {
+                ", "
+            } else {
+                ""
+            };
+            console::line(format_args!(
+                "{owner}: reclaimed private ER `{}`: {stopped}{joiner}{removed}",
+                reclaimed.label
+            ));
+        }
+        self.audit()
     }
 }
 

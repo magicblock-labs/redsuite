@@ -183,7 +183,7 @@ impl Scenario for CloneOnAccess {
         )
         .await?;
 
-        let identity = topology::er_identity_keypair()?;
+        let identity = topology::identity_keypair(&er.identity())?;
         let cycle = [
             commit_state(
                 &er.identity(),

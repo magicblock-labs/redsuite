@@ -2,7 +2,10 @@ use std::{future::Future, pin::Pin};
 
 use pubkey::Pubkey;
 
-use crate::{profile::ExecutionConfig, scenario::RunRecord};
+use crate::{
+    context::ErCtx, profile::ExecutionConfig, scenario::RunRecord,
+    topology::ErOptions,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Family {
@@ -21,23 +24,41 @@ impl Family {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Topology {
-    Shared,
-    PrivateEr,
+#[derive(Debug, PartialEq, Eq)]
+pub struct ErGroup {
+    pub label: &'static str,
+    pub env: &'static [(&'static str, &'static str)],
+}
+
+impl ErGroup {
+    pub fn options(&self) -> ErOptions {
+        ErOptions {
+            label: self.label.to_owned(),
+            env: self
+                .env
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+            ..ErOptions::default()
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Resource {
-    Er,
-    HostExclusive,
+pub enum Er {
+    Shared(&'static ErGroup),
+    Exclusive(&'static ErGroup),
+    Fresh,
+    None,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Lane {
-    Exclusive,
-    PrivateEr,
-    Shared,
+impl Er {
+    pub fn group(self) -> Option<&'static ErGroup> {
+        match self {
+            Er::Shared(group) | Er::Exclusive(group) => Some(group),
+            Er::Fresh | Er::None => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -115,37 +136,38 @@ pub type ScenarioFuture = Pin<Box<dyn Future<Output = RunRecord>>>;
 pub struct ScenarioEntry {
     pub family: Family,
     pub short_name: &'static str,
-    pub topology: Topology,
-    pub resources: &'static [Resource],
+    pub er: Er,
+    pub host_exclusive: bool,
     pub fixtures: &'static [Fixture],
     pub optional_fixtures: &'static [Fixture],
-    pub run: fn(ExecutionConfig) -> ScenarioFuture,
+    pub run: fn(
+        ExecutionConfig,
+        std::result::Result<ErCtx, String>,
+    ) -> ScenarioFuture,
 }
 
 impl ScenarioEntry {
     pub fn name(&self) -> String {
         format!("{}/{}", self.family.prefix(), self.short_name)
     }
-
-    pub fn lane(&self) -> Lane {
-        if self.resources.contains(&Resource::HostExclusive) {
-            Lane::Exclusive
-        } else if self.topology == Topology::PrivateEr {
-            Lane::PrivateEr
-        } else {
-            Lane::Shared
-        }
-    }
 }
 
 #[macro_export]
 macro_rules! scenario_catalog {
-    (@execute Shared, $scenario:expr, $fixtures:expr, $optional:expr,
-     $config:expr) => {
-        $crate::run_shared_scenario($scenario, $fixtures, $optional, $config)
+    (@execute Shared($group:expr), $scenario:expr, $fixtures:expr,
+     $optional:expr, $config:expr, $er:expr) => {
+        $crate::run_shared_scenario(
+            $scenario, $fixtures, $optional, $config, $er,
+        )
     };
-    (@execute PrivateEr, $scenario:expr, $fixtures:expr, $optional:expr,
-     $config:expr) => {
+    (@execute Exclusive($group:expr), $scenario:expr, $fixtures:expr,
+     $optional:expr, $config:expr, $er:expr) => {
+        $crate::run_shared_scenario(
+            $scenario, $fixtures, $optional, $config, $er,
+        )
+    };
+    (@execute $base_only:ident, $scenario:expr, $fixtures:expr,
+     $optional:expr, $config:expr, $er:expr) => {
         $crate::run_private_er_scenario(
             $scenario, $fixtures, $optional, $config,
         )
@@ -153,8 +175,8 @@ macro_rules! scenario_catalog {
     (
         family: $family:ident,
         $($short_name:ident => $($segment:ident)::+ {
-            topology: $topology:ident,
-            resources: [$($resource:expr),* $(,)?],
+            er: $er:ident $(($group:expr))?,
+            $(host_exclusive: $host_exclusive:literal,)?
             fixtures: [$($fixture:expr),* $(,)?]
             $(, optional_fixtures: [$($optional:expr),* $(,)?])?
             $(,)?
@@ -164,16 +186,18 @@ macro_rules! scenario_catalog {
             $($crate::catalog::ScenarioEntry {
                 family: $crate::catalog::Family::$family,
                 short_name: stringify!($short_name),
-                topology: $crate::catalog::Topology::$topology,
-                resources: &[$($resource),*],
+                er: $crate::catalog::Er::$er $((&$group))?,
+                host_exclusive: false $(| $host_exclusive)?,
                 fixtures: &[$($fixture),*],
                 optional_fixtures: &[$($($optional),*)?],
-                run: |config| {
-                    Box::pin($crate::scenario_catalog!(@execute $topology,
+                run: |config, _group_er| {
+                    Box::pin($crate::scenario_catalog!(
+                        @execute $er $(($group))?,
                         scenarios::$($segment)::+,
                         &[$($fixture),*],
                         &[$($($optional),*)?],
-                        config
+                        config,
+                        _group_er
                     ))
                 },
             },)*

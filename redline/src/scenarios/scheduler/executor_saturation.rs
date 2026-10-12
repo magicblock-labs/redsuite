@@ -19,8 +19,8 @@ use redsuite_core::{
         RunConfig, RunOutcome, WorkerBudgets,
     },
     sampler::{MeanMax, Sampled, Sampler, Trailing},
-    topology, Api, BaseCtx, ChainCtx, ErClient, ErCtx, MetricsDelta, Result,
-    Scenario, ScenarioReport, SendBody, TxSender,
+    Api, BaseCtx, ChainCtx, ErClient, ErCtx, MetricsDelta, Result, Scenario,
+    ScenarioReport, SendBody, TxSender,
 };
 use signature::Signature;
 
@@ -360,9 +360,7 @@ impl Scenario<ScenarioReport> for ExecutorSaturation {
         let accounts = Arc::new(accounts);
         let payer_bytes = prep::payer_bytes(&payers);
         let er_rpc_url = er.api().url().to_owned();
-        let er_pid = topology::current_state()
-            .ok_or("no shared stack state")?
-            .er_pid;
+        let er_pid = er.pid();
 
         let count_before_warmup = er.scrape_metrics().await?.get(TX_COUNT);
         let warm = execute_cell_burst(

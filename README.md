@@ -34,8 +34,9 @@ Then, in this repo:
     cargo build --release -p redsuite    # build the runner
     target/release/redsuite run all      # run everything
 
-The first scenario boots the base + ER; every other scenario — and every later
-run — reuses them. `cargo xtask stack down` stops the stack.
+The first run boots the base L1 and leaves it running for later runs; each
+run boots the ERs its scenarios declare and stops them when it ends.
+`cargo xtask stack down` stops the base.
 
 Scenarios run on Linux and macOS. Process supervision (readiness, graceful
 stop, hard kill, restart, orphan cleanup) and the ER measurements (per-thread
@@ -91,34 +92,34 @@ benchmark hosts use — no cargo, no checkout:
     redsuite run all                          # everything (redline last, alone)
     redsuite run all --serial                 # one at a time, storage wiped at the end
     redsuite stack status                     # ports, pids, health
-    redsuite stack down                       # stop the shared stack and delete its storage
+    redsuite stack down                       # stop the base and leftover ERs, delete their storage
     redsuite report bmf --out redsuite-bmf.json # export benchmark measurements for Bencher
 
 It still needs `solana-test-validator` on PATH and the ER binary under test
 (`MAGICBLOCK_VALIDATOR_BIN`), and it reads the built programs from the
 workspace. Set `REDSUITE_ROOT` when it runs outside a checkout.
 
-`run all` uses three lanes: every shared-stack scenario at once, at most two
-private-ER scenarios beside them, then the redline family last and alone.
+`run all` gives each ER group a lane — the group's shared members at once,
+then its exclusive members one at a time — beside a lane of at most two
+fresh-ER scenarios, then runs the host-exclusive benchmarks last and alone.
 Benchmarks must never share the box, so keep that last lane exclusive.
 
 A CLI run whose selection contains Redline records `suite/<target>` with its
 host, workload profile, full wall time and lane durations in
 `target/redsuite-reports/`; Redshift- and Redhat-only runs persist nothing.
-Shared and private lane times overlap; benchmarks follow both, and serial wall
+Group and fresh lane times overlap; benchmarks follow both, and serial wall
 time includes teardown.
 
 Every ER preallocates its storage in multi-gigabyte steps, so a full parallel
 run needs room for about five validators at once. `--serial` trades wall
-time for disk: it runs every scenario that uses the shared ER one at a
-time, benchmarks included, then stops the shared ER and removes its storage,
-then runs the private-ER scenarios one at a time against the remaining
+time for disk: it runs each ER group's members one at a time, benchmarks
+included, stops the group's ER and removes its storage before the next
+group, then runs the fresh-ER scenarios one at a time against the remaining
 base. Apart from the scenarios that boot several validators by design (a
-second ER, a leader with verifiers, or a private ER beside the shared one),
-only one ER exists at any moment. When the run ends it performs `stack
-down`, which stops every process it started and deletes the base ledger,
-the shared ER storage and every private ER directory under
-`target/redsuite-stack/` (logs stay). `--keep-storage` skips that final
+leader with verifiers, or a private ER beside the group's), only one ER
+exists at any moment. When the run ends it performs `stack down`, which
+stops every process it started and deletes the base ledger and every ER
+directory under `target/redsuite-stack/` (logs stay). `--keep-storage` skips that final
 teardown. Every validator's ledger lives in the stack dir,
 `target/redsuite-stack/` unless `REDSUITE_STACK_DIR` points it at a larger
 disk; set `REDSUITE_ACCOUNTSDB_DIR` to
@@ -137,45 +138,56 @@ the run log names what was reclaimed.
 
 A selection is `all`, a family, a scenario (full or short name), or a name
 prefix; an exact name wins over the prefix it also matches. The runner owns
-the concurrency limits: shared-stack scenarios run together, private-ER
-scenarios two at a time, and the redline family last and alone. Run one suite
-invocation at a time.
+the concurrency limits: an ER group's shared members run together and its
+exclusive members alone on that ER, fresh-ER scenarios two at a time, and the
+redline family last and alone. Run one suite invocation at a time.
 
-All scenarios share **one boot-once stack**: the first scenario to need it boots
-base + ER on dynamically allocated ports and leaves them running; every later
-scenario — in the same run or the next — health-checks and reuses them. A dead or
-unhealthy stack is killed and rebooted transparently. Coordination lives in
+All scenarios share **one boot-once base L1**: the first run boots it on
+dynamically allocated ports and leaves it running; every later scenario — in
+the same run or the next — health-checks and reuses it, and a dead or unhealthy
+base is killed and rebooted transparently. ERs are not shared across runs: the
+runner boots each ER group its selection needs, hands it to the group's
+members and stops it after the group's last member. Coordination lives in
 `target/redsuite-stack/` (`state.json`, `identity-pool.json`, a cross-process
 flock, `genesis-accounts/`, logs, ledgers).
 
     cargo xtask stack status    # ports, pids, health, log locations
     cargo xtask stack down      # stop the stack and clear its state
 
-Scenario isolation comes from fresh keypairs, not fresh chains.
-Scenarios that kill a validator, restart one, or need their own config boot
-private ERs. `ephemeral_accounts`, `task_scheduler`, `config_gates`, `rpc_compat_methods`, `aml_gate`,
-`activation_single_shot`, `program_upgrade`, `cache_lifecycle`,
-`undelegation_reconnect_gap`, `undelegation_grpc_redundancy`,
-`checkpoint_durability`, `ledger_retention`, `snapshot_read_race`,
-`commit_blackout`, `commit_exactly_once`,
-`commit_settlement_order`, `undelegation_recovery`,
-`delegation_session_isolation`, `projected_token_lifecycle`,
-`transaction_retry_cold_fetch`, `transaction_retry_concurrent`,
-`transaction_retry_subscriptions`,
-`transaction_retry_expiry_restart`,
-`verifier_lifecycle`, and `replication_recovery`
-run on
-one instead of the shared ER (the last two boot their private ER as a leader
-with two verifiers replicating from it); `restart_under_load` and
-`superblock_boundary_latency` do the same without ever booting the shared ER;
-`ws_conn_capacity`, `clone_lru_churn`, `cold_hydration_tail`,
-`ensure_gate_stall`, and `storage_prodsize_sustain` boot theirs beside the
-shared stack, whose identity their accounts are delegated to. Each takes
-its own identity from a 64-slot pool minted at genesis, so private ERs never
-collide with the shared one or each other.
+Scenario isolation comes from fresh keypairs, not fresh chains. Every
+catalog entry declares its ER contract (`cli/src/catalog.rs`):
+
+- `Shared(DEFAULT)` — parallel shared access: the member runs concurrently
+  with the group's other shared members on the group's ER.
+- `Exclusive(DEFAULT)` — sequential shared access: the member has the
+  group's ER to itself, with no shared or other exclusive member beside it
+  (`ephemeral_accounts` and `task_scheduler` account for every lamport of a
+  vault or of the validator identity, and every Redline benchmark on the
+  default ER).
+- `Fresh` — fresh isolated execution: the scenario boots and owns the ERs it
+  needs — those that kill or restart a validator, run behind the base-chain
+  proxies, need their own configuration, or boot a leader with verifiers.
+  `restart_under_load` and `superblock_boundary_latency` are the host-exclusive
+  ones; `ws_conn_capacity`, `clone_lru_churn`, `cold_hydration_tail`,
+  `ensure_gate_stall` and `storage_prodsize_sustain` instead hold the default
+  ER exclusively and boot theirs beside it, delegating their accounts to the
+  default identity.
+- `None` — base only: `api_invariants`, `claim_fees` and `table_mania` never
+  start an ER.
+
+An ER group (`DEFAULT` is the only one so far) names an ER and the
+environment it boots with; groups are declared, never inferred from matching
+configuration. The runner boots a group's ER before its first member and
+stops it, storage included, after its last member; a `Fresh` scenario's ERs
+are reclaimed when that scenario ends. A member that fails, or a group ER
+that no longer reports itself healthy, makes the runner replace that ER with
+a fresh one before the next member and say so in the run log, so no state
+carries over; a group ER that fails to boot fails every member with that
+cause, and a run reclaims and audits every ER it launched before it exits;
+shared members accept each other's state by declaration. Every ER takes its
+identity from a 64-slot pool minted at genesis, so ERs never collide with
+each other, and a group's ER keeps its identity across the run.
 The four retry entrypoints share their implementation in `transaction_retries`.
-`api_invariants`, `claim_fees`, and `table_mania` use the same private-scenario
-runner to provision only the base; they do not start an ER.
 
 The harness needs two binaries, and a third for replicated topologies:
 
@@ -553,8 +565,8 @@ committor (ER → base commits):
   value landed. After the connections are restored, or the ER is restarted
   in place, a base write must become visible on the ER without any storage
   cleanup, and redelegating the account must let ER writes through again.
-- `delegation_session_isolation` — boots two private ERs, the first behind
-  the base-chain proxies, and proves work from an earlier delegation
+- `delegation_session_isolation` — boots a private ER behind the base-chain
+  proxies beside the default ER and proves work from an earlier delegation
   session cannot touch the account after it was undelegated and delegated
   again, since the address stays the same. Per case: an account delegated
   to the first ER is written, a commit is scheduled while the proxy rejects
@@ -583,9 +595,9 @@ committor (ER → base commits):
   byte-for-byte, and it files one undelegation so the owning program refuses
   it. The account then keeps its committed state but stays delegated, which is
   the failure mode worth knowing about.
-- `claim_fees` — funds the validator's own fee vault on base and then claims
-  it, signed by the validator itself. The lamports land on the identity and the
-  vault is left sitting at its rent-exempt floor.
+- `claim_fees` — funds the fee vault of one of the stack's validator
+  identities on base and then claims it, signed by that identity. The lamports
+  land on the identity and the vault is left sitting at its rent-exempt floor.
 - `table_mania` — drives the base chain's address lookup table program, the
   one the committor uses when a commit outgrows a single transaction.
   Creates a table, extends it to the 256-key cap, decodes the account and
@@ -673,7 +685,8 @@ harness:
 scheduler:
 
 - `task_scheduler` — drives the scheduler the way a user does: `ScheduleTask`
-  and `CancelTask` through the flexi fixture on a private ER, nothing else.
+  and `CancelTask` through the flexi fixture on the default ER, which it
+  holds exclusively, nothing else.
   Since validator PR #1369 the validator keeps each task as an account owned
   by the ephemeral Hydra scheduler program and no longer executes anything
   itself, so the scenario observes those accounts generically: schedule creates

@@ -105,7 +105,7 @@ pub const VERIFIER_BIN_ENV: &str = "MAGICBLOCK_VERIFIER_BIN";
 
 const BASE_LEDGER_SHREDS: &str = "200000";
 pub(super) const BASE_READY_TIMEOUT: Duration = Duration::from_secs(60);
-pub(super) const ER_READY_TIMEOUT: Duration = Duration::from_secs(120);
+pub const ER_READY_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub(super) fn find_base_bin() -> Result<PathBuf> {
     which(BASE_BIN).ok_or_else(|| {
