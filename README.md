@@ -166,8 +166,8 @@ catalog entry declares its ER contract (`cli/src/catalog.rs`):
   benchmark on the default ER, and the three transaction-retry cases that
   take turns on the proxied `transaction-retries` ER).
 - `Fresh` — fresh isolated execution: the scenario boots and owns the ERs it
-  needs — those that kill or restart a validator, run behind the base-chain
-  proxies, need their own configuration, or boot a leader with verifiers.
+  needs — those that kill or restart a validator, require their own proxied
+  ER, need their own configuration, or boot a leader with verifiers.
   `restart_under_load` and `superblock_boundary_latency` are the host-exclusive
   ones; `ws_conn_capacity`, `clone_lru_churn`, `cold_hydration_tail`,
   `ensure_gate_stall` and `storage_prodsize_sustain` instead hold the default
