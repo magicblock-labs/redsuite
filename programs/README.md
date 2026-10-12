@@ -10,7 +10,7 @@ instruction. Scenario paths are relative to `<family>/src/scenarios/`.
 
 | Redline instruction (bincode tag) | Consumer |
 |---|---|
-| `CommitAccounts` (0), `CommitAndUndelegateAccounts` (1) | Redshift `committor/commit_roundtrip`; Redline commit benchmarks use tag 0 |
+| `CommitAccounts` (0), `CommitAndUndelegateAccounts` (1) | Redshift `chainlink/clone_on_access`; Redline commit benchmarks use tag 0 |
 | `InitAccount` (2), `Delegate` (3) | `redsuite-core::redline::Accounts`, used by Redline workloads and Redshift lifecycle scenarios |
 | `SimpleByteSet` (4) | Redline `aperture/simple_load`; Redshift lifecycle writes and upgrade-probe CPIs |
 | `ExpensiveHashCompute` (5) | Redline `aperture/high_cu`, scheduler workloads, `redsuite-core::redline::causal` |

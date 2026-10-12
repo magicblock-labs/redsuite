@@ -2,7 +2,6 @@ pub mod claim_fees;
 pub mod commit_and_undelegate;
 pub mod commit_blackout;
 pub mod commit_exactly_once;
-pub mod commit_roundtrip;
 pub mod commit_settlement_order;
 pub mod delegation_session_isolation;
 pub mod table_mania;
