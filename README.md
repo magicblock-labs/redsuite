@@ -71,9 +71,9 @@ return the measurements that land in `target/redsuite-reports/`.
 
 Registration is one declaration: an entry in the catalog
 (`cli/src/catalog.rs`, one `scenario_catalog!` block per family). The entry
-names the scenario's short name, its runner type, and its metadata
-(topology, resources, and fixtures); the `redsuite` binary dispatches from
-that record and is the only scenario runner. Cargo tests do not execute
+names the scenario's short name, runner type, ER contract (`er`), host
+exclusivity (`host_exclusive`), and fixtures. The `redsuite` binary dispatches
+from that record and is the only scenario runner. Cargo tests do not execute
 scenarios.
 
 ## The redsuite binary
