@@ -31,7 +31,8 @@ const CONTINUITY_STEP: Duration = Duration::from_millis(50);
 pub struct CloneOnAccess;
 
 fn untouched(data: &[u8]) -> bool {
-    data[layout::DATA_OFFSET..].iter().all(|&byte| byte == 0)
+    data.get(layout::DATA_OFFSET..)
+        .is_some_and(|rest| rest.iter().all(|&byte| byte == 0))
 }
 
 fn head(bytes: &[u8]) -> String {
