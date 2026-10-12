@@ -159,11 +159,12 @@ catalog entry declares its ER contract (`cli/src/catalog.rs`):
 
 - `Shared(DEFAULT)` — parallel shared access: the member runs concurrently
   with the group's other shared members on the group's ER.
-- `Exclusive(DEFAULT)` — sequential shared access: the member has the
-  group's ER to itself, with no shared or other exclusive member beside it
-  (`ephemeral_accounts` and `task_scheduler` account for every lamport of a
-  vault or of the validator identity, and every Redline benchmark on the
-  default ER).
+- `Exclusive(DEFAULT)`, `Exclusive(RETRIES)` — sequential shared access: the
+  member has the group's ER to itself, with no shared or other exclusive
+  member beside it (`ephemeral_accounts` and `task_scheduler` account for
+  every lamport of a vault or of the validator identity, every Redline
+  benchmark on the default ER, and the three transaction-retry cases that
+  take turns on the proxied `transaction-retries` ER).
 - `Fresh` — fresh isolated execution: the scenario boots and owns the ERs it
   needs — those that kill or restart a validator, run behind the base-chain
   proxies, need their own configuration, or boot a leader with verifiers.
@@ -175,10 +176,15 @@ catalog entry declares its ER contract (`cli/src/catalog.rs`):
 - `None` — base only: `api_invariants`, `claim_fees` and `table_mania` never
   start an ER.
 
-An ER group (`DEFAULT` is the only one so far) names an ER and the
-environment it boots with; groups are declared, never inferred from matching
-configuration. The runner boots a group's ER before its first member and
-stops it, storage included, after its last member; a `Fresh` scenario's ERs
+An ER group names an ER, the environment it boots with and whether its base
+traffic runs through RedSuite's base-chain proxies — `DEFAULT` is the stock
+ER most scenarios share, `RETRIES` the proxied one; groups are declared,
+never inferred from matching configuration. The runner boots a group's ER
+(and its proxies) before its first member and stops it, storage included,
+after its last member; between members it resets the proxies — rules
+cleared, holds released and waited for until the held operations resume, an
+interception that never fired failing the member that registered it — so no
+fault carries into the next one. A `Fresh` scenario's ERs
 are reclaimed when that scenario ends. A member that fails, or a group ER
 that no longer reports itself healthy, makes the runner replace that ER with
 a fresh one before the next member and say so in the run log, so no state
@@ -613,13 +619,16 @@ aperture (JSON-RPC surface):
   fetch failures, concurrent submissions, expiry, and same-storage restart.
   Check exact counter effects, rollback, payer fees, ledger occurrences, and
   signature notifications registered before, during, and after submission.
-  The concurrent case runs eight success rounds and eight failure rounds on
-  one private ER, each with 32 identical submissions. Each outcome uses fresh
-  payer/counter state and its own ledger window.
+  The cold-fetch, concurrent and subscription cases take turns on the
+  `transaction-retries` group's proxied ER, each outcome with fresh
+  payer/counter state and its own ledger window; the concurrent case runs
+  eight success rounds and eight failure rounds with 32 identical submissions
+  each. The expiry-restart case boots an ER of its own so it can restart it.
   The subscription case queues conflicting readers and requires registrations
   acknowledged after submission but before terminal status for both outcomes.
-  Accepted submissions drain through block publication before assertions;
-  the current ER execution fee is zero.
+  Accepted submissions drain through block publication before assertions, and
+  the subscription case waits for every queued reader to execute before it
+  ends; the current ER execution fee is zero.
 - `rpc_lifecycle` — drives one execution through every read that describes
   it, using the official `solana-rpc-client`. Prepares 256 delegated
   accounts, submits 256 uniquely signed writes concurrently and unpaced under

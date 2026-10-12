@@ -3,6 +3,13 @@ use redsuite_core::catalog::{ErGroup, Fixture};
 pub static DEFAULT: ErGroup = ErGroup {
     label: "default",
     env: &[],
+    proxied: false,
+};
+
+pub static RETRIES: ErGroup = ErGroup {
+    label: "transaction-retries",
+    env: &[],
+    proxied: true,
 };
 
 pub mod redline {
@@ -115,7 +122,7 @@ pub mod redshift {
     use ::redshift::scenarios;
     use redsuite_core::scenario_catalog;
 
-    use super::{Fixture, DEFAULT};
+    use super::{Fixture, DEFAULT, RETRIES};
 
     scenario_catalog! {
         family: Redshift,
@@ -197,15 +204,15 @@ pub mod redshift {
             fixtures: [Fixture::RedlineProgram],
         },
         transaction_retry_cold_fetch => aperture::transaction_retries::TransactionRetries::ColdFetch {
-            er: Fresh,
+            er: Exclusive(RETRIES),
             fixtures: [Fixture::RedshiftProgram],
         },
         transaction_retry_concurrent => aperture::transaction_retries::TransactionRetries::Concurrent {
-            er: Fresh,
+            er: Exclusive(RETRIES),
             fixtures: [Fixture::RedshiftProgram],
         },
         transaction_retry_subscriptions => aperture::transaction_retries::TransactionRetries::Subscriptions {
-            er: Fresh,
+            er: Exclusive(RETRIES),
             fixtures: [Fixture::RedshiftProgram, Fixture::RedlineProgram],
         },
         transaction_retry_expiry_restart => aperture::transaction_retries::TransactionRetries::ExpiryRestart {

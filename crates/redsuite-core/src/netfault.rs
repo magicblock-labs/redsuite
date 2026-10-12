@@ -232,6 +232,7 @@ struct State {
     started: Instant,
     traps: Vec<Rc<TrapState>>,
     unfired: Vec<String>,
+    holding: usize,
     rules: Vec<Rule>,
     stalled: Vec<(u64, oneshot::Sender<Decision>)>,
     next_rule: u64,
@@ -281,6 +282,7 @@ fn gate_start(shared: &Shared, operation: Operation) -> GateStart {
             let (sender, receiver) = oneshot::channel();
             state.stalled.push((id, sender));
             state.record(Action::Held, Some(operation.clone()));
+            state.holding += 1;
             GateStart::Pending(receiver, operation)
         }
         None => {
@@ -303,6 +305,7 @@ fn gate_start(shared: &Shared, operation: Operation) -> GateStart {
                         decide: Some(sender),
                     });
                     state.record(Action::Held, Some(operation.clone()));
+                    state.holding += 1;
                     trap.notify.notify_waiters();
                     GateStart::Pending(receiver, operation)
                 }
@@ -322,7 +325,9 @@ async fn gate_finish(
         Decision::Discard => Action::Discarded,
         Decision::Reject(_) => Action::Rejected,
     };
-    shared.borrow_mut().record(action, Some(operation));
+    let mut state = shared.borrow_mut();
+    state.holding -= 1;
+    state.record(action, Some(operation));
     decision
 }
 
@@ -445,6 +450,7 @@ impl BaseProxies {
             started: Instant::now(),
             traps: Vec::new(),
             unfired: Vec::new(),
+            holding: 0,
             rules: Vec::new(),
             stalled: Vec::new(),
             next_rule: 1,
@@ -555,17 +561,33 @@ impl BaseProxies {
         self.shared.borrow().events.clone()
     }
 
+    pub async fn reset(&self) -> Result<()> {
+        self.restore();
+        crate::check::poll(
+            "released interceptions resuming",
+            UPSTREAM_TIMEOUT,
+            || async { self.shared.borrow().holding == 0 },
+        )
+        .await?;
+        self.shared.borrow_mut().events.clear();
+        self.unfired()
+    }
+
     pub fn finish(mut self) -> Result<()> {
         self.shutdown();
-        let unfired = self.shared.borrow().unfired.clone();
-        if !unfired.is_empty() {
-            return Err(format!(
-                "requested interceptions never occurred: {}",
-                unfired.join("; ")
-            )
-            .into());
+        self.unfired()
+    }
+
+    fn unfired(&self) -> Result<()> {
+        let unfired = std::mem::take(&mut self.shared.borrow_mut().unfired);
+        if unfired.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        Err(format!(
+            "requested interceptions never occurred: {}",
+            unfired.join("; ")
+        )
+        .into())
     }
 
     fn shutdown(&mut self) {

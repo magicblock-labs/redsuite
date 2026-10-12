@@ -16,6 +16,7 @@ use transaction::Transaction;
 
 use crate::{
     api::{self, Api, ConfirmOptions, Metrics},
+    netfault::BaseProxies,
     profile::ExecutionConfig,
     resources::Resources,
     DynError, Result,
@@ -247,6 +248,7 @@ pub struct ErCtx {
     identity: Pubkey,
     blockhash: Rc<BlockhashCache>,
     pub(crate) pid: u32,
+    pub(crate) proxies: Option<Rc<BaseProxies>>,
 }
 
 impl ErCtx {
@@ -269,7 +271,12 @@ impl ErCtx {
             identity,
             blockhash: Rc::new(BlockhashCache::new(ER_BLOCKHASH_TTL)),
             pid,
+            proxies: None,
         }
+    }
+
+    pub fn proxies(&self) -> Option<&BaseProxies> {
+        self.proxies.as_deref()
     }
 
     pub fn pid(&self) -> u32 {

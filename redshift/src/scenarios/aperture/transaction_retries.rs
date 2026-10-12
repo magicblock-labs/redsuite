@@ -12,11 +12,11 @@ use redshift_interface::flexi::{build, FlexiCounter};
 use redsuite_core::{
     api::RpcError,
     check, check_eq,
-    netfault::{BaseProxies, Selector},
+    netfault::Selector,
     prep, topology,
     topology::{ErOptions, RestartConfig},
     transport::wsraw::RawWs,
-    BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result,
+    BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result, Scenario,
 };
 use serde_json::{json, Value};
 use signature::Signature;
@@ -182,7 +182,7 @@ async fn queue_readers(
     payer: &Keypair,
     counter: Pubkey,
     round: u8,
-) -> Result<()> {
+) -> Result<Vec<Signature>> {
     let blockhash = er.api().get_latest_blockhash().await?;
     let mut data = vec![2];
     data.extend_from_slice(&1_400_000u32.to_le_bytes());
@@ -210,13 +210,10 @@ async fn queue_readers(
             )
         })
         .collect();
-    for result in
-        join_all(transactions.iter().map(|tx| er.api().send_transaction(tx)))
-            .await
-    {
-        result?;
-    }
-    Ok(())
+    join_all(transactions.iter().map(|tx| er.api().send_transaction(tx)))
+        .await
+        .into_iter()
+        .collect()
 }
 
 async fn execute(
@@ -229,8 +226,9 @@ async fn execute(
     for _ in 0..2 {
         listeners.push(subscribe(er, tx).await?);
     }
+    let mut readers = Vec::new();
     if let Some((payer, counter, round)) = queued {
-        queue_readers(er, payer, counter, round).await?;
+        readers = queue_readers(er, payer, counter, round).await?;
     }
     let (sent, racing) = tokio::join!(
         tx.copies(er, copies),
@@ -270,6 +268,9 @@ async fn execute(
             "subscriber {index} terminal result"
         )?;
         ws.close().await?;
+    }
+    for reader in readers {
+        er.api().await_transaction(&reader, TIMEOUT).await?;
     }
     Ok(pending)
 }
@@ -316,7 +317,38 @@ async fn audit(
 }
 
 #[async_trait(?Send)]
+impl Scenario for TransactionRetries {
+    fn name(&self) -> &str {
+        TransactionRetries::name(self)
+    }
+
+    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<()> {
+        self.run_phases(base, er, None).await
+    }
+}
+
+#[async_trait(?Send)]
 impl PrivateErScenario for TransactionRetries {
+    fn name(&self) -> &str {
+        TransactionRetries::name(self)
+    }
+
+    async fn run(&self, base: &BaseCtx) -> Result<()> {
+        let mut private = topology::private_er(
+            base,
+            ErOptions {
+                label: self.name().replace("redshift/", ""),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let er = private.ctx().clone();
+        self.run_phases(base, &er, Some(&mut private)).await?;
+        private.finish().await
+    }
+}
+
+impl TransactionRetries {
     fn name(&self) -> &str {
         match self {
             Self::ColdFetch => "redshift/transaction_retry_cold_fetch",
@@ -326,17 +358,12 @@ impl PrivateErScenario for TransactionRetries {
         }
     }
 
-    async fn run(&self, base: &BaseCtx) -> Result<()> {
-        let proxies = BaseProxies::spawn(base).await?;
-        let mut private = topology::private_er(
-            base,
-            ErOptions {
-                label: self.name().replace("redshift/", ""),
-                base_endpoints: Some(proxies.endpoints()),
-                ..Default::default()
-            },
-        )
-        .await?;
+    async fn run_phases(
+        &self,
+        base: &BaseCtx,
+        er: &ErCtx,
+        mut private: Option<&mut topology::PrivateEr>,
+    ) -> Result<()> {
         let phases: &[&str] = if matches!(self, Self::Concurrent) {
             &["success", "failure"]
         } else {
@@ -344,7 +371,7 @@ impl PrivateErScenario for TransactionRetries {
         };
         for &phase in phases {
             // Each outcome owns fresh payer/counter state and its ledger window.
-            self.run_case(base, &proxies, &mut private, phase)
+            self.run_case(base, er, phase, private.as_deref_mut())
                 .await
                 .map_err(|error| -> redsuite_core::DynError {
                     match error.downcast::<redsuite_core::CheckError>() {
@@ -353,21 +380,16 @@ impl PrivateErScenario for TransactionRetries {
                     }
                 })?;
         }
-        private.finish().await?;
-        proxies.finish()?;
         Ok(())
     }
-}
 
-impl TransactionRetries {
     async fn run_case(
         &self,
         base: &BaseCtx,
-        proxies: &BaseProxies,
-        private: &mut topology::PrivateEr,
+        er: &ErCtx,
         phase: &str,
+        private: Option<&mut topology::PrivateEr>,
     ) -> Result<()> {
-        let er = private.ctx();
         let owner = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
         let (counter, setup) = prep::flexi_counter(
             owner.pubkey(),
@@ -419,6 +441,10 @@ impl TransactionRetries {
                 .http()
                 .request()
                 .account(&cold);
+                let proxies = er.proxies().ok_or(
+                    "the cold-fetch case needs the base-chain proxies of its \
+                     ER group",
+                )?;
                 let trap = proxies.intercept(selector);
                 let tx = Signed::new(er, &payer, owner, 7, false, Some(cold))
                     .await?;
@@ -512,9 +538,11 @@ impl TransactionRetries {
                 }
             }
             Self::ExpiryRestart => {
+                let private = private.ok_or(
+                    "the expiry-restart case needs an ER of its own to restart",
+                )?;
                 let mut probes = Vec::new();
                 for epoch in 0..2 {
-                    let er = private.ctx();
                     let start = er.api().get_slot().await? + 1;
                     let first = probes.len();
                     for i in 0..if epoch == 0 { 3 } else { 2 } {
@@ -574,7 +602,6 @@ impl TransactionRetries {
                         }
                         private.restart(RestartConfig::default()).await?;
                     }
-                    let er = private.ctx();
                     check_eq!(
                         state(er, &keys).await?,
                         expected,
@@ -622,7 +649,7 @@ impl TransactionRetries {
             }
         }
         check_eq!(
-            state(private.ctx(), &keys).await?,
+            state(er, &keys).await?,
             expected,
             "final effect and payer balance"
         )?;
