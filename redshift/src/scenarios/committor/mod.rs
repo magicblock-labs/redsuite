@@ -18,6 +18,8 @@ use signer::Signer;
 
 use crate::program::instruction::build;
 
+pub(super) const PROXIED_GROUP: &str =
+    "this scenario needs the base-chain proxies of its ER group";
 const BASE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(30);
 const BASE_STATE_TIMEOUT: Duration = Duration::from_secs(30);
 

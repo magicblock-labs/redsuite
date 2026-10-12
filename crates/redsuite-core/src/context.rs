@@ -1,8 +1,10 @@
 use std::{
     cell::RefCell,
-    rc::Rc,
+    rc::{Rc, Weak},
     time::{Duration, Instant},
 };
+
+use tokio::sync::Mutex;
 
 use account::Account;
 use async_trait::async_trait;
@@ -19,6 +21,7 @@ use crate::{
     netfault::BaseProxies,
     profile::ExecutionConfig,
     resources::Resources,
+    topology::{PrivateEr, RestartConfig, RestartTiming},
     DynError, Result,
 };
 
@@ -249,6 +252,7 @@ pub struct ErCtx {
     blockhash: Rc<BlockhashCache>,
     pub(crate) pid: u32,
     pub(crate) proxies: Option<Rc<BaseProxies>>,
+    pub(crate) owner: Option<Weak<Mutex<PrivateEr>>>,
 }
 
 impl ErCtx {
@@ -272,11 +276,26 @@ impl ErCtx {
             blockhash: Rc::new(BlockhashCache::new(ER_BLOCKHASH_TTL)),
             pid,
             proxies: None,
+            owner: None,
         }
     }
 
     pub fn proxies(&self) -> Option<&BaseProxies> {
         self.proxies.as_deref()
+    }
+
+    pub async fn restart(
+        &self,
+        config: RestartConfig,
+    ) -> Result<RestartTiming> {
+        self.owner
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .ok_or("only a group ER is restartable through its context")?
+            .lock()
+            .await
+            .restart(config)
+            .await
     }
 
     pub fn pid(&self) -> u32 {

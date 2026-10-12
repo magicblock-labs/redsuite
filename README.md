@@ -159,15 +159,19 @@ catalog entry declares its ER contract (`cli/src/catalog.rs`):
 
 - `Shared(DEFAULT)` — parallel shared access: the member runs concurrently
   with the group's other shared members on the group's ER.
-- `Exclusive(DEFAULT)`, `Exclusive(RETRIES)` — sequential shared access: the
-  member has the group's ER to itself, with no shared or other exclusive
-  member beside it (`ephemeral_accounts` and `task_scheduler` account for
-  every lamport of a vault or of the validator identity, every Redline
-  benchmark on the default ER, and the three transaction-retry cases that
-  take turns on the proxied `transaction-retries` ER).
+- `Exclusive(DEFAULT)`, `Exclusive(RETRIES)`, `Exclusive(COMMITTOR)` —
+  sequential shared access: the member has the group's ER to itself, with no
+  shared or other exclusive member beside it (`ephemeral_accounts` and
+  `task_scheduler` account for every lamport of a vault or of the validator
+  identity, every Redline benchmark on the default ER, the three
+  transaction-retry cases that take turns on the proxied `transaction-retries`
+  ER, and `commit_blackout`, `commit_exactly_once` and `undelegation_recovery`
+  on the proxied `committor-faults` ER, which the last two restart in place).
 - `Fresh` — fresh isolated execution: the scenario boots and owns the ERs it
-  needs — those that kill or restart a validator, require their own proxied
-  ER, need their own configuration, or boot a leader with verifiers.
+  needs because no declared group covers them — a configuration of its own,
+  a leader with verifiers, a second ER beside the first, or a crash path such
+  as a hard kill. Restarting is not a reason by itself: an exclusive member
+  restarts its group's ER in place.
   `restart_under_load` and `superblock_boundary_latency` are the host-exclusive
   ones; `ws_conn_capacity`, `clone_lru_churn`, `cold_hydration_tail`,
   `ensure_gate_stall` and `storage_prodsize_sustain` instead hold the default
@@ -178,13 +182,15 @@ catalog entry declares its ER contract (`cli/src/catalog.rs`):
 
 An ER group names an ER, the environment it boots with and whether its base
 traffic runs through RedSuite's base-chain proxies — `DEFAULT` is the stock
-ER most scenarios share, `RETRIES` the proxied one; groups are declared,
+ER most scenarios share, `RETRIES` and `COMMITTOR` the proxied ones; groups are declared,
 never inferred from matching configuration. The runner boots a group's ER
 (and its proxies) before its first member and stops it, storage included,
 after its last member; between members it resets the proxies — rules
 cleared, holds released and waited for until the held operations resume, an
 interception that never fired failing the member that registered it — so no
-fault carries into the next one. A `Fresh` scenario's ERs
+fault carries into the next one. An exclusive member may restart the group's
+ER in place through its context (same storage, identity and ports); its
+successor gets the restarted ER. A `Fresh` scenario's ERs
 are reclaimed when that scenario ends. A member that fails, or a group ER
 that no longer reports itself healthy, makes the runner replace that ER with
 a fresh one before the next member and say so in the run log, so no state
@@ -510,7 +516,7 @@ chainlink (account cloning):
 
 committor (ER → base commits):
 
-- `commit_blackout` — boots a private ER behind the base-chain proxies and
+- `commit_blackout` — runs on the proxied `committor-faults` ER and
   commits three times. First the base `sendTransaction` response is held
   until the scenario's own base client proves the commit landed, then it is
   discarded so the ER never learns its submission succeeded. Then the base
@@ -519,7 +525,7 @@ committor (ER → base commits):
   and traffic is restored. Finally every proxied connection is closed and a
   fresh account must still clone and commit. Each commit has to converge on
   the ER with the base copy matching the ER snapshot.
-- `commit_exactly_once` — boots a private ER behind the base-chain proxies
+- `commit_exactly_once` — runs on the proxied `committor-faults` ER
   and proves a base commit is never applied twice because the ER missed the
   response confirming it landed. Each faulted commit forwards the base
   submission, holds the ER's `sendTransaction` response until the scenario's
@@ -557,8 +563,8 @@ committor (ER → base commits):
   temporary commit buffers, which must appear on base as committor-owned
   accounts while the first bundle is held and be gone once every bundle
   settled.
-- `undelegation_recovery` — boots a private ER behind the base-chain
-  proxies and proves an account stays locked while its undelegation is
+- `undelegation_recovery` — runs on the proxied `committor-faults` ER
+  and proves an account stays locked while its undelegation is
   pending but is released once base completes it, even when the ER missed
   the completion. Twice, with a reconnect and with a same-storage restart:
   a delegated account is written on the ER and a commit-and-undelegate

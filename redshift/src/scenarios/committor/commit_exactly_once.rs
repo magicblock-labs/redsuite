@@ -11,8 +11,8 @@ use redsuite_core::{
     netfault::{BaseProxies, RuleHandle, Selector},
     prep,
     receipt::{self, CommitReceipt},
-    topology::{self, ErOptions, PrivateEr, RestartConfig},
-    BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result,
+    topology::RestartConfig,
+    BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
 use signature::Signature;
 use signer::Signer;
@@ -142,7 +142,7 @@ async fn settled_receipt(
 async fn commit_blackout(
     proxies: &BaseProxies,
     base: &BaseCtx,
-    private: &mut PrivateEr,
+    er: &ErCtx,
     payer: &Keypair,
     account: Pubkey,
     faulted: FaultedCommit<'_>,
@@ -161,8 +161,7 @@ async fn commit_blackout(
             .account(&account),
     );
     let (snapshot, commit_signature) =
-        write_and_commit(private.ctx(), payer, commit_id, write, &account)
-            .await?;
+        write_and_commit(er, payer, commit_id, write, &account).await?;
     let held = submission.wait(INTERCEPT_TIMEOUT).await?;
     let landed = held.operation.signature()?;
     prove_landed(base, &landed, &account, &snapshot).await?;
@@ -173,19 +172,13 @@ async fn commit_blackout(
         "{phase}: the intercepted commit advances the base nonce exactly once"
     )?;
     let restart_intent_id = if restart {
-        Some(
-            receipt::scheduled_intent_id(
-                private.ctx().api(),
-                &commit_signature,
-            )
-            .await?,
-        )
+        Some(receipt::scheduled_intent_id(er.api(), &commit_signature).await?)
     } else {
         None
     };
     let confirmations = withhold_confirmations(proxies, &landed);
     if restart {
-        private.restart(RestartConfig::default()).await?;
+        er.restart(RestartConfig::default()).await?;
     }
     held.discard();
     // The base transaction already landed and advanced the DLP nonce. Recovery
@@ -196,14 +189,9 @@ async fn commit_blackout(
     for rule in confirmations {
         rule.remove();
     }
-    let receipt = settled_receipt(
-        base,
-        private.ctx(),
-        &commit_signature,
-        restart_intent_id,
-        phase,
-    )
-    .await?;
+    let receipt =
+        settled_receipt(base, er, &commit_signature, restart_intent_id, phase)
+            .await?;
     check!(
         receipt.base_signatures.contains(&landed),
         "{phase}: the receipt must name the base transaction that landed \
@@ -340,24 +328,14 @@ async fn action_blackout(
 }
 
 #[async_trait(?Send)]
-impl PrivateErScenario for CommitExactlyOnce {
+impl Scenario for CommitExactlyOnce {
     fn name(&self) -> &str {
         "redshift/commit_exactly_once"
     }
 
-    async fn run(&self, base: &BaseCtx) -> Result<()> {
-        let proxies = BaseProxies::spawn(base).await?;
-        let mut private = topology::private_er(
-            base,
-            ErOptions {
-                label: LABEL.to_owned(),
-                env: Vec::new(),
-                request_timeout: None,
-                base_endpoints: Some(proxies.endpoints()),
-            },
-        )
-        .await?;
-        let identity = private.identity();
+    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<()> {
+        let proxies = er.proxies().ok_or(super::PROXIED_GROUP)?;
+        let identity = er.identity();
         let payer = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
         let account =
             crate::init_delegated_account(base, &payer, 0, identity).await?;
@@ -368,27 +346,19 @@ impl PrivateErScenario for CommitExactlyOnce {
             "a delegated pda must be dlp-owned on base"
         )?;
         prep::await_clones(
-            private.ctx(),
+            er,
             &[account],
             crate::ACCOUNT_SPACE as usize,
             CLONE_TIMEOUT,
         )
         .await?;
 
-        follow_up_commit(
-            base,
-            private.ctx(),
-            &payer,
-            account,
-            1,
-            WARMUP_WRITE,
-            "warm-up",
-        )
-        .await?;
+        follow_up_commit(base, er, &payer, account, 1, WARMUP_WRITE, "warm-up")
+            .await?;
         commit_blackout(
-            &proxies,
+            proxies,
             base,
-            &mut private,
+            er,
             &payer,
             account,
             FaultedCommit {
@@ -401,7 +371,7 @@ impl PrivateErScenario for CommitExactlyOnce {
         .await?;
         follow_up_commit(
             base,
-            private.ctx(),
+            er,
             &payer,
             account,
             3,
@@ -409,11 +379,11 @@ impl PrivateErScenario for CommitExactlyOnce {
             "post-blackout",
         )
         .await?;
-        action_blackout(&proxies, base, private.ctx()).await?;
+        action_blackout(proxies, base, er).await?;
         commit_blackout(
-            &proxies,
+            proxies,
             base,
-            &mut private,
+            er,
             &payer,
             account,
             FaultedCommit {
@@ -426,7 +396,7 @@ impl PrivateErScenario for CommitExactlyOnce {
         .await?;
         follow_up_commit(
             base,
-            private.ctx(),
+            er,
             &payer,
             account,
             5,
@@ -435,8 +405,6 @@ impl PrivateErScenario for CommitExactlyOnce {
         )
         .await?;
 
-        proxies.finish()?;
-        private.finish().await?;
         Ok(())
     }
 }
