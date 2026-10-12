@@ -255,7 +255,7 @@ impl State {
 
 enum GateStart {
     Decided(Decision),
-    Pending(oneshot::Receiver<Decision>, Operation),
+    Pending(oneshot::Receiver<Decision>, Operation, Holding),
 }
 
 fn gate_start(shared: &Shared, operation: Operation) -> GateStart {
@@ -283,7 +283,7 @@ fn gate_start(shared: &Shared, operation: Operation) -> GateStart {
             state.stalled.push((id, sender));
             state.record(Action::Held, Some(operation.clone()));
             state.holding += 1;
-            GateStart::Pending(receiver, operation)
+            GateStart::Pending(receiver, operation, Holding(shared.clone()))
         }
         None => {
             let trap = state
@@ -307,10 +307,22 @@ fn gate_start(shared: &Shared, operation: Operation) -> GateStart {
                     state.record(Action::Held, Some(operation.clone()));
                     state.holding += 1;
                     trap.notify.notify_waiters();
-                    GateStart::Pending(receiver, operation)
+                    GateStart::Pending(
+                        receiver,
+                        operation,
+                        Holding(shared.clone()),
+                    )
                 }
             }
         }
+    }
+}
+
+struct Holding(Shared);
+
+impl Drop for Holding {
+    fn drop(&mut self) {
+        self.0.borrow_mut().holding -= 1;
     }
 }
 
@@ -325,27 +337,32 @@ async fn gate_finish(
         Decision::Discard => Action::Discarded,
         Decision::Reject(_) => Action::Rejected,
     };
-    let mut state = shared.borrow_mut();
-    state.holding -= 1;
-    state.record(action, Some(operation));
+    shared.borrow_mut().record(action, Some(operation));
     decision
 }
 
-async fn gate(shared: &Shared, operation: Operation) -> Decision {
+async fn gate(
+    shared: &Shared,
+    operation: Operation,
+) -> (Decision, Option<Holding>) {
     match gate_start(shared, operation) {
-        GateStart::Decided(decision) => decision,
-        GateStart::Pending(receiver, operation) => {
-            gate_finish(shared, receiver, operation).await
-        }
+        GateStart::Decided(decision) => (decision, None),
+        GateStart::Pending(receiver, operation, holding) => (
+            gate_finish(shared, receiver, operation).await,
+            Some(holding),
+        ),
     }
 }
 
+type Outbound = mpsc::UnboundedSender<Option<(Message, Option<Holding>)>>;
+
 fn deliver(
-    outbound: &mpsc::UnboundedSender<Option<Message>>,
+    outbound: &Outbound,
     decision: Decision,
     text: Utf8Bytes,
     is_notification: bool,
     id: &Option<json::Value>,
+    holding: Option<Holding>,
 ) -> std::result::Result<(), ()> {
     let message = match decision {
         Decision::Discard => return Ok(()),
@@ -353,11 +370,11 @@ fn deliver(
             if is_notification {
                 return Ok(());
             }
-            Some(Message::Text(rejection(id, &message).into()))
+            Message::Text(rejection(id, &message).into())
         }
-        Decision::Release => Some(Message::Text(text)),
+        Decision::Release => Message::Text(text),
     };
-    outbound.send(message).map_err(|_| ())
+    outbound.send(Some((message, holding))).map_err(|_| ())
 }
 
 pub struct Held {
@@ -844,7 +861,8 @@ async fn serve_http(
                 operation(Transport::Http, Stage::Request, "?", Vec::new()),
             ),
         };
-        match gate(&shared, request.clone()).await {
+        let (decision, _request_hold) = gate(&shared, request.clone()).await;
+        match decision {
             Decision::Discard => return,
             Decision::Reject(message) => {
                 if !write_response(&mut socket, 200, &rejection(&id, &message))
@@ -874,7 +892,8 @@ async fn serve_http(
             .map(|parsed| parsed.strings)
             .unwrap_or_default();
         let response = merged(request, Stage::Response, extra);
-        match gate(&shared, response).await {
+        let (decision, _response_hold) = gate(&shared, response).await;
+        match decision {
             Decision::Discard => return,
             Decision::Reject(message) => {
                 if !write_response(&mut socket, 200, &rejection(&id, &message))
@@ -919,10 +938,9 @@ async fn serve_ws(socket: TcpStream, upstream: String, shared: Shared) {
     };
     let (mut client_sink, mut client_stream) = client.split();
     let (mut server_sink, mut server_stream) = server.split();
-    let (outbound, mut outbound_rx) =
-        mpsc::unbounded_channel::<Option<Message>>();
+    let (outbound, mut outbound_rx) = mpsc::unbounded_channel();
     tokio::task::spawn_local(async move {
-        while let Some(Some(message)) = outbound_rx.recv().await {
+        while let Some(Some((message, _hold))) = outbound_rx.recv().await {
             if client_sink.send(message).await.is_err() {
                 break;
             }
@@ -949,11 +967,12 @@ async fn serve_ws(socket: TcpStream, upstream: String, shared: Shared) {
                             parsed.method.as_deref().unwrap_or("?"),
                             parsed.strings,
                         );
-                        match gate(&shared, request.clone()).await {
+                        let (decision, _hold) = gate(&shared, request.clone()).await;
+                        match decision {
                             Decision::Discard => break,
                             Decision::Reject(message) => {
                                 let reply = rejection(&parsed.id, &message);
-                                if outbound.send(Some(Message::Text(reply.into()))).is_err() {
+                                if outbound.send(Some((Message::Text(reply.into()), None))).is_err() {
                                     break;
                                 }
                             }
@@ -980,7 +999,7 @@ async fn serve_ws(socket: TcpStream, upstream: String, shared: Shared) {
                 match frame {
                     Message::Text(text) => {
                         let Some(parsed) = parse(&text) else {
-                            if outbound.send(Some(Message::Text(text))).is_err() {
+                            if outbound.send(Some((Message::Text(text), None))).is_err() {
                                 break;
                             }
                             continue;
@@ -1018,23 +1037,23 @@ async fn serve_ws(socket: TcpStream, upstream: String, shared: Shared) {
                         let id = parsed.id.clone();
                         match gate_start(&shared, inbound) {
                             GateStart::Decided(decision) => {
-                                if deliver(&outbound, decision, text, is_notification, &id).is_err() {
+                                if deliver(&outbound, decision, text, is_notification, &id, None).is_err() {
                                     break;
                                 }
                             }
-                            GateStart::Pending(receiver, operation) => {
+                            GateStart::Pending(receiver, operation, holding) => {
                                 let shared = shared.clone();
                                 let outbound = outbound.clone();
                                 tokio::task::spawn_local(async move {
                                     let decision = gate_finish(&shared, receiver, operation).await;
-                                    let _ = deliver(&outbound, decision, text, is_notification, &id);
+                                    let _ = deliver(&outbound, decision, text, is_notification, &id, Some(holding));
                                 });
                             }
                         }
                     }
                     Message::Close(_) => break,
                     other => {
-                        if outbound.send(Some(other)).is_err() {
+                        if outbound.send(Some((other, None))).is_err() {
                             break;
                         }
                     }

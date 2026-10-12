@@ -12,6 +12,7 @@ use redsuite_core::{
     topology::{self, PrivateEr, ER_READY_TIMEOUT},
     BaseCtx, ErCtx, Result, RunRecord,
 };
+use tokio::sync::Mutex;
 
 const FAMILIES: &[&[ScenarioEntry]] = &[
     catalog::redline::SCENARIOS,
@@ -70,7 +71,7 @@ fn selected(target: &str) -> Vec<&'static ScenarioEntry> {
 
 struct GroupEr {
     group: &'static ErGroup,
-    er: Option<PrivateEr>,
+    er: Option<Rc<Mutex<PrivateEr>>>,
     proxies: Option<Rc<BaseProxies>>,
     failure: Option<String>,
     tainted: bool,
@@ -106,10 +107,10 @@ impl GroupEr {
         if let Some(er) = &self.er {
             let why = if self.tainted {
                 "a scenario failed on it"
-            } else if !er.healthy().await {
+            } else if !er.lock().await.healthy().await {
                 "it is no longer healthy"
             } else {
-                return Ok(er.ctx().clone());
+                return Ok(er.lock().await.ctx().clone());
             };
             console::line(format_args!(
                 "group ER `{label}`: {why}; replacing it with a fresh one"
@@ -145,14 +146,20 @@ impl GroupEr {
             er = er.with_proxies(proxies.clone());
         }
         er.wait_ready(ER_READY_TIMEOUT).await?;
-        let ctx = er.ctx().clone();
+        let er = er.shared();
+        let ctx = er.lock().await.ctx().clone();
         self.er = Some(er);
         self.proxies = proxies;
         Ok(ctx)
     }
 
     async fn finish(&mut self) {
-        if let Some(er) = self.er.take() {
+        let er = self
+            .er
+            .take()
+            .and_then(|er| Rc::try_unwrap(er).ok())
+            .map(Mutex::into_inner);
+        if let Some(er) = er {
             if let Err(error) = er.finish().await {
                 console::line(format_args!(
                     "group ER `{}`: {error}",

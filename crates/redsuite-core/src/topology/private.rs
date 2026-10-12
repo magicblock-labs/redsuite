@@ -7,6 +7,7 @@ use std::{
 
 use pubkey::Pubkey;
 use signer::Signer;
+use tokio::sync::Mutex;
 
 use super::{
     config,
@@ -56,6 +57,13 @@ impl PrivateEr {
     pub fn with_proxies(mut self, proxies: Rc<BaseProxies>) -> Self {
         self.ctx.proxies = Some(proxies);
         self
+    }
+
+    pub fn shared(mut self) -> Rc<Mutex<Self>> {
+        Rc::new_cyclic(|owner| {
+            self.ctx.owner = Some(owner.clone());
+            Mutex::new(self)
+        })
     }
 
     pub fn pid(&self) -> u32 {

@@ -3,11 +3,8 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use pubkey::Pubkey;
 use redsuite_core::{
-    check, check_eq,
-    netfault::{BaseProxies, Selector},
-    prep, receipt, topology,
-    topology::ErOptions,
-    BaseCtx, ChainCtx, CheckError, ErCtx, PrivateErScenario, Result,
+    check, check_eq, netfault::Selector, prep, receipt, BaseCtx, ChainCtx,
+    CheckError, ErCtx, Result, Scenario,
 };
 use signature::Signature;
 
@@ -17,7 +14,6 @@ use super::{
     prove_landed, write_and_commit, BASE_CONFIRM_TIMEOUT, BASE_STATE_TIMEOUT,
 };
 
-const LABEL: &str = "commit-blackout";
 const CLONE_TIMEOUT: Duration = Duration::from_secs(30);
 const INTERCEPT_TIMEOUT: Duration = Duration::from_secs(60);
 const RECEIPT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -72,25 +68,14 @@ async fn await_convergence(
 }
 
 #[async_trait(?Send)]
-impl PrivateErScenario for CommitBlackout {
+impl Scenario for CommitBlackout {
     fn name(&self) -> &str {
         "redshift/commit_blackout"
     }
 
-    async fn run(&self, base: &BaseCtx) -> Result<()> {
-        let proxies = BaseProxies::spawn(base).await?;
-        let private = topology::private_er(
-            base,
-            ErOptions {
-                label: LABEL.to_owned(),
-                env: Vec::new(),
-                request_timeout: None,
-                base_endpoints: Some(proxies.endpoints()),
-            },
-        )
-        .await?;
-        let identity = private.identity();
-        let er = private.ctx();
+    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<()> {
+        let proxies = er.proxies().ok_or(super::PROXIED_GROUP)?;
+        let identity = er.identity();
         let payer = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
         let account =
             crate::init_delegated_account(base, &payer, 0, identity).await?;
@@ -228,8 +213,6 @@ impl PrivateErScenario for CommitBlackout {
         )
         .await?;
 
-        proxies.finish()?;
-        private.finish().await?;
         Ok(())
     }
 }

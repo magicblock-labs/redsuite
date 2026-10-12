@@ -6,15 +6,14 @@ use pubkey::Pubkey;
 use redsuite_core::{
     check, check_eq,
     netfault::{BaseProxies, Selector},
-    prep, topology,
-    topology::{ErOptions, PrivateEr, RestartConfig},
-    BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result,
+    prep,
+    topology::RestartConfig,
+    BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
 use signer::Signer;
 
 use crate::program::{instruction::build, DELEGATION_PROGRAM_ID};
 
-const LABEL: &str = "undelegation-recovery";
 const CLONE_TIMEOUT: Duration = Duration::from_secs(30);
 const INTERCEPT_TIMEOUT: Duration = Duration::from_secs(60);
 const COMPLETION_TIMEOUT: Duration = Duration::from_secs(90);
@@ -213,25 +212,24 @@ async fn redelegate_and_write(
 
 async fn recover(
     base: &BaseCtx,
-    private: &mut PrivateEr,
+    er: &ErCtx,
     proxies: &BaseProxies,
     payer: &Keypair,
     seed: u8,
     mode: Recovery,
 ) -> Result<()> {
     let case = u64::from(seed);
-    let identity = private.identity();
+    let identity = er.identity();
     let account =
         crate::init_delegated_account(base, payer, seed, identity).await?;
     prep::await_clones(
-        private.ctx(),
+        er,
         &[account],
         crate::ACCOUNT_SPACE as usize,
         CLONE_TIMEOUT,
     )
     .await?;
-    let snapshot =
-        write(private.ctx(), payer, value(case, 1), &account).await?;
+    let snapshot = write(er, payer, value(case, 1), &account).await?;
 
     let submission = proxies.intercept(
         Selector::method("sendTransaction")
@@ -239,20 +237,18 @@ async fn recover(
             .request()
             .account(&account),
     );
-    private
-        .ctx()
-        .submit_and_confirm(
-            payer,
-            &[build::commit_and_undelegate_accounts(
-                case,
-                payer.pubkey(),
-                &[account],
-            )],
-        )
-        .await?;
+    er.submit_and_confirm(
+        payer,
+        &[build::commit_and_undelegate_accounts(
+            case,
+            payer.pubkey(),
+            &[account],
+        )],
+    )
+    .await?;
     let held = submission.wait(INTERCEPT_TIMEOUT).await?;
     rejected_write(
-        private.ctx(),
+        er,
         payer,
         value(case, 2),
         &account,
@@ -270,7 +266,7 @@ async fn recover(
     held.discard();
     let held = resubmission.wait(INTERCEPT_TIMEOUT).await?;
     rejected_write(
-        private.ctx(),
+        er,
         payer,
         value(case, 3),
         &account,
@@ -302,7 +298,7 @@ async fn recover(
             proxies.close_connections();
         }
         Recovery::Restart => {
-            let timing = private.restart(RestartConfig::default()).await?;
+            let timing = er.restart(RestartConfig::default()).await?;
             check_eq!(
                 timing.exit_code,
                 Some(0),
@@ -312,7 +308,6 @@ async fn recover(
         }
     }
 
-    let er = private.ctx();
     let base_write = value(case, 5);
     base.submit_and_confirm(
         payer,
@@ -336,32 +331,18 @@ async fn recover(
 }
 
 #[async_trait(?Send)]
-impl PrivateErScenario for UndelegationRecovery {
+impl Scenario for UndelegationRecovery {
     fn name(&self) -> &str {
         "redshift/undelegation_recovery"
     }
 
-    async fn run(&self, base: &BaseCtx) -> Result<()> {
-        let proxies = BaseProxies::spawn(base).await?;
-        let mut private = topology::private_er(
-            base,
-            ErOptions {
-                label: LABEL.to_owned(),
-                env: Vec::new(),
-                request_timeout: None,
-                base_endpoints: Some(proxies.endpoints()),
-            },
-        )
-        .await?;
+    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<()> {
+        let proxies = er.proxies().ok_or(super::PROXIED_GROUP)?;
         let payer = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
 
-        recover(base, &mut private, &proxies, &payer, 1, Recovery::Reconnect)
-            .await?;
-        recover(base, &mut private, &proxies, &payer, 2, Recovery::Restart)
-            .await?;
+        recover(base, er, proxies, &payer, 1, Recovery::Reconnect).await?;
+        recover(base, er, proxies, &payer, 2, Recovery::Restart).await?;
 
-        proxies.finish()?;
-        private.finish().await?;
         Ok(())
     }
 }

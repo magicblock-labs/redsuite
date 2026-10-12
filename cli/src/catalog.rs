@@ -12,6 +12,12 @@ pub static RETRIES: ErGroup = ErGroup {
     proxied: true,
 };
 
+pub static COMMITTOR: ErGroup = ErGroup {
+    label: "committor-faults",
+    env: &[],
+    proxied: true,
+};
+
 pub mod redline {
     use ::redline::scenarios;
     use redsuite_core::scenario_catalog;
@@ -122,7 +128,7 @@ pub mod redshift {
     use ::redshift::scenarios;
     use redsuite_core::scenario_catalog;
 
-    use super::{Fixture, DEFAULT, RETRIES};
+    use super::{Fixture, COMMITTOR, DEFAULT, RETRIES};
 
     scenario_catalog! {
         family: Redshift,
@@ -148,11 +154,11 @@ pub mod redshift {
             fixtures: [Fixture::RedlineProgram],
         },
         commit_blackout => committor::commit_blackout::CommitBlackout {
-            er: Fresh,
+            er: Exclusive(COMMITTOR),
             fixtures: [Fixture::RedlineProgram],
         },
         commit_exactly_once => committor::commit_exactly_once::CommitExactlyOnce {
-            er: Fresh,
+            er: Exclusive(COMMITTOR),
             fixtures: [Fixture::RedlineProgram, Fixture::RedshiftProgram],
         },
         commit_settlement_order => committor::commit_settlement_order::CommitSettlementOrder {
@@ -160,7 +166,7 @@ pub mod redshift {
             fixtures: [Fixture::RedlineProgram],
         },
         undelegation_recovery => committor::undelegation_recovery::UndelegationRecovery {
-            er: Fresh,
+            er: Exclusive(COMMITTOR),
             fixtures: [Fixture::RedlineProgram],
         },
         delegation_session_isolation => committor::delegation_session_isolation::DelegationSessionIsolation {
