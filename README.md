@@ -761,6 +761,9 @@ magicblock:
 - `ephemeral_accounts` — creates, resizes, closes and recreates sponsored
   accounts, checking ownership, contents, rent and fees. Rejects unauthorized
   calls and verifies rollback and serialized conflicts without duplicate refunds.
+  Its payer, sponsor, substitute and target are fresh, but the ephemeral vault
+  is the ER's one global account, so the scenario holds the default ER
+  exclusively and baselines every balance from the ER before its first step.
 
 chainlink:
 
