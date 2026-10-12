@@ -371,14 +371,11 @@ impl TransactionRetries {
         };
         for &phase in phases {
             // Each outcome owns fresh payer/counter state and its ledger window.
-            self.run_case(base, er, phase, private.as_deref_mut())
-                .await
-                .map_err(|error| -> redsuite_core::DynError {
-                    match error.downcast::<redsuite_core::CheckError>() {
-                        Ok(error) => error.context("case", phase).into(),
-                        Err(error) => format!("{phase}: {error}").into(),
-                    }
-                })?;
+            crate::phase(
+                phase,
+                self.run_case(base, er, phase, private.as_deref_mut()),
+            )
+            .await?;
         }
         Ok(())
     }

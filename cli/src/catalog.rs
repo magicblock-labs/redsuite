@@ -173,10 +173,6 @@ pub mod redshift {
             er: Shared(DEFAULT),
             fixtures: [Fixture::RedshiftProgram],
         },
-        commit_roundtrip => committor::commit_roundtrip::CommitRoundtrip {
-            er: Shared(DEFAULT),
-            fixtures: [Fixture::RedlineProgram],
-        },
         commit_and_undelegate => committor::commit_and_undelegate::CommitAndUndelegate {
             er: Shared(DEFAULT),
             fixtures: [Fixture::RedshiftProgram],
@@ -253,10 +249,6 @@ pub mod redshift {
             fixtures: [],
         },
         account_info_semantics => chainlink::account_info_semantics::AccountInfoSemantics {
-            er: Shared(DEFAULT),
-            fixtures: [],
-        },
-        escrow_cloning => chainlink::escrow_cloning::EscrowCloning {
             er: Shared(DEFAULT),
             fixtures: [],
         },

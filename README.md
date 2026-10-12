@@ -131,7 +131,7 @@ the run log names what was reclaimed.
 
 ## Running
 
-    redsuite run commit_roundtrip       # one scenario
+    redsuite run clone_on_access        # one scenario
     redsuite run redline                # one family
     redsuite run redshift/rpc_          # the RPC-surface scenarios
     redsuite run all                    # everything
@@ -452,10 +452,18 @@ Ported from the validator repo's test-integration suites.
 
 chainlink (account cloning):
 
-- `clone_on_access` — writes an account on base and reads it on the ER: same
-  bytes, same owner, same balance, and later update on a base is cloned on ER. A missing
-  account is read as missing, and an ER write to a delegated account stays off
-  base until a commit.
+- `clone_on_access` — the delegated-account lifecycle from first read to
+  undelegation. Writes an account on base and reads it on the ER: same bytes,
+  owner and balance; a later base write shows up on the clone; an account that
+  exists nowhere reads as missing until a base airdrop invalidates that
+  negative cache; and an ER write to an undelegated clone is refused. Then,
+  with a delegated account and a sibling, ER writes stay off base until a
+  commit; committing one account lands it on base byte-for-byte and leaves
+  the sibling untouched; committing and undelegating both returns them to the
+  owning program with the exact final bytes and lamports, after which the ER
+  refuses writes to the undelegated account; finally a one-transaction
+  undelegate + redelegate must never interrupt a wallet's clone. The commit
+  phases absorb the former `commit_roundtrip`.
 - `account_info_semantics` — query ER for an account that has never
   existed, for ordinary funded wallets, and for an escrow payer, first
   one account at a time and then in mixed batches. Every balance has to match
@@ -463,7 +471,13 @@ chainlink (account cloning):
   read, and an account that does not exist has to be considered as missing.
   A cold-read case funds ten fresh wallets and reads them through three
   concurrent batches (3/2/3 accounts) and two single-account requests, checking
-  exact response lengths and balances.
+  exact response lengths and balances. The escrow phase reads the escrowed
+  wallet and its escrow first, then proves a transfer out of the non-delegated
+  wallet is refused and leaves the escrow clone untouched, that a base top-up
+  of the escrow never shows on the ER while base holds it (the mixed batch
+  still reports the original balance), and that a wallet-delegated escrowed
+  spender can transfer on the ER, paying exactly the amount with its escrow
+  untouched. The escrow phases absorb the former `escrow_cloning`.
 - `cache_lifecycle` — combines eviction, reconnecting subscriptions, delayed
   stale observations, and continuous ER writes; protects delegated and
   undelegating state, refreshes base reads, and discovers undelegation completion.
@@ -486,9 +500,6 @@ chainlink (account cloning):
   memo v2 cloned from mainnet with their original loaders intact, the redshift
   fixture preloaded as an upgradeable v3 program, and a fourth copy that the
   scenario deploys from scratch, calls, and then upgrades to a second build.
-- `escrow_cloning` — creates an escrowed payer, lets the ER clone the escrow
-  once, then tops that escrow up on base. Delegated escrow belongs to the ER, and base-side changes to it 
-  are not reflected on ER.
 - `post_delegation_token_transfer` — attaches an SPL transfer to a delegation,
   so the validator runs that transfer the moment the account lands on
   the ER. It also checks the projection that makes this work.
@@ -592,10 +603,6 @@ committor (ER → base commits):
   the session-B delegation, value and nonce while the session-B ER keeps
   its state. After reassignment the old ER must reject writes and commits
   for the account, and in both cases a fresh session-B commit must land.
-- `commit_roundtrip` — writes two delegated accounts on the ER, commits one
-  and checks it lands on base byte-for-byte while the other doesn't move.
-  Then commits and undelegates both — the owning program gets its accounts
-  back with the exact final bytes.
 - `commit_and_undelegate` — walks the whole round trip and then back again:
   commit, undelegate, write to the account on base so that the program owns
   it once more, and delegate it a second time. A plain commit of one and of
