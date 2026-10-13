@@ -742,22 +742,42 @@ scheduler:
 
 replication (leader + verifiers):
 
-- `verifier_lifecycle` — boots a private ER as a leader with two verifiers
-  following it, checks every node has its own identity, storage, log,
-  configuration and metrics port, and that both verifiers catch up with the
-  leader's transactions and blocks. Then it stops one verifier gracefully
-  while the other keeps following, restarts it and watches it reconnect and
-  catch up, and finally hard-kills the second verifier and keeps it offline
-  while the leader and the first verifier carry on, before letting it rejoin
-  from wiped storage. Teardown must reap every process the topology owns.
-- `replication_recovery` — one leader and two verifiers under a steady stream of
-  `X(A) -> Y(A,B) -> Z(B)` hash-fold chains. Both verifiers must keep up,
-  one is restarted while its cursor is still retained and must catch up
-  under load, and the other is kept offline until the
-  leader's retention has purged its history, so it must install a snapshot
-  and replay the tail. At the final sealed boundary both verifiers hold
-  exactly the leader's transactions, report zero sealed-checksum mismatches,
-  and the leader's accounts match the client-side fold model.
+- `verifier_lifecycle` — the whole replication lifecycle on one leader
+  with two verifiers: it boots them once and then takes each node through
+  every stimulus in turn, under a steady stream of `X(A) -> Y(A,B) ->
+  Z(B)` hash-fold chains. First every node must have its own identity,
+  storage directory, configuration, log and metrics port, sit on the
+  leader's follower allowlist, follow the leader's replication listener,
+  and both verifiers must catch up with the leader's transactions and
+  blocks. Then, with the load running: verifier 0 is stopped cleanly at a
+  fresh superblock boundary and restarted inside three seconds, so it must
+  resume from its retained cursor without installing a snapshot; verifier
+  1 is stopped cleanly and kept offline until the leader's one-byte ledger
+  limit has purged a block it had not seen, so it must install a
+  leader-served snapshot and replay the tail — and while it is down the
+  leader must keep advancing and verifier 0 must keep following and
+  catching up; verifier 1 is then SIGKILLed, the leader must keep cloning
+  fresh base accounts and sealing blocks with only one follower left, and
+  verifier 1 must rejoin from wiped storage on a freshly served snapshot,
+  catch up with the leader's transactions and resume appending blocks.
+  Every stop also proves the node stops answering its metrics endpoint,
+  and both long stops prove the leader's connection count drops before it
+  comes back; the retained-cursor restart, whose node must be back inside
+  three seconds, only requires it to come back. The recovered node must
+  also seal a superblock against the leader before the next stimulus kills
+  it, so a wrong snapshot cannot vanish with the storage wipe. At the
+  final sealed boundary, after the load drains, both verifiers hold
+  exactly the leader's transactions and reach its sealed superblock, and
+  because a wiped node counts blocks from the snapshot it installed, the
+  block count is compared on the verifier that was never wiped. Both
+  report zero sealed-checksum mismatches and no mismatch in their logs,
+  and the leader's accounts match the client-side fold model. Failures
+  name the node and the phase, and teardown must reap every process the
+  topology owns. This scenario carries the coverage of the former
+  `replication_recovery` (steady load, retained-cursor restart,
+  out-of-retention snapshot recovery, final state consistency) and of the
+  former `verifier_lifecycle` (node isolation, stopped endpoints, survivor
+  progress, SIGKILL, wiped rejoin, teardown).
 
 storage (checkpoint durability and ledger retention):
 

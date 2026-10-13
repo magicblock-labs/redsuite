@@ -199,10 +199,6 @@ pub mod redshift {
         },
         verifier_lifecycle => replication::verifier_lifecycle::VerifierLifecycle {
             er: Fresh,
-            fixtures: [],
-        },
-        replication_recovery => replication::replication_recovery::ReplicationRecovery {
-            er: Fresh,
             fixtures: [Fixture::RedlineProgram],
         },
         transaction_retry_cold_fetch => aperture::transaction_retries::TransactionRetries::ColdFetch {
