@@ -244,10 +244,6 @@ pub mod redshift {
             er: None,
             fixtures: [],
         },
-        pubsub_contracts => pubsub::pubsub_contracts::PubsubContracts {
-            er: Shared(DEFAULT),
-            fixtures: [],
-        },
         account_info_semantics => chainlink::account_info_semantics::AccountInfoSemantics {
             er: Shared(DEFAULT),
             fixtures: [],
