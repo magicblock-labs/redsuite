@@ -624,7 +624,7 @@ committor (ER → base commits):
   would overflow it. One authority creates a second table for the remaining
   addresses and a separate empty table for deactivation.
 
-aperture (JSON-RPC surface):
+aperture (JSON-RPC and WebSocket surface):
 
 - `transaction_retry_cold_fetch`, `transaction_retry_concurrent`,
   `transaction_retry_subscriptions`, and
@@ -642,23 +642,37 @@ aperture (JSON-RPC surface):
   Accepted submissions drain through block publication before assertions, and
   the subscription case waits for every queued reader to execute before it
   ends; the current ER execution fee is zero.
-- `rpc_lifecycle` — drives one execution through every read that describes
-  it, using the official `solana-rpc-client`. Prepares 256 delegated
-  accounts, submits 256 uniquely signed writes concurrently and unpaced under
-  a bounded deadline, then requires `sendTransaction`, `getSignatureStatuses`,
-  `getTransaction`, `getSignaturesForAddress`, `getAccountInfo`,
-  `getMultipleAccounts`, `getBalance`, `getBlock`, `getBlockTime`,
-  `getBlocks`, `getBlocksWithLimit`, `getSlot` and `getBlockHeight` to tell
-  one story: the echoed signatures, the written values, the transaction
-  slots, the block contents and the block times all have to agree.
-  `getLatestBlockhash`, `isBlockhashValid` and `getFeeForMessage` are
-  exercised on the way in, `simulateTransaction` must leave no trace in state
-  or status, and the MagicBlock-specific `getBlockhashForAccounts` and
-  `getDelegationStatus` are called raw. Block publication is polled with a
-  bound before history is read. Ten additional transfers span advancing slots;
-  after each settles for ten slots, transaction/block timestamps must agree
-  with `getBlockTime`, be positive, and not be in the future. The burst carries
-  no throughput verdict.
+- `rpc_lifecycle` — drives executions through every read and every
+  subscription that describes them: HTTP via the official
+  `solana-rpc-client`, WebSocket via the harness clients. The HTTP burst
+  prepares 256 delegated accounts, submits 256 uniquely signed writes
+  concurrently and unpaced under a bounded deadline, then requires
+  `sendTransaction`, `getSignatureStatuses`, `getTransaction`,
+  `getSignaturesForAddress`, `getAccountInfo`, `getMultipleAccounts`,
+  `getBalance`, `getBlock`, `getBlockTime`, `getBlocks`, `getBlocksWithLimit`,
+  `getSlot` and `getBlockHeight` to tell one story: the echoed signatures, the
+  written values, the transaction slots, the block contents and the block
+  times all have to agree. `getLatestBlockhash`, `isBlockhashValid` and
+  `getFeeForMessage` are exercised on the way in, `simulateTransaction` must
+  leave no trace in state or status, and the MagicBlock-specific
+  `getBlockhashForAccounts` and `getDelegationStatus` are called raw. Block
+  publication is polled with a bound before history is read; the burst
+  carries no throughput verdict. Alongside the burst, two delegated wallets
+  make ten sequential transfers that both surfaces observe: account subscriptions
+  must deliver every balance in order down to the drained value, and once
+  ten more slots have settled, `getTransaction`, `getBlock` and
+  `getBlockTime` must agree on each transfer's positive, non-future
+  timestamp. Logs (mentions) and program subscriptions must report five
+  further transfers with their signatures and log lines, signature
+  subscriptions registered before and after confirmation must both fire,
+  slot notifications must increase strictly, every account, logs, program
+  and slot unsubscribe must return true and be followed by silence while
+  further transfers execute, `logsSubscribe(all)` must be refused as an
+  unsupported filter, and no frame may fail to parse. The burst, the wallet
+  stream, the timestamp settlement and the slot stream overlap wherever the
+  transaction order allows; failures carry their HTTP or WebSocket phase,
+  each transfer's HTTP submission and confirmation included. The WebSocket
+  phases absorb the former `pubsub_contracts`.
 - `rpc_token_queries` — builds realistic SPL state on base and lets the ER
   materialize it: two mints, two owners, an approved delegate, plain ATAs
   and eATA-backed projections delegated to the ER, plus one account that is
@@ -725,13 +739,6 @@ scheduler:
   task in place is not asserted: PR #1369 sends Cancel and Create in one
   transaction and the ER rejects the Create with "invalid program argument",
   so that path stays an upstream limitation.
-
-pubsub (websocket subscriptions):
-
-- `pubsub_contracts` — subscribes to accounts, logs, programs, signatures
-  and slots, then makes transfers and checks every promised notification
-  arrives with the right content. After unsubscribing, sends more transfers
-  and checks nothing arrives.
 
 replication (leader + verifiers):
 
