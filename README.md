@@ -756,8 +756,8 @@ replication (leader + verifiers):
   limit has purged a block it had not seen, so it must install a
   leader-served snapshot and replay the tail — and while it is down the
   leader must keep advancing and verifier 0 must keep following and
-  catching up; verifier 1 is then SIGKILLed, the leader must keep cloning
-  fresh base accounts and sealing blocks with only one follower left, and
+  catching up. Verifier 1 is then SIGKILLed; the leader must keep cloning
+  fresh base accounts and sealing blocks with one follower. In a later phase,
   verifier 1 must rejoin from wiped storage on a freshly served snapshot,
   catch up with the leader's transactions and resume appending blocks.
   Every stop also proves the node stops answering its metrics endpoint,
