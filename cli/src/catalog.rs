@@ -256,10 +256,6 @@ pub mod redshift {
             er: Shared(DEFAULT),
             fixtures: [Fixture::RedshiftProgram],
         },
-        post_delegation_token_transfer => chainlink::post_delegation_token_transfer::PostDelegationTokenTransfer {
-            er: Shared(DEFAULT),
-            fixtures: [],
-        },
         projected_token_lifecycle => chainlink::projected_token_lifecycle::ProjectedTokenLifecycle {
             er: Fresh,
             fixtures: [Fixture::RedlineProgram],
