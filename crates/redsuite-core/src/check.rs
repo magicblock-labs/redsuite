@@ -190,3 +190,14 @@ pub async fn poll_until<T, E>(
         tokio::time::sleep(interval).await;
     }
 }
+
+pub async fn phase<T>(
+    name: &str,
+    work: impl Future<Output = crate::Result<T>>,
+) -> crate::Result<T> {
+    work.await
+        .map_err(|error| match error.downcast::<CheckError>() {
+            Ok(error) => error.context("phase", name).into(),
+            Err(error) => format!("{name}: {error}").into(),
+        })
+}
