@@ -1,850 +1,244 @@
-# RedSuite
-
-Black-box test harness for the MagicBlock validator. Scenarios drive a live
-base L1 + ephemeral rollup purely through the public surface — transactions,
-JSON-RPC, WebSocket and the Prometheus `/metrics` endpoint. Redline emits
-performance reports with measurements; Redshift and Redhat are correctness
-and security gates that pass or fail with diagnostics.
-
-RedSuite is built on top of [redline](https://github.com/magicblock-labs/redline),
-the MagicBlock validator load-testing tool: redline's engine (transport pools,
-rate limiting, confirmation tracking, streaming stats, account prep) is being
-extracted into `redsuite-core`, topped with a net-new topology harness and a
-scenario/assertion layer.
-
-## Quick start
-
-One-time setup:
-
-1. rustup — the toolchain is pinned by `rust-toolchain.toml`.
-2. The Solana CLI on PATH — provides `solana-test-validator` (the base L1)
-   and `cargo-build-sbf` (SBF builds).
-3. A source build of the validator under test, pointed at via env:
-
-       git clone https://github.com/magicblock-labs/magicblock-validator
-       cargo build --release --manifest-path magicblock-validator/Cargo.toml
-       export MAGICBLOCK_VALIDATOR_BIN=$PWD/magicblock-validator/target/release/magicblock-validator
-
-   The committor program is picked up from that same build tree
-   (`target/deploy/magicblock_committor_program.so`).
-
-Then, in this repo:
-
-    cargo xtask programs                 # build the family SBF programs
-    cargo build --release -p redsuite    # build the runner
-    target/release/redsuite run all      # run everything
-
-The first run boots the base L1 and leaves it running for later runs; each
-run boots the ERs its scenarios declare and stops them when it ends.
-`cargo xtask stack down` stops the base.
-
-Scenarios run on Linux and macOS. Process supervision (readiness, graceful
-stop, hard kill, restart, orphan cleanup) and the ER measurements (per-thread
-CPU time, open file descriptors, resident size) read `/proc` on Linux and go
-through `libproc` on macOS. The validator raises its open-file limit to 1,000,000 at startup and
-exits if it cannot, so on macOS run `sudo launchctl limit maxfiles 1000000
-1000000` once per boot and `ulimit -n 1000000` in the shell that launches
-redsuite.
-
-## Layout
-
-    crates/redsuite-core/   the engine: topology, contexts, transport, prep, scenario, stats
-    redline/                performance scenarios (load)
-    redshift/               correctness scenarios (observed state vs expected model)
-    redhat/                 security scenarios (adversarial, must-be-rejected)
-    cli/                    the `redsuite` binary — run scenarios without cargo
-    programs/               on-chain SBF programs, one per family
-    xtask/                  cargo xtask automation (SBF builds, stack control, reports)
-
-Fixture instruction consumers and wire contracts are documented in
-[programs/README.md](programs/README.md).
-
-## Writing a scenario
-
-Scenarios live in the family libraries under `<family>/src/scenarios/
-<subsystem>/<name>.rs`: one `Scenario` impl each, exported from the
-subsystem's `mod.rs`. The harness owns process spawning, ports, funding and
-teardown. See `redshift/src/scenarios/harness/example.rs`. A correctness or
-security scenario returns `Result<()>`: its checks are the verdict and nothing
-is persisted. Redline benchmarks implement `Scenario<ScenarioReport>` and
-return the measurements that land in `target/redsuite-reports/`.
-
-Registration is one declaration: an entry in the catalog
-(`cli/src/catalog.rs`, one `scenario_catalog!` block per family). The entry
-names the scenario's short name, runner type, ER contract (`er`), host
-exclusivity (`host_exclusive`), and fixtures. The `redsuite` binary dispatches
-from that record and is the only scenario runner. Cargo tests do not execute
-scenarios.
-
-## The redsuite binary
-
-The whole suite runs through one executable, which is also what CI and
-benchmark hosts use — no cargo, no checkout:
-
-    cargo build --release -p redsuite
-
-    redsuite list                             # every scenario
-    redsuite list redshift/rpc_               # what a selection would run
-    redsuite run redline/high_cu              # one scenario (short names work too)
-    redsuite run redline --profile full       # a whole family
-    redsuite run redshift/rpc_                # every scenario under a name prefix
-    redsuite run commit_                      # a prefix across families (benchmarks last)
-    redsuite run all                          # everything (redline last, alone)
-    redsuite run all --serial                 # one at a time, storage wiped at the end
-    redsuite stack status                     # ports, pids, health
-    redsuite stack down                       # stop the base and leftover ERs, delete their storage
-    redsuite report bmf --out redsuite-bmf.json # export benchmark measurements for Bencher
-
-It still needs `solana-test-validator` on PATH and the ER binary under test
-(`MAGICBLOCK_VALIDATOR_BIN`), and it reads the built programs from the
-workspace. Set `REDSUITE_ROOT` when it runs outside a checkout.
-
-`run all` gives each ER group a lane — the group's shared members at once,
-then its exclusive members one at a time — beside a lane of at most two
-fresh-ER scenarios, then runs the host-exclusive benchmarks last and alone.
-Benchmarks must never share the box, so keep that last lane exclusive.
-
-A CLI run whose selection contains Redline records `suite/<target>` with its
-host, workload profile, full wall time and lane durations in
-`target/redsuite-reports/`; Redshift- and Redhat-only runs persist nothing.
-Group and fresh lane times overlap; benchmarks follow both, and serial wall
-time includes teardown.
-
-Every ER preallocates its storage in multi-gigabyte steps, so a full parallel
-run needs room for about five validators at once. `--serial` trades wall
-time for disk: it runs each ER group's members one at a time, benchmarks
-included, stops the group's ER and removes its storage before the next
-group, then runs the fresh-ER scenarios one at a time against the remaining
-base. Apart from the scenarios that boot several validators by design (a
-leader with verifiers, or a private ER beside the group's), only one ER
-exists at any moment. When the run ends it performs `stack down`, which
-stops every process it started and deletes the base ledger and every ER
-directory under `target/redsuite-stack/` (logs stay). `--keep-storage` skips that final
-teardown. Every validator's ledger lives in the stack dir,
-`target/redsuite-stack/` unless `REDSUITE_STACK_DIR` points it at a larger
-disk; set `REDSUITE_ACCOUNTSDB_DIR` to
-put the accounts databases on a separate disk, laid out as
-`<dir>/er-<label>/accountsdb`, and both `stack down` and the failure
-cleanup sweep that root too. Independently of the mode, a scenario that fails before stopping
-its private ERs has them stopped and their storage removed by the harness;
-the run log names what was reclaimed.
-
-## Running
-
-    redsuite run clone_on_access        # one scenario
-    redsuite run redline                # one family
-    redsuite run redshift/rpc_          # the RPC-surface scenarios
-    redsuite run all                    # everything
-
-A selection is `all`, a family, a scenario (full or short name), or a name
-prefix; an exact name wins over the prefix it also matches. The runner owns
-the concurrency limits: an ER group's shared members run together and its
-exclusive members alone on that ER, fresh-ER scenarios two at a time, and the
-redline family last and alone. Run one suite invocation at a time.
-
-All scenarios share **one boot-once base L1**: the first run boots it on
-dynamically allocated ports and leaves it running; every later scenario — in
-the same run or the next — health-checks and reuses it, and a dead or unhealthy
-base is killed and rebooted transparently. ERs are not shared across runs: the
-runner boots each ER group its selection needs, hands it to the group's
-members and stops it after the group's last member. Coordination lives in
-`target/redsuite-stack/` (`state.json`, `identity-pool.json`, a cross-process
-flock, `genesis-accounts/`, logs, ledgers).
-
-    cargo xtask stack status    # ports, pids, health, log locations
-    cargo xtask stack down      # stop the stack and clear its state
-
-Scenario isolation comes from fresh keypairs, not fresh chains. Every
-catalog entry declares its ER contract (`cli/src/catalog.rs`):
-
-- `Shared(DEFAULT)` — parallel shared access: the member runs concurrently
-  with the group's other shared members on the group's ER.
-- `Exclusive(DEFAULT)`, `Exclusive(RETRIES)`, `Exclusive(COMMITTOR)` —
-  sequential shared access: the member has the group's ER to itself, with no
-  shared or other exclusive member beside it (`ephemeral_accounts` and
-  `task_scheduler` account for every lamport of a vault or of the validator
-  identity, every Redline benchmark on the default ER, the three
-  transaction-retry cases that take turns on the proxied `transaction-retries`
-  ER, and `commit_blackout`, `commit_exactly_once` and `undelegation_recovery`
-  on the proxied `committor-faults` ER, which the last two restart in place).
-- `Fresh` — fresh isolated execution: the scenario boots and owns the ERs it
-  needs because no declared group covers them — a configuration of its own,
-  a leader with verifiers, a second ER beside the first, or a crash path such
-  as a hard kill. Restarting is not a reason by itself: an exclusive member
-  restarts its group's ER in place.
-  `restart_under_load` and `superblock_boundary_latency` are the host-exclusive
-  ones; `ws_conn_capacity`, `clone_lru_churn`, `cold_hydration_tail`,
-  `ensure_gate_stall` and `storage_prodsize_sustain` instead hold the default
-  ER exclusively and boot theirs beside it, delegating their accounts to the
-  default identity.
-- `None` — base only: `api_invariants`, `claim_fees` and `table_mania` never
-  start an ER.
-
-An ER group names an ER, the environment it boots with and whether its base
-traffic runs through RedSuite's base-chain proxies — `DEFAULT` is the stock
-ER most scenarios share, `RETRIES` and `COMMITTOR` the proxied ones; groups are declared,
-never inferred from matching configuration. The runner boots a group's ER
-(and its proxies) before its first member and stops it, storage included,
-after its last member; between members it resets the proxies — rules
-cleared, holds released and waited for until the held operations resume, an
-interception that never fired failing the member that registered it — so no
-fault carries into the next one. An exclusive member may restart the group's
-ER in place through its context (same storage, identity and ports); its
-successor gets the restarted ER. A `Fresh` scenario's ERs
-are reclaimed when that scenario ends. A member that fails, or a group ER
-that no longer reports itself healthy, makes the runner replace that ER with
-a fresh one before the next member and say so in the run log, so no state
-carries over; a group ER that fails to boot fails every member with that
-cause, and a run reclaims and audits every ER it launched before it exits;
-shared members accept each other's state by declaration. Every ER takes its
-identity from a 64-slot pool minted at genesis, so ERs never collide with
-each other, and a group's ER keeps its identity across the run.
-The four retry entrypoints share their implementation in `transaction_retries`.
-
-The harness needs two binaries, and a third for replicated topologies:
-
-- base — `solana-test-validator` on PATH;
-- ER — `$MAGICBLOCK_VALIDATOR_BIN`, else `magicblock-validator` on PATH;
-- verifier — `$MAGICBLOCK_VERIFIER_BIN`, else `magicblock-verifier` beside
-  the ER binary, else on PATH. Only scenarios that boot a leader with
-  verifiers need it.
-
-A replicated topology (`topology::replicated`) is one private ER booted as a
-leader whose follower allowlist names N freshly minted verifier identities,
-plus N `magicblock-verifier` processes replicating from its listener. Every
-verifier gets its own identity, generated TOML, storage directory, log and
-metrics port, and a scenario can stop, start or restart each one on its own
-while the others keep following (a verifier killed before it archived a
-snapshot cannot reopen its storage; `reset_storage` wipes it so the next
-start rejoins from the leader's snapshot). Each launch is listed in a failing
-or verbose run's console details and, for Redline benchmarks, persisted in the
-run's report under `launches` (binary, version, identity, ports, storage, log,
-config, pid and relaunch count); `redsuite stack down` reaps any leader,
-verifier or private ER a crashed run left behind.
-
-A private ER can also be booted behind RedSuite-owned base-chain proxies
-(`netfault::BaseProxies`): one HTTP and one WebSocket listener that forward
-the ER's remote traffic to the real base validator. A scenario registers an
-interception by RPC method, account or transaction signature at the request,
-response or notification stage, waits until it fires, and then releases,
-discards, or rejects that one operation; rules stall or reject every match
-until removed; and every proxied connection can be closed at once. The
-scenario's own base client never goes through the proxies, so it can verify
-what base executed independently. The proxies only hold, drop, reject or
-disconnect real traffic and never fabricate account contents or slots. Each
-hold, release, discard, rejection, disconnect and restore is recorded for the
-scenario's own checks, an interception that never fires fails the scenario,
-and dropping the proxies releases pending work and closes their connections
-even when the scenario fails early.
-
-## Environment
-
-| variable | what |
-|---|---|
-| `MAGICBLOCK_VALIDATOR_BIN` | the ER binary under test; else `magicblock-validator` on PATH |
-| `MAGICBLOCK_VERIFIER_BIN` | the verifier binary for replicated topologies; else beside the ER binary, else on PATH |
-| `REDSUITE_ROOT` | workspace root, when the `redsuite` binary runs outside a checkout |
-| `REDSUITE_STACK_DIR` | where the stack lives: every validator's ledger, the base ledger, state and logs; defaults to `target/redsuite-stack` under the workspace root |
-| `REDSUITE_ACCOUNTSDB_DIR` | root for every validator's accountsdb, when it should live on another disk than the ledger; by default it sits inside each validator's storage dir |
-| `REDSUITE_CLONE_URL` | where a cold boot clones base programs from; defaults to mainnet-beta |
-| `REDSUITE_PROFILE` | Redline workload: `lite` (default) or `full`; ignored by Redhat and Redshift |
-| `REDSUITE_LOOP` | S1 loop mode: `open` (default) or `closed` |
-| `REDSUITE_VERBOSE` | set to print stack boot, reuse and per-scenario detail lines for passing scenarios too; by default those appear only for failures |
-| `REDSUITE_YELLOWSTONE_PLUGIN` | a prebuilt `libyellowstone_grpc_geyser.so` to load instead of the cached upstream release |
-| `REDSUITE_YELLOWSTONE_DIR` | where cached Yellowstone releases live; defaults to `target/yellowstone` under the workspace root |
-
-A cold boot clones its base programs from `REDSUITE_CLONE_URL`, so the first
-boot needs that endpoint. A warm stack does not, and neither does a rerun.
-
-### Yellowstone gRPC
-
-The shared base boots with the upstream Yellowstone geyser plugin when it can,
-so the feed is provisioned once, before any scenario runs, and no scenario ever
-restarts the base to acquire it. An ER only receives the feed when its scenario
-puts the endpoint in `BaseEndpoints::grpc_url`; today only
-`undelegation_grpc_redundancy` does, so every other ER keeps exactly the
-remotes it always had. `BaseCtx::grpc` returns the endpoint and the release
-tag, or `None` when the base came up without the plugin.
-
-Acquiring the plugin never breaks a run. If the release cannot be resolved,
-downloaded or verified, the base boots without it; if the base then refuses to
-serve with the plugin loaded, it is relaunched without it. Either way the stack
-records no feed, and only a scenario that asks for one fails, naming the
-reason.
-
-The plugin is an upstream release binary, chosen by the `major.minor` version
-of the `solana-test-validator` on PATH and cached under
-`target/yellowstone/<release tag>`. The first run that needs it downloads the
-`.so`, checks it against the release checksums and keeps it. Upstream builds it
-for x86_64 linux only, so elsewhere point `REDSUITE_YELLOWSTONE_PLUGIN` at a
-plugin built for that host.
-
-A scenario proves the feed is live by what reaches the ER, not by a metric: the
-validator attributes subscription counters to a client id even when that
-client's endpoint is unreachable, so the counters cannot tell the transports
-apart. `undelegation_grpc_redundancy` holds the WebSocket and account-fetch
-paths for its accounts and fails if nothing arrives, which is why it fails when
-the feed is missing or pointed at a dead port.
-
-## redline scenarios
-
-The performance tests, one file each under `redline/src/scenarios/<subsystem>/`.
-`lite` (default) provides shorter benchmark runs; `full` uses the larger
-workloads. Select one with `--profile` or `REDSUITE_PROFILE`. The flag is
-accepted only when the selection includes Redline.
-`redsuite run all --profile full` runs every scenario and changes only Redline's workload.
-Redhat and Redshift use fixed workloads. Other profile names are rejected.
-
-aperture (RPC / websocket ingress):
-
-- `simple_load` — smoke test for the whole pipeline: create and delegate a
-  few accounts, send some writes to the ER, check the data actually changed
-  and that account updates arrive over websocket.
-- `rpc_warm_ingress` — sends transactions at a steady rate and measures how
-  long acceptance, confirmation and the websocket account update take. This
-  is the baseline.
-- `ws_fanout_threshold` — opens an increasing number of websocket
-  connections, all subscribed to the same accounts, while writes are
-  running. Every connection must receive every update.
-- `ws_conn_capacity` — opens thousands of websocket connections, subscribes,
-  unsubscribes and closes them, watching the validator's file descriptors
-  and memory the whole time. Anything left behind is a leak.
-- `rpc_capacity_blast` — fires transactions as fast as the client can push
-  for a few seconds and records how many per second the validator accepted.
-- `high_cu` — stresses execution: the same rate of transactions, once with a
-  trivial amount of work per transaction and once with a heavy one (a hash
-  computed over and over, close to the compute limit). Reading the final hash
-  back off the accounts proves the validator really did the work.
-
-scheduler:
-
-- `hot_account_cliff` — sends a fixed transaction rate at fewer and fewer
-  accounts (32 down to 4) so they all fight over the same account locks.
-- `executor_saturation` — pre-signs a large pile of transactions and fires
-  them all at once, one payer per delegated account so no two in-flight
-  transactions share a writable key; reports the engine's busy-executor
-  gauge and ordering-dependency count alongside throughput.
-- `mixed_sustained_load` — holds a fixed transaction rate over many payer
-  lanes while cycling the workload every 20 slots: two slots of high-CU
-  sha256 work, nine of simple writes, nine of read-write transactions. The
-  validator must keep up without drops or failures and drain the backlog.
-- `conflict_ordering` — proves conflicting transactions execute in their
-  accepted order regardless of executor timing. Account pairs receive
-  repeated `X(A) -> Y(A,B) -> Z(B)` chains, each step folding the accounts'
-  current hashes into a new one, while high-CU work on disjoint accounts
-  keeps every executor busy: first with a bounded number of unconfirmed
-  transactions (a deep ready queue), then open loop (the sequencer's
-  pending-work bound engaged). After each batch the pipeline must drain to
-  zero blocked, busy and pending work, and every pair must hold exactly the
-  fold of its accepted order — any reordering changes every later digest.
-  Needs a host whose engine runs at least two executors.
-
-chainlink (account cloning / subscriptions):
-
-- `clone_lru_churn` — makes the validator track more accounts than its
-  configured cap and keeps reading random ones. Every miss forces an evict +
-  refetch cycle; the test checks evictions and refetches match one-to-one
-  and measures how fast that churn can go. The cache rounds a cap up to a
-  power of two with a floor of 256, so each rung is a distinct effective
-  capacity: lite 360 and 200 (512 and 256), full 900, 500 and 125 (1024, 512
-  and 256).
-- `ensure_gate_stall` — same oversubscription (working set 8x
-  the cap) with multi-account transactions: each transaction waits until all
-  its accounts are present.
-- `cold_hydration_tail` — how expensive is the first-ever read of an account
-  versus reading it again, and how much slower a burst of transactions gets
-  when they all wait on the same missing dependencies.
-
-committor (ER → base commits):
-
-- `commit_width_envelope` — commits 1, 2 and 4 accounts back to the base
-  chain and records what each input costs: round-trip latency and number of
-  base transactions.
-- `commit_throughput_ceiling` — schedules wide commits over never-committed
-  accounts and measures the committor's drain rate.
-
-storage:
-
-- `storage_prodsize_sustain` — sustained load against a validator with
-  production-sized storage settings, measured as two equal back-to-back
-  windows.
-- `superblock_boundary_latency` — boots a private ER with short superblocks,
-  fills its ledger, then offers a steady rate and compares the latency of
-  requests that land on a superblock seal against the ones that do not.
-
-lifecycle (restart / shutdown):
-
-- `restart_under_load` — runs twice on fresh private validators, once
-  stopped with SIGTERM and once with SIGKILL, never resetting storage. Lanes
-  write to one account each and track every transaction; at termination new
-  work stops and each transaction is confirmed, failed, or unresolved. After
-  the relaunch every unresolved signature is resolved, every confirmed one
-  must still be in the ledger, and each account must hold the id of its last
-  confirmed write. Load then resumes until another superblock seals and drains
-  cleanly, and a second restart must preserve that state. Times both restarts.
-
-harness:
-
-- `protocol_boundary_selftest` — tests the test harness itself. Runs the
-  same load with one thread and with eight: if the single-threaded
-  run reports huge latency while the validator-side numbers stay flat, the
-  slowness was our client, not the validator — and must never be reported
-  as a validator regression.
-
-### What the test client measures
-
-| Metric                  | What it measures                                                                                                               | If it grows, it means                                                                                   |
-|-------------------------|--------------------------------------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------|
-| `delivery us`           | How long you wait for the validator to confirm it received txn. No execution yet — just acceptance.                            | The validator is struggling to receive traffic. The problem is at the entrance, before any real work.   |
-| `signature latency us`  | How long from sending until the validator confirms your transaction actually ran.                                              | The work itself got slower - scheduling, waiting for account locks, or execution.                       |
-| `account-update lag us` | How long until someone watching an account over websocket sees your change.                                                    | Something in the pipeline slowed down                                                                   |
-| `sync round-trip us`    | Cost of one isolated transaction: send it, wait for confirmation, only then send next one.                                     | The true per-transaction cost went up                                                                   |
-| `fanout lag us`         | One account changes while many clients watch it. Times how long until each watcher gets the notification.                      | Broadcasting one update to many listeners doesn't scale — the more watchers, the longer they all wait.  |
-| `churn op us`           | How long one subscribe, unsubscribe, or connection close takes.                                                                | Managing subscriptions itself became slow                                                               |
-| `cold first-touch us`   | Reading an account the validator has never seen — it must first fetch it from the base chain.                                  | Fetching accounts from the base chain got slower.                                                       |
-| `warm repeat us`        | Reading that same account again. Should be fast and stay flat — it's the control.                                              | The cache is broken. If only cold reads slow down, cloning is the problem; if warm ones do, caching is. |
-| `read latency us`       | Read speed while we force the account cache to constantly throw accounts out and re-fetch them.                                | Each evict-and-refetch cycle costs more than it used to.                                                |
-| `commit round-trip us`  | How long from "save this state to the base chain" until it's actually confirmed there.                                         | The commit pipeline is slowing down                                                                     |
-| `er delivery us`        | Just the rollup's commit time.                                                                                                 | Tells you rollup side takes longer for commit                                                           |
-| `achieved rps`          | How many requests the harness actually admitted each second, counted second by second after the concurrency gate.             | A low average means you hit a ceiling; big swings mean throughput is unstable.                          |
-
-Everything is a distribution, not an average — problems show up in the
-p95/max tail long before the average moves.
-
-### One-number verdicts per run
-
-| Metric                                              | What it measures                                                                                  | If it's off, it means                                                                                       |
-|-----------------------------------------------------|---------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------|
-| `achieved tps` vs `offered tps`                     | We *tried* to send at some rate — did we actually manage to?                                      | A gap means something saturated — and every other result was measured under less load than the test claims. |
-| `base txs per commit`                               | How many base-chain transactions one commit costs.                                                | Commits got more expensive — worse batching, or lookup tables aren't being reused.                          |
-| `cliff at ws conns`                                 | At how many websocket connections update delivery fell over.                                      | The capacity edge moved closer. 0 means we never hit an edge — good, or the test didn't push far enough.    |
-| `thrash p50 slowdown x`                             | How many times slower a typical read gets once the account cache starts thrashing.                | Going over the cache limit hurts more than it used to.                                                      |
-| `heavy/light validator avg ratio`                   | Did compute-heavy transactions take proportionally longer inside the validator than trivial ones? | A ratio near 1.0 proves the validator *didn't actually do the work*.                                        |
-| `writes produced` vs `received total`               | We caused N updates — did N notifications actually arrive?                                        | Any shortfall is the validator silently dropping messages                                                   |
-| `incomplete conn-account pairs`                     | How many watchers missed at least one update.                                                     | How widespread the dropping is.                                                                             |
-| `missing final states`                              | How many watchers never got the *last* update — they're stuck believing stale state forever.      | Clients that are permanently wrong, not just briefly behind.                                                |
-| `received per-conn min/max`                         | The best- and worst-served connection.                                                            | A big spread means drops starve specific connections instead of spreading evenly.                           |
-| `baseline fds` / `fds after churn`                  | Open file handles before vs after churning thousands of connections. They must match.             | A handle leak                                                                                               |
-| `baseline rss kb` / `rss after churn kb`            | Same check for memory.                                                                            | A memory leak.                                                                                              |
-| `validator cores`                                   | How much CPU the validator actually used during the test.                                         | Low CPU *at* a throughput ceiling means the bottleneck is a lock or a serial stage                          |
-| `top thread cores`, `busy threads`                  | How the work spread across threads.                                                               | One thread maxed out while the rest sit idle: a single-threaded bottleneck.                                 |
-
-### What the validator reports about itself (scraped from `/metrics`, counted over the test window)
-
-| Metric                                                            | What it measures                                                                                                                   | If it moves the wrong way, it means…                                                                                                                         |
-|-------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `mbv_transaction_count`, `mbv_failed_transactions_count`          | The validator's own count of transactions it ran, and how many failed.                                                             | If it didn't move at all during a load test, the test measured nothing — the run is thrown out as INVALID.                                                   |
-| `mbv_transaction_processing_time`                                 | The validator timing its own execution of each transaction.                                                                        | If this stays flat while the client's numbers grow, time is being lost *waiting in queues between stages* — the most useful disagreement in the whole suite. |
-| `mbv_ensure_accounts_time`                                        | How long transactions stood at the door waiting for their accounts to be fetched first.                                            | Account fetching is stalling admission — one missing account holds up whole transactions.                                                                    |
-| `mbv_monitored_accounts_gauge`                                    | How many accounts the validator is currently tracking.                                                                             | Used as proof: the oversubscription test really did push past the configured limit.                                                                          |
-| `mbv_evicted_accounts_count` vs `mbv_account_fetches_found_count` | Accounts thrown out of the cache vs accounts fetched back in                                                                       | If they drift apart, accounts are getting lost or fetched twice.                                                                                             |
-| `mbv_max_lock_contention_queue_size`                              | The deepest pile-up of transactions waiting behind one popular account's lock.                                                     | Traffic on hot accounts is serializing harder.                                                                                                               |
-| `mbv_committor_intents_count`, `_failed_intents_count`            | How many commits the validator processed and how many failed.                                                                      | Zero during a commit test invalidates the run.                                                                                                               |
-| `mbv_committor_intent_backlog_count`                              | How many commits are waiting in line.                                                                                              | Commits are being created faster than the workers can process them.                                                                                          |
-| `mbv_committor_executors_busy_count`                              | How many of the commit workers are busy.                                                                                           | All busy *and* the line growing: the pipeline is  saturated                                                                                                  |
-| `mbv_committor_intent_alt_count`, `_alt_preparation_time`         | How many address lookup tables each commit needs, and how long building them takes (each build waits on base-chain confirmations). | The expensive setup step of committing new accounts got even more expensive.                                                                                 |
-
-
-## redshift scenarios
-
-The correctness tests, one file each under `redshift/src/scenarios/<subsystem>/`.
-Ported from the validator repo's test-integration suites.
-
-chainlink (account cloning):
-
-- `clone_on_access` — the delegated-account lifecycle from first read to
-  undelegation. Writes an account on base and reads it on the ER: same bytes,
-  owner and balance; a later base write shows up on the clone; an account that
-  exists nowhere reads as missing until a base airdrop invalidates that
-  negative cache; and an ER write to an undelegated clone is refused. Then,
-  with a delegated account and a sibling, ER writes stay off base until a
-  commit; committing one account lands it on base byte-for-byte and leaves
-  the sibling untouched; committing and undelegating both returns them to the
-  owning program with the exact final bytes and lamports, after which the ER
-  refuses writes to the undelegated account; finally a one-transaction
-  undelegate + redelegate must never interrupt a wallet's clone. The commit
-  phases absorb the former `commit_roundtrip`.
-- `account_info_semantics` — query ER for an account that has never
-  existed, for ordinary funded wallets, and for an escrow payer, first
-  one account at a time and then in mixed batches. Every balance has to match
-  the base chain exactly, a top-up on base has to show through on the next ER
-  read, and an account that does not exist has to be considered as missing.
-  A cold-read case funds ten fresh wallets and reads them through three
-  concurrent batches (3/2/3 accounts) and two single-account requests, checking
-  exact response lengths and balances. The escrow phase reads the escrowed
-  wallet and its escrow first, then proves a transfer out of the non-delegated
-  wallet is refused and leaves the escrow clone untouched, that a base top-up
-  of the escrow never shows on the ER while base holds it (the mixed batch
-  still reports the original balance), and that a wallet-delegated escrowed
-  spender can transfer on the ER, paying exactly the amount with its escrow
-  untouched. The escrow phases absorb the former `escrow_cloning`.
-- `cache_lifecycle` — combines eviction, reconnecting subscriptions, delayed
-  stale observations, and continuous ER writes; protects delegated and
-  undelegating state, refreshes base reads, and discovers undelegation completion.
-- `undelegation_reconnect_gap` — shares the `cache_lifecycle` implementation,
-  with one churn cycle followed by a reconnect immediately before undelegation
-  settles, and checks how quickly the ER observes completion.
-- `undelegation_grpc_redundancy` — the same interruption as
-  `undelegation_reconnect_gap`, with the base chain's Yellowstone gRPC feed as
-  a third remote. Holds every WebSocket message and every account fetch for the
-  accounts under test, so gRPC is the only path left, then checks that the ER
-  still observes a base write to a cloned account and the completed
-  undelegation. See *Yellowstone gRPC*.
-- `multi_program_clone` — sends one transaction that calls two programs the ER
-  has never seen. The validator has to fetch both program accounts and both of
-  their program-data accounts together before it can execute anything
-- `program_upgrade` — upgrades a live V3 program while holding observations and
-  cold clones; checks complete A/B effects, failed-write rollback, and consistent
-  B execution after fresh bytes materialize.
-- `loader_matrix` — exercises all four BPF loaders in one run: memo v1 and
-  memo v2 cloned from mainnet with their original loaders intact, the redshift
-  fixture preloaded as an upgradeable v3 program, and a fourth copy that the
-  scenario deploys from scratch, calls, and then upgrades to a second build.
-- `projected_token_lifecycle` — the whole projected-token lifecycle on one
-  mint, vault and four wallets. It funds and deposits the source and
-  destination tokens, delegates their eATAs to the ER and checks the
-  projection, then attaches an SPL transfer to a fresh delegation so the
-  validator runs it the moment the account lands, and attaches one that
-  cannot execute, which must hand its account back to the system program
-  without moving a token. Ordinary ER transfers follow; a commit loses its
-  confirmation after base execution and then recovers; the eATAs are
-  undelegated, withdrawn against on base and redelegated. Exact eATA
-  settlement and token conservation are checked at every step, with
-  unbacked and foreign-validator transfer controls that the ER first sees
-  only after the foreign delegation and must present at their chain
-  balances on first access, and failures name the phase. This scenario
-  carries the coverage of the former
-  `post_delegation_token_transfer` (post-delegation action, failing-action
-  undelegation, plain and foreign projection controls).
-- `aml_gate` — screens the owner of an incoming token account against a risk
-  API before the tokens are merged. An owner scored above the threshold never
-  gets a merge: no transaction goes near the destination, and the account is
-  handed back undelegated. A second, low-risk owner must get a merge attempt;
-  tokens move only if the deployed program accepts it. Both owners use the
-  same ER and mock server, with separate token fixtures and owner-query counts.
-- `activation_single_shot` — boots a private ER behind the base-chain
-  proxies and delegates an account whose post-delegation action bumps a
-  delegated counter and names a never-cloned dependency. The proxy stalls
-  the dependency fetch, so the ER cannot finish activating; while it is
-  held, concurrent reads and transfers referencing the delegated account
-  hit the ER and a base credit delivers a subscription update for it. After
-  the release the counter must show the action exactly once, and it must
-  keep that value through a steady window, a base-connection reset with
-  fresh notifications, and an in-place restart on the same storage. A second
-  delegation carries a failing action under the same hold: it must leave the
-  counter untouched and hand the account back to the system program.
-
-committor (ER → base commits):
-
-- `commit_blackout` — runs on the proxied `committor-faults` ER and
-  commits three times. First the base `sendTransaction` response is held
-  until the scenario's own base client proves the commit landed, then it is
-  discarded so the ER never learns its submission succeeded. Then the base
-  `signatureNotification` is held and `getSignatureStatuses` stalled for the
-  same signature, no receipt may appear while the confirmation is withheld,
-  and traffic is restored. Finally every proxied connection is closed and a
-  fresh account must still clone and commit. Each commit has to converge on
-  the ER with the base copy matching the ER snapshot.
-- `commit_exactly_once` — runs on the proxied `committor-faults` ER
-  and proves a base commit is never applied twice because the ER missed the
-  response confirming it landed. Each faulted commit forwards the base
-  submission, holds the ER's `sendTransaction` response until the scenario's
-  own base client proves the transaction succeeded and advanced the
-  delegation nonce by one, then discards the response while
-  `getSignatureStatuses` and `signatureNotification` for that signature are
-  withheld. The nonce must not move during the blackout, the receipt after
-  connectivity is restored must report success and name the transaction
-  that landed (a duplicate-rejection receipt fails outright, base bytes
-  alone are not enough), and a follow-up commit to the same account must
-  advance the nonce by exactly one. The same fault is repeated with a
-  same-storage restart of the ER while the persisted intent is still
-  unconfirmed: the recovered intent is replayed exactly once, so the nonce
-  advances one more step and then holds, and the fresh receipt must report
-  success for a base transaction that landed. An action-only intent then
-  increments a base-chain counter
-  through a standalone base action under the same fault: the counter must
-  read one before and after recovery, and a succeeded receipt must name a
-  base transaction that actually landed.
-- `commit_settlement_order` — boots a private ER behind the base-chain
-  proxies and proves a delayed commit cannot be overtaken by a later
-  conflicting one while unrelated commits keep flowing. Four delegated
-  accounts A, B, C and D are written and three bundles scheduled in order:
-  {A,B}, {B,C} and {D}. The first bundle's base submission is held at the
-  proxy before it reaches base, the other two are scheduled behind it, and
-  every account is overwritten on the ER with values that differ from the
-  staged commit payloads. While the first bundle waits, {D} must settle
-  with its staged value and the nonces of A and B must not move. The held
-  submission is then dropped so the ER retries, the retry is observed, and
-  {A,B} must land with its staged values before {B,C} is even submitted;
-  {B,C} then lands with its own staged values. Base transaction slots and
-  B's base history confirm the order, and a final bundle over all four
-  accounts must settle afterwards. The whole sequence runs twice: with
-  small accounts and with accounts large enough that delivery goes through
-  temporary commit buffers, which must appear on base as committor-owned
-  accounts while the first bundle is held and be gone once every bundle
-  settled.
-- `undelegation_recovery` — runs on the proxied `committor-faults` ER
-  and proves an account stays locked while its undelegation is
-  pending but is released once base completes it, even when the ER missed
-  the completion. Twice, with a reconnect and with a same-storage restart:
-  a delegated account is written on the ER and a commit-and-undelegate
-  scheduled, its base submission is held before reaching base, and ER
-  writes must be rejected with an upstream lockout code both while it is
-  held and after the held submission is dropped and resubmitted. The
-  account's base notifications are then dropped and the proxied
-  connections closed, the submission released, and the scenario's own base
-  client watches ownership return to the program only after the committed
-  value landed. After the connections are restored, or the ER is restarted
-  in place, a base write must become visible on the ER without any storage
-  cleanup, and redelegating the account must let ER writes through again.
-- `delegation_session_isolation` — boots a private ER behind the base-chain
-  proxies beside the default ER and proves work from an earlier delegation
-  session cannot touch the account after it was undelegated and delegated
-  again, since the address stays the same. Per case: an account delegated
-  to the first ER is written, a commit is scheduled while the proxy rejects
-  its base submission so the intent fails and stays on record, the
-  account's base notifications are held, the ER undelegates it, base must
-  receive the staged value before ownership returns, base writes a second
-  value, and the account is delegated again either to the same ER or to
-  the second one, where a third value is written. The held session-A
-  notifications are then released, the first ER is restarted so recovery
-  examines the failed intent, and throughout both windows base must keep
-  the session-B delegation, value and nonce while the session-B ER keeps
-  its state. After reassignment the old ER must reject writes and commits
-  for the account, and in both cases a fresh session-B commit must land.
-- `commit_and_undelegate` — walks the whole round trip and then back again:
-  commit, undelegate, write to the account on base so that the program owns
-  it once more, and delegate it a second time. A plain commit of one and of
-  two accounts checks that the receipt names exactly what was committed and
-  that a single base transaction carried them, leaving the accounts delegated,
-  and an account delegated to a *different* validator must refuse both a
-  commit and an undelegation. Along the way it pushes a 10 KB
-  order book through the same pipeline to check that large state is preserved
-  byte-for-byte, and it files one undelegation so the owning program refuses
-  it. The account then keeps its committed state but stays delegated, which is
-  the failure mode worth knowing about.
-- `claim_fees` — funds the fee vault of one of the stack's validator
-  identities on base and then claims it, signed by that identity. The lamports
-  land on the identity and the vault is left sitting at its rent-exempt floor.
-- `table_mania` — drives the base chain's address lookup table program, the
-  one the committor uses when a commit outgrows a single transaction.
-  Creates a table, extends it to the 256-key cap, decodes the account and
-  requires the stored keys to match what was put in, then refuses the key that
-  would overflow it. One authority creates a second table for the remaining
-  addresses and a separate empty table for deactivation.
-
-aperture (JSON-RPC and WebSocket surface):
-
-- `transaction_retry_cold_fetch`, `transaction_retry_concurrent`,
-  `transaction_retry_subscriptions`, and
-  `transaction_retry_expiry_restart` — reuse identical signed bytes across
-  fetch failures, concurrent submissions, expiry, and same-storage restart.
-  Check exact counter effects, rollback, payer fees, ledger occurrences, and
-  signature notifications registered before, during, and after submission.
-  The cold-fetch, concurrent and subscription cases take turns on the
-  `transaction-retries` group's proxied ER, each outcome with fresh
-  payer/counter state and its own ledger window; the concurrent case runs
-  eight success rounds and eight failure rounds with 32 identical submissions
-  each. The expiry-restart case boots an ER of its own so it can restart it.
-  The subscription case queues conflicting readers and requires registrations
-  acknowledged after submission but before terminal status for both outcomes.
-  Accepted submissions drain through block publication before assertions, and
-  the subscription case waits for every queued reader to execute before it
-  ends; the current ER execution fee is zero.
-- `rpc_lifecycle` — drives executions through every read and every
-  subscription that describes them: HTTP via the official
-  `solana-rpc-client`, WebSocket via the harness clients. The HTTP burst
-  prepares 256 delegated accounts, submits 256 uniquely signed writes
-  concurrently and unpaced under a bounded deadline, then requires
-  `sendTransaction`, `getSignatureStatuses`, `getTransaction`,
-  `getSignaturesForAddress`, `getAccountInfo`, `getMultipleAccounts`,
-  `getBalance`, `getBlock`, `getBlockTime`, `getBlocks`, `getBlocksWithLimit`,
-  `getSlot` and `getBlockHeight` to tell one story: the echoed signatures, the
-  written values, the transaction slots, the block contents and the block
-  times all have to agree. `getLatestBlockhash`, `isBlockhashValid` and
-  `getFeeForMessage` are exercised on the way in, `simulateTransaction` must
-  leave no trace in state or status, and the MagicBlock-specific
-  `getBlockhashForAccounts` and `getDelegationStatus` are called raw. Block
-  publication is polled with a bound before history is read; the burst
-  carries no throughput verdict. Alongside the burst, two delegated wallets
-  make ten sequential transfers that both surfaces observe: account subscriptions
-  must deliver every balance in order down to the drained value, and once
-  ten more slots have settled, `getTransaction`, `getBlock` and
-  `getBlockTime` must agree on each transfer's positive, non-future
-  timestamp. Logs (mentions) and program subscriptions must report five
-  further transfers with their signatures and log lines, signature
-  subscriptions registered before and after confirmation must both fire,
-  slot notifications must increase strictly, every account, logs, program
-  and slot unsubscribe must return true and be followed by silence while
-  further transfers execute, `logsSubscribe(all)` must be refused as an
-  unsupported filter, and no frame may fail to parse. The burst, the wallet
-  stream, the timestamp settlement and the slot stream overlap wherever the
-  transaction order allows; failures carry their HTTP or WebSocket phase,
-  each transfer's HTTP submission and confirmation included. The WebSocket
-  phases absorb the former `pubsub_contracts`.
-- `rpc_token_queries` — builds realistic SPL state on base and lets the ER
-  materialize it: two mints, two owners, an approved delegate, plain ATAs
-  and eATA-backed projections delegated to the ER, plus one account that is
-  never touched. Then fires 256 concurrent, unpaced reads under a bounded
-  deadline through the official `solana-rpc-client`, cycling
-  `getProgramAccounts` with mint and owner filters, `getTokenAccountBalance`,
-  `getTokenAccountsByOwner` and `getTokenAccountsByDelegate` with mint and
-  program filters. Every answer must name exactly the expected accounts with
-  the right owners, delegates, balances and encodings, and the untouched
-  account must never appear. Missing mints and invalid token program ids
-  must be rejected within a bound. The burst carries no throughput verdict.
-- `rpc_compat_methods` — checks compatibility methods through the official
-  `solana-rpc-client` on a private ER. Fires 256 concurrent,
-  unpaced typed requests under a bounded deadline, cycling `getBlockCommitment`,
-  `getClusterNodes`, `getEpochInfo`, `getEpochSchedule`,
-  `getFirstAvailableBlock`, `getGenesisHash`, `getHealth`,
-  `getHighestSnapshotSlot`, `getIdentity`, `getLargestAccounts`,
-  `getRecentPerformanceSamples`, `getSlotLeader`, `getSlotLeaders`,
-  `getSupply`, `getTokenLargestAccounts`, `getTokenSupply`,
-  `getTransactionCount`, `getVersion`, `getVoteAccounts` and
-  `minimumLedgerSlot`. Every answer must decode through the client's own
-  response types and carry the documented default (zero counters and stakes,
-  the default genesis hash, empty account and vote lists, the validator
-  identity as the only node and leader) or the configured Engine schedule:
-  slots per epoch and leader-schedule offset equal the superblock interval,
-  with epoch and slot index checked after crossing an epoch boundary. Slots
-  must fall inside the burst window, and version and feature set must be
-  well formed. Afterwards
-  `requestAirdrop` must be rejected with the disabled-faucet message, the
-  MagicBlock-specific `getRoutes` must answer an empty list raw, and an
-  unknown method must fail with the JSON-RPC method-not-found code. The burst
-  carries no throughput verdict.
-  RPC-surface scenarios carry the `rpc_` prefix so they can be run together:
-  `redsuite run redshift/rpc_`.
-
-harness:
-
-- `api_invariants` — registers, updates and removes a validator record in the
-  domain registry on base. The update changes fields and grows the record.
-- `config_gates` — boots two private ERs: one whose allow list contains
-  a single program, and one with no list at all. The restricted validator has
-  to clone the program it was instructed. Neither of them may create a lookup table on base,
-  at startup or while cloning.
-- `example` — the template from *Writing a scenario*.
-
-scheduler:
-
-- `task_scheduler` — drives the scheduler the way a user does: `ScheduleTask`
-  and `CancelTask` through the flexi fixture on the default ER, which it
-  holds exclusively, nothing else.
-  Since validator PR #1369 the validator keeps each task as an account owned
-  by the ephemeral Hydra scheduler program and no longer executes anything
-  itself, so the scenario observes those accounts generically: schedule creates
-  one, cancel removes it, a cancelled task id can be reused and lands on the
-  same account with the new schedule, another authority's identical task id
-  gets its own account, a signer in the payload is refused, and the validator
-  identity sponsors the account and is refunded on cancel. Lifecycle cases
-  reuse one actor, with a second authority for isolation and an empty task
-  store between cases. The scheduler
-  program is cloned from `REDSUITE_CLONE_URL` into the base chain at a cold
-  boot like dlp, and the private ER clones it on first use, so the scenario
-  runs against the deployed bytes and no program binary lives in this repo.
-  Execution by an external cranker is out of scope. Rescheduling an active
-  task in place is not asserted: PR #1369 sends Cancel and Create in one
-  transaction and the ER rejects the Create with "invalid program argument",
-  so that path stays an upstream limitation.
-
-replication (leader + verifiers):
-
-- `verifier_lifecycle` — the whole replication lifecycle on one leader
-  with two verifiers: it boots them once and then takes each node through
-  every stimulus in turn, under a steady stream of `X(A) -> Y(A,B) ->
-  Z(B)` hash-fold chains. First every node must have its own identity,
-  storage directory, configuration, log and metrics port, sit on the
-  leader's follower allowlist, follow the leader's replication listener,
-  and both verifiers must catch up with the leader's transactions and
-  blocks. Then, with the load running: verifier 0 is stopped cleanly at a
-  fresh superblock boundary and restarted inside three seconds, so it must
-  resume from its retained cursor without installing a snapshot; verifier
-  1 is stopped cleanly and kept offline until the leader's one-byte ledger
-  limit has purged a block it had not seen, so it must install a
-  leader-served snapshot and replay the tail — and while it is down the
-  leader must keep advancing and verifier 0 must keep following and
-  catching up. Verifier 1 is then SIGKILLed; the leader must keep cloning
-  fresh base accounts and sealing blocks with one follower. In a later phase,
-  verifier 1 must rejoin from wiped storage on a freshly served snapshot,
-  catch up with the leader's transactions and resume appending blocks.
-  Every stop also proves the node stops answering its metrics endpoint,
-  and both long stops prove the leader's connection count drops before it
-  comes back; the retained-cursor restart, whose node must be back inside
-  three seconds, only requires it to come back. The recovered node must
-  also seal a superblock against the leader before the next stimulus kills
-  it, so a wrong snapshot cannot vanish with the storage wipe. At the
-  final sealed boundary, after the load drains, both verifiers hold
-  exactly the leader's transactions and reach its sealed superblock, and
-  because a wiped node counts blocks from the snapshot it installed, the
-  block count is compared on the verifier that was never wiped. Both
-  report zero sealed-checksum mismatches and no mismatch in their logs,
-  and the leader's accounts match the client-side fold model. Failures
-  name the node and the phase, and teardown must reap every process the
-  topology owns. This scenario carries the coverage of the former
-  `replication_recovery` (steady load, retained-cursor restart,
-  out-of-retention snapshot recovery, final state consistency) and of the
-  former `verifier_lifecycle` (node isolation, stopped endpoints, survivor
-  progress, SIGKILL, wiped rejoin, teardown).
-
-storage (checkpoint durability and ledger retention):
-
-- `checkpoint_durability` — three SIGKILL restarts check every success and
-  executed failure protected by a completed checkpoint, state rollback and
-  fees, separate tail outcomes, and fresh execution after recovery.
-- `ledger_retention` — boots a private ER with 40-slot superblocks and a
-  one-byte ledger size limit, so retention purges the oldest sealed
-  superblock at every check. Sends counter adds across superblocks, and at
-  each of at least three purges confirms only the oldest history vanished:
-  pruned transactions and their blocks return null, retained ones stay
-  queryable, getSignaturesForAddress lists exactly the retained set, and the
-  counter holds every add. Then restarts the ER in place without reset and
-  checks the same history and state survive.
-- `snapshot_read_race` — boots a private ER with 10-slot superblocks and
-  grows eight order books in small steps while reader tasks poll their
-  accounts continuously. Every grow must succeed, every read must keep
-  succeeding across superblock seals and the resulting account-store resizes
-  and compactions, and after an in-place SIGTERM restart the churn resumes
-  under the same rules. At the end each order book must reflect all of its
-  grows.
-
-## redhat scenarios
-
-The security tests, one file each under `redhat/src/scenarios/<subsystem>/`.
-Each one performs an attack and requires the platform to refuse it.
-
-magicblock:
-
-- `ephemeral_accounts` — creates, resizes, closes and recreates sponsored
-  accounts, checking ownership, contents, rent and fees. Rejects unauthorized
-  calls and verifies rollback and serialized conflicts without duplicate refunds.
-  Its payer, sponsor, substitute and target are fresh, but the ephemeral vault
-  is the ER's one global account, so the scenario holds the default ER
-  exclusively and baselines every balance from the ER before its first step.
-
-chainlink:
-
-- `illegal_writable` — tries four ways to commit accounts the caller has no
-  claim to: straight from a wallet, the same call buried between two innocent
-  transfers, and two variants routed through a second program that calls the
-  real owner first to look legitimate. Every one has to fail, the validator has
-  to say why in its logs, and the accounts have to be exactly as they were on
-  base once the dust settles.
-
-aperture:
-
-- `fee_payer_rules` — takes the fee rule from both sides. A delegated payer is
-  allowed to commit itself, and that commit has to reach base. A payer that is
-  not delegated may not pay ER fees at all, so its transaction is turned
-  away before anything runs.
-
-## Base-chain programs & accounts
-
-- dlp, mdp, SPL Token, both ATA programs, memo v1/v2 and the ephemeral Hydra
-  scheduler program (`eHyd5…`) are cloned from
-  `REDSUITE_CLONE_URL` when the base chain starts. dlp keeps its real mainnet
-  upgrade authority, so no local key is its admin, and dlp calls that need the
-  admin cannot be tested.
-- ER identities are random keypairs
-- `magicblock_committor_program.so` is taken from the ER binary's own build.
+<h1 align="center">RedSuite</h1>
+
+<p align="center">
+  <b>Performance, correctness, and adversarial testing for MagicBlock Validator.</b>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Rust-test_harness-orange?logo=rust" alt="Rust test harness">
+  <img src="https://img.shields.io/badge/platform-Linux_%7C_macOS-blue" alt="Linux and macOS">
+  <img src="https://img.shields.io/badge/testing-black--box-6d4bd6" alt="Black-box testing">
+</p>
+
+<p align="center">
+  <a href="#-what-you-can-validate">Capabilities</a> ·
+  <a href="#-get-started">Get started</a> ·
+  <a href="#-results-and-diagnostics">Results</a>
+</p>
+
+---
+
+RedSuite tests [MagicBlock Validator](https://github.com/magicblock-labs/magicblock-validator)
+against a live local Solana base chain and Ephemeral Rollups (ERs). It submits
+transactions, queries JSON-RPC, follows WebSocket updates, and reads Prometheus
+metrics to check externally observable behavior.
+
+Use it to validate validator changes, reproduce failures across the base-chain
+and rollup boundary, or measure performance under controlled workloads. One
+runner manages the local processes, fixtures, funding, and cleanup for all three
+test families.
+
+## ✨ What you can validate
+
+| Family | Purpose | Result |
+| :-- | :-- | :-- |
+| **Redline** | Measure latency, throughput, capacity, and resource use under load. | Benchmark reports with workload settings and measurements. |
+| **Redshift** | Check observed state and behavior against expected outcomes. | Pass/fail verdicts with diagnostics. |
+| **Redhat** | Exercise ownership, authorization, and fee rules with adversarial transactions. | Required rejections and state-integrity checks. |
+
+The families cover complementary parts of the validator's behavior:
+
+- **Execution and client APIs:** transaction admission, simulation, retries,
+  conflicting workloads, RPC responses, and live notification delivery.
+- **Account lifecycle and settlement:** cloning and freshness, delegation,
+  commits, undelegation, program upgrades, and sponsored ephemeral accounts.
+- **Recovery and replication:** restarts, interrupted settlement, checkpoint
+  durability, retained history, and leader/verifier consistency.
+- **Application services:** recurring tasks and base-chain actions with callbacks.
+- **Performance under pressure:** compute-heavy traffic, hot accounts, cache
+  churn, subscription fanout, storage growth, and restart behavior under load.
+
+Redhat checks specific adversarial behaviors; it is not a comprehensive security
+assessment of the validator.
+
+## 🧩 How it works
+
+**Scenario → public APIs → local base chain and rollups → observations and checks**
+
+The harness boots the base chain on demand, loads the required programs, and
+allocates ports and funded identities. Scenarios use real transactions and
+client-facing interfaces rather than calling validator internals. Client-side
+observations establish behavior; validator metrics provide additional context.
+
+### Managed execution and isolation
+
+The runner reuses compatible rollups within a run. Scenarios declare whether
+that access can be shared, must be exclusive, or needs a separate topology.
+Fresh keys isolate scenario-owned accounts; checks involving global balances or
+process-wide changes require exclusive access. Scenarios can also manage a
+leader with independently restartable verifiers.
+
+Compatible functional checks run concurrently. Benchmarks run alone, after the
+functional checks in a normal run. The runner stops the rollups it owns and
+replaces failed or unhealthy group rollups before subsequent members use them.
+The base chain normally remains available for later runs.
+
+### Controlled failures, real traffic
+
+Fault scenarios can delay, drop, reject, or disconnect the rollup's base-chain
+HTTP and WebSocket traffic. The proxies forward real traffic and do not invent
+account contents or slots. A separate base-chain client lets the scenario check
+what actually executed, and a requested interception must fire for its check
+to succeed. Proxy faults are cleared between scenarios.
+
+## 🚀 Get started
+
+RedSuite runs on **Linux and macOS**. Install Rust through `rustup` and the
+Solana/Agave tools, with `solana-test-validator` and `cargo-build-sbf` on your
+`PATH`. Each checkout uses its pinned Rust toolchain.
+
+### Prepare the validator under test
+
+In a [MagicBlock Validator checkout](https://github.com/magicblock-labs/magicblock-validator),
+build the leader, verifier, and committor program:
+
+```bash
+cargo build --release --locked -p magicblock-validator -p magicblock-verifier
+cargo build-sbf --manifest-path programs/committor-program/Cargo.toml \
+  --sbf-out-dir target/deploy
+export MAGICBLOCK_VALIDATOR_BIN="$PWD/target/release/magicblock-validator"
+```
+
+The verifier is needed for replication checks and is discovered beside the
+leader binary. The harness loads `magicblock_committor_program.so` from that
+build tree's `target/deploy`; a host build alone does not produce it.
+
+On macOS, the validator's open-file limit requires these settings before a run:
+
+```bash
+sudo launchctl limit maxfiles 1000000 1000000  # once per boot
+ulimit -n 1000000                             # in the shell running RedSuite
+```
+
+### Build and run RedSuite
+
+In the RedSuite checkout, using the same shell:
+
+```bash
+cargo xtask programs
+cargo build --release --locked -p redsuite
+export PATH="$PWD/target/release:$PATH"
+
+redsuite list
+redsuite run redshift
+```
+
+The first base-chain boot needs access to an RPC endpoint to clone its programs;
+this defaults to mainnet-beta. Later runs reuse the local base. Stop the stack
+when finished with `redsuite stack down`.
+
+## 🛠️ Choose a run
+
+| Task | Command |
+| :-- | :-- |
+| Discover available scenarios | `redsuite list` |
+| Preview a selection | `redsuite list redshift/rpc_` |
+| Check correctness or adversarial behavior | `redsuite run redshift` or `redsuite run redhat` |
+| Measure performance | `redsuite run redline` |
+| Use the larger benchmark workloads | `redsuite run redline --profile full` |
+| Run the complete suite | `redsuite run all` |
+| Reduce concurrent storage use | `redsuite run all --serial` |
+| Inspect processes, endpoints, and logs | `redsuite stack status` |
+
+Selections accept a family, a full or short scenario name, a name prefix, or
+`all`. An exact name takes precedence over prefix matches. Use `redsuite list`
+as the current scenario catalog.
+
+Redline defaults to the shorter `lite` workloads. `--profile full` changes only
+Redline workloads, and the flag requires a selection that includes Redline.
+Correctness and adversarial checks use fixed workloads.
+
+### Host and storage considerations
+
+Run **one suite invocation at a time**. Keep the benchmark host free of other
+workloads; the runner isolates its own benchmarks, not unrelated host activity.
+For comparisons, keep the hardware, validator build settings, and workload
+profile consistent.
+
+Validators preallocate storage in multi-gigabyte steps, so parallel runs need
+space for several rollups. `--serial` runs scenarios one at a time and removes
+each group's storage before moving on. Scenarios with multiple validators still
+need space for their topology.
+
+Serial runs finish with `stack down` by default. Add `--keep-storage` to skip
+that final teardown; it does not preserve rollups already cleaned up during the
+run. **`stack down` stops the base and leftover rollups and deletes their
+storage, including separately located accounts databases; logs remain.** The
+harness also reclaims private rollups left behind by failed scenarios.
+
+## 📊 Results and diagnostics
+
+Redshift and Redhat return verdicts in the console without persisting benchmark
+reports. Failed scenarios include diagnostic details; set `REDSUITE_VERBOSE=1`
+to include stack and scenario details for successful checks too. A failed run
+returns a nonzero exit status.
+
+Redline writes reports under `target/redsuite-reports/`. Reports include workload
+settings, measurements, and process-launch details. Runs containing Redline
+also record suite wall time and execution-lane durations. Concurrent lane times
+overlap, so they should not be added together as elapsed time.
+
+Read the measurements together:
+
+- **Latency and delivery:** distinguish request acceptance, transaction
+  confirmation, and account-update arrival rather than treating them as one step.
+- **Load and capacity:** compare offered and achieved traffic before interpreting
+  latency at a claimed load; use fanout and contention workloads to explore limits.
+- **Resources and validator metrics:** CPU, memory, file descriptors, and
+  Prometheus observations help explain changes alongside client-side results.
+
+Export the latest report campaign's supported latency and throughput measurements
+in Bencher Metric Format:
+
+```bash
+redsuite report bmf --out redsuite-bmf.json
+```
+
+The exporter excludes failed or incomplete runs.
+
+## ⚙️ Configure the environment
+
+| Variable | Use |
+| :-- | :-- |
+| `MAGICBLOCK_VALIDATOR_BIN` | Select the validator under test; otherwise discover `magicblock-validator` on `PATH`. |
+| `MAGICBLOCK_VERIFIER_BIN` | Select a verifier; otherwise discover it beside the leader binary, then on `PATH`. |
+| `REDSUITE_ROOT` | Set the resource root when running outside the original checkout. |
+| `REDSUITE_STACK_DIR` | Place ledgers, stack state, and logs on another disk; defaults to `target/redsuite-stack` under the resource root. |
+| `REDSUITE_ACCOUNTSDB_DIR` | Place rollup and verifier accounts databases separately from their ledgers. |
+| `REDSUITE_CLONE_URL` | Choose the RPC endpoint used to acquire base-chain programs on a cold boot. |
+| `REDSUITE_PROFILE` | Set the default Redline workload to `lite` or `full`; `--profile` overrides it. |
+| `REDSUITE_VERBOSE` | Include operational details for passing scenarios as well as failures. |
+
+The compiled runner works without Cargo or a source checkout at runtime, but it
+still needs the validator binaries, `solana-test-validator`, and staged fixture
+artifacts and their manifest under the resource root's `target/deploy`. Preserve
+the committor artifact's location relative to the validator binary when moving a
+build to another host.
+
+### Optional gRPC coverage
+
+The base chain attempts to load a compatible Yellowstone Geyser plugin. Missing
+or incompatible plugins fail only checks that require the gRPC feed; other
+checks can run without it.
+
+Automatic acquisition uses upstream binaries for **x86_64 Linux**. On other
+hosts, set `REDSUITE_YELLOWSTONE_PLUGIN` to a compatible locally built plugin.
+`REDSUITE_YELLOWSTONE_DIR` controls the download cache. Rollups receive the feed
+only when their scenario explicitly requests it.
+
+## 🦀 Extend the suite
+
+Add a scenario to the family that owns its outcome. The harness provides process
+management, clients, funding, and fixtures; the scenario defines its workload
+and checks. Correctness and adversarial scenarios return `Result<()>`;
+benchmarks return a `ScenarioReport`.
+
+Start with the [example scenario](redshift/src/scenarios/harness/example.rs),
+then register the scenario in the [catalog](cli/src/catalog.rs) with its
+fixtures and execution contract. Declare shared, exclusive, or fresh execution
+according to the state and topology the check needs. The CLI runs scenarios;
+Cargo tests do not run the suite.
+
+For on-chain fixture instructions and compatibility contracts, see the
+[fixture reference](programs/README.md). After changing fixtures, rebuild with
+`cargo xtask programs` and stop the old stack so the next base boot loads them.
