@@ -2863,6 +2863,7 @@ dependencies = [
  "sonic-rs",
  "tokio",
  "tokio-tungstenite",
+ "wincode",
 ]
 
 [[package]]

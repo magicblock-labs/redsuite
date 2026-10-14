@@ -643,7 +643,8 @@ fn decode_transaction(text: &str) -> Option<VersionedTransaction> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(text)
         .ok()?;
-    bincode::deserialize(&bytes).ok()
+    // V1's serde representation differs from the transaction wire format.
+    wincode::deserialize(&bytes).ok()
 }
 
 fn classify(strings: Vec<String>) -> (Vec<String>, Vec<String>) {
