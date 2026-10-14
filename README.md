@@ -500,13 +500,22 @@ chainlink (account cloning):
   memo v2 cloned from mainnet with their original loaders intact, the redshift
   fixture preloaded as an upgradeable v3 program, and a fourth copy that the
   scenario deploys from scratch, calls, and then upgrades to a second build.
-- `post_delegation_token_transfer` — attaches an SPL transfer to a delegation,
-  so the validator runs that transfer the moment the account lands on
-  the ER. It also checks the projection that makes this work.
-- `projected_token_lifecycle` — transfers between projected ATAs, loses commit
-  confirmation after base execution, then recovers, undelegates, withdraws,
-  and redelegates. Checks exact eATA settlement and token conservation at
-  every step, with unbacked and foreign-validator transfer controls.
+- `projected_token_lifecycle` — the whole projected-token lifecycle on one
+  mint, vault and four wallets. It funds and deposits the source and
+  destination tokens, delegates their eATAs to the ER and checks the
+  projection, then attaches an SPL transfer to a fresh delegation so the
+  validator runs it the moment the account lands, and attaches one that
+  cannot execute, which must hand its account back to the system program
+  without moving a token. Ordinary ER transfers follow; a commit loses its
+  confirmation after base execution and then recovers; the eATAs are
+  undelegated, withdrawn against on base and redelegated. Exact eATA
+  settlement and token conservation are checked at every step, with
+  unbacked and foreign-validator transfer controls that the ER first sees
+  only after the foreign delegation and must present at their chain
+  balances on first access, and failures name the phase. This scenario
+  carries the coverage of the former
+  `post_delegation_token_transfer` (post-delegation action, failing-action
+  undelegation, plain and foreign projection controls).
 - `aml_gate` — screens the owner of an incoming token account against a risk
   API before the tokens are merged. An owner scored above the threshold never
   gets a merge: no transaction goes near the destination, and the account is
