@@ -291,9 +291,5 @@ pub mod redhat {
             er: Shared(DEFAULT),
             fixtures: [Fixture::RedhatProgram, Fixture::RedshiftProgram],
         },
-        fee_payer_rules => aperture::fee_payer_rules::FeePayerRules {
-            er: Shared(DEFAULT),
-            fixtures: [Fixture::RedshiftProgram],
-        },
     }
 }
