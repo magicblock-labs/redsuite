@@ -7,7 +7,7 @@ use json::{Deserialize, Serialize};
 use pubkey::Pubkey;
 use serde::de::DeserializeOwned;
 use signature::Signature;
-use transaction::Transaction;
+use transaction::{versioned::VersionedTransaction, Transaction};
 
 use crate::{transport::http, Result};
 
@@ -178,18 +178,7 @@ struct RpcTransaction {
     #[serde(rename = "blockTime")]
     block_time: Option<i64>,
     meta: Option<RpcTransactionMeta>,
-    transaction: Option<RpcTransactionBody>,
-}
-
-#[derive(Deserialize)]
-struct RpcTransactionBody {
-    message: RpcTransactionMessage,
-}
-
-#[derive(Deserialize)]
-struct RpcTransactionMessage {
-    #[serde(rename = "addressTableLookups")]
-    address_table_lookups: Option<Vec<json::Value>>,
+    transaction: Option<(String, String)>,
 }
 
 #[derive(Default, Deserialize)]
@@ -644,6 +633,8 @@ impl Api {
         }))
     }
 
+    /// Reads receipts without JSON's per-instruction base58 encoding, which is
+    /// expensive for materialization transactions carrying whole program images.
     pub async fn get_transaction(
         &self,
         sig: &Signature,
@@ -651,21 +642,23 @@ impl Api {
         let params = (
             sig.to_string(),
             TransactionConfig {
-                encoding: "json",
+                encoding: "base64",
                 commitment: Commitment::Confirmed.as_str(),
                 max_supported_transaction_version: 1,
             },
         );
         let raw: Option<RpcTransaction> =
             self.call_nullable("getTransaction", &params).await?;
-        Ok(raw.map(|tx| {
+        raw.map(|tx| {
             let meta = tx.meta.unwrap_or_default();
-            let lookup_tables = tx
-                .transaction
-                .and_then(|body| body.message.address_table_lookups)
-                .map(|lookups| lookups.len())
-                .unwrap_or(0);
-            TransactionInfo {
+            let lookup_tables = match tx.transaction {
+                Some((wire, _)) => decode_transaction(&wire)?
+                    .message
+                    .address_table_lookups()
+                    .map_or(0, |lookups| lookups.len()),
+                None => 0,
+            };
+            Ok(TransactionInfo {
                 slot: tx.slot,
                 block_time: tx.block_time,
                 err: meta.err,
@@ -674,8 +667,9 @@ impl Api {
                 post_balances: meta.post_balances,
                 logs: meta.log_messages.unwrap_or_default(),
                 lookup_tables,
-            }
-        }))
+            })
+        })
+        .transpose()
     }
 
     pub async fn get_block_time(&self, slot: u64) -> Result<Option<i64>> {
@@ -726,6 +720,12 @@ impl Api {
             format!("transaction {sig} not found within {timeout:?}").into()
         })
     }
+}
+
+pub(crate) fn decode_transaction(text: &str) -> Result<VersionedTransaction> {
+    let bytes = base64::engine::general_purpose::STANDARD.decode(text)?;
+    // V1's serde representation differs from the transaction wire format.
+    Ok(wincode::deserialize(&bytes)?)
 }
 
 pub fn custom_error_code(err: &json::Value) -> Option<u32> {

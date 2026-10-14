@@ -6,7 +6,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use json::{JsonContainerTrait, JsonValueTrait};
 use pubkey::Pubkey;
@@ -18,9 +17,9 @@ use tokio::{
     task::JoinHandle,
 };
 use tokio_tungstenite::tungstenite::{Message, Utf8Bytes};
-use transaction::versioned::VersionedTransaction;
 
 use crate::{
+    api::decode_transaction,
     console,
     context::{BaseCtx, ChainCtx},
     topology::BaseEndpoints,
@@ -639,14 +638,6 @@ fn collect_strings(value: &json::Value, into: &mut Vec<String>) {
     }
 }
 
-fn decode_transaction(text: &str) -> Option<VersionedTransaction> {
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(text)
-        .ok()?;
-    // V1's serde representation differs from the transaction wire format.
-    wincode::deserialize(&bytes).ok()
-}
-
 fn classify(strings: Vec<String>) -> (Vec<String>, Vec<String>) {
     let mut signatures = Vec::new();
     let mut accounts = Vec::new();
@@ -655,7 +646,7 @@ fn classify(strings: Vec<String>) -> (Vec<String>, Vec<String>) {
             signatures.push(text);
         } else if text.parse::<Pubkey>().is_ok() {
             accounts.push(text);
-        } else if let Some(tx) = decode_transaction(&text) {
+        } else if let Ok(tx) = decode_transaction(&text) {
             signatures.extend(tx.signatures.iter().map(ToString::to_string));
             accounts.extend(
                 tx.message
