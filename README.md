@@ -816,12 +816,19 @@ Each one performs an attack and requires the platform to refuse it.
 
 magicblock:
 
-- `ephemeral_accounts` — creates, resizes, closes and recreates sponsored
-  accounts, checking ownership, contents, rent and fees. Rejects unauthorized
-  calls and verifies rollback and serialized conflicts without duplicate refunds.
-  Its payer, sponsor, substitute and target are fresh, but the ephemeral vault
-  is the ER's one global account, so the scenario holds the default ER
-  exclusively and baselines every balance from the ER before its first step.
+- `ephemeral_accounts` — first takes the fee rule from both sides on the ER
+  it is about to account for: one of its delegated signers commits itself
+  through the magic program and that commit has to reach base, and the
+  non-delegated funder may not pay ER fees at all, so its transaction is
+  turned away before anything runs. Only then does it baseline every balance
+  from the ER and create, resize, close and recreate sponsored accounts,
+  checking ownership, contents, rent and fees. Rejects unauthorized calls
+  and verifies rollback and serialized conflicts without duplicate refunds.
+  Its payer, sponsor, substitute and target are fresh, but the ephemeral
+  vault is the ER's one global account, so the scenario holds the default ER
+  exclusively for the controls and the matrix alike. Failures name the
+  control or the case and its signature. This scenario carries the coverage
+  of the former `fee_payer_rules`.
 
 chainlink:
 
@@ -831,13 +838,6 @@ chainlink:
   real owner first to look legitimate. Every one has to fail, the validator has
   to say why in its logs, and the accounts have to be exactly as they were on
   base once the dust settles.
-
-aperture:
-
-- `fee_payer_rules` — takes the fee rule from both sides. A delegated payer is
-  allowed to commit itself, and that commit has to reach base. A payer that is
-  not delegated may not pay ER fees at all, so its transaction is turned
-  away before anything runs.
 
 ## Base-chain programs & accounts
 
