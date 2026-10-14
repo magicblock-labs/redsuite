@@ -481,7 +481,7 @@ impl Api {
     ) -> Result<(String, SendTransactionConfig)> {
         Ok((
             base64::engine::general_purpose::STANDARD
-                .encode(bincode::serialize(tx)?),
+                .encode(wincode::serialize(tx)?),
             SendTransactionConfig {
                 encoding: "base64",
                 skip_preflight: true,
@@ -653,7 +653,7 @@ impl Api {
             TransactionConfig {
                 encoding: "json",
                 commitment: Commitment::Confirmed.as_str(),
-                max_supported_transaction_version: 0,
+                max_supported_transaction_version: 1,
             },
         );
         let raw: Option<RpcTransaction> =
@@ -689,7 +689,7 @@ impl Api {
                 transaction_details: "none",
                 rewards: false,
                 commitment: Commitment::Confirmed.as_str(),
-                max_supported_transaction_version: 0,
+                max_supported_transaction_version: 1,
             },
         );
         self.call_nullable("getBlock", &params).await

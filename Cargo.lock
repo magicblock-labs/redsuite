@@ -2837,7 +2837,6 @@ version = "0.6.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
- "bincode",
  "bytes",
  "futures-util",
  "libproc",
@@ -2863,6 +2862,7 @@ dependencies = [
  "sonic-rs",
  "tokio",
  "tokio-tungstenite",
+ "wincode",
 ]
 
 [[package]]

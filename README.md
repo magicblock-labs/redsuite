@@ -17,8 +17,9 @@ scenario/assertion layer.
 One-time setup:
 
 1. rustup — the toolchain is pinned by `rust-toolchain.toml`.
-2. The Solana CLI on PATH — provides `solana-test-validator` (the base L1)
-   and `cargo-build-sbf` (SBF builds).
+2. Agave 4.2.2 on PATH — provides `solana-test-validator` (the base L1)
+   and `cargo-build-sbf` (SBF builds). Use this version with Engine 0.14.3;
+   Agave 4.1.1's RPC size limit rejects larger native v1 commits.
 3. A source build of the validator under test, pointed at via env:
 
        git clone https://github.com/magicblock-labs/magicblock-validator
@@ -361,7 +362,8 @@ committor (ER → base commits):
   chain and records what each input costs: round-trip latency and number of
   base transactions.
 - `commit_throughput_ceiling` — schedules wide commits over never-committed
-  accounts and measures the committor's drain rate.
+  accounts and measures the committor's drain rate and ALT usage. Native v1
+  commits can complete without ALTs.
 
 storage:
 
