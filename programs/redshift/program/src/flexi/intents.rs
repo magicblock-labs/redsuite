@@ -111,31 +111,25 @@ pub(super) fn schedule(
             )
         };
         builder = match mode {
-            IntentMode::Undelegate(change) => {
-                let mut intent = builder
-                    .commit_and_undelegate(std::slice::from_ref(counter));
-                if actions {
-                    intent = intent
-                        .add_post_commit_actions([post_commit()])
-                        .add_post_undelegate_actions([handler(
-                            owner,
-                            counter,
-                            destination,
-                            system,
-                            ACTION_PRIZE,
-                            Some(*change),
-                            false,
-                        )]);
-                }
-                intent.fold_builder()
-            }
-            IntentMode::Commit => {
-                let mut intent = builder.commit(std::slice::from_ref(counter));
-                if actions {
-                    intent = intent.add_post_commit_actions([post_commit()]);
-                }
-                intent.fold_builder()
-            }
+            IntentMode::Undelegate(change) => builder
+                .commit_and_undelegate(std::slice::from_ref(counter))
+                .add_post_commit_actions(actions.then(post_commit))
+                .add_post_undelegate_actions(actions.then(|| {
+                    handler(
+                        owner,
+                        counter,
+                        destination,
+                        system,
+                        ACTION_PRIZE,
+                        Some(*change),
+                        false,
+                    )
+                }))
+                .fold_builder(),
+            IntentMode::Commit => builder
+                .commit(std::slice::from_ref(counter))
+                .add_post_commit_actions(actions.then(post_commit))
+                .fold_builder(),
             IntentMode::Finalize => {
                 return Err(ProgramError::InvalidInstructionData)
             }
