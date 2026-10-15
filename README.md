@@ -243,27 +243,3 @@ Cargo tests do not run the suite.
 For on-chain fixture instructions and compatibility contracts, see the
 [fixture reference](programs/README.md). After changing fixtures, rebuild with
 `cargo xtask programs` and stop the old stack so the next base boot loads them.
-
-## Validator integration coverage
-
-The following phases exercise behaviors from the validator's
-[`test-integration`](https://github.com/magicblock-labs/magicblock-validator/tree/fb23ace883d65b5c1c99a9e5b651248b2b35ac06/test-integration)
-through the CLI. They run in the normal Redshift selection and reuse their
-scenario's ER; no additional ER bootstrap is required.
-
-| Integration behavior | RedSuite scenario and phases |
-|---|---|
-| `test-cloning/11_magic_ata` | `projected_token_lifecycle`: receive/drain/close, readonly overlay, projection only after explicit close, full and transparent shuttle withdrawal; exact balances, restored accounts, marker and shuttle cleanup |
-| `schedulecommit/02_commit_and_undelegate`: base-requested undelegation | `commit_and_undelegate`: base-origin request settles the latest ER bytes, restores ownership and removes the request PDA |
-| `schedulecommit/03_commit_limit` | `commit_exactly_once`: sponsored limit/refusal/undelegation, free commits below the separate paid threshold, exact paid-commit and combined action fees |
-| `test-schedule-intent/test_schedule_intents` | `commit_exactly_once`: one/two-payer commit and undelegate actions, repeated commits/redelegation, mixed commit/undelegate and commit/finalize bundles, transfer success and failed-action refund |
-
-Full integration parity is still incomplete. Keep these validator-owned tests:
-
-| Remaining contract | Why the existing RedSuite stimulus is insufficient |
-|---|---|
-| `test-table-mania`: concurrent ensure/reserve/release, reuse, overlapping reservation lifetimes and lookup cleanup | RedSuite's `table_mania` exercises raw ALT instructions. The allocation/reservation manager has no external RPC contract; its component tests must remain. Optional close/GC cases are separate from default CI coverage. |
-| `test-committor-service`: preparation/re-preparation, state/diff and inline/buffer boundaries, mixed bundles/partial tails, CPI-limit fallback, stale/unfinalized repair and callback/resource cleanup | End-to-end settlement does not force each internal preparation or repair path. Retain the focused component tests until supported stimuli and observations expose each contract; copying their implementation into RedSuite would not establish parity. |
-
-The ignored five-payer intent (instruction size limit) and same-transaction
-redelegation (Solana reentrancy restriction) are not counted as default coverage.
