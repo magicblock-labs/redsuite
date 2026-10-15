@@ -83,9 +83,10 @@ to succeed. Proxy faults are cleared between scenarios.
 
 ## 🚀 Get started
 
-RedSuite runs on **Linux and macOS**. Install Rust through `rustup` and the
-Solana/Agave tools, with `solana-test-validator` and `cargo-build-sbf` on your
-`PATH`. Each checkout uses its pinned Rust toolchain.
+RedSuite runs on **Linux and macOS**. Install Rust through `rustup` and
+Agave 4.2.2, with `solana-test-validator` and `cargo-build-sbf` on your `PATH`.
+Use this Agave version with Engine 0.14.3; Agave 4.1.1's RPC size limit rejects
+larger native v1 commits. Each checkout uses its pinned Rust toolchain.
 
 ### Prepare the validator under test
 
