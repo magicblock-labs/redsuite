@@ -2,8 +2,11 @@ use std::{collections::BTreeMap, fs};
 
 use json::Serialize;
 
-use super::{store, MeasureValue, ScenarioRun, Unit};
-use crate::Result;
+use super::{store, MeasureValue, ScenarioRun, Unit, LATENCY_ORIGIN};
+use crate::{
+    runner::{REQUEST_ORIGIN, SEND_ORIGIN},
+    Result,
+};
 
 fn run_gate(run: &ScenarioRun) -> Option<String> {
     if !run.passed {
@@ -17,6 +20,31 @@ fn run_gate(run: &ScenarioRun) -> Option<String> {
     run.failures.first().map(|failure| {
         format!("run has a {} failure: {}", failure.phase, failure.message)
     })
+}
+
+fn origin_suffix(run: &ScenarioRun) -> String {
+    run.config
+        .iter()
+        .find(|(key, _)| key == LATENCY_ORIGIN)
+        .map(|(_, origins)| {
+            let tags: Vec<&str> = origins
+                .split("; ")
+                .map(|origin| match origin {
+                    SEND_ORIGIN => "send",
+                    REQUEST_ORIGIN => "request",
+                    other => other,
+                })
+                .collect();
+            format!("@{}", slug(&tags.join("+")))
+        })
+        .unwrap_or_default()
+}
+
+fn withheld(run: &ScenarioRun) -> Option<String> {
+    run.config
+        .iter()
+        .find(|(key, _)| super::LOAD_FLAGS.contains(&key.as_str()))
+        .map(|(flag, reason)| format!("{flag}: {reason}"))
 }
 
 // Bencher Metric Format: {"benchmark": {"measure": {"value", "lower_value",
@@ -45,10 +73,27 @@ fn export_run(
     doc: &mut BTreeMap<String, BTreeMap<String, MeasureVal>>,
     run: &ScenarioRun,
 ) {
+    let withheld = withheld(run);
+    if let Some(reason) = &withheld {
+        eprintln!(
+            "[redsuite] bmf: {} latency withheld — {reason}",
+            run.scenario
+        );
+    }
+    let origin = origin_suffix(run);
     for measurement in &run.measurements {
-        let benchmark =
-            format!("{}/{}", run.scenario, slug(&measurement.label));
+        let label = &measurement.label;
+        let mut benchmark = format!("{}/{}", run.scenario, slug(label));
+        if measurement.unit == Unit::Micros
+            && !label.contains("validator")
+            && !label.contains("scheduling delay")
+            && !["boundary", "normal", "finalize", "snapshot", "checksum"]
+                .contains(&label.split_whitespace().next().unwrap_or(""))
+        {
+            benchmark.push_str(&origin);
+        }
         match (measurement.unit, &measurement.value) {
+            (Unit::Micros, _) if withheld.is_some() => {}
             (Unit::Micros, MeasureValue::Distribution(stats)) => {
                 doc.entry(benchmark).or_default().insert(
                     "latency".to_owned(),

@@ -1,8 +1,9 @@
 use std::{
     cell::RefCell,
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     rc::Rc,
-    time::{Duration, Instant},
+    sync::Arc,
+    time::Duration,
 };
 
 use base64::Engine;
@@ -11,7 +12,10 @@ use pubkey::Pubkey;
 use signature::Signature;
 use tokio::sync::oneshot;
 
-use super::conn::{self, CloseReason, FrameHandler, Reader, Requester};
+use super::{
+    clock::SendClock,
+    conn::{self, CloseReason, FrameHandler, Reader, Requester},
+};
 use crate::{
     stats::{ObservationsStats, StreamingStats},
     Result,
@@ -48,7 +52,7 @@ struct Shared {
     error: Option<String>,
     subs_by_req: HashMap<u64, Pubkey>,
     account_by_subid: HashMap<u64, Pubkey>,
-    pending: HashMap<u64, (Pubkey, Instant)>,
+    pending: HashMap<u64, Pubkey>,
     by_account: HashMap<Pubkey, BTreeSet<u64>>,
     // closed-loop per-id wake-ups, fired the moment an id settles
     waiters: HashMap<u64, oneshot::Sender<()>>,
@@ -59,7 +63,7 @@ struct Shared {
 
 impl Shared {
     fn settle(&mut self, id: u64) {
-        if let Some((account, _)) = self.pending.remove(&id) {
+        if let Some(account) = self.pending.remove(&id) {
             self.by_account.entry(account).or_default().remove(&id);
         }
         if let Some(tx) = self.waiters.remove(&id) {
@@ -77,6 +81,7 @@ impl Shared {
 struct AccountHandler<E> {
     shared: Rc<RefCell<Shared>>,
     extractor: E,
+    clock: Arc<SendClock>,
 }
 
 impl<E: Fn(&[u8]) -> Option<u64>> FrameHandler for AccountHandler<E> {
@@ -106,8 +111,10 @@ impl<E: Fn(&[u8]) -> Option<u64>> FrameHandler for AccountHandler<E> {
             return;
         };
         let mut shared = self.shared.borrow_mut();
-        if let Some((_, sent)) = shared.pending.get(&id).copied() {
-            shared.lag.push(sent.elapsed().as_micros() as u32);
+        if shared.pending.contains_key(&id) {
+            if let Some(lag) = self.clock.elapsed_micros(id) {
+                shared.lag.push(lag);
+            }
             shared.observed += 1;
             shared.settle(id);
         }
@@ -142,6 +149,7 @@ impl AccountUpdates {
     pub async fn connect(
         url: &str,
         extractor: impl Fn(&[u8]) -> Option<u64> + 'static,
+        clock: Arc<SendClock>,
     ) -> Result<Self> {
         let (requester, stream) = conn::split(conn::connect(url).await?);
         let shared = Rc::new(RefCell::new(Shared::default()));
@@ -150,6 +158,7 @@ impl AccountUpdates {
             AccountHandler {
                 shared: shared.clone(),
                 extractor,
+                clock,
             },
         );
         Ok(Self {
@@ -180,9 +189,7 @@ impl AccountUpdates {
 
     pub fn track(&self, id: u64, account: Pubkey) {
         let mut shared = self.shared.borrow_mut();
-        if let Some((previous, _)) =
-            shared.pending.insert(id, (account, Instant::now()))
-        {
+        if let Some(previous) = shared.pending.insert(id, account) {
             shared.by_account.entry(previous).or_default().remove(&id);
         }
         shared.by_account.entry(account).or_default().insert(id);
@@ -280,7 +287,7 @@ struct SigShared {
     error: Option<String>,
     id_by_req: HashMap<u64, u64>,
     id_by_subid: HashMap<u64, u64>,
-    pending: HashMap<u64, Instant>,
+    pending: HashSet<u64>,
     waiters: HashMap<u64, oneshot::Sender<()>>,
     latency: StreamingStats,
     confirmed: usize,
@@ -303,6 +310,7 @@ impl SigShared {
 
 struct SigHandler {
     shared: Rc<RefCell<SigShared>>,
+    clock: Arc<SendClock>,
 }
 
 impl FrameHandler for SigHandler {
@@ -332,12 +340,14 @@ impl FrameHandler for SigHandler {
         let Some(id) = shared.id_by_subid.remove(&subscription) else {
             return;
         };
-        let Some(sent) = shared.pending.remove(&id) else {
+        if !shared.pending.remove(&id) {
             return;
-        };
+        }
         match result.value.err {
             None => {
-                shared.latency.push(sent.elapsed().as_micros() as u32);
+                if let Some(latency) = self.clock.elapsed_micros(id) {
+                    shared.latency.push(latency);
+                }
                 shared.confirmed += 1;
             }
             Some(err) => {
@@ -366,13 +376,14 @@ pub struct SignatureConfirmations {
 }
 
 impl SignatureConfirmations {
-    pub async fn connect(url: &str) -> Result<Self> {
+    pub async fn connect(url: &str, clock: Arc<SendClock>) -> Result<Self> {
         let (requester, stream) = conn::split(conn::connect(url).await?);
         let shared = Rc::new(RefCell::new(SigShared::default()));
         let reader = Reader::spawn(
             stream,
             SigHandler {
                 shared: shared.clone(),
+                clock,
             },
         );
         Ok(Self {
@@ -382,8 +393,6 @@ impl SignatureConfirmations {
         })
     }
 
-    // The latency clock starts here, before delivery — signature latency is
-    // send-start → inclusion, the same origin as delivery and account lag.
     pub async fn subscribe(
         &self,
         id: u64,
@@ -394,7 +403,7 @@ impl SignatureConfirmations {
             let mut shared = self.shared.borrow_mut();
             conn::check_stream(&shared.error)?;
             shared.id_by_req.insert(req, id);
-            shared.pending.insert(id, Instant::now());
+            shared.pending.insert(id);
         }
         self.requester
             .send(
@@ -409,7 +418,7 @@ impl SignatureConfirmations {
         let rx = {
             let mut shared = self.shared.borrow_mut();
             conn::check_stream(&shared.error)?;
-            if !shared.pending.contains_key(&id) {
+            if !shared.pending.contains(&id) {
                 return Ok(());
             }
             let (tx, rx) = oneshot::channel();

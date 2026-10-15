@@ -1,4 +1,4 @@
-use std::{rc::Rc, time::Duration};
+use std::{rc::Rc, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use redsuite_core::redline::{copy_three, Accounts};
@@ -7,7 +7,10 @@ use redsuite_core::{
     check_eq, prep,
     profile::{LoopMode, ProfileValues},
     runner::{execute, execute_and_sync, Pacing, RunConfig},
-    transport::ws::{AccountUpdates, SignatureConfirmations},
+    transport::{
+        clock::SendClock,
+        ws::{AccountUpdates, SignatureConfirmations},
+    },
     BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
     TxSender,
 };
@@ -88,7 +91,7 @@ impl Scenario<ScenarioReport> for WarmIngress {
             |id| {
                 let sender = senders[(id as usize) % senders.len()].clone();
                 let (ix, _) = copy_three(&pdas, id);
-                async move { sender.submit(&[ix]).await.map(|_| ()) }
+                sender.staged(&[ix])
             },
         )
         .await?;
@@ -99,9 +102,16 @@ impl Scenario<ScenarioReport> for WarmIngress {
             warmup.first_error
         )?;
 
+        let offset = profile.warmup;
+        let clock =
+            Arc::new(SendClock::new(offset + 1, profile.iterations as usize));
         let updates = Rc::new(
-            AccountUpdates::connect(er.ws_url(), crate::account_update_id)
-                .await?,
+            AccountUpdates::connect(
+                er.ws_url(),
+                crate::account_update_id,
+                clock.clone(),
+            )
+            .await?,
         );
         for pda in &pdas {
             updates.account_subscribe(pda).await?;
@@ -109,25 +119,26 @@ impl Scenario<ScenarioReport> for WarmIngress {
         updates
             .await_subscribed(pdas.len(), Duration::from_secs(5))
             .await?;
-        let sigs = Rc::new(SignatureConfirmations::connect(er.ws_url()).await?);
+        let sigs = Rc::new(
+            SignatureConfirmations::connect(er.ws_url(), clock.clone()).await?,
+        );
 
         // warmup discarded and setup complete — open the measured window
         let before = er.scrape_metrics().await?;
 
-        let offset = profile.warmup;
         let request = |iteration: u64| {
             let id = offset + iteration;
             let sender = senders[(id as usize) % senders.len()].clone();
             let (ix, [tracked_dest, _]) = copy_three(&pdas, id);
             updates.track(id, tracked_dest);
             let sigs = sigs.clone();
+            let clock = clock.clone();
             async move {
                 // sign → subscribe → deliver: the signature subscription
                 // must exist before the tx can confirm
                 let tx = sender.prepare(&[ix]).await?;
                 sigs.subscribe(id, &tx.signatures[0]).await?;
-                sender.submit_prepared(&tx).await?;
-                Ok(())
+                Ok(clock.stamped(id, sender.deliver(tx)))
             }
         };
         let sync = |iteration: u64| {
@@ -248,6 +259,7 @@ impl Scenario<ScenarioReport> for WarmIngress {
             .setting("offered tps", profile.rate)
             .setting("concurrency", profile.concurrency)
             .observe("delivery us", Unit::Micros, outcome.delivery)
+            .client_side(&outcome)
             .observe("signature latency us", Unit::Micros, sig_outcome.latency)
             .observe("achieved rps", Unit::Rps, outcome.rps)
             .observe("account-update lag us", Unit::Micros, update_outcome.lag)

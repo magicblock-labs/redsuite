@@ -67,9 +67,14 @@ fn run_cell(
     pool: Arc<Vec<Pubkey>>,
     payer_bytes: Arc<Vec<[u8; 64]>>,
 ) -> Result<RunOutcome> {
-    execute_kernel(config, er_rpc_url, payer_bytes, 0, move |id| {
-        copy_three(&pool, id_offset + id).0
-    })
+    execute_kernel(
+        config,
+        er_rpc_url,
+        payer_bytes,
+        0,
+        move |id| copy_three(&pool, id_offset + id).0,
+        None,
+    )
 }
 
 struct CellOutcome {
@@ -186,6 +191,7 @@ impl Scenario<ScenarioReport> for ProtocolBoundarySelftest {
             .setting("offered tps", profile.rate)
             .setting("concurrency", profile.concurrency)
             .observe("delivery us", Unit::Micros, cell.outcome.delivery)
+            .client_side(&cell.outcome)
             .metric("achieved tps", Unit::Tps, cell.outcome.achieved_rps())
             .metric_if(
                 "validator tx processing avg us",
@@ -199,15 +205,13 @@ impl Scenario<ScenarioReport> for ProtocolBoundarySelftest {
         let single = &cells[0];
         let multi = &cells[1];
 
-        if multi.outcome.achieved_rps() < profile.rate as f64 * 0.9 {
+        for (flag, reason) in multi.outcome.flags() {
             eprintln!(
-                "[redsuite] {}: warning: the {}-thread driver achieved only \
-                 {:.0} of {} offered — the boundary rate exceeds even the \
-                 multi-thread client on this host",
+                "[redsuite] {}: warning: the {}-thread driver: {flag} \
+                 ({reason}) — the boundary rate exceeds even the multi-thread \
+                 client on this host",
                 self.name(),
-                profile.threads,
-                multi.outcome.achieved_rps(),
-                profile.rate
+                profile.threads
             );
         }
         if let (Some(single_validator), Some(multi_validator)) =
@@ -269,6 +273,8 @@ impl Scenario<ScenarioReport> for ProtocolBoundarySelftest {
             .setting("offered tps", profile.rate)
             .setting("concurrency", profile.concurrency)
             .setting("expect artifact", profile.expect_artifact)
+            .with_flags(&single.outcome)
+            .with_flags(&multi.outcome)
             .metric(
                 "single p50 us",
                 Unit::Micros,

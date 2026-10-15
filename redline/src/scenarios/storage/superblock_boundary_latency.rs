@@ -234,7 +234,7 @@ impl PrivateErScenario<ScenarioReport> for SuperblockBoundaryLatency {
             |id| {
                 let sender = senders[(id as usize) % senders.len()].clone();
                 let (ix, _) = copy_three(&pool, id);
-                async move { sender.submit(&[ix]).await.map(|_| ()) }
+                sender.staged(&[ix])
             },
         )
         .await?;
@@ -285,7 +285,7 @@ impl PrivateErScenario<ScenarioReport> for SuperblockBoundaryLatency {
                 |id| {
                     let sender = senders[(id as usize) % senders.len()].clone();
                     let (ix, _) = copy_three(&pool, profile.fill + id);
-                    async move { sender.submit(&[ix]).await.map(|_| ()) }
+                    sender.staged(&[ix])
                 },
             )
             .await;
@@ -386,6 +386,7 @@ impl PrivateErScenario<ScenarioReport> for SuperblockBoundaryLatency {
             .setting("payers", profile.payers)
             .setting("concurrency", profile.concurrency)
             .observe("delivery us", Unit::Micros, outcome.delivery)
+            .client_side(&outcome)
             .metric("boundary count", Unit::Count, boundary.count as f64)
             .metric("boundary p50 us", Unit::Micros, boundary.p50 as f64)
             .metric("boundary p95 us", Unit::Micros, boundary.p95 as f64)

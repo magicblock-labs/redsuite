@@ -186,7 +186,7 @@ impl Scenario<ScenarioReport> for EnsureGateStall {
                     let accounts = sample_accounts(&pool, id, READ_WIDTH);
                     let ix = build::read_accounts_data(id, &accounts);
                     let sender = sender.clone();
-                    async move { sender.submit(&[ix]).await.map(|_| ()) }
+                    sender.staged(&[ix])
                 }
             };
             let outcome = execute(
@@ -250,6 +250,7 @@ impl Scenario<ScenarioReport> for EnsureGateStall {
                         Unit::Micros,
                         cell_outcome.outcome.delivery,
                     )
+                    .client_side(&cell_outcome.outcome)
                     .metric(
                         "achieved tps",
                         Unit::Tps,
@@ -365,6 +366,7 @@ impl Scenario<ScenarioReport> for EnsureGateStall {
                     Unit::Tps,
                     cell.outcome.achieved_rps(),
                 )
+                .with_flags(&cell.outcome)
                 .metric(
                     format!("{} p50 us", cell.name),
                     Unit::Micros,

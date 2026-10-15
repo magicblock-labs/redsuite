@@ -1,14 +1,14 @@
-use std::time::{Duration, Instant};
+use std::{rc::Rc, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use redsuite_core::redline::Accounts;
 use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, prep,
-    stats::StreamingStats,
+    runner::{execute_and_sync, Pacing, RunConfig},
     transport::{
-        rate::{Pacing, Throttle},
-        ws::AccountUpdates,
+        clock::SendClock,
+        ws::{AccountUpdates, SignatureConfirmations},
     },
     BaseCtx, ChainCtx, ErCtx, Result, Scenario, ScenarioReport,
 };
@@ -18,7 +18,8 @@ use crate::program::{layout, DELEGATION_PROGRAM_ID};
 const ACCOUNTS: u8 = 4;
 const ITERATIONS: u64 = 40;
 const RATE: u32 = 20;
-const CONCURRENCY: usize = 8;
+const CONCURRENCY: usize = 1;
+const CONFIRM_TIMEOUT: Duration = Duration::from_secs(20);
 const PAYER_LAMPORTS: u64 = 2_000_000_000;
 
 pub struct SimpleLoad;
@@ -51,35 +52,79 @@ impl Scenario<ScenarioReport> for SimpleLoad {
         )
         .await?;
 
-        let updates =
-            AccountUpdates::connect(er.ws_url(), crate::account_update_id)
-                .await?;
+        let clock = Arc::new(SendClock::new(1, ITERATIONS as usize));
+        let updates = Rc::new(
+            AccountUpdates::connect(
+                er.ws_url(),
+                crate::account_update_id,
+                clock.clone(),
+            )
+            .await?,
+        );
         for pda in &pdas {
             updates.account_subscribe(pda).await?;
         }
         updates
             .await_subscribed(pdas.len(), Duration::from_secs(5))
             .await?;
+        let sigs = Rc::new(
+            SignatureConfirmations::connect(er.ws_url(), clock.clone()).await?,
+        );
+        let sender = er.sender(Rc::new(payer));
 
-        let mut throttle = Throttle::new(Pacing::PerSecond(RATE), CONCURRENCY)?;
-        let mut latency = StreamingStats::new();
-        for id in 1..=ITERATIONS {
-            let _permit = throttle.admit().await;
+        let request = |id: u64| {
             let target = pdas[((id - 1) % pdas.len() as u64) as usize];
             let ix = crate::program::instruction::build::simple_byte_set(
                 id,
                 &[target],
             );
             updates.track(id, target);
-            let sent = Instant::now();
-            er.submit_and_confirm(&payer, &[ix]).await?;
-            latency.push(sent.elapsed().as_micros() as u32);
-        }
+            let (sender, sigs, clock) =
+                (sender.clone(), sigs.clone(), clock.clone());
+            async move {
+                let tx = sender.prepare(&[ix]).await?;
+                sigs.subscribe(id, &tx.signatures[0]).await?;
+                Ok(clock.stamped(id, sender.deliver(tx)))
+            }
+        };
+        let sync = |id: u64| {
+            let sigs = sigs.clone();
+            async move {
+                tokio::time::timeout(CONFIRM_TIMEOUT, sigs.await_id(id))
+                    .await
+                    .map_err(|_| {
+                        format!("confirmation for id {id} not within {CONFIRM_TIMEOUT:?}")
+                    })?
+            }
+        };
+        let outcome = execute_and_sync(
+            RunConfig {
+                iterations: ITERATIONS,
+                rate: Pacing::PerSecond(RATE),
+                concurrency: CONCURRENCY,
+            },
+            request,
+            sync,
+        )
+        .await?;
+        check_eq!(
+            outcome.failed,
+            0,
+            "deliveries or confirmations failed: {:?}",
+            outcome.first_error
+        )?;
 
         updates
             .await_observed(ITERATIONS as usize, Duration::from_secs(15))
             .await?;
         let update_lag = updates.finalize().lag;
+        let confirmations = sigs.finalize();
+        check_eq!(
+            confirmations.failed,
+            0,
+            "transactions failed on-chain: {:?}",
+            confirmations.first_failure
+        )?;
 
         for (i, pda) in pdas.iter().enumerate() {
             let last_id = ITERATIONS - ACCOUNTS as u64 + 1 + i as u64;
@@ -98,7 +143,16 @@ impl Scenario<ScenarioReport> for SimpleLoad {
         }
 
         Ok(ScenarioReport::ok(self.name())
-            .observe("send+confirm us", Unit::Micros, latency.finalize(false))
+            .setting("offered tps", RATE)
+            .setting("concurrency", CONCURRENCY)
+            .observe(
+                "send+confirm us",
+                Unit::Micros,
+                outcome.sync.unwrap_or_default(),
+            )
+            .observe("delivery us", Unit::Micros, outcome.delivery)
+            .client_side(&outcome)
+            .metric("achieved tps", Unit::Tps, outcome.achieved_rps())
             .observe("account-update lag us", Unit::Micros, update_lag))
     }
 }

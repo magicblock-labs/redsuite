@@ -9,6 +9,7 @@ use signer::Signer;
 use crate::{
     prep,
     runner::{execute_threaded, RunOutcome, ThreadRunConfig},
+    transport::clock::{SendClock, Stamped},
     ChainCtx, Result,
 };
 
@@ -38,6 +39,7 @@ pub fn execute_kernel<K>(
     payers: Arc<Vec<[u8; 64]>>,
     first_id: u64,
     kernel: K,
+    clock: Option<Arc<SendClock>>,
 ) -> Result<RunOutcome>
 where
     K: Fn(u64) -> Instruction + Clone + Send + 'static,
@@ -46,11 +48,14 @@ where
     execute_threaded(config, move |worker| {
         let senders = prep::worker_senders(&rpc_url, &payers, worker, threads);
         let kernel = kernel.clone();
+        let clock = clock.clone();
         move |id: u64| {
             let id = first_id + id;
             let ix = kernel(id);
             let sender = senders[(id as usize) % senders.len()].clone();
-            async move { sender.submit(&[ix]).await.map(|_| ()) }
+            let clock = clock.clone();
+            let staged = sender.staged(&[ix]);
+            async move { Ok(Stamped::new(clock, id, staged.await?)) }
         }
     })
 }
