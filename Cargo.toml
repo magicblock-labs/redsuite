@@ -30,6 +30,7 @@ redline-interface = { path = "programs/redline/interface" }
 redline-program = { path = "programs/redline/program" }
 redshift-interface = { path = "programs/redshift/interface" }
 redshift-program = { path = "programs/redshift/program" }
+system-interface = { package = "solana-system-interface", version = "3.2", features = ["bincode"] }
 redhat-interface = { path = "programs/redhat/interface" }
 redhat-program = { path = "programs/redhat/program" }
 

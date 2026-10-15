@@ -4,6 +4,7 @@ pub mod commit_blackout;
 pub mod commit_exactly_once;
 pub mod commit_settlement_order;
 pub mod delegation_session_isolation;
+mod scheduled_intents;
 pub mod table_mania;
 pub mod undelegation_recovery;
 
@@ -21,6 +22,34 @@ pub(super) const PROXIED_GROUP: &str =
     "this scenario needs the base-chain proxies of its ER group";
 const BASE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(30);
 const BASE_STATE_TIMEOUT: Duration = Duration::from_secs(30);
+
+async fn await_delegated(
+    er: &ErCtx,
+    account: &Pubkey,
+    timeout: Duration,
+    what: &str,
+) -> Result<()> {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Status {
+        is_delegated: bool,
+    }
+    check::poll_for(what, timeout, || async {
+        let status: Status = er
+            .api()
+            .call("getDelegationStatus", &(account.to_string(),))
+            .await
+            .map_err(|error| format!("read failed: {error}"))?;
+        if status.is_delegated {
+            Ok(())
+        } else {
+            Err("not delegated".to_owned())
+        }
+    })
+    .await
+    .map_err(|error| error.expected("delegated"))?;
+    Ok(())
+}
 
 async fn write_and_commit(
     er: &ErCtx,
