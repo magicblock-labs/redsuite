@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
     rc::Rc,
+    sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -21,7 +22,8 @@ use redsuite_core::{
     },
     system,
     transport::{
-        events::EventSubscriptions, ws::SignatureConfirmations, wsraw::RawWs,
+        clock::SendClock, events::EventSubscriptions,
+        ws::SignatureConfirmations, wsraw::RawWs,
     },
     BaseCtx, ChainCtx, CheckError, ErCtx, Result, Scenario, TxSender,
 };
@@ -789,8 +791,11 @@ async fn wallet_stream(
         .await?;
 
         crate::phase("ws signature notifications", async {
-            let confirmations =
-                SignatureConfirmations::connect(er.ws_url()).await?;
+            let confirmations = SignatureConfirmations::connect(
+                er.ws_url(),
+                Arc::new(SendClock::new(1, 2)),
+            )
+            .await?;
             let immediate_tx = sender
                 .prepare(&[system::transfer(
                     &account1_pubkey,

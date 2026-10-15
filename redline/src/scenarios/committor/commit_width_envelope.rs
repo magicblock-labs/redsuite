@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use pubkey::Pubkey;
 use redsuite_core::redline::Accounts;
 use redsuite_core::report::Unit;
+use redsuite_core::runner::{RunOutcome, SendTransaction};
 use redsuite_core::{
     api::custom_error_code,
     check, check_eq, prep,
@@ -82,6 +83,7 @@ struct CellTally {
 
 struct CellSummary {
     width: usize,
+    outcome: RunOutcome,
     round_trip_p50_us: f64,
     round_trip_p95_us: f64,
     base_txs_per_commit: f64,
@@ -228,44 +230,48 @@ impl Scenario<ScenarioReport> for CommitWidthEnvelope {
                     let base_api = base_api.clone();
                     let tally = tally.clone();
                     async move {
-                        let started = Instant::now();
                         let tx = sender.prepare(&[ix]).await?;
-                        let commit_signature =
-                            sender.submit_prepared(&tx).await?;
-                        tally
-                            .borrow_mut()
-                            .er_delivery
-                            .push(started.elapsed().as_micros() as u32);
-                        let commit_receipt = super::settled_receipt(
-                            &er_api,
-                            &commit_signature,
-                            RECEIPT_TIMEOUT,
-                            format!("commit {id} intent"),
-                        )
-                        .await?;
-                        let round_trip_us =
-                            started.elapsed().as_micros() as u32;
-                        receipt::confirm_base_signatures(
-                            &base_api,
-                            &commit_receipt,
-                            BASE_CONFIRM_TIMEOUT,
-                        )
-                        .await?;
-                        let mut tally = tally.borrow_mut();
-                        tally.round_trip.push(round_trip_us);
-                        tally.base_signatures +=
-                            commit_receipt.base_signatures.len();
-                        tally
-                            .base_txs
-                            .extend(commit_receipt.base_signatures.iter());
-                        let mut reported = commit_receipt.included.clone();
-                        reported.sort();
-                        let mut expected = accounts;
-                        expected.sort();
-                        if reported != expected {
-                            tally.included_mismatch += 1;
-                        }
-                        Ok(())
+                        Ok(SendTransaction(
+                            move |started: Instant| async move {
+                                let commit_signature =
+                                    sender.submit_prepared(&tx).await?;
+                                tally
+                                    .borrow_mut()
+                                    .er_delivery
+                                    .push(started.elapsed().as_micros() as u32);
+                                let commit_receipt = super::settled_receipt(
+                                    &er_api,
+                                    &commit_signature,
+                                    RECEIPT_TIMEOUT,
+                                    format!("commit {id} intent"),
+                                )
+                                .await?;
+                                let round_trip_us =
+                                    started.elapsed().as_micros() as u32;
+                                receipt::confirm_base_signatures(
+                                    &base_api,
+                                    &commit_receipt,
+                                    BASE_CONFIRM_TIMEOUT,
+                                )
+                                .await?;
+                                let mut tally = tally.borrow_mut();
+                                tally.round_trip.push(round_trip_us);
+                                tally.base_signatures +=
+                                    commit_receipt.base_signatures.len();
+                                tally.base_txs.extend(
+                                    commit_receipt.base_signatures.iter(),
+                                );
+                                let mut reported =
+                                    commit_receipt.included.clone();
+                                reported.sort();
+                                let mut expected = accounts;
+                                expected.sort();
+                                if reported != expected {
+                                    tally.included_mismatch += 1;
+                                }
+                                Ok(())
+                            },
+                        ))
                     }
                 }
             };
@@ -404,6 +410,7 @@ impl Scenario<ScenarioReport> for CommitWidthEnvelope {
                     .setting("receipt timeout s", RECEIPT_TIMEOUT.as_secs())
                     .observe("er delivery us", Unit::Micros, er_delivery)
                     .observe("commit round-trip us", Unit::Micros, round_trip)
+                    .client_side(&outcome)
                     .metric(
                         "base txs per commit",
                         Unit::Count,
@@ -441,6 +448,7 @@ impl Scenario<ScenarioReport> for CommitWidthEnvelope {
 
             cells.push(CellSummary {
                 width,
+                outcome,
                 round_trip_p50_us: round_trip.median as f64,
                 round_trip_p95_us: round_trip.quantile95 as f64,
                 base_txs_per_commit: flow_txs_per_commit,
@@ -461,8 +469,9 @@ impl Scenario<ScenarioReport> for CommitWidthEnvelope {
                     build::commit_accounts(offset, payer_pubkey, &accounts);
                 let flow_before = snapshot_base_flow(base.api()).await?;
                 let before = er.scrape_metrics().await?;
+                let tx = sender.prepare(&[ix]).await?;
                 let started = Instant::now();
-                let commit_signature = sender.submit(&[ix]).await?;
+                let commit_signature = sender.submit_prepared(&tx).await?;
                 match scheduling_outcome(
                     er.api(),
                     &commit_signature,
@@ -750,6 +759,7 @@ impl Scenario<ScenarioReport> for CommitWidthEnvelope {
         }
         for cell in &cells {
             summary = summary
+                .with_flags(&cell.outcome)
                 .metric(
                     format!("w{} round-trip p50 us", cell.width),
                     Unit::Micros,

@@ -200,7 +200,9 @@ impl Scenario<ScenarioReport> for CloneLruChurn {
                 move |id: u64| {
                     let account = pick_account(&pool, id);
                     let api = api.clone();
-                    async move { api.get_account(&account).await.map(|_| ()) }
+                    std::future::ready(Ok(move |_: Instant| async move {
+                        api.get_account(&account).await.map(|_| ())
+                    }))
                 }
             };
 
@@ -287,6 +289,7 @@ impl Scenario<ScenarioReport> for CloneLruChurn {
                         Unit::Micros,
                         cell_outcome.outcome.delivery,
                     )
+                    .client_side(&cell_outcome.outcome)
                     .metric(
                         "achieved reads /s",
                         Unit::PerSecond,
@@ -422,6 +425,7 @@ impl Scenario<ScenarioReport> for CloneLruChurn {
                     Unit::PerSecond,
                     cell.outcome.achieved_rps(),
                 )
+                .with_flags(&cell.outcome)
                 .metric(
                     format!("{} p50 us", cell.name),
                     Unit::Micros,

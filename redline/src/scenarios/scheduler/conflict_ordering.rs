@@ -14,6 +14,7 @@ use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::redline::Accounts;
 use redsuite_core::report::Unit::{Count, Micros, Ratio, Seconds, Tps};
+use redsuite_core::transport::clock::SendClock;
 use redsuite_core::{
     check, check_eq, prep,
     profile::ProfileValues,
@@ -23,7 +24,7 @@ use redsuite_core::{
     report,
     runner::{
         execute_until_raw, merge_outcomes, spawn_workers, split_budget, Pacing,
-        RawRunOutcome, RunOutcome, Worker, Workers,
+        RawRunOutcome, RunOutcome, Worker, Workers, SEND_ORIGIN,
     },
     sampler::{MeanMax, Sampled, Sampler, Trailing},
     stats::{ObservationsStats, StreamingStats},
@@ -227,7 +228,7 @@ async fn open_load(
             let (account, sender) = &lanes[((id - 1) as usize) % lanes.len()];
             let ixs = independent_ixs(id, *account, iters);
             let sender = sender.clone();
-            async move { sender.submit(&ixs).await.map(|_| ()) }
+            sender.staged(&ixs)
         },
     )
     .await
@@ -247,7 +248,10 @@ async fn bounded_load(
     iters: u32,
     stop: Arc<AtomicBool>,
 ) -> Result<RawRunOutcome> {
-    let sigs = Rc::new(SignatureConfirmations::connect(ws_url).await?);
+    let sigs = Rc::new(
+        SignatureConfirmations::connect(ws_url, Arc::new(SendClock::new(1, 0)))
+            .await?,
+    );
     let tally = Rc::new(RefCell::new(LaneTally {
         delivery: Some(StreamingStats::new()),
         ..LaneTally::default()
@@ -266,10 +270,10 @@ async fn bounded_load(
                     let id = next_id.get() + 1;
                     next_id.set(id);
                     let ixs = independent_ixs(id, account, iters);
-                    let sent = Instant::now();
                     let result: Result<()> = async {
                         let tx = sender.prepare(&ixs).await?;
                         sigs.subscribe(id, &tx.signatures[0]).await?;
+                        let sent = Instant::now();
                         sender.submit_prepared(&tx).await?;
                         if let Some(delivery) =
                             tally.borrow_mut().delivery.as_mut()
@@ -314,6 +318,7 @@ async fn bounded_load(
         failed: tally.failed + confirmations.failed as u64,
         first_error: tally.first_error.take().or(confirmations.first_failure),
         delivery: tally.delivery.take().unwrap_or_default(),
+        origin: SEND_ORIGIN,
         wall: started.elapsed(),
         ..RawRunOutcome::default()
     })
@@ -463,11 +468,11 @@ async fn drive_pair(
             let id = plan.space.step_id(plan.batch, pair_index, chain, step);
             let iters = if step == heavy { plan.heavy_iters } else { 0 };
             let ixs = chain_ixs(id, iters, &step.accounts(pair.a, pair.b));
+            let sender = &pair.senders[step.index()];
+            let tx = sender.prepare(&ixs).await?;
             let sent = Instant::now();
-            let signature = pair.senders[step.index()]
-                .submit(&ixs)
-                .await
-                .map_err(|error| {
+            let signature =
+                sender.submit_prepared(&tx).await.map_err(|error| {
                     format!(
                         "pair {pair_index} chain {chain} step {} (id {id}) \
                              was not accepted: {error}",
@@ -1040,6 +1045,10 @@ impl Scenario<ScenarioReport> for ConflictOrdering {
                         format!("{} independent delivery us", phase.label),
                         Micros,
                         phase.load.delivery,
+                    )
+                    .client_side_as(
+                        format!("{} scheduling delay us", phase.label),
+                        &phase.load,
                     );
                 for (label, unit, value) in [
                     ("chain txs", Count, phase.chain_txs as f64),
