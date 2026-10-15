@@ -405,6 +405,6 @@ impl Scenario for CommitExactlyOnce {
         )
         .await?;
 
-        Ok(())
+        super::scheduled_intents::run(base, er).await
     }
 }

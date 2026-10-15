@@ -94,6 +94,7 @@ pub mod schedulecommit {
         DelegateOrderBook(DelegateOrderBookArgs) = 10,
         UpdateOrderBook(BookUpdate) = 11,
         ScheduleCommitForOrderBook(ScheduleCommitType) = 13,
+        RequestUndelegation(Pubkey) = 16,
     }
 
     pub fn book_lens(data: &[u8]) -> Option<(usize, usize, usize)> {
@@ -241,6 +242,25 @@ pub mod schedulecommit {
                 AccountMeta::new_readonly(system_program::ID, false),
             ];
             (with_tag(&ScheduleCommitInstruction::Init, metas), pda)
+        }
+
+        pub fn request_undelegation(
+            payer: Pubkey,
+            player: Pubkey,
+        ) -> Instruction {
+            let mut ix =
+                sdk::dlp_api::instruction_builder::request_undelegation(
+                    payer,
+                    pda_and_bump(&player).0,
+                    crate::ID,
+                );
+            ix.accounts[1].is_signer = false;
+            ix.accounts
+                .push(AccountMeta::new_readonly(ix.program_id, false));
+            with_tag(
+                &ScheduleCommitInstruction::RequestUndelegation(player),
+                ix.accounts,
+            )
         }
 
         pub fn delegate_cpi(

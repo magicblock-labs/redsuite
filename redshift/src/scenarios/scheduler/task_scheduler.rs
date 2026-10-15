@@ -2,16 +2,15 @@ use std::time::Duration;
 
 use account::Account;
 use async_trait::async_trait;
+use instruction::Instruction;
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redshift_interface::flexi::{build as flexi, FlexiCounter};
 use redsuite_core::{
-    api::{ConfirmOptions, TxError},
-    check, check_eq, prep, topology, BaseCtx, ChainCtx, ErCtx, Result,
-    Scenario,
+    api::TxError, check, check_eq, prep, topology, BaseCtx, ChainCtx, ErCtx,
+    Result, Scenario,
 };
 use signer::Signer;
-use transaction::Transaction;
 
 const TASK_INTERVAL_MS: i64 = 100;
 const TIMEOUT: Duration = Duration::from_secs(30);
@@ -119,16 +118,20 @@ async fn schedule(
 }
 
 async fn cancel(er: &ErCtx, actor: &Actor, task_id: i64) -> Result<()> {
-    let tx = Transaction::new_signed_with_payer(
-        &[flexi::cancel_counter_task(actor.pubkey(), task_id)],
-        Some(&actor.pubkey()),
-        &[&actor.payer],
-        er.api().get_latest_blockhash().await?,
-    );
-    let signature = er.api().send_transaction(&tx).await?;
-    er.api()
-        .confirm(&signature, ConfirmOptions::default())
-        .await?;
+    er.submit_and_confirm(
+        &actor.payer,
+        &[
+            flexi::cancel_counter_task(actor.pubkey(), task_id),
+            Instruction {
+                program_id: redshift_interface::ID,
+                accounts: vec![],
+                data: redshift_interface::log_msg_data(
+                    &rand::random::<u64>().to_string(),
+                ),
+            },
+        ],
+    )
+    .await?;
     Ok(())
 }
 

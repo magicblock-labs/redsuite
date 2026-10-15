@@ -16,6 +16,7 @@ schedulecommit = [
     "dep:sdk-ids",
     "dep:magic-api",
     "dep:bincode",
+    "dep:system-interface",
 ]
 upgraded = []
 
@@ -28,3 +29,4 @@ solana-program = { workspace = true }
 sdk-ids = { workspace = true, optional = true }
 magic-api = { workspace = true, optional = true }
 bincode = { workspace = true, optional = true }
+system-interface = { workspace = true, optional = true }

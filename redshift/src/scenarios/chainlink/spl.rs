@@ -45,6 +45,41 @@ pub(crate) fn derive_ata(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
     .0
 }
 
+pub(crate) fn ensure_magic_ata(
+    payer: Pubkey,
+    owner: Pubkey,
+    mint: Pubkey,
+) -> Instruction {
+    Instruction {
+        program_id: eata_program(),
+        accounts: vec![
+            AccountMeta::new_readonly(payer, true),
+            AccountMeta::new_readonly(owner, false),
+            AccountMeta::new(derive_ata(&owner, &mint), false),
+            AccountMeta::new_readonly(mint, false),
+            AccountMeta::new_readonly(token_program(), false),
+            AccountMeta::new_readonly(sdk::consts::MAGIC_PROGRAM_ID, false),
+        ],
+        data: vec![36],
+    }
+}
+
+pub(crate) fn close_magic_ata(owner: Pubkey, mint: Pubkey) -> Instruction {
+    Instruction {
+        program_id: sdk::consts::MAGIC_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new_readonly(owner, true),
+            AccountMeta::new(derive_ata(&owner, &mint), false),
+        ],
+        data: 26u32.to_le_bytes().to_vec(),
+    }
+}
+
+pub(crate) fn is_magic_ata(data: &[u8]) -> bool {
+    data.get(129..133) == Some(1u32.to_le_bytes().as_slice())
+        && data.get(133..165) == Some(sdk_ids::sysvar::rent::ID.as_ref())
+}
+
 pub(crate) fn allocate_mint(payer: &Pubkey, mint: &Pubkey) -> Instruction {
     system::create_account(payer, mint, MINT_RENT, MINT_LEN, &token_program())
 }
