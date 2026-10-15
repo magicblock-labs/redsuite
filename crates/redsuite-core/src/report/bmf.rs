@@ -84,16 +84,16 @@ fn export_run(
     for measurement in &run.measurements {
         let label = &measurement.label;
         let mut benchmark = format!("{}/{}", run.scenario, slug(label));
-        if measurement.unit == Unit::Micros
+        let client_latency = measurement.unit == Unit::Micros
             && !label.contains("validator")
             && !label.contains("scheduling delay")
             && !["boundary", "normal", "finalize", "snapshot", "checksum"]
-                .contains(&label.split_whitespace().next().unwrap_or(""))
-        {
+                .contains(&label.split_whitespace().next().unwrap_or(""));
+        if client_latency {
             benchmark.push_str(&origin);
         }
         match (measurement.unit, &measurement.value) {
-            (Unit::Micros, _) if withheld.is_some() => {}
+            (Unit::Micros, _) if client_latency && withheld.is_some() => {}
             (Unit::Micros, MeasureValue::Distribution(stats)) => {
                 doc.entry(benchmark).or_default().insert(
                     "latency".to_owned(),

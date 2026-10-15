@@ -205,15 +205,6 @@ impl Scenario<ScenarioReport> for ProtocolBoundarySelftest {
         let single = &cells[0];
         let multi = &cells[1];
 
-        for (flag, reason) in multi.outcome.flags() {
-            eprintln!(
-                "[redsuite] {}: warning: the {}-thread driver: {flag} \
-                 ({reason}) — the boundary rate exceeds even the multi-thread \
-                 client on this host",
-                self.name(),
-                profile.threads
-            );
-        }
         if let (Some(single_validator), Some(multi_validator)) =
             (single.tx_processing_avg_us, multi.tx_processing_avg_us)
         {
