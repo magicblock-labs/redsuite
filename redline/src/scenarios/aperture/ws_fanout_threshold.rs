@@ -4,15 +4,14 @@ use async_trait::async_trait;
 use pubkey::Pubkey;
 use redsuite_core::redline::{copy_three, execute_kernel, Accounts};
 use redsuite_core::report::Unit;
+use redsuite_core::transport::clock::SendClock;
 use redsuite_core::{
     check, check_eq, prep,
     profile::ProfileValues,
     report,
     runner::{Pacing, RunOutcome, ThreadRunConfig},
     stats::{ObservationsStats, StreamingStats},
-    transport::subpool::{
-        ConnReport, ExpectedWrites, ProducedLedger, SubscriberPool,
-    },
+    transport::subpool::{ConnReport, ExpectedWrites, SubscriberPool},
     BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
 };
 
@@ -89,15 +88,16 @@ fn execute_cell(
     id_offset: u64,
     pool: Arc<Vec<Pubkey>>,
     payer_bytes: Arc<Vec<[u8; 64]>>,
-    produced: Option<Arc<ProducedLedger>>,
+    clock: Option<Arc<SendClock>>,
 ) -> Result<RunOutcome> {
-    execute_kernel(config, er_rpc_url, payer_bytes, id_offset, move |id| {
-        let (ix, _) = copy_three(&pool, id);
-        if let Some(ledger) = &produced {
-            ledger.record(id);
-        }
-        ix
-    })
+    execute_kernel(
+        config,
+        er_rpc_url,
+        payer_bytes,
+        id_offset,
+        move |id| copy_three(&pool, id).0,
+        clock,
+    )
 }
 
 struct CellOutcome {
@@ -162,7 +162,7 @@ impl Scenario<ScenarioReport> for WsFanoutThreshold {
         let mut id_cursor = profile.warmup;
         let mut cells: Vec<CellOutcome> = Vec::new();
         for &connections in profile.ladder {
-            let produced = Arc::new(ProducedLedger::new(
+            let clock = Arc::new(SendClock::new(
                 id_cursor + 1,
                 profile.iterations as usize,
             ));
@@ -176,7 +176,7 @@ impl Scenario<ScenarioReport> for WsFanoutThreshold {
                 &pool,
                 connections,
                 profile.subscriber_threads,
-                produced.clone(),
+                clock.clone(),
                 expected.clone(),
                 Arc::new(crate::account_update_id),
                 LAG_THRESHOLD,
@@ -197,7 +197,7 @@ impl Scenario<ScenarioReport> for WsFanoutThreshold {
                 id_cursor,
                 pool.clone(),
                 payer_bytes.clone(),
-                Some(produced.clone()),
+                Some(clock.clone()),
             )?;
             check_eq!(
                 outcome.failed,
@@ -288,6 +288,7 @@ impl Scenario<ScenarioReport> for WsFanoutThreshold {
                         Unit::Micros,
                         cell_outcome.outcome.delivery,
                     )
+                    .client_side(&cell_outcome.outcome)
                     .observe("fanout lag us", Unit::Micros, cell_outcome.lag)
                     .metric(
                         "achieved tps",
@@ -450,6 +451,7 @@ impl Scenario<ScenarioReport> for WsFanoutThreshold {
         for cell in &cells {
             let cell_name = format!("ws{}", cell.connections);
             summary = summary
+                .with_flags(&cell.outcome)
                 .metric(
                     format!("{cell_name} lag p50 us"),
                     Unit::Micros,

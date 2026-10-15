@@ -1,4 +1,4 @@
-use std::{cell::RefCell, rc::Rc, time::Duration};
+use std::{cell::RefCell, rc::Rc, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use pubkey::Pubkey;
@@ -10,7 +10,10 @@ use redsuite_core::{
     redline::causal::HASH_INIT,
     report,
     runner::{execute, Pacing, RunConfig, RunOutcome},
-    transport::ws::{AccountUpdates, UpdateOutcome},
+    transport::{
+        clock::SendClock,
+        ws::{AccountUpdates, UpdateOutcome},
+    },
     BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
     TxSender,
 };
@@ -97,7 +100,7 @@ async fn run_cell(
             &[pdas[pda_index]],
         );
         let sender = senders[(global_id as usize) % senders.len()].clone();
-        async move { sender.submit(&[ix]).await.map(|_| ()) }
+        sender.staged(&[ix])
     };
     let count_before_warmup = er.scrape_metrics().await?.get(TX_COUNT);
     let warm = execute(
@@ -120,8 +123,17 @@ async fn run_cell(
             .await?;
     }
 
+    let clock = Arc::new(SendClock::new(
+        offset + profile.warmup + 1,
+        profile.iterations as usize,
+    ));
     let updates = Rc::new(
-        AccountUpdates::connect(er.ws_url(), crate::account_update_id).await?,
+        AccountUpdates::connect(
+            er.ws_url(),
+            crate::account_update_id,
+            clock.clone(),
+        )
+        .await?,
     );
     for pda in pdas {
         updates.account_subscribe(pda).await?;
@@ -144,12 +156,13 @@ async fn run_cell(
         updates.track(global_id, pdas[pda_index]);
         let sender = senders[(global_id as usize) % senders.len()].clone();
         let probe = probe.clone();
+        let clock = clock.clone();
         async move {
-            let sig = sender.submit(&[ix]).await?;
+            let tx = sender.prepare(&[ix]).await?;
             if probe.borrow().is_none() {
-                *probe.borrow_mut() = Some(sig);
+                *probe.borrow_mut() = Some(tx.signatures[0]);
             }
-            Ok(())
+            Ok(clock.stamped(global_id, sender.deliver(tx)))
         }
     };
     let before = er.scrape_metrics().await?;
@@ -279,6 +292,7 @@ impl Scenario<ScenarioReport> for HighCu {
                     .setting("offered tps", profile.rate)
                     .setting("concurrency", profile.concurrency)
                     .observe("delivery us", Unit::Micros, cell.outcome.delivery)
+                    .client_side(&cell.outcome)
                     .observe(
                         "account-update lag us",
                         Unit::Micros,
@@ -377,6 +391,7 @@ impl Scenario<ScenarioReport> for HighCu {
             .setting("concurrency", profile.concurrency);
         for cell in &cells {
             summary = summary
+                .with_flags(&cell.outcome)
                 .metric(
                     format!("{} delivery p50 us", cell.label),
                     Unit::Micros,

@@ -87,7 +87,7 @@ async fn execute_window(
             let id = first_id + iteration;
             let sender = senders[(id as usize) % senders.len()].clone();
             let (ix, _) = copy_three(pool, id);
-            async move { sender.submit(&[ix]).await.map(|_| ()) }
+            sender.staged(&[ix])
         },
     )
     .await?;
@@ -184,7 +184,7 @@ impl Scenario<ScenarioReport> for StorageProdsizeSustain {
                 |id| {
                     let sender = senders[(id as usize) % senders.len()].clone();
                     let (ix, _) = copy_three(&pool, id);
-                    async move { sender.submit(&[ix]).await.map(|_| ()) }
+                    sender.staged(&[ix])
                 },
             )
             .await?;
@@ -305,6 +305,10 @@ impl Scenario<ScenarioReport> for StorageProdsizeSustain {
                         Unit::Micros,
                         window.outcome.delivery,
                     )
+                    .client_side_as(
+                        format!("window {window_name} scheduling delay us"),
+                        &window.outcome,
+                    )
                     .metric(
                         format!("window {window_name} achieved tps"),
                         Unit::Tps,
@@ -363,6 +367,8 @@ impl Scenario<ScenarioReport> for StorageProdsizeSustain {
             .setting("concurrency", profile.concurrency);
         for cell in &cells {
             summary = summary
+                .with_flags(&cell.windows[0].outcome)
+                .with_flags(&cell.windows[1].outcome)
                 .metric(
                     format!("{} window A p50 us", cell.name),
                     Unit::Micros,

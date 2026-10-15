@@ -1,5 +1,6 @@
 use std::{
     cell::RefCell,
+    future::Future,
     rc::{Rc, Weak},
     time::{Duration, Instant},
 };
@@ -21,6 +22,7 @@ use crate::{
     netfault::BaseProxies,
     profile::ExecutionConfig,
     resources::Resources,
+    runner::{Delivery, SendTransaction},
     topology::{PrivateEr, RestartConfig, RestartTiming},
     DynError, Result,
 };
@@ -133,6 +135,22 @@ impl TxSender {
 
     pub async fn submit_prepared(&self, tx: &Transaction) -> Result<Signature> {
         self.api.send_transaction(tx).await
+    }
+
+    pub fn deliver(&self, tx: Transaction) -> impl Delivery {
+        let api = self.api.clone();
+        SendTransaction(move |_: Instant| async move {
+            api.send_transaction(&tx).await.map(|_| ())
+        })
+    }
+
+    pub fn staged(
+        &self,
+        ixs: &[Instruction],
+    ) -> impl Future<Output = Result<impl Delivery>> + 'static {
+        let sender = self.clone();
+        let ixs = ixs.to_vec();
+        async move { Ok(sender.deliver(sender.prepare(&ixs).await?)) }
     }
 
     pub async fn submit(&self, ixs: &[Instruction]) -> Result<Signature> {

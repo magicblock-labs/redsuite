@@ -9,6 +9,7 @@ use instruction::Instruction;
 use pubkey::Pubkey;
 use redsuite_core::redline::Accounts;
 use redsuite_core::report::Unit;
+use redsuite_core::runner::{Delivery, SendTransaction};
 use redsuite_core::{
     check, check_eq, host, prep,
     profile::ProfileValues,
@@ -238,8 +239,10 @@ async fn execute(
         async move {
             let senders =
                 prep::worker_senders(&er_rpc_url, &payer_bytes, index, threads);
-            let locks: Rc<Vec<tokio::sync::Mutex<()>>> = Rc::new(
-                (0..span.len).map(|_| tokio::sync::Mutex::new(())).collect(),
+            let locks: Rc<Vec<Arc<tokio::sync::Mutex<()>>>> = Rc::new(
+                (0..span.len)
+                    .map(|_| Arc::new(tokio::sync::Mutex::new(())))
+                    .collect(),
             );
             execute_raw(
                 RunConfig {
@@ -254,8 +257,12 @@ async fn execute(
                     let sender = senders[(id as usize) % senders.len()].clone();
                     let locks = locks.clone();
                     async move {
-                        let _lane = locks[lane_index].lock().await;
-                        sender.submit(&ixs).await.map(|_| ())
+                        let lane = locks[lane_index].clone().lock_owned().await;
+                        let send = sender.staged(&ixs).await?;
+                        Ok(SendTransaction(move |sent: Instant| async move {
+                            let _lane = lane;
+                            send.deliver(sent).await
+                        }))
                     }
                 },
             )
@@ -548,6 +555,7 @@ impl Scenario<ScenarioReport> for MixedSustainedLoad {
             .setting("concurrency per thread", profile.concurrency_per_thread())
             .setting("high cu sha256 iters", profile.high_cu_iters)
             .observe("delivery us", Unit::Micros, outcome.delivery)
+            .client_side(&outcome)
             .metric("target tps", Unit::Tps, f64::from(profile.rate))
             .metric("delivered tps", Unit::Tps, outcome.achieved_rps())
             .metric("executed tps", Unit::Tps, executed_tps)

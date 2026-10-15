@@ -71,9 +71,14 @@ fn execute_cell(
     hot_set: Arc<Vec<Pubkey>>,
     payer_bytes: Arc<Vec<[u8; 64]>>,
 ) -> Result<RunOutcome> {
-    execute_kernel(config, er_rpc_url, payer_bytes, id_offset, move |id| {
-        copy_three(&hot_set, id).0
-    })
+    execute_kernel(
+        config,
+        er_rpc_url,
+        payer_bytes,
+        id_offset,
+        move |id| copy_three(&hot_set, id).0,
+        None,
+    )
 }
 
 struct CellResult {
@@ -205,6 +210,7 @@ impl Scenario<ScenarioReport> for HotAccountCliff {
                     .setting("offered tps", profile.rate)
                     .setting("concurrency", profile.concurrency)
                     .observe("delivery us", Unit::Micros, cell.outcome.delivery)
+                    .client_side(&cell.outcome)
                     .metric(
                         "achieved tps",
                         Unit::Tps,
@@ -289,6 +295,7 @@ impl Scenario<ScenarioReport> for HotAccountCliff {
             );
         for cell in &cells {
             summary = summary
+                .with_flags(&cell.outcome)
                 .metric(
                     format!("hot{} delivery p50 us", cell.hot),
                     Unit::Micros,

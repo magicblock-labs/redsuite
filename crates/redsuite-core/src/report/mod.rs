@@ -18,6 +18,7 @@ use json::{Deserialize, Serialize};
 use crate::{
     api, console,
     resources::LaunchRecord,
+    runner::RunOutcome,
     scenario::{failed_check, RunRecord, ScenarioOutcome},
     stats::ObservationsStats,
     topology,
@@ -40,6 +41,8 @@ pub enum Unit {
     Kilobytes,
     Megabytes,
     Ratio,
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -129,7 +132,74 @@ impl ScenarioReport {
             None => self,
         }
     }
+
+    pub fn client_side(self, outcome: &RunOutcome) -> Self {
+        self.client_side_as("scheduling delay us", outcome)
+    }
+
+    pub fn client_side_as(
+        self,
+        label: impl Into<String>,
+        outcome: &RunOutcome,
+    ) -> Self {
+        if outcome.scheduling.count == 0 {
+            return self.with_flags(outcome);
+        }
+        self.observe(label, Unit::Micros, outcome.scheduling)
+            .with_flags(outcome)
+    }
+
+    pub fn latency_origin(mut self, origin: &str) -> Self {
+        if origin.is_empty() {
+            return self;
+        }
+        match self
+            .config
+            .iter_mut()
+            .find(|(key, _)| key == LATENCY_ORIGIN)
+        {
+            Some((_, origins)) => {
+                if !origins.split("; ").any(|known| known == origin) {
+                    origins.push_str("; ");
+                    origins.push_str(origin);
+                }
+            }
+            None => self.config.push((LATENCY_ORIGIN.into(), origin.into())),
+        }
+        self
+    }
+
+    pub fn with_flags(self, outcome: &RunOutcome) -> Self {
+        let mut report = self.latency_origin(outcome.origin);
+        for (flag, reason) in outcome.flags() {
+            console::line(format_args!(
+                "{}: warning: {flag} ({reason}); {}",
+                report.scenario,
+                if flag == LOAD_FLAGS[0] {
+                    "its latency is client-observed and not a validator \
+                     regression"
+                } else {
+                    "the load fell short of the claimed rate, so read its \
+                     latency with the validator metrics before calling it a \
+                     regression"
+                }
+            ));
+            match report.config.iter_mut().find(|(key, _)| key == flag) {
+                Some((_, reasons)) => {
+                    reasons.push_str("; ");
+                    reasons.push_str(&reason);
+                }
+                None => report.config.push((flag.into(), reason)),
+            }
+        }
+        report
+    }
 }
+
+pub const LATENCY_ORIGIN: &str = "latency origin";
+
+pub const LOAD_FLAGS: [&str; 2] =
+    ["client saturated", "offered rate not sustained"];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CampaignMeta {

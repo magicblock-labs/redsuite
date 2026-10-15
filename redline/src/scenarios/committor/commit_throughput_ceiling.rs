@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use pubkey::Pubkey;
 use redsuite_core::redline::Accounts;
 use redsuite_core::report::Unit;
+use redsuite_core::runner::SendTransaction;
 use redsuite_core::{
     check, check_eq,
     monitor::{self, MonitorSpec},
@@ -98,9 +99,11 @@ async fn deliver_commits(
             let delivered = delivered.clone();
             async move {
                 let tx = sender.prepare(&[ix]).await?;
-                let commit_signature = sender.submit_prepared(&tx).await?;
-                delivered.borrow_mut().push((id, commit_signature));
-                Ok(())
+                Ok(SendTransaction(move |_: Instant| async move {
+                    let commit_signature = sender.submit_prepared(&tx).await?;
+                    delivered.borrow_mut().push((id, commit_signature));
+                    Ok(())
+                }))
             }
         }
     };
@@ -349,6 +352,7 @@ impl Scenario<ScenarioReport> for CommitThroughputCeiling {
             .setting("steady-state scrapes", coverage)
             .setting("fully drained", drain.fully_drained)
             .observe("delivery us", Unit::Micros, delivery_outcome.delivery)
+            .client_side(&delivery_outcome)
             .metric("fresh drain intents/s", Unit::PerSecond, drain_rate)
             .metric(
                 "delivery+drain span s",

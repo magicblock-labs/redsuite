@@ -1,10 +1,7 @@
 use std::{
     collections::HashMap,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
-    },
-    time::{Duration, Instant},
+    sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use json::LazyValue;
@@ -12,52 +9,13 @@ use pubkey::Pubkey;
 use tokio::sync::watch;
 
 use super::{
+    clock::SendClock,
     conn::{self, CloseReason, FrameHandler},
     ws::account_update_data,
 };
 use crate::{stats::StreamingStats, Result};
 
 const AWAIT_POLL: Duration = Duration::from_millis(20);
-
-pub struct ProducedLedger {
-    epoch: Instant,
-    first_id: u64,
-    sent_micros: Vec<AtomicU64>,
-}
-
-impl ProducedLedger {
-    pub fn new(first_id: u64, capacity: usize) -> Self {
-        let mut sent_micros = Vec::with_capacity(capacity);
-        sent_micros.resize_with(capacity, || AtomicU64::new(0));
-        Self {
-            epoch: Instant::now(),
-            first_id,
-            sent_micros,
-        }
-    }
-
-    fn slot_of(&self, id: u64) -> Option<&AtomicU64> {
-        let index = id.checked_sub(self.first_id)?;
-        self.sent_micros.get(index as usize)
-    }
-
-    pub fn record(&self, id: u64) {
-        let slot = self
-            .slot_of(id)
-            .unwrap_or_else(|| panic!("id {id} outside the ledger range"));
-        let stamp = self.epoch.elapsed().as_micros() as u64 + 1;
-        slot.store(stamp, Ordering::Release);
-    }
-
-    pub fn lag_micros(&self, id: u64) -> Option<u64> {
-        let stamp = self.slot_of(id)?.load(Ordering::Acquire);
-        if stamp == 0 {
-            return None;
-        }
-        let now = self.epoch.elapsed().as_micros() as u64;
-        Some(now.saturating_sub(stamp - 1))
-    }
-}
 
 #[derive(Debug, Clone, Default)]
 pub struct AccountRecv {
@@ -124,7 +82,7 @@ impl SubscriberPool {
         accounts: &[Pubkey],
         connections: usize,
         threads: usize,
-        produced: Arc<ProducedLedger>,
+        clock: Arc<SendClock>,
         expected: Arc<ExpectedWrites>,
         extractor: Extractor,
         lag_threshold: Duration,
@@ -149,7 +107,7 @@ impl SubscriberPool {
                 .collect();
             let url = url.to_owned();
             let accounts = accounts.clone();
-            let produced = produced.clone();
+            let clock = clock.clone();
             let expected = expected.clone();
             let extractor = extractor.clone();
             let shutdown_rx = shutdown.subscribe();
@@ -167,7 +125,7 @@ impl SubscriberPool {
                                 url.clone(),
                                 accounts.clone(),
                                 state,
-                                produced.clone(),
+                                clock.clone(),
                                 expected.clone(),
                                 extractor.clone(),
                                 shutdown_rx.clone(),
@@ -300,7 +258,7 @@ impl SubscriberPool {
 
 struct PoolHandler {
     state: Arc<Mutex<ConnState>>,
-    produced: Arc<ProducedLedger>,
+    clock: Arc<SendClock>,
     expected: Arc<ExpectedWrites>,
     extractor: Extractor,
     threshold_micros: u64,
@@ -334,7 +292,7 @@ impl FrameHandler for PoolHandler {
         let Some(id) = (self.extractor)(&data) else {
             return;
         };
-        let Some(lag_micros) = self.produced.lag_micros(id) else {
+        let Some(lag_micros) = self.clock.elapsed_micros(id) else {
             return;
         };
         let Some(account) = self.account_by_subid.get(&subscription).copied()
@@ -354,11 +312,11 @@ impl FrameHandler for PoolHandler {
                 return;
             }
             state.received += 1;
-            if lag_micros > self.threshold_micros {
+            if u64::from(lag_micros) > self.threshold_micros {
                 state.over_threshold += 1;
             }
         }
-        self.local_lag.push(lag_micros.min(u32::MAX as u64) as u32);
+        self.local_lag.push(lag_micros);
     }
 
     fn on_closed(&mut self, reason: &CloseReason) {
@@ -371,7 +329,7 @@ async fn run_connection(
     url: String,
     accounts: Arc<Vec<Pubkey>>,
     state: Arc<Mutex<ConnState>>,
-    produced: Arc<ProducedLedger>,
+    clock: Arc<SendClock>,
     expected: Arc<ExpectedWrites>,
     extractor: Extractor,
     mut shutdown: watch::Receiver<bool>,
@@ -387,7 +345,7 @@ async fn run_connection(
     let (requester, mut stream) = conn::split(socket);
     let mut handler = PoolHandler {
         state: state.clone(),
-        produced,
+        clock,
         expected,
         extractor,
         threshold_micros,

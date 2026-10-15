@@ -181,8 +181,28 @@ overlap, so they should not be added together as elapsed time.
 
 Read the measurements together:
 
-- **Latency and delivery:** distinguish request acceptance, transaction
-  confirmation, and account-update arrival rather than treating them as one step.
+- **Latency and delivery:** transaction latency is client-observed from one
+  timestamp taken immediately before the `sendTransaction` HTTP request, after
+  signing, blockhash refresh and subscription setup. Delivery is that request's
+  round trip, including Reqwest connection pooling, transport and response
+  processing; signature confirmation and account-update arrival start from the
+  same instant. Account reads and WebSocket churn start immediately before
+  their respective requests. None of these is validator-only processing time,
+  so read them next to the validator's own processing metrics in the same report.
+- **Client scheduling:** `scheduling delay us` is the gap between the pacer
+  admitting a transaction and its task starting, reported apart from request
+  latency. A scheduling delay p95 above the pacing interval, or above the
+  achieved inter-arrival interval for unlimited loads, marks the run
+  `client saturated`: its latency is a client limit. A run that delivered
+  under 90 % of its offered rate is marked `offered rate not sustained`,
+  which validator backpressure can also cause, so read it next to the
+  validator processing metrics in the same report. The BMF export withholds
+  client latency for both. Reports using these boundaries carry a
+  `latency origin` setting: `client, immediately before sendTransaction` for
+  transaction loads and `client, immediately before the request` for account
+  reads and WebSocket churn, listing both when one report mixes them. Older
+  reports without this setting keep their legacy series and should be compared
+  separately.
 - **Load and capacity:** compare offered and achieved traffic before interpreting
   latency at a claimed load; use fanout and contention workloads to explore limits.
 - **Resources and validator metrics:** CPU, memory, file descriptors, and
@@ -195,7 +215,10 @@ in Bencher Metric Format:
 redsuite report bmf --out redsuite-bmf.json
 ```
 
-The exporter excludes failed or incomplete runs.
+The exporter excludes failed and incomplete runs. It withholds client latency
+for `client saturated` or `offered rate not sustained` runs while retaining
+diagnostic measurements. Client latency series have timing-origin suffixes
+(`@send`, `@request`) to keep them separate from legacy series.
 
 ## ⚙️ Configure the environment
 
