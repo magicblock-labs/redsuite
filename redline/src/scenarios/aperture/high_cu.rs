@@ -227,7 +227,7 @@ async fn run_cell(
         drain,
         probe_cus,
         validator_avg_us: delta
-            .histogram_avg("mbv_transaction_processing_time")
+            .histogram_avg("aperture_rpc_request_duration_seconds{method=\"sendTransaction\"}")
             .map(|seconds| seconds * 1e6),
         validator_txs: delta.counter(TX_COUNT),
     })
@@ -316,7 +316,7 @@ impl Scenario<ScenarioReport> for HighCu {
                     )
                     .metric("probe consumed cus", Unit::Count, cell.probe_cus)
                     .metric_if(
-                        "validator tx processing avg us",
+                        "validator sendTransaction RPC avg us",
                         Unit::Micros,
                         cell.validator_avg_us,
                     )
@@ -428,7 +428,10 @@ impl Scenario<ScenarioReport> for HighCu {
                     cell.probe_cus,
                 )
                 .metric_if(
-                    format!("{} validator tx processing avg us", cell.label),
+                    format!(
+                        "{} validator sendTransaction RPC avg us",
+                        cell.label
+                    ),
                     Unit::Micros,
                     cell.validator_avg_us,
                 );

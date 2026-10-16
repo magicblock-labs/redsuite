@@ -16,7 +16,8 @@ const LEDGER_SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
 const LEDGER_SETTLE_POLL: Duration = Duration::from_millis(50);
 const CATASTROPHIC_RPS_FLOOR: f64 = 1_000.0;
 
-const TX_PROCESSING_HISTOGRAM: &str = "mbv_transaction_processing_time";
+const RPC_DURATION: &str =
+    "aperture_rpc_request_duration_seconds{method=\"sendTransaction\"}";
 
 struct Profile {
     name: &'static str,
@@ -122,7 +123,7 @@ impl Scenario<ScenarioReport> for RpcCapacityBlast {
             outcome.delivery.median,
             outcome.delivery.quantile95,
             delta
-                .histogram_avg(TX_PROCESSING_HISTOGRAM)
+                .histogram_avg(RPC_DURATION)
                 .map(|seconds| format!("{:.1} us", seconds * 1e6))
                 .unwrap_or_else(|| "n/a".to_owned()),
         );
@@ -175,10 +176,10 @@ impl Scenario<ScenarioReport> for RpcCapacityBlast {
             .metric("blast wall s", Unit::Seconds, outcome.wall.as_secs_f64())
             .metric("failed", Unit::Count, outcome.failed as f64)
             .metric_if(
-                "validator tx processing avg us",
+                "validator sendTransaction RPC avg us",
                 Unit::Micros,
                 delta
-                    .histogram_avg(TX_PROCESSING_HISTOGRAM)
+                    .histogram_avg(RPC_DURATION)
                     .map(|seconds| seconds * 1e6),
             )
             .metric_if(

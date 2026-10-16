@@ -344,6 +344,7 @@ impl PrivateErScenario for ActivationSingleShot {
                 env: Vec::new(),
                 request_timeout: None,
                 base_endpoints: Some(proxies.endpoints()),
+                ..Default::default()
             },
         )
         .await?;

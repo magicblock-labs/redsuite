@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{future, SinkExt, StreamExt};
 use json::{JsonContainerTrait, JsonValueTrait};
 use pubkey::Pubkey;
 use signature::Signature;
@@ -236,7 +236,7 @@ struct State {
     stalled: Vec<(u64, oneshot::Sender<Decision>)>,
     next_rule: u64,
     events: Vec<FaultEvent>,
-    connections: Vec<JoinHandle<()>>,
+    connections: Vec<(Transport, JoinHandle<()>)>,
 }
 
 type Shared = Rc<RefCell<State>>;
@@ -246,9 +246,9 @@ impl State {
         self.events.push(FaultEvent { action, operation });
     }
 
-    fn track(&mut self, handle: JoinHandle<()>) {
-        self.connections.retain(|handle| !handle.is_finished());
-        self.connections.push(handle);
+    fn track(&mut self, transport: Transport, handle: JoinHandle<()>) {
+        self.connections.retain(|(_, handle)| !handle.is_finished());
+        self.connections.push((transport, handle));
     }
 }
 
@@ -353,7 +353,33 @@ async fn gate(
     }
 }
 
-type Outbound = mpsc::UnboundedSender<Option<(Message, Option<Holding>)>>;
+/// A frame stays intact, including batches. Any held member holds the whole frame.
+type Outbound = mpsc::UnboundedSender<Option<(Message, Vec<Holding>)>>;
+
+async fn gate_batch(
+    shared: &Shared,
+    gates: Vec<GateStart>,
+) -> (Decision, Vec<Holding>) {
+    let results = future::join_all(gates.into_iter().map(|gate| async {
+        match gate {
+            GateStart::Decided(decision) => (decision, None),
+            GateStart::Pending(receiver, operation, holding) => (
+                gate_finish(shared, receiver, operation).await,
+                Some(holding),
+            ),
+        }
+    }))
+    .await;
+    let mut decision = Decision::Release;
+    let mut holdings = Vec::new();
+    for (result, holding) in results {
+        if !matches!(result, Decision::Release) {
+            decision = result;
+        }
+        holdings.extend(holding);
+    }
+    (decision, holdings)
+}
 
 fn deliver(
     outbound: &Outbound,
@@ -361,7 +387,7 @@ fn deliver(
     text: Utf8Bytes,
     is_notification: bool,
     id: &Option<json::Value>,
-    holding: Option<Holding>,
+    holding: Vec<Holding>,
 ) -> std::result::Result<(), ()> {
     let message = match decision {
         Decision::Discard => return Ok(()),
@@ -545,10 +571,24 @@ impl BaseProxies {
     }
 
     pub fn close_connections(&self) {
+        self.disconnect(None);
+    }
+
+    /// Loses subscriptions without aborting deliberately held HTTP operations.
+    pub fn close_websocket_connections(&self) {
+        self.disconnect(Some(Transport::Ws));
+    }
+
+    fn disconnect(&self, transport: Option<Transport>) {
         let mut state = self.shared.borrow_mut();
-        for handle in state.connections.drain(..) {
-            handle.abort();
-        }
+        state.connections.retain(|(kind, handle)| {
+            if transport.is_none_or(|transport| transport == *kind) {
+                handle.abort();
+                false
+            } else {
+                true
+            }
+        });
         state.record(Action::ConnectionsClosed, None);
     }
 
@@ -612,7 +652,7 @@ impl BaseProxies {
             handle.abort();
         }
         let mut state = self.shared.borrow_mut();
-        for handle in state.connections.drain(..) {
+        for (_, handle) in state.connections.drain(..) {
             handle.abort();
         }
     }
@@ -663,11 +703,31 @@ struct Parsed {
     id: Option<json::Value>,
     method: Option<String>,
     subscription: Option<u64>,
+    subscription_result: Option<u64>,
     strings: Vec<String>,
 }
 
 fn parse(text: &str) -> Option<Parsed> {
     let value: json::Value = json::from_str(text).ok()?;
+    Some(parse_value(&value))
+}
+
+/// Decode members for fault selection and subscription identity without rewriting wire bytes.
+fn parse_ws(text: &str) -> Option<(Vec<Parsed>, Option<json::Value>)> {
+    let value: json::Value = json::from_str(text).ok()?;
+    if let Some(batch) = value.as_array() {
+        let members: Vec<_> = batch.iter().map(parse_value).collect();
+        let ids: Vec<_> =
+            members.iter().map(|member| member.id.clone()).collect();
+        Some((members, Some(json::json!(ids))))
+    } else {
+        let member = parse_value(&value);
+        let id = member.id.clone();
+        Some((vec![member], id))
+    }
+}
+
+fn parse_value(value: &json::Value) -> Parsed {
     let method = value
         .get("method")
         .and_then(|m| m.as_str())
@@ -683,12 +743,15 @@ fn parse(text: &str) -> Option<Parsed> {
         .get("params")
         .and_then(|params| params.get("subscription"))
         .and_then(|sub| sub.as_u64());
-    Some(Parsed {
+    Parsed {
         id: value.get("id").cloned(),
         method,
         subscription,
+        subscription_result: value
+            .get("result")
+            .and_then(|result| result.as_u64()),
         strings,
-    })
+    }
 }
 
 fn operation(
@@ -724,6 +787,13 @@ fn merged(mut base: Operation, stage: Stage, extra: Vec<String>) -> Operation {
 }
 
 fn rejection(id: &Option<json::Value>, message: &str) -> String {
+    if let Some(batch) = id.as_ref().and_then(|id| id.as_array()) {
+        let replies: Vec<_> = batch
+            .iter()
+            .map(|id| rejection(&Some(id.clone()), message))
+            .collect();
+        return format!("[{}]", replies.join(","));
+    }
     let id = id
         .as_ref()
         .and_then(|id| json::to_string(id).ok())
@@ -751,7 +821,7 @@ async fn accept_http(
             client.clone(),
             shared.clone(),
         ));
-        shared.borrow_mut().track(handle);
+        shared.borrow_mut().track(Transport::Http, handle);
     }
 }
 
@@ -916,7 +986,7 @@ async fn accept_ws(listener: TcpListener, upstream: String, shared: Shared) {
             upstream.clone(),
             shared.clone(),
         ));
-        shared.borrow_mut().track(handle);
+        shared.borrow_mut().track(Transport::Ws, handle);
     }
 }
 
@@ -947,31 +1017,35 @@ async fn serve_ws(socket: TcpStream, upstream: String, shared: Shared) {
                 let Some(Ok(frame)) = frame else { break };
                 match frame {
                     Message::Text(text) => {
-                        let Some(parsed) = parse(&text) else {
+                        let Some((members, id)) = parse_ws(&text) else {
                             if server_sink.send(Message::Text(text)).await.is_err() {
                                 break;
                             }
                             continue;
                         };
-                        let request = operation(
-                            Transport::Ws,
-                            Stage::Request,
-                            parsed.method.as_deref().unwrap_or("?"),
-                            parsed.strings,
-                        );
-                        let (decision, _hold) = gate(&shared, request.clone()).await;
+                        let mut gates = Vec::new();
+                        for member in members {
+                            let request = operation(
+                                Transport::Ws,
+                                Stage::Request,
+                                member.method.as_deref().unwrap_or("?"),
+                                member.strings,
+                            );
+                            if let Some(id) = member.id.as_ref().and_then(|id| json::to_string(id).ok()) {
+                                pending.insert(id, request.clone());
+                            }
+                            gates.push(gate_start(&shared, request));
+                        }
+                        let (decision, _holds) = gate_batch(&shared, gates).await;
                         match decision {
                             Decision::Discard => break,
                             Decision::Reject(message) => {
-                                let reply = rejection(&parsed.id, &message);
-                                if outbound.send(Some((Message::Text(reply.into()), None))).is_err() {
+                                let reply = rejection(&id, &message);
+                                if outbound.send(Some((Message::Text(reply.into()), Vec::new()))).is_err() {
                                     break;
                                 }
                             }
                             Decision::Release => {
-                                if let Some(id) = parsed.id.as_ref().and_then(|id| json::to_string(id).ok()) {
-                                    pending.insert(id, request);
-                                }
                                 if server_sink.send(Message::Text(text)).await.is_err() {
                                     break;
                                 }
@@ -990,12 +1064,15 @@ async fn serve_ws(socket: TcpStream, upstream: String, shared: Shared) {
                 let Some(Ok(frame)) = frame else { break };
                 match frame {
                     Message::Text(text) => {
-                        let Some(parsed) = parse(&text) else {
-                            if outbound.send(Some((Message::Text(text), None))).is_err() {
+                        let Some((members, id)) = parse_ws(&text) else {
+                            if outbound.send(Some((Message::Text(text), Vec::new()))).is_err() {
                                 break;
                             }
                             continue;
                         };
+                        let is_notification = members.iter().all(|member| member.subscription.is_some());
+                        let mut gates = Vec::new();
+                        for parsed in members {
                         let inbound = if let Some(subscription) = parsed.subscription {
                             let base = subscriptions.get(&subscription).cloned();
                             let method = parsed.method.clone().unwrap_or_else(|| "?".to_owned());
@@ -1013,10 +1090,7 @@ async fn serve_ws(socket: TcpStream, upstream: String, shared: Shared) {
                             match request {
                                 Some(request) => {
                                     if request.method.ends_with("Subscribe") {
-                                        if let Some(subid) = json::from_str::<json::Value>(&text)
-                                            .ok()
-                                            .and_then(|value| value.get("result").and_then(|r| r.as_u64()))
-                                        {
+                                        if let Some(subid) = parsed.subscription_result {
                                             subscriptions.insert(subid, request.clone());
                                         }
                                     }
@@ -1025,27 +1099,24 @@ async fn serve_ws(socket: TcpStream, upstream: String, shared: Shared) {
                                 None => operation(Transport::Ws, Stage::Response, "?", parsed.strings),
                             }
                         };
-                        let is_notification = parsed.subscription.is_some();
-                        let id = parsed.id.clone();
-                        match gate_start(&shared, inbound) {
-                            GateStart::Decided(decision) => {
-                                if deliver(&outbound, decision, text, is_notification, &id, None).is_err() {
-                                    break;
-                                }
+                        gates.push(gate_start(&shared, inbound));
+                        }
+                        if gates.iter().all(|gate| matches!(gate, GateStart::Decided(Decision::Release))) {
+                            if deliver(&outbound, Decision::Release, text, is_notification, &id, Vec::new()).is_err() {
+                                break;
                             }
-                            GateStart::Pending(receiver, operation, holding) => {
-                                let shared = shared.clone();
-                                let outbound = outbound.clone();
-                                tokio::task::spawn_local(async move {
-                                    let decision = gate_finish(&shared, receiver, operation).await;
-                                    let _ = deliver(&outbound, decision, text, is_notification, &id, Some(holding));
-                                });
-                            }
+                        } else {
+                            let shared = shared.clone();
+                            let outbound = outbound.clone();
+                            tokio::task::spawn_local(async move {
+                                let (decision, holds) = gate_batch(&shared, gates).await;
+                                let _ = deliver(&outbound, decision, text, is_notification, &id, holds);
+                            });
                         }
                     }
                     Message::Close(_) => break,
                     other => {
-                        if outbound.send(Some((other, None))).is_err() {
+                        if outbound.send(Some((other, Vec::new()))).is_err() {
                             break;
                         }
                     }

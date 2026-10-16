@@ -17,7 +17,8 @@ const CLONE_TIMEOUT: Duration = Duration::from_secs(15);
 const ARTIFACT_P50_RATIO: f64 = 5.0;
 const VALIDATOR_AGREEMENT_RATIO: f64 = 3.0;
 
-const TX_PROCESSING_HISTOGRAM: &str = "mbv_transaction_processing_time";
+const RPC_DURATION: &str =
+    "aperture_rpc_request_duration_seconds{method=\"sendTransaction\"}";
 
 struct Profile {
     name: &'static str,
@@ -80,7 +81,7 @@ fn run_cell(
 struct CellOutcome {
     threads: usize,
     outcome: RunOutcome,
-    tx_processing_avg_us: Option<f64>,
+    rpc_duration_avg_us: Option<f64>,
 }
 
 pub struct ProtocolBoundarySelftest;
@@ -153,8 +154,8 @@ impl Scenario<ScenarioReport> for ProtocolBoundarySelftest {
             let cell = CellOutcome {
                 threads,
                 outcome,
-                tx_processing_avg_us: delta
-                    .histogram_avg(TX_PROCESSING_HISTOGRAM)
+                rpc_duration_avg_us: delta
+                    .histogram_avg(RPC_DURATION)
                     .map(|seconds| seconds * 1e6),
             };
             eprintln!(
@@ -166,7 +167,7 @@ impl Scenario<ScenarioReport> for ProtocolBoundarySelftest {
                 profile.rate,
                 cell.outcome.delivery.median,
                 cell.outcome.delivery.quantile95,
-                cell.tx_processing_avg_us
+                cell.rpc_duration_avg_us
                     .map(|us| format!("{us:.1} us"))
                     .unwrap_or_else(|| "n/a".to_owned()),
             );
@@ -194,9 +195,9 @@ impl Scenario<ScenarioReport> for ProtocolBoundarySelftest {
             .client_side(&cell.outcome)
             .metric("achieved tps", Unit::Tps, cell.outcome.achieved_rps())
             .metric_if(
-                "validator tx processing avg us",
+                "validator sendTransaction RPC avg us",
                 Unit::Micros,
-                cell.tx_processing_avg_us,
+                cell.rpc_duration_avg_us,
             );
             report::persist_cell(self.name(), &cell_report);
             cells.push(cell);
@@ -206,7 +207,7 @@ impl Scenario<ScenarioReport> for ProtocolBoundarySelftest {
         let multi = &cells[1];
 
         if let (Some(single_validator), Some(multi_validator)) =
-            (single.tx_processing_avg_us, multi.tx_processing_avg_us)
+            (single.rpc_duration_avg_us, multi.rpc_duration_avg_us)
         {
             let validator_ratio = (single_validator / multi_validator)
                 .max(multi_validator / single_validator);
@@ -305,12 +306,12 @@ impl Scenario<ScenarioReport> for ProtocolBoundarySelftest {
             .metric_if(
                 "single validator tx avg us",
                 Unit::Micros,
-                single.tx_processing_avg_us,
+                single.rpc_duration_avg_us,
             )
             .metric_if(
                 "multi validator tx avg us",
                 Unit::Micros,
-                multi.tx_processing_avg_us,
+                multi.rpc_duration_avg_us,
             ))
     }
 }

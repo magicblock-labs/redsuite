@@ -5,7 +5,6 @@ pub mod commit_exactly_once;
 pub mod commit_settlement_order;
 pub mod delegation_session_isolation;
 mod scheduled_intents;
-pub mod table_mania;
 pub mod undelegation_recovery;
 
 use std::time::{Duration, Instant};

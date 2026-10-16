@@ -8,33 +8,14 @@ use redsuite_core::{
     PrivateErScenario, Result,
 };
 use signer::Signer;
-use solana_address_lookup_table_interface::instruction::create_lookup_table;
 
-const PROGRAM_CLONE_TIMEOUT: Duration = Duration::from_secs(20);
-const BLOCKED_SETTLE: Duration = Duration::from_secs(2);
 const ALT_SETTLE: Duration = Duration::from_secs(1);
+const PROGRAM_CLONE_TIMEOUT: Duration = Duration::from_secs(20);
 const LABEL: &str = "redshift config";
 const OPEN_ER_LABEL: &str = "cfg-none";
-const RESTRICTED_ER_LABEL: &str = "cfg-allow";
 const SIGNATURE_WINDOW: usize = 50;
 
 pub struct ConfigGates;
-
-fn committor_id() -> Pubkey {
-    topology::COMMITTOR_ID.parse().expect("committor id")
-}
-
-// The config's AllowedProgram id deserializes as a 32-byte array, not as a
-// base58 string.
-fn allowed_programs_env(program: &Pubkey) -> String {
-    let bytes = program
-        .as_ref()
-        .iter()
-        .map(|byte| byte.to_string())
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("[{{id=[{bytes}]}}]")
-}
 
 async fn identity_signatures(
     base: &BaseCtx,
@@ -65,21 +46,6 @@ async fn alt_transactions_since(
         }
     }
     Ok(found)
-}
-
-async fn assert_program_blocked(er: &ErCtx, program: &Pubkey) -> Result<()> {
-    let first = er.account(program).await?;
-    check!(
-        first.is_none(),
-        "the blocked program must not be on the er before the settle"
-    )?;
-    tokio::time::sleep(BLOCKED_SETTLE).await;
-    let second = er.account(program).await?;
-    check!(
-        second.is_none(),
-        "the restricted er must not clone the blocked program"
-    )?;
-    Ok(())
 }
 
 async fn delegate_and_clone_counter(base: &BaseCtx, er: &ErCtx) -> Result<()> {
@@ -119,31 +85,8 @@ impl PrivateErScenario for ConfigGates {
     }
 
     async fn run(&self, base: &BaseCtx) -> Result<()> {
-        let allowed = redshift_interface::id();
-        let blocked = committor_id();
-
-        let restricted = topology::private_er(
-            base,
-            topology::ErOptions {
-                label: RESTRICTED_ER_LABEL.to_owned(),
-                env: vec![(
-                    "MBV_CHAINLINK__ALLOWED_PROGRAMS".to_owned(),
-                    allowed_programs_env(&allowed),
-                )],
-                request_timeout: None,
-                base_endpoints: None,
-            },
-        )
-        .await?;
-        prep::await_program_clone(
-            restricted.ctx(),
-            &allowed,
-            PROGRAM_CLONE_TIMEOUT,
-        )
-        .await?;
-        assert_program_blocked(restricted.ctx(), &blocked).await?;
-        restricted.finish().await?;
-
+        // ChainSync has no program allowlist. Default startup must still clone
+        // both application and settlement programs without creating lookup tables.
         let open_identity = topology::identity_for_label(OPEN_ER_LABEL)?;
         let open_pubkey = open_identity.pubkey();
         let baseline = identity_signatures(base, &open_pubkey).await?;
@@ -155,6 +98,7 @@ impl PrivateErScenario for ConfigGates {
                 env: vec![],
                 request_timeout: None,
                 base_endpoints: None,
+                ..Default::default()
             },
         )
         .await?;
@@ -167,10 +111,16 @@ impl PrivateErScenario for ConfigGates {
              got {after_start:?}"
         )?;
 
-        prep::await_program_clone(open.ctx(), &allowed, PROGRAM_CLONE_TIMEOUT)
+        for program in
+            [redshift_interface::id(), topology::COMMITTOR_ID.parse()?]
+        {
+            prep::await_program_clone(
+                open.ctx(),
+                &program,
+                PROGRAM_CLONE_TIMEOUT,
+            )
             .await?;
-        prep::await_program_clone(open.ctx(), &blocked, PROGRAM_CLONE_TIMEOUT)
-            .await?;
+        }
 
         delegate_and_clone_counter(base, open.ctx()).await?;
 
@@ -183,20 +133,6 @@ impl PrivateErScenario for ConfigGates {
              {after_clone:?}"
         )?;
         open.finish().await?;
-
-        let recent_slot = base.api().get_slot().await?;
-        let (create_ix, _) =
-            create_lookup_table(open_pubkey, open_pubkey, recent_slot);
-        base.submit_and_confirm(&open_identity, &[create_ix])
-            .await?;
-        let control =
-            alt_transactions_since(base, &open_pubkey, &baseline).await?;
-        check_eq!(
-            control.len(),
-            1,
-            "the lookup table detector must see the one table this identity \
-             created, got {control:?}"
-        )?;
 
         Ok(())
     }

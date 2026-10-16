@@ -7,7 +7,7 @@ use std::{
 use keypair::Keypair;
 use pubkey::Pubkey;
 
-use crate::{catalog::Fixture, console, manifest, Result};
+use crate::{catalog::Fixture, manifest, Result};
 
 const LEDGER_SIZE_LIMIT_UNREACHABLE: u64 = 1 << 60;
 
@@ -243,14 +243,13 @@ pub(super) struct BasePlan {
     // (program id, .so) loaded via --bpf-program; redline gets its aliases
     pub(super) bpf_programs: Vec<(String, PathBuf)>,
     pub(super) loaded_fixtures: Vec<String>,
-    pub(super) geyser_plugin_config: Option<PathBuf>,
-    // the Yellowstone release serving this base's gRPC feed, when it has one
+    pub(super) geyser_plugin_config: PathBuf,
+    // Yellowstone is required for ChainSync lifecycle observations and Clock.
     pub(super) plugin: String,
 }
 
 impl BasePlan {
-    // `grpc_port` asks for a Yellowstone gRPC feed on that port: the plugin is
-    // resolved and configured here, with the rest of the base's launch.
+    // Resolve the required lifecycle feed before spawning the base process.
     pub(super) async fn gather(
         bin: PathBuf,
         er_bin: &Path,
@@ -258,29 +257,16 @@ impl BasePlan {
         rpc_port: u16,
         faucet_port: u16,
         gossip_port: u16,
-        grpc_port: Option<u16>,
+        grpc_port: u16,
     ) -> Result<Self> {
-        let mut geyser_plugin_config = None;
-        let mut plugin = String::new();
-        if let Some(port) = grpc_port {
-            let feed = async {
-                let yellowstone = super::yellowstone::ensure(&bin).await?;
-                let path = stack_dir.join(format!("geyser-{port}.json"));
-                yellowstone
-                    .write_config(&path, &format!("127.0.0.1:{port}"))?;
-                Result::Ok((path, yellowstone.tag))
-            }
-            .await;
-            match feed {
-                Ok((path, tag)) => {
-                    geyser_plugin_config = Some(path);
-                    plugin = tag;
-                }
-                Err(e) => console::line(format_args!(
-                    "no Yellowstone gRPC feed on this base: {e}"
-                )),
-            }
-        }
+        let yellowstone = super::yellowstone::ensure(&bin).await?;
+        let geyser_plugin_config =
+            stack_dir.join(format!("geyser-{grpc_port}.json"));
+        yellowstone.write_config(
+            &geyser_plugin_config,
+            &format!("127.0.0.1:{grpc_port}"),
+        )?;
+        let plugin = yellowstone.tag;
         let mut upgradeable_v3 = Vec::new();
         if let Ok(redshift_so) = manifest::resolve(Fixture::RedshiftProgram) {
             let (v3_id, v3_authority) = redshift_loader_v3_target();
@@ -340,9 +326,8 @@ impl BasePlan {
             }
             cmd.arg("--bpf-program").arg(id).arg(so);
         }
-        if let Some(plugin) = &self.geyser_plugin_config {
-            cmd.arg("--geyser-plugin-config").arg(plugin);
-        }
+        cmd.arg("--geyser-plugin-config")
+            .arg(&self.geyser_plugin_config);
         cmd
     }
 }
@@ -354,7 +339,9 @@ pub(super) struct ErPlan {
     pub(super) identity: Keypair,
     pub(super) base_rpc_url: String,
     pub(super) base_ws_url: String,
-    pub(super) base_grpc_url: Option<String>,
+    pub(super) base_grpc_url: String,
+    /// Lifecycle delivery is immediate; this delay governs ordinary mirror redundancy only.
+    pub(super) grpc_duplication_delay: Duration,
     pub(super) listen_port: u16,
     pub(super) metrics_port: u16,
     // every validator binds a follower listener (default 127.0.0.1:10000);
@@ -373,24 +360,21 @@ pub(super) struct ErPlan {
 impl ErPlan {
     pub(super) fn command(&self) -> Command {
         let mut cmd = Command::new(&self.bin);
-        match &self.base_grpc_url {
-            Some(grpc_url) => {
-                cmd.env(
-                    "MBV_REMOTES",
-                    toml_string_array(&[
-                        self.base_rpc_url.as_str(),
-                        self.base_ws_url.as_str(),
-                        &with_api_key(grpc_url),
-                    ]),
-                );
-            }
-            None => {
-                cmd.arg("--remotes")
-                    .arg(&self.base_rpc_url)
-                    .arg("--remotes")
-                    .arg(&self.base_ws_url);
-            }
-        }
+        cmd.env(
+            "MBV_CHAINSYNC__HTTP",
+            toml_string_array(&[&self.base_rpc_url]),
+        );
+        cmd.env(
+            "MBV_CHAINSYNC__WEBSOCKET",
+            format!(
+                "[{{url=\"{}\",max-connections=4,subs-per-connection=900}}]",
+                self.base_ws_url
+            ),
+        );
+        cmd.env("MBV_CHAINSYNC__GRPC", format!(
+            "[{{endpoint=\"{}\",token=\"{GRPC_API_KEY}\",duplication-delay=\"{}ms\"}}]",
+            self.base_grpc_url, self.grpc_duplication_delay.as_millis()
+        ));
         cmd.arg("-l").arg(format!("127.0.0.1:{}", self.listen_port));
         cmd.env(
             "MBV_ENGINE__AUTHORITY__LOCAL",
@@ -433,14 +417,6 @@ impl ErPlan {
 }
 
 pub(super) const GRPC_API_KEY: &str = "redsuite";
-
-fn with_api_key(grpc_url: &str) -> String {
-    if grpc_url.contains('?') {
-        grpc_url.to_owned()
-    } else {
-        format!("{grpc_url}?api-key={GRPC_API_KEY}")
-    }
-}
 
 fn toml_string_array<T: std::fmt::Display>(values: &[T]) -> String {
     let quoted: Vec<String> =
@@ -539,6 +515,9 @@ pub struct ErOptions {
     pub env: Vec<(String, String)>,
     pub request_timeout: Option<Duration>,
     pub base_endpoints: Option<BaseEndpoints>,
+    /// Overrides the default 30-minute delay for gRPC copies of WebSocket mirrors.
+    /// Does not delay delegation, undelegation, or Clock observations.
+    pub grpc_duplication_delay: Option<Duration>,
 }
 
 #[derive(Debug, Clone)]

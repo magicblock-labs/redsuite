@@ -29,9 +29,9 @@ const SLOW_THRESHOLD: Duration = Duration::from_millis(100);
 const MIN_COLD_WARM_RATIO: f64 = 10.0;
 
 const ENSURE_ACCOUNT_HISTOGRAM: &str =
-    r#"mbv_ensure_accounts_time{kind="account"}"#;
+    r#"engine_chainsync_duration_micros{op="chainsync"}"#;
 const ENSURE_TX_HISTOGRAM: &str =
-    r#"mbv_ensure_accounts_time{kind="transaction"}"#;
+    r#"engine_chainsync_duration_micros{op="chainsync"}"#;
 
 struct Profile {
     name: &'static str,
@@ -105,6 +105,7 @@ async fn burst_cell(
             env: Vec::new(),
             request_timeout: Some(REQUEST_TIMEOUT),
             base_endpoints: None,
+            ..Default::default()
         },
     )
     .await?;
@@ -170,7 +171,9 @@ async fn burst_cell(
         outcome,
         slow: slow.get(),
         wall_s,
-        ensure_avg_s: delta.histogram_avg(ENSURE_TX_HISTOGRAM),
+        ensure_avg_s: delta
+            .histogram_avg(ENSURE_TX_HISTOGRAM)
+            .map(|micros| micros / 1e6),
     })
 }
 
@@ -206,6 +209,7 @@ impl Scenario<ScenarioReport> for ColdHydrationTail {
                 env: Vec::new(),
                 request_timeout: Some(REQUEST_TIMEOUT),
                 base_endpoints: None,
+                ..Default::default()
             },
         )
         .await?;
@@ -259,7 +263,9 @@ impl Scenario<ScenarioReport> for ColdHydrationTail {
                 .metric_if(
                     "validator ensure (account) avg s",
                     Unit::Seconds,
-                    touch_delta.histogram_avg(ENSURE_ACCOUNT_HISTOGRAM),
+                    touch_delta
+                        .histogram_avg(ENSURE_ACCOUNT_HISTOGRAM)
+                        .map(|micros| micros / 1e6),
                 );
         report::persist_cell(self.name(), &touch_report);
 

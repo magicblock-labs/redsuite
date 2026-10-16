@@ -13,7 +13,7 @@ use redsuite_core::{
 };
 use sdk::spl::{
     builders::{
-        InitializeRentPdaBuilder, UndelegateEphemeralAtaBuilder,
+        InitializeRentPdaBuilder,
         WithdrawThroughDelegatedShuttleWithMergeBuilder,
     },
     find_rent_pda,
@@ -134,6 +134,9 @@ async fn check_controls(
     amount: u64,
 ) -> Result<()> {
     let atas = wallets.each_ref().map(|wallet| wallet.ata);
+    // Acquisition may install ordinary readonly controls. Establish those
+    // images before checking that a rejected execution has no token effects.
+    prep::await_clones(er, &atas, 165, TIMEOUT).await?;
     let before = er.accounts(&atas).await?;
     for control in [2, 3] {
         for (from, to) in [(control, 0), (0, control)] {
@@ -403,6 +406,7 @@ impl PrivateErScenario for ProjectedTokenLifecycle {
                     env: Vec::new(),
                     request_timeout: None,
                     base_endpoints: Some(proxies.endpoints()),
+                    ..Default::default()
                 },
             ),
         )
@@ -672,16 +676,16 @@ impl PrivateErScenario for ProjectedTokenLifecycle {
         .await?;
 
         crate::phase("undelegation", async {
-            for wallet in &wallets[..2] {
+            for (i, wallet) in wallets[..2].iter().enumerate() {
                 let signature = er
                     .submit_and_confirm(
-                        &wallet.owner,
-                        &[UndelegateEphemeralAtaBuilder {
-                            payer: wallet.owner.pubkey(),
-                            user: wallet.owner.pubkey(),
-                            mint: mint_key,
-                        }
-                        .instruction()],
+                        &validator,
+                        // ER settlement uses the projected ATA, not its raw base-chain eATA.
+                        &[build::commit_and_undelegate_accounts(
+                            3 + i as u64,
+                            identity,
+                            &[wallet.ata],
+                        )],
                     )
                     .await?;
                 settled(base, er, &signature, &[wallet.eata], true).await?;
@@ -723,7 +727,7 @@ impl PrivateErScenario for ProjectedTokenLifecycle {
             wallets[0].transfer(er, &wallets[1], 7).await?;
             expected.projected = [25, 255, 70, 5];
             record("redelegated transfer", &expected, true).await?;
-            settled(base, er, &commit(3).await?, &eatas, false).await?;
+            settled(base, er, &commit(5).await?, &eatas, false).await?;
             expected.eatas[..2].copy_from_slice(&[Some(25), Some(255)]);
             record("final committed balances", &expected, true).await
         })

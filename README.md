@@ -239,16 +239,21 @@ artifacts and their manifest under the resource root's `target/deploy`. Preserve
 the committor artifact's location relative to the validator binary when moving a
 build to another host.
 
-### Optional gRPC coverage
+### Yellowstone gRPC
 
-The base chain attempts to load a compatible Yellowstone Geyser plugin. Missing
-or incompatible plugins fail only checks that require the gRPC feed; other
-checks can run without it.
+The base chain requires a compatible Yellowstone Geyser plugin. Every rollup
+uses its feed for ChainSync lifecycle events and confirmed Clock observations;
+an unavailable or incompatible plugin fails setup.
 
 Automatic acquisition uses upstream binaries for **x86_64 Linux**. On other
 hosts, set `REDSUITE_YELLOWSTONE_PLUGIN` to a compatible locally built plugin.
-`REDSUITE_YELLOWSTONE_DIR` controls the download cache. Rollups receive the feed
-only when their scenario explicitly requests it.
+`REDSUITE_YELLOWSTONE_DIR` controls the download cache. Rollups use the shared
+feed unless a scenario overrides it.
+
+Ordinary WebSocket mirrors enter gRPC coverage after a 30-minute delay by
+default, keeping WebSocket fault scenarios isolated. Scenarios can shorten
+`ErOptions::grpc_duplication_delay` to exercise redundancy. This delay never
+applies to delegation, undelegation, or Clock observations.
 
 ## 🦀 Extend the suite
 

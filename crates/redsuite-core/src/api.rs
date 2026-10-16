@@ -1,4 +1,8 @@
-use std::{collections::HashMap, str::FromStr, time::Duration};
+use std::{
+    collections::HashMap,
+    str::FromStr,
+    time::{Duration, Instant},
+};
 
 use account::Account;
 use base64::Engine;
@@ -178,7 +182,6 @@ struct RpcTransaction {
     #[serde(rename = "blockTime")]
     block_time: Option<i64>,
     meta: Option<RpcTransactionMeta>,
-    transaction: Option<(String, String)>,
 }
 
 #[derive(Default, Deserialize)]
@@ -209,9 +212,6 @@ pub struct TransactionInfo {
     pub pre_balances: Vec<u64>,
     pub post_balances: Vec<u64>,
     pub logs: Vec<String>,
-    // lookup tables the transaction message loads addresses through;
-    // 0 for legacy transactions
-    pub lookup_tables: usize,
 }
 
 #[derive(Debug)]
@@ -576,10 +576,24 @@ impl Api {
         &self,
         tx: &Transaction,
     ) -> Result<Signature> {
-        let sig: String = self
-            .call("sendTransaction", &Self::send_params(tx)?)
-            .await?;
-        Ok(Signature::from_str(&sig)?)
+        let params = Self::send_params(tx)?;
+        let deadline = Instant::now() + CONFIRM_DEADLINE;
+        loop {
+            let result: Result<String> =
+                self.call("sendTransaction", &params).await;
+            // These verification failures occur before admission: retry the same
+            // signed transaction while ChainSync connects. Never retry an unknown
+            // submission outcome, execution failure, or exhausted subscription capacity.
+            let connecting = result.as_ref().err().and_then(|error| error.downcast_ref::<RpcError>())
+                .is_some_and(|error| error.code == -32003
+                    && ["WebSocket subscription failed: capacity is connecting or unavailable",
+                        "WebSocket subscription failed: peer closed the socket"]
+                    .iter().any(|message| error.message.contains(message)));
+            if !connecting || Instant::now() >= deadline {
+                return Ok(Signature::from_str(&result?)?);
+            }
+            tokio::time::sleep(CONFIRM_POLL).await;
+        }
     }
 
     pub async fn confirm(
@@ -633,8 +647,9 @@ impl Api {
         }))
     }
 
-    /// Reads receipts without JSON's per-instruction base58 encoding, which is
-    /// expensive for materialization transactions carrying whole program images.
+    /// Reads execution metadata without JSON's per-instruction base58 encoding.
+    /// Native materialization transactions can carry whole program images;
+    /// base64 keeps these receipt scans linear in the transaction size.
     pub async fn get_transaction(
         &self,
         sig: &Signature,
@@ -649,16 +664,9 @@ impl Api {
         );
         let raw: Option<RpcTransaction> =
             self.call_nullable("getTransaction", &params).await?;
-        raw.map(|tx| {
+        Ok(raw.map(|tx| {
             let meta = tx.meta.unwrap_or_default();
-            let lookup_tables = match tx.transaction {
-                Some((wire, _)) => decode_transaction(&wire)?
-                    .message
-                    .address_table_lookups()
-                    .map_or(0, |lookups| lookups.len()),
-                None => 0,
-            };
-            Ok(TransactionInfo {
+            TransactionInfo {
                 slot: tx.slot,
                 block_time: tx.block_time,
                 err: meta.err,
@@ -666,10 +674,8 @@ impl Api {
                 pre_balances: meta.pre_balances,
                 post_balances: meta.post_balances,
                 logs: meta.log_messages.unwrap_or_default(),
-                lookup_tables,
-            })
-        })
-        .transpose()
+            }
+        }))
     }
 
     pub async fn get_block_time(&self, slot: u64) -> Result<Option<i64>> {

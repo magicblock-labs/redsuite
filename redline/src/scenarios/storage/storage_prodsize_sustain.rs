@@ -17,7 +17,8 @@ const PREP_PAYER_LAMPORTS: u64 = 4_000_000_000;
 const CLONE_TIMEOUT: Duration = Duration::from_secs(15);
 const FLATNESS_P50_FACTOR: f64 = 1.5;
 
-const TX_PROCESSING_HISTOGRAM: &str = "mbv_transaction_processing_time";
+const RPC_DURATION: &str =
+    "aperture_rpc_request_duration_seconds{method=\"sendTransaction\"}";
 const LEDGER_TRANSACTIONS_GAUGE: &str = "engine_ledger_transactions";
 const LEDGER_FILL_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -63,7 +64,7 @@ const PROFILES: ProfileValues<Profile> = ProfileValues {
 
 struct WindowOutcome {
     outcome: RunOutcome,
-    tx_processing_avg_us: Option<f64>,
+    rpc_duration_avg_us: Option<f64>,
     storage_growth_bytes: u64,
 }
 
@@ -96,8 +97,8 @@ async fn execute_window(
     let storage_after = host::dir_size_bytes(storage_dir)?;
     Ok(WindowOutcome {
         outcome,
-        tx_processing_avg_us: delta
-            .histogram_avg(TX_PROCESSING_HISTOGRAM)
+        rpc_duration_avg_us: delta
+            .histogram_avg(RPC_DURATION)
             .map(|seconds| seconds * 1e6),
         storage_growth_bytes: storage_after.saturating_sub(storage_before),
     })
@@ -153,6 +154,7 @@ impl Scenario<ScenarioReport> for StorageProdsizeSustain {
                     ],
                     request_timeout: None,
                     base_endpoints: None,
+                    ..Default::default()
                 },
             )
             .await?;
@@ -266,11 +268,11 @@ impl Scenario<ScenarioReport> for StorageProdsizeSustain {
                 cell.windows[1].outcome.delivery.quantile95,
                 cell.windows[1].outcome.achieved_rps(),
                 cell.windows[0]
-                    .tx_processing_avg_us
+                    .rpc_duration_avg_us
                     .map(|us| format!("{us:.1}"))
                     .unwrap_or_else(|| "n/a".to_owned()),
                 cell.windows[1]
-                    .tx_processing_avg_us
+                    .rpc_duration_avg_us
                     .map(|us| format!("{us:.1}"))
                     .unwrap_or_else(|| "n/a".to_owned()),
             );
@@ -322,7 +324,7 @@ impl Scenario<ScenarioReport> for StorageProdsizeSustain {
                     .metric_if(
                         format!("window {window_name} validator tx avg us"),
                         Unit::Micros,
-                        window.tx_processing_avg_us,
+                        window.rpc_duration_avg_us,
                     );
             }
             report::persist_cell(self.name(), &cell_report);
@@ -403,7 +405,7 @@ impl Scenario<ScenarioReport> for StorageProdsizeSustain {
                 .metric_if(
                     format!("{} window B validator tx avg us", cell.name),
                     Unit::Micros,
-                    cell.windows[1].tx_processing_avg_us,
+                    cell.windows[1].rpc_duration_avg_us,
                 );
         }
         Ok(summary)

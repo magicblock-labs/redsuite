@@ -100,6 +100,7 @@ impl Scenario<ScenarioReport> for WsConnCapacity {
                 env: Vec::new(),
                 request_timeout: None,
                 base_endpoints: None,
+                ..Default::default()
             },
         )
         .await?;

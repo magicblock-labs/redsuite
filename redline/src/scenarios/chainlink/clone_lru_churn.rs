@@ -21,8 +21,10 @@ const CLONE_TIMEOUT: Duration = Duration::from_secs(15);
 
 const MONITORED_GAUGE: &str = "engine_keeper_account_cache_entries";
 const EVICTED_COUNTER: &str = "engine_keeper_account_cache_evictions";
-const FETCHES_FOUND_COUNTER: &str = "mbv_account_fetches_found_count";
-const ENSURE_HISTOGRAM: &str = r#"mbv_ensure_accounts_time{kind="account"}"#;
+const HTTP_FETCHES: &str =
+    r#"engine_chainsync_http_attempts{outcome="success"}"#;
+const ENSURE_HISTOGRAM: &str =
+    r#"engine_chainsync_duration_micros{op="chainsync"}"#;
 
 const SETTLE_POLL: Duration = Duration::from_millis(500);
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -34,8 +36,7 @@ async fn settled_scrape(er: &ErCtx) -> Result<redsuite_core::Metrics> {
         tokio::time::sleep(SETTLE_POLL).await;
         let next = er.scrape_metrics().await?;
         let stable = next.get(EVICTED_COUNTER) == last.get(EVICTED_COUNTER)
-            && next.value_sum(FETCHES_FOUND_COUNTER)
-                == last.value_sum(FETCHES_FOUND_COUNTER);
+            && next.get(HTTP_FETCHES) == last.get(HTTP_FETCHES);
         last = next;
         if stable {
             break;
@@ -110,7 +111,7 @@ struct CellOutcome {
     outcome: RunOutcome,
     evictions: f64,
     eviction_rate: f64,
-    fetches_found: Option<f64>,
+    http_fetches: Option<f64>,
     ensure_avg_s: Option<f64>,
     monitored_end: f64,
 }
@@ -158,18 +159,13 @@ impl Scenario<ScenarioReport> for CloneLruChurn {
                 base,
                 topology::ErOptions {
                     label: format!("s5-{}", cell.name),
-                    env: vec![
-                        (
-                            "MBV_ENGINE__ACCOUNTSDB__LRU_CAPACITY".to_owned(),
-                            cell.cap.to_string(),
-                        ),
-                        (
-                            "MBV_CHAINLINK__RESUBSCRIPTION_DELAY".to_owned(),
-                            "50ms".to_owned(),
-                        ),
-                    ],
+                    env: vec![(
+                        "MBV_ENGINE__ACCOUNTSDB__LRU_CAPACITY".to_owned(),
+                        cell.cap.to_string(),
+                    )],
                     request_timeout: Some(REQUEST_TIMEOUT),
                     base_endpoints: None,
+                    ..Default::default()
                 },
             )
             .await?;
@@ -243,14 +239,16 @@ impl Scenario<ScenarioReport> for CloneLruChurn {
                 cap: cell.cap,
                 evictions,
                 eviction_rate: evictions / outcome.wall.as_secs_f64(),
-                fetches_found: delta.counter_all(FETCHES_FOUND_COUNTER),
-                ensure_avg_s: delta.histogram_avg(ENSURE_HISTOGRAM),
+                http_fetches: delta.counter(HTTP_FETCHES),
+                ensure_avg_s: delta
+                    .histogram_avg(ENSURE_HISTOGRAM)
+                    .map(|micros| micros / 1e6),
                 monitored_end: delta.gauge(MONITORED_GAUGE).unwrap_or(0.0),
                 outcome,
             };
             eprintln!(
                 "[redsuite] {}: {} (cap {}): {:.0} reads/s, p50 {} us / p95 {} us, \
-                 {} delivered / {} failed, evictions {:.0} ({:.1}/s), fetches found {}, ensure avg {}, monitored {:.0}",
+                 {} delivered / {} failed, evictions {:.0} ({:.1}/s), successful HTTP batches {}, ensure avg {}, monitored {:.0}",
                 self.name(),
                 cell_outcome.name,
                 cell_outcome.cap,
@@ -262,7 +260,7 @@ impl Scenario<ScenarioReport> for CloneLruChurn {
                 cell_outcome.evictions,
                 cell_outcome.eviction_rate,
                 cell_outcome
-                    .fetches_found
+                    .http_fetches
                     .map(|count| format!("{count:.0}"))
                     .unwrap_or_else(|| "n/a".to_owned()),
                 cell_outcome
@@ -316,9 +314,9 @@ impl Scenario<ScenarioReport> for CloneLruChurn {
                         cell_outcome.eviction_rate,
                     )
                     .metric_if(
-                        "fetches found in window",
+                        "successful HTTP batches in window",
                         Unit::Count,
-                        cell_outcome.fetches_found,
+                        cell_outcome.http_fetches,
                     )
                     .metric_if(
                         "validator ensure avg s",
@@ -377,8 +375,8 @@ impl Scenario<ScenarioReport> for CloneLruChurn {
                 churn_cell.cap,
                 profile.working_set
             )?;
-            if let Some(fetches_found) = churn_cell.fetches_found {
-                let deviation = (fetches_found - churn_cell.evictions).abs();
+            if let Some(http_fetches) = churn_cell.http_fetches {
+                let deviation = (http_fetches - churn_cell.evictions).abs();
                 let tolerance = (churn_cell.evictions * 0.15)
                     .max(profile.concurrency as f64);
                 check!(
@@ -386,7 +384,7 @@ impl Scenario<ScenarioReport> for CloneLruChurn {
                     "{}: {} refetches vs {} evictions — evict/reload left \
                      lockstep",
                     churn_cell.name,
-                    fetches_found,
+                    http_fetches,
                     churn_cell.evictions
                 )?;
             }
@@ -442,9 +440,9 @@ impl Scenario<ScenarioReport> for CloneLruChurn {
                     cell.outcome.failed as f64,
                 )
                 .metric_if(
-                    format!("{} fetches found", cell.name),
+                    format!("{} successful HTTP batches", cell.name),
                     Unit::Count,
-                    cell.fetches_found,
+                    cell.http_fetches,
                 )
                 .metric_if(
                     format!("{} ensure avg s", cell.name),

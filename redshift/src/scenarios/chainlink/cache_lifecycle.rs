@@ -7,7 +7,7 @@ use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
     check, check_eq,
-    netfault::{Action, BaseProxies, Selector},
+    netfault::{Action, BaseProxies, Selector, Stage},
     prep, system, topology,
     topology::ErOptions,
     BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result,
@@ -18,7 +18,6 @@ use crate::program::{self, instruction::build, layout::*, utils::fold_hash};
 
 const TIMEOUT: Duration = Duration::from_secs(20);
 const EVICTIONS: &str = "engine_keeper_account_cache_evictions";
-const RECOVERY_OBSERVATION: Duration = Duration::from_secs(100);
 const FETCHES: [&str; 2] = ["getAccountInfo", "getMultipleAccounts"];
 
 pub enum CacheLifecycle {
@@ -91,6 +90,7 @@ impl PrivateErScenario for CacheLifecycle {
                 )],
                 request_timeout: Some(TIMEOUT),
                 base_endpoints: Some(endpoints),
+                ..Default::default()
             },
         )
         .await?;
@@ -116,14 +116,33 @@ impl PrivateErScenario for CacheLifecycle {
             .await?;
         let (readonly, protected_keys) = keys.split_at(3);
         let (delegated, pending) = protected_keys.split_at(2);
+        let acquire = async |keys: &[Pubkey]| -> Result<()> {
+            check::poll_for("ordinary mirrors acquired", TIMEOUT, || async {
+                check!(
+                    er.accounts(keys).await?.iter().all(Option::is_some),
+                    "mirror acquisition incomplete"
+                )?;
+                Result::Ok(())
+            })
+            .await?;
+            Ok(())
+        };
+        // Buffer ordinary mirror updates before delegation. ChainSync receives
+        // lifecycle events through gRPC, not WebSocket program subscriptions.
+        acquire(protected_keys).await?;
         let stale: Vec<_> = if reconnect_before_settlement {
             Vec::new()
         } else {
             protected_keys
                 .iter()
-                .map(|key| observe("programNotification", key))
+                .map(|key| observe("accountNotification", key))
                 .collect()
         };
+        if !reconnect_before_settlement {
+            set_base(42, protected_keys).await?;
+        }
+        let stale =
+            try_join_all(stale.iter().map(|trap| trap.wait(TIMEOUT))).await?;
         let delegates: Vec<_> = protected_keys
             .iter()
             .zip(3..)
@@ -132,8 +151,6 @@ impl PrivateErScenario for CacheLifecycle {
             })
             .collect();
         base.submit_and_confirm(&funder, &delegates).await?;
-        let stale =
-            try_join_all(stale.iter().map(|trap| trap.wait(TIMEOUT))).await?;
         er.accounts(protected_keys).await?;
         er.submit_and_confirm(
             &payer,
@@ -185,7 +202,9 @@ impl PrivateErScenario for CacheLifecycle {
         let sender = er.sender(Rc::new(payer));
         let traffic = async {
             let mut expected = protected.clone();
-            let mut hash = [0; HASH_SIZE];
+            let mut hash = expected[0].as_ref().unwrap().data
+                [HASH_OFFSET..HASH_OFFSET + HASH_SIZE]
+                .try_into()?;
             let mut id = 0;
             while !done.get() {
                 id += 1;
@@ -231,34 +250,50 @@ impl PrivateErScenario for CacheLifecycle {
             }
             if reconnect_before_settlement {
                 for chunk in pool.chunks(32) {
-                    er.accounts(chunk).await?;
+                    acquire(chunk).await?;
                 }
                 let next = eviction_count().await?;
                 check!(next > evictions, "evictions before blackout")?;
                 evictions = next;
-                blackout.push(
-                    ws.stall(Selector::default().response().notification()),
-                );
+                blackout.push(ws.stall(Selector::default().notification()));
                 for key in protected_keys {
                     blackout.push(http.stall(
                         Selector::methods(&FETCHES).response().account(key),
                     ));
                 }
                 ws.close_connections();
+                // A fresh mirror proves the replacement socket can acknowledge
+                // subscriptions before lifecycle handling needs to acquire one.
+                let canary = Keypair::new().pubkey();
+                base.submit_and_confirm(
+                    &funder,
+                    &[system::transfer(&owner, &canary, 1_000_000)],
+                )
+                .await?;
+                check::poll_for(
+                    "replacement socket acquires a fresh mirror",
+                    TIMEOUT,
+                    || async {
+                        let account = er
+                            .account(&canary)
+                            .await?
+                            .ok_or("replacement subscription not ready")?;
+                        Result::Ok(account)
+                    },
+                )
+                .await?;
             }
             for (cycle, &target) in readonly[..churn_cycles].iter().enumerate()
             {
                 for chunk in pool.chunks(32) {
-                    er.accounts(chunk).await?;
+                    acquire(chunk).await?;
                 }
                 let next = eviction_count().await?;
                 check!(next > evictions, "evictions before reconnect {cycle}")?;
                 evictions = next;
                 let cold = crate::local_accounts(er, &[target]).await?;
                 check!(cold[0].is_none(), "new subscription target is cold")?;
-                let reconnect = observe("accountSubscribe", &pending[0]);
                 ws.close_connections();
-                let reconnect = reconnect.wait(TIMEOUT).await?;
                 let registered = observe("accountSubscribe", &target);
                 let old = http.intercept(
                     Selector::methods(&[
@@ -269,23 +304,39 @@ impl PrivateErScenario for CacheLifecycle {
                     .account(&target),
                 );
                 let latest = cycle as u64 + 10;
-                let (read, ()) = try_join(er.account(&target), async {
+                let acquire = async {
+                    let account = check::poll_for(
+                        "cold mirror acquisition after reconnect",
+                        TIMEOUT,
+                        || async {
+                            let account = er
+                                .account(&target)
+                                .await?
+                                .ok_or("mirror not acquired yet")?;
+                            Result::Ok(account)
+                        },
+                    )
+                    .await?;
+                    Result::Ok(account)
+                };
+                let (read, ()) = try_join(acquire, async {
                     registered.wait(TIMEOUT).await?.release();
                     let old = old.wait(TIMEOUT).await?;
                     let notification = observe("accountNotification", &target);
                     set_base(latest, &[target]).await?;
                     notification.wait(TIMEOUT).await?.release();
-                    value(er, &[target], latest).await?;
+                    // The HTTP acquisition owns the lease. Its queued notification
+                    // can materialize only after the held response releases that lease.
                     old.release();
+                    value(er, &[target], latest).await?;
                     progressed(progress.get()).await?;
-                    reconnect.release();
                     Ok(())
                 })
                 .await?;
                 check_eq!(
-                    crate::account_id(read),
-                    Some(latest),
-                    "HTTP read stays current"
+                    read.owner,
+                    program::id(),
+                    "HTTP read returns the ordinary account image"
                 )?;
                 value(er, &[target], latest).await?;
                 check!(
@@ -295,6 +346,22 @@ impl PrivateErScenario for CacheLifecycle {
                 )?;
             }
             completed.set(true);
+            // ChainSync release handling must subscribe and refetch; restoring
+            // the transport is not a promise of recovery during a total outage.
+            for rule in blackout {
+                rule.remove();
+            }
+            ws.restore();
+            http.restore();
+            let refresh_events = http.events().len();
+            let refreshes: Vec<_> = pending
+                .iter()
+                .map(|key| {
+                    http.stall(
+                        Selector::methods(&FETCHES).response().account(key),
+                    )
+                })
+                .collect();
             settlement.remove();
             check::poll_for("base undelegation", TIMEOUT, || async {
                 let actual = base.accounts(pending).await?;
@@ -307,42 +374,37 @@ impl PrivateErScenario for CacheLifecycle {
                 Result::Ok(())
             })
             .await?;
-            let released_at = tokio::time::Instant::now();
+            // Hold every matching response: Committor can read the same keys
+            // before ChainSync, so a one-shot interception is not a refresh barrier.
+            // Observe holds concurrently: ChainSync refreshes releases serially
+            // in provider order, not necessarily in this test's key order.
+            // Waiting for another key first would leave the active fetch stalled.
+            let refreshes = pending.iter().zip(refreshes).zip(&protected[2..]);
+            try_join_all(refreshes.map(|((key, rule), expected)| async {
+                let address = key.to_string();
+                check::poll("readonly refetch held", TIMEOUT, || async {
+                    http.events().iter().skip(refresh_events).any(|event| {
+                        event.action == Action::Held
+                            && event.operation.as_ref().is_some_and(
+                                |operation| {
+                                    operation.accounts.contains(&address)
+                                        && operation.stage == Stage::Response
+                                },
+                            )
+                    })
+                })
+                .await?;
+                check_eq!(
+                    crate::local_accounts(er, &[*key]).await?[0],
+                    *expected,
+                    "resident state while readonly refetch is held"
+                )?;
+                rule.remove();
+                Result::Ok(())
+            }))
+            .await?;
             set_base(900, pending).await?;
-            let recovery = if reconnect_before_settlement {
-                // Observe late recovery for diagnostics, but retain the
-                // TIMEOUT deadline checked after teardown below.
-                Some(
-                    check::poll_for(
-                        "ER discovers the completed undelegation",
-                        RECOVERY_OBSERVATION,
-                        || async {
-                            match crate::local_accounts(er, pending).await {
-                                Ok(observed)
-                                    if observed.iter().all(|a| {
-                                        crate::account_id(a.clone())
-                                            == Some(900)
-                                    }) =>
-                                {
-                                    Ok(released_at.elapsed())
-                                }
-                                Ok(observed) => Err(format!(
-                                    "{:?}",
-                                    observed
-                                        .iter()
-                                        .map(|a| crate::account_id(a.clone()))
-                                        .collect::<Vec<_>>()
-                                )),
-                                Err(error) => Err(error.to_string()),
-                            }
-                        },
-                    )
-                    .await,
-                )
-            } else {
-                value(er, pending, 900).await?;
-                None
-            };
+            value(er, pending, 900).await?;
             set_base(901, readonly).await?;
             let fetched = er.accounts(readonly).await?;
             let local = crate::local_accounts(er, readonly).await?;
@@ -364,9 +426,9 @@ impl PrivateErScenario for CacheLifecycle {
                 }
             }
             done.set(true);
-            Result::Ok(recovery)
+            Result::Ok(())
         };
-        let (_, recovery) = tokio::time::timeout(
+        tokio::time::timeout(
             Duration::from_secs(180),
             try_join(traffic, faults),
         )
@@ -376,13 +438,6 @@ impl PrivateErScenario for CacheLifecycle {
         private.finish().await?;
         http.finish()?;
         ws.finish()?;
-        if let Some(recovery) = recovery {
-            let elapsed = recovery?;
-            check!(
-                elapsed <= TIMEOUT,
-                "ER discovered the completed undelegation only after {elapsed:.1?}"
-            )?;
-        }
         Ok(())
     }
 }

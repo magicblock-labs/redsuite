@@ -73,6 +73,7 @@ impl PrivateErScenario for GrpcRedundancy {
                 label: LABEL.into(),
                 base_endpoints: Some(endpoints),
                 request_timeout: Some(TIMEOUT),
+                grpc_duplication_delay: Some(Duration::from_millis(10)),
                 ..ErOptions::default()
             },
         )
@@ -133,14 +134,6 @@ impl PrivateErScenario for GrpcRedundancy {
         })
         .await?;
 
-        let mut blackout =
-            vec![ws.stall(Selector::default().response().notification())];
-        for key in &keys {
-            blackout.push(
-                http.stall(Selector::methods(&FETCHES).response().account(key)),
-            );
-        }
-        ws.close_connections();
         settlement.remove();
 
         check::poll_for("base completes the undelegation", TIMEOUT, || async {
@@ -159,6 +152,24 @@ impl PrivateErScenario for GrpcRedundancy {
                 &[build::simple_byte_set(SETTLED_ON_BASE, pending)],
             )
             .await?;
+        // Undelegation re-enters the acknowledged subscription + HTTP fetch flow.
+        // Establish those mirrors before testing redundancy: gRPC cannot replace
+        // the HTTP acquisition required to demote the locally transient images.
+        pushed_to(
+            er,
+            "undelegation refetch creates readonly mirrors",
+            pending,
+            SETTLED_ON_BASE,
+        )
+        .await?;
+
+        let mut blackout =
+            vec![ws.stall(Selector::default().response().notification())];
+        for key in &keys {
+            blackout.push(
+                http.stall(Selector::methods(&FETCHES).response().account(key)),
+            );
+        }
         shared
             .submit_and_confirm(
                 &funder,
@@ -174,11 +185,20 @@ impl PrivateErScenario for GrpcRedundancy {
             REFRESHED_ON_BASE,
         )
         .await?;
+        // First prove delivery while WS notifications are held, then lose the
+        // socket entirely. A replacement WS socket starts without subscriptions.
+        ws.close_connections();
+        shared
+            .submit_and_confirm(
+                &funder,
+                &[build::simple_byte_set(SETTLED_ON_BASE + 1, pending)],
+            )
+            .await?;
         if let Err(error) = pushed_to(
             er,
-            "the er observes the completed undelegation while websocket is cut",
+            "released mirrors receive newer base writes while websocket is cut",
             pending,
-            SETTLED_ON_BASE,
+            SETTLED_ON_BASE + 1,
         )
         .await
         {

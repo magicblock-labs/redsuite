@@ -275,10 +275,10 @@ impl Scenario<ScenarioReport> for WarmIngress {
             // above, but a divergence points at the harness, not the
             // validator (R1)
             .metric_if(
-                "validator tx processing avg us",
+                "validator sendTransaction RPC avg us",
                 Unit::Micros,
                 delta
-                    .histogram_avg("mbv_transaction_processing_time")
+                    .histogram_avg("aperture_rpc_request_duration_seconds{method=\"sendTransaction\"}")
                     .map(|seconds| seconds * 1e6),
             )
             .metric_if(
@@ -286,9 +286,8 @@ impl Scenario<ScenarioReport> for WarmIngress {
                 Unit::Micros,
                 delta
                     .histogram_avg(
-                        r#"mbv_ensure_accounts_time{kind="transaction"}"#,
-                    )
-                    .map(|seconds| seconds * 1e6),
+                        r#"engine_chainsync_duration_micros{op="chainsync"}"#,
+                    ),
             )
             .metric_if(
                 "validator txs in window",
@@ -298,7 +297,7 @@ impl Scenario<ScenarioReport> for WarmIngress {
             .metric_if(
                 "monitored accounts (gauge)",
                 Unit::Count,
-                delta.gauge("mbv_monitored_accounts_gauge"),
+                delta.gauge("engine_keeper_account_cache_entries"),
             );
         if let Some(sync) = outcome.sync {
             report = report.observe("sync round-trip us", Unit::Micros, sync);

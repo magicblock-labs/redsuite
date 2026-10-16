@@ -290,12 +290,19 @@ async fn launch(
         ),
         None => (base.api().url().to_owned(), base.ws_url().to_owned(), None),
     };
+    // A proxy can override the feed, but omitting it never disables lifecycle delivery.
+    let base_grpc_url = base_grpc_url
+        .or_else(|| base.grpc().map(|(url, _)| url.to_owned()))
+        .ok_or("ChainSync requires the base Yellowstone lifecycle feed")?;
     let plan = config::ErPlan {
         bin: er_bin,
         identity: er_identity,
         base_rpc_url,
         base_ws_url,
         base_grpc_url,
+        grpc_duplication_delay: options
+            .grpc_duplication_delay
+            .unwrap_or(Duration::from_secs(30 * 60)),
         listen_port: rpc_port,
         metrics_port,
         replication_port,

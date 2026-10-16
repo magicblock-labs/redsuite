@@ -341,10 +341,10 @@ impl Scenario<ScenarioReport> for WsFanoutThreshold {
                         delta.counter(crate::metrics::ENGINE_TRANSACTIONS),
                     )
                     .metric_if(
-                        "validator tx processing avg us",
+                        "validator sendTransaction RPC avg us",
                         Unit::Micros,
                         delta
-                            .histogram_avg("mbv_transaction_processing_time")
+                            .histogram_avg("aperture_rpc_request_duration_seconds{method=\"sendTransaction\"}")
                             .map(|seconds| seconds * 1e6),
                     );
             report::persist_cell(self.name(), &cell_report);

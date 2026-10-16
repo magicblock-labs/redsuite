@@ -217,16 +217,16 @@ impl Scenario<ScenarioReport> for HotAccountCliff {
                         cell.outcome.achieved_rps(),
                     )
                     .metric_if(
-                        "validator tx processing avg us",
+                        "validator sendTransaction RPC avg us",
                         Unit::Micros,
                         delta
-                            .histogram_avg("mbv_transaction_processing_time")
+                            .histogram_avg("aperture_rpc_request_duration_seconds{method=\"sendTransaction\"}")
                             .map(|seconds| seconds * 1e6),
                     )
                     .metric_if(
                         "max lock contention queue",
                         Unit::Count,
-                        delta.gauge("mbv_max_lock_contention_queue_size"),
+                        delta.gauge("engine_processor_blocked_transactions"),
                     )
                     .metric_if(
                         "validator txs in window",
@@ -240,7 +240,7 @@ impl Scenario<ScenarioReport> for HotAccountCliff {
         // the widest cell is the healthy baseline every other cell is
         // judged against — and it must itself be healthy, else the whole
         // sweep is INVALID (saturated baseline = measuring the harness,
-        // not the scheduler; check `validator tx processing avg us` in the
+        // not the scheduler; check `validator sendTransaction RPC avg us` in the
         // cell report to attribute, then lower the offered rate)
         let p50 = |cell: &CellResult| cell.outcome.delivery.median as f64;
         let base_p50 = p50(&cells[0]);

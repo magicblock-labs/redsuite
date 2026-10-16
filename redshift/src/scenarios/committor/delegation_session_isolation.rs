@@ -293,9 +293,6 @@ async fn isolate(
     )
     .await?;
 
-    let delayed = proxies.intercept(
-        Selector::methods(&[]).ws().notification().account(&account),
-    );
     let undelegate = schedule_commit(
         er_a.ctx(),
         payer,
@@ -322,10 +319,33 @@ async fn isolate(
         "base returns the account to the program with the staged value",
     )
     .await?;
-    let delayed = delayed.wait(INTERCEPT_TIMEOUT).await?;
-
+    // Undelegation is delivered through gRPC and reacquires a readonly mirror
+    // over HTTP. Capture an ordinary update from that mirror for the stale-session check.
+    check::poll_for(
+        "session-a readonly mirror is reacquired",
+        CLONE_TIMEOUT,
+        || async {
+            let image =
+                er_a.ctx().account(&account).await?.ok_or("mirror absent")?;
+            check_eq!(
+                image.owner,
+                redshift_interface::id(),
+                "readonly mirror owner"
+            )?;
+            check_eq!(count(&image.data)?, staged, "readonly mirror count")?;
+            Result::Ok(())
+        },
+    )
+    .await?;
+    let delayed = proxies.intercept(
+        Selector::method("accountNotification")
+            .ws()
+            .notification()
+            .account(&account),
+    );
     let base_value = value(case, 2);
     write(base, payer, &player, &account, base_value).await?;
+    let delayed = delayed.wait(INTERCEPT_TIMEOUT).await?;
     let session_b = match target {
         Target::SameValidator => er_a.ctx(),
         Target::OtherValidator => {
@@ -481,6 +501,7 @@ impl Scenario for DelegationSessionIsolation {
                 env: Vec::new(),
                 request_timeout: None,
                 base_endpoints: Some(proxies.endpoints()),
+                ..Default::default()
             },
         )
         .await?;

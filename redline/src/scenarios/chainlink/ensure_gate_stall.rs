@@ -29,7 +29,7 @@ const CLONE_TIMEOUT: Duration = Duration::from_secs(15);
 const MONITORED_GAUGE: &str = "engine_keeper_account_cache_entries";
 const EVICTED_COUNTER: &str = "engine_keeper_account_cache_evictions";
 const ENSURE_HISTOGRAM: &str =
-    r#"mbv_ensure_accounts_time{kind="transaction"}"#;
+    r#"engine_chainsync_duration_micros{op="chainsync"}"#;
 
 struct Profile {
     name: &'static str,
@@ -150,20 +150,13 @@ impl Scenario<ScenarioReport> for EnsureGateStall {
                 base,
                 topology::ErOptions {
                     label: format!("s6-{}", cell.name),
-                    env: vec![
-                        (
-                            "MBV_ENGINE__ACCOUNTSDB__LRU_CAPACITY".to_owned(),
-                            cell.cap.to_string(),
-                        ),
-                        // campaign parity: fast resubscription keeps the
-                        // churn cadence high
-                        (
-                            "MBV_CHAINLINK__RESUBSCRIPTION_DELAY".to_owned(),
-                            "50ms".to_owned(),
-                        ),
-                    ],
+                    env: vec![(
+                        "MBV_ENGINE__ACCOUNTSDB__LRU_CAPACITY".to_owned(),
+                        cell.cap.to_string(),
+                    )],
                     request_timeout: Some(STALL_REQUEST_TIMEOUT),
                     base_endpoints: None,
+                    ..Default::default()
                 },
             )
             .await?;
@@ -205,7 +198,9 @@ impl Scenario<ScenarioReport> for EnsureGateStall {
                 name: cell.name,
                 cap: cell.cap,
                 outcome,
-                ensure_avg_s: delta.histogram_avg(ENSURE_HISTOGRAM),
+                ensure_avg_s: delta
+                    .histogram_avg(ENSURE_HISTOGRAM)
+                    .map(|micros| micros / 1e6),
                 // recorded for context only: the gauge refreshes on the
                 // 60 s subscription reconciler, so short windows read stale
                 monitored_end: delta.gauge(MONITORED_GAUGE).unwrap_or(0.0),

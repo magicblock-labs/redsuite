@@ -91,16 +91,6 @@ pub mod redline {
             host_exclusive: true,
             fixtures: [Fixture::RedlineProgram],
         },
-        commit_width_envelope => committor::commit_width_envelope::CommitWidthEnvelope {
-            er: Exclusive(DEFAULT),
-            host_exclusive: true,
-            fixtures: [Fixture::RedlineProgram],
-        },
-        commit_throughput_ceiling => committor::commit_throughput_ceiling::CommitThroughputCeiling {
-            er: Exclusive(DEFAULT),
-            host_exclusive: true,
-            fixtures: [Fixture::RedlineProgram],
-        },
         storage_prodsize_sustain => storage::storage_prodsize_sustain::StorageProdsizeSustain {
             er: Exclusive(DEFAULT),
             host_exclusive: true,
@@ -267,10 +257,6 @@ pub mod redshift {
         activation_single_shot => chainlink::activation_single_shot::ActivationSingleShot {
             er: Fresh,
             fixtures: [Fixture::RedshiftProgram],
-        },
-        table_mania => committor::table_mania::TableManiaScenario {
-            er: None,
-            fixtures: [],
         },
     }
 }

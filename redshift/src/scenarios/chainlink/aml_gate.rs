@@ -23,6 +23,7 @@ use sdk::spl::{
         SetupAndDelegateShuttleEphemeralAtaWithMergeBuilder,
     },
     find_rent_pda, find_shuttle_ata, find_shuttle_ephemeral_ata,
+    find_shuttle_wallet_ata,
 };
 use signer::Signer;
 
@@ -42,7 +43,7 @@ const RISK_THRESHOLD: u64 = 5;
 
 // Stands in for the risk server the validator queries via
 // GET /risk?pubkey=<addr>, answering the camelCase {"isRisky":bool} shape
-// magicblock-aml deserializes.
+// ChainSync deserializes.
 pub struct MockRiskServer {
     base_url: String,
     shutdown: Arc<AtomicBool>,
@@ -172,20 +173,17 @@ impl PrivateErScenario for AmlGate {
 
     async fn run(&self, base: &BaseCtx) -> Result<()> {
         let server = MockRiskServer::start()?;
-        // No api key or threshold: both belong to the risk server now; loopback
-        // http is the one plaintext scheme magicblock-aml accepts.
+        // Signer verdicts and thresholds belong to the risk server; ChainSync
+        // permits plaintext HTTP only for loopback assessment endpoints.
         let private = topology::private_er(
             base,
             topology::ErOptions {
                 label: "aml-gate".to_owned(),
                 env: vec![
+                    ("MBV_CHAINSYNC__AML__TIMEOUT".to_owned(), "5s".to_owned()),
                     (
-                        "MBV_CHAINLINK__RISK__ENABLED".to_owned(),
-                        "true".to_owned(),
-                    ),
-                    (
-                        "MBV_CHAINLINK__RISK__RISK_SERVER_URL".to_owned(),
-                        server.base_url().to_owned(),
+                        "MBV_CHAINSYNC__AML__ENDPOINT".to_owned(),
+                        format!("{}/risk", server.base_url()),
                     ),
                 ],
                 ..Default::default()
@@ -230,6 +228,8 @@ async fn run_risk_case(
         find_shuttle_ephemeral_ata(&owner_pk, &mint.pubkey(), SHUTTLE_ID);
     let (shuttle_ata, _) =
         find_shuttle_ata(&shuttle_ephemeral_ata, &mint.pubkey());
+    let shuttle_wallet_ata =
+        find_shuttle_wallet_ata(&mint.pubkey(), &shuttle_ephemeral_ata);
 
     // 1. Create mint, source ATA, destination ATA, and mint tokens
     let setup_ixs = vec![
@@ -276,8 +276,14 @@ async fn run_risk_case(
          base — genesis did not supply one for this pool slot"
     )?;
 
-    let _ = er_ctx.account(&source_ata).await;
-    let _ = er_ctx.account(&destination_ata).await;
+    // A streamed eATA delegation projects only onto an ATA already present in Engine.
+    prep::await_clones(
+        er_ctx,
+        &[source_ata, destination_ata],
+        165,
+        READY_TIMEOUT,
+    )
+    .await?;
 
     // 4. Delegate shuttle ATA with post-delegation merge instruction
     let shuttle_ix = SetupAndDelegateShuttleEphemeralAtaWithMergeBuilder {
@@ -301,10 +307,19 @@ async fn run_risk_case(
     )?;
 
     // 5. Wait for the risk server query
-    check::poll(
+    // Drive acquisition through the public RPC; AML checks the attached action,
+    // not the latency or ordering of the independent lifecycle feed.
+    check::poll_for(
         &format!("the risk server receives the shuttle owner {owner_pk} query"),
         QUERY_TIMEOUT,
-        || async { server.query_count(&owner_pk) > 0 },
+        || async {
+            er_ctx.account(&shuttle_wallet_ata).await?;
+            check!(
+                server.query_count(&owner_pk) > 0,
+                "owner not assessed yet"
+            )?;
+            Result::Ok(())
+        },
     )
     .await?;
 

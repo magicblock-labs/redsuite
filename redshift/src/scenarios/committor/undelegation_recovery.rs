@@ -6,7 +6,7 @@ use pubkey::Pubkey;
 use redsuite_core::{
     check, check_eq,
     netfault::{BaseProxies, Selector},
-    prep,
+    prep, system,
     topology::RestartConfig,
     BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
@@ -287,15 +287,53 @@ async fn recover(
         Selector::methods(&[]).ws().notification().account(&account),
         HIDDEN,
     );
-    proxies.close_connections();
+    proxies.close_websocket_connections();
+    // Release handling must acquire a mirror. A fresh canary ensures the
+    // replacement socket is ready before base completes the undelegation.
+    let canary = Keypair::new().pubkey();
+    base.submit_and_confirm(
+        payer,
+        &[system::transfer(&payer.pubkey(), &canary, 1_000_000)],
+    )
+    .await?;
+    check::poll_for(
+        "replacement socket accepts subscriptions",
+        DISCOVERY_TIMEOUT,
+        || async {
+            er.account(&canary)
+                .await?
+                .ok_or("replacement socket not ready")?;
+            Result::Ok(())
+        },
+    )
+    .await?;
     held.release();
     await_ownership_return(base, &account, &crate::program::id(), &snapshot)
         .await?;
 
     match mode {
         Recovery::Reconnect => {
+            // Base confirmation can precede lifecycle delivery. Let the HTTP
+            // reacquisition finish before deliberately losing its new subscription.
+            check::poll_for(
+                "undelegation readonly image acquired",
+                DISCOVERY_TIMEOUT,
+                || async {
+                    let image = er
+                        .account(&account)
+                        .await?
+                        .ok_or("readonly image absent")?;
+                    check_eq!(
+                        image.owner,
+                        crate::program::id(),
+                        "readonly image owner"
+                    )?;
+                    Result::Ok(())
+                },
+            )
+            .await?;
             blind.remove();
-            proxies.close_connections();
+            proxies.close_websocket_connections();
         }
         Recovery::Restart => {
             let timing = er.restart(RestartConfig::default()).await?;

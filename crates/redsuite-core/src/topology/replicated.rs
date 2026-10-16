@@ -333,6 +333,7 @@ pub async fn replicated(
             env: options.leader_env.clone(),
             request_timeout: options.request_timeout,
             base_endpoints: None,
+            ..Default::default()
         },
         identities
             .iter()
