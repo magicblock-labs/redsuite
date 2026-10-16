@@ -478,9 +478,8 @@ impl Scenario for DelegationSessionIsolation {
             base,
             ErOptions {
                 label: LABEL_A.to_owned(),
-                env: Vec::new(),
-                request_timeout: None,
                 base_endpoints: Some(proxies.endpoints()),
+                ..Default::default()
             },
         )
         .await?;

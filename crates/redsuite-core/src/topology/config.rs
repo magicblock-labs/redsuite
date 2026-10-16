@@ -1,12 +1,23 @@
 use std::{
+    fs,
+    net::SocketAddr,
     path::{Path, PathBuf},
+    process::Child,
     process::Command,
     time::Duration,
 };
 
 use keypair::Keypair;
+use magicblock_config::{
+    config::EngineConfig,
+    types::{BindAddress, Remote, SerdePubkey},
+    LeaderParams, VerifierParams,
+};
 use pubkey::Pubkey;
+use serde::Serialize;
+use signer::Signer;
 
+use super::{process, state};
 use crate::{catalog::Fixture, console, manifest, Result};
 
 const LEDGER_SIZE_LIMIT_UNREACHABLE: u64 = 1 << 60;
@@ -347,92 +358,167 @@ impl BasePlan {
     }
 }
 
-// A validated ER launch, shared by the attached ER and every private ER;
-// command() stays pure so restarts rebuild the exact same invocation.
-pub(super) struct ErPlan {
-    pub(super) bin: PathBuf,
-    pub(super) identity: Keypair,
-    pub(super) base_rpc_url: String,
-    pub(super) base_ws_url: String,
-    pub(super) base_grpc_url: Option<String>,
-    pub(super) listen_port: u16,
-    pub(super) metrics_port: u16,
-    // every validator binds a follower listener (default 127.0.0.1:10000);
-    pub(super) replication_port: u16,
-    pub(super) storage_dir: PathBuf,
-    pub(super) accountsdb_dir: PathBuf,
-    pub(super) env: Vec<(String, String)>,
-    // reset=true wipes only the ledger (rocksdb) and skips replay; it
-    // preserves the accountsdb. A restart-in-place relaunch passes false so
-    // the ER reopens the on-disk ledger + accountsdb it already has.
-    pub(super) reset: bool,
-    // follower identities the replication listener admits; empty denies all
-    pub(super) allowed_followers: Vec<Pubkey>,
+pub type Settings = Box<dyn FnOnce(&mut LeaderParams)>;
+
+fn local(port: u16) -> BindAddress {
+    BindAddress(SocketAddr::from(([127, 0, 0, 1], port)))
 }
 
-impl ErPlan {
+pub(super) fn config_path(dir: &Path, label: &str) -> PathBuf {
+    dir.join(format!("er-{label}.toml"))
+}
+
+pub(super) struct ErPorts {
+    pub(super) rpc: u16,
+    pub(super) metrics: u16,
+    pub(super) replication: u16,
+}
+
+pub(super) fn leader_params(
+    identity: Keypair,
+    endpoints: &BaseEndpoints,
+    ports: ErPorts,
+    storage_dir: PathBuf,
+    allowed_followers: Vec<Pubkey>,
+    settings: Settings,
+) -> Result<LeaderParams> {
+    let mut params = LeaderParams {
+        remotes: vec![
+            Remote::Http(endpoints.rpc_url.parse()?),
+            Remote::Websocket(endpoints.ws_url.parse()?, None),
+        ],
+        ..LeaderParams::default()
+    };
+    if let Some(grpc_url) = &endpoints.grpc_url {
+        params
+            .remotes
+            .push(Remote::Grpc(with_api_key(grpc_url).parse()?));
+    }
+    params.aperture.listen = local(ports.rpc);
+    params.metrics.address = local(ports.metrics);
+    params.engine.authority = identity.into();
+    // engine.accountsdb.directory defaults to a compile-time constant
+    // path, not to the configured engine.ledger.directory — overriding
+    // only the ledger directory leaves the accountsdb at the global
+    // default. Set both, mirroring the engine's default
+    // <ledger dir>/accountsdb layout under this ER's storage dir.
+    params.engine.accountsdb.directory = state::accountsdb_dir(&storage_dir);
+    params.engine.ledger.directory = storage_dir;
+    params.engine.ledger.size_limit = LEDGER_SIZE_LIMIT_UNREACHABLE;
+    params.engine.replication.bind_address = local(ports.replication);
+    params.engine.replication.allowed_followers =
+        allowed_followers.into_iter().map(SerdePubkey).collect();
+    params.ledger.reset = true;
+    settings(&mut params);
+    Ok(params)
+}
+
+// Block timing must match between a leader and its followers.
+pub(super) fn verifier_params(
+    leader: &LeaderParams,
+    identity: Keypair,
+    metrics_port: u16,
+    storage_dir: PathBuf,
+) -> VerifierParams {
+    let mut params = VerifierParams {
+        metrics: Default::default(),
+        engine: EngineConfig::default(),
+        programs: Vec::new(),
+    };
+    params.metrics.address = local(metrics_port);
+    params.engine.authority = identity.into();
+    params.engine.accountsdb.directory = state::accountsdb_dir(&storage_dir);
+    params.engine.ledger.directory = storage_dir;
+    params.engine.blockstore = leader.engine.blockstore;
+    params.engine.replication.upstream_address =
+        *leader.engine.replication.bind_address;
+    params.engine.replication.upstream_authority =
+        SerdePubkey(leader.engine.authority.local.pubkey());
+    params
+}
+
+// A validated launch, shared by the attached ER and every private ER;
+// command() stays pure so restarts rebuild the exact same invocation.
+pub(super) struct Plan<P> {
+    pub(super) bin: PathBuf,
+    pub(super) config_path: PathBuf,
+    pub(super) params: P,
+}
+
+pub(super) type ErPlan = Plan<LeaderParams>;
+pub(super) type VerifierPlan = Plan<VerifierParams>;
+
+impl<P: Serialize> Plan<P> {
     pub(super) fn command(&self) -> Command {
         let mut cmd = Command::new(&self.bin);
-        match &self.base_grpc_url {
-            Some(grpc_url) => {
-                cmd.env(
-                    "MBV_REMOTES",
-                    toml_string_array(&[
-                        self.base_rpc_url.as_str(),
-                        self.base_ws_url.as_str(),
-                        &with_api_key(grpc_url),
-                    ]),
-                );
+        cmd.arg(&self.config_path);
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("MBV_") {
+                cmd.env_remove(&key);
             }
-            None => {
-                cmd.arg("--remotes")
-                    .arg(&self.base_rpc_url)
-                    .arg("--remotes")
-                    .arg(&self.base_ws_url);
-            }
-        }
-        cmd.arg("-l").arg(format!("127.0.0.1:{}", self.listen_port));
-        cmd.env(
-            "MBV_ENGINE__AUTHORITY__LOCAL",
-            self.identity.to_base58_string(), // throwaway test identity
-        );
-        cmd.env("MBV_ENGINE__LEDGER__DIRECTORY", &self.storage_dir);
-        cmd.env(
-            "MBV_ENGINE__LEDGER__SIZE_LIMIT",
-            LEDGER_SIZE_LIMIT_UNREACHABLE.to_string(),
-        );
-        // engine.accountsdb.directory defaults to a compile-time constant
-        // path, not to the configured engine.ledger.directory — overriding
-        // only the ledger directory leaves the accountsdb at the global
-        // default. Set both, mirroring the engine's default
-        // <ledger dir>/accountsdb layout under this ER's storage dir.
-        cmd.env("MBV_ENGINE__ACCOUNTSDB__DIRECTORY", &self.accountsdb_dir);
-        cmd.env(
-            "MBV_ENGINE__REPLICATION__BIND_ADDRESS",
-            format!("127.0.0.1:{}", self.replication_port),
-        );
-        cmd.env("MBV_LEDGER__RESET", self.reset.to_string());
-        cmd.env(
-            "MBV_METRICS__ADDRESS",
-            format!("127.0.0.1:{}", self.metrics_port),
-        );
-        if !self.allowed_followers.is_empty() {
-            cmd.env(
-                "MBV_ENGINE__REPLICATION__ALLOWED_FOLLOWERS",
-                toml_string_array(&self.allowed_followers),
-            );
-        }
-        for (key, value) in &self.env {
-            cmd.env(key, value);
         }
         if std::env::var_os("RUST_LOG").is_none() {
             cmd.env("RUST_LOG", "info");
         }
         cmd
     }
+
+    pub(super) fn spawn(&self, log: &Path) -> Result<Child> {
+        if let Some(dir) = self.config_path.parent() {
+            fs::create_dir_all(dir)?;
+        }
+        fs::write(&self.config_path, toml::to_string(&self.params)?)?;
+        process::spawn_child(self.command(), log)
+    }
 }
 
-pub(super) const GRPC_API_KEY: &str = "redsuite";
+impl ErPlan {
+    pub(super) fn listen(&self) -> BindAddress {
+        self.params.aperture.listen
+    }
+
+    pub(super) fn metrics_port(&self) -> u16 {
+        self.params.metrics.address.port()
+    }
+
+    pub(super) fn replication_port(&self) -> u16 {
+        self.params.engine.replication.bind_address.port()
+    }
+
+    pub(super) fn storage_dir(&self) -> &Path {
+        &self.params.engine.ledger.directory
+    }
+
+    pub(super) fn allowed_followers(&self) -> Vec<Pubkey> {
+        self.params
+            .engine
+            .replication
+            .allowed_followers
+            .iter()
+            .map(|follower| follower.0)
+            .collect()
+    }
+}
+
+impl VerifierPlan {
+    pub(super) fn identity(&self) -> Pubkey {
+        self.params.engine.authority.local.pubkey()
+    }
+
+    pub(super) fn metrics_port(&self) -> u16 {
+        self.params.metrics.address.port()
+    }
+
+    pub(super) fn storage_dir(&self) -> &Path {
+        &self.params.engine.ledger.directory
+    }
+
+    pub(super) fn upstream_address(&self) -> SocketAddr {
+        self.params.engine.replication.upstream_address
+    }
+}
+
+const GRPC_API_KEY: &str = "redsuite";
 
 fn with_api_key(grpc_url: &str) -> String {
     if grpc_url.contains('?') {
@@ -442,103 +528,22 @@ fn with_api_key(grpc_url: &str) -> String {
     }
 }
 
-fn toml_string_array<T: std::fmt::Display>(values: &[T]) -> String {
-    let quoted: Vec<String> =
-        values.iter().map(|value| format!("\"{value}\"")).collect();
-    format!("[{}]", quoted.join(", "))
-}
-
-pub(super) const VERIFIER_CONFIG_FILE: &str = "verifier.toml";
-const VERIFIER_ENV_PREFIX: &str = "MBV_VERIFIER_";
-const MIRRORED_LEADER_ENV_PREFIX: &str = "MBV_ENGINE__BLOCKSTORE__";
-
-// A validated verifier launch: the bare replicated engine reads one TOML
-// (identity, storage, upstream) plus MBV_VERIFIER_ overrides; command()
-// stays pure so a relaunch reuses the exact invocation.
-pub(super) struct VerifierPlan {
-    pub(super) bin: PathBuf,
-    pub(super) identity: Keypair,
-    pub(super) upstream_port: u16,
-    pub(super) upstream_authority: Pubkey,
-    pub(super) metrics_port: u16,
-    pub(super) storage_dir: PathBuf,
-    pub(super) accountsdb_dir: PathBuf,
-    pub(super) env: Vec<(String, String)>,
-}
-
-impl VerifierPlan {
-    pub(super) fn config_path(&self) -> PathBuf {
-        self.storage_dir.join(VERIFIER_CONFIG_FILE)
-    }
-
-    pub(super) fn upstream_address(&self) -> String {
-        format!("127.0.0.1:{}", self.upstream_port)
-    }
-
-    pub(super) fn config_toml(&self) -> String {
-        format!(
-            "[metrics]\naddress = \"127.0.0.1:{metrics}\"\n\n\
-             [engine.authority]\nlocal = \"{identity}\"\n\n\
-             [engine.accountsdb]\ndirectory = \"{accountsdb}\"\n\n\
-             [engine.ledger]\ndirectory = \"{ledger}\"\n\n\
-             [engine.replication]\nupstream-address = \"{upstream}\"\n\
-             upstream-authority = \"{authority}\"\n",
-            metrics = self.metrics_port,
-            identity = self.identity.to_base58_string(),
-            accountsdb = self.accountsdb_dir.display(),
-            ledger = self.storage_dir.display(),
-            upstream = self.upstream_address(),
-            authority = self.upstream_authority,
-        )
-    }
-
-    pub(super) fn write_config(&self) -> Result<PathBuf> {
-        let path = self.config_path();
-        std::fs::create_dir_all(&self.storage_dir)?;
-        std::fs::write(&path, self.config_toml())?;
-        Ok(path)
-    }
-
-    pub(super) fn command(&self) -> Command {
-        let mut cmd = Command::new(&self.bin);
-        cmd.arg(self.config_path());
-        for (key, value) in &self.env {
-            cmd.env(key, value);
-        }
-        if std::env::var_os("RUST_LOG").is_none() {
-            cmd.env("RUST_LOG", "info");
-        }
-        cmd
-    }
-}
-
-// Block timing must match between a leader and its followers, so the
-// leader's blockstore overrides are mirrored into the verifier's env tree.
-pub(super) fn mirrored_verifier_env(
-    leader_env: &[(String, String)],
-) -> Vec<(String, String)> {
-    leader_env
-        .iter()
-        .filter(|(key, _)| key.starts_with(MIRRORED_LEADER_ENV_PREFIX))
-        .map(|(key, value)| {
-            (
-                format!(
-                    "{VERIFIER_ENV_PREFIX}{}",
-                    key.trim_start_matches("MBV_")
-                ),
-                value.clone(),
-            )
-        })
-        .collect()
-}
-
-#[derive(Default)]
 pub struct ErOptions {
     pub label: String,
-    // e.g. ("MBV_ENGINE__ACCOUNTSDB__LRU_CAPACITY", "100")
-    pub env: Vec<(String, String)>,
+    pub settings: Settings,
     pub request_timeout: Option<Duration>,
     pub base_endpoints: Option<BaseEndpoints>,
+}
+
+impl Default for ErOptions {
+    fn default() -> Self {
+        Self {
+            label: String::new(),
+            settings: Box::new(|_| {}),
+            request_timeout: None,
+            base_endpoints: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

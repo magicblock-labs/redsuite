@@ -102,9 +102,8 @@ async fn burst_cell(
         base,
         topology::ErOptions {
             label: label.to_owned(),
-            env: Vec::new(),
             request_timeout: Some(REQUEST_TIMEOUT),
-            base_endpoints: None,
+            ..Default::default()
         },
     )
     .await?;
@@ -203,9 +202,8 @@ impl Scenario<ScenarioReport> for ColdHydrationTail {
             base,
             topology::ErOptions {
                 label: "s7-touch".to_owned(),
-                env: Vec::new(),
                 request_timeout: Some(REQUEST_TIMEOUT),
-                base_endpoints: None,
+                ..Default::default()
             },
         )
         .await?;

@@ -15,6 +15,7 @@ use signer::Signer;
 use transaction::Transaction;
 
 const ROUNDS: usize = 3;
+const BLOCKTIME: Duration = Duration::from_millis(50);
 const SUPERBLOCK_SLOTS: u64 = 40;
 const TIMEOUT: Duration = Duration::from_secs(30);
 const CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -208,16 +209,10 @@ impl PrivateErScenario for CheckpointDurability {
             base,
             ErOptions {
                 label: "checkpoint-durability".to_owned(),
-                env: vec![
-                    (
-                        "MBV_ENGINE__BLOCKSTORE__BLOCKTIME".to_owned(),
-                        "50ms".to_owned(),
-                    ),
-                    (
-                        "MBV_ENGINE__BLOCKSTORE__SUPERBLOCK".to_owned(),
-                        SUPERBLOCK_SLOTS.to_string(),
-                    ),
-                ],
+                settings: Box::new(|params| {
+                    params.engine.blockstore.blocktime = BLOCKTIME;
+                    params.engine.blockstore.superblock = SUPERBLOCK_SLOTS;
+                }),
                 ..Default::default()
             },
         )

@@ -157,12 +157,10 @@ impl PrivateErScenario for SnapshotReadRace {
             base,
             ErOptions {
                 label: LABEL.to_owned(),
-                env: vec![(
-                    "MBV_ENGINE__BLOCKSTORE__SUPERBLOCK".to_owned(),
-                    SUPERBLOCK_SLOTS.to_string(),
-                )],
-                request_timeout: None,
-                base_endpoints: None,
+                settings: Box::new(|params| {
+                    params.engine.blockstore.superblock = SUPERBLOCK_SLOTS;
+                }),
+                ..Default::default()
             },
         )
         .await?;

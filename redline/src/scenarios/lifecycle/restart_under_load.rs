@@ -32,6 +32,7 @@ const RESOLVE_POLL: Duration = Duration::from_millis(200);
 const SUPERBLOCK_POLL: Duration = Duration::from_millis(250);
 const LANE_BACKOFF: Duration = Duration::from_millis(100);
 const BLOCKTIME_MS: u64 = 50;
+const BLOCKTIME: Duration = Duration::from_millis(BLOCKTIME_MS);
 const SUPERBLOCK_SLOTS: u64 = 100;
 const HASH_ITERS: u32 = 1;
 const PROGRAM: Pubkey = crate::program::ID;
@@ -518,18 +519,11 @@ async fn run_mode(
         base,
         topology::ErOptions {
             label: format!("restart-{label}"),
-            env: vec![
-                (
-                    "MBV_ENGINE__BLOCKSTORE__BLOCKTIME".to_owned(),
-                    format!("{BLOCKTIME_MS}ms"),
-                ),
-                (
-                    "MBV_ENGINE__BLOCKSTORE__SUPERBLOCK".to_owned(),
-                    SUPERBLOCK_SLOTS.to_string(),
-                ),
-            ],
-            request_timeout: None,
-            base_endpoints: None,
+            settings: Box::new(|params| {
+                params.engine.blockstore.blocktime = BLOCKTIME;
+                params.engine.blockstore.superblock = SUPERBLOCK_SLOTS;
+            }),
+            ..Default::default()
         },
     )
     .await?;

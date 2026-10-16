@@ -1,5 +1,6 @@
 use std::{future::Future, pin::Pin};
 
+use magicblock_config::LeaderParams;
 use pubkey::Pubkey;
 
 use crate::{
@@ -24,28 +25,25 @@ impl Family {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct ErGroup {
     pub label: &'static str,
-    pub env: &'static [(&'static str, &'static str)],
+    pub settings: fn(&mut LeaderParams),
     pub proxied: bool,
 }
 
 impl ErGroup {
     pub fn options(&self) -> ErOptions {
+        let settings = self.settings;
         ErOptions {
             label: self.label.to_owned(),
-            env: self
-                .env
-                .iter()
-                .map(|(key, value)| (key.to_string(), value.to_string()))
-                .collect(),
+            settings: Box::new(settings),
             ..ErOptions::default()
         }
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub enum Er {
     Shared(&'static ErGroup),
     Exclusive(&'static ErGroup),

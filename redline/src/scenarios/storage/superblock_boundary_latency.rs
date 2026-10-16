@@ -24,6 +24,7 @@ const LEDGER_FILL_TIMEOUT: Duration = Duration::from_secs(30);
 const NOTIFICATION_POLL: Duration = Duration::from_millis(200);
 const HEALTH_SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
 const BLOCKTIME_MS: u64 = 50;
+const BLOCKTIME: Duration = Duration::from_millis(BLOCKTIME_MS);
 
 const LEDGER_TRANSACTIONS: &str = "engine_ledger_transactions";
 const SUPERBLOCKS: &str = "engine_ledger_superblocks";
@@ -185,18 +186,12 @@ impl PrivateErScenario<ScenarioReport> for SuperblockBoundaryLatency {
             base,
             topology::ErOptions {
                 label: "superblock-boundary".to_owned(),
-                env: vec![
-                    (
-                        "MBV_ENGINE__BLOCKSTORE__BLOCKTIME".to_owned(),
-                        format!("{BLOCKTIME_MS}ms"),
-                    ),
-                    (
-                        "MBV_ENGINE__BLOCKSTORE__SUPERBLOCK".to_owned(),
-                        profile.superblock_slots.to_string(),
-                    ),
-                ],
-                request_timeout: None,
-                base_endpoints: None,
+                settings: Box::new(move |params| {
+                    params.engine.blockstore.blocktime = BLOCKTIME;
+                    params.engine.blockstore.superblock =
+                        profile.superblock_slots;
+                }),
+                ..Default::default()
             },
         )
         .await?;

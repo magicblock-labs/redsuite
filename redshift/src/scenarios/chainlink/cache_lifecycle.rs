@@ -16,6 +16,7 @@ use signer::Signer;
 
 use crate::program::{self, instruction::build, layout::*, utils::fold_hash};
 
+const LRU_CAPACITY: usize = 256;
 const TIMEOUT: Duration = Duration::from_secs(20);
 const EVICTIONS: &str = "engine_keeper_account_cache_evictions";
 const RECOVERY_OBSERVATION: Duration = Duration::from_secs(100);
@@ -85,10 +86,9 @@ impl PrivateErScenario for CacheLifecycle {
             base,
             ErOptions {
                 label: label.into(),
-                env: vec![(
-                    "MBV_ENGINE__ACCOUNTSDB__LRU_CAPACITY".into(),
-                    "256".into(),
-                )],
+                settings: Box::new(|params| {
+                    params.engine.accountsdb.lru_capacity = LRU_CAPACITY;
+                }),
                 request_timeout: Some(TIMEOUT),
                 base_endpoints: Some(endpoints),
             },

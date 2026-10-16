@@ -21,6 +21,7 @@ const TX_PROCESSING_HISTOGRAM: &str = "mbv_transaction_processing_time";
 const LEDGER_TRANSACTIONS_GAUGE: &str = "engine_ledger_transactions";
 const LEDGER_FILL_TIMEOUT: Duration = Duration::from_secs(5);
 
+const BLOCKTIME: Duration = Duration::from_millis(50);
 const PROD_SUPERBLOCK_SLOTS: u64 = 72_000;
 
 struct Profile {
@@ -141,18 +142,11 @@ impl Scenario<ScenarioReport> for StorageProdsizeSustain {
                 base,
                 topology::ErOptions {
                     label: format!("s11-{cell_name}"),
-                    env: vec![
-                        (
-                            "MBV_ENGINE__BLOCKSTORE__BLOCKTIME".to_owned(),
-                            "50ms".to_owned(),
-                        ),
-                        (
-                            "MBV_ENGINE__BLOCKSTORE__SUPERBLOCK".to_owned(),
-                            superblock_slots.to_string(),
-                        ),
-                    ],
-                    request_timeout: None,
-                    base_endpoints: None,
+                    settings: Box::new(move |params| {
+                        params.engine.blockstore.blocktime = BLOCKTIME;
+                        params.engine.blockstore.superblock = superblock_slots;
+                    }),
+                    ..Default::default()
                 },
             )
             .await?;

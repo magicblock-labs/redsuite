@@ -407,10 +407,9 @@ impl PrivateErScenario for RpcCompatMethods {
             base,
             ErOptions {
                 label: "rpc-compat-methods".into(),
-                env: vec![(
-                    "MBV_ENGINE__BLOCKSTORE__SUPERBLOCK".into(),
-                    SUPERBLOCK_SLOTS.to_string(),
-                )],
+                settings: Box::new(|params| {
+                    params.engine.blockstore.superblock = SUPERBLOCK_SLOTS;
+                }),
                 ..ErOptions::default()
             },
         )

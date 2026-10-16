@@ -178,16 +178,13 @@ impl PrivateErScenario for AmlGate {
             base,
             topology::ErOptions {
                 label: "aml-gate".to_owned(),
-                env: vec![
-                    (
-                        "MBV_CHAINLINK__RISK__ENABLED".to_owned(),
-                        "true".to_owned(),
-                    ),
-                    (
-                        "MBV_CHAINLINK__RISK__RISK_SERVER_URL".to_owned(),
-                        server.base_url().to_owned(),
-                    ),
-                ],
+                settings: Box::new({
+                    let url = server.base_url().to_owned();
+                    move |params| {
+                        params.chainlink.risk.enabled = true;
+                        params.chainlink.risk.risk_server_url = url;
+                    }
+                }),
                 ..Default::default()
             },
         )

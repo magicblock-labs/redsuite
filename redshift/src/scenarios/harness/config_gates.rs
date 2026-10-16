@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
+use magicblock_config::config::AllowedProgram;
 use pubkey::Pubkey;
 use redshift_interface::flexi::{build, FlexiCounter};
 use redsuite_core::{
@@ -22,18 +23,6 @@ pub struct ConfigGates;
 
 fn committor_id() -> Pubkey {
     topology::COMMITTOR_ID.parse().expect("committor id")
-}
-
-// The config's AllowedProgram id deserializes as a 32-byte array, not as a
-// base58 string.
-fn allowed_programs_env(program: &Pubkey) -> String {
-    let bytes = program
-        .as_ref()
-        .iter()
-        .map(|byte| byte.to_string())
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("[{{id=[{bytes}]}}]")
 }
 
 async fn identity_signatures(
@@ -126,12 +115,11 @@ impl PrivateErScenario for ConfigGates {
             base,
             topology::ErOptions {
                 label: RESTRICTED_ER_LABEL.to_owned(),
-                env: vec![(
-                    "MBV_CHAINLINK__ALLOWED_PROGRAMS".to_owned(),
-                    allowed_programs_env(&allowed),
-                )],
-                request_timeout: None,
-                base_endpoints: None,
+                settings: Box::new(move |params| {
+                    params.chainlink.allowed_programs =
+                        Some(vec![AllowedProgram { id: allowed }]);
+                }),
+                ..Default::default()
             },
         )
         .await?;
@@ -152,9 +140,7 @@ impl PrivateErScenario for ConfigGates {
             base,
             topology::ErOptions {
                 label: OPEN_ER_LABEL.to_owned(),
-                env: vec![],
-                request_timeout: None,
-                base_endpoints: None,
+                ..Default::default()
             },
         )
         .await?;
