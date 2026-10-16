@@ -131,10 +131,9 @@ pub(super) fn kill_matching(procs: &[(u32, &str)]) {
     }
 }
 
-// Every process the topology layer spawns names the stack directory: the
-// base and verifiers on their command line, ERs in their MBV_ storage env.
-// Only the topology binaries qualify, so a shell or editor that merely
-// mentions the directory is never touched.
+// Every process the topology layer spawns names the stack directory on its
+// command line. Only the topology binaries qualify, so a shell or editor
+// that merely mentions the directory is never touched.
 pub(super) const TOPOLOGY_BINS: [&str; 3] = [
     "solana-test-validator",
     "magicblock-validator",
@@ -175,15 +174,7 @@ pub(super) fn orphaned_topology_processes(
             continue;
         }
         let cmdline = argv.join(" ");
-        let environ = fs::read(format!("/proc/{pid}/environ"))
-            .map(|raw| String::from_utf8_lossy(&raw).into_owned())
-            .unwrap_or_default();
-        let owned = cmdline.contains(&marker)
-            || environ.split('\0').any(|pair| {
-                pair.starts_with("MBV_ENGINE__LEDGER__DIRECTORY=")
-                    && pair.contains(&marker)
-            });
-        if owned && proc_running(pid) {
+        if cmdline.contains(&marker) && proc_running(pid) {
             found.push((pid, cmdline));
         }
     }
@@ -218,20 +209,12 @@ pub(super) fn orphaned_topology_processes(
         let Some(cmdline) = cmdline(pid) else {
             continue;
         };
-        if owned_by_stack(pid, &cmdline, &marker) && proc_running(pid) {
+        if cmdline.contains(&marker) && proc_running(pid) {
             found.push((pid, cmdline));
         }
     }
     found.sort_unstable();
     found
-}
-
-#[cfg(target_os = "macos")]
-fn owned_by_stack(pid: u32, cmdline: &str, marker: &str) -> bool {
-    cmdline.contains(marker)
-        || environment(pid).is_some_and(|environ| {
-            environ.contains(&format!("MBV_ENGINE__LEDGER__DIRECTORY={marker}"))
-        })
 }
 
 #[cfg(target_os = "macos")]
@@ -241,18 +224,6 @@ fn runs_topology_bin(cmdline: &str) -> bool {
             TOPOLOGY_BINS.contains(&name.to_string_lossy().as_ref())
         })
     })
-}
-
-#[cfg(target_os = "macos")]
-fn environment(pid: u32) -> Option<String> {
-    let output = Command::new("ps")
-        .args(["-ww", "-E", "-o", "command=", "-p", &pid.to_string()])
-        .output()
-        .ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 #[cfg(target_os = "linux")]

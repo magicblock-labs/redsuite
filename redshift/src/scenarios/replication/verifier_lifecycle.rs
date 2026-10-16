@@ -583,16 +583,11 @@ impl PrivateErScenario for VerifierLifecycle {
                 ReplicatedOptions {
                     label: LABEL.to_owned(),
                     verifiers: VERIFIERS,
-                    leader_env: vec![
-                        (
-                            "MBV_ENGINE__BLOCKSTORE__SUPERBLOCK".to_owned(),
-                            SUPERBLOCK_SLOTS.to_string(),
-                        ),
-                        (
-                            "MBV_ENGINE__LEDGER__SIZE_LIMIT".to_owned(),
-                            LEDGER_SIZE_LIMIT_BYTES.to_string(),
-                        ),
-                    ],
+                    settings: Box::new(|params| {
+                        params.engine.blockstore.superblock = SUPERBLOCK_SLOTS;
+                        params.engine.ledger.size_limit =
+                            LEDGER_SIZE_LIMIT_BYTES;
+                    }),
                     ..ReplicatedOptions::default()
                 },
             ),

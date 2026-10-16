@@ -97,9 +97,7 @@ impl Scenario<ScenarioReport> for WsConnCapacity {
             base,
             topology::ErOptions {
                 label: "s3".to_owned(),
-                env: Vec::new(),
-                request_timeout: None,
-                base_endpoints: None,
+                ..Default::default()
             },
         )
         .await?;

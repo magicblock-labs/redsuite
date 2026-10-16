@@ -9,7 +9,7 @@ use signer::Signer;
 
 use super::{
     config,
-    config::{ErOptions, VerifierPlan},
+    config::{ErOptions, Settings, VerifierPlan},
     private::{leader_er, PrivateEr},
     process, state,
 };
@@ -28,13 +28,22 @@ pub const SERVER_CONNECTIONS: &str = "engine_replicator_server_connections";
 const VERIFIER_READY_TIMEOUT: Duration = Duration::from_secs(60);
 const CONNECT_POLL: Duration = Duration::from_millis(100);
 
-#[derive(Default)]
 pub struct ReplicatedOptions {
     pub label: String,
     pub verifiers: usize,
-    pub leader_env: Vec<(String, String)>,
-    pub verifier_env: Vec<(String, String)>,
+    pub settings: Settings,
     pub request_timeout: Option<Duration>,
+}
+
+impl Default for ReplicatedOptions {
+    fn default() -> Self {
+        Self {
+            label: String::new(),
+            verifiers: 0,
+            settings: Box::new(|_| {}),
+            request_timeout: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -76,23 +85,23 @@ impl Verifier {
     }
 
     pub fn identity(&self) -> Pubkey {
-        self.plan.identity.pubkey()
+        self.plan.identity()
     }
 
     pub fn metrics_port(&self) -> u16 {
-        self.plan.metrics_port
+        self.plan.metrics_port()
     }
 
     pub fn upstream_address(&self) -> String {
-        self.plan.upstream_address()
+        self.plan.upstream_address().to_string()
     }
 
     pub fn storage_dir(&self) -> &Path {
-        &self.plan.storage_dir
+        self.plan.storage_dir()
     }
 
-    pub fn config_path(&self) -> PathBuf {
-        self.plan.config_path()
+    pub fn config_path(&self) -> &Path {
+        &self.plan.config_path
     }
 
     pub fn log(&self) -> &Path {
@@ -174,13 +183,11 @@ impl Verifier {
             )
             .into());
         }
-        self.remove_storage()?;
-        self.plan.write_config()?;
-        Ok(())
+        self.remove_storage()
     }
 
     fn remove_storage(&self) -> Result<()> {
-        state::remove_storage(&self.plan.storage_dir).map_err(|error| {
+        state::remove_storage(self.plan.storage_dir()).map_err(|error| {
             format!(
                 "removing the storage of verifier `{}`: {error}",
                 self.proc.label()
@@ -199,8 +206,7 @@ impl Verifier {
             .into());
         }
         let started = Instant::now();
-        self.proc
-            .relaunch(process::spawn_child(self.plan.command(), &self.log))?;
+        self.proc.relaunch(self.plan.spawn(&self.log))?;
         self.proc.audit(self.wait_ready(ready_timeout).await)?;
         Ok(started.elapsed())
     }
@@ -330,9 +336,9 @@ pub async fn replicated(
         base,
         ErOptions {
             label: options.label.clone(),
-            env: options.leader_env.clone(),
+            settings: options.settings,
             request_timeout: options.request_timeout,
-            base_endpoints: None,
+            ..ErOptions::default()
         },
         identities
             .iter()
@@ -342,8 +348,6 @@ pub async fn replicated(
     .await?;
 
     let dir = state::stack_dir();
-    let mut verifier_env = config::mirrored_verifier_env(&options.leader_env);
-    verifier_env.extend(options.verifier_env.iter().cloned());
     let (bin_version, bin_fingerprint) =
         report::binary_provenance(&verifier_bin);
 
@@ -352,20 +356,18 @@ pub async fn replicated(
         let label = format!("{}-verifier{index}", options.label);
         let storage_dir = dir.join(format!("er-{label}"));
         state::remove_storage(&storage_dir)?;
-        let accountsdb_dir = state::accountsdb_dir(&storage_dir);
         let mut ports = process::PortLease::default();
         let metrics_port = ports.single()?;
         let plan = VerifierPlan {
             bin: verifier_bin.clone(),
-            identity,
-            upstream_port: leader.replication_port(),
-            upstream_authority: leader.identity(),
-            metrics_port,
-            storage_dir,
-            accountsdb_dir,
-            env: verifier_env.clone(),
+            config_path: config::config_path(&dir, &label),
+            params: config::verifier_params(
+                leader.params(),
+                identity,
+                metrics_port,
+                storage_dir,
+            ),
         };
-        let config_path = plan.write_config()?;
         let log = dir.join(format!("er-{label}.log"));
         console::debug(format_args!(
             "booting verifier `{label}` (metrics 127.0.0.1:{metrics_port}) \
@@ -373,7 +375,7 @@ pub async fn replicated(
             plan.upstream_address()
         ));
         ports.release();
-        let child = process::spawn_child(plan.command(), &log)?;
+        let child = plan.spawn(&log)?;
         let pid = child.id();
         let record = base.resources().register_launch(LaunchRecord {
             label: label.clone(),
@@ -381,14 +383,14 @@ pub async fn replicated(
             bin: plan.bin.display().to_string(),
             bin_version: bin_version.clone(),
             bin_fingerprint: bin_fingerprint.clone(),
-            identity: plan.identity.pubkey().to_string(),
+            identity: plan.identity().to_string(),
             metrics_port,
-            upstream: Some(plan.upstream_address()),
-            storage_dir: plan.storage_dir.display().to_string(),
-            accountsdb_dir: state::split_accountsdb_dir(&plan.storage_dir)
+            upstream: Some(plan.upstream_address().to_string()),
+            storage_dir: plan.storage_dir().display().to_string(),
+            accountsdb_dir: state::split_accountsdb_dir(plan.storage_dir())
                 .map(|dir| dir.display().to_string()),
             log: log.display().to_string(),
-            config: Some(config_path.display().to_string()),
+            config: Some(plan.config_path.display().to_string()),
             pid,
             ..LaunchRecord::default()
         });

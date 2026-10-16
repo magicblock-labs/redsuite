@@ -260,18 +260,11 @@ impl PrivateErScenario for LedgerRetention {
             base,
             ErOptions {
                 label: LABEL.to_owned(),
-                env: vec![
-                    (
-                        "MBV_ENGINE__BLOCKSTORE__SUPERBLOCK".to_owned(),
-                        SUPERBLOCK_SLOTS.to_string(),
-                    ),
-                    (
-                        "MBV_ENGINE__LEDGER__SIZE_LIMIT".to_owned(),
-                        LEDGER_SIZE_LIMIT_BYTES.to_string(),
-                    ),
-                ],
-                request_timeout: None,
-                base_endpoints: None,
+                settings: Box::new(|params| {
+                    params.engine.blockstore.superblock = SUPERBLOCK_SLOTS;
+                    params.engine.ledger.size_limit = LEDGER_SIZE_LIMIT_BYTES;
+                }),
+                ..Default::default()
             },
         )
         .await?;

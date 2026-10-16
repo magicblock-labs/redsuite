@@ -41,6 +41,8 @@ async-trait = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
 serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+magicblock-config = { git = "https://github.com/magicblock-labs/magicblock-validator.git", rev = "fb23ace883d65b5c1c99a9e5b651248b2b35ac06" }
 json = { package = "sonic-rs", version = "0.5" }
 rand = "0.8"
 base64 = "0.22"

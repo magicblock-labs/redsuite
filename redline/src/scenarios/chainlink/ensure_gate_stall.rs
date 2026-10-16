@@ -23,6 +23,7 @@ const PAYER_LAMPORTS: u64 = 2_000_000_000;
 
 const PREP_PAYER_LAMPORTS: u64 = 4_000_000_000;
 
+const RESUBSCRIBE: Duration = Duration::from_millis(50);
 const STALL_REQUEST_TIMEOUT: Duration = Duration::from_secs(75);
 const CLONE_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -150,20 +151,14 @@ impl Scenario<ScenarioReport> for EnsureGateStall {
                 base,
                 topology::ErOptions {
                     label: format!("s6-{}", cell.name),
-                    env: vec![
-                        (
-                            "MBV_ENGINE__ACCOUNTSDB__LRU_CAPACITY".to_owned(),
-                            cell.cap.to_string(),
-                        ),
+                    settings: Box::new(move |params| {
+                        params.engine.accountsdb.lru_capacity = cell.cap;
                         // campaign parity: fast resubscription keeps the
                         // churn cadence high
-                        (
-                            "MBV_CHAINLINK__RESUBSCRIPTION_DELAY".to_owned(),
-                            "50ms".to_owned(),
-                        ),
-                    ],
+                        params.chainlink.resubscription_delay = RESUBSCRIBE;
+                    }),
                     request_timeout: Some(STALL_REQUEST_TIMEOUT),
-                    base_endpoints: None,
+                    ..Default::default()
                 },
             )
             .await?;

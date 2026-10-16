@@ -470,9 +470,8 @@ impl PrivateErScenario for CommitSettlementOrder {
             base,
             ErOptions {
                 label: LABEL.to_owned(),
-                env: Vec::new(),
-                request_timeout: None,
                 base_endpoints: Some(proxies.endpoints()),
+                ..Default::default()
             },
         )
         .await?;

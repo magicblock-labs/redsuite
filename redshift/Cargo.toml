@@ -11,6 +11,7 @@ borsh = { workspace = true }
 tokio = { workspace = true }
 futures-util = { workspace = true }
 serde = { workspace = true }
+magicblock-config = { workspace = true }
 redsuite-core = { workspace = true }
 redline-interface = { workspace = true }
 redshift-interface = { workspace = true }
