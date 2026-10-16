@@ -9,6 +9,7 @@ use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::redline::Accounts;
 use redsuite_core::report::Unit;
+use redsuite_core::runner::{SendTransaction, REQUEST_ORIGIN};
 use redsuite_core::{
     check_eq, prep,
     profile::ProfileValues,
@@ -101,9 +102,8 @@ async fn burst_cell(
         base,
         topology::ErOptions {
             label: label.to_owned(),
-            env: Vec::new(),
             request_timeout: Some(REQUEST_TIMEOUT),
-            base_endpoints: None,
+            ..Default::default()
         },
     )
     .await?;
@@ -139,12 +139,15 @@ async fn burst_cell(
             );
             let slow = slow.clone();
             async move {
-                let started = Instant::now();
-                let delivery = sender.submit(&[ix]).await.map(|_| ());
-                if started.elapsed() > SLOW_THRESHOLD {
-                    slow.set(slow.get() + 1);
-                }
-                delivery
+                let tx = sender.prepare(&[ix]).await?;
+                Ok(SendTransaction(move |started: Instant| async move {
+                    let delivery =
+                        sender.submit_prepared(&tx).await.map(|_| ());
+                    if started.elapsed() > SLOW_THRESHOLD {
+                        slow.set(slow.get() + 1);
+                    }
+                    delivery
+                }))
             }
         }
     };
@@ -199,9 +202,8 @@ impl Scenario<ScenarioReport> for ColdHydrationTail {
             base,
             topology::ErOptions {
                 label: "s7-touch".to_owned(),
-                env: Vec::new(),
                 request_timeout: Some(REQUEST_TIMEOUT),
-                base_endpoints: None,
+                ..Default::default()
             },
         )
         .await?;
@@ -248,6 +250,7 @@ impl Scenario<ScenarioReport> for ColdHydrationTail {
                 .setting("profile", profile.name)
                 .setting("accounts", profile.cold_accounts)
                 .setting("account space", ACCOUNT_SPACE)
+                .latency_origin(REQUEST_ORIGIN)
                 .observe("cold first-touch us", Unit::Micros, cold)
                 .observe("warm repeat us", Unit::Micros, warm)
                 .metric("collapse ratio", Unit::Ratio, collapse_ratio)
@@ -343,6 +346,7 @@ impl Scenario<ScenarioReport> for ColdHydrationTail {
                         Unit::Micros,
                         outcome.outcome.delivery,
                     )
+                    .client_side(&outcome.outcome)
                     .metric(
                         "delivered",
                         Unit::Count,
@@ -365,10 +369,13 @@ impl Scenario<ScenarioReport> for ColdHydrationTail {
             .setting("burst payers", profile.burst_payers)
             .setting("burst concurrency", profile.burst_concurrency)
             .setting("account space", ACCOUNT_SPACE)
+            .latency_origin(REQUEST_ORIGIN)
             .metric("cold p50 us", Unit::Micros, cold_median_us)
             .metric("cold p95 us", Unit::Micros, cold.quantile95 as f64)
             .metric("warm p50 us", Unit::Micros, warm_median_us)
             .metric("collapse ratio", Unit::Ratio, collapse_ratio)
+            .with_flags(&cold_deps.outcome)
+            .with_flags(&warm_deps.outcome)
             .metric(
                 "burst cold-deps p95 us",
                 Unit::Micros,

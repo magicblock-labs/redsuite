@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use keypair::Keypair;
@@ -11,7 +11,13 @@ use redsuite_core::{
     topology::ErOptions,
     BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result,
 };
-use sdk::spl::builders::UndelegateEphemeralAtaBuilder;
+use sdk::spl::{
+    builders::{
+        InitializeRentPdaBuilder, UndelegateEphemeralAtaBuilder,
+        WithdrawThroughDelegatedShuttleWithMergeBuilder,
+    },
+    find_rent_pda,
+};
 use signature::Signature;
 use signer::Signer;
 
@@ -179,6 +185,207 @@ async fn settled(
     receipt::confirm_base_signatures(base.api(), &receipt, TIMEOUT).await
 }
 
+async fn magic_atas(
+    base: &BaseCtx,
+    er: &ErCtx,
+    funder: &Keypair,
+    mint: Pubkey,
+    wallets: &[Wallet; 4],
+    vault: &[Pubkey; 2],
+) -> Result<()> {
+    const RECEIVE: u64 = 60;
+    const DEPOSIT: u64 = 45;
+    let payer =
+        prep::escrowed_payer(base, er.identity(), crate::PAYER_LAMPORTS)
+            .await?
+            .payer;
+    let source = &wallets[1];
+    let mut source_balance = amount(er, &source.ata).await?;
+    let mut extra_base = 0;
+    let mut extra_claims = 0;
+    let mut supply = SUPPLY;
+    let destinations: [Wallet; 5] = std::array::from_fn(|_| Wallet::new(&mint));
+    let rent = find_rent_pda().0;
+    if base.account(&rent).await?.is_none() {
+        base.submit_and_confirm(
+            funder,
+            &[InitializeRentPdaBuilder {
+                payer: funder.pubkey(),
+            }
+            .instruction()],
+        )
+        .await?;
+    }
+    base.submit_and_confirm(
+        funder,
+        &[
+            system::transfer(&funder.pubkey(), &rent, 100_000_000),
+            dlp::top_up_ephemeral_balance_for(
+                &funder.pubkey(),
+                &funder.pubkey(),
+                10_000_000,
+                255,
+            ),
+        ],
+    )
+    .await?;
+
+    crate::phase("empty Magic ATA creation", async {
+        let empty = Wallet::new(&mint);
+        er.submit_and_confirm(
+            &payer,
+            &[spl::ensure_magic_ata(
+                payer.pubkey(),
+                empty.owner.pubkey(),
+                mint,
+            )],
+        )
+        .await?;
+        let account = er
+            .account(&empty.ata)
+            .await?
+            .ok_or("empty Magic ATA missing")?;
+        check!(
+            spl::is_magic_ata(&account.data),
+            "empty creation retains the Magic ATA marker"
+        )?;
+        check_eq!(
+            amount(er, &empty.ata).await?,
+            0,
+            "empty Magic ATA creation succeeds"
+        )?;
+        er.submit_and_confirm_with(
+            &payer,
+            &[&empty.owner],
+            &[spl::close_magic_ata(empty.owner.pubkey(), mint)],
+        )
+        .await?;
+        check!(
+            er.account(&empty.ata).await?.is_none(),
+            "explicit close removes the empty ATA"
+        )?;
+        Ok(())
+    })
+    .await?;
+
+    for (case, destination) in destinations.iter().enumerate() {
+        let label = [
+            "receive/drain/close",
+            "readonly overlay",
+            "projection after explicit close",
+            "full shuttle withdrawal",
+            "transparent shuttle withdrawal",
+        ][case];
+        crate::phase(&format!("Magic ATA {label}: {}", destination.ata), async {
+            let ensure = spl::ensure_magic_ata(payer.pubkey(), destination.owner.pubkey(), mint);
+            let close = spl::close_magic_ata(destination.owner.pubkey(), mint);
+            let transfer = spl::transfer(&source.ata, &destination.ata, &source.owner.pubkey(), RECEIVE);
+            let restore = spl::transfer(&destination.ata, &source.ata, &destination.owner.pubkey(), RECEIVE);
+            let create = spl::create_ata_idempotent(&funder.pubkey(), &destination.owner.pubkey(), &mint);
+            let mint_to = spl::mint_to(&mint, &destination.ata, &funder.pubkey(), DEPOSIT);
+            let readonly = if case == 1 {
+                base.submit_and_confirm(funder, &[create.clone(), mint_to.clone()]).await?;
+                supply += DEPOSIT;
+                extra_base += DEPOSIT;
+                let original = base.account(&destination.ata).await?.ok_or("base ATA missing")?;
+                check_eq!(er.account(&destination.ata).await?, Some(original.clone()), "readonly ATA is initially cloned")?;
+                let attempt = er.submit_and_confirm_with(&payer, &[&destination.owner, &source.owner], &[
+                    spl::transfer(&destination.ata, &source.ata, &destination.owner.pubkey(), DEPOSIT),
+                    ensure.clone(), transfer.clone(),
+                ]).await;
+                check!(attempt.is_err(), "readonly base balance cannot be spent before overlay")?;
+                crate::rejection_code("readonly spend before overlay",
+                    &["InvalidWritableAccount", "ExternalAccountDataModified", "ReadonlyDataModified", "Immutable"],
+                    &attempt.unwrap_err().to_string())?;
+                check_eq!(er.account(&destination.ata).await?, Some(original.clone()), "failed overlay transaction rolls back")?;
+                check_eq!(amount(er, &source.ata).await?, source_balance, "failed overlay leaves the source unchanged")?;
+                Some(original)
+            } else { None };
+
+            er.submit_and_confirm_with(&payer, &[&source.owner], &[ensure, transfer]).await?;
+            check_eq!(amount(er, &destination.ata).await?, RECEIVE, "overlay contains only received tokens")?;
+            check_eq!(amount(er, &source.ata).await?, source_balance - RECEIVE, "source funds the Magic ATA")?;
+            check!(spl::is_magic_ata(&er.account(&destination.ata).await?.ok_or("Magic ATA missing")?.data), "received ATA is marked")?;
+            check_eq!(spl::token_balance(base, &destination.ata).await?, if case == 1 { Some(DEPOSIT) } else { None }, "ER receipt leaves base unchanged")?;
+
+            if case <= 2 {
+                er.submit_and_confirm_with(&payer, &[&destination.owner], &[restore]).await?;
+                check_eq!(amount(er, &source.ata).await?, source_balance, "draining restores every received token")?;
+                if case == 2 {
+                    base.submit_and_confirm_with(funder, &[&destination.owner], &[
+                        create, mint_to,
+                        spl::initialize_eata(&funder.pubkey(), &destination.owner.pubkey(), &mint),
+                        spl::deposit_spl_tokens(&destination.owner.pubkey(), &mint, DEPOSIT),
+                        spl::delegate_eata(&funder.pubkey(), &destination.owner.pubkey(), &mint, &er.identity()),
+                    ]).await?;
+                    supply += DEPOSIT;
+                    extra_claims += DEPOSIT;
+                    let until = Instant::now() + Duration::from_secs(5);
+                    loop {
+                        let account = er.account(&destination.ata).await?.ok_or("empty overlay disappeared")?;
+                        check!(spl::is_magic_ata(&account.data), "projection cannot replace an existing Magic ATA")?;
+                        check_eq!(amount(er, &destination.ata).await?, 0, "unclosed overlay stays empty")?;
+                        if Instant::now() >= until { break; }
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                    }
+                }
+                er.submit_and_confirm_with(&payer, &[&destination.owner], &[close]).await?;
+                let base_ata = base.account(&destination.ata).await?;
+                check::poll_for("close restores the base ATA or permits eATA projection", TIMEOUT, || async {
+                    let local = er.account(&destination.ata).await?;
+                    if case == 2 {
+                        let account = local.ok_or("projection missing")?;
+                        check!(!spl::is_magic_ata(&account.data), "projected ATA has no Magic marker")?;
+                        check_eq!(account.owner, spl::token_program(), "projected ATA owner")?;
+                        check_eq!(account.data.len(), spl::TOKEN_ACCOUNT_LEN, "projected ATA layout")?;
+                        check_eq!(account.lamports, base_ata.as_ref().ok_or("base ATA missing")?.lamports, "projection restores base rent")?;
+                        check_eq!(amount(er, &destination.ata).await?, DEPOSIT, "close exposes delegated tokens")?;
+                    } else {
+                        check_eq!(local, readonly, "close restores all original bytes, lamports and ownership")?;
+                    }
+                    Ok::<_, redsuite_core::DynError>(())
+                }).await?;
+            } else {
+                let shuttle = WithdrawThroughDelegatedShuttleWithMergeBuilder {
+                    payer: funder.pubkey(), owner: destination.owner.pubkey(), owner_ata: destination.ata,
+                    mint, shuttle_id: case as u32, amount: RECEIVE, validator: Some(er.identity()),
+                }.instruction();
+                let shuttle_accounts: Vec<_> = shuttle.accounts[2..5].iter().map(|meta| meta.pubkey).collect();
+                let mut instructions = vec![create];
+                if case == 4 {
+                    instructions.extend([
+                        spl::initialize_eata(&funder.pubkey(), &destination.owner.pubkey(), &mint),
+                        spl::delegate_eata(&funder.pubkey(), &destination.owner.pubkey(), &mint, &er.identity()),
+                    ]);
+                }
+                instructions.push(shuttle);
+                let signature = base.submit_and_confirm_with(funder, &[&destination.owner], &instructions).await?;
+                check::poll_for(&format!("shuttle {signature} settles and cleans up"), TIMEOUT, || async {
+                    check_eq!(amount(base, &destination.ata).await?, RECEIVE, "shuttle delivers all tokens on base")?;
+                    if let Some(local) = er.account(&destination.ata).await? {
+                        check!(!spl::is_magic_ata(&local.data), "withdrawal clears the Magic ATA marker")?;
+                    }
+                    for address in &shuttle_accounts {
+                        check!(base.account(address).await?.is_none(), "shuttle account {address} is removed")?;
+                    }
+                    Ok::<_, redsuite_core::DynError>(())
+                }).await?;
+                if case == 4 {
+                    check_eq!(base.account(&destination.eata).await?.map(|a| a.owner), Some(dlp::dlp_id()), "transparent withdrawal retains delegated eATA")?;
+                }
+                source_balance -= RECEIVE;
+                extra_base += RECEIVE;
+            }
+            check_eq!(amount(er, &source.ata).await?, source_balance, "final source balance")?;
+            let state = balances(base, er, wallets, vault).await?;
+            check_eq!(state.vault[0], state.projected[..2].iter().sum::<u64>() + state.eatas[3].unwrap_or(0) + state.vault[1] + extra_claims, "vault backs every remaining claim")?;
+            check_eq!(state.base_atas.iter().sum::<u64>() + state.vault[0] + extra_base, supply, "Magic ATA lifecycle conserves token supply")?;
+            Ok(())
+        }).await?;
+    }
+    Ok(())
+}
+
 #[async_trait(?Send)]
 impl PrivateErScenario for ProjectedTokenLifecycle {
     fn name(&self) -> &str {
@@ -193,9 +400,8 @@ impl PrivateErScenario for ProjectedTokenLifecycle {
                 base,
                 ErOptions {
                     label: LABEL.to_owned(),
-                    env: Vec::new(),
-                    request_timeout: None,
                     base_endpoints: Some(proxies.endpoints()),
+                    ..Default::default()
                 },
             ),
         )
@@ -521,6 +727,8 @@ impl PrivateErScenario for ProjectedTokenLifecycle {
             record("final committed balances", &expected, true).await
         })
         .await?;
+
+        magic_atas(base, er, &payer, mint_key, &wallets, &vault).await?;
 
         crate::phase("teardown", async {
             proxies.finish()?;

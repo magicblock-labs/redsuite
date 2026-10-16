@@ -9,9 +9,11 @@ use pubkey::Pubkey;
 use signer::Signer;
 use tokio::sync::Mutex;
 
+use magicblock_config::LeaderParams;
+
 use super::{
     config,
-    config::{ErOptions, RestartConfig},
+    config::{ErOptions, ErPorts, RestartConfig},
     identity, process, state,
 };
 use crate::{
@@ -79,19 +81,23 @@ impl PrivateEr {
     }
 
     pub fn rpc_port(&self) -> u16 {
-        self.plan.listen_port
+        self.plan.listen().port()
     }
 
     pub fn metrics_port(&self) -> u16 {
-        self.plan.metrics_port
+        self.plan.metrics_port()
     }
 
     pub fn replication_port(&self) -> u16 {
-        self.plan.replication_port
+        self.plan.replication_port()
     }
 
-    pub fn allowed_followers(&self) -> &[Pubkey] {
-        &self.plan.allowed_followers
+    pub fn allowed_followers(&self) -> Vec<Pubkey> {
+        self.plan.allowed_followers()
+    }
+
+    pub(super) fn params(&self) -> &LeaderParams {
+        &self.plan.params
     }
 
     pub fn is_running(&self) -> bool {
@@ -103,7 +109,7 @@ impl PrivateEr {
     }
 
     pub fn storage_dir(&self) -> &Path {
-        &self.plan.storage_dir
+        self.plan.storage_dir()
     }
 
     // Current boot's log. After a restart the prior boot's log (with the
@@ -113,7 +119,7 @@ impl PrivateEr {
     }
 
     fn rpc_api(&self) -> Api {
-        Api::new(format!("http://127.0.0.1:{}", self.plan.listen_port))
+        Api::new(self.plan.listen().http())
     }
 
     pub async fn wait_ready(&self, timeout: Duration) -> Result<()> {
@@ -147,7 +153,7 @@ impl PrivateEr {
     }
 
     fn remove_storage(&self) -> Result<()> {
-        state::remove_storage(&self.plan.storage_dir).map_err(|error| {
+        state::remove_storage(self.plan.storage_dir()).map_err(|error| {
             format!(
                 "removing the storage of private ER `{}`: {error}",
                 self.proc.label()
@@ -176,10 +182,9 @@ impl PrivateEr {
         let exit_signal =
             std::os::unix::process::ExitStatusExt::signal(&exit_status);
 
-        self.plan.reset = config.reset;
+        self.plan.params.ledger.reset = config.reset;
         let launch_started = std::time::Instant::now();
-        self.proc
-            .relaunch(process::spawn_child(self.plan.command(), &self.log))?;
+        self.proc.relaunch(self.plan.spawn(&self.log))?;
         let ready = process::wait_until_every(
             process::RESTART_POLL,
             config.ready_timeout,
@@ -272,7 +277,6 @@ async fn launch(
     let replication_port = ports.single()?;
     let storage_dir = dir.join(format!("er-{}", options.label));
     state::remove_storage(&storage_dir)?;
-    let accountsdb_dir = state::accountsdb_dir(&storage_dir);
     let log = dir.join(format!("er-{}.log", options.label));
     let identity_pubkey = er_identity.pubkey();
     let role = if allowed_followers.is_empty() {
@@ -280,37 +284,36 @@ async fn launch(
     } else {
         "leader"
     };
-    let (base_rpc_url, base_ws_url, base_grpc_url) = match &options
-        .base_endpoints
-    {
-        Some(endpoints) => (
-            endpoints.rpc_url.clone(),
-            endpoints.ws_url.clone(),
-            endpoints.grpc_url.clone(),
-        ),
-        None => (base.api().url().to_owned(), base.ws_url().to_owned(), None),
-    };
+    let endpoints =
+        options
+            .base_endpoints
+            .unwrap_or_else(|| config::BaseEndpoints {
+                rpc_url: base.api().url().to_owned(),
+                ws_url: base.ws_url().to_owned(),
+                grpc_url: None,
+            });
     let plan = config::ErPlan {
         bin: er_bin,
-        identity: er_identity,
-        base_rpc_url,
-        base_ws_url,
-        base_grpc_url,
-        listen_port: rpc_port,
-        metrics_port,
-        replication_port,
-        storage_dir,
-        accountsdb_dir,
-        env: options.env,
-        reset: true,
-        allowed_followers,
+        config_path: config::config_path(&dir, &options.label),
+        params: config::leader_params(
+            er_identity,
+            &endpoints,
+            ErPorts {
+                rpc: rpc_port,
+                metrics: metrics_port,
+                replication: replication_port,
+            },
+            storage_dir,
+            allowed_followers,
+            options.settings,
+        )?,
     };
     console::debug(format_args!(
         "booting {role} `{}` on 127.0.0.1:{rpc_port} …",
         options.label
     ));
     ports.release();
-    let child = process::spawn_child(plan.command(), &log)?;
+    let child = plan.spawn(&log)?;
     let pid = child.id();
     let (bin_version, bin_fingerprint) = report::binary_provenance(&plan.bin);
     let record = base.resources().register_launch(LaunchRecord {
@@ -324,8 +327,8 @@ async fn launch(
         ws_port: Some(ws_port),
         metrics_port,
         replication_port: Some(replication_port),
-        storage_dir: plan.storage_dir.display().to_string(),
-        accountsdb_dir: state::split_accountsdb_dir(&plan.storage_dir)
+        storage_dir: plan.storage_dir().display().to_string(),
+        accountsdb_dir: state::split_accountsdb_dir(plan.storage_dir())
             .map(|dir| dir.display().to_string()),
         log: log.display().to_string(),
         pid,

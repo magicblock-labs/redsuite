@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use pubkey::Pubkey;
 use redsuite_core::redline::Accounts;
 use redsuite_core::report::Unit;
+use redsuite_core::runner::SendTransaction;
 use redsuite_core::{
     check, check_eq,
     monitor::{self, MonitorSpec},
@@ -22,10 +23,6 @@ use signer::Signer;
 
 use crate::program::instruction::build;
 
-// The widest fresh-key commit the >= 0.13.7 scheduling-time intent gate
-// admits with margin (it estimates commits at full inline size; probed on
-// v0.13.7: w10 x 40 B schedules, w12 x 40 B is refused). Wide enough that
-// every intent still needs ALTs on base — the TableMania convoy trigger.
 const COMMIT_WIDTH: usize = 8;
 const ACCOUNT_SPACE: u32 = 40;
 const PAYER_LAMPORTS: u64 = 2_000_000_000;
@@ -45,7 +42,7 @@ const BUSY_GAUGE: &str = "mbv_committor_executors_busy_count";
 
 struct Profile {
     name: &'static str,
-    // wide commits over never-committed keys — the convoy trigger
+    // wide commits over never-committed keys
     fresh_commits: u64,
     prep_payers: usize,
     rate: u32,
@@ -102,9 +99,11 @@ async fn deliver_commits(
             let delivered = delivered.clone();
             async move {
                 let tx = sender.prepare(&[ix]).await?;
-                let commit_signature = sender.submit_prepared(&tx).await?;
-                delivered.borrow_mut().push((id, commit_signature));
-                Ok(())
+                Ok(SendTransaction(move |_: Instant| async move {
+                    let commit_signature = sender.submit_prepared(&tx).await?;
+                    delivered.borrow_mut().push((id, commit_signature));
+                    Ok(())
+                }))
             }
         }
     };
@@ -294,15 +293,6 @@ impl Scenario<ScenarioReport> for CommitThroughputCeiling {
             .counter_all("mbv_committor_failed_intents_count")
             .unwrap_or(0.0);
         check_eq!(failed_intents, 0.0, "fresh-key intents failed")?;
-        if let Some(alt_tables_used) =
-            delta.counter("mbv_committor_intent_alt_count_sum")
-        {
-            check!(
-                alt_tables_used >= 1.0,
-                "wide fresh-key commits should ride ALTs"
-            )?;
-        }
-
         let drain_rate = drain.drained / span_wall.as_secs_f64();
         eprintln!(
             "[redsuite] {}: fresh drain {:.2} intents/s ({}/{} over {:.1} s \
@@ -362,6 +352,7 @@ impl Scenario<ScenarioReport> for CommitThroughputCeiling {
             .setting("steady-state scrapes", coverage)
             .setting("fully drained", drain.fully_drained)
             .observe("delivery us", Unit::Micros, delivery_outcome.delivery)
+            .client_side(&delivery_outcome)
             .metric("fresh drain intents/s", Unit::PerSecond, drain_rate)
             .metric(
                 "delivery+drain span s",

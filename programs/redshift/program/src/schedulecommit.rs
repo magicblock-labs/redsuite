@@ -151,6 +151,24 @@ pub fn process(
         ScheduleCommitForOrderBook(commit_type) => {
             process_commit_for_order_book(accounts, commit_type)
         }
+        RequestUndelegation(player) => {
+            let [payer, committee, ..] = accounts else {
+                return Err(ProgramError::NotEnoughAccountKeys);
+            };
+            let (pda, bump) = pda_and_bump(&player);
+            if committee.key != &pda {
+                return Err(ProgramError::InvalidSeeds);
+            }
+            invoke_signed(
+                &sdk::dlp_api::instruction_builder::request_undelegation(
+                    *payer.key,
+                    pda,
+                    crate::ID,
+                ),
+                accounts,
+                &[&[PDA_SEED, player.as_ref(), &[bump]]],
+            )
+        }
     }
 }
 

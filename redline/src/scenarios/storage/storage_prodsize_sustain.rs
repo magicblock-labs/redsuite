@@ -21,6 +21,7 @@ const TX_PROCESSING_HISTOGRAM: &str = "mbv_transaction_processing_time";
 const LEDGER_TRANSACTIONS_GAUGE: &str = "engine_ledger_transactions";
 const LEDGER_FILL_TIMEOUT: Duration = Duration::from_secs(5);
 
+const BLOCKTIME: Duration = Duration::from_millis(50);
 const PROD_SUPERBLOCK_SLOTS: u64 = 72_000;
 
 struct Profile {
@@ -87,7 +88,7 @@ async fn execute_window(
             let id = first_id + iteration;
             let sender = senders[(id as usize) % senders.len()].clone();
             let (ix, _) = copy_three(pool, id);
-            async move { sender.submit(&[ix]).await.map(|_| ()) }
+            sender.staged(&[ix])
         },
     )
     .await?;
@@ -141,18 +142,11 @@ impl Scenario<ScenarioReport> for StorageProdsizeSustain {
                 base,
                 topology::ErOptions {
                     label: format!("s11-{cell_name}"),
-                    env: vec![
-                        (
-                            "MBV_ENGINE__BLOCKSTORE__BLOCKTIME".to_owned(),
-                            "50ms".to_owned(),
-                        ),
-                        (
-                            "MBV_ENGINE__BLOCKSTORE__SUPERBLOCK".to_owned(),
-                            superblock_slots.to_string(),
-                        ),
-                    ],
-                    request_timeout: None,
-                    base_endpoints: None,
+                    settings: Box::new(move |params| {
+                        params.engine.blockstore.blocktime = BLOCKTIME;
+                        params.engine.blockstore.superblock = superblock_slots;
+                    }),
+                    ..Default::default()
                 },
             )
             .await?;
@@ -184,7 +178,7 @@ impl Scenario<ScenarioReport> for StorageProdsizeSustain {
                 |id| {
                     let sender = senders[(id as usize) % senders.len()].clone();
                     let (ix, _) = copy_three(&pool, id);
-                    async move { sender.submit(&[ix]).await.map(|_| ()) }
+                    sender.staged(&[ix])
                 },
             )
             .await?;
@@ -305,6 +299,10 @@ impl Scenario<ScenarioReport> for StorageProdsizeSustain {
                         Unit::Micros,
                         window.outcome.delivery,
                     )
+                    .client_side_as(
+                        format!("window {window_name} scheduling delay us"),
+                        &window.outcome,
+                    )
                     .metric(
                         format!("window {window_name} achieved tps"),
                         Unit::Tps,
@@ -363,6 +361,8 @@ impl Scenario<ScenarioReport> for StorageProdsizeSustain {
             .setting("concurrency", profile.concurrency);
         for cell in &cells {
             summary = summary
+                .with_flags(&cell.windows[0].outcome)
+                .with_flags(&cell.windows[1].outcome)
                 .metric(
                     format!("{} window A p50 us", cell.name),
                     Unit::Micros,

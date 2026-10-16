@@ -2,19 +2,19 @@ use redsuite_core::catalog::{ErGroup, Fixture};
 
 pub static DEFAULT: ErGroup = ErGroup {
     label: "default",
-    env: &[],
+    settings: |_| {},
     proxied: false,
 };
 
 pub static RETRIES: ErGroup = ErGroup {
     label: "transaction-retries",
-    env: &[],
+    settings: |_| {},
     proxied: true,
 };
 
 pub static COMMITTOR: ErGroup = ErGroup {
     label: "committor-faults",
-    env: &[],
+    settings: |_| {},
     proxied: true,
 };
 
@@ -290,10 +290,6 @@ pub mod redhat {
         illegal_writable => chainlink::illegal_writable::IllegalWritable {
             er: Shared(DEFAULT),
             fixtures: [Fixture::RedhatProgram, Fixture::RedshiftProgram],
-        },
-        fee_payer_rules => aperture::fee_payer_rules::FeePayerRules {
-            er: Shared(DEFAULT),
-            fixtures: [Fixture::RedshiftProgram],
         },
     }
 }

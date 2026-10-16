@@ -13,10 +13,10 @@ use magic_api::instruction::{
     },
 };
 use pubkey::Pubkey;
-use redshift_interface::{ephemeral_cpi, log_msg_data};
+use redshift_interface::{ephemeral_cpi, log_msg_data, schedulecommit::build};
 use redsuite_core::{
-    api::TransactionInfo, check, check_eq, manifest, prep, system, topology,
-    BaseCtx, ChainCtx, ErCtx, Result, Scenario,
+    api::TransactionInfo, check, check_eq, dlp, manifest, phase, prep, receipt,
+    system, topology, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
 use sdk::{consts::EPHEMERAL_VAULT_ID, ephemeral_accounts::rent};
 use signer::Signer;
@@ -302,8 +302,9 @@ impl Workload<'_> {
             "{label}: before"
         )?;
         let error_index = instructions.len() - 1;
-        let record =
-            Record::submit(self.er, self.prepare(instructions).await?).await?;
+        let record = Record::submit(self.er, self.prepare(instructions).await?)
+            .await
+            .map_err(|error| format!("{label}: {error}"))?;
         let before = self.expected.clone();
         let mut after = before.clone();
         let expected_error = match effect {
@@ -359,6 +360,86 @@ impl Scenario for EphemeralAccounts {
                 .await?,
             );
         }
+        // A delegated (mapped-signing) fee payer may commit ITSELF directly
+        // via the magic program: it is the transaction signer and is delegated
+        // to this ER, so the pipeline maps the signature and schedules the
+        // commit. The vault is required because the payer is delegated.
+        phase("mapped-signing self-commit", async {
+            let payer = &signers[2];
+            let vault = dlp::magic_fee_vault_pda(&er.identity());
+            check!(
+                er.account(&vault).await?.is_some(),
+                "the magic fee vault for the booted er identity must exist"
+            )?;
+            let signature = er
+                .submit_and_confirm(
+                    payer,
+                    &[build::direct_schedule_commit(
+                        payer.pubkey(),
+                        Some(vault),
+                        &[payer.pubkey()],
+                    )],
+                )
+                .await?;
+            let commit_receipt =
+                receipt::fetch_commit_receipt(er.api(), &signature, TIMEOUT)
+                    .await?;
+            check!(
+                commit_receipt.succeeded(),
+                "the mapped-signing self-commit {signature} succeeds, receipt \
+                 error {:?} code {:?}",
+                commit_receipt.error_message,
+                commit_receipt.receipt_err_code
+            )?;
+            check!(
+                commit_receipt.included.contains(&payer.pubkey()),
+                "the mapped-signing payer must commit itself in {signature}, \
+                 receipt included {:?}",
+                commit_receipt.included
+            )?;
+            check!(
+                !commit_receipt.base_signatures.is_empty(),
+                "the mapped-signing self-commit {signature} must reach base \
+                 through at least one base transaction"
+            )?;
+            receipt::confirm_base_signatures(
+                base.api(),
+                &commit_receipt,
+                TIMEOUT,
+            )
+            .await
+        })
+        .await?;
+
+        // A non-delegated payer cannot pay ER fees for a transaction that
+        // touches no delegated account. This is the fee gate outside gasless
+        // mode: only delegated (or otherwise privileged) accounts may pay. The
+        // transfer is to the payer itself, so it lands on an account that
+        // already exists (no rent path) and touches nothing delegated — the
+        // fee gate is the only thing left to fail on.
+        phase("fee gate", async {
+            let fee_only = er
+                .submit_and_confirm(
+                    &funder,
+                    &[system::transfer(&funder.pubkey(), &funder.pubkey(), 1)],
+                )
+                .await;
+            check!(
+                fee_only.is_err(),
+                "a non-delegated payer must not pay ER fees for a tx touching \
+                 no delegated account"
+            )?;
+            let fee_error = format!("{:?}", fee_only.unwrap_err());
+            check!(
+                fee_error.contains("InvalidAccountForFee")
+                    || fee_error.contains("Immutable"),
+                "expected InvalidAccountForFee or Immutable for the \
+                 non-delegated payer, got {fee_error}"
+            )?;
+            Ok(())
+        })
+        .await?;
+
         let target = Keypair::new();
         let keys = [
             signers[0].pubkey(),
@@ -368,6 +449,17 @@ impl Scenario for EphemeralAccounts {
             signers[2].pubkey(),
         ];
         signers.push(target);
+        eprintln!(
+            "[redsuite] {}: payer {} sponsor {} target {} vault {} substitute \
+             {} funder {}",
+            self.name(),
+            keys[PAYER],
+            keys[SPONSOR],
+            keys[TARGET],
+            keys[VAULT],
+            keys[SUBSTITUTE],
+            funder.pubkey()
+        );
         let foreign = topology::redshift_loader_v3_target().0;
         let mut workload = Workload {
             er,
@@ -521,10 +613,12 @@ impl Scenario for EphemeralAccounts {
             }
             let records = try_join_all(prepared.into_iter().map(
                 |(action, tx)| async move {
-                    Ok::<_, redsuite_core::DynError>((
-                        action,
-                        Record::submit(er, tx).await?,
-                    ))
+                    let signature = tx.signatures[0];
+                    let record =
+                        Record::submit(er, tx).await.map_err(|error| {
+                            format!("conflicts ({signature}): {error}")
+                        })?;
+                    Ok::<_, redsuite_core::DynError>((action, record))
                 },
             ))
             .await?;

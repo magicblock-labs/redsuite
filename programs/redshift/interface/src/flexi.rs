@@ -3,6 +3,17 @@ use pubkey::Pubkey;
 
 pub const FLEXI_SEED: &[u8] = b"flexi_counter";
 pub const ACTOR_ESCROW_INDEX: u8 = 1;
+pub const TRANSFER_CALLBACK: &[u8] = &[crate::FLEXI_TAG, 255];
+pub const TRANSFER_FAILURE: u32 = 0xFA11;
+pub const ACTION_PRIZE: u64 = 1_000_000;
+pub const ACTION_COMPUTE_UNITS: u32 = 100_000;
+
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone, Copy)]
+pub enum IntentMode {
+    Commit,
+    Undelegate(i64),
+    Finalize,
+}
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
 pub struct FlexiCounter {
     pub count: u64,
@@ -76,6 +87,19 @@ pub enum FlexiInstruction {
     AddActionHandler {
         count: u8,
     } = 17,
+    ScheduleIntents {
+        modes: Vec<IntentMode>,
+        actions: bool,
+    } = 18,
+    BaseAction {
+        amount: u64,
+        change: Option<i64>,
+        fail: bool,
+    } = 19,
+    TransferIntent {
+        amount: u64,
+        fail: bool,
+    } = 20,
 }
 
 pub mod build {
@@ -113,6 +137,46 @@ pub mod build {
             ),
             pda,
         )
+    }
+
+    pub fn schedule_intents(
+        payers: &[Pubkey],
+        validator: Pubkey,
+        destination: Pubkey,
+        modes: Vec<IntentMode>,
+        actions: bool,
+    ) -> Instruction {
+        let mut metas = vec![
+            AccountMeta::new(payers[0], true),
+            AccountMeta::new(MAGIC_CONTEXT_ID, false),
+            AccountMeta::new_readonly(MAGIC_PROGRAM_ID, false),
+            AccountMeta::new(
+                sdk::pda::magic_fee_vault_pda_from_validator(&validator),
+                false,
+            ),
+            AccountMeta::new_readonly(destination, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ];
+        for payer in payers {
+            metas.extend([
+                AccountMeta::new_readonly(*payer, true),
+                AccountMeta::new(FlexiCounter::pda_and_bump(payer).0, false),
+            ]);
+        }
+        with_tag(&FlexiInstruction::ScheduleIntents { modes, actions }, metas)
+    }
+
+    pub fn transfer_intent(
+        payer: Pubkey,
+        validator: Pubkey,
+        destination: Pubkey,
+        amount: u64,
+        fail: bool,
+    ) -> Instruction {
+        let mut ix =
+            schedule_intents(&[payer], validator, destination, vec![], false);
+        ix.data = tagged(&FlexiInstruction::TransferIntent { amount, fail });
+        ix
     }
 
     pub fn delegate_counter(

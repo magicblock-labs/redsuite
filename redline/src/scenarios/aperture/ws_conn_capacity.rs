@@ -97,9 +97,7 @@ impl Scenario<ScenarioReport> for WsConnCapacity {
             base,
             topology::ErOptions {
                 label: "s3".to_owned(),
-                env: Vec::new(),
-                request_timeout: None,
-                base_endpoints: None,
+                ..Default::default()
             },
         )
         .await?;
@@ -198,14 +196,17 @@ impl Scenario<ScenarioReport> for WsConnCapacity {
             },
             |_| {
                 let ws_url = ws_url.clone();
-                async move {
-                    let mut conn = RawWs::connect(&ws_url).await?;
-                    let subid = conn.account_subscribe(&shared_account).await?;
-                    if !conn.account_unsubscribe(subid).await? {
-                        return Err("unsubscribe returned false".into());
-                    }
-                    conn.close().await
-                }
+                std::future::ready(Ok(
+                    move |_: std::time::Instant| async move {
+                        let mut conn = RawWs::connect(&ws_url).await?;
+                        let subid =
+                            conn.account_subscribe(&shared_account).await?;
+                        if !conn.account_unsubscribe(subid).await? {
+                            return Err("unsubscribe returned false".into());
+                        }
+                        conn.close().await
+                    },
+                ))
             },
         )
         .await?;
@@ -253,6 +254,7 @@ impl Scenario<ScenarioReport> for WsConnCapacity {
             .setting("churn concurrency", profile.churn_concurrency)
             .setting("fd tolerance", FD_TOLERANCE)
             .observe("churn op us", Unit::Micros, churn.delivery)
+            .client_side(&churn)
             .metric("baseline fds", Unit::Count, fd_baseline as f64)
             .metric("baseline rss kb", Unit::Kilobytes, rss_baseline_kb as f64)
             .metric("churn ops /s", Unit::PerSecond, churn.achieved_rps())

@@ -21,6 +21,39 @@ use crate::{
 };
 
 const STOP_POLL: Duration = Duration::from_millis(20);
+const SUSTAINED_FRACTION: f64 = 0.9;
+
+pub const SEND_ORIGIN: &str = "client, immediately before sendTransaction";
+pub const REQUEST_ORIGIN: &str = "client, immediately before the request";
+
+pub trait Delivery: 'static {
+    const ORIGIN: &'static str = REQUEST_ORIGIN;
+    type Fut: Future<Output = Result<()>> + 'static;
+    fn deliver(self, sent: Instant) -> Self::Fut;
+}
+
+pub struct SendTransaction<D>(pub D);
+
+impl<D: Delivery> Delivery for SendTransaction<D> {
+    const ORIGIN: &'static str = SEND_ORIGIN;
+    type Fut = D::Fut;
+
+    fn deliver(self, sent: Instant) -> D::Fut {
+        self.0.deliver(sent)
+    }
+}
+
+impl<F, Fut> Delivery for F
+where
+    F: FnOnce(Instant) -> Fut + 'static,
+    Fut: Future<Output = Result<()>> + 'static,
+{
+    type Fut = Fut;
+
+    fn deliver(self, sent: Instant) -> Fut {
+        self(sent)
+    }
+}
 
 pub struct RunConfig {
     pub iterations: u64,
@@ -60,6 +93,8 @@ pub struct RunOutcome<S = ObservationsStats> {
     pub cancelled: u64,
     pub first_error: Option<String>,
     pub delivery: S,
+    pub scheduling: S,
+    pub origin: &'static str,
     // closed loop only: send-start → all confirmations for the id
     pub sync: Option<S>,
     pub offered: Pacing,
@@ -70,6 +105,37 @@ pub struct RunOutcome<S = ObservationsStats> {
 impl RunOutcome {
     pub fn achieved_rps(&self) -> f64 {
         self.delivered as f64 / self.wall.as_secs_f64()
+    }
+
+    pub fn flags(&self) -> Vec<(&'static str, String)> {
+        let mut flags = Vec::new();
+        let achieved = self.achieved_rps();
+        let (rate, interval) = match self.offered {
+            Pacing::PerSecond(offered) => (f64::from(offered), "pacing"),
+            Pacing::Unlimited => (achieved, "achieved inter-arrival"),
+        };
+        if rate > 0.0 {
+            let interval_micros = (1e6 / rate) as i64;
+            if i64::from(self.scheduling.quantile95) > interval_micros {
+                flags.push((
+                    "client saturated",
+                    format!(
+                        "scheduling delay p95 {} us exceeds the \
+                         {interval_micros} us {interval} interval",
+                        self.scheduling.quantile95
+                    ),
+                ));
+            }
+        }
+        if let Pacing::PerSecond(offered) = self.offered {
+            if achieved < f64::from(offered) * SUSTAINED_FRACTION {
+                flags.push((
+                    "offered rate not sustained",
+                    format!("achieved {achieved:.0} of {offered} offered tps"),
+                ));
+            }
+        }
+        flags
     }
 }
 
@@ -85,6 +151,10 @@ impl RawRunOutcome {
             self.first_error = other.first_error;
         }
         self.delivery.merge(other.delivery);
+        self.scheduling.merge(other.scheduling);
+        if self.origin.is_empty() {
+            self.origin = other.origin;
+        }
         self.sync = match (self.sync.take(), other.sync) {
             (Some(mut own_sync), Some(other_sync)) => {
                 own_sync.merge(other_sync);
@@ -105,6 +175,8 @@ impl RawRunOutcome {
             cancelled: self.cancelled,
             first_error: self.first_error,
             delivery: self.delivery.finalize(false),
+            scheduling: self.scheduling.finalize(false),
+            origin: self.origin,
             sync: self.sync.map(|sync| sync.finalize(false)),
             offered: self.offered,
             rps: self.rps,
@@ -186,7 +258,7 @@ impl Completion {
 type NoSync = fn(u64) -> std::future::Ready<Result<()>>;
 const NO_SYNC: Option<NoSync> = None;
 
-async fn execute_inner<Request, RequestFut, Sync, SyncFut>(
+async fn execute_inner<Request, RequestFut, D, Sync, SyncFut>(
     completion: Completion,
     pacing: Pacing,
     concurrency: usize,
@@ -195,13 +267,15 @@ async fn execute_inner<Request, RequestFut, Sync, SyncFut>(
 ) -> Result<RawRunOutcome>
 where
     Request: FnMut(u64) -> RequestFut,
-    RequestFut: Future<Output = Result<()>> + 'static,
+    RequestFut: Future<Output = Result<D>> + 'static,
+    D: Delivery,
     Sync: FnMut(u64) -> SyncFut,
     SyncFut: Future<Output = Result<()>> + 'static,
 {
     let mut throttle = Throttle::new(pacing, concurrency)?;
     let tally = Rc::new(RefCell::new(RawRunOutcome {
         sync: sync.is_some().then(StreamingStats::new),
+        origin: D::ORIGIN,
         ..RawRunOutcome::default()
     }));
     let started = Instant::now();
@@ -210,32 +284,43 @@ where
     let mut admitted = 0u64;
     while completion.admits(admitted) {
         let permit = throttle.admit().await;
+        let admitted_at = Instant::now();
         admitted += 1;
         let request_fut = request(admitted);
         let sync_fut = sync.as_mut().map(|sync| sync(admitted));
         let job_tally = tally.clone();
         jobs.spawn_local(async move {
-            let sent = Instant::now();
+            job_tally
+                .borrow_mut()
+                .scheduling
+                .push(admitted_at.elapsed().as_micros() as u32);
             let outcome = match request_fut.await {
-                Ok(()) => {
-                    let delivery_micros = sent.elapsed().as_micros() as u32;
-                    match sync_fut {
-                        None => JobOutcome::Delivered {
-                            delivery_micros,
-                            sync_micros: None,
-                        },
-                        Some(sync_fut) => match sync_fut.await {
-                            Ok(()) => JobOutcome::Delivered {
-                                delivery_micros,
-                                sync_micros: Some(
-                                    sent.elapsed().as_micros() as u32
-                                ),
-                            },
-                            Err(error) => JobOutcome::SyncFailed {
-                                delivery_micros,
-                                error,
-                            },
-                        },
+                Ok(send) => {
+                    let sent = Instant::now();
+                    match send.deliver(sent).await {
+                        Ok(()) => {
+                            let delivery_micros =
+                                sent.elapsed().as_micros() as u32;
+                            match sync_fut {
+                                None => JobOutcome::Delivered {
+                                    delivery_micros,
+                                    sync_micros: None,
+                                },
+                                Some(sync_fut) => match sync_fut.await {
+                                    Ok(()) => JobOutcome::Delivered {
+                                        delivery_micros,
+                                        sync_micros: Some(
+                                            sent.elapsed().as_micros() as u32,
+                                        ),
+                                    },
+                                    Err(error) => JobOutcome::SyncFailed {
+                                        delivery_micros,
+                                        error,
+                                    },
+                                },
+                            }
+                        }
+                        Err(error) => JobOutcome::DeliveryFailed(error),
                     }
                 }
                 Err(error) => JobOutcome::DeliveryFailed(error),
@@ -277,21 +362,26 @@ fn record_join(
     }
 }
 
-pub async fn execute<F, Fut>(cfg: RunConfig, request: F) -> Result<RunOutcome>
+pub async fn execute<F, Fut, D>(
+    cfg: RunConfig,
+    request: F,
+) -> Result<RunOutcome>
 where
     F: FnMut(u64) -> Fut,
-    Fut: Future<Output = Result<()>> + 'static,
+    Fut: Future<Output = Result<D>> + 'static,
+    D: Delivery,
 {
     Ok(execute_raw(cfg, request).await?.finalize())
 }
 
-pub async fn execute_raw<F, Fut>(
+pub async fn execute_raw<F, Fut, D>(
     cfg: RunConfig,
     request: F,
 ) -> Result<RawRunOutcome>
 where
     F: FnMut(u64) -> Fut,
-    Fut: Future<Output = Result<()>> + 'static,
+    Fut: Future<Output = Result<D>> + 'static,
+    D: Delivery,
 {
     execute_inner(
         Completion::Iterations(cfg.iterations),
@@ -305,7 +395,7 @@ where
 
 // Same open-loop pacing as `execute`, but runs until `stop` is set instead of a
 // fixed iteration count — for load that must span an externally-timed event.
-pub async fn execute_until_raw<F, Fut>(
+pub async fn execute_until_raw<F, Fut, D>(
     pacing: Pacing,
     concurrency: usize,
     stop: Rc<Cell<bool>>,
@@ -313,7 +403,8 @@ pub async fn execute_until_raw<F, Fut>(
 ) -> Result<RawRunOutcome>
 where
     F: FnMut(u64) -> Fut,
-    Fut: Future<Output = Result<()>> + 'static,
+    Fut: Future<Output = Result<D>> + 'static,
+    D: Delivery,
 {
     execute_inner(
         Completion::Stop(stop),
@@ -325,14 +416,15 @@ where
     .await
 }
 
-pub async fn execute_and_sync<F, Fut, S, SFut>(
+pub async fn execute_and_sync<F, Fut, D, S, SFut>(
     cfg: RunConfig,
     request: F,
     sync: S,
 ) -> Result<RunOutcome>
 where
     F: FnMut(u64) -> Fut,
-    Fut: Future<Output = Result<()>> + 'static,
+    Fut: Future<Output = Result<D>> + 'static,
+    D: Delivery,
     S: FnMut(u64) -> SFut,
     SFut: Future<Output = Result<()>> + 'static,
 {
@@ -512,14 +604,15 @@ impl WorkerBudgets {
     }
 }
 
-pub fn execute_threaded<Factory, Request, Fut>(
+pub fn execute_threaded<Factory, Request, Fut, D>(
     config: ThreadRunConfig,
     factory: Factory,
 ) -> Result<RunOutcome>
 where
     Factory: Fn(usize) -> Request + Clone + Send + 'static,
     Request: FnMut(u64) -> Fut,
-    Fut: Future<Output = Result<()>> + 'static,
+    Fut: Future<Output = Result<D>> + 'static,
+    D: Delivery,
 {
     let budgets = WorkerBudgets::partition(
         config.threads,

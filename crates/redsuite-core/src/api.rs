@@ -470,7 +470,7 @@ impl Api {
     ) -> Result<(String, SendTransactionConfig)> {
         Ok((
             base64::engine::general_purpose::STANDARD
-                .encode(bincode::serialize(tx)?),
+                .encode(wincode::serialize(tx)?),
             SendTransactionConfig {
                 encoding: "base64",
                 skip_preflight: true,

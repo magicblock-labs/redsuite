@@ -9,6 +9,7 @@ use instruction::Instruction;
 use pubkey::Pubkey;
 use redsuite_core::redline::Accounts;
 use redsuite_core::report::Unit::{Count, Micros, Ratio, Seconds, Tps};
+use redsuite_core::runner::SendTransaction;
 use redsuite_core::{
     check, check_eq, host, prep,
     profile::ProfileValues,
@@ -240,16 +241,18 @@ async fn execute_cell_burst(
                     |index| {
                         let body = bodies[(index - 1) as usize].clone();
                         let api = api.clone();
-                        async move {
-                            match api.send_prepared(&body).await {
-                                Ok(0) => Ok(()),
-                                Ok(rejected) => {
-                                    Err(format!("{rejected} entries rejected")
-                                        .into())
+                        std::future::ready(Ok(SendTransaction(
+                            move |_: Instant| async move {
+                                match api.send_prepared(&body).await {
+                                    Ok(0) => Ok(()),
+                                    Ok(rejected) => Err(format!(
+                                        "{rejected} entries rejected"
+                                    )
+                                    .into()),
+                                    Err(error) => Err(error),
                                 }
-                                Err(error) => Err(error),
-                            }
-                        }
+                            },
+                        )))
                     },
                 )
                 .await?;
@@ -556,6 +559,7 @@ impl Scenario<ScenarioReport> for ExecutorSaturation {
                     .setting("batch per thread", profile.batch)
                     .setting("concurrency", profile.cell_concurrency(label))
                     .observe("delivery us", Micros, cell.outcome.delivery)
+                    .client_side(&cell.outcome)
                     .setting("metrics sampling", &cell.busy);
             for (name, unit, value) in [
                 ("achieved tps", Tps, Some(cell.outcome.achieved_rps())),
@@ -640,6 +644,7 @@ impl Scenario<ScenarioReport> for ExecutorSaturation {
                 },
             );
         for cell in &cells {
+            summary = summary.with_flags(&cell.outcome);
             let busy = &cell.busy.value;
             for (name, unit, value) in [
                 ("achieved tps", Tps, Some(cell.delivered_tps())),

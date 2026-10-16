@@ -35,6 +35,90 @@ const FOREIGN_REJECTION: &str = "MissingAccount";
 
 pub struct CommitAndUndelegate;
 
+async fn base_requested_undelegation(base: &BaseCtx, er: &ErCtx) -> Result<()> {
+    let payer = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
+    let committees =
+        prep::init_committees(base, &payer, er.identity(), 1).await?;
+    prep::await_committee_clones(er, &committees).await?;
+    let committee = &committees[0];
+    let request = sdk::pda::undelegation_request_pda_from_delegated_account(
+        &committee.pda,
+    );
+    check!(
+        base.account(&request).await?.is_none(),
+        "request {request} starts absent"
+    )?;
+    er.submit_and_confirm(
+        &payer,
+        &[build::increase_count(committee.player.pubkey())],
+    )
+    .await?;
+    let snapshot = er
+        .account(&committee.pda)
+        .await?
+        .ok_or("missing ER committee")?;
+    check_eq!(
+        decoded_count(&snapshot.data)?,
+        1,
+        "latest ER state before base request"
+    )?;
+    check_eq!(
+        decoded_count(
+            &base
+                .account(&committee.pda)
+                .await?
+                .ok_or("missing base committee")?
+                .data
+        )?,
+        0,
+        "the request must settle an ER write absent from base"
+    )?;
+    let signature = base
+        .submit_and_confirm(
+            &payer,
+            &[build::request_undelegation(
+                payer.pubkey(),
+                committee.player.pubkey(),
+            )],
+        )
+        .await?;
+    check::poll_for(
+        &format!(
+            "base request {signature} settles {} and removes {request}",
+            committee.pda
+        ),
+        BASE_STATE_TIMEOUT,
+        || async {
+            let account = base
+                .account(&committee.pda)
+                .await?
+                .ok_or("missing committee")?;
+            check_eq!(
+                account.owner,
+                redshift_interface::ID,
+                "base-requested ownership restored"
+            )?;
+            check_eq!(
+                account.data,
+                snapshot.data,
+                "base-requested undelegation settles the latest bytes"
+            )?;
+            check_eq!(
+                account.lamports,
+                snapshot.lamports,
+                "base-requested undelegation preserves lamports"
+            )?;
+            check!(
+                base.account(&request).await?.is_none(),
+                "completed request {request} is removed"
+            )?;
+            Ok::<_, redsuite_core::DynError>(())
+        },
+    )
+    .await?;
+    Ok(())
+}
+
 fn decoded_count(data: &[u8]) -> Result<u64> {
     Ok(MainAccount::try_from_slice(data)?.count)
 }
@@ -667,6 +751,10 @@ impl Scenario for CommitAndUndelegate {
         let seed_undelegate = OsRng.next_u64();
 
         tokio::try_join!(
+            crate::phase(
+                "base-requested undelegation",
+                base_requested_undelegation(base, er)
+            ),
             test_lifecycle_cell(base, er, 1),
             test_lifecycle_cell(base, er, 2),
             test_foreign_ownership(base, er),

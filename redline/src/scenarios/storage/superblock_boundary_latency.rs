@@ -24,6 +24,7 @@ const LEDGER_FILL_TIMEOUT: Duration = Duration::from_secs(30);
 const NOTIFICATION_POLL: Duration = Duration::from_millis(200);
 const HEALTH_SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
 const BLOCKTIME_MS: u64 = 50;
+const BLOCKTIME: Duration = Duration::from_millis(BLOCKTIME_MS);
 
 const LEDGER_TRANSACTIONS: &str = "engine_ledger_transactions";
 const SUPERBLOCKS: &str = "engine_ledger_superblocks";
@@ -185,18 +186,12 @@ impl PrivateErScenario<ScenarioReport> for SuperblockBoundaryLatency {
             base,
             topology::ErOptions {
                 label: "superblock-boundary".to_owned(),
-                env: vec![
-                    (
-                        "MBV_ENGINE__BLOCKSTORE__BLOCKTIME".to_owned(),
-                        format!("{BLOCKTIME_MS}ms"),
-                    ),
-                    (
-                        "MBV_ENGINE__BLOCKSTORE__SUPERBLOCK".to_owned(),
-                        profile.superblock_slots.to_string(),
-                    ),
-                ],
-                request_timeout: None,
-                base_endpoints: None,
+                settings: Box::new(move |params| {
+                    params.engine.blockstore.blocktime = BLOCKTIME;
+                    params.engine.blockstore.superblock =
+                        profile.superblock_slots;
+                }),
+                ..Default::default()
             },
         )
         .await?;
@@ -234,7 +229,7 @@ impl PrivateErScenario<ScenarioReport> for SuperblockBoundaryLatency {
             |id| {
                 let sender = senders[(id as usize) % senders.len()].clone();
                 let (ix, _) = copy_three(&pool, id);
-                async move { sender.submit(&[ix]).await.map(|_| ()) }
+                sender.staged(&[ix])
             },
         )
         .await?;
@@ -285,7 +280,7 @@ impl PrivateErScenario<ScenarioReport> for SuperblockBoundaryLatency {
                 |id| {
                     let sender = senders[(id as usize) % senders.len()].clone();
                     let (ix, _) = copy_three(&pool, profile.fill + id);
-                    async move { sender.submit(&[ix]).await.map(|_| ()) }
+                    sender.staged(&[ix])
                 },
             )
             .await;
@@ -386,6 +381,7 @@ impl PrivateErScenario<ScenarioReport> for SuperblockBoundaryLatency {
             .setting("payers", profile.payers)
             .setting("concurrency", profile.concurrency)
             .observe("delivery us", Unit::Micros, outcome.delivery)
+            .client_side(&outcome)
             .metric("boundary count", Unit::Count, boundary.count as f64)
             .metric("boundary p50 us", Unit::Micros, boundary.p50 as f64)
             .metric("boundary p95 us", Unit::Micros, boundary.p95 as f64)

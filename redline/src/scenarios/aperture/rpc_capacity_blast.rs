@@ -97,6 +97,7 @@ impl Scenario<ScenarioReport> for RpcCapacityBlast {
                     &[pool[(id as usize) % pool.len()]],
                 )
             },
+            None,
         )?;
         if let Some(ledger_txs_before) =
             before.get(crate::metrics::ENGINE_TRANSACTIONS)
@@ -168,6 +169,7 @@ impl Scenario<ScenarioReport> for RpcCapacityBlast {
             .setting("offered rps", profile.offered)
             .setting("concurrency", profile.concurrency)
             .observe("delivery us", Unit::Micros, outcome.delivery)
+            .client_side(&outcome)
             .observe("achieved rps", Unit::Rps, outcome.rps)
             .metric("delivered rps", Unit::Rps, delivered_rps)
             .metric("blast wall s", Unit::Seconds, outcome.wall.as_secs_f64())

@@ -1,3 +1,4 @@
+pub mod clock;
 pub mod conn;
 pub mod events;
 pub mod http;

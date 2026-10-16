@@ -107,15 +107,21 @@ fn sweep(dir: &std::path::Path) -> Result<Vec<PathBuf>> {
     let mut removed = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
         let name = entry.file_name().to_string_lossy().into_owned();
-        if !(STACK_STORAGE.contains(&name.as_str()) || name.starts_with("er-"))
-        {
-            continue;
-        }
-        fs::remove_dir_all(&path).map_err(|error| {
+        let outcome = if path.is_dir() {
+            if !(STACK_STORAGE.contains(&name.as_str())
+                || name.starts_with("er-"))
+            {
+                continue;
+            }
+            fs::remove_dir_all(&path)
+        } else {
+            if !(name.starts_with("er-") && name.ends_with(".toml")) {
+                continue;
+            }
+            fs::remove_file(&path)
+        };
+        outcome.map_err(|error| {
             format!("removing stack storage {}: {error}", path.display())
         })?;
         removed.push(path);

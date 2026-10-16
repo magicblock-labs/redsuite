@@ -5,7 +5,6 @@ use sdk::{
     ephem::{CallHandler, MagicIntentBundleBuilder},
     ActionArgs, ShortAccountMeta,
 };
-use sdk_ids::system_program;
 use solana_program::{
     account_info::{next_account_info, AccountInfo},
     entrypoint::ProgramResult,
@@ -17,33 +16,14 @@ use solana_program::{
     rent::Rent,
     sysvar::Sysvar,
 };
+use system_interface::instruction as system_instruction;
 
-mod system_instruction {
-    use super::*;
-
-    pub fn create_account(
-        from: &Pubkey,
-        to: &Pubkey,
-        lamports: u64,
-        space: u64,
-        owner: &Pubkey,
-    ) -> Instruction {
-        let mut data = 0u32.to_le_bytes().to_vec();
-        data.extend_from_slice(&lamports.to_le_bytes());
-        data.extend_from_slice(&space.to_le_bytes());
-        data.extend_from_slice(owner.as_ref());
-        Instruction {
-            program_id: system_program::ID,
-            accounts: vec![
-                AccountMeta::new(*from, true),
-                AccountMeta::new(*to, true),
-            ],
-            data,
-        }
-    }
-}
+mod intents;
 
 pub fn process(accounts: &[AccountInfo], payload: &[u8]) -> ProgramResult {
+    if let Some(response) = payload.strip_prefix(&TRANSFER_CALLBACK[1..]) {
+        return intents::callback(accounts, response);
+    }
     let instruction =
         FlexiInstruction::try_from_slice(payload).map_err(|err| {
             msg!("cannot parse the flexi instruction: {}", err);
@@ -88,13 +68,31 @@ pub fn process(accounts: &[AccountInfo], payload: &[u8]) -> ProgramResult {
         AddActionHandler { count } => {
             process_add_action_handler(accounts, count)
         }
+        ScheduleIntents { modes, actions } => {
+            intents::schedule(accounts, &modes, actions)
+        }
+        BaseAction {
+            amount,
+            change,
+            fail,
+        } => intents::action(accounts, amount, change, fail),
+        TransferIntent { amount, fail } => {
+            intents::transfer(accounts, amount, fail)
+        }
     }
 }
 
 fn add(counter_account: &AccountInfo, count: u8) -> ProgramResult {
+    adjust(counter_account, count as i64)
+}
+
+fn adjust(counter_account: &AccountInfo, change: i64) -> ProgramResult {
     let mut counter =
         FlexiCounter::try_from_slice(&counter_account.data.borrow())?;
-    counter.count += count as u64;
+    counter.count = counter
+        .count
+        .checked_add_signed(change)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
     counter.updates += 1;
     let size = counter_account.data_len();
     let counter_data = to_vec(&counter)?;

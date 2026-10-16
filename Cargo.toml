@@ -30,6 +30,7 @@ redline-interface = { path = "programs/redline/interface" }
 redline-program = { path = "programs/redline/program" }
 redshift-interface = { path = "programs/redshift/interface" }
 redshift-program = { path = "programs/redshift/program" }
+system-interface = { package = "solana-system-interface", version = "3.2", features = ["bincode"] }
 redhat-interface = { path = "programs/redhat/interface" }
 redhat-program = { path = "programs/redhat/program" }
 
@@ -40,11 +41,14 @@ async-trait = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
 serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+magicblock-config = { git = "https://github.com/magicblock-labs/magicblock-validator.git", rev = "fb23ace883d65b5c1c99a9e5b651248b2b35ac06" }
 json = { package = "sonic-rs", version = "0.5" }
 rand = "0.8"
 base64 = "0.22"
 bytes = "1"
 bincode = "1.3"
+wincode = "0.5"
 borsh = "1.5"
 sha2 = "0.10"
 # Same dep shape as the validator's test-integration workspace (the proven pair
@@ -54,7 +58,6 @@ sdk = { package = "ephemeral-rollups-sdk", version = "0.16.2", default-features 
 pubkey = { package = "solana-pubkey", version = "4.2", features = ["serde"] }
 hash = { package = "solana-hash", version = "4.3", features = ["serde", "std", "decode", "copy", "atomic", "sanitize"] }
 transaction = { package = "solana-transaction", version = "4.1", features = ["serde", "wincode"] }
-wincode = "0.5.5"
 message = { package = "solana-message", version = "4.1", features = ["serde"] }
 keypair = { package = "solana-keypair", version = "3.1" }
 signature = { package = "solana-signature", version = "3.4" }

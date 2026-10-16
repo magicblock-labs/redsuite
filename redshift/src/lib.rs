@@ -1,6 +1,6 @@
 pub mod scenarios;
 
-use std::{future::Future, time::Duration};
+use std::time::Duration;
 
 use keypair::Keypair;
 use pubkey::Pubkey;
@@ -11,16 +11,7 @@ use redsuite_core::{
     check, check_eq, dlp, receipt, BaseCtx, ChainCtx, ErCtx, Result,
 };
 
-pub async fn phase<T>(
-    name: &str,
-    work: impl Future<Output = Result<T>>,
-) -> Result<T> {
-    work.await
-        .map_err(|error| match error.downcast::<check::CheckError>() {
-            Ok(error) => error.context("phase", name).into(),
-            Err(error) => format!("{name}: {error}").into(),
-        })
-}
+pub use redsuite_core::phase;
 
 pub const ACCOUNT_SPACE: u32 = 128;
 pub const PAYER_LAMPORTS: u64 = 2_000_000_000;

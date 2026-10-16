@@ -23,6 +23,7 @@ const PAYER_LAMPORTS: u64 = 2_000_000_000;
 
 const PREP_PAYER_LAMPORTS: u64 = 4_000_000_000;
 
+const RESUBSCRIBE: Duration = Duration::from_millis(50);
 const STALL_REQUEST_TIMEOUT: Duration = Duration::from_secs(75);
 const CLONE_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -150,20 +151,14 @@ impl Scenario<ScenarioReport> for EnsureGateStall {
                 base,
                 topology::ErOptions {
                     label: format!("s6-{}", cell.name),
-                    env: vec![
-                        (
-                            "MBV_ENGINE__ACCOUNTSDB__LRU_CAPACITY".to_owned(),
-                            cell.cap.to_string(),
-                        ),
+                    settings: Box::new(move |params| {
+                        params.engine.accountsdb.lru_capacity = cell.cap;
                         // campaign parity: fast resubscription keeps the
                         // churn cadence high
-                        (
-                            "MBV_CHAINLINK__RESUBSCRIPTION_DELAY".to_owned(),
-                            "50ms".to_owned(),
-                        ),
-                    ],
+                        params.chainlink.resubscription_delay = RESUBSCRIBE;
+                    }),
                     request_timeout: Some(STALL_REQUEST_TIMEOUT),
-                    base_endpoints: None,
+                    ..Default::default()
                 },
             )
             .await?;
@@ -186,7 +181,7 @@ impl Scenario<ScenarioReport> for EnsureGateStall {
                     let accounts = sample_accounts(&pool, id, READ_WIDTH);
                     let ix = build::read_accounts_data(id, &accounts);
                     let sender = sender.clone();
-                    async move { sender.submit(&[ix]).await.map(|_| ()) }
+                    sender.staged(&[ix])
                 }
             };
             let outcome = execute(
@@ -250,6 +245,7 @@ impl Scenario<ScenarioReport> for EnsureGateStall {
                         Unit::Micros,
                         cell_outcome.outcome.delivery,
                     )
+                    .client_side(&cell_outcome.outcome)
                     .metric(
                         "achieved tps",
                         Unit::Tps,
@@ -365,6 +361,7 @@ impl Scenario<ScenarioReport> for EnsureGateStall {
                     Unit::Tps,
                     cell.outcome.achieved_rps(),
                 )
+                .with_flags(&cell.outcome)
                 .metric(
                     format!("{} p50 us", cell.name),
                     Unit::Micros,

@@ -25,6 +25,7 @@ const FETCHES_FOUND_COUNTER: &str = "mbv_account_fetches_found_count";
 const ENSURE_HISTOGRAM: &str = r#"mbv_ensure_accounts_time{kind="account"}"#;
 
 const SETTLE_POLL: Duration = Duration::from_millis(500);
+const RESUBSCRIBE: Duration = Duration::from_millis(50);
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 async fn settled_scrape(er: &ErCtx) -> Result<redsuite_core::Metrics> {
@@ -158,18 +159,12 @@ impl Scenario<ScenarioReport> for CloneLruChurn {
                 base,
                 topology::ErOptions {
                     label: format!("s5-{}", cell.name),
-                    env: vec![
-                        (
-                            "MBV_ENGINE__ACCOUNTSDB__LRU_CAPACITY".to_owned(),
-                            cell.cap.to_string(),
-                        ),
-                        (
-                            "MBV_CHAINLINK__RESUBSCRIPTION_DELAY".to_owned(),
-                            "50ms".to_owned(),
-                        ),
-                    ],
+                    settings: Box::new(move |params| {
+                        params.engine.accountsdb.lru_capacity = cell.cap;
+                        params.chainlink.resubscription_delay = RESUBSCRIBE;
+                    }),
                     request_timeout: Some(REQUEST_TIMEOUT),
-                    base_endpoints: None,
+                    ..Default::default()
                 },
             )
             .await?;
@@ -200,7 +195,9 @@ impl Scenario<ScenarioReport> for CloneLruChurn {
                 move |id: u64| {
                     let account = pick_account(&pool, id);
                     let api = api.clone();
-                    async move { api.get_account(&account).await.map(|_| ()) }
+                    std::future::ready(Ok(move |_: Instant| async move {
+                        api.get_account(&account).await.map(|_| ())
+                    }))
                 }
             };
 
@@ -287,6 +284,7 @@ impl Scenario<ScenarioReport> for CloneLruChurn {
                         Unit::Micros,
                         cell_outcome.outcome.delivery,
                     )
+                    .client_side(&cell_outcome.outcome)
                     .metric(
                         "achieved reads /s",
                         Unit::PerSecond,
@@ -422,6 +420,7 @@ impl Scenario<ScenarioReport> for CloneLruChurn {
                     Unit::PerSecond,
                     cell.outcome.achieved_rps(),
                 )
+                .with_flags(&cell.outcome)
                 .metric(
                     format!("{} p50 us", cell.name),
                     Unit::Micros,
