@@ -344,16 +344,25 @@ impl PrivateErScenario for CacheLifecycle {
                 None
             };
             set_base(901, readonly).await?;
-            let fetched = er.accounts(readonly).await?;
+            // Base confirmation does not wait for ER subscription delivery.
+            check::poll_for(
+                "final readonly mirrors synchronized",
+                TIMEOUT,
+                || async {
+                    let fetched = er.accounts(readonly).await?;
+                    for (key, account) in readonly.iter().zip(fetched) {
+                        check_eq!(
+                            crate::account_id(account),
+                            Some(901),
+                            "final fetch of {key}"
+                        )?;
+                    }
+                    Result::Ok(())
+                },
+            )
+            .await?;
             let local = crate::local_accounts(er, readonly).await?;
-            for ((key, fetched), local) in
-                readonly.iter().zip(fetched).zip(local)
-            {
-                check_eq!(
-                    crate::account_id(fetched),
-                    Some(901),
-                    "final fetch of {key}"
-                )?;
+            for (key, local) in readonly.iter().zip(local) {
                 // Readonly entries may be evicted after the fetch.
                 if let Some(local) = local {
                     check_eq!(
