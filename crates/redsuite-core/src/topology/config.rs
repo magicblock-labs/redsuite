@@ -2,8 +2,7 @@ use std::{
     fs,
     net::SocketAddr,
     path::{Path, PathBuf},
-    process::Child,
-    process::Command,
+    process::{Child, Command},
     time::Duration,
 };
 
@@ -16,9 +15,10 @@ use magicblock_config::{
 use pubkey::Pubkey;
 use serde::Serialize;
 use signer::Signer;
+use tracing::warn;
 
 use super::{process, state};
-use crate::{catalog::Fixture, console, manifest, Result};
+use crate::{catalog::Fixture, manifest, Result};
 
 const LEDGER_SIZE_LIMIT_UNREACHABLE: u64 = 1 << 60;
 
@@ -194,9 +194,9 @@ fn base_programs(er_bin: &Path) -> Result<StagedPrograms> {
 
     match committor_so(er_bin) {
         Some(so) => bpf.push((COMMITTOR_ID.to_owned(), so)),
-        None => eprintln!(
-            "[redsuite] warning: magicblock_committor_program.so not found in the ER binary's \
-             build tree (cargo build-sbf it in the validator repo) — commit scenarios will fail"
+        None => warn!(
+            "magicblock_committor_program.so missing from the ER build; \
+             build it with cargo build-sbf or commit scenarios will fail"
         ),
     }
 
@@ -209,9 +209,13 @@ fn base_programs(er_bin: &Path) -> Result<StagedPrograms> {
                 bpf.push((fixture.program_id().to_string(), so));
                 loaded_fixtures.push(fixture.so_name().to_owned());
             }
-            Err(error) => eprintln!(
-                "[redsuite] warning: {error} — its family's scenarios will fail"
-            ),
+            Err(error) => {
+                warn!(
+                    ?fixture,
+                    %error,
+                    "fixture unavailable; dependent scenarios cannot run",
+                )
+            }
         }
     }
     Ok(StagedPrograms {
@@ -287,9 +291,9 @@ impl BasePlan {
                     geyser_plugin_config = Some(path);
                     plugin = tag;
                 }
-                Err(e) => console::line(format_args!(
-                    "no Yellowstone gRPC feed on this base: {e}"
-                )),
+                Err(error) => {
+                    warn!(%error, "Yellowstone setup failed; starting base without gRPC")
+                }
             }
         }
         let mut upgradeable_v3 = Vec::new();

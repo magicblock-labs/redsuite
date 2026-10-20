@@ -170,8 +170,8 @@ harness also reclaims private rollups left behind by failed scenarios.
 ## 📊 Results and diagnostics
 
 Redshift and Redhat return verdicts in the console without persisting benchmark
-reports. Failed scenarios include diagnostic details; set `REDSUITE_VERBOSE=1`
-to include stack and scenario details for successful checks too. A failed run
+reports. Failed scenarios include diagnostic details; set `RUST_LOG=debug`
+to include phase and workload progress. `RUST_LOG` also applies to launched validators. A failed run
 returns a nonzero exit status.
 
 Redline writes reports under `target/redsuite-reports/`. Reports include workload
@@ -231,7 +231,7 @@ diagnostic measurements. Client latency series have timing-origin suffixes
 | `REDSUITE_ACCOUNTSDB_DIR` | Place rollup and verifier accounts databases separately from their ledgers. |
 | `REDSUITE_CLONE_URL` | Choose the RPC endpoint used to acquire base-chain programs on a cold boot. |
 | `REDSUITE_PROFILE` | Set the default Redline workload to `lite` or `full`; `--profile` overrides it. |
-| `REDSUITE_VERBOSE` | Include operational details for passing scenarios as well as failures. |
+| `RUST_LOG` | Log filter for RedSuite and launched validators; defaults to `info`. Use `debug` for passing-run details. |
 
 The compiled runner works without Cargo or a source checkout at runtime, but it
 still needs the validator binaries, `solana-test-validator`, and staged fixture

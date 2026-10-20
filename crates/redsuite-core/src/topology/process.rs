@@ -7,8 +7,9 @@ use std::{
 };
 
 use rand::Rng;
+use tracing::warn;
 
-use crate::{console, host::proc_running, resources::ResourceRecord, Result};
+use crate::{host::proc_running, resources::ResourceRecord, Result};
 
 pub(super) const KILL_GRACE: Duration = Duration::from_secs(5);
 pub(super) const POLL: Duration = Duration::from_millis(250);
@@ -69,6 +70,7 @@ pub(super) async fn terminate(
             return Ok((status, needed_sigkill));
         }
         if !escalated && std::time::Instant::now() >= grace_deadline {
+            warn!(pid, "graceful shutdown timed out; sending SIGKILL");
             send_signal(pid, "-KILL");
             escalated = true;
             needed_sigkill = true;
@@ -102,6 +104,7 @@ pub(crate) fn kill_pid(pid: u32) {
         std::thread::sleep(Duration::from_millis(100));
     }
     if proc_running(pid) {
+        warn!(pid, "process still alive after SIGTERM; sending SIGKILL");
         let _ = Command::new("kill")
             .args(["-KILL", &pid.to_string()])
             .status();
@@ -596,17 +599,11 @@ impl Drop for Owned {
         match self.audit(child.try_wait()).ok().flatten() {
             Some(status) => {
                 let exit = describe_exit(&status);
-                console::line(format_args!(
-                    "{kind} `{label}` (pid {pid}) had already exited before \
-                     cleanup: {exit}"
-                ));
+                warn!(kind, label, %exit, "process exited before cleanup");
                 self.record
                     .record_exit(format!("died before cleanup: {exit}"));
             }
             None => {
-                console::debug(format_args!(
-                    "stopping {kind} `{label}` (pid {pid})"
-                ));
                 kill_pid(pid);
                 let exit = self
                     .audit(child.wait())

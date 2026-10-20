@@ -1,19 +1,17 @@
-use std::{
-    rc::Rc,
-    time::{Duration, Instant},
-};
+use std::{rc::Rc, time::Duration};
 
 use async_trait::async_trait;
 use pubkey::Pubkey;
-use redsuite_core::redline::Accounts;
-use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, prep,
     profile::ProfileValues,
+    redline::Accounts,
     report,
+    report::Unit,
     runner::{execute, Pacing, RunConfig, RunOutcome},
     topology, BaseCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
 };
+use tracing::{debug, warn};
 
 use crate::program::instruction::build;
 
@@ -98,7 +96,6 @@ struct Cell {
 
 struct CellOutcome {
     name: &'static str,
-    cap: usize,
     outcome: RunOutcome,
     ensure_avg_s: Option<f64>,
     monitored_end: f64,
@@ -118,16 +115,9 @@ impl Scenario<ScenarioReport> for EnsureGateStall {
         let prep_payers =
             prep::funded_payers(base, profile.prep_payers, PREP_PAYER_LAMPORTS)
                 .await?;
-        let prep_started = Instant::now();
         let pool = Accounts::new(ACCOUNT_SPACE, er.identity())
             .init_batched(base, &prep_payers, profile.working_set, false)
             .await?;
-        eprintln!(
-            "[redsuite] {}: prepped {} non-delegated 2 KiB accounts in {:.1} s",
-            self.name(),
-            pool.len(),
-            prep_started.elapsed().as_secs_f64(),
-        );
         let payer = Rc::new(prep::funded_payer(base, PAYER_LAMPORTS).await?);
 
         let cells_spec = [
@@ -198,7 +188,6 @@ impl Scenario<ScenarioReport> for EnsureGateStall {
 
             let cell_outcome = CellOutcome {
                 name: cell.name,
-                cap: cell.cap,
                 outcome,
                 ensure_avg_s: delta.histogram_avg(ENSURE_HISTOGRAM),
                 // recorded for context only: the gauge refreshes on the
@@ -206,23 +195,11 @@ impl Scenario<ScenarioReport> for EnsureGateStall {
                 monitored_end: delta.gauge(MONITORED_GAUGE).unwrap_or(0.0),
                 evictions: delta.counter(EVICTED_COUNTER).unwrap_or(0.0),
             };
-            eprintln!(
-                "[redsuite] {}: {} (cap {}): {:.0} tx/s, p50 {} us / p95 {} us, \
-                 {} delivered / {} failed, ensure avg {}, monitored {:.0}, evictions {:.0}",
-                self.name(),
+            debug!(
                 cell_outcome.name,
-                cell_outcome.cap,
-                cell_outcome.outcome.achieved_rps(),
-                cell_outcome.outcome.delivery.median,
-                cell_outcome.outcome.delivery.quantile95,
-                cell_outcome.outcome.delivered,
                 cell_outcome.outcome.failed,
-                cell_outcome
-                    .ensure_avg_s
-                    .map(|seconds| format!("{seconds:.6} s"))
-                    .unwrap_or_else(|| "n/a".to_owned()),
-                cell_outcome.monitored_end,
                 cell_outcome.evictions,
+                "ensure-gate cell finished",
             );
 
             let cell_report =
@@ -291,19 +268,16 @@ impl Scenario<ScenarioReport> for EnsureGateStall {
             healthy.outcome.first_error
         )?;
         if healthy.outcome.delivery.median >= 1_000_000 {
-            eprintln!(
-                "[redsuite] {}: warning: healthy cell p50 {} us left the \
-                 sub-second range",
-                self.name(),
-                healthy.outcome.delivery.median
+            warn!(
+                healthy.outcome.delivery.median,
+                "healthy cell median exceeds latency bound",
             );
         }
-        if let Some(ensure_avg) = healthy.ensure_avg_s {
-            if ensure_avg >= 0.005 {
-                eprintln!(
-                    "[redsuite] {}: warning: healthy warm ensure avg \
-                     {ensure_avg:.6} s left the µs–ms range",
-                    self.name()
+        if let Some(ensure_avg_s) = healthy.ensure_avg_s {
+            if ensure_avg_s >= 0.005 {
+                warn!(
+                    ensure_avg_s,
+                    "healthy cell mean ensure latency exceeds bound",
                 );
             }
         }
@@ -333,10 +307,6 @@ impl Scenario<ScenarioReport> for EnsureGateStall {
         } else {
             0.0
         };
-        eprintln!(
-            "[redsuite] {}: thrash p50 is {slowdown:.0}x the healthy p50",
-            self.name()
-        );
 
         let mut summary = ScenarioReport::ok(self.name())
             .setting("profile", profile.name)

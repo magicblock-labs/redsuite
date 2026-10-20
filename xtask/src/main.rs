@@ -4,7 +4,8 @@ use std::{
     process::{exit, Command},
 };
 
-use redsuite_core::{catalog::Fixture, frontend, manifest};
+use redsuite_core::{catalog::Fixture, frontend, logging, manifest};
+use tracing::{error, info};
 
 type Result<T> = redsuite_core::Result<T>;
 
@@ -17,8 +18,12 @@ usage:
 ";
 
 fn main() {
+    if let Err(error) = logging::init() {
+        eprintln!("cannot initialize logging: {error}");
+        exit(1);
+    }
     if let Err(err) = run() {
-        eprintln!("error: {err}");
+        error!(error = %err, "command failed");
         exit(1);
     }
 }
@@ -102,7 +107,7 @@ fn programs() -> Result<()> {
         Fixture::RedshiftProgramSlimUpgraded.so_name(),
     )?;
     let manifest_path = manifest::emit()?;
-    eprintln!("staged fixture manifest: {}", manifest_path.display());
+    info!(?manifest_path, "staged fixture manifest");
     Ok(())
 }
 

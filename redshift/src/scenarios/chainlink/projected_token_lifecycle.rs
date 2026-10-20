@@ -481,7 +481,6 @@ impl PrivateErScenario for ProjectedTokenLifecycle {
                             delegated: bool|
                -> Result<()> {
             let observed = balances(base, er, &wallets, &vault).await?;
-            eprintln!("[redsuite] {LABEL}: {phase}: {observed:?}");
             check_eq!(&observed, expected, "{phase}: token balances")?;
             observed.conserved(delegated)?;
             Ok(())

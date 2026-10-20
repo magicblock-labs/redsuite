@@ -11,6 +11,7 @@ use redsuite_core::{
 };
 use signature::Signature;
 use signer::Signer;
+use tracing::debug;
 
 const LABEL: &str = "ledger-retention";
 const SUPERBLOCK_SLOTS: u64 = 40;
@@ -316,14 +317,12 @@ impl PrivateErScenario for LedgerRetention {
                         first_pruning_event = Some(events);
                     }
                     previous_pruned = view.pruned.len();
-                    eprintln!(
-                        "[redsuite] {}: retention event {events}: {} pruned, \
-                         {} retained, {} adds, superblocks allocated {}",
-                        self.name(),
-                        view.pruned.len(),
-                        view.retained.len(),
-                        adds,
-                        superblocks(er).await?,
+                    let superblocks = superblocks(er).await?;
+                    debug!(
+                        pruned = view.pruned.len(),
+                        retained = view.retained.len(),
+                        superblocks,
+                        "retention advanced",
                     );
                 }
                 if events >= RETENTION_EVENTS && first_pruning_event.is_some() {

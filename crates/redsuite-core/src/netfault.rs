@@ -20,7 +20,6 @@ use tokio_tungstenite::tungstenite::{Message, Utf8Bytes};
 
 use crate::{
     api::decode_transaction,
-    console,
     context::{BaseCtx, ChainCtx},
     topology::BaseEndpoints,
     transport::http::{self, TransportError},
@@ -496,10 +495,6 @@ impl BaseProxies {
                 shared.clone(),
             )),
         ];
-        console::debug(format_args!(
-            "base proxies up: rpc {} ws {}",
-            endpoints.rpc_url, endpoints.ws_url
-        ));
         Ok(Self {
             shared,
             endpoints,

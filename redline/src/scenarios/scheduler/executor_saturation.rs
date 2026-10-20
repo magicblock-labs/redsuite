@@ -7,23 +7,25 @@ use std::{
 use async_trait::async_trait;
 use instruction::Instruction;
 use pubkey::Pubkey;
-use redsuite_core::redline::Accounts;
-use redsuite_core::report::Unit::{Count, Micros, Ratio, Seconds, Tps};
-use redsuite_core::runner::SendTransaction;
 use redsuite_core::{
     check, check_eq, host, prep,
     profile::ProfileValues,
-    redline::causal::{compute_unit_limit, CU_LIMIT, HASH_INIT},
+    redline::{
+        causal::{compute_unit_limit, CU_LIMIT, HASH_INIT},
+        Accounts,
+    },
     report,
+    report::Unit::{Count, Micros, Ratio, Seconds, Tps},
     runner::{
         execute_raw, merge_outcomes, spawn_workers, Pacing, RawRunOutcome,
-        RunConfig, RunOutcome, WorkerBudgets,
+        RunConfig, RunOutcome, SendTransaction, WorkerBudgets,
     },
     sampler::{MeanMax, Sampled, Sampler, Trailing},
     Api, BaseCtx, ChainCtx, ErClient, ErCtx, MetricsDelta, Result, Scenario,
     ScenarioReport, SendBody, TxSender,
 };
 use signature::Signature;
+use tracing::debug;
 
 use crate::program::{instruction::build, layout, utils::hash_chain};
 
@@ -337,7 +339,6 @@ impl Scenario<ScenarioReport> for ExecutorSaturation {
     async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
         let profile = PROFILES.select(base.config().profile);
 
-        let prep_started = Instant::now();
         let payers =
             prep::funded_payers(base, profile.accounts, PAYER_LAMPORTS).await?;
         let accounts = Accounts {
@@ -354,12 +355,6 @@ impl Scenario<ScenarioReport> for ExecutorSaturation {
             CLONE_TIMEOUT,
         )
         .await?;
-        eprintln!(
-            "[redsuite] {}: prepped {} payers x 1 delegated account in {:.1} s",
-            self.name(),
-            profile.accounts,
-            prep_started.elapsed().as_secs_f64(),
-        );
         let accounts = Arc::new(accounts);
         let payer_bytes = prep::payer_bytes(&payers);
         let er_rpc_url = er.api().url().to_owned();
@@ -517,30 +512,11 @@ impl Scenario<ScenarioReport> for ExecutorSaturation {
                 execution_failed,
             };
             let busy = &cell.busy.value;
-            eprintln!(
-                "[redsuite] {}: {label} (sha256 iters {iters}): sign+encode {:.1} s, \
-                 blasted in {:.1} s ({:.0} tps delivered), {:.0} tps executed \
-                 (drain {:.1} s), p50 {} us / p95 {} us, probe {:.0} cus, \
-                 busy executors mean {:.1} / max {:.0} over {} samples, \
-                 dependency ratio {:.3}, validator cores {:.2} (top thread \
-                 {:.2}, {} threads >= {:.1})",
-                self.name(),
-                cell.sign_s,
-                cell.blast_s,
-                cell.delivered_tps(),
-                cell.executed_tps(cell_iterations),
-                cell.drain.as_secs_f64(),
-                cell.outcome.delivery.median,
-                cell.outcome.delivery.quantile95,
-                cell.probe_cus,
-                busy.mean(),
+            debug!(
+                label,
+                busy_mean = busy.mean(),
                 busy.max,
-                busy.count,
-                cell.dependency_ratio().unwrap_or(f64::NAN),
-                cell.cores,
-                cell.top_thread_cores,
-                cell.busy_threads,
-                BUSY_THREAD_CORES,
+                "executor saturation cell finished",
             );
 
             let mut cell_report =

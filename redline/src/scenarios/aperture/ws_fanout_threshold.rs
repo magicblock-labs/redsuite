@@ -2,18 +2,21 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use pubkey::Pubkey;
-use redsuite_core::redline::{copy_three, execute_kernel, Accounts};
-use redsuite_core::report::Unit;
-use redsuite_core::transport::clock::SendClock;
 use redsuite_core::{
     check, check_eq, prep,
     profile::ProfileValues,
+    redline::{copy_three, execute_kernel, Accounts},
     report,
+    report::Unit,
     runner::{Pacing, RunOutcome, ThreadRunConfig},
     stats::{ObservationsStats, StreamingStats},
-    transport::subpool::{ConnReport, ExpectedWrites, SubscriberPool},
+    transport::{
+        clock::SendClock,
+        subpool::{ConnReport, ExpectedWrites, SubscriberPool},
+    },
     BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
 };
+use tracing::{debug, warn};
 
 const PREP_PAYER_LAMPORTS: u64 = 4_000_000_000;
 
@@ -250,21 +253,9 @@ impl Scenario<ScenarioReport> for WsFanoutThreshold {
                 over_threshold,
                 received_total,
             };
-            eprintln!(
-                "[redsuite] {}: ws{} — {:.0} tps, lag p50 {} us / p95 {} us / max {} us, \
-                 received {}..{} per conn ({} total), missing finals {}, incomplete pairs {}, >1s {}",
-                self.name(),
+            debug!(
                 connections,
-                cell_outcome.outcome.achieved_rps(),
-                cell_outcome.lag.median,
-                cell_outcome.lag.quantile95,
-                cell_outcome.lag.max,
-                received_min,
-                received_max,
-                received_total,
-                missing_final,
-                incomplete,
-                over_threshold,
+                missing_final, incomplete, "fan-out cell finished",
             );
 
             let cell_report =
@@ -363,31 +354,25 @@ impl Scenario<ScenarioReport> for WsFanoutThreshold {
 
         let baseline = &cells[0];
         if baseline.lag.quantile95 >= CLIFF_P95_US {
-            eprintln!(
-                "[redsuite] {}: warning: baseline cell ws{} lag p95 {} us is \
-                 already past the cliff threshold at minimum fan-out",
-                self.name(),
+            warn!(
                 baseline.connections,
-                baseline.lag.quantile95
+                baseline.lag.quantile95,
+                "baseline already exceeds fan-out cliff threshold",
             );
         }
         if baseline.missing_final > 0 {
-            eprintln!(
-                "[redsuite] {}: warning: baseline ws{}: {} (connection, \
-                 account) pairs never received the final produced state",
-                self.name(),
+            warn!(
                 baseline.connections,
-                baseline.missing_final
+                baseline.missing_final,
+                "baseline subscriptions missed final state",
             );
         }
         if baseline.received_min != baseline.received_max {
-            eprintln!(
-                "[redsuite] {}: warning: baseline ws{}: connections received \
-                 unequal notification counts ({}..{})",
-                self.name(),
+            warn!(
                 baseline.connections,
                 baseline.received_min,
-                baseline.received_max
+                baseline.received_max,
+                "baseline connections received unequal notification counts",
             );
         }
 
@@ -408,15 +393,6 @@ impl Scenario<ScenarioReport> for WsFanoutThreshold {
             })
             .map(|cell| cell.connections)
             .unwrap_or(0);
-        eprintln!(
-            "[redsuite] {}: cliff {}",
-            self.name(),
-            if cliff == 0 {
-                "not reached on this ladder".to_owned()
-            } else {
-                format!("at ws{cliff}")
-            }
-        );
 
         let mut summary = ScenarioReport::ok(self.name())
             .setting("profile", profile.name)

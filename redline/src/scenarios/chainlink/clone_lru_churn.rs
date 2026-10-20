@@ -2,16 +2,17 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use pubkey::Pubkey;
-use redsuite_core::redline::Accounts;
-use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, prep,
     profile::ProfileValues,
+    redline::Accounts,
     report,
+    report::Unit,
     runner::{execute, Pacing, RunConfig, RunOutcome},
     topology, BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario,
     ScenarioReport,
 };
+use tracing::{debug, warn};
 
 const ACCOUNT_SPACE: u32 = 2048;
 const PREP_PAYER_LAMPORTS: u64 = 4_000_000_000;
@@ -129,16 +130,9 @@ impl Scenario<ScenarioReport> for CloneLruChurn {
         let prep_payers =
             prep::funded_payers(base, profile.prep_payers, PREP_PAYER_LAMPORTS)
                 .await?;
-        let prep_started = Instant::now();
         let pool = Accounts::new(ACCOUNT_SPACE, er.identity())
             .init_batched(base, &prep_payers, profile.working_set, false)
             .await?;
-        eprintln!(
-            "[redsuite] {}: prepped {} non-delegated 2 KiB accounts in {:.1} s",
-            self.name(),
-            pool.len(),
-            prep_started.elapsed().as_secs_f64(),
-        );
 
         let mut cells_spec = vec![Cell {
             name: "closure".to_owned(),
@@ -169,7 +163,6 @@ impl Scenario<ScenarioReport> for CloneLruChurn {
             )
             .await?;
             let cell_er = private.ctx();
-            let sweep_started = Instant::now();
             if cell.closure {
                 prep::prewarm(
                     cell_er,
@@ -181,13 +174,6 @@ impl Scenario<ScenarioReport> for CloneLruChurn {
             } else {
                 prep::touch(cell_er, &pool).await;
             }
-            eprintln!(
-                "[redsuite] {}: {} swept {} accounts in {:.1} s",
-                self.name(),
-                cell.name,
-                pool.len(),
-                sweep_started.elapsed().as_secs_f64(),
-            );
 
             let request = {
                 let pool = pool.clone();
@@ -243,28 +229,11 @@ impl Scenario<ScenarioReport> for CloneLruChurn {
                 monitored_end: delta.gauge(MONITORED_GAUGE).unwrap_or(0.0),
                 outcome,
             };
-            eprintln!(
-                "[redsuite] {}: {} (cap {}): {:.0} reads/s, p50 {} us / p95 {} us, \
-                 {} delivered / {} failed, evictions {:.0} ({:.1}/s), fetches found {}, ensure avg {}, monitored {:.0}",
-                self.name(),
-                cell_outcome.name,
-                cell_outcome.cap,
-                cell_outcome.outcome.achieved_rps(),
-                cell_outcome.outcome.delivery.median,
-                cell_outcome.outcome.delivery.quantile95,
-                cell_outcome.outcome.delivered,
+            debug!(
+                %cell_outcome.name,
                 cell_outcome.outcome.failed,
                 cell_outcome.evictions,
-                cell_outcome.eviction_rate,
-                cell_outcome
-                    .fetches_found
-                    .map(|count| format!("{count:.0}"))
-                    .unwrap_or_else(|| "n/a".to_owned()),
-                cell_outcome
-                    .ensure_avg_s
-                    .map(|seconds| format!("{seconds:.6} s"))
-                    .unwrap_or_else(|| "n/a".to_owned()),
-                cell_outcome.monitored_end,
+                "cache churn cell finished",
             );
 
             let cell_report =
@@ -350,11 +319,9 @@ impl Scenario<ScenarioReport> for CloneLruChurn {
             closure.evictions
         )?;
         if closure.outcome.delivery.median >= 1_000_000 {
-            eprintln!(
-                "[redsuite] {}: warning: closure cell p50 {} us left the \
-                 sub-second range",
-                self.name(),
-                closure.outcome.delivery.median
+            warn!(
+                closure.outcome.delivery.median,
+                "cache-fit cell median exceeds latency bound",
             );
         }
 

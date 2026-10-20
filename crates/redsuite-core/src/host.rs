@@ -1,5 +1,8 @@
 use std::{collections::HashMap, time::Instant};
 
+#[cfg(target_os = "macos")]
+use tracing::warn;
+
 use crate::Result;
 
 #[cfg(target_os = "linux")]
@@ -31,9 +34,7 @@ pub fn proc_running(pid: u32) -> bool {
         Ok(info) => info.pbi_status != SZOMB,
         Err(error) => {
             if !error.contains("No such process") {
-                eprintln!(
-                    "[redsuite] pid {pid} liveness query failed: {error}"
-                );
+                warn!(pid, %error, "process liveness query failed");
             }
             false
         }

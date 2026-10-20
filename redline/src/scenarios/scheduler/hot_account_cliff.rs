@@ -2,15 +2,16 @@ use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use pubkey::Pubkey;
-use redsuite_core::redline::{copy_three, execute_kernel, Accounts};
-use redsuite_core::report::Unit;
 use redsuite_core::{
     check_eq, prep,
     profile::ProfileValues,
+    redline::{copy_three, execute_kernel, Accounts},
     report,
+    report::Unit,
     runner::{Pacing, RunOutcome, ThreadRunConfig},
     BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
 };
+use tracing::{debug, warn};
 
 const PAYER_LAMPORTS: u64 = 2_000_000_000;
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(300);
@@ -25,7 +26,7 @@ const HEALTHY_P50_US: f64 = 15_000.0;
 struct Profile {
     name: &'static str,
     payers: usize,
-    // hot write-set sizes; widest first (it is the healthy baseline),
+    // Hot write-set sizes; widest first as the low-contention baseline.
     // narrowest last so a wedged cell cannot poison the others
     cells: &'static [u8],
     threads: usize,
@@ -188,13 +189,10 @@ impl Scenario<ScenarioReport> for HotAccountCliff {
             }
 
             let cell = CellResult { hot, outcome };
-            eprintln!(
-                "[redsuite] {}: hot{hot}: p50 {} us / p95 {} us, {:.0} tps of {} offered",
-                self.name(),
-                cell.outcome.delivery.median,
-                cell.outcome.delivery.quantile95,
-                cell.outcome.achieved_rps(),
-                profile.rate,
+            debug!(
+                hot,
+                delivered_tps = cell.outcome.achieved_rps(),
+                "hot account cell finished",
             );
 
             let cell_report =
@@ -237,36 +235,28 @@ impl Scenario<ScenarioReport> for HotAccountCliff {
             cells.push(cell);
         }
 
-        // the widest cell is the healthy baseline every other cell is
-        // judged against — and it must itself be healthy, else the whole
-        // sweep is INVALID (saturated baseline = measuring the harness,
-        // not the scheduler; check `validator tx processing avg us` in the
-        // cell report to attribute, then lower the offered rate)
+        // High baseline latency confounds comparisons of contention effects.
+        // Validator processing latency helps separate execution from client delay.
         let p50 = |cell: &CellResult| cell.outcome.delivery.median as f64;
-        let base_p50 = p50(&cells[0]);
-        if base_p50 > HEALTHY_P50_US {
-            eprintln!(
-                "[redsuite] {}: warning: baseline hot{} p50 {:.0} us is \
-                 itself unhealthy (> {HEALTHY_P50_US:.0} us) — offered {} \
-                 tps exceeds what this harness+validator pair sustains",
-                self.name(),
-                cells[0].hot,
-                base_p50,
+        let baseline_p50_us = p50(&cells[0]);
+        if baseline_p50_us > HEALTHY_P50_US {
+            warn!(
+                hot = cells[0].hot,
+                baseline_p50_us,
                 profile.rate,
+                "baseline median exceeds latency bound; sweep may be load-limited",
             );
         }
         for cell in cells.iter().filter(|cell| cell.hot >= 16) {
-            let bound = (base_p50 * FLAT_FACTOR).max(HEALTHY_P50_US);
-            if p50(cell) > bound {
-                eprintln!(
-                    "[redsuite] {}: warning: hot{} p50 {:.0} us exceeds the \
-                     healthy bound {:.0} us (baseline hot{} p50 {:.0} us)",
-                    self.name(),
+            let bound_us = (baseline_p50_us * FLAT_FACTOR).max(HEALTHY_P50_US);
+            if p50(cell) > bound_us {
+                warn!(
                     cell.hot,
-                    p50(cell),
-                    bound,
-                    cells[0].hot,
-                    base_p50,
+                    p50_us = p50(cell),
+                    bound_us,
+                    baseline_hot = cells[0].hot,
+                    baseline_p50_us,
+                    "hot account latency exceeded healthy bound",
                 );
             }
         }
@@ -274,7 +264,7 @@ impl Scenario<ScenarioReport> for HotAccountCliff {
         // baseline.
         let cliff = cells
             .iter()
-            .find(|cell| p50(cell) > base_p50 * CLIFF_FACTOR)
+            .find(|cell| p50(cell) > baseline_p50_us * CLIFF_FACTOR)
             .map(|cell| cell.hot);
 
         let cell_names: Vec<String> =

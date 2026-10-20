@@ -2,16 +2,17 @@ use std::{rc::Rc, time::Duration};
 
 use async_trait::async_trait;
 use pubkey::Pubkey;
-use redsuite_core::redline::{copy_three, Accounts};
-use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, host, prep,
     profile::ProfileValues,
+    redline::{copy_three, Accounts},
     report,
+    report::Unit,
     runner::{execute, Pacing, RunConfig, RunOutcome},
     topology, BaseCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
     TxSender,
 };
+use tracing::{debug, warn};
 
 const PREP_PAYER_LAMPORTS: u64 = 4_000_000_000;
 const CLONE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -242,31 +243,9 @@ impl Scenario<ScenarioReport> for StorageProdsizeSustain {
                 fill_ledger_txs,
                 windows: [window_a, window_b],
             };
-            eprintln!(
-                "[redsuite] {}: {} (superblock {}) — fill recorded {:.0} \
-                 ledger txs, dir delta {:.1} MB; \
-                 window A p50 {} us / p95 {} us @ {:.0} tps, \
-                 window B p50 {} us / p95 {} us @ {:.0} tps, \
-                 validator tx avg {} / {} us",
-                self.name(),
+            debug!(
                 cell.name,
-                cell.superblock_slots,
-                cell.fill_ledger_txs,
-                cell.fill_growth_bytes as f64 / 1e6,
-                cell.windows[0].outcome.delivery.median,
-                cell.windows[0].outcome.delivery.quantile95,
-                cell.windows[0].outcome.achieved_rps(),
-                cell.windows[1].outcome.delivery.median,
-                cell.windows[1].outcome.delivery.quantile95,
-                cell.windows[1].outcome.achieved_rps(),
-                cell.windows[0]
-                    .tx_processing_avg_us
-                    .map(|us| format!("{us:.1}"))
-                    .unwrap_or_else(|| "n/a".to_owned()),
-                cell.windows[1]
-                    .tx_processing_avg_us
-                    .map(|us| format!("{us:.1}"))
-                    .unwrap_or_else(|| "n/a".to_owned()),
+                cell.fill_ledger_txs, "storage sustain cell finished",
             );
 
             let mut cell_report =
@@ -334,14 +313,16 @@ impl Scenario<ScenarioReport> for StorageProdsizeSustain {
                     window.outcome.first_error
                 )?;
             }
-            let p50_a = cell.windows[0].outcome.delivery.median.max(1) as f64;
-            let p50_b = cell.windows[1].outcome.delivery.median as f64;
-            if p50_b > p50_a * FLATNESS_P50_FACTOR {
-                eprintln!(
-                    "[redsuite] {}: warning: {}: p50 drifted across equal \
-                     windows ({p50_a:.0} -> {p50_b:.0} us)",
-                    self.name(),
+            let window_a_p50_us =
+                cell.windows[0].outcome.delivery.median.max(1) as f64;
+            let window_b_p50_us =
+                cell.windows[1].outcome.delivery.median as f64;
+            if window_b_p50_us > window_a_p50_us * FLATNESS_P50_FACTOR {
+                warn!(
                     cell.name,
+                    window_a_p50_us,
+                    window_b_p50_us,
+                    "median latency drifted across equal windows",
                 );
             }
         }

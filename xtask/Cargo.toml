@@ -7,4 +7,5 @@ authors.workspace = true
 publish = false
 
 [dependencies]
+tracing = { workspace = true }
 redsuite-core = { workspace = true }

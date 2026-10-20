@@ -6,17 +6,18 @@ use std::{
 
 use async_trait::async_trait;
 use json::JsonValueTrait;
-use redsuite_core::redline::{copy_three, Accounts};
-use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, host, prep,
     profile::ProfileValues,
+    redline::{copy_three, Accounts},
+    report::Unit,
     runner::{execute, Pacing, RunConfig},
     sampler::{Sampler, Trailing},
     topology,
     transport::wsraw::RawWs,
     BaseCtx, MetricsDelta, PrivateErScenario, Result, ScenarioReport, TxSender,
 };
+use tracing::debug;
 
 const PREP_PAYER_LAMPORTS: u64 = 4_000_000_000;
 const CLONE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -341,32 +342,9 @@ impl PrivateErScenario<ScenarioReport> for SuperblockBoundaryLatency {
             0.0
         };
 
-        eprintln!(
-            "[redsuite] {}: superblock every {} slots at {BLOCKTIME_MS} ms — \
-             {} boundaries / {} normal blocks; boundary p50 {} us / p95 {} us \
-             / p99 {} us / max {} us, normal p50 {} us / p95 {} us / p99 {} us \
-             / max {} us ({:.2}x), finalize {} us over {} seals, snapshot \
-             {:.1} MB, tx p50 {} us / max {} us",
-            self.name(),
-            profile.superblock_slots,
+        debug!(
             boundary.count,
-            normal.count,
-            boundary.p50,
-            boundary.p95,
-            boundary.p99,
-            boundary.max,
-            normal.p50,
-            normal.p95,
-            normal.p99,
-            normal.max,
-            stall_ratio,
-            finalize_us
-                .map(|us| format!("{us:.0}"))
-                .unwrap_or_else(|| "n/a".to_owned()),
-            finalize_count.unwrap_or_default(),
-            snapshot_bytes / 1e6,
-            outcome.delivery.median,
-            outcome.delivery.max,
+            stall_ratio, "superblock boundary workload finished",
         );
 
         Ok(ScenarioReport::ok(self.name())

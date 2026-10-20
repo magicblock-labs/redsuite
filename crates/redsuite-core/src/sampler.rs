@@ -2,6 +2,7 @@ use std::{thread::JoinHandle, time::Duration};
 
 use futures_util::future::{AbortHandle, Abortable};
 use tokio::sync::{oneshot, watch};
+use tracing::{info, warn, Instrument, Span};
 
 use crate::{
     api::{Metrics, MetricsCollector},
@@ -49,20 +50,35 @@ impl<T: Default + Send + 'static> Sampler<T> {
         let (stop, mut halted) = watch::channel(false);
         let (abort, registration) = AbortHandle::new_pair();
         let (done, result) = oneshot::channel();
+        let span = Span::current();
         let handle = std::thread::spawn(move || {
             let sampling = async move {
                 let mut samples = Sampled::<T>::default();
+                let mut consecutive_failures = 0usize;
                 while trailing == Trailing::Sample || !*halted.borrow() {
                     samples.scrapes += 1;
                     match collector.scrape().await {
                         Ok(metrics) => {
+                            if consecutive_failures != 0 {
+                                info!(
+                                    consecutive_failures,
+                                    "metrics scraping recovered",
+                                );
+                                consecutive_failures = 0;
+                            }
                             samples.observations += usize::from(
                                 observe(&metrics, &mut samples.value).is_some(),
                             )
                         }
                         Err(error) => {
                             samples.failures += 1;
-                            eprintln!("[redsuite] metrics scrape: {error}");
+                            consecutive_failures += 1;
+                            if consecutive_failures == 1 {
+                                warn!(
+                                    %error,
+                                    "metrics scrape failed; repeats suppressed until recovery",
+                                );
+                            }
                         }
                     }
                     if *halted.borrow() {
@@ -73,8 +89,16 @@ impl<T: Default + Send + 'static> Sampler<T> {
                         _ = halted.changed(), if trailing == Trailing::Skip => {}
                     }
                 }
+                if samples.failures != 0 {
+                    warn!(
+                        samples.scrapes,
+                        samples.failures,
+                        consecutive_failures,
+                        "metrics sampling finished with failures",
+                    );
+                }
                 samples
-            };
+            }.instrument(span);
             let output = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()

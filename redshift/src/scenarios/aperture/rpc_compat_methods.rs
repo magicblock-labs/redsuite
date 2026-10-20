@@ -452,29 +452,28 @@ impl PrivateErScenario for RpcCompatMethods {
         let slot_ceiling = client.get_slot().await?;
 
         let mut failures = 0u64;
+        let mut first_failure = None;
         for (index, outcome) in outcomes.iter().enumerate() {
             let method = CYCLE[index % CYCLE.len()];
             match outcome {
                 Ok(Some(slot)) => {
                     if *slot < fixture.slot_floor || *slot > slot_ceiling {
                         failures += 1;
-                        eprintln!(
-                            "[redsuite] {}: request {index} ({method:?}) \
-                             reported slot {slot} outside [{}, {}]",
-                            self.name(),
-                            fixture.slot_floor,
-                            slot_ceiling
-                        );
+                        first_failure.get_or_insert_with(|| {
+                            format!(
+                                "request {index} ({method:?}) \
+                                 reported slot {slot} outside [{}, {}]",
+                                fixture.slot_floor, slot_ceiling
+                            )
+                        });
                     }
                 }
                 Ok(None) => {}
                 Err(error) => {
                     failures += 1;
-                    eprintln!(
-                        "[redsuite] {}: request {index} ({method:?}) failed: \
-                         {error}",
-                        self.name()
-                    );
+                    first_failure.get_or_insert_with(|| {
+                        format!("request {index} ({method:?}) failed: {error}")
+                    });
                 }
             }
         }
@@ -482,7 +481,7 @@ impl PrivateErScenario for RpcCompatMethods {
             failures,
             0,
             "every request in the burst must decode and carry the documented \
-             value"
+             value; first failure: {first_failure:?}"
         )?;
 
         let airdrop = bounded(

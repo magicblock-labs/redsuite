@@ -6,6 +6,7 @@ use std::{
 use keypair::Keypair;
 use pubkey::Pubkey;
 use signer::Signer;
+use tracing::debug;
 
 use super::{
     config,
@@ -15,7 +16,6 @@ use super::{
 };
 use crate::{
     api::{self, Metrics},
-    console,
     context::BaseCtx,
     report,
     resources::LaunchRecord,
@@ -369,11 +369,7 @@ pub async fn replicated(
             ),
         };
         let log = dir.join(format!("er-{label}.log"));
-        console::debug(format_args!(
-            "booting verifier `{label}` (metrics 127.0.0.1:{metrics_port}) \
-             following {} …",
-            plan.upstream_address()
-        ));
+        debug!(%label, "starting verifier");
         ports.release();
         let child = plan.spawn(&log)?;
         let pid = child.id();

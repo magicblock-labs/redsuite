@@ -7,18 +7,20 @@ use std::{
 use async_trait::async_trait;
 use keypair::Keypair;
 use pubkey::Pubkey;
-use redsuite_core::redline::Accounts;
-use redsuite_core::report::Unit;
-use redsuite_core::runner::{SendTransaction, REQUEST_ORIGIN};
 use redsuite_core::{
     check_eq, prep,
     profile::ProfileValues,
+    redline::Accounts,
     report,
-    runner::{execute, Pacing, RunConfig, RunOutcome},
+    report::Unit,
+    runner::{
+        execute, Pacing, RunConfig, RunOutcome, SendTransaction, REQUEST_ORIGIN,
+    },
     stats::{ObservationsStats, StreamingStats},
     topology, BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario,
     ScenarioReport, TxSender,
 };
+use tracing::{debug, warn};
 
 const ACCOUNT_SPACE: u32 = 2048;
 const PREP_PAYER_LAMPORTS: u64 = 4_000_000_000;
@@ -217,32 +219,11 @@ impl Scenario<ScenarioReport> for ColdHydrationTail {
         let cold_median_us = cold.median.max(1) as f64;
         let warm_median_us = warm.median.max(1) as f64;
         let collapse_ratio = cold_median_us / warm_median_us;
-        eprintln!(
-            "[redsuite] {}: cold p50 {:.0} us / p95 {} us / max {} us vs warm \
-             p50 {:.0} us / p95 {} us — collapse ratio {:.0}x",
-            self.name(),
-            cold_median_us,
-            cold.quantile95,
-            cold.max,
-            warm_median_us,
-            warm.quantile95,
-            collapse_ratio,
-        );
         if collapse_ratio < MIN_COLD_WARM_RATIO {
-            eprintln!(
-                "[redsuite] {}: warning: warm repeats collapsed only \
-                 {collapse_ratio:.1}x below cold first touches (expected \
-                 {MIN_COLD_WARM_RATIO}x)",
-                self.name()
-            );
+            warn!(collapse_ratio, "cold-to-warm median speedup below minimum",);
         }
         if warm.quantile95 >= 100_000 {
-            eprintln!(
-                "[redsuite] {}: warning: warm read p95 {} us left the \
-                 sub-100ms range",
-                self.name(),
-                warm.quantile95
-            );
+            warn!(warm.quantile95, "warm read p95 exceeds latency bound");
         }
 
         let touch_report =
@@ -294,23 +275,11 @@ impl Scenario<ScenarioReport> for ColdHydrationTail {
             ("burst cold-deps", &cold_deps),
             ("burst warm-deps", &warm_deps),
         ] {
-            eprintln!(
-                "[redsuite] {}: {} — {} delivered / {} failed in {:.1} s, \
-                 p50 {} us / p95 {} us / max {} us, >100ms {} of {}, ensure avg {}",
-                self.name(),
+            debug!(
                 cell_name,
-                outcome.outcome.delivered,
                 outcome.outcome.failed,
-                outcome.wall_s,
-                outcome.outcome.delivery.median,
-                outcome.outcome.delivery.quantile95,
-                outcome.outcome.delivery.max,
                 outcome.slow,
-                outcome.outcome.delivered + outcome.outcome.failed,
-                outcome
-                    .ensure_avg_s
-                    .map(|seconds| format!("{seconds:.6} s"))
-                    .unwrap_or_else(|| "n/a".to_owned()),
+                "dependency hydration cell finished",
             );
             check_eq!(
                 outcome.outcome.failed,
@@ -320,12 +289,10 @@ impl Scenario<ScenarioReport> for ColdHydrationTail {
             )?;
         }
         if warm_deps.slow > cold_deps.slow {
-            eprintln!(
-                "[redsuite] {}: warning: warm-deps >100ms tail ({}) exceeded \
-                 cold-deps ({})",
-                self.name(),
+            warn!(
                 warm_deps.slow,
-                cold_deps.slow
+                cold_deps.slow,
+                "warm dependency tail exceeded cold dependency tail",
             );
         }
 

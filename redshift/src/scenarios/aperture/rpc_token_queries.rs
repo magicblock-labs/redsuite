@@ -670,23 +670,25 @@ impl Scenario for RpcTokenQueries {
                 )
             })?;
         let mut failures = 0u64;
+        let mut first_failure = None;
         for (index, outcome) in outcomes.iter().enumerate() {
             match outcome {
                 Ok(()) => {}
                 Err(error) => {
                     failures += 1;
-                    eprintln!(
-                        "[redsuite] {}: read {index} ({}) failed: {error}",
-                        self.name(),
-                        index % CYCLE.len()
-                    );
+                    first_failure.get_or_insert_with(|| {
+                        format!(
+                            "read {index} ({}) failed: {error}",
+                            index % CYCLE.len()
+                        )
+                    });
                 }
             }
         }
         check_eq!(
             failures,
             0,
-            "every read in the burst must succeed and agree"
+            "every read in the burst must succeed and agree; first failure: {first_failure:?}"
         )?;
 
         let missing_mint = Keypair::new().pubkey();
