@@ -3302,6 +3302,7 @@ version = "0.6.0"
 dependencies = [
  "clap",
  "futures-util",
+ "humantime",
  "redhat",
  "redline",
  "redshift",

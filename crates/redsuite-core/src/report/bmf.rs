@@ -10,6 +10,13 @@ use crate::{
 };
 
 fn run_gate(run: &ScenarioRun) -> Option<String> {
+    if run
+        .config
+        .iter()
+        .any(|(key, value)| key == "completion" && value == "interrupted")
+    {
+        return Some("load interrupted".to_owned());
+    }
     if !run.passed {
         return Some(match run.failures.first() {
             Some(failure) => {

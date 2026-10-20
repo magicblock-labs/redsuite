@@ -18,7 +18,7 @@ use redsuite_core::{
     catalog::{Er, ErGroup, Family, ScenarioEntry},
     logging,
     netfault::BaseProxies,
-    profile::ExecutionConfig,
+    profile::{ExecutionConfig, LoopMode},
     report::{self, ScenarioReport, Unit},
     topology::{self, PrivateEr, ER_READY_TIMEOUT},
     BaseCtx, ErCtx, Result, RunRecord,
@@ -436,8 +436,63 @@ async fn dispatch(command: args::Command) -> Result<ExitCode> {
                 };
                 run(Family::Redline, args.run, config, true, 1).await?;
             }
+            args::Benchmarks::Load(args) => return load(args).await,
         },
         args::Command::Shared(command) => command.run()?,
     }
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn load(args: args::Load) -> Result<ExitCode> {
+    use redsuite_core::{catalog::Fixture, run_private_er_scenario};
+    use tokio::{
+        signal::unix::{signal, SignalKind},
+        sync::watch,
+    };
+
+    let mut interrupts = signal(SignalKind::interrupt())?;
+    let (stop, receiver) = watch::channel(false);
+    let config = ExecutionConfig {
+        profile: args.profile,
+        loop_mode: LoopMode::Open,
+    };
+    let scenario = redline::load::Load {
+        duration: args.duration,
+        rate: args.rate,
+        concurrency: args.concurrency,
+        stop: receiver,
+    };
+    let work = run_private_er_scenario(
+        scenario,
+        &[Fixture::RedlineProgram],
+        &[],
+        config,
+    );
+    tokio::pin!(work);
+    let record = tokio::select! {
+        record = &mut work => record,
+        Some(()) = interrupts.recv() => {
+            stop.send_replace(true);
+            info!("load interrupted; stopping admission and draining");
+            // Finish the same future so admitted work and its report survive SIGINT.
+            work.await
+        }
+    };
+    let outcome = summarize(&[record]);
+    let cleanup = if args.cleanup {
+        topology::down()
+    } else {
+        Ok(())
+    };
+    if let Err(error) = &cleanup {
+        error!(%error, "load cleanup failed");
+    }
+    if *stop.borrow() {
+        if let Err(error) = outcome.and(cleanup) {
+            error!(%error, "interrupted load failed");
+        }
+        return Ok(ExitCode::from(130));
+    }
+    outcome.and(cleanup)?;
     Ok(ExitCode::SUCCESS)
 }

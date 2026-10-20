@@ -1,7 +1,10 @@
 //! Family-specific arguments own their environment bindings, so unrelated
 //! commands neither read nor validate benchmark-only settings.
 
-use std::num::NonZeroUsize;
+use std::{
+    num::{NonZeroU32, NonZeroUsize},
+    time::{Duration, Instant},
+};
 
 use clap::{Args, Parser, Subcommand};
 use redsuite_core::{
@@ -23,7 +26,7 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Curated benchmarks.
+    /// Curated benchmarks and continuous load.
     #[command(subcommand)]
     Redline(Benchmarks),
     /// Correctness checks.
@@ -58,6 +61,8 @@ pub enum Benchmarks {
     },
     /// Run curated benchmarks sequentially.
     Run(BenchmarkRun),
+    /// Generate continuous mixed transaction load, then drain and verify it.
+    Load(Load),
 }
 
 #[derive(Args)]
@@ -97,4 +102,34 @@ pub struct BenchmarkRun {
         default_value = "open"
     )]
     pub loop_mode: LoopMode,
+}
+
+#[derive(Args)]
+pub struct Load {
+    /// Workload preset.
+    #[arg(long, env = "REDSUITE_PROFILE", value_enum, default_value = "lite")]
+    pub profile: Profile,
+    /// Load-generation time, excluding setup and drain (e.g. 30s, 10m, 1h).
+    #[arg(long, value_parser = duration)]
+    pub duration: Duration,
+    /// Total offered transactions/second; defaults to the preset rate.
+    #[arg(long)]
+    pub rate: Option<NonZeroU32>,
+    /// Total outstanding requests across workers; defaults to the preset budget.
+    #[arg(long)]
+    pub concurrency: Option<NonZeroUsize>,
+    /// Stop the stack and delete its storage after the run, retaining logs.
+    #[arg(long)]
+    pub cleanup: bool,
+}
+
+fn duration(value: &str) -> Result<Duration, String> {
+    let duration =
+        humantime::parse_duration(value).map_err(|error| error.to_string())?;
+    if duration.is_zero() || Instant::now().checked_add(duration).is_none() {
+        return Err(
+            "duration must be positive and fit a monotonic deadline".into()
+        );
+    }
+    Ok(duration)
 }

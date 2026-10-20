@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 use redsuite_core::{check, ChainCtx, CheckError, ErCtx, Result};
 use signature::Signature;
 
+pub mod load;
 pub mod scenarios;
 pub use redline_interface as program;
 pub use redsuite_core::redline::written_id as account_update_id;

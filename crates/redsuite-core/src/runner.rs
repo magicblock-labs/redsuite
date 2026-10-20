@@ -11,7 +11,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tokio::task::{JoinError, JoinSet};
+use tokio::{
+    sync::{watch, OwnedSemaphorePermit},
+    task::{JoinError, JoinSet},
+};
 use tracing::{Instrument, Span};
 
 pub use crate::transport::rate::{split_budget, Pacing};
@@ -87,8 +90,8 @@ pub enum JobOutcome {
 #[derive(Debug, Default)]
 pub struct RunOutcome<S = ObservationsStats> {
     pub delivered: u64,
-    // every admitted iteration that did not end Delivered; panicked and
-    // cancelled below break this count down, so delivered + failed == admitted
+    /// All unsuccessful admitted iterations, including panics and cancellations.
+    /// Together with `delivered`, this gives the admitted count.
     pub failed: u64,
     pub panicked: u64,
     pub cancelled: u64,
@@ -100,7 +103,10 @@ pub struct RunOutcome<S = ObservationsStats> {
     pub sync: Option<S>,
     pub offered: Pacing,
     pub rps: ObservationsStats,
+    /// Driver time through completion of all admitted requests, including drain.
     pub wall: std::time::Duration,
+    /// Driver time before admission stops, excluding in-flight request drain.
+    pub admission_wall: Duration,
 }
 
 impl RunOutcome {
@@ -166,6 +172,7 @@ impl RawRunOutcome {
         self.offered = self.offered.combine(other.offered);
         self.rps = self.rps.add_rates(other.rps);
         self.wall = self.wall.max(other.wall);
+        self.admission_wall = self.admission_wall.max(other.admission_wall);
     }
 
     pub fn finalize(self) -> RunOutcome {
@@ -182,6 +189,7 @@ impl RawRunOutcome {
             offered: self.offered,
             rps: self.rps,
             wall: self.wall,
+            admission_wall: self.admission_wall,
         }
     }
 
@@ -245,13 +253,34 @@ pub fn panic_message(payload: Box<dyn Any + Send>) -> String {
 enum Completion {
     Iterations(u64),
     Stop(Rc<Cell<bool>>),
+    Until {
+        deadline: Instant,
+        stop: watch::Receiver<bool>,
+    },
 }
 
 impl Completion {
-    fn admits(&self, admitted: u64) -> bool {
+    async fn admit(
+        &mut self,
+        admitted: u64,
+        throttle: &mut Throttle,
+    ) -> Option<OwnedSemaphorePermit> {
         match self {
-            Completion::Iterations(total) => admitted < *total,
-            Completion::Stop(stop) => !stop.get(),
+            Completion::Iterations(total) if admitted >= *total => None,
+            Completion::Stop(stop) if stop.get() => None,
+            Completion::Until { deadline, stop } => {
+                if Instant::now() >= *deadline || *stop.borrow() {
+                    return None;
+                }
+                let permit = tokio::select! {
+                    biased;
+                    _ = tokio::time::sleep_until((*deadline).into()) => None,
+                    _ = stop.wait_for(|stop| *stop) => None,
+                    permit = throttle.acquire() => Some(permit),
+                };
+                permit.filter(|_| Instant::now() < *deadline && !*stop.borrow())
+            }
+            _ => Some(throttle.acquire().await),
         }
     }
 }
@@ -260,7 +289,7 @@ type NoSync = fn(u64) -> std::future::Ready<Result<()>>;
 const NO_SYNC: Option<NoSync> = None;
 
 async fn execute_inner<Request, RequestFut, D, Sync, SyncFut>(
-    completion: Completion,
+    mut completion: Completion,
     pacing: Pacing,
     concurrency: usize,
     mut request: Request,
@@ -283,8 +312,8 @@ where
 
     let mut jobs = JoinSet::new();
     let mut admitted = 0u64;
-    while completion.admits(admitted) {
-        let permit = throttle.admit().await;
+    while let Some(permit) = completion.admit(admitted, &mut throttle).await {
+        throttle.record();
         let admitted_at = Instant::now();
         admitted += 1;
         let request_fut = request(admitted);
@@ -333,6 +362,7 @@ where
             record_join(&tally, joined);
         }
     }
+    let admission_wall = started.elapsed();
     let rps = throttle.finish();
     while let Some(joined) = jobs.join_next().await {
         record_join(&tally, joined);
@@ -345,6 +375,7 @@ where
         offered: pacing,
         rps,
         wall: started.elapsed(),
+        admission_wall,
         ..tally
     })
 }
@@ -394,8 +425,8 @@ where
     .await
 }
 
-// Same open-loop pacing as `execute`, but runs until `stop` is set instead of a
-// fixed iteration count — for load that must span an externally-timed event.
+/// Generate open-loop load until `stop` is observed between admissions, then drain.
+/// Unlike [`execute_for_raw`], a stop does not interrupt a pending throttle wait.
 pub async fn execute_until_raw<F, Fut, D>(
     pacing: Pacing,
     concurrency: usize,
@@ -409,6 +440,32 @@ where
 {
     execute_inner(
         Completion::Stop(stop),
+        pacing,
+        concurrency,
+        request,
+        NO_SYNC,
+    )
+    .await
+}
+
+/// Stop admission at the deadline or stop notification, then drain admitted work.
+/// Closing the stop channel also stops admission.
+///
+/// Await this future after signaling stop: dropping it aborts in-flight jobs.
+pub async fn execute_for_raw<F, Fut, D>(
+    pacing: Pacing,
+    concurrency: usize,
+    deadline: Instant,
+    stop: watch::Receiver<bool>,
+    request: F,
+) -> Result<RawRunOutcome>
+where
+    F: FnMut(u64) -> Fut,
+    Fut: Future<Output = Result<D>> + 'static,
+    D: Delivery,
+{
+    execute_inner(
+        Completion::Until { deadline, stop },
         pacing,
         concurrency,
         request,
