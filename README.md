@@ -138,6 +138,7 @@ when finished with `redsuite stack down`.
 | Run security checks (Redhat) | `redsuite redhat run` |
 | Measure performance (Redline) | `redsuite redline run` |
 | Use the larger benchmark workloads | `redsuite redline run --profile full` |
+| Generate an hour of mixed load | `redsuite redline load --profile full --duration 1h --rate 4000 --concurrency 128` |
 | Reduce concurrent storage use | `redsuite redshift run --serial` |
 | Stop the stack after a run | `redsuite redshift run --cleanup` |
 | Inspect processes, endpoints, and logs | `redsuite stack status` |
@@ -147,9 +148,18 @@ chosen family. Multiple selections run together without repeating scenarios;
 an exact name takes precedence over prefix matches. Omit selections to run the
 whole family. Use the family's `list` command to preview selections.
 
-Redline defaults to the shorter `lite` workloads. Only `redline run` accepts `--profile` or read `REDSUITE_PROFILE`. Correctness and
+Redline defaults to the shorter `lite` workloads. Only `redline run` and
+`redline load` accept `--profile` or read `REDSUITE_PROFILE`. Correctness and
 adversarial checks use fixed workloads. Redline benchmarks run sequentially;
 checks can use `--fresh-concurrency` to bound concurrent fresh scenarios.
+
+`redline load` continuously runs the mixed write/compute/read-write workload.
+The duration covers load generation, not setup or draining. Rate and total
+outstanding-request concurrency default from the selected preset; overrides
+apply across all driver workers. Offered TPS is a target, not a guarantee of
+executed throughput. At the deadline, or on Ctrl+C, admission stops and existing
+work drains before final-state checks and report persistence. Ctrl+C returns
+exit status 130 and marks the report interrupted; BMF excludes interrupted runs.
 
 ### Host and storage considerations
 
@@ -164,7 +174,7 @@ group's storage when the next scenario cannot reuse it. Scenarios with multiple
 validators still need space for their topology.
 
 Scheduling and cleanup are independent: `--serial` does not stop the shared
-base. Add `--cleanup` to any run command to finish with `stack down`;
+base. Add `--cleanup` to any run/load command to finish with `stack down`;
 this does not preserve rollups already cleaned up during the run.
 **`stack down` stops the base and leftover rollups and deletes their
 storage, including separately located accounts databases; logs remain.** The
@@ -180,7 +190,8 @@ returns a nonzero exit status.
 
 Redline writes reports under `target/redsuite-reports/`. Reports include workload
 settings, measurements, and process-launch details. Benchmark runs also record
-suite wall time and execution-lane durations.
+suite wall time and execution-lane durations. Continuous-load reports separate
+setup, generation, request drain, and validator drain time.
 
 Read the measurements together:
 
@@ -233,7 +244,7 @@ diagnostic measurements. Client latency series have timing-origin suffixes
 | `REDSUITE_STACK_DIR` | Place ledgers, stack state, and logs on another disk; defaults to `target/redsuite-stack` under the resource root. |
 | `REDSUITE_ACCOUNTSDB_DIR` | Place rollup and verifier accounts databases separately from their ledgers. |
 | `REDSUITE_CLONE_URL` | Choose the RPC endpoint used to acquire base-chain programs on a cold boot. |
-| `REDSUITE_PROFILE` | Set the Redline run preset to `lite` or `full`; `--profile` overrides it. Other commands do not read it. |
+| `REDSUITE_PROFILE` | Set the Redline run/load preset to `lite` or `full`; `--profile` overrides it. Other commands do not read it. |
 | `RUST_LOG` | Log filter for RedSuite and launched validators; defaults to `info`. Use `debug` for passing-run details. |
 
 The compiled runner works without Cargo or a source checkout at runtime, but it

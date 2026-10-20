@@ -194,11 +194,21 @@ impl Throttle {
         })
     }
 
-    pub async fn admit(&mut self) -> OwnedSemaphorePermit {
+    /// Wait for pacing and capacity without counting an admission.
+    /// Call [`Self::record`] only if the caller accepts the permit after its stop check.
+    pub async fn acquire(&mut self) -> OwnedSemaphorePermit {
         self.pacer.wait().await;
-        let permit = self.admission.acquire().await;
-        self.stats.record();
+        self.admission.acquire().await
+    }
+
+    pub async fn admit(&mut self) -> OwnedSemaphorePermit {
+        let permit = self.acquire().await;
+        self.record();
         permit
+    }
+
+    pub fn record(&mut self) {
+        self.stats.record();
     }
 
     pub fn finish(self) -> ObservationsStats {
