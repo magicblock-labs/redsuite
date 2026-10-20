@@ -1,15 +1,11 @@
 use std::{
-    path::{Path, PathBuf},
-    process::{exit, Command},
+    path::Path,
+    process::{Command, ExitCode},
 };
 
-use clap::{Parser, Subcommand};
-use redsuite_core::{catalog::Fixture, frontend, logging};
+use clap::Parser;
+use redsuite_core::{catalog::Fixture, frontend, logging, Result};
 use tracing::error;
-
-type Result<T> = redsuite_core::Result<T>;
-
-const FAMILY_PROGRAMS: &[&str] = &["redline", "redshift", "redhat"];
 
 #[derive(Parser)]
 #[command(
@@ -19,16 +15,10 @@ const FAMILY_PROGRAMS: &[&str] = &["redline", "redshift", "redhat"];
     about = "RedSuite development tools",
     after_long_help = frontend::env_help()
 )]
-struct Cli {
-    #[command(subcommand)]
-    command: Task,
-}
-
-#[derive(Subcommand)]
 enum Task {
     /// Build and stage the SBF programs.
     Programs,
-    /// Format the workspace using nightly rustfmt.
+    /// Format the workspace using the pinned Rust toolchain.
     Fmt {
         /// Check formatting without rewriting files.
         #[arg(long)]
@@ -38,105 +28,81 @@ enum Task {
     Shared(frontend::Command),
 }
 
-fn main() {
-    let cli = Cli::parse();
+fn main() -> ExitCode {
+    let task = Task::parse();
     if let Err(error) = logging::init() {
         eprintln!("cannot initialize logging: {error}");
-        exit(1);
+        return ExitCode::FAILURE;
     }
-    let outcome = match cli.command {
-        Task::Programs => programs(),
-        Task::Fmt { check } => fmt(check),
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let outcome = match task {
+        Task::Programs => programs(root),
+        Task::Fmt { check } => {
+            let mut command = Command::new("cargo");
+            command.args(["fmt", "--all"]).current_dir(root);
+            if check {
+                command.arg("--check");
+            }
+            run(&mut command)
+        }
         Task::Shared(command) => command.run(),
     };
     if let Err(error) = outcome {
         error!(%error, "command failed");
-        exit(1);
+        return ExitCode::FAILURE;
     }
+    ExitCode::SUCCESS
 }
 
-fn fmt(check: bool) -> Result<()> {
-    let mut cmd = Command::new("cargo");
-    cmd.args(["+nightly", "fmt"]);
-    if check {
-        cmd.arg("--check");
-    }
-    cmd.args(["--", "--config-path"])
-        .arg(root().join("rustfmt-nightly.toml"))
-        .current_dir(root());
-    run_cmd("cargo +nightly fmt", &mut cmd)
-}
-
-fn root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .to_path_buf()
-}
-
-fn run_cmd(desc: &str, cmd: &mut Command) -> Result<()> {
-    let status = cmd
+fn run(command: &mut Command) -> Result<()> {
+    let status = command
         .status()
-        .map_err(|e| format!("{desc}: failed to spawn: {e}"))?;
+        .map_err(|error| format!("{command:?}: failed to spawn: {error}"))?;
     if !status.success() {
-        return Err(format!("{desc} failed ({status})").into());
+        return Err(format!("{command:?} failed ({status})").into());
     }
     Ok(())
 }
 
-const SBF_LTO: &str = "profile.release.lto=\"fat\"";
-
-fn programs() -> Result<()> {
-    for program in FAMILY_PROGRAMS {
-        run_cmd(
-            &format!("cargo build-sbf ({program})"),
-            Command::new("cargo")
-                .args(["build-sbf", "--manifest-path"])
-                .arg(
-                    root()
-                        .join(format!("programs/{program}/program/Cargo.toml")),
-                )
-                .arg("--sbf-out-dir")
-                .arg(root().join("target/deploy"))
-                .args(["--", "--config", SBF_LTO]),
-        )?;
+fn programs(root: &Path) -> Result<()> {
+    let deploy = root.join("target/deploy");
+    for fixture in Fixture::ALL {
+        let (family, variant) = match fixture {
+            Fixture::RedlineProgram => ("redline", None),
+            Fixture::RedshiftProgram => ("redshift", None),
+            Fixture::RedhatProgram => ("redhat", None),
+            Fixture::RedshiftProgramSlim => ("redshift", Some("slim")),
+            Fixture::RedshiftProgramSlimUpgraded => {
+                ("redshift", Some("slim-upgraded"))
+            }
+        };
+        let out = match variant {
+            Some(label) => deploy.join(format!("{family}-{label}")),
+            None => deploy.clone(),
+        };
+        let mut command = Command::new("cargo");
+        command
+            .args(["build-sbf", "--manifest-path"])
+            .arg(root.join(format!("programs/{family}/program/Cargo.toml")))
+            .arg("--sbf-out-dir")
+            .arg(&out);
+        if variant.is_some() {
+            command.args(["--arch", "v3", "--no-default-features"]);
+            if fixture == Fixture::RedshiftProgramSlimUpgraded {
+                command.args(["--features", "upgraded"]);
+            }
+        }
+        command.args(["--", "--config", "profile.release.lto=\"fat\""]);
+        run(&mut command)?;
+        if variant.is_some() {
+            let staged = deploy.join(fixture.so_name());
+            // fs::copy can fail with ENOENT on virtiofs bind mounts.
+            std::fs::read(out.join("redshift_program.so"))
+                .and_then(|bytes| std::fs::write(&staged, bytes))
+                .map_err(|error| {
+                    format!("staging {}: {error}", staged.display())
+                })?;
+        }
     }
-    build_redshift_variant(
-        "slim",
-        &[],
-        Fixture::RedshiftProgramSlim.so_name(),
-    )?;
-    build_redshift_variant(
-        "slim-upgraded",
-        &["upgraded"],
-        Fixture::RedshiftProgramSlimUpgraded.so_name(),
-    )?;
-    Ok(())
-}
-
-fn build_redshift_variant(
-    label: &str,
-    features: &[&str],
-    staged_name: &str,
-) -> Result<()> {
-    let out_dir = root().join(format!("target/deploy/redshift-{label}"));
-    let mut command = Command::new("cargo");
-    command
-        .args(["build-sbf", "--arch", "v3", "--manifest-path"])
-        .arg(root().join("programs/redshift/program/Cargo.toml"))
-        .arg("--no-default-features");
-    if !features.is_empty() {
-        command.args(["--features", &features.join(",")]);
-    }
-    command.arg("--sbf-out-dir").arg(&out_dir);
-    command.args(["--", "--config", SBF_LTO]);
-    run_cmd(&format!("cargo build-sbf (redshift {label})"), &mut command)?;
-    let built = out_dir.join("redshift_program.so");
-    let staged = root().join("target/deploy").join(staged_name);
-    // Not fs::copy: it fstats the freshly created destination, which fails
-    // with ENOENT on virtiofs bind mounts (Docker Desktop devcontainers).
-    std::fs::read(&built)
-        .and_then(|bytes| std::fs::write(&staged, bytes))
-        .map_err(|err| format!("staging {staged_name}: {err}"))?;
     Ok(())
 }
