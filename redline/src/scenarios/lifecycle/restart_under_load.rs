@@ -8,17 +8,17 @@ use std::{
 
 use async_trait::async_trait;
 use pubkey::Pubkey;
-use redsuite_core::redline::Accounts;
-use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, host, prep,
     profile::ProfileValues,
-    redline::causal::HASH_INIT,
+    redline::{causal::HASH_INIT, Accounts},
+    report::Unit,
     topology::{self, RestartConfig, RestartTiming},
     Api, BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result, ScenarioReport,
     TxSender,
 };
 use signature::Signature;
+use tracing::debug;
 
 use crate::program::instruction::build;
 
@@ -621,18 +621,9 @@ async fn run_mode(
         &records,
     )
     .await?;
-    eprintln!(
-        "[redsuite] restart_under_load {label}: first restart total {} ms \
-         (shutdown {} ms, startup {} ms), exit {:?}/sig {:?}, slot {:?} -> \
-         {:?}, replay_ran {replay_ran:?}, at kill {at_kill:?}, resolved \
-         {resolved:?}, lost to the kill {lost_first}",
-        first.total.as_millis(),
-        first.shutdown.as_millis(),
-        first.startup.as_millis(),
-        first.exit_code,
-        first.exit_signal,
-        first.slot_before,
-        first.slot_after,
+    debug!(
+        label,
+        replay_ran, lost_first, "first restart under load finished"
     );
 
     let superblocks_before = superblocks(private.ctx()).await?;

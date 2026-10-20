@@ -5,6 +5,7 @@ use std::{
 };
 
 use sha2::{Digest, Sha256};
+use tracing::info;
 
 use super::state;
 use crate::Result;
@@ -143,10 +144,7 @@ async fn cached(tag: &str) -> Result<PathBuf> {
 
     fs::create_dir_all(&dir)?;
     let expected = expected_digest(tag).await?;
-    crate::console::line(format_args!(
-        "downloading the Yellowstone geyser plugin {tag} to {}",
-        dir.display()
-    ));
+    info!(tag, ?dir, "downloading Yellowstone geyser plugin");
     let bytes = fetch(&asset_url(tag, LIB)).await?;
     let actual = sha256(&bytes);
     if actual != expected {

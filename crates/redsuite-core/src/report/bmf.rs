@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, fs};
 
 use json::Serialize;
+use tracing::warn;
 
 use super::{store, MeasureValue, ScenarioRun, Unit, LATENCY_ORIGIN};
 use crate::{
@@ -75,10 +76,7 @@ fn export_run(
 ) {
     let withheld = withheld(run);
     if let Some(reason) = &withheld {
-        eprintln!(
-            "[redsuite] bmf: {} latency withheld — {reason}",
-            run.scenario
-        );
+        warn!(%run.scenario, reason, "BMF latency withheld");
     }
     let origin = origin_suffix(run);
     for measurement in &run.measurements {
@@ -136,10 +134,7 @@ fn bmf_document(
         BTreeMap::new();
     for scenario in &campaign.scenarios {
         if let Some(reason) = run_gate(&scenario.run) {
-            eprintln!(
-                "[redsuite] bmf: excluded {} — {reason}",
-                scenario.run.scenario
-            );
+            warn!(%scenario.run.scenario, reason, "BMF run excluded");
             continue;
         }
         export_run(&mut doc, &scenario.run);
@@ -148,9 +143,9 @@ fn bmf_document(
         }
     }
     for parent_slug in &campaign.orphan_cells {
-        eprintln!(
-            "[redsuite] bmf: excluded {parent_slug} cells — the parent run did not \
-             conclude"
+        warn!(
+            parent_slug,
+            "BMF cells excluded; parent run did not conclude"
         );
     }
     doc

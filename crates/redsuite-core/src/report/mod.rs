@@ -14,9 +14,10 @@ use std::{
 
 pub use bmf::bmf;
 use json::{Deserialize, Serialize};
+use tracing::warn;
 
 use crate::{
-    api, console,
+    api,
     resources::LaunchRecord,
     runner::RunOutcome,
     scenario::{failed_check, RunRecord, ScenarioOutcome},
@@ -172,18 +173,7 @@ impl ScenarioReport {
     pub fn with_flags(self, outcome: &RunOutcome) -> Self {
         let mut report = self.latency_origin(outcome.origin);
         for (flag, reason) in outcome.flags() {
-            console::line(format_args!(
-                "{}: warning: {flag} ({reason}); {}",
-                report.scenario,
-                if flag == LOAD_FLAGS[0] {
-                    "its latency is client-observed and not a validator \
-                     regression"
-                } else {
-                    "the load fell short of the claimed rate, so read its \
-                     latency with the validator metrics before calling it a \
-                     regression"
-                }
-            ));
+            warn!(%report.scenario, flag, %reason, "workload validity warning");
             match report.config.iter_mut().find(|(key, _)| key == flag) {
                 Some((_, reasons)) => {
                     reasons.push_str("; ");
@@ -274,7 +264,8 @@ pub fn persist_run(record: &RunRecord) -> Result<PathBuf> {
 
     let fallback;
     let report = match &record.scenario {
-        ScenarioOutcome::Passed(Some(report)) => report,
+        ScenarioOutcome::Passed(Some(report))
+        | ScenarioOutcome::FailedReport(_, report) => report,
         _ => {
             fallback = ScenarioReport::failed(&record.name).metric_if(
                 "wall seconds",
@@ -317,13 +308,8 @@ pub fn persist_cell(parent: &str, report: &ScenarioReport) {
     let persisted = ensure_campaign(&dir).and_then(|()| {
         append_cell(&dir, parent, &scenario_run_doc(report, &[], &[]))
     });
-    match persisted {
-        Ok(path) => {
-            console::detail(format_args!("cell report: {}", path.display()))
-        }
-        Err(error) => console::detail(format_args!(
-            "warning: cell report not persisted: {error}"
-        )),
+    if let Err(error) = persisted {
+        warn!(%error, "cell report not persisted");
     }
 }
 
@@ -407,7 +393,8 @@ fn append_cell(dir: &Path, parent: &str, doc: &ScenarioRun) -> Result<PathBuf> {
 fn run_failures(record: &RunRecord) -> Vec<PersistedFailure> {
     let mut failures = Vec::new();
     match &record.scenario {
-        ScenarioOutcome::Failed(error) => {
+        ScenarioOutcome::Failed(error)
+        | ScenarioOutcome::FailedReport(error, _) => {
             failures.push(scenario_failure(error))
         }
         ScenarioOutcome::Panicked(message) => {

@@ -1,11 +1,11 @@
 use std::{rc::Rc, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use redsuite_core::redline::{copy_three, Accounts};
-use redsuite_core::report::Unit;
 use redsuite_core::{
     check_eq, prep,
     profile::{LoopMode, ProfileValues},
+    redline::{copy_three, Accounts},
+    report::Unit,
     runner::{execute, execute_and_sync, Pacing, RunConfig},
     transport::{
         clock::SendClock,
@@ -14,6 +14,7 @@ use redsuite_core::{
     BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
     TxSender,
 };
+use tracing::warn;
 
 const PAYER_LAMPORTS: u64 = 2_000_000_000;
 
@@ -194,11 +195,10 @@ impl Scenario<ScenarioReport> for WarmIngress {
             delta.counter(crate::metrics::ENGINE_TRANSACTIONS)
         {
             if processed < profile.iterations as f64 {
-                eprintln!(
-                    "[redsuite] {}: warning: validator processed {processed} \
-                     txs in the measured window, expected at least {}",
-                    self.name(),
-                    profile.iterations
+                warn!(
+                    processed,
+                    profile.iterations,
+                    "validator transaction count below expected total in scrape window",
                 );
             }
         }

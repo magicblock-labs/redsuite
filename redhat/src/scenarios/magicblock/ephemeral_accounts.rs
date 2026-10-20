@@ -449,17 +449,6 @@ impl Scenario for EphemeralAccounts {
             signers[2].pubkey(),
         ];
         signers.push(target);
-        eprintln!(
-            "[redsuite] {}: payer {} sponsor {} target {} vault {} substitute \
-             {} funder {}",
-            self.name(),
-            keys[PAYER],
-            keys[SPONSOR],
-            keys[TARGET],
-            keys[VAULT],
-            keys[SUBSTITUTE],
-            funder.pubkey()
-        );
         let foreign = topology::redshift_loader_v3_target().0;
         let mut workload = Workload {
             er,

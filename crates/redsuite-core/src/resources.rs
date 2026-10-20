@@ -4,8 +4,9 @@ use std::{
 };
 
 use json::{Deserialize, Serialize};
+use tracing::warn;
 
-use crate::{console, host, report, topology, DynError};
+use crate::{host, report, topology, DynError};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaunchRecord {
@@ -91,33 +92,20 @@ impl Resources {
         }
         errors
     }
-}
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Reclaimed {
-    pub label: String,
-    pub storage_dir: String,
-    pub killed: bool,
-    pub removed: bool,
-}
-
-impl Resources {
-    pub(crate) fn reclaim(&self) -> Vec<Reclaimed> {
-        let mut reclaimed = Vec::new();
+    pub(crate) fn reclaim_and_audit(&self, owner: &str) -> Vec<DynError> {
         for record in self.records.borrow().iter() {
             let launch = record.launch.borrow();
-            let pid = launch.pid;
-            let killed = !record.finished.get() && host::proc_running(pid);
-            if killed {
-                topology::kill_pid(pid);
+            if !record.finished.get() && host::proc_running(launch.pid) {
+                topology::kill_pid(launch.pid);
                 record.mark_finished();
+                warn!(owner, %launch.label, "reclaimed running rollup");
             }
-            let mut removed = false;
             for dir in std::iter::once(&launch.storage_dir)
                 .chain(launch.accountsdb_dir.iter())
             {
                 match std::fs::remove_dir_all(dir) {
-                    Ok(()) => removed = true,
+                    Ok(()) => {}
                     Err(error)
                         if error.kind() == std::io::ErrorKind::NotFound => {}
                     Err(error) => record.record_finish_error(format!(
@@ -125,37 +113,6 @@ impl Resources {
                     )),
                 }
             }
-            if killed || removed {
-                reclaimed.push(Reclaimed {
-                    label: launch.label.clone(),
-                    storage_dir: launch.storage_dir.clone(),
-                    killed,
-                    removed,
-                });
-            }
-        }
-        reclaimed
-    }
-}
-
-impl Resources {
-    pub(crate) fn reclaim_and_audit(&self, owner: &str) -> Vec<DynError> {
-        for reclaimed in self.reclaim() {
-            let stopped = if reclaimed.killed { "stopped" } else { "" };
-            let removed = if reclaimed.removed {
-                format!("removed {}", reclaimed.storage_dir)
-            } else {
-                String::new()
-            };
-            let joiner = if reclaimed.killed && reclaimed.removed {
-                ", "
-            } else {
-                ""
-            };
-            console::line(format_args!(
-                "{owner}: reclaimed private ER `{}`: {stopped}{joiner}{removed}",
-                reclaimed.label
-            ));
         }
         self.audit()
     }

@@ -5,7 +5,7 @@ use std::{future::Future, process::Command, rc::Rc, time::Instant};
 use futures_util::{future::join_all, StreamExt};
 use redsuite_core::{
     catalog::{Er, ErGroup, Family, ScenarioEntry},
-    console, frontend,
+    frontend, logging,
     netfault::BaseProxies,
     profile::{ExecutionConfig, LoopMode, Profile},
     report::{self, ScenarioReport, Unit},
@@ -13,6 +13,7 @@ use redsuite_core::{
     BaseCtx, ErCtx, Result, RunRecord,
 };
 use tokio::sync::Mutex;
+use tracing::{error, warn};
 
 const FAMILIES: &[&[ScenarioEntry]] = &[
     catalog::redline::SCENARIOS,
@@ -105,16 +106,16 @@ impl GroupEr {
     ) -> std::result::Result<ErCtx, String> {
         let label = self.group.label;
         if let Some(er) = &self.er {
-            let why = if self.tainted {
+            let reason = if self.tainted {
                 "a scenario failed on it"
-            } else if !er.lock().await.healthy().await {
-                "it is no longer healthy"
             } else {
-                return Ok(er.lock().await.ctx().clone());
+                let er = er.lock().await;
+                if er.healthy().await {
+                    return Ok(er.ctx().clone());
+                }
+                "it is no longer healthy"
             };
-            console::line(format_args!(
-                "group ER `{label}`: {why}; replacing it with a fresh one"
-            ));
+            warn!(label, reason, "replacing group ER");
             self.finish().await;
         } else if let Some(failure) = &self.failure {
             return Err(failure.clone());
@@ -126,7 +127,6 @@ impl GroupEr {
         };
         booted.map_err(|error| {
             let failure = format!("group ER `{label}` did not boot: {error}");
-            console::line(format_args!("{failure}"));
             self.failure = Some(failure.clone());
             failure
         })
@@ -161,10 +161,7 @@ impl GroupEr {
             .map(Mutex::into_inner);
         if let Some(er) = er {
             if let Err(error) = er.finish().await {
-                console::line(format_args!(
-                    "group ER `{}`: {error}",
-                    self.group.label
-                ));
+                error!(self.group.label, %error, "group ER cleanup failed");
             }
         }
         let proxies = self
@@ -172,10 +169,7 @@ impl GroupEr {
             .take()
             .and_then(|proxies| Rc::try_unwrap(proxies).ok());
         if let Some(Err(error)) = proxies.map(BaseProxies::finish) {
-            console::line(format_args!(
-                "group ER `{}` proxies: {error}",
-                self.group.label
-            ));
+            error!(self.group.label, %error, "group ER proxy cleanup failed");
         }
     }
 }
@@ -193,7 +187,6 @@ async fn run_one(
     config: ExecutionConfig,
     er: std::result::Result<ErCtx, String>,
 ) -> RunRecord {
-    console::debug(format_args!("starting {}", entry.name()));
     (entry.run)(config, er).await
 }
 
@@ -353,13 +346,6 @@ async fn run(args: &[String]) -> Result<()> {
     let (grouped, fresh): (Vec<_>, Vec<_>) = functional
         .into_iter()
         .partition(|entry| entry.er.group().is_some());
-    console::debug(format_args!(
-        "running {} ER group(s), {} fresh-ER scenarios and {} benchmarks{}",
-        groups.len(),
-        fresh.len(),
-        benchmarks.len(),
-        if serial { ", one at a time" } else { "" }
-    ));
 
     let mut lanes = Vec::new();
     if serial {
@@ -466,7 +452,7 @@ async fn run(args: &[String]) -> Result<()> {
         Ok(())
     };
     if let Err(error) = &cleanup {
-        console::line(format_args!("suite cleanup failed: {error}"));
+        error!(%error, "suite cleanup failed");
     }
     let outcome = outcome.and(cleanup);
     let Some(report) = report else {
@@ -479,30 +465,18 @@ async fn run(args: &[String]) -> Result<()> {
     );
     let persisted = report::persist_summary(report, &outcome);
     if let Err(error) = &persisted {
-        console::line(format_args!("suite report failed: {error}"));
+        error!(%error, "suite report failed");
     }
     outcome.and(persisted)
 }
 
 fn summarize(records: &[RunRecord]) -> Result<()> {
     let total_scenarios = records.len();
-    let failed: Vec<&RunRecord> =
-        records.iter().filter(|record| !record.passed()).collect();
-    if !failed.is_empty() {
-        for record in &failed {
-            match record.failure() {
-                Some(failure) => eprintln!("[redsuite] FAILED {failure}"),
-                None => eprintln!("[redsuite] FAILED {}", record.name),
-            }
-        }
-        return Err(format!(
-            "{} of {total_scenarios} scenarios failed",
-            failed.len()
-        )
-        .into());
-    }
-    if total_scenarios > 1 {
-        eprintln!("[redsuite] {total_scenarios} scenarios passed");
+    let failed = records.iter().filter(|record| !record.passed()).count();
+    if failed != 0 {
+        return Err(
+            format!("{failed} of {total_scenarios} scenarios failed").into()
+        );
     }
     Ok(())
 }
@@ -515,6 +489,10 @@ fn list(selection: Option<&str>) {
 
 #[tokio::main]
 async fn main() {
+    if let Err(error) = logging::init() {
+        eprintln!("cannot initialize logging: {error}");
+        std::process::exit(1);
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let arg = |index: usize| args.get(index).map(String::as_str);
 
@@ -532,7 +510,7 @@ async fn main() {
     };
 
     if let Err(err) = outcome {
-        eprintln!("error: {err}");
+        error!(error = %err, "command failed");
         std::process::exit(1);
     }
 }

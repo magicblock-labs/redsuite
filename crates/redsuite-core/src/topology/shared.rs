@@ -2,11 +2,11 @@ use std::{fs, path::Path};
 
 use keypair::Keypair;
 use signer::Signer;
+use tracing::{debug, warn};
 
 use super::{config, identity, process, state, state::StackState};
 use crate::{
     api::Api,
-    console,
     context::{BaseCtx, ChainCtx},
     profile::ExecutionConfig,
     Result,
@@ -31,10 +31,6 @@ async fn ensure_base(config: ExecutionConfig) -> Result<StackState> {
             if process::proc_matches(state.base_pid, &state.base_bin)
                 && base_healthy(&state).await =>
         {
-            console::debug(format_args!(
-                "reusing base L1 on 127.0.0.1:{}",
-                state.base_rpc_port
-            ));
             Ok(state)
         }
         stale => {
@@ -103,10 +99,7 @@ async fn boot_base(config: ExecutionConfig) -> Result<StackState> {
             )?;
         }
         identity::reset_pool(&dir);
-        console::debug(format_args!(
-            "booting base L1 on 127.0.0.1:{base_rpc_port} (cloning from \
-             {clone_url}) …"
-        ));
+        debug!("starting base L1");
         base_ports.release();
         let base_pid = process::spawn_detached(plan.command(), &base_log)?;
 
@@ -130,25 +123,19 @@ async fn boot_base(config: ExecutionConfig) -> Result<StackState> {
         match await_base_ready(&state, &base_log, config).await {
             Ok(()) => {
                 state::write_state(&state)?;
-                console::debug(format_args!(
-                    "base up: 127.0.0.1:{} (ws {}, grpc {})",
-                    state.base_rpc_port,
-                    state.base_ws_port,
-                    state.base_grpc_port,
-                ));
                 return Ok(state);
             }
-            Err(e) => {
-                let e = base_ports.failure(e);
+            Err(error) => {
+                let error = base_ports.failure(error);
                 process::kill_pid(base_pid);
                 if state.base_grpc_port == 0 {
-                    return Err(e);
+                    return Err(error);
                 }
-                console::line(format_args!(
-                    "base L1 refused to serve with the Yellowstone plugin \
-                     ({}): {e}; retrying without the gRPC feed",
-                    state.base_plugin
-                ));
+                warn!(
+                    %state.base_plugin,
+                    %error,
+                    "base L1 failed with Yellowstone; retrying without gRPC",
+                );
                 feed = None;
             }
         }

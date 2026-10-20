@@ -9,9 +9,9 @@ use async_trait::async_trait;
 use futures_util::future::join_all;
 use json::{JsonContainerTrait, JsonValueTrait};
 use pubkey::Pubkey;
-use redsuite_core::redline::Accounts;
 use redsuite_core::{
     check, check_eq, prep,
+    redline::Accounts,
     rpc_client::{
         nonblocking::rpc_client::RpcClient,
         rpc_client::GetConfirmedSignaturesForAddress2Config,
@@ -317,6 +317,7 @@ async fn burst(
                 )
             })?;
     let mut failures = 0u64;
+    let mut first_failure = None;
     for (write, sent) in writes.iter().zip(sends) {
         match sent {
             Ok(signature) => check_eq!(
@@ -326,17 +327,16 @@ async fn burst(
             )?,
             Err(error) => {
                 failures += 1;
-                eprintln!(
-                    "[redsuite] {scenario}: send of {} failed: {error}",
-                    write.signature
-                );
+                first_failure.get_or_insert_with(|| {
+                    format!("send of {} failed: {error}", write.signature)
+                });
             }
         }
     }
     check_eq!(
         failures,
         0,
-        "every write must be accepted by sendTransaction"
+        "{scenario}: every write must be accepted by sendTransaction; first failure: {first_failure:?}"
     )?;
 
     let slots = await_statuses(client, &signatures).await?;

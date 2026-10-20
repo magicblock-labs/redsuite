@@ -1,14 +1,15 @@
 use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use redsuite_core::redline::{execute_kernel, Accounts};
-use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, prep,
     profile::ProfileValues,
+    redline::{execute_kernel, Accounts},
+    report::Unit,
     runner::{Pacing, ThreadRunConfig},
     BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
 };
+use tracing::{debug, warn};
 
 const PREP_PAYER_LAMPORTS: u64 = 4_000_000_000;
 const CLONE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -108,24 +109,7 @@ impl Scenario<ScenarioReport> for RpcCapacityBlast {
         let delta = MetricsDelta::new(before, after);
 
         let delivered_rps = outcome.achieved_rps();
-        eprintln!(
-            "[redsuite] {}: {} requests at offered {}/s over {} threads — \
-             delivered {:.0} RPS in {:.2} s, {} failed, client p50 {} us / \
-             p95 {} us, validator tx avg {}",
-            self.name(),
-            profile.requests,
-            profile.offered,
-            threads,
-            delivered_rps,
-            outcome.wall.as_secs_f64(),
-            outcome.failed,
-            outcome.delivery.median,
-            outcome.delivery.quantile95,
-            delta
-                .histogram_avg(TX_PROCESSING_HISTOGRAM)
-                .map(|seconds| format!("{:.1} us", seconds * 1e6))
-                .unwrap_or_else(|| "n/a".to_owned()),
-        );
+        debug!(delivered_rps, outcome.failed, "RPC blast finished");
 
         check_eq!(
             outcome.failed,
@@ -134,11 +118,7 @@ impl Scenario<ScenarioReport> for RpcCapacityBlast {
             outcome.first_error
         )?;
         if delivered_rps < CATASTROPHIC_RPS_FLOOR {
-            eprintln!(
-                "[redsuite] {}: warning: delivered only {delivered_rps:.0} \
-                 RPS — catastrophic ingress regression or broken harness",
-                self.name()
-            );
+            warn!(delivered_rps, "RPC throughput below minimum",);
         }
         if let Some(processed) =
             delta.counter(crate::metrics::ENGINE_TRANSACTIONS)

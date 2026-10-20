@@ -1,4 +1,4 @@
-use crate::{console, profile, report, topology, Result};
+use crate::{profile, report, topology, Result};
 
 pub const ENV_VARS: &[(&str, &str)] = &[
     (
@@ -44,8 +44,8 @@ pub const ENV_VARS: &[(&str, &str)] = &[
     ),
     (profile::LOOP_ENV, "S1 loop mode: open (default) or closed"),
     (
-        console::VERBOSE_ENV,
-        "print stack and per-scenario detail lines for passing runs too",
+        "RUST_LOG",
+        "log filter for RedSuite and launched validators (default info; debug includes phase and workload progress)",
     ),
 ];
 

@@ -3,15 +3,16 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures_util::future::join_all;
 use pubkey::Pubkey;
-use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, host,
     profile::ProfileValues,
+    report::Unit,
     runner::{execute, Pacing, RunConfig},
     topology,
     transport::wsraw::RawWs,
     BaseCtx, ErCtx, Result, Scenario, ScenarioReport,
 };
+use tracing::debug;
 
 const OPEN_CONCURRENCY: usize = 64;
 const FD_TOLERANCE: usize = 64;
@@ -106,10 +107,6 @@ impl Scenario<ScenarioReport> for WsConnCapacity {
 
         let fd_baseline = host::fd_count(pid)?;
         let rss_baseline_kb = host::rss_kb(pid)?;
-        eprintln!(
-            "[redsuite] {}: baseline fds {fd_baseline}, rss {rss_baseline_kb} kB",
-            self.name()
-        );
 
         let mut rungs: Vec<RungOutcome> = Vec::new();
         for connections in profile.ladder {
@@ -144,20 +141,7 @@ impl Scenario<ScenarioReport> for WsConnCapacity {
                 settle_s,
                 unsubscribe_failures,
             };
-            eprintln!(
-                "[redsuite] {}: {} conns — fds idle {} / subscribed {} \
-                 (baseline {}), rss {} kB, after close {} in {:.1} s, \
-                 unsub failures {}",
-                self.name(),
-                rung.connections,
-                rung.fds_idle,
-                rung.fds_subscribed,
-                fd_baseline,
-                rung.rss_subscribed_kb,
-                rung.fds_after_close,
-                rung.settle_s,
-                rung.unsubscribe_failures,
-            );
+            debug!(rung.connections, "connection rung finished");
 
             check!(
                 rung.fds_idle + FD_BASELINE_SLACK >= fd_baseline + connections,
@@ -213,20 +197,9 @@ impl Scenario<ScenarioReport> for WsConnCapacity {
         let (fds_after_churn, churn_settle_s) =
             await_fd_settle(pid, fd_baseline).await?;
         let rss_after_churn_kb = host::rss_kb(pid)?;
-        eprintln!(
-            "[redsuite] {}: churn {} ops — {} ok / {} failed in {:.1} s \
-             (p50 {} us / p95 {} us), fds settle {} in {:.1} s (baseline {}), rss {} kB",
-            self.name(),
-            profile.churn_ops,
-            churn.delivered,
+        debug!(
             churn.failed,
-            churn.wall.as_secs_f64(),
-            churn.delivery.median,
-            churn.delivery.quantile95,
-            fds_after_churn,
-            churn_settle_s,
-            fd_baseline,
-            rss_after_churn_kb,
+            fds_after_churn, fd_baseline, "connection churn finished",
         );
         check_eq!(
             churn.failed,

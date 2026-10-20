@@ -2,6 +2,7 @@ use std::{collections::HashSet, time::Duration};
 
 use pubkey::Pubkey;
 use signature::Signature;
+use tracing::warn;
 
 use crate::{
     api::{custom_error_code, Api, TransactionInfo},
@@ -63,11 +64,11 @@ impl CommitReceipt {
     }
 }
 
-pub fn warn_duplicate_rejection(scenario: &str, message: &str) {
-    eprintln!(
-        "[redsuite] {scenario}: warning: intent reported failed with a \
-         duplicate-rejection code (validator PR #1537) — verifying base \
-         state instead: {message}"
+pub fn warn_duplicate_rejection(scenario: &str, error: &str) {
+    warn!(
+        scenario,
+        %error,
+        "intent rejected as duplicate; verifying base state"
     );
 }
 

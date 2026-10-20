@@ -1,5 +1,7 @@
 use std::{fmt, future::Future, time::Duration};
 
+use tracing::{debug, error_span, Instrument};
+
 use crate::DynError;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
@@ -191,11 +193,15 @@ pub async fn poll_until<T, E>(
     }
 }
 
+/// Attach phase context to both tracing and returned errors.
+/// Check errors retain their type so reports preserve assertion details.
 pub async fn phase<T>(
     name: &str,
     work: impl Future<Output = crate::Result<T>>,
 ) -> crate::Result<T> {
-    work.await
+    debug!(name, "phase started");
+    work.instrument(error_span!("phase", name))
+        .await
         .map_err(|error| match error.downcast::<CheckError>() {
             Ok(error) => error.context("phase", name).into(),
             Err(error) => format!("{name}: {error}").into(),

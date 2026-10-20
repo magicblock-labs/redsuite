@@ -12,6 +12,7 @@ use std::{
 };
 
 use tokio::task::{JoinError, JoinSet};
+use tracing::{Instrument, Span};
 
 pub use crate::transport::rate::{split_budget, Pacing};
 use crate::{
@@ -488,6 +489,7 @@ where
     let handles = (0..threads)
         .map(|index| {
             let factory = factory.clone();
+            let span = Span::current();
             let worker = Worker {
                 index,
                 threads,
@@ -499,9 +501,10 @@ where
                     .build()
                     .expect("driver runtime build is infallible");
                 let local = tokio::task::LocalSet::new();
-                runtime.block_on(
-                    local.run_until(async move { factory(worker).await }),
-                )
+                // Run future construction in the span too: the factory can log.
+                runtime.block_on(local.run_until(
+                    async move { factory(worker).await }.instrument(span),
+                ))
             })
         })
         .collect();

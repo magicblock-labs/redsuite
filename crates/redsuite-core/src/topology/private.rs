@@ -5,11 +5,11 @@ use std::{
     time::Duration,
 };
 
+use magicblock_config::LeaderParams;
 use pubkey::Pubkey;
 use signer::Signer;
 use tokio::sync::Mutex;
-
-use magicblock_config::LeaderParams;
+use tracing::debug;
 
 use super::{
     config,
@@ -18,7 +18,6 @@ use super::{
 };
 use crate::{
     api::Api,
-    console,
     context::{BaseCtx, ChainCtx, ErCtx},
     netfault::BaseProxies,
     report,
@@ -308,10 +307,7 @@ async fn launch(
             options.settings,
         )?,
     };
-    console::debug(format_args!(
-        "booting {role} `{}` on 127.0.0.1:{rpc_port} …",
-        options.label
-    ));
+    debug!(%options.label, "starting rollup");
     ports.release();
     let child = plan.spawn(&log)?;
     let pid = child.id();

@@ -19,6 +19,7 @@ use redsuite_core::{
 };
 use signature::Signature;
 use signer::Signer;
+use tracing::debug;
 
 const LABEL: &str = "verifier-lifecycle";
 const VERIFIERS: usize = 2;
@@ -574,8 +575,6 @@ impl PrivateErScenario for VerifierLifecycle {
     }
 
     async fn run(&self, base: &BaseCtx) -> Result<()> {
-        let name = self.name();
-        let boot_started = Instant::now();
         let mut topology = crate::phase(
             "boot",
             topology::replicated(
@@ -596,19 +595,16 @@ impl PrivateErScenario for VerifierLifecycle {
 
         crate::phase("boot", async {
             topology.leader().wait_ready(READY_TIMEOUT).await?;
-            let connect =
-                topology.wait_verifiers_connected(CONNECT_TIMEOUT).await?;
+            topology.wait_verifiers_connected(CONNECT_TIMEOUT).await?;
             let leader_executors = executors_in_log(topology.leader().log())?;
-            let mut executors = Vec::with_capacity(VERIFIERS);
+            let mut verifier_executors = Vec::with_capacity(VERIFIERS);
             for verifier in topology.verifiers() {
-                executors.push(executors_in_log(verifier.log())?);
+                verifier_executors.push(executors_in_log(verifier.log())?);
             }
-            eprintln!(
-                "[redsuite] {name}: leader ({leader_executors} executors) + \
-                 {VERIFIERS} verifiers ({executors:?} executors) up in \
-                 {:.1} s, streams connected after {:.1} s",
-                boot_started.elapsed().as_secs_f64(),
-                connect.as_secs_f64(),
+            debug!(
+                leader_executors,
+                ?verifier_executors,
+                "replicated topology ready",
             );
             Ok(())
         })
@@ -627,16 +623,13 @@ impl PrivateErScenario for VerifierLifecycle {
         let workload = Workload::start(pairs, CHAIN_GAP, HEAVY_ITERS);
 
         crate::phase("steady load", async {
-            let (max_lag, samples) = sample_lag(&topology, STEADY).await?;
-            let steady = catch_up_fleet(&topology, &[TRANSACTIONS]).await?;
+            let (max_lag, _) = sample_lag(&topology, STEADY).await?;
+            catch_up_fleet(&topology, &[TRANSACTIONS]).await?;
             verify_no_mismatch(&topology).await?;
-            eprintln!(
-                "[redsuite] {name}: steady load for {:.0} s: {} chain txs \
-                 sent, max lag {max_lag:?} txs over {samples} samples, both \
-                 verifiers caught up in {} ms",
-                STEADY.as_secs_f64(),
-                workload.sent(),
-                steady.as_millis(),
+            debug!(
+                sent = workload.sent(),
+                ?max_lag,
+                "steady replication load finished",
             );
             Ok(())
         })
@@ -652,7 +645,7 @@ impl PrivateErScenario for VerifierLifecycle {
             )
             .await?;
             let stopped_at = Instant::now();
-            let stop = stop_verifier(topology.verifier_mut(0), false).await?;
+            stop_verifier(topology.verifier_mut(0), false).await?;
             topology.verifier_mut(0).start(READY_TIMEOUT).await?;
             let offline = stopped_at.elapsed();
             check!(
@@ -660,8 +653,7 @@ impl PrivateErScenario for VerifierLifecycle {
                 "verifier 0 was offline {offline:?}, too long to be sure its \
                  cursor survived the next retention check"
             )?;
-            let reconnect =
-                topology.verifier(0).wait_connected(CONNECT_TIMEOUT).await?;
+            topology.verifier(0).wait_connected(CONNECT_TIMEOUT).await?;
             let snapshots =
                 verifier_count(topology.verifier(0), CLIENT_SNAPSHOTS).await?;
             check_eq!(
@@ -676,16 +668,9 @@ impl PrivateErScenario for VerifierLifecycle {
                     .await?;
             await_leader_connections(&topology, VERIFIERS).await?;
             verify_no_mismatch(&topology).await?;
-            eprintln!(
-                "[redsuite] {name}: verifier 0 restarted on its retained \
-                 cursor: stopped in {} ms (exit {:?}), offline {} ms, \
-                 reconnected after {} ms, caught up under load in {} ms, \
-                 snapshots {snapshots}",
-                stop.shutdown.as_millis(),
-                stop.exit_code,
-                offline.as_millis(),
-                reconnect.as_millis(),
-                catch_up.as_millis(),
+            debug!(
+                catch_up_secs = catch_up.as_secs_f64(),
+                snapshots, "verifier restarted on retained cursor",
             );
             Ok(())
         })
@@ -694,72 +679,66 @@ impl PrivateErScenario for VerifierLifecycle {
         let server_snapshots_before =
             leader_count(&topology, SERVER_SNAPSHOTS).await?;
         let truncations_before = leader_count(&topology, TRUNCATIONS).await?;
-        let stopped_at = Instant::now();
-        let stop = crate::phase(
+        crate::phase(
             "verifier 1 clean stop out of retention",
             stop_verifier(topology.verifier_mut(1), false),
         )
         .await?;
 
-        let survivor_blocks =
-            crate::phase("verifier 1 clean stop out of retention", async {
-                await_leader_connections(&topology, 1).await?;
-                // A block produced after shutdown is beyond the stopped
-                // cursor. Observe it before waiting for retention to remove
-                // its superblock.
-                let slot = topology.leader().ctx().api().get_slot().await? + 1;
-                let pruned = async {
-                    for (retained, timeout) in
-                        [(true, SEAL_TIMEOUT), (false, RETENTION_TIMEOUT)]
-                    {
-                        check::poll(
-                            &format!(
-                                "leader block {slot} retained={retained} \
+        crate::phase("verifier 1 clean stop out of retention", async {
+            await_leader_connections(&topology, 1).await?;
+            // A block produced after shutdown is beyond the stopped
+            // cursor. Observe it before waiting for retention to remove
+            // its superblock.
+            let slot = topology.leader().ctx().api().get_slot().await? + 1;
+            let pruned = async {
+                for (retained, timeout) in
+                    [(true, SEAL_TIMEOUT), (false, RETENTION_TIMEOUT)]
+                {
+                    check::poll(
+                        &format!(
+                            "leader block {slot} retained={retained} \
                                  after verifier 1 stopped"
-                            ),
-                            timeout,
-                            || async {
-                                topology
-                                    .leader()
-                                    .ctx()
-                                    .api()
-                                    .get_block(slot)
-                                    .await
-                                    .is_ok_and(|block| {
-                                        block.is_some() == retained
-                                    })
-                            },
-                        )
-                        .await?;
-                    }
-                    Result::Ok(())
-                };
-                let survivor = async {
-                    let slot_before =
-                        topology.leader().ctx().api().get_slot().await?;
-                    let blocks = blocks_advance(topology.verifier(0)).await?;
-                    let slot_after =
-                        topology.leader().ctx().api().get_slot().await?;
-                    check!(
-                        slot_after > slot_before,
-                        "the leader's slot stood at {slot_before} with \
+                        ),
+                        timeout,
+                        || async {
+                            topology
+                                .leader()
+                                .ctx()
+                                .api()
+                                .get_block(slot)
+                                .await
+                                .is_ok_and(|block| block.is_some() == retained)
+                        },
+                    )
+                    .await?;
+                }
+                Result::Ok(())
+            };
+            let survivor = async {
+                let slot_before =
+                    topology.leader().ctx().api().get_slot().await?;
+                let blocks = blocks_advance(topology.verifier(0)).await?;
+                let slot_after =
+                    topology.leader().ctx().api().get_slot().await?;
+                check!(
+                    slot_after > slot_before,
+                    "the leader's slot stood at {slot_before} with \
                          verifier 1 stopped"
-                    )?;
-                    let target = leader_metric(&topology, TRANSACTIONS).await?;
-                    await_catch_up(topology.verifier(0), TRANSACTIONS, target)
-                        .await?;
-                    Result::Ok(blocks)
-                };
-                let ((), blocks) = tokio::try_join!(pruned, survivor)?;
-                Ok(blocks)
-            })
-            .await?;
-        let offline = stopped_at.elapsed();
+                )?;
+                let target = leader_metric(&topology, TRANSACTIONS).await?;
+                await_catch_up(topology.verifier(0), TRANSACTIONS, target)
+                    .await?;
+                Result::Ok(blocks)
+            };
+            let ((), blocks) = tokio::try_join!(pruned, survivor)?;
+            Ok(blocks)
+        })
+        .await?;
 
         crate::phase("verifier 1 snapshot recovery", async {
             topology.verifier_mut(1).start(READY_TIMEOUT).await?;
-            let reconnect =
-                topology.verifier(1).wait_connected(CONNECT_TIMEOUT).await?;
+            topology.verifier(1).wait_connected(CONNECT_TIMEOUT).await?;
             let client_snapshots =
                 verifier_count(topology.verifier(1), CLIENT_SNAPSHOTS).await?;
             check!(
@@ -776,9 +755,7 @@ impl PrivateErScenario for VerifierLifecycle {
                  verifier"
             )?;
             let target = leader_metric(&topology, TRANSACTIONS).await?;
-            let catch_up =
-                await_catch_up(topology.verifier(1), TRANSACTIONS, target)
-                    .await?;
+            await_catch_up(topology.verifier(1), TRANSACTIONS, target).await?;
             await_leader_connections(&topology, VERIFIERS).await?;
             let sealed = await_leader_advance(
                 &topology,
@@ -787,32 +764,22 @@ impl PrivateErScenario for VerifierLifecycle {
                 "a superblock sealed after the snapshot recovery",
             )
             .await?;
-            let verified =
-                await_catch_up(topology.verifier(1), SUPERBLOCKS, sealed)
-                    .await?;
+            await_catch_up(topology.verifier(1), SUPERBLOCKS, sealed).await?;
             verify_no_mismatch(&topology).await?;
             let truncations = leader_count(&topology, TRUNCATIONS).await?
                 - truncations_before;
-            eprintln!(
-                "[redsuite] {name}: verifier 1 fell behind retention \
-                 ({truncations:.0} purges, stopped in {} ms, offline {:.1} s \
-                 while verifier 0 followed {survivor_blocks:.0} blocks), \
-                 installed {client_snapshots} snapshot(s) (leader served \
-                 {server_snapshots}), reconnected after {} ms, replayed the \
-                 tail in {} ms and verified superblock {sealed:.0} against \
-                 the leader's seal {} ms later",
-                stop.shutdown.as_millis(),
-                offline.as_secs_f64(),
-                reconnect.as_millis(),
-                catch_up.as_millis(),
-                verified.as_millis(),
+            debug!(
+                truncations,
+                client_snapshots,
+                server_snapshots,
+                "verifier recovered beyond retention via snapshot",
             );
             Ok(())
         })
         .await?;
 
         crate::phase("verifier 1 sigkill", async {
-            let killed = stop_verifier(topology.verifier_mut(1), true).await?;
+            stop_verifier(topology.verifier_mut(1), true).await?;
             await_leader_connections(&topology, 1).await?;
             let slot_before = topology.leader().ctx().api().get_slot().await?;
             let lone_blocks = blocks_advance(topology.verifier(0)).await?;
@@ -824,21 +791,16 @@ impl PrivateErScenario for VerifierLifecycle {
             )?;
             probe_clones(base, &topology).await?;
             let target = leader_metric(&topology, TRANSACTIONS).await?;
-            let catch_up =
-                await_catch_up(topology.verifier(0), TRANSACTIONS, target)
-                    .await?;
+            await_catch_up(topology.verifier(0), TRANSACTIONS, target).await?;
             check!(
                 !topology.verifier(1).is_running(),
                 "verifier 1 must stay offline while the others are observed"
             )?;
-            eprintln!(
-                "[redsuite] {name}: verifier 1 kept offline (exit signal \
-                 {:?}); the leader advanced {} slots and verifier 0 followed \
-                 with {lone_blocks:.0} blocks, catching up to {target:.0} \
-                 transactions in {} ms",
-                killed.exit_signal,
-                slot_after - slot_before,
-                catch_up.as_millis(),
+            debug!(
+                slots_advanced = slot_after - slot_before,
+                lone_blocks,
+                target,
+                "surviving verifier kept up while peer offline",
             );
             Ok(())
         })
@@ -847,11 +809,9 @@ impl PrivateErScenario for VerifierLifecycle {
         crate::phase("verifier 1 wiped rejoin", async {
             let served_before =
                 leader_count(&topology, SERVER_SNAPSHOTS).await?;
-            let rejoin_started = Instant::now();
             topology.verifier_mut(1).reset_storage()?;
             topology.verifier_mut(1).start(READY_TIMEOUT).await?;
-            let reconnect =
-                topology.verifier(1).wait_connected(CONNECT_TIMEOUT).await?;
+            topology.verifier(1).wait_connected(CONNECT_TIMEOUT).await?;
             let client_snapshots =
                 verifier_count(topology.verifier(1), CLIENT_SNAPSHOTS).await?;
             check!(
@@ -867,28 +827,20 @@ impl PrivateErScenario for VerifierLifecycle {
                 "the leader served no snapshot to the wiped verifier 1"
             )?;
             let target = leader_metric(&topology, TRANSACTIONS).await?;
-            let catch_up =
-                await_catch_up(topology.verifier(1), TRANSACTIONS, target)
-                    .await?;
+            await_catch_up(topology.verifier(1), TRANSACTIONS, target).await?;
             let blocks = blocks_advance(topology.verifier(1)).await?;
             await_leader_connections(&topology, VERIFIERS).await?;
             verify_no_mismatch(&topology).await?;
-            eprintln!(
-                "[redsuite] {name}: verifier 1 rejoined from wiped storage in \
-                 {} ms, installed {client_snapshots} snapshot(s) (leader \
-                 served {server_snapshots}), reconnected after {} ms, caught \
-                 up to {target:.0} transactions in {} ms and appended \
-                 {blocks:.0} blocks on the snapshot's superblock",
-                rejoin_started.elapsed().as_millis(),
-                reconnect.as_millis(),
-                catch_up.as_millis(),
+            debug!(
+                client_snapshots,
+                blocks, "verifier rejoined from wiped storage",
             );
             Ok(())
         })
         .await?;
 
         crate::phase("final sealed boundary", async {
-            let (pairs, chain_txs) = workload.stop(&topology).await?;
+            let (pairs, _) = workload.stop(&topology).await?;
             let final_txs = leader_metric(&topology, TRANSACTIONS).await?;
             await_leader_advance(
                 &topology,
@@ -904,8 +856,7 @@ impl PrivateErScenario for VerifierLifecycle {
                 final_txs,
                 "the leader appended transactions after the workload stopped"
             )?;
-            let drain =
-                catch_up_fleet(&topology, &[TRANSACTIONS, SUPERBLOCKS]).await?;
+            catch_up_fleet(&topology, &[TRANSACTIONS, SUPERBLOCKS]).await?;
             await_catch_up(topology.verifier(0), BLOCKS, leader_blocks).await?;
             for verifier in topology.verifiers() {
                 check_eq!(
@@ -918,23 +869,16 @@ impl PrivateErScenario for VerifierLifecycle {
             }
             verify_no_mismatch(&topology).await?;
             verify_pairs(&topology, &pairs).await?;
-            let leader_superblocks =
-                leader_metric(&topology, SUPERBLOCKS).await?;
+            leader_metric(&topology, SUPERBLOCKS).await?;
             let mut verifier_superblocks = Vec::with_capacity(VERIFIERS);
             for verifier in topology.verifiers() {
                 verifier_superblocks
                     .push(verifier_metric(verifier, SUPERBLOCKS).await?);
             }
-            let chains: u64 = pairs.iter().map(|pair| pair.chains).sum();
-            eprintln!(
-                "[redsuite] {name}: final boundary: {chains} chains \
-                 ({chain_txs} chain txs) over {} pairs; leader {leader_txs:.0} \
-                 txs / {leader_blocks:.0} blocks / {leader_superblocks:.0} \
-                 superblocks, verifiers drained to zero lag in {} ms on \
-                 superblocks {verifier_superblocks:?}, no mismatches, every \
-                 pair matches its fold on the leader",
-                pairs.len(),
-                drain.as_millis(),
+            debug!(
+                leader_txs,
+                ?verifier_superblocks,
+                "final replicated account state verified",
             );
             Ok(())
         })

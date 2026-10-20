@@ -7,19 +7,21 @@ use std::{
 use async_trait::async_trait;
 use instruction::Instruction;
 use pubkey::Pubkey;
-use redsuite_core::redline::Accounts;
-use redsuite_core::report::Unit;
-use redsuite_core::runner::{Delivery, SendTransaction};
 use redsuite_core::{
     check, check_eq, host, prep,
     profile::ProfileValues,
-    redline::causal::{compute_unit_limit, CU_LIMIT, HASH_INIT},
+    redline::{
+        causal::{compute_unit_limit, CU_LIMIT, HASH_INIT},
+        Accounts,
+    },
+    report::Unit,
     runner::{
-        execute_raw, merge_outcomes, spawn_workers, split_iterations, Pacing,
-        RunConfig, RunOutcome,
+        execute_raw, merge_outcomes, spawn_workers, split_iterations, Delivery,
+        Pacing, RunConfig, RunOutcome, SendTransaction,
     },
     BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
 };
+use tracing::debug;
 
 use crate::program::{instruction::build, layout, utils::hash_chain};
 
@@ -420,7 +422,6 @@ impl Scenario<ScenarioReport> for MixedSustainedLoad {
 
         let payers =
             prep::funded_payers(base, profile.payers, PAYER_LAMPORTS).await?;
-        let prep_started = Instant::now();
         let pool = Accounts::new(crate::ACCOUNT_SPACE, er.identity())
             .init_batched(base, &payers, profile.lanes as usize, true)
             .await?;
@@ -431,12 +432,6 @@ impl Scenario<ScenarioReport> for MixedSustainedLoad {
             CLONE_TIMEOUT,
         )
         .await?;
-        eprintln!(
-            "[redsuite] {}: prepped {} lanes in {:.1} s",
-            self.name(),
-            profile.lanes,
-            prep_started.elapsed().as_secs_f64(),
-        );
 
         let pool = Arc::new(pool);
         let payer_bytes = prep::payer_bytes(&payers);
@@ -524,20 +519,11 @@ impl Scenario<ScenarioReport> for MixedSustainedLoad {
         let wall = outcome.wall + drained.elapsed;
         let executed_tps = total as f64 / wall.as_secs_f64();
         let thread_cores = cpu_after.thread_cores_since(&cpu_before);
-        eprintln!(
-            "[redsuite] {}: {total} txs at {:.0} tps offered / {:.0} tps \
-             delivered / {:.0} tps executed (drain {:.1} s), p50 {} us / \
-             p95 {} us, cores {:.2}, rss {} -> {} MiB",
-            self.name(),
-            profile.rate,
-            outcome.achieved_rps(),
+        debug!(
+            total,
+            delivered_tps = outcome.achieved_rps(),
             executed_tps,
-            drained.elapsed.as_secs_f64(),
-            outcome.delivery.median,
-            outcome.delivery.quantile95,
-            cpu_after.cores_since(&cpu_before),
-            rss_before / 1024,
-            rss_after / 1024,
+            "sustained workload finished",
         );
 
         let mut report = ScenarioReport::ok(self.name())

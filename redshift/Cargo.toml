@@ -6,6 +6,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+tracing = { workspace = true }
 async-trait = { workspace = true }
 borsh = { workspace = true }
 tokio = { workspace = true }

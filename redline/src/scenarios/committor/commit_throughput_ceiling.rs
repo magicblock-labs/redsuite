@@ -6,20 +6,20 @@ use std::{
 
 use async_trait::async_trait;
 use pubkey::Pubkey;
-use redsuite_core::redline::Accounts;
-use redsuite_core::report::Unit;
-use redsuite_core::runner::SendTransaction;
 use redsuite_core::{
     check, check_eq,
     monitor::{self, MonitorSpec},
     prep,
     profile::ProfileValues,
     receipt,
-    runner::{execute, Pacing, RunConfig},
+    redline::Accounts,
+    report::Unit,
+    runner::{execute, Pacing, RunConfig, SendTransaction},
     BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
 };
 use signature::Signature;
 use signer::Signer;
+use tracing::{debug, warn};
 
 use crate::program::instruction::build;
 
@@ -206,16 +206,9 @@ impl Scenario<ScenarioReport> for CommitThroughputCeiling {
         let prep_payers =
             prep::funded_payers(base, profile.prep_payers, PREP_PAYER_LAMPORTS)
                 .await?;
-        let prep_started = Instant::now();
         let pool = Accounts::new(ACCOUNT_SPACE, er.identity())
             .init_batched(base, &prep_payers, pool_size, true)
             .await?;
-        eprintln!(
-            "[redsuite] {}: prepped {} fresh delegated accounts in {:.1} s",
-            self.name(),
-            pool.len(),
-            prep_started.elapsed().as_secs_f64(),
-        );
 
         prep::prewarm(er, &pool, ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
 
@@ -294,19 +287,11 @@ impl Scenario<ScenarioReport> for CommitThroughputCeiling {
             .unwrap_or(0.0);
         check_eq!(failed_intents, 0.0, "fresh-key intents failed")?;
         let drain_rate = drain.drained / span_wall.as_secs_f64();
-        eprintln!(
-            "[redsuite] {}: fresh drain {:.2} intents/s ({}/{} over {:.1} s \
-             span), verdict {}, outstanding peak {:.0} (backlog gauge peak \
-             {:.0}), busy peak {:.0}",
-            self.name(),
-            drain_rate,
+        debug!(
             drain.drained,
             profile.fresh_commits,
-            span_wall.as_secs_f64(),
-            steady_state.verdict,
-            steady_state.outstanding_peak,
-            steady_state.backlog_peak,
-            steady_state.busy_peak.unwrap_or(f64::NAN),
+            %steady_state.verdict,
+            "fresh commit drain finished",
         );
         // drain measured a second, independent way: every scheduling tx's
         // receipt exists, succeeded, and its base txs confirm on chain
@@ -329,13 +314,11 @@ impl Scenario<ScenarioReport> for CommitThroughputCeiling {
                 receipt_base_txs += commit_receipt.base_signatures.len();
             }
         } else {
-            eprintln!(
-                "[redsuite] {}: warning: only {:.0} of {} intents drained \
-                 within {:?} — receipts skipped, drain rate is partial",
-                self.name(),
+            warn!(
                 drain.drained,
                 profile.fresh_commits,
-                profile.drain_cap,
+                drain_cap_secs = profile.drain_cap.as_secs_f64(),
+                "commit drain incomplete; receipt checks skipped",
             );
         }
 

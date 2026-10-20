@@ -2,13 +2,12 @@ use std::{cell::RefCell, rc::Rc, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use pubkey::Pubkey;
-use redsuite_core::redline::Accounts;
-use redsuite_core::report::Unit;
 use redsuite_core::{
     check, check_eq, prep,
     profile::ProfileValues,
-    redline::causal::HASH_INIT,
+    redline::{causal::HASH_INIT, Accounts},
     report,
+    report::Unit,
     runner::{execute, Pacing, RunConfig, RunOutcome},
     transport::{
         clock::SendClock,
@@ -18,6 +17,7 @@ use redsuite_core::{
     TxSender,
 };
 use signature::Signature;
+use tracing::debug;
 
 use crate::program::{instruction::build, layout, utils::hash_chain};
 
@@ -267,18 +267,10 @@ impl Scenario<ScenarioReport> for HighCu {
                 run_cell(er, &senders, &pdas, profile, label, iters, offset)
                     .await?;
             offset += profile.warmup + profile.iterations;
-            eprintln!(
-                "[redsuite] {}: {label} (sha256 iters {iters}): delivery p50 {} us / p95 {} us, {:.0} tps delivered, {:.0} tps executed, lag p50 {} us, probe {:.0} cus, validator avg {} us",
-                self.name(),
-                cell.outcome.delivery.median,
-                cell.outcome.delivery.quantile95,
-                cell.outcome.achieved_rps(),
-                cell.executed_tps(profile.iterations),
-                cell.updates.lag.median,
-                cell.probe_cus,
-                cell.validator_avg_us
-                    .map(|avg| format!("{avg:.1}"))
-                    .unwrap_or_else(|| "n/a".into()),
+            debug!(
+                label,
+                executed_tps = cell.executed_tps(profile.iterations),
+                "compute cell finished",
             );
 
             let cell_report =

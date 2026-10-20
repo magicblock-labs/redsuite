@@ -7,20 +7,21 @@ use std::{
 
 use async_trait::async_trait;
 use pubkey::Pubkey;
-use redsuite_core::redline::Accounts;
-use redsuite_core::report::Unit;
-use redsuite_core::runner::{RunOutcome, SendTransaction};
 use redsuite_core::{
     api::custom_error_code,
     check, check_eq, prep,
     profile::ProfileValues,
-    receipt, report,
-    runner::{execute, Pacing, RunConfig},
+    receipt,
+    redline::Accounts,
+    report,
+    report::Unit,
+    runner::{execute, Pacing, RunConfig, RunOutcome, SendTransaction},
     stats::StreamingStats,
     topology, Api, BaseCtx, ChainCtx, CheckError, ErCtx, MetricsDelta, Result,
     Scenario, ScenarioReport,
 };
 use signer::Signer;
+use tracing::debug;
 
 use crate::program::{instruction::build, DELEGATION_PROGRAM_ID};
 
@@ -387,15 +388,11 @@ impl Scenario<ScenarioReport> for CommitWidthEnvelope {
                 as f64
                 / profile.commits as f64;
 
-            eprintln!(
-                "[redsuite] {}: w{width}: round-trip p50 {:.0} us / p95 {:.0} us, \
-                 {:.1} base txs/commit ({:.1} receipt-listed), {:.2} commits/s achieved",
-                self.name(),
-                round_trip.median,
-                round_trip.quantile95,
-                flow_txs_per_commit,
-                receipt_txs_per_commit,
-                profile.commits as f64 / outcome.wall.as_secs_f64(),
+            debug!(
+                width,
+                commits_per_sec =
+                    profile.commits as f64 / outcome.wall.as_secs_f64(),
+                "commit width cell finished"
             );
 
             let cell_report =
@@ -486,11 +483,7 @@ impl Scenario<ScenarioReport> for CommitWidthEnvelope {
                             "the width-15 probe was rejected with an \
                              unexpected code"
                         )?;
-                        eprintln!(
-                            "[redsuite] {}: probe w15: refused at scheduling \
-                             (intent size gate)",
-                            self.name()
-                        );
+                        debug!("probe refused by scheduling intent-size gate");
                         probe_settings.push((
                             "probe w15".to_owned(),
                             "refused at scheduling (intent size gate)"
@@ -529,13 +522,7 @@ impl Scenario<ScenarioReport> for CommitWidthEnvelope {
                             "the width-15 commit's own base txs must load a \
                              lookup table"
                         )?;
-                        eprintln!(
-                            "[redsuite] {}: probe w15: {:.1} s, {} flow + {} alt base txs",
-                            self.name(),
-                            wall.as_secs_f64(),
-                            flow_after.new_flow_since(&flow_before),
-                            alt_base_txs,
-                        );
+                        debug!(alt_base_txs, "ALT commit probe finished");
                         probe_settings.push((
                             "probe w15".to_owned(),
                             "delivered via ALTs".to_owned(),
@@ -653,10 +640,7 @@ impl Scenario<ScenarioReport> for CommitWidthEnvelope {
                         }
                     }
                 };
-                eprintln!(
-                    "[redsuite] {}: probe w30: {outcome_note}",
-                    self.name()
-                );
+                debug!(%outcome_note, "oversized commit probe finished");
                 probe_settings.push(("probe w30".to_owned(), outcome_note));
             }
 
@@ -731,10 +715,7 @@ impl Scenario<ScenarioReport> for CommitWidthEnvelope {
                     receipt::SPONSORED_COMMIT_LIMIT + 1,
                     receipt::COMMIT_LIMIT_ERR
                 );
-                eprintln!(
-                    "[redsuite] {}: probe commit-limit: {outcome_note}",
-                    self.name()
-                );
+                debug!(%outcome_note, "commit limit probe finished");
                 probe_settings
                     .push(("probe commit limit".to_owned(), outcome_note));
             }

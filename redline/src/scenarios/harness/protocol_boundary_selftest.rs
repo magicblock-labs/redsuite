@@ -2,15 +2,16 @@ use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use pubkey::Pubkey;
-use redsuite_core::redline::{copy_three, execute_kernel, Accounts};
-use redsuite_core::report::Unit;
 use redsuite_core::{
     check_eq, prep,
     profile::ProfileValues,
+    redline::{copy_three, execute_kernel, Accounts},
     report,
+    report::Unit,
     runner::{Pacing, RunOutcome, ThreadRunConfig},
     BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
 };
+use tracing::{debug, warn};
 
 const PREP_PAYER_LAMPORTS: u64 = 4_000_000_000;
 const CLONE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -157,18 +158,11 @@ impl Scenario<ScenarioReport> for ProtocolBoundarySelftest {
                     .histogram_avg(TX_PROCESSING_HISTOGRAM)
                     .map(|seconds| seconds * 1e6),
             };
-            eprintln!(
-                "[redsuite] {}: threads={} — {:.0} tps achieved of {} offered, \
-                 client p50 {} us / p95 {} us, validator tx avg {}",
-                self.name(),
+            debug!(
                 cell.threads,
-                cell.outcome.achieved_rps(),
-                profile.rate,
                 cell.outcome.delivery.median,
-                cell.outcome.delivery.quantile95,
-                cell.tx_processing_avg_us
-                    .map(|us| format!("{us:.1} us"))
-                    .unwrap_or_else(|| "n/a".to_owned()),
+                cell.tx_processing_avg_us,
+                "protocol boundary cell finished",
             );
             check_eq!(
                 cell.outcome.failed,
@@ -205,17 +199,16 @@ impl Scenario<ScenarioReport> for ProtocolBoundarySelftest {
         let single = &cells[0];
         let multi = &cells[1];
 
-        if let (Some(single_validator), Some(multi_validator)) =
+        if let (Some(single_validator_us), Some(multi_validator_us)) =
             (single.tx_processing_avg_us, multi.tx_processing_avg_us)
         {
-            let validator_ratio = (single_validator / multi_validator)
-                .max(multi_validator / single_validator);
+            let validator_ratio = (single_validator_us / multi_validator_us)
+                .max(multi_validator_us / single_validator_us);
             if validator_ratio > VALIDATOR_AGREEMENT_RATIO {
-                eprintln!(
-                    "[redsuite] {}: warning: validator-side work diverged \
-                     across cells ({single_validator:.1} vs \
-                     {multi_validator:.1} us) — cells are not comparable",
-                    self.name()
+                warn!(
+                    single_validator_us,
+                    multi_validator_us,
+                    "validator processing latency differs; client comparison is confounded",
                 );
             }
         }
@@ -223,34 +216,21 @@ impl Scenario<ScenarioReport> for ProtocolBoundarySelftest {
         let p50_ratio = single.outcome.delivery.median.max(1) as f64
             / multi.outcome.delivery.median.max(1) as f64;
         let artifact_detected = p50_ratio >= ARTIFACT_P50_RATIO;
-        eprintln!(
-            "[redsuite] {}: single/multi client p50 ratio {:.1}x — client \
-             artifact {}",
-            self.name(),
+        debug!(
             p50_ratio,
-            if artifact_detected {
-                "DETECTED (single-thread latency is the harness, not the validator)"
-            } else {
-                "not detected"
-            }
+            artifact_detected, "client boundary comparison finished",
         );
         if profile.expect_artifact && !artifact_detected {
-            eprintln!(
-                "[redsuite] {}: warning: the single-thread cell was expected \
-                 to hit the client boundary at {} tps (p50 ratio {:.1}x < \
-                 {ARTIFACT_P50_RATIO}x) — raise the boundary rate for this \
-                 host",
-                self.name(),
+            warn!(
                 profile.rate,
-                p50_ratio
+                p50_ratio,
+                "expected client-thread latency gap absent; try a higher rate",
             );
         }
         if !profile.expect_artifact && artifact_detected {
-            eprintln!(
-                "[redsuite] {}: warning: both cells run below the client \
-                 boundary yet p50 diverged {:.1}x",
-                self.name(),
-                p50_ratio
+            warn!(
+                p50_ratio,
+                "unexpected client-thread latency gap at baseline rate",
             );
         }
 

@@ -12,28 +12,30 @@ use async_trait::async_trait;
 use futures_util::future::join_all;
 use keypair::Keypair;
 use pubkey::Pubkey;
-use redsuite_core::redline::Accounts;
-use redsuite_core::report::Unit::{Count, Micros, Ratio, Seconds, Tps};
-use redsuite_core::transport::clock::SendClock;
 use redsuite_core::{
     check, check_eq, prep,
     profile::ProfileValues,
-    redline::causal::{
-        chain_ixs, independent_ixs, PairModel, Step, HASH_INIT, STEPS,
+    redline::{
+        causal::{
+            chain_ixs, independent_ixs, PairModel, Step, HASH_INIT, STEPS,
+        },
+        Accounts,
     },
     report,
+    report::Unit::{Count, Micros, Ratio, Seconds, Tps},
     runner::{
         execute_until_raw, merge_outcomes, spawn_workers, split_budget, Pacing,
         RawRunOutcome, RunOutcome, Worker, Workers, SEND_ORIGIN,
     },
     sampler::{MeanMax, Sampled, Sampler, Trailing},
     stats::{ObservationsStats, StreamingStats},
-    transport::ws::SignatureConfirmations,
+    transport::{clock::SendClock, ws::SignatureConfirmations},
     BaseCtx, ChainCtx, CheckError, ErClient, ErCtx, Metrics, MetricsDelta,
     Result, Scenario, ScenarioReport, TxSender,
 };
 use signature::Signature;
 use signer::Signer;
+use tracing::debug;
 
 use crate::program::{layout, utils::hash_chain};
 
@@ -684,7 +686,6 @@ impl Scenario<ScenarioReport> for ConflictOrdering {
             )?;
         }
 
-        let prep_started = Instant::now();
         let payers = prep::funded_payers(
             base,
             profile.pairs * PAYERS_PER_PAIR + profile.independent_accounts,
@@ -727,14 +728,6 @@ impl Scenario<ScenarioReport> for ConflictOrdering {
         let payer_keys: Vec<Pubkey> =
             payers.iter().map(Signer::pubkey).collect();
         prep::await_cloned_payers(er, &payer_keys, CLONE_TIMEOUT).await?;
-        eprintln!(
-            "[redsuite] {}: prepped {} pairs x 2 accounts x 3 payers and {} \
-             independent lanes in {:.1} s",
-            self.name(),
-            profile.pairs,
-            profile.independent_accounts,
-            prep_started.elapsed().as_secs_f64(),
-        );
 
         let mut pairs: Vec<Pair> = pair_accounts
             .chunks_exact(2)
@@ -793,17 +786,10 @@ impl Scenario<ScenarioReport> for ConflictOrdering {
         let calibration_target =
             calibration_before.get(TX_COUNT).unwrap_or_default()
                 + calibration.delivered as f64;
-        let calibration_drain = drain(er, calibration_target).await?;
-        eprintln!(
-            "[redsuite] {}: calibration: {} executors busy at peak (mean \
-             {:.1}), {} independent txs at {:.0} tps, drained in {:.1} s; \
-             contention phases use {contention_lanes} lanes",
-            self.name(),
+        drain(er, calibration_target).await?;
+        debug!(
             executors,
-            calibration_samples.value.busy.mean(),
-            calibration.delivered,
-            calibration.delivered as f64 / calibration.wall.as_secs_f64(),
-            calibration_drain.elapsed.as_secs_f64(),
+            contention_lanes, "contention calibration finished"
         );
 
         let space = ChainSpace {
@@ -859,24 +845,9 @@ impl Scenario<ScenarioReport> for ConflictOrdering {
                     phase.label,
                     phase.load.first_error
                 )?;
-                let samples = &phase.samples.value;
-                eprintln!(
-                    "[redsuite] {}: batch {batch} {}: {} chain txs (send p50 \
-                     {} us / p95 {} us) beside {} independent txs in {:.1} s; \
-                     busy executors mean {:.1} / max {:.0} over {} samples, \
-                     blocked max {:.0}, longest progress stall {:.2} s",
-                    self.name(),
-                    phase.label,
-                    phase.chain_txs,
-                    phase.send.median,
-                    phase.send.quantile95,
-                    phase.load.delivered,
-                    phase.wall.as_secs_f64(),
-                    samples.busy.mean(),
-                    samples.busy.max,
-                    samples.busy.count,
-                    samples.blocked_max,
-                    samples.max_stall.as_secs_f64(),
+                debug!(
+                    batch,
+                    phase.label, phase.chain_txs, "contention phase finished",
                 );
                 phases.push(phase);
             }
@@ -976,16 +947,10 @@ impl Scenario<ScenarioReport> for ConflictOrdering {
                  unfinished predecessor, so executor timing was not exercised"
             )?;
             verify_pairs(er, &mut pairs, batch).await?;
-            eprintln!(
-                "[redsuite] {}: batch {batch}: {} chains ({} chain txs, {} \
-                 independent txs) drained in {:.1} s, {dependencies:.0} \
-                 ordering dependencies, every pair matches its accepted \
-                 X/Y/Z fold",
-                self.name(),
-                outcome.chains() * profile.pairs as u64,
-                outcome.chain_txs(),
-                outcome.independent_txs(),
-                outcome.drained.elapsed.as_secs_f64(),
+            debug!(
+                batch,
+                dependencies,
+                "contention batch drained; all pairs match accepted fold",
             );
 
             let mut cell =
