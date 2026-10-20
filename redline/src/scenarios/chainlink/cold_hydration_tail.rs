@@ -128,29 +128,23 @@ async fn burst_cell(
 
     let before = cell_er.scrape_metrics().await?;
     let slow = Rc::new(Cell::new(0u64));
-    let request = {
+    let request = |id: u64| {
+        let sender = senders[(id as usize) % senders.len()].clone();
+        let account = pool[(id as usize - 1) % pool.len()];
+        let ix = crate::program::instruction::build::read_accounts_data(
+            id,
+            &[account],
+        );
         let slow = slow.clone();
-        let senders = senders.clone();
-        let pool = pool.to_vec();
-        move |id: u64| {
-            let sender = senders[(id as usize) % senders.len()].clone();
-            let account = pool[(id as usize - 1) % pool.len()];
-            let ix = crate::program::instruction::build::read_accounts_data(
-                id,
-                &[account],
-            );
-            let slow = slow.clone();
-            async move {
-                let tx = sender.prepare(&[ix]).await?;
-                Ok(SendTransaction(move |started: Instant| async move {
-                    let delivery =
-                        sender.submit_prepared(&tx).await.map(|_| ());
-                    if started.elapsed() > SLOW_THRESHOLD {
-                        slow.set(slow.get() + 1);
-                    }
-                    delivery
-                }))
-            }
+        async move {
+            let tx = sender.prepare(&[ix]).await?;
+            Ok(SendTransaction(move |started: Instant| async move {
+                let delivery = sender.submit_prepared(&tx).await.map(|_| ());
+                if started.elapsed() > SLOW_THRESHOLD {
+                    slow.set(slow.get() + 1);
+                }
+                delivery
+            }))
         }
     };
     let started = Instant::now();

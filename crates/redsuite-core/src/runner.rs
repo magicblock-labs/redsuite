@@ -1,6 +1,6 @@
 use std::{
     any::Any,
-    cell::{Cell, RefCell},
+    cell::Cell,
     future::Future,
     rc::Rc,
     sync::{
@@ -13,7 +13,7 @@ use std::{
 
 use tokio::{
     sync::{watch, OwnedSemaphorePermit},
-    task::{JoinError, JoinSet},
+    task::JoinSet,
 };
 use tracing::{Instrument, Span};
 
@@ -21,7 +21,7 @@ pub use crate::transport::rate::{split_budget, Pacing};
 use crate::{
     stats::{ObservationsStats, StreamingStats},
     transport::rate::Throttle,
-    DynError, Result,
+    Result,
 };
 
 const STOP_POLL: Duration = Duration::from_millis(20);
@@ -72,29 +72,52 @@ pub struct ThreadRunConfig {
     pub concurrency: usize,
 }
 
-#[derive(Debug)]
-pub enum JobOutcome {
-    Delivered {
-        delivery_micros: u32,
-        sync_micros: Option<u32>,
-    },
-    DeliveryFailed(DynError),
-    SyncFailed {
-        delivery_micros: u32,
-        error: DynError,
-    },
-    Cancelled,
-    Panicked(JoinError),
+struct Job {
+    scheduling: u32,
+    delivery: Option<u32>,
+    sync: Option<u32>,
+    outcome: Result<()>,
+}
+
+impl Job {
+    async fn run<D: Delivery>(
+        admitted: Instant,
+        request: impl Future<Output = Result<D>>,
+        sync: Option<impl Future<Output = Result<()>>>,
+    ) -> Self {
+        let mut job = Self {
+            scheduling: admitted.elapsed().as_micros() as u32,
+            delivery: None,
+            sync: None,
+            outcome: Ok(()),
+        };
+        job.outcome = job.deliver(request, sync).await;
+        job
+    }
+
+    async fn deliver<D: Delivery>(
+        &mut self,
+        request: impl Future<Output = Result<D>>,
+        sync: Option<impl Future<Output = Result<()>>>,
+    ) -> Result<()> {
+        let send = request.await?;
+        let started = Instant::now();
+        send.deliver(started).await?;
+        self.delivery = Some(started.elapsed().as_micros() as u32);
+        if let Some(sync) = sync {
+            sync.await.map_err(|error| format!("sync: {error}"))?;
+            self.sync = Some(started.elapsed().as_micros() as u32);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Default)]
 pub struct RunOutcome<S = ObservationsStats> {
     pub delivered: u64,
-    /// All unsuccessful admitted iterations, including panics and cancellations.
+    /// Unsuccessful requests; task panics abort the run instead of producing a tally.
     /// Together with `delivered`, this gives the admitted count.
     pub failed: u64,
-    pub panicked: u64,
-    pub cancelled: u64,
     pub first_error: Option<String>,
     pub delivery: S,
     pub scheduling: S,
@@ -152,8 +175,6 @@ impl RawRunOutcome {
     pub fn merge(&mut self, other: RawRunOutcome) {
         self.delivered += other.delivered;
         self.failed += other.failed;
-        self.panicked += other.panicked;
-        self.cancelled += other.cancelled;
         if self.first_error.is_none() {
             self.first_error = other.first_error;
         }
@@ -179,8 +200,6 @@ impl RawRunOutcome {
         RunOutcome {
             delivered: self.delivered,
             failed: self.failed,
-            panicked: self.panicked,
-            cancelled: self.cancelled,
             first_error: self.first_error,
             delivery: self.delivery.finalize(false),
             scheduling: self.scheduling.finalize(false),
@@ -193,48 +212,19 @@ impl RawRunOutcome {
         }
     }
 
-    fn record(&mut self, outcome: JobOutcome) {
-        match outcome {
-            JobOutcome::Delivered {
-                delivery_micros,
-                sync_micros,
-            } => {
-                self.delivery.push(delivery_micros);
-                if let (Some(sync_stats), Some(sync_micros)) =
-                    (self.sync.as_mut(), sync_micros)
-                {
-                    sync_stats.push(sync_micros);
-                }
-                self.delivered += 1;
-            }
-            JobOutcome::DeliveryFailed(error) => {
+    fn record(&mut self, job: Job) {
+        self.scheduling.push(job.scheduling);
+        if let Some(micros) = job.delivery {
+            self.delivery.push(micros);
+        }
+        if let (Some(stats), Some(micros)) = (&mut self.sync, job.sync) {
+            stats.push(micros);
+        }
+        match job.outcome {
+            Ok(()) => self.delivered += 1,
+            Err(error) => {
                 self.failed += 1;
                 self.first_error.get_or_insert_with(|| error.to_string());
-            }
-            JobOutcome::SyncFailed {
-                delivery_micros,
-                error,
-            } => {
-                self.delivery.push(delivery_micros);
-                self.failed += 1;
-                self.first_error
-                    .get_or_insert_with(|| format!("sync: {error}"));
-            }
-            JobOutcome::Cancelled => {
-                self.failed += 1;
-                self.cancelled += 1;
-                self.first_error.get_or_insert_with(|| {
-                    "request task was cancelled".to_string()
-                });
-            }
-            JobOutcome::Panicked(join_error) => {
-                self.failed += 1;
-                self.panicked += 1;
-                let message = format!(
-                    "panic: {}",
-                    panic_message(join_error.into_panic())
-                );
-                self.first_error.get_or_insert(message);
             }
         }
     }
@@ -303,11 +293,11 @@ where
     SyncFut: Future<Output = Result<()>> + 'static,
 {
     let mut throttle = Throttle::new(pacing, concurrency)?;
-    let tally = Rc::new(RefCell::new(RawRunOutcome {
+    let mut tally = RawRunOutcome {
         sync: sync.is_some().then(StreamingStats::new),
         origin: D::ORIGIN,
         ..RawRunOutcome::default()
-    }));
+    };
     let started = Instant::now();
 
     let mut jobs = JoinSet::new();
@@ -318,59 +308,21 @@ where
         admitted += 1;
         let request_fut = request(admitted);
         let sync_fut = sync.as_mut().map(|sync| sync(admitted));
-        let job_tally = tally.clone();
         jobs.spawn_local(async move {
-            job_tally
-                .borrow_mut()
-                .scheduling
-                .push(admitted_at.elapsed().as_micros() as u32);
-            let outcome = match request_fut.await {
-                Ok(send) => {
-                    let sent = Instant::now();
-                    match send.deliver(sent).await {
-                        Ok(()) => {
-                            let delivery_micros =
-                                sent.elapsed().as_micros() as u32;
-                            match sync_fut {
-                                None => JobOutcome::Delivered {
-                                    delivery_micros,
-                                    sync_micros: None,
-                                },
-                                Some(sync_fut) => match sync_fut.await {
-                                    Ok(()) => JobOutcome::Delivered {
-                                        delivery_micros,
-                                        sync_micros: Some(
-                                            sent.elapsed().as_micros() as u32,
-                                        ),
-                                    },
-                                    Err(error) => JobOutcome::SyncFailed {
-                                        delivery_micros,
-                                        error,
-                                    },
-                                },
-                            }
-                        }
-                        Err(error) => JobOutcome::DeliveryFailed(error),
-                    }
-                }
-                Err(error) => JobOutcome::DeliveryFailed(error),
-            };
-            job_tally.borrow_mut().record(outcome);
+            let job = Job::run(admitted_at, request_fut, sync_fut).await;
             drop(permit);
+            job
         });
         while let Some(joined) = jobs.try_join_next() {
-            record_join(&tally, joined);
+            tally.record(joined?);
         }
     }
     let admission_wall = started.elapsed();
     let rps = throttle.finish();
     while let Some(joined) = jobs.join_next().await {
-        record_join(&tally, joined);
+        tally.record(joined?);
     }
 
-    let tally = Rc::try_unwrap(tally)
-        .unwrap_or_else(|_| panic!("execute jobs still hold the tally"))
-        .into_inner();
     Ok(RawRunOutcome {
         offered: pacing,
         rps,
@@ -378,20 +330,6 @@ where
         admission_wall,
         ..tally
     })
-}
-
-fn record_join(
-    tally: &Rc<RefCell<RawRunOutcome>>,
-    joined: std::result::Result<(), JoinError>,
-) {
-    if let Err(join_error) = joined {
-        let outcome = if join_error.is_panic() {
-            JobOutcome::Panicked(join_error)
-        } else {
-            JobOutcome::Cancelled
-        };
-        tally.borrow_mut().record(outcome);
-    }
 }
 
 pub async fn execute<F, Fut, D>(
@@ -543,28 +481,27 @@ where
     Fut: Future<Output = Result<T>>,
 {
     let stop = Arc::new(AtomicBool::new(false));
-    let handles = (0..threads)
-        .map(|index| {
-            let factory = factory.clone();
-            let span = Span::current();
-            let worker = Worker {
-                index,
-                threads,
-                stop: stop.clone(),
-            };
-            std::thread::spawn(move || {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("driver runtime build is infallible");
-                let local = tokio::task::LocalSet::new();
-                // Run future construction in the span too: the factory can log.
-                runtime.block_on(local.run_until(
-                    async move { factory(worker).await }.instrument(span),
-                ))
-            })
-        })
-        .collect();
+    let mut handles = Vec::with_capacity(threads);
+    for index in 0..threads {
+        let factory = factory.clone();
+        let span = Span::current();
+        let worker = Worker {
+            index,
+            threads,
+            stop: stop.clone(),
+        };
+        handles.push(std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("driver runtime build is infallible");
+            let local = tokio::task::LocalSet::new();
+            // Run future construction in the span too: the factory can log.
+            runtime.block_on(local.run_until(
+                async move { factory(worker).await }.instrument(span),
+            ))
+        }));
+    }
     Workers { stop, handles }
 }
 

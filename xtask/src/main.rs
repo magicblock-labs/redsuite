@@ -4,8 +4,8 @@ use std::{
 };
 
 use clap::{Parser, Subcommand};
-use redsuite_core::{catalog::Fixture, frontend, logging, manifest};
-use tracing::{error, info};
+use redsuite_core::{catalog::Fixture, frontend, logging};
+use tracing::error;
 
 type Result<T> = redsuite_core::Result<T>;
 
@@ -26,7 +26,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Task {
-    /// Build and stage the SBF programs and fixture manifest.
+    /// Build and stage the SBF programs.
     Programs,
     /// Format the workspace using nightly rustfmt.
     Fmt {
@@ -111,8 +111,6 @@ fn programs() -> Result<()> {
         &["upgraded"],
         Fixture::RedshiftProgramSlimUpgraded.so_name(),
     )?;
-    let manifest_path = manifest::emit()?;
-    info!(?manifest_path, "staged fixture manifest");
     Ok(())
 }
 

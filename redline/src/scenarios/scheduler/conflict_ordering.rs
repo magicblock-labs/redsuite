@@ -16,9 +16,7 @@ use redsuite_core::{
     check, check_eq, prep,
     profile::ProfileValues,
     redline::{
-        causal::{
-            chain_ixs, independent_ixs, PairModel, Step, HASH_INIT, STEPS,
-        },
+        causal::{independent_ixs, CausalPair, Step, HASH_INIT, STEPS},
         Accounts,
     },
     report,
@@ -130,10 +128,7 @@ fn phase_ranges(chains: u64) -> [(u64, u64); 2] {
 }
 
 struct Pair {
-    a: Pubkey,
-    b: Pubkey,
-    senders: Vec<TxSender>,
-    model: PairModel,
+    chain: CausalPair,
     steps: Vec<(u64, Step, Signature)>,
 }
 
@@ -241,7 +236,7 @@ struct LaneTally {
     delivered: u64,
     failed: u64,
     first_error: Option<String>,
-    delivery: Option<StreamingStats>,
+    delivery: StreamingStats,
 }
 
 async fn bounded_load(
@@ -254,38 +249,30 @@ async fn bounded_load(
         SignatureConfirmations::connect(ws_url, Arc::new(SendClock::new(1, 0)))
             .await?,
     );
-    let tally = Rc::new(RefCell::new(LaneTally {
-        delivery: Some(StreamingStats::new()),
-        ..LaneTally::default()
-    }));
+    let tally = Rc::new(RefCell::new(LaneTally::default()));
     let next_id = Rc::new(Cell::new(0u64));
     let started = Instant::now();
-    let tasks: Vec<_> = lanes
-        .into_iter()
-        .map(|(account, sender)| {
-            let sigs = sigs.clone();
-            let tally = tally.clone();
-            let stop = stop.clone();
-            let next_id = next_id.clone();
-            tokio::task::spawn_local(async move {
-                while !stop.load(Ordering::Relaxed) {
-                    let id = next_id.get() + 1;
-                    next_id.set(id);
-                    let ixs = independent_ixs(id, account, iters);
-                    let result: Result<()> = async {
-                        let tx = sender.prepare(&ixs).await?;
-                        sigs.subscribe(id, &tx.signatures[0]).await?;
-                        let sent = Instant::now();
-                        sender.submit_prepared(&tx).await?;
-                        if let Some(delivery) =
-                            tally.borrow_mut().delivery.as_mut()
-                        {
-                            delivery.push(sent.elapsed().as_micros() as u32);
-                        }
-                        tokio::time::timeout(
-                            CONFIRM_TIMEOUT,
-                            sigs.await_id(id),
-                        )
+    let mut tasks = Vec::with_capacity(lanes.len());
+    for (account, sender) in lanes {
+        let sigs = sigs.clone();
+        let tally = tally.clone();
+        let stop = stop.clone();
+        let next_id = next_id.clone();
+        tasks.push(tokio::task::spawn_local(async move {
+            while !stop.load(Ordering::Relaxed) {
+                let id = next_id.get() + 1;
+                next_id.set(id);
+                let ixs = independent_ixs(id, account, iters);
+                let result: Result<()> = async {
+                    let tx = sender.prepare(&ixs).await?;
+                    sigs.subscribe(id, &tx.signatures[0]).await?;
+                    let sent = Instant::now();
+                    sender.submit_prepared(&tx).await?;
+                    tally
+                        .borrow_mut()
+                        .delivery
+                        .push(sent.elapsed().as_micros() as u32);
+                    tokio::time::timeout(CONFIRM_TIMEOUT, sigs.await_id(id))
                         .await
                         .map_err(|_| {
                             format!(
@@ -293,22 +280,21 @@ async fn bounded_load(
                                      within {CONFIRM_TIMEOUT:?}"
                             )
                         })??;
-                        Ok(())
-                    }
-                    .await;
-                    let mut tally = tally.borrow_mut();
-                    match result {
-                        Ok(()) => tally.delivered += 1,
-                        Err(error) => {
-                            tally.failed += 1;
-                            tally.first_error.get_or_insert(error.to_string());
-                            break;
-                        }
+                    Ok(())
+                }
+                .await;
+                let mut tally = tally.borrow_mut();
+                match result {
+                    Ok(()) => tally.delivered += 1,
+                    Err(error) => {
+                        tally.failed += 1;
+                        tally.first_error.get_or_insert(error.to_string());
+                        break;
                     }
                 }
-            })
-        })
-        .collect();
+            }
+        }));
+    }
     for task in tasks {
         task.await
             .map_err(|error| format!("independent lane panicked: {error}"))?;
@@ -319,7 +305,7 @@ async fn bounded_load(
         delivered: tally.delivered,
         failed: tally.failed + confirmations.failed as u64,
         first_error: tally.first_error.take().or(confirmations.first_failure),
-        delivery: tally.delivery.take().unwrap_or_default(),
+        delivery: std::mem::take(&mut tally.delivery),
         origin: SEND_ORIGIN,
         wall: started.elapsed(),
         ..RawRunOutcome::default()
@@ -469,22 +455,8 @@ async fn drive_pair(
         for step in Step::ALL {
             let id = plan.space.step_id(plan.batch, pair_index, chain, step);
             let iters = if step == heavy { plan.heavy_iters } else { 0 };
-            let ixs = chain_ixs(id, iters, &step.accounts(pair.a, pair.b));
-            let sender = &pair.senders[step.index()];
-            let tx = sender.prepare(&ixs).await?;
-            let sent = Instant::now();
-            let signature =
-                sender.submit_prepared(&tx).await.map_err(|error| {
-                    format!(
-                        "pair {pair_index} chain {chain} step {} (id {id}) \
-                             was not accepted: {error}",
-                        step.label()
-                    )
-                })?;
-            send_stats
-                .borrow_mut()
-                .push(sent.elapsed().as_micros() as u32);
-            pair.model.apply(step, id, iters);
+            let (signature, elapsed) = pair.chain.send(step, id, iters).await?;
+            send_stats.borrow_mut().push(elapsed.as_micros() as u32);
             pair.steps.push((id, step, signature));
         }
     }
@@ -585,12 +557,8 @@ async fn verify_pairs(
 ) -> Result<()> {
     for (index, pair) in pairs.iter_mut().enumerate() {
         if let Err(error) = pair
-            .model
-            .verify(
-                er,
-                [pair.a, pair.b],
-                &format!("batch {batch}: pair {index} on the ER"),
-            )
+            .chain
+            .verify(er, &format!("batch {batch}: pair {index} on the ER"))
             .await
         {
             let error = match error.downcast::<CheckError>() {
@@ -670,12 +638,6 @@ impl Scenario<ScenarioReport> for ConflictOrdering {
 
     async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
         let profile = PROFILES.select(base.config().profile);
-        check!(
-            profile.chains >= 2,
-            "profile {}: at least two chains per pair are needed to split a \
-             batch across the contention and backpressure phases",
-            profile.name
-        )?;
 
         let probe = er.scrape_metrics().await?;
         for name in REQUIRED_METRICS {
@@ -733,14 +695,14 @@ impl Scenario<ScenarioReport> for ConflictOrdering {
             .chunks_exact(2)
             .enumerate()
             .map(|(index, accounts)| Pair {
-                a: accounts[0],
-                b: accounts[1],
-                senders: chain_payers
-                    [index * PAYERS_PER_PAIR..(index + 1) * PAYERS_PER_PAIR]
-                    .iter()
-                    .map(|payer| er.sender(Rc::new(payer.insecure_clone())))
-                    .collect(),
-                model: PairModel::default(),
+                chain: CausalPair::new(
+                    [accounts[0], accounts[1]],
+                    chain_payers[index * PAYERS_PER_PAIR
+                        ..(index + 1) * PAYERS_PER_PAIR]
+                        .iter()
+                        .map(|payer| er.sender(Rc::new(payer.insecure_clone())))
+                        .collect(),
+                ),
                 steps: Vec::new(),
             })
             .collect();

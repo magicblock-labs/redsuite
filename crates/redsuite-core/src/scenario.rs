@@ -2,63 +2,42 @@ use std::{panic::AssertUnwindSafe, time::Instant};
 
 use async_trait::async_trait;
 use futures_util::FutureExt;
-use tracing::{debug, error, error_span, info, warn, Instrument};
+use tracing::{debug, error, error_span, info, Instrument};
 
 use crate::{
     catalog::Fixture,
-    check::CheckError,
     context::{BaseCtx, ErCtx},
-    manifest,
     profile::ExecutionConfig,
-    report::{MeasureValue, Measurement, ScenarioReport, Unit},
+    report::{ScenarioReport, Unit},
     resources::LaunchRecord,
     runner::panic_message,
-    topology, DynError, Result,
+    topology, Result,
 };
 
-/// Converts a completed scenario body into its verdict and optional measurements.
+/// A scenario may return measurements even when its validation fails.
 pub trait Verdict {
     const REPORTS: bool;
-    fn into_report(self) -> Option<ScenarioReport>;
-    /// Override when a returned value can carry both measurements and a failure.
-    fn into_outcome(self) -> ScenarioOutcome
-    where
-        Self: Sized,
-    {
-        ScenarioOutcome::Passed(self.into_report())
-    }
+    fn into_result(self) -> (Option<ScenarioReport>, Result<()>);
 }
 
 impl Verdict for () {
     const REPORTS: bool = false;
-    fn into_report(self) -> Option<ScenarioReport> {
-        None
+    fn into_result(self) -> (Option<ScenarioReport>, Result<()>) {
+        (None, Ok(()))
     }
 }
 
 impl Verdict for ScenarioReport {
     const REPORTS: bool = true;
-    fn into_report(self) -> Option<ScenarioReport> {
-        Some(self)
+    fn into_result(self) -> (Option<ScenarioReport>, Result<()>) {
+        (Some(self), Ok(()))
     }
 }
 
 impl Verdict for (ScenarioReport, Result<()>) {
     const REPORTS: bool = true;
-
-    fn into_report(self) -> Option<ScenarioReport> {
-        Some(self.0)
-    }
-
-    fn into_outcome(self) -> ScenarioOutcome {
-        let (mut report, outcome) = self;
-        match outcome {
-            Ok(()) => ScenarioOutcome::Passed(Some(report)),
-            Err(error) => {
-                report.passed = false;
-                ScenarioOutcome::FailedReport(error, report)
-            }
-        }
+    fn into_result(self) -> (Option<ScenarioReport>, Result<()>) {
+        (Some(self.0), self.1)
     }
 }
 
@@ -75,60 +54,11 @@ pub trait PrivateErScenario<V: Verdict = ()> {
 }
 
 #[derive(Debug)]
-pub enum RunError {
-    Preflight(DynError),
-    Topology(DynError),
-    Teardown(DynError),
-    Persist(DynError),
-}
-
-impl RunError {
-    pub fn phase(&self) -> &'static str {
-        match self {
-            RunError::Preflight(_) => "preflight",
-            RunError::Topology(_) => "topology",
-            RunError::Teardown(_) => "teardown",
-            RunError::Persist(_) => "persist",
-        }
-    }
-
-    pub fn error(&self) -> &DynError {
-        match self {
-            RunError::Preflight(error)
-            | RunError::Topology(error)
-            | RunError::Teardown(error)
-            | RunError::Persist(error) => error,
-        }
-    }
-}
-
-impl std::fmt::Display for RunError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{} failed: {}", self.phase(), self.error())
-    }
-}
-
-#[derive(Debug)]
-pub enum ScenarioOutcome {
-    Passed(Option<ScenarioReport>),
-    Skipped(String),
-    Failed(DynError),
-    /// Measurements retained alongside a scenario error.
-    FailedReport(DynError, ScenarioReport),
-    Panicked(String),
-    NotReached,
-}
-
-/// Distinguishes failed assertions from infrastructure errors in reports.
-pub fn failed_check(error: &DynError) -> Option<&CheckError> {
-    error.downcast_ref::<CheckError>()
-}
-
-#[derive(Debug)]
 pub struct RunRecord {
     pub name: String,
-    pub errors: Vec<RunError>,
-    pub scenario: ScenarioOutcome,
+    pub outcome: Result<()>,
+    pub phase: &'static str,
+    pub report: Option<ScenarioReport>,
     pub wall_seconds: Option<f64>,
     pub launches: Vec<LaunchRecord>,
 }
@@ -137,187 +67,153 @@ impl RunRecord {
     fn new(name: String) -> Self {
         Self {
             name,
-            errors: Vec::new(),
-            scenario: ScenarioOutcome::NotReached,
+            outcome: Ok(()),
+            phase: "preflight",
+            report: None,
             wall_seconds: None,
             launches: Vec::new(),
         }
     }
 
     pub fn passed(&self) -> bool {
-        let passed = match &self.scenario {
-            ScenarioOutcome::Passed(report) => {
-                report.as_ref().is_none_or(|report| report.passed)
-            }
-            ScenarioOutcome::Skipped(_) => true,
-            _ => false,
-        };
-        passed && self.errors.is_empty()
+        self.outcome.is_ok() && self.report.as_ref().is_none_or(|r| r.passed)
     }
 
-    pub fn failure(&self) -> Option<String> {
-        let mut lines = Vec::new();
-        match &self.scenario {
-            ScenarioOutcome::Failed(error)
-            | ScenarioOutcome::FailedReport(error, _) => {
-                match failed_check(error) {
-                    Some(check) => lines.push(format!("check failed: {check}")),
-                    None => lines.push(format!("scenario failed: {error}")),
+    fn failure(&self) -> String {
+        match &self.outcome {
+            Err(error) if self.phase == "panic" => {
+                format!("{}: scenario panicked: {error}", self.name)
+            }
+            Err(error) => {
+                format!("{}: {} failed: {error}", self.name, self.phase)
+            }
+            Ok(()) => format!("{}: scenario verdict failed", self.name),
+        }
+    }
+
+    async fn run<V: Verdict, State>(
+        &mut self,
+        fixtures: &[Fixture],
+        config: ExecutionConfig,
+        provision: impl AsyncFnOnce(ExecutionConfig) -> Result<(BaseCtx, State)>,
+        body: impl AsyncFnOnce(BaseCtx, State) -> Result<V>,
+    ) -> Result<()> {
+        let total = Instant::now();
+        preflight(fixtures)?;
+        self.phase = "topology";
+        let (base, state) = provision(config).await?;
+        let resources = base.resources();
+        self.phase = "scenario";
+        let started = Instant::now();
+        // A scenario panic must not skip cleanup or prevent sibling runs.
+        let result = AssertUnwindSafe(body(base, state)).catch_unwind().await;
+        let wall = started.elapsed().as_secs_f64();
+        resources.reclaim(&self.name);
+        self.launches = resources.launches();
+        self.wall_seconds = Some(wall);
+        let (report, outcome) = match result {
+            Ok(Ok(verdict)) => verdict.into_result(),
+            Ok(Err(error)) => (None, Err(error)),
+            Err(payload) => {
+                self.phase = "panic";
+                (None, Err(panic_message(payload).into()))
+            }
+        };
+        self.report = report.map(|report| {
+            report.metric("wall seconds", Unit::Seconds, wall).metric(
+                "total seconds",
+                Unit::Seconds,
+                total.elapsed().as_secs_f64(),
+            )
+        });
+        outcome
+    }
+
+    fn conclude(&mut self, reports: bool) {
+        if reports {
+            if let Err(error) = crate::report::persist_run(self) {
+                error!(%error, "report not persisted");
+                if self.outcome.is_ok() {
+                    self.phase = "persist";
+                    self.outcome = Err(error);
                 }
             }
-            ScenarioOutcome::Panicked(message) => {
-                lines.push(format!("scenario panicked: {message}"))
+        }
+        if self.passed() {
+            info!(self.wall_seconds, "scenario passed");
+        } else {
+            error!(failure = %self.failure(), "scenario failed");
+            for launch in &self.launches {
+                debug!(%launch.label, %launch.log, "node log");
             }
-            ScenarioOutcome::Passed(_)
-            | ScenarioOutcome::Skipped(_)
-            | ScenarioOutcome::NotReached => {}
         }
-        lines.extend(self.errors.iter().map(ToString::to_string));
-        if lines.is_empty() {
-            return None;
-        }
-        Some(format!("{}: {}", self.name, lines.join("\n  also: ")))
     }
 }
 
 pub async fn run_shared_scenario<V: Verdict>(
     scenario: impl Scenario<V>,
     fixtures: &[Fixture],
-    optional_fixtures: &[Fixture],
     config: ExecutionConfig,
     er: std::result::Result<ErCtx, String>,
 ) -> RunRecord {
-    // Keep spawn_local work (such as WS readers) scoped to this scenario.
-    let name = scenario.name().to_owned();
-    tokio::task::LocalSet::new()
-        .run_until(execute(
-            name,
-            fixtures,
-            optional_fixtures,
-            config,
-            async move |config| {
-                let er = er?;
-                Ok((topology::base_only(config).await?, er))
-            },
-            async move |base, er| {
-                let outcome = scenario.run(&base, &er).await;
-                let faults = match er.proxies() {
-                    Some(proxies) => proxies.reset().await,
-                    None => Ok(()),
-                };
-                outcome.and_then(|verdict| faults.map(|()| verdict))
-            },
-        ))
-        .await
+    execute(
+        scenario.name().to_owned(),
+        fixtures,
+        config,
+        async move |config| Ok((topology::base_only(config).await?, er?)),
+        async move |base, er| {
+            let outcome = scenario.run(&base, &er).await;
+            if let Some(proxies) = er.proxies() {
+                let reset = proxies.reset().await;
+                return outcome.and_then(|verdict| reset.map(|()| verdict));
+            }
+            outcome
+        },
+    )
+    .await
 }
 
 pub async fn run_private_er_scenario<V: Verdict>(
     scenario: impl PrivateErScenario<V>,
     fixtures: &[Fixture],
-    optional_fixtures: &[Fixture],
     config: ExecutionConfig,
 ) -> RunRecord {
-    let name = scenario.name().to_owned();
-    tokio::task::LocalSet::new()
-        .run_until(execute(
-            name,
-            fixtures,
-            optional_fixtures,
-            config,
-            async |config| Ok((topology::base_only(config).await?, ())),
-            async move |base, ()| scenario.run(&base).await,
-        ))
-        .await
+    execute(
+        scenario.name().to_owned(),
+        fixtures,
+        config,
+        async |config| Ok((topology::base_only(config).await?, ())),
+        async move |base, ()| scenario.run(&base).await,
+    )
+    .await
 }
 
 async fn execute<V: Verdict, State>(
     name: String,
     fixtures: &[Fixture],
-    optional_fixtures: &[Fixture],
     config: ExecutionConfig,
     provision: impl AsyncFnOnce(ExecutionConfig) -> Result<(BaseCtx, State)>,
     body: impl AsyncFnOnce(BaseCtx, State) -> Result<V>,
 ) -> RunRecord {
-    // Retain failure context even with RUST_LOG=error; spans emit no events.
+    // Error-level spans retain context without emitting standalone events.
     let span = error_span!("scenario", %name);
-    let total_started = Instant::now();
-    async move {
-        info!("scenario started");
+    let run = async {
         let mut record = RunRecord::new(name);
-
-        if let Err(error) = preflight(fixtures) {
-            record.errors.push(RunError::Preflight(error));
-            conclude(&mut record, V::REPORTS);
-            return record;
-        }
-        if let Some(reason) = optional_fixture_gap(optional_fixtures) {
-            record.scenario = ScenarioOutcome::Skipped(reason);
-            conclude(&mut record, V::REPORTS);
-            return record;
-        }
-
-        let (base, state) = match provision(config).await {
-            Ok(provisioned) => provisioned,
-            Err(error) => {
-                record.errors.push(RunError::Topology(error));
-                conclude(&mut record, V::REPORTS);
-                return record;
-            }
-        };
-
-        let resources = base.resources();
-        let started = Instant::now();
-        // catch_unwind so an internal-invariant panic still reaches the teardown
-        // audit and the persisted report instead of aborting sibling scenarios
-        let outcome = AssertUnwindSafe(body(base, state)).catch_unwind().await;
-        let wall_seconds = started.elapsed().as_secs_f64();
-        let teardown_errors = resources.reclaim_and_audit(&record.name);
-        record.launches = resources.launches();
-        record.wall_seconds = Some(wall_seconds);
-        record.scenario = match outcome {
-            Ok(Ok(verdict)) => verdict.into_outcome(),
-            Ok(Err(error)) => ScenarioOutcome::Failed(error),
-            Err(payload) => ScenarioOutcome::Panicked(panic_message(payload)),
-        };
-
-        if let ScenarioOutcome::Passed(Some(report))
-        | ScenarioOutcome::FailedReport(_, report) = &mut record.scenario
-        {
-            report.measurements.push(Measurement {
-                label: "wall seconds".to_owned(),
-                unit: Unit::Seconds,
-                value: MeasureValue::Scalar(wall_seconds),
-            });
-            report.measurements.push(Measurement {
-                label: "total seconds".to_owned(),
-                unit: Unit::Seconds,
-                value: MeasureValue::Scalar(
-                    total_started.elapsed().as_secs_f64(),
-                ),
-            });
-        }
-
+        info!("scenario started");
+        record.outcome = record.run(fixtures, config, provision, body).await;
+        record.conclude(V::REPORTS);
         record
-            .errors
-            .extend(teardown_errors.into_iter().map(RunError::Teardown));
-
-        conclude(&mut record, V::REPORTS);
-        record
-    }
-    .instrument(span)
-    .await
+    };
+    // Dropping the LocalSet cancels scenario-owned readers and background tasks.
+    tokio::task::LocalSet::new()
+        .run_until(run.instrument(span))
+        .await
 }
 
 fn preflight(fixtures: &[Fixture]) -> Result<()> {
     topology::er_bin_path()?;
-    if !fixtures.is_empty() {
-        let manifest = manifest::load()?;
-        if let Some(warning) = manifest::revision_drift(&manifest) {
-            warn!(%warning, "fixture revision drift");
-        }
-        for fixture in fixtures {
-            manifest::resolve(*fixture)?;
-        }
+    for fixture in fixtures {
+        fixture.resolve()?;
     }
     let Some(loaded) = topology::running_base_programs() else {
         return Ok(());
@@ -335,41 +231,4 @@ fn preflight(fixtures: &[Fixture]) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn optional_fixture_gap(optional_fixtures: &[Fixture]) -> Option<String> {
-    for fixture in optional_fixtures {
-        if let Err(error) = manifest::resolve(*fixture) {
-            return Some(format!(
-                "optional fixture {} is unavailable: {error}",
-                fixture.so_name()
-            ));
-        }
-    }
-    None
-}
-
-fn conclude(record: &mut RunRecord, reports: bool) {
-    if let ScenarioOutcome::Skipped(reason) = &record.scenario {
-        info!(reason, "scenario skipped");
-        return;
-    }
-    if reports {
-        match crate::report::persist_run(record) {
-            Ok(path) => debug!(?path, "report persisted"),
-            Err(error) => record.errors.push(RunError::Persist(error)),
-        }
-    }
-    if record.passed() {
-        info!(record.wall_seconds, "scenario passed");
-        return;
-    }
-    let failure = record.failure();
-    error!(
-        failure = failure.as_deref().unwrap_or("scenario verdict failed"),
-        "scenario failed"
-    );
-    for launch in &record.launches {
-        debug!(%launch.label, %launch.log, "node log");
-    }
 }

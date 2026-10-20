@@ -165,14 +165,11 @@ impl Scenario<ScenarioReport> for EnsureGateStall {
             let sender = cell_er.sender(payer.clone());
 
             let before = cell_er.scrape_metrics().await?;
-            let request = {
-                let pool = pool.clone();
-                move |id: u64| {
-                    let accounts = sample_accounts(&pool, id, READ_WIDTH);
-                    let ix = build::read_accounts_data(id, &accounts);
-                    let sender = sender.clone();
-                    sender.staged(&[ix])
-                }
+            let request = |id: u64| {
+                let accounts = sample_accounts(&pool, id, READ_WIDTH);
+                let ix = build::read_accounts_data(id, &accounts);
+                let sender = sender.clone();
+                sender.staged(&[ix])
             };
             let outcome = execute(
                 RunConfig {

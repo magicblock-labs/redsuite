@@ -6,6 +6,11 @@ use crate::DynError;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
+pub fn content_hash(bytes: &[u8]) -> hash::Hash {
+    use sha2::{Digest, Sha256};
+    hash::Hash::new_from_array(Sha256::digest(bytes).into())
+}
+
 #[derive(Debug)]
 pub struct CheckError {
     pub check: String,

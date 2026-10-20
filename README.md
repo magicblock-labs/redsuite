@@ -68,9 +68,9 @@ Fresh keys isolate scenario-owned accounts; checks involving global balances or
 process-wide changes require exclusive access. Scenarios can also manage a
 leader with independently restartable verifiers.
 
-Compatible functional checks run concurrently. Benchmarks run alone, after the
-functional checks in a normal run. The runner stops the rollups it owns and
-replaces failed or unhealthy group rollups before subsequent members use them.
+Compatible functional checks run concurrently. Benchmarks run sequentially.
+Group rollups are reused for the run without automatic recovery after failures.
+The runner stops the rollups it owns when their lane finishes.
 The base chain normally remains available for later runs.
 
 ### Controlled failures, real traffic
@@ -233,6 +233,9 @@ The exporter excludes failed and incomplete runs. It withholds client latency
 for `client saturated` or `offered rate not sustained` runs while retaining
 diagnostic measurements. Client latency series have timing-origin suffixes
 (`@send`, `@request`) to keep them separate from legacy series.
+Each invocation writes one `campaign.json` under `target/redsuite-reports`,
+including cells recorded before a scenario finishes. The `latest` file selects
+the campaign to export; older report layouts are not read.
 
 ## ⚙️ Configure the environment
 
@@ -249,15 +252,14 @@ diagnostic measurements. Client latency series have timing-origin suffixes
 
 The compiled runner works without Cargo or a source checkout at runtime, but it
 still needs the validator binaries, `solana-test-validator`, and staged fixture
-artifacts and their manifest under the resource root's `target/deploy`. Preserve
-the committor artifact's location relative to the validator binary when moving a
-build to another host.
+artifacts under the resource root's `target/deploy`. Preserve the committor
+artifact's location relative to the validator binary when moving a build to
+another host.
 
-### Optional gRPC coverage
+### gRPC setup
 
-The base chain attempts to load a compatible Yellowstone Geyser plugin. Missing
-or incompatible plugins fail only checks that require the gRPC feed; other
-checks can run without it.
+The base chain requires a compatible Yellowstone Geyser plugin. Plugin setup or
+startup failures stop the run; the harness does not retry without gRPC.
 
 Automatic acquisition uses upstream binaries for **x86_64 Linux**. On other
 hosts, set `REDSUITE_YELLOWSTONE_PLUGIN` to a compatible locally built plugin.

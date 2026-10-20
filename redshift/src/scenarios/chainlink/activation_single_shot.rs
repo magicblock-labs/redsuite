@@ -202,28 +202,26 @@ async fn race_discovery(
     let started = Instant::now();
     let sender = er.sender(er_payer.clone());
     let trigger = *trigger;
-    let reads: Vec<_> = (0..CONCURRENT_READS)
-        .map(|_| {
-            let api = er.api().clone();
-            tokio::task::spawn_local(
-                async move { api.get_account(&trigger).await },
-            )
-        })
-        .collect();
-    let submissions: Vec<_> = (0..CONCURRENT_SUBMISSIONS)
-        .map(|_| {
-            let sender = sender.clone();
-            tokio::task::spawn_local(async move {
-                sender
-                    .submit_fresh(&[system::transfer(
-                        &sender.payer().pubkey(),
-                        &trigger,
-                        1,
-                    )])
-                    .await
-            })
-        })
-        .collect();
+    let mut reads = Vec::with_capacity(CONCURRENT_READS);
+    for _ in 0..CONCURRENT_READS {
+        let api = er.api().clone();
+        reads.push(tokio::task::spawn_local(async move {
+            api.get_account(&trigger).await
+        }));
+    }
+    let mut submissions = Vec::with_capacity(CONCURRENT_SUBMISSIONS);
+    for _ in 0..CONCURRENT_SUBMISSIONS {
+        let sender = sender.clone();
+        submissions.push(tokio::task::spawn_local(async move {
+            sender
+                .submit_fresh(&[system::transfer(
+                    &sender.payer().pubkey(),
+                    &trigger,
+                    1,
+                )])
+                .await
+        }));
+    }
     base.submit_and_confirm(
         funder,
         &[system::transfer(&funder.pubkey(), &trigger, 1)],

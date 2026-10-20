@@ -658,6 +658,7 @@ struct Parsed {
     id: Option<json::Value>,
     method: Option<String>,
     subscription: Option<u64>,
+    result: Option<u64>,
     strings: Vec<String>,
 }
 
@@ -682,6 +683,7 @@ fn parse(text: &str) -> Option<Parsed> {
         id: value.get("id").cloned(),
         method,
         subscription,
+        result: value.get("result").and_then(|result| result.as_u64()),
         strings,
     })
 }
@@ -915,6 +917,43 @@ async fn accept_ws(listener: TcpListener, upstream: String, shared: Shared) {
     }
 }
 
+fn response_operation(
+    parsed: Parsed,
+    pending: &mut HashMap<String, Operation>,
+    subscriptions: &mut HashMap<u64, Operation>,
+) -> Operation {
+    if let Some(subscription) = parsed.subscription {
+        let method = parsed.method.as_deref().unwrap_or("?");
+        return match subscriptions.get(&subscription).cloned() {
+            Some(base) => {
+                let mut op = merged(base, Stage::Notification, parsed.strings);
+                op.method = method.to_owned();
+                op
+            }
+            None => operation(
+                Transport::Ws,
+                Stage::Notification,
+                method,
+                parsed.strings,
+            ),
+        };
+    }
+    let request = parsed
+        .id
+        .as_ref()
+        .and_then(|id| json::to_string(id).ok())
+        .and_then(|id| pending.remove(&id));
+    let Some(request) = request else {
+        return operation(Transport::Ws, Stage::Response, "?", parsed.strings);
+    };
+    if request.method.ends_with("Subscribe") {
+        if let Some(subid) = parsed.result {
+            subscriptions.insert(subid, request.clone());
+        }
+    }
+    merged(request, Stage::Response, parsed.strings)
+}
+
 async fn serve_ws(socket: TcpStream, upstream: String, shared: Shared) {
     let Ok(client) = tokio_tungstenite::accept_async(socket).await else {
         return;
@@ -940,42 +979,42 @@ async fn serve_ws(socket: TcpStream, upstream: String, shared: Shared) {
         tokio::select! {
             frame = client_stream.next() => {
                 let Some(Ok(frame)) = frame else { break };
-                match frame {
-                    Message::Text(text) => {
-                        let Some(parsed) = parse(&text) else {
-                            if server_sink.send(Message::Text(text)).await.is_err() {
-                                break;
-                            }
-                            continue;
-                        };
-                        let request = operation(
-                            Transport::Ws,
-                            Stage::Request,
-                            parsed.method.as_deref().unwrap_or("?"),
-                            parsed.strings,
-                        );
-                        let (decision, _hold) = gate(&shared, request.clone()).await;
-                        match decision {
-                            Decision::Discard => break,
-                            Decision::Reject(message) => {
-                                let reply = rejection(&parsed.id, &message);
-                                if outbound.send(Some((Message::Text(reply.into()), None))).is_err() {
-                                    break;
-                                }
-                            }
-                            Decision::Release => {
-                                if let Some(id) = parsed.id.as_ref().and_then(|id| json::to_string(id).ok()) {
-                                    pending.insert(id, request);
-                                }
-                                if server_sink.send(Message::Text(text)).await.is_err() {
-                                    break;
-                                }
-                            }
-                        }
-                    }
+                let text = match frame {
+                    Message::Text(text) => text,
                     Message::Close(_) => break,
                     other => {
                         if server_sink.send(other).await.is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                };
+                let Some(parsed) = parse(&text) else {
+                    if server_sink.send(Message::Text(text)).await.is_err() {
+                        break;
+                    }
+                    continue;
+                };
+                let request = operation(
+                    Transport::Ws,
+                    Stage::Request,
+                    parsed.method.as_deref().unwrap_or("?"),
+                    parsed.strings,
+                );
+                let (decision, _hold) = gate(&shared, request.clone()).await;
+                match decision {
+                    Decision::Discard => break,
+                    Decision::Reject(message) => {
+                        let reply = rejection(&parsed.id, &message);
+                        if outbound.send(Some((Message::Text(reply.into()), None))).is_err() {
+                            break;
+                        }
+                    }
+                    Decision::Release => {
+                        if let Some(id) = parsed.id.as_ref().and_then(|id| json::to_string(id).ok()) {
+                            pending.insert(id, request);
+                        }
+                        if server_sink.send(Message::Text(text)).await.is_err() {
                             break;
                         }
                     }
@@ -983,66 +1022,38 @@ async fn serve_ws(socket: TcpStream, upstream: String, shared: Shared) {
             }
             frame = server_stream.next() => {
                 let Some(Ok(frame)) = frame else { break };
-                match frame {
-                    Message::Text(text) => {
-                        let Some(parsed) = parse(&text) else {
-                            if outbound.send(Some((Message::Text(text), None))).is_err() {
-                                break;
-                            }
-                            continue;
-                        };
-                        let inbound = if let Some(subscription) = parsed.subscription {
-                            let base = subscriptions.get(&subscription).cloned();
-                            let method = parsed.method.clone().unwrap_or_else(|| "?".to_owned());
-                            match base {
-                                Some(base) => {
-                                    let mut op = merged(base, Stage::Notification, parsed.strings);
-                                    op.method = method;
-                                    op
-                                }
-                                None => operation(Transport::Ws, Stage::Notification, &method, parsed.strings),
-                            }
-                        } else {
-                            let id = parsed.id.as_ref().and_then(|id| json::to_string(id).ok());
-                            let request = id.as_ref().and_then(|id| pending.remove(id));
-                            match request {
-                                Some(request) => {
-                                    if request.method.ends_with("Subscribe") {
-                                        if let Some(subid) = json::from_str::<json::Value>(&text)
-                                            .ok()
-                                            .and_then(|value| value.get("result").and_then(|r| r.as_u64()))
-                                        {
-                                            subscriptions.insert(subid, request.clone());
-                                        }
-                                    }
-                                    merged(request, Stage::Response, parsed.strings)
-                                }
-                                None => operation(Transport::Ws, Stage::Response, "?", parsed.strings),
-                            }
-                        };
-                        let is_notification = parsed.subscription.is_some();
-                        let id = parsed.id.clone();
-                        match gate_start(&shared, inbound) {
-                            GateStart::Decided(decision) => {
-                                if deliver(&outbound, decision, text, is_notification, &id, None).is_err() {
-                                    break;
-                                }
-                            }
-                            GateStart::Pending(receiver, operation, holding) => {
-                                let shared = shared.clone();
-                                let outbound = outbound.clone();
-                                tokio::task::spawn_local(async move {
-                                    let decision = gate_finish(&shared, receiver, operation).await;
-                                    let _ = deliver(&outbound, decision, text, is_notification, &id, Some(holding));
-                                });
-                            }
-                        }
-                    }
+                let text = match frame {
+                    Message::Text(text) => text,
                     Message::Close(_) => break,
                     other => {
                         if outbound.send(Some((other, None))).is_err() {
                             break;
                         }
+                        continue;
+                    }
+                };
+                let Some(parsed) = parse(&text) else {
+                    if outbound.send(Some((Message::Text(text), None))).is_err() {
+                        break;
+                    }
+                    continue;
+                };
+                let is_notification = parsed.subscription.is_some();
+                let id = parsed.id.clone();
+                let inbound = response_operation(parsed, &mut pending, &mut subscriptions);
+                match gate_start(&shared, inbound) {
+                    GateStart::Decided(decision) => {
+                        if deliver(&outbound, decision, text, is_notification, &id, None).is_err() {
+                            break;
+                        }
+                    }
+                    GateStart::Pending(receiver, operation, holding) => {
+                        let shared = shared.clone();
+                        let outbound = outbound.clone();
+                        tokio::task::spawn_local(async move {
+                            let decision = gate_finish(&shared, receiver, operation).await;
+                            let _ = deliver(&outbound, decision, text, is_notification, &id, Some(holding));
+                        });
                     }
                 }
             }
