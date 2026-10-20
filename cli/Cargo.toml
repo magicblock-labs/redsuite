@@ -10,6 +10,7 @@ name = "redsuite"
 path = "src/main.rs"
 
 [dependencies]
+clap = { workspace = true }
 tracing = { workspace = true }
 redsuite-core = { workspace = true }
 redline = { workspace = true }

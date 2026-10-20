@@ -120,8 +120,8 @@ cargo xtask programs
 cargo build --release --locked -p redsuite
 export PATH="$PWD/target/release:$PATH"
 
-redsuite list
-redsuite run redshift
+redsuite redshift list
+redsuite redshift run
 ```
 
 The first base-chain boot needs access to an RPC endpoint to clone its programs;
@@ -132,22 +132,24 @@ when finished with `redsuite stack down`.
 
 | Task | Command |
 | :-- | :-- |
-| Discover available scenarios | `redsuite list` |
-| Preview a selection | `redsuite list redshift/rpc_` |
-| Check correctness or adversarial behavior | `redsuite run redshift` or `redsuite run redhat` |
-| Measure performance | `redsuite run redline` |
-| Use the larger benchmark workloads | `redsuite run redline --profile full` |
-| Run the complete suite | `redsuite run all` |
-| Reduce concurrent storage use | `redsuite run all --serial` |
+| Discover a family's scenarios | `redsuite redshift list` |
+| Preview a selection | `redsuite redshift list rpc_` |
+| Run correctness checks (Redshift) | `redsuite redshift run` |
+| Run security checks (Redhat) | `redsuite redhat run` |
+| Measure performance (Redline) | `redsuite redline run` |
+| Use the larger benchmark workloads | `redsuite redline run --profile full` |
+| Reduce concurrent storage use | `redsuite redshift run --serial` |
+| Stop the stack after a run | `redsuite redshift run --cleanup` |
 | Inspect processes, endpoints, and logs | `redsuite stack status` |
 
-Selections accept a family, a full or short scenario name, a name prefix, or
-`all`. An exact name takes precedence over prefix matches. Use `redsuite list`
-as the current scenario catalog.
+Selections accept full or short scenario names and name prefixes within the
+chosen family. Multiple selections run together without repeating scenarios;
+an exact name takes precedence over prefix matches. Omit selections to run the
+whole family. Use the family's `list` command to preview selections.
 
-Redline defaults to the shorter `lite` workloads. `--profile full` changes only
-Redline workloads, and the flag requires a selection that includes Redline.
-Correctness and adversarial checks use fixed workloads.
+Redline defaults to the shorter `lite` workloads. Only `redline run` accepts `--profile` or read `REDSUITE_PROFILE`. Correctness and
+adversarial checks use fixed workloads. Redline benchmarks run sequentially;
+checks can use `--fresh-concurrency` to bound concurrent fresh scenarios.
 
 ### Host and storage considerations
 
@@ -157,13 +159,14 @@ For comparisons, keep the hardware, validator build settings, and workload
 profile consistent.
 
 Validators preallocate storage in multi-gigabyte steps, so parallel runs need
-space for several rollups. `--serial` runs scenarios one at a time and removes
-each group's storage before moving on. Scenarios with multiple validators still
-need space for their topology.
+space for several rollups. `--serial` runs scenarios one at a time, releasing a
+group's storage when the next scenario cannot reuse it. Scenarios with multiple
+validators still need space for their topology.
 
-Serial runs finish with `stack down` by default. Add `--keep-storage` to skip
-that final teardown; it does not preserve rollups already cleaned up during the
-run. **`stack down` stops the base and leftover rollups and deletes their
+Scheduling and cleanup are independent: `--serial` does not stop the shared
+base. Add `--cleanup` to any run command to finish with `stack down`;
+this does not preserve rollups already cleaned up during the run.
+**`stack down` stops the base and leftover rollups and deletes their
 storage, including separately located accounts databases; logs remain.** The
 harness also reclaims private rollups left behind by failed scenarios.
 
@@ -171,13 +174,13 @@ harness also reclaims private rollups left behind by failed scenarios.
 
 Redshift and Redhat return verdicts in the console without persisting benchmark
 reports. Failed scenarios include diagnostic details; set `RUST_LOG=debug`
-to include phase and workload progress. `RUST_LOG` also applies to launched validators. A failed run
+to include phase and workload progress. Logging defaults
+to `info`; `RUST_LOG` also applies to launched validators. A failed run
 returns a nonzero exit status.
 
 Redline writes reports under `target/redsuite-reports/`. Reports include workload
-settings, measurements, and process-launch details. Runs containing Redline
-also record suite wall time and execution-lane durations. Concurrent lane times
-overlap, so they should not be added together as elapsed time.
+settings, measurements, and process-launch details. Benchmark runs also record
+suite wall time and execution-lane durations.
 
 Read the measurements together:
 
@@ -230,7 +233,7 @@ diagnostic measurements. Client latency series have timing-origin suffixes
 | `REDSUITE_STACK_DIR` | Place ledgers, stack state, and logs on another disk; defaults to `target/redsuite-stack` under the resource root. |
 | `REDSUITE_ACCOUNTSDB_DIR` | Place rollup and verifier accounts databases separately from their ledgers. |
 | `REDSUITE_CLONE_URL` | Choose the RPC endpoint used to acquire base-chain programs on a cold boot. |
-| `REDSUITE_PROFILE` | Set the default Redline workload to `lite` or `full`; `--profile` overrides it. |
+| `REDSUITE_PROFILE` | Set the Redline run preset to `lite` or `full`; `--profile` overrides it. Other commands do not read it. |
 | `RUST_LOG` | Log filter for RedSuite and launched validators; defaults to `info`. Use `debug` for passing-run details. |
 
 The compiled runner works without Cargo or a source checkout at runtime, but it

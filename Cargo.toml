@@ -22,6 +22,7 @@ license = "MIT"
 authors = ["Magicblock Labs <dev@magicblock.gg>"]
 
 [workspace.dependencies]
+clap = { version = "4", features = ["derive", "env"] }
 redsuite-core = { path = "crates/redsuite-core" }
 redline = { path = "redline" }
 redshift = { path = "redshift" }

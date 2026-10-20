@@ -1,4 +1,6 @@
-use crate::{profile, report, topology, Result};
+use clap::Subcommand;
+
+use crate::{report, topology, Result};
 
 pub const ENV_VARS: &[(&str, &str)] = &[
     (
@@ -39,56 +41,53 @@ pub const ENV_VARS: &[(&str, &str)] = &[
         "where a cold boot clones base programs from (default mainnet-beta)",
     ),
     (
-        profile::PROFILE_ENV,
-        "Redline workload: lite (default) or full; ignored by Redhat and Redshift",
-    ),
-    (profile::LOOP_ENV, "S1 loop mode: open (default) or closed"),
-    (
         "RUST_LOG",
         "log filter for RedSuite and launched validators (default info; debug includes phase and workload progress)",
     ),
 ];
 
-pub fn usage_env() -> String {
-    let mut text = String::from("\nenvironment:\n");
+pub fn env_help() -> String {
+    let mut text = String::from("Environment:\n");
     for (name, description) in ENV_VARS {
         text.push_str(&format!("  {name:<26} {description}\n"));
     }
     text
 }
 
-pub fn dispatch(args: &[String]) -> Option<Result<()>> {
-    let arg = |index: usize| args.get(index).map(String::as_str);
-    match (arg(0), arg(1)) {
-        (Some("stack"), Some("status")) => Some(topology::status()),
-        (Some("stack"), Some("down")) => Some(topology::down()),
-        (Some("report"), Some("bmf")) => match (arg(2), arg(3)) {
-            (Some("--out"), Some(path)) => Some(report::bmf(Some(path))),
-            (None, _) => Some(report::bmf(None)),
-            _ => None,
-        },
-        _ => None,
-    }
+#[derive(Subcommand)]
+pub enum Command {
+    /// Inspect the shared stack and leftover rollup processes.
+    #[command(subcommand)]
+    Stack(Stack),
+    /// Export benchmark reports.
+    #[command(subcommand)]
+    Report(Report),
 }
 
-pub fn usage(invocation: &str) -> String {
-    [
-        (
-            "stack status",
-            "show the shared base L1 (booted on demand) and leftover ERs",
-        ),
-        (
-            "stack down",
-            "stop the base and leftover ERs, clear the state, delete storage",
-        ),
-        (
-            "report bmf [--out <path>]",
-            "export the latest campaign as Bencher Metric Format JSON",
-        ),
-    ]
-    .into_iter()
-    .map(|(command, description)| {
-        format!("  {invocation} {command:<46} {description}\n")
-    })
-    .collect()
+#[derive(Subcommand)]
+pub enum Stack {
+    /// Show processes, endpoints, and log locations.
+    Status,
+    /// Stop the stack and remove its storage, retaining logs.
+    Down,
+}
+
+#[derive(Subcommand)]
+pub enum Report {
+    /// Export the latest campaign in Bencher Metric Format.
+    Bmf {
+        /// Write JSON to a file instead of stdout.
+        #[arg(long, value_name = "PATH")]
+        out: Option<String>,
+    },
+}
+
+impl Command {
+    pub fn run(self) -> Result<()> {
+        match self {
+            Command::Stack(Stack::Status) => topology::status(),
+            Command::Stack(Stack::Down) => topology::down(),
+            Command::Report(Report::Bmf { out }) => report::bmf(out.as_deref()),
+        }
+    }
 }

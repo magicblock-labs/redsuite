@@ -1,74 +1,32 @@
+mod args;
 mod catalog;
 
-use std::{future::Future, process::Command, rc::Rc, time::Instant};
+use std::{
+    future::Future,
+    process::{Command, ExitCode},
+    rc::Rc,
+    time::Instant,
+};
 
-use futures_util::{future::join_all, StreamExt};
+use args::{Cli, Run};
+use clap::Parser;
+use futures_util::{
+    future::{join, join_all},
+    StreamExt,
+};
 use redsuite_core::{
     catalog::{Er, ErGroup, Family, ScenarioEntry},
-    frontend, logging,
+    logging,
     netfault::BaseProxies,
-    profile::{ExecutionConfig, LoopMode, Profile},
+    profile::ExecutionConfig,
     report::{self, ScenarioReport, Unit},
     topology::{self, PrivateEr, ER_READY_TIMEOUT},
     BaseCtx, ErCtx, Result, RunRecord,
 };
 use tokio::sync::Mutex;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
-const FAMILIES: &[&[ScenarioEntry]] = &[
-    catalog::redline::SCENARIOS,
-    catalog::redshift::SCENARIOS,
-    catalog::redhat::SCENARIOS,
-];
-const FRESH_CONCURRENCY: usize = 2;
 const NO_GROUP: &str = "the catalog entry declares no ER group";
-
-fn entries() -> impl Iterator<Item = &'static ScenarioEntry> {
-    FAMILIES.iter().flat_map(|scenarios| scenarios.iter())
-}
-
-const USAGE_HEAD: &str = "\
-usage:
-  redsuite list [selection]                               list scenarios (selection as for run)
-  redsuite run <scenario|family|prefix|all> [opts]        run scenarios (benchmarks last, alone)
-      --profile <lite|full>                               Redline workload; requires Redline in the selection (default lite)
-      --loop <open|closed>                                S1 loop mode
-      --serial                                            one scenario at a time, then stack down
-      --keep-storage                                      with --serial: leave the stack and its storage up
-";
-
-fn usage() -> ! {
-    eprint!(
-        "{USAGE_HEAD}{}{}",
-        frontend::usage("redsuite"),
-        frontend::usage_env()
-    );
-    std::process::exit(2);
-}
-
-fn selected(target: &str) -> Vec<&'static ScenarioEntry> {
-    if target == "all" {
-        return entries().collect();
-    }
-    if entries().any(|entry| entry.family.prefix() == target) {
-        return entries()
-            .filter(|entry| entry.family.prefix() == target)
-            .collect();
-    }
-    let (exact, prefixed): (Vec<_>, Vec<_>) = entries()
-        .filter(|entry| {
-            entry.name().starts_with(target)
-                || entry.short_name.starts_with(target)
-        })
-        .partition(|entry| {
-            entry.name() == target || entry.short_name == target
-        });
-    if exact.is_empty() {
-        prefixed
-    } else {
-        exact
-    }
-}
 
 struct GroupEr {
     group: &'static ErGroup,
@@ -98,6 +56,18 @@ impl GroupEr {
 
     fn note(&mut self, records: &[RunRecord]) {
         self.tainted |= records.iter().any(|record| !record.passed());
+    }
+
+    async fn run(
+        &mut self,
+        entry: &ScenarioEntry,
+        base: &Result<BaseCtx>,
+        config: ExecutionConfig,
+    ) -> RunRecord {
+        let er = self.provide(base).await;
+        let record = (entry.run)(config, er).await;
+        self.note(std::slice::from_ref(&record));
+        record
     }
 
     async fn provide(
@@ -174,20 +144,15 @@ impl GroupEr {
     }
 }
 
-type Lane = (String, f64, Vec<RunRecord>);
+type Lane = (&'static str, f64, Vec<RunRecord>);
 
-async fn timed(lane: &str, run: impl Future<Output = Vec<RunRecord>>) -> Lane {
+async fn timed(
+    lane: &'static str,
+    run: impl Future<Output = Vec<RunRecord>>,
+) -> Lane {
     let started = Instant::now();
     let records = run.await;
-    (lane.to_owned(), started.elapsed().as_secs_f64(), records)
-}
-
-async fn run_one(
-    entry: &'static ScenarioEntry,
-    config: ExecutionConfig,
-    er: std::result::Result<ErCtx, String>,
-) -> RunRecord {
-    (entry.run)(config, er).await
+    (lane, started.elapsed().as_secs_f64(), records)
 }
 
 async fn run_lane(
@@ -197,7 +162,7 @@ async fn run_lane(
     er: std::result::Result<ErCtx, String>,
 ) -> Vec<RunRecord> {
     futures_util::stream::iter(scenarios)
-        .map(|entry| run_one(entry, config, er.clone()))
+        .map(|entry| (entry.run)(config, er.clone()))
         .buffer_unordered(limit.max(1))
         .collect()
         .await
@@ -208,97 +173,40 @@ async fn run_group(
     members: Vec<&'static ScenarioEntry>,
     base: &Result<BaseCtx>,
     config: ExecutionConfig,
-    serial: bool,
 ) -> Vec<RunRecord> {
     let (shared, exclusive): (Vec<_>, Vec<_>) = members
         .into_iter()
         .partition(|entry| matches!(entry.er, Er::Shared(_)));
-    let (batch, mut sequential) = if serial {
-        (Vec::new(), shared)
-    } else {
-        (shared, Vec::new())
-    };
-    sequential.extend(exclusive);
     let mut records = Vec::new();
-    if !batch.is_empty() {
+    if !shared.is_empty() {
         let er = group.provide(base).await;
-        let limit = batch.len();
-        let mut done = run_lane(batch, limit, config, er).await;
+        let limit = shared.len();
+        let mut done = run_lane(shared, limit, config, er).await;
         group.note(&done);
         records.append(&mut done);
     }
-    for entry in sequential {
-        let er = group.provide(base).await;
-        let record = run_one(entry, config, er).await;
-        group.note(std::slice::from_ref(&record));
-        records.push(record);
+    for entry in exclusive {
+        records.push(group.run(entry, base, config).await);
     }
     records
 }
 
-fn members(
-    group: &GroupEr,
-    pool: &[&'static ScenarioEntry],
-) -> Vec<&'static ScenarioEntry> {
-    pool.iter()
-        .copied()
-        .filter(|entry| group.owns(entry))
-        .collect()
-}
-
-async fn run(args: &[String]) -> Result<()> {
+async fn run(
+    family: Family,
+    args: Run,
+    config: ExecutionConfig,
+    serial: bool,
+    fresh_concurrency: usize,
+) -> Result<()> {
     let suite_started = Instant::now();
-    let Some(target) = args.first() else { usage() };
-
-    let scenarios = selected(target);
-    if scenarios.is_empty() {
-        return Err(format!(
-            "nothing matches `{target}` — `redsuite list` shows what exists"
-        )
-        .into());
-    }
-    let redline = scenarios
-        .iter()
-        .any(|entry| entry.family == Family::Redline);
-    let mut config = ExecutionConfig::from_env(redline)?;
-    let mut serial = false;
-    let mut keep_storage = false;
-    let mut options = args[1..].iter();
-    while let Some(flag) = options.next() {
-        match flag.as_str() {
-            "--serial" => {
-                serial = true;
-                continue;
-            }
-            "--keep-storage" => {
-                keep_storage = true;
-                continue;
-            }
-            _ => {}
-        }
-        let value = options.next().unwrap_or_else(|| usage());
-        match flag.as_str() {
-            "--profile" => {
-                if !redline {
-                    return Err(
-                        "--profile requires a selection containing Redline"
-                            .into(),
-                    );
-                }
-                config.profile = Profile::parse(value).ok_or_else(|| {
-                    format!("unknown profile `{value}` (expected lite|full)")
-                })?
-            }
-            "--loop" => {
-                config.loop_mode = LoopMode::parse(value).ok_or_else(|| {
-                    format!(
-                        "unknown loop mode `{value}` (expected open|closed)"
-                    )
-                })?
-            }
-            _ => usage(),
-        }
-    }
+    let selections = args.selections;
+    let selection = if selections.is_empty() {
+        family.prefix().to_owned()
+    } else {
+        selections.join(" ")
+    };
+    let scenarios = catalog::select(family, &selections)?;
+    let redline = family == Family::Redline;
 
     let mut report = redline.then(|| {
         let mut names: Vec<_> =
@@ -315,7 +223,7 @@ async fn run(args: &[String]) -> Result<()> {
             })
             .filter(|name| !name.trim().is_empty())
             .unwrap_or_else(|| format!("unknown-{}", report::run_id()));
-        ScenarioReport::ok(&format!("suite/{target}"))
+        ScenarioReport::ok(&format!("suite/{selection}"))
             .setting("loop", config.loop_mode.name())
             .setting(
                 "host",
@@ -328,11 +236,12 @@ async fn run(args: &[String]) -> Result<()> {
                 ),
             )
             .setting("serial", serial)
-            .setting("keep storage", keep_storage)
+            .setting("cleanup", args.cleanup)
             .setting("scenarios", names.join(","))
             .setting("redline profile", config.profile.name())
     });
 
+    info!(selection, "suite started");
     let base = topology::base_only(config).await;
     let mut groups: Vec<GroupEr> = Vec::new();
     for group in scenarios.iter().filter_map(|entry| entry.er.group()) {
@@ -340,52 +249,52 @@ async fn run(args: &[String]) -> Result<()> {
             groups.push(GroupEr::new(group));
         }
     }
-    let (benchmarks, functional): (Vec<_>, Vec<_>) = scenarios
-        .into_iter()
-        .partition(|entry| entry.host_exclusive);
-    let (grouped, fresh): (Vec<_>, Vec<_>) = functional
-        .into_iter()
-        .partition(|entry| entry.er.group().is_some());
-
-    let mut lanes = Vec::new();
-    if serial {
-        for group in &mut groups {
-            let mut mine = members(group, &grouped);
-            mine.extend(members(group, &benchmarks));
-            let lane = format!("{} serial", group.group.label);
-            lanes.push(
-                timed(&lane, run_group(group, mine, &base, config, true)).await,
-            );
-            group.finish().await;
-        }
-        let mut rest = fresh;
-        rest.extend(
-            benchmarks
+    let sequential = serial || redline;
+    let lanes = if sequential {
+        let run = async {
+            let mut records = Vec::new();
+            let mut active: Option<usize> = None;
+            for entry in scenarios {
+                let next = groups.iter().position(|group| group.owns(entry));
+                if active != next {
+                    if let Some(index) = active {
+                        groups[index].finish().await;
+                    }
+                    active = next;
+                }
+                let record = match active {
+                    Some(index) => {
+                        groups[index].run(entry, &base, config).await
+                    }
+                    None => (entry.run)(config, Err(NO_GROUP.to_owned())).await,
+                };
+                records.push(record);
+            }
+            if let Some(index) = active {
+                groups[index].finish().await;
+            }
+            records
+        };
+        let lane = timed("serial", run).await;
+        vec![lane]
+    } else {
+        let (grouped, fresh): (Vec<_>, Vec<_>) = scenarios
+            .into_iter()
+            .partition(|entry| entry.er.group().is_some());
+        let group_lanes = join_all(groups.iter_mut().map(|group| {
+            let mine = grouped
                 .iter()
                 .copied()
-                .filter(|entry| entry.er.group().is_none()),
-        );
-        lanes.push(
-            timed(
-                "fresh serial",
-                run_lane(rest, 1, config, Err(NO_GROUP.to_owned())),
-            )
-            .await,
-        );
-    } else {
-        let group_lanes = join_all(groups.iter_mut().map(|group| {
-            let mine = members(group, &grouped);
-            let keep = benchmarks.iter().any(|entry| group.owns(entry));
+                .filter(|entry| group.owns(entry))
+                .collect();
             let base = &base;
             async move {
                 let lane = timed(
                     group.group.label,
-                    run_group(group, mine, base, config, false),
+                    run_group(group, mine, base, config),
                 )
                 .await;
-                if !keep {
-                    group.finish().await;
-                }
+                group.finish().await;
                 lane
             }
         }));
@@ -393,39 +302,15 @@ async fn run(args: &[String]) -> Result<()> {
             "fresh",
             run_lane(
                 fresh,
-                FRESH_CONCURRENCY,
+                fresh_concurrency,
                 config,
                 Err(NO_GROUP.to_owned()),
             ),
         );
-        let (group_lanes, fresh_lane) =
-            futures_util::future::join(group_lanes, fresh_lane).await;
-        lanes.extend(group_lanes);
+        let (mut lanes, fresh_lane) = join(group_lanes, fresh_lane).await;
         lanes.push(fresh_lane);
-        if !benchmarks.is_empty() {
-            let benchmark_lane = async {
-                let mut records = Vec::new();
-                for entry in benchmarks {
-                    let mut group =
-                        groups.iter_mut().find(|group| group.owns(entry));
-                    let er = match &mut group {
-                        Some(group) => group.provide(&base).await,
-                        None => Err(NO_GROUP.to_owned()),
-                    };
-                    let record = run_one(entry, config, er).await;
-                    if let Some(group) = group {
-                        group.note(std::slice::from_ref(&record));
-                    }
-                    records.push(record);
-                }
-                records
-            };
-            lanes.push(timed("benchmarks", benchmark_lane).await);
-        }
-        for group in &mut groups {
-            group.finish().await;
-        }
-    }
+        lanes
+    };
 
     let mut records = Vec::new();
     for (lane, seconds, mut runs) in lanes {
@@ -438,7 +323,7 @@ async fn run(args: &[String]) -> Result<()> {
     }
     let reclaim_errors: Vec<String> = base
         .iter()
-        .flat_map(|base| base.reclaim(&format!("suite/{target}")))
+        .flat_map(|base| base.reclaim(&format!("suite/{selection}")))
         .map(|error| error.to_string())
         .collect();
     let outcome = summarize(&records).and(if reclaim_errors.is_empty() {
@@ -446,7 +331,7 @@ async fn run(args: &[String]) -> Result<()> {
     } else {
         Err(reclaim_errors.join("; ").into())
     });
-    let cleanup = if serial && !keep_storage {
+    let cleanup = if args.cleanup {
         topology::down()
     } else {
         Ok(())
@@ -455,19 +340,27 @@ async fn run(args: &[String]) -> Result<()> {
         error!(%error, "suite cleanup failed");
     }
     let outcome = outcome.and(cleanup);
-    let Some(report) = report else {
-        return outcome;
+    let outcome = if let Some(report) = report {
+        let report = report.metric(
+            "wall seconds",
+            Unit::Seconds,
+            suite_started.elapsed().as_secs_f64(),
+        );
+        let persisted = report::persist_summary(report, &outcome);
+        if let Err(error) = &persisted {
+            error!(%error, "suite report failed");
+        }
+        outcome.and(persisted)
+    } else {
+        outcome
     };
-    let report = report.metric(
-        "wall seconds",
-        Unit::Seconds,
-        suite_started.elapsed().as_secs_f64(),
+    info!(
+        selection,
+        elapsed_secs = suite_started.elapsed().as_secs_f64(),
+        passed = outcome.is_ok(),
+        "suite finished",
     );
-    let persisted = report::persist_summary(report, &outcome);
-    if let Err(error) = &persisted {
-        error!(%error, "suite report failed");
-    }
-    outcome.and(persisted)
+    outcome
 }
 
 fn summarize(records: &[RunRecord]) -> Result<()> {
@@ -481,36 +374,70 @@ fn summarize(records: &[RunRecord]) -> Result<()> {
     Ok(())
 }
 
-fn list(selection: Option<&str>) {
-    for entry in selection.map_or_else(|| entries().collect(), selected) {
-        println!("{}", entry.name());
+#[tokio::main]
+async fn main() -> ExitCode {
+    let cli = Cli::parse();
+    if let Err(error) = logging::init() {
+        eprintln!("cannot initialize logging: {error}");
+        return ExitCode::FAILURE;
+    }
+    let outcome = tokio::task::LocalSet::new()
+        .run_until(dispatch(cli.command))
+        .await;
+
+    match outcome {
+        Ok(code) => code,
+        Err(error) => {
+            error!(%error, "command failed");
+            ExitCode::FAILURE
+        }
     }
 }
 
-#[tokio::main]
-async fn main() {
-    if let Err(error) = logging::init() {
-        eprintln!("cannot initialize logging: {error}");
-        std::process::exit(1);
+fn list(family: Family, selections: &[String]) -> Result<()> {
+    for entry in catalog::select(family, selections)? {
+        println!("{}", entry.name());
     }
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let arg = |index: usize| args.get(index).map(String::as_str);
+    Ok(())
+}
 
-    let local = tokio::task::LocalSet::new();
-    let outcome = match arg(0) {
-        Some("list") => {
-            list(arg(1));
-            Ok(())
+async fn checks(family: Family, command: args::Checks) -> Result<()> {
+    match command {
+        args::Checks::List { selections } => list(family, &selections),
+        args::Checks::Run(args) => {
+            run(
+                family,
+                args.run,
+                ExecutionConfig::default(),
+                args.serial,
+                args.fresh_concurrency.get(),
+            )
+            .await
         }
-        Some("run") => local.run_until(run(&args[1..])).await,
-        _ => match frontend::dispatch(&args) {
-            Some(outcome) => outcome,
-            None => usage(),
-        },
-    };
-
-    if let Err(err) = outcome {
-        error!(error = %err, "command failed");
-        std::process::exit(1);
     }
+}
+
+async fn dispatch(command: args::Command) -> Result<ExitCode> {
+    match command {
+        args::Command::Redshift(command) => {
+            checks(Family::Redshift, command).await?
+        }
+        args::Command::Redhat(command) => {
+            checks(Family::Redhat, command).await?
+        }
+        args::Command::Redline(command) => match command {
+            args::Benchmarks::List { selections } => {
+                list(Family::Redline, &selections)?
+            }
+            args::Benchmarks::Run(args) => {
+                let config = ExecutionConfig {
+                    profile: args.profile,
+                    loop_mode: args.loop_mode,
+                };
+                run(Family::Redline, args.run, config, true, 1).await?;
+            }
+        },
+        args::Command::Shared(command) => command.run()?,
+    }
+    Ok(ExitCode::SUCCESS)
 }

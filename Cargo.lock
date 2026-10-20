@@ -3300,6 +3300,7 @@ dependencies = [
 name = "redsuite"
 version = "0.6.0"
 dependencies = [
+ "clap",
  "futures-util",
  "redhat",
  "redline",
@@ -3316,6 +3317,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "bytes",
+ "clap",
  "futures-util",
  "libproc",
  "magicblock-config",
@@ -7582,6 +7584,7 @@ dependencies = [
 name = "xtask"
 version = "0.6.0"
 dependencies = [
+ "clap",
  "redsuite-core",
  "tracing",
 ]
