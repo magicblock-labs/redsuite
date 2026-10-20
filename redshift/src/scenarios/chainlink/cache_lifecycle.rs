@@ -334,7 +334,27 @@ impl PrivateErScenario for CacheLifecycle {
                     .await,
                 )
             } else {
-                value(er, pending, 900).await?;
+                // Completed accounts are evictable mirrors. A later reconnect
+                // gap can invalidate them, so verify normal access refetches them.
+                check::poll_for(
+                    "completed accounts refetch current base state",
+                    TIMEOUT,
+                    || async {
+                        let actual: Vec<_> = er
+                            .accounts(pending)
+                            .await?
+                            .into_iter()
+                            .map(crate::account_id)
+                            .collect();
+                        check_eq!(
+                            actual,
+                            vec![Some(900); pending.len()],
+                            "completed undelegation values"
+                        )?;
+                        Result::Ok(())
+                    },
+                )
+                .await?;
                 None
             };
             set_base(901, readonly).await?;
