@@ -24,7 +24,7 @@ use crate::{
     resources::Resources,
     runner::{Delivery, SendTransaction},
     topology::{PrivateEr, RestartConfig, RestartTiming},
-    DynError, Result,
+    Result,
 };
 
 const AIRDROP_TIMEOUT: Duration = Duration::from_secs(60);
@@ -234,8 +234,8 @@ impl BaseCtx {
         self.resources.clone()
     }
 
-    pub fn reclaim(&self, owner: &str) -> Vec<DynError> {
-        self.resources.reclaim_and_audit(owner)
+    pub fn reclaim(&self, owner: &str) {
+        self.resources.reclaim(owner);
     }
 
     pub fn grpc(&self) -> Option<(&str, &str)> {

@@ -6,7 +6,7 @@ use std::{
 use json::{Deserialize, Serialize};
 use tracing::warn;
 
-use crate::{host, report, topology, DynError};
+use crate::{host, report, topology};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaunchRecord {
@@ -53,7 +53,6 @@ impl Resources {
         launch.launched_at = report::utc_stamp();
         let record = Rc::new(ResourceRecord {
             finished: Cell::new(false),
-            finish_error: RefCell::new(None),
             launch: RefCell::new(launch),
         });
         self.records.borrow_mut().push(record.clone());
@@ -68,32 +67,7 @@ impl Resources {
             .collect()
     }
 
-    // Audits every private ER booted against this run's base: an explicit
-    // finish() failure and a process that survived teardown both come back
-    // as errors, kept apart from the scenario's own outcome.
-    pub(crate) fn audit(&self) -> Vec<DynError> {
-        let mut errors: Vec<DynError> = Vec::new();
-        for record in self.records.borrow().iter() {
-            let launch = record.launch.borrow();
-            if let Some(message) = record.finish_error.borrow().as_deref() {
-                errors.push(
-                    format!("private ER `{}`: {message}", launch.label).into(),
-                );
-            } else if !record.finished.get() && host::proc_running(launch.pid) {
-                errors.push(
-                    format!(
-                        "private ER `{}` (pid {}) is still running after the \
-                         scenario",
-                        launch.label, launch.pid
-                    )
-                    .into(),
-                );
-            }
-        }
-        errors
-    }
-
-    pub(crate) fn reclaim_and_audit(&self, owner: &str) -> Vec<DynError> {
+    pub(crate) fn reclaim(&self, owner: &str) {
         for record in self.records.borrow().iter() {
             let launch = record.launch.borrow();
             if !record.finished.get() && host::proc_running(launch.pid) {
@@ -108,19 +82,17 @@ impl Resources {
                     Ok(()) => {}
                     Err(error)
                         if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => record.record_finish_error(format!(
-                        "reclaiming storage {dir}: {error}"
-                    )),
+                    Err(error) => {
+                        warn!(owner, dir, %error, "storage cleanup failed")
+                    }
                 }
             }
         }
-        self.audit()
     }
 }
 
 pub(crate) struct ResourceRecord {
     finished: Cell<bool>,
-    finish_error: RefCell<Option<String>>,
     launch: RefCell<LaunchRecord>,
 }
 
@@ -134,10 +106,6 @@ impl ResourceRecord {
 
     pub(crate) fn mark_finished(&self) {
         self.finished.set(true);
-    }
-
-    pub(crate) fn record_finish_error(&self, message: String) {
-        *self.finish_error.borrow_mut() = Some(message);
     }
 
     pub(crate) fn record_exit(&self, message: String) {

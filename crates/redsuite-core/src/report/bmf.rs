@@ -97,40 +97,39 @@ fn export_run(
         if client_latency {
             benchmark.push_str(&origin);
         }
-        match (measurement.unit, &measurement.value) {
-            (Unit::Micros, _) if client_latency && withheld.is_some() => {}
-            (Unit::Micros, MeasureValue::Distribution(stats)) => {
-                doc.entry(benchmark).or_default().insert(
-                    "latency".to_owned(),
-                    MeasureVal {
-                        value: stats.median as f64 * 1e3,
-                        lower_value: Some(stats.min as f64 * 1e3),
-                        upper_value: Some(stats.max as f64 * 1e3),
-                    },
-                );
+        let (measure, value) = match (measurement.unit, &measurement.value) {
+            (Unit::Micros, _) if client_latency && withheld.is_some() => {
+                continue
             }
-            (Unit::Micros, MeasureValue::Scalar(value)) => {
-                doc.entry(benchmark).or_default().insert(
-                    "latency".to_owned(),
-                    MeasureVal {
-                        value: value * 1e3,
-                        lower_value: None,
-                        upper_value: None,
-                    },
-                );
-            }
-            (Unit::Tps | Unit::Rps, MeasureValue::Scalar(value)) => {
-                doc.entry(benchmark).or_default().insert(
-                    "throughput".to_owned(),
-                    MeasureVal {
-                        value: *value,
-                        lower_value: None,
-                        upper_value: None,
-                    },
-                );
-            }
-            _ => {}
-        }
+            (Unit::Micros, MeasureValue::Distribution(stats)) => (
+                "latency",
+                MeasureVal {
+                    value: stats.median as f64 * 1e3,
+                    lower_value: Some(stats.min as f64 * 1e3),
+                    upper_value: Some(stats.max as f64 * 1e3),
+                },
+            ),
+            (Unit::Micros, MeasureValue::Scalar(value)) => (
+                "latency",
+                MeasureVal {
+                    value: value * 1e3,
+                    lower_value: None,
+                    upper_value: None,
+                },
+            ),
+            (Unit::Tps | Unit::Rps, MeasureValue::Scalar(value)) => (
+                "throughput",
+                MeasureVal {
+                    value: *value,
+                    lower_value: None,
+                    upper_value: None,
+                },
+            ),
+            _ => continue,
+        };
+        doc.entry(benchmark)
+            .or_default()
+            .insert(measure.to_owned(), value);
     }
 }
 
@@ -139,33 +138,29 @@ fn bmf_document(
 ) -> BTreeMap<String, BTreeMap<String, MeasureVal>> {
     let mut doc: BTreeMap<String, BTreeMap<String, MeasureVal>> =
         BTreeMap::new();
-    for scenario in &campaign.scenarios {
-        if let Some(reason) = run_gate(&scenario.run) {
-            warn!(%scenario.run.scenario, reason, "BMF run excluded");
+    for (name, scenario) in &campaign.scenarios {
+        let Some(run) = &scenario.run else {
+            warn!(
+                scenario = name,
+                "BMF cells excluded; parent did not conclude"
+            );
+            continue;
+        };
+        if let Some(reason) = run_gate(run) {
+            warn!(scenario = name, reason, "BMF run excluded");
             continue;
         }
-        export_run(&mut doc, &scenario.run);
+        export_run(&mut doc, run);
         for cell in &scenario.cells {
             export_run(&mut doc, cell);
         }
-    }
-    for parent_slug in &campaign.orphan_cells {
-        warn!(
-            parent_slug,
-            "BMF cells excluded; parent run did not conclude"
-        );
     }
     doc
 }
 
 pub fn bmf(out: Option<&str>) -> Result<()> {
-    let campaigns = store::load()?;
-    let Some(latest) = campaigns.last() else {
-        return Err(
-            "no campaign reports to export — run a scenario first".into()
-        );
-    };
-    let doc = bmf_document(latest);
+    let latest = store::load()?;
+    let doc = bmf_document(&latest);
     if doc.is_empty() {
         return Err("the latest campaign has no exportable measurements".into());
     }

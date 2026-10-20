@@ -131,7 +131,6 @@ pub mod redshift {
         example => harness::example::Example {
             er: Shared(DEFAULT),
             fixtures: [],
-            optional_fixtures: [],
         },
         clone_on_access => chainlink::clone_on_access::CloneOnAccess {
             er: Shared(DEFAULT),
@@ -204,17 +203,14 @@ pub mod redshift {
         rpc_lifecycle => aperture::rpc_lifecycle::RpcLifecycle {
             er: Shared(DEFAULT),
             fixtures: [Fixture::RedlineProgram],
-            optional_fixtures: [],
         },
         rpc_token_queries => aperture::rpc_token_queries::RpcTokenQueries {
             er: Shared(DEFAULT),
             fixtures: [],
-            optional_fixtures: [],
         },
         rpc_compat_methods => aperture::rpc_compat_methods::RpcCompatMethods {
             er: Fresh,
             fixtures: [],
-            optional_fixtures: [],
         },
         api_invariants => harness::api_invariants::ApiInvariants {
             er: None,

@@ -1,4 +1,4 @@
-use std::{future::Future, pin::Pin};
+use std::{future::Future, path::PathBuf, pin::Pin};
 
 use clap::ValueEnum;
 use magicblock_config::LeaderParams;
@@ -6,7 +6,7 @@ use pubkey::Pubkey;
 
 use crate::{
     context::ErCtx, profile::ExecutionConfig, scenario::RunRecord,
-    topology::ErOptions,
+    topology::ErOptions, Result,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
@@ -71,6 +71,20 @@ pub enum Fixture {
 }
 
 impl Fixture {
+    pub fn resolve(self) -> Result<PathBuf> {
+        let path = crate::topology::workspace_root()
+            .join("target/deploy")
+            .join(self.so_name());
+        if !path.is_file() {
+            return Err(format!(
+                "fixture {} is missing; run `cargo xtask programs`",
+                path.display()
+            )
+            .into());
+        }
+        Ok(path)
+    }
+
     pub const ALL: [Fixture; 5] = [
         Fixture::RedlineProgram,
         Fixture::RedshiftProgram,
@@ -109,26 +123,6 @@ impl Fixture {
             Fixture::RedhatProgram => redhat_interface::ID,
         }
     }
-
-    pub const fn package(self) -> &'static str {
-        match self {
-            Fixture::RedlineProgram => "redline-program",
-            Fixture::RedshiftProgram
-            | Fixture::RedshiftProgramSlim
-            | Fixture::RedshiftProgramSlimUpgraded => "redshift-program",
-            Fixture::RedhatProgram => "redhat-program",
-        }
-    }
-
-    pub const fn features(self) -> &'static [&'static str] {
-        match self {
-            Fixture::RedlineProgram
-            | Fixture::RedshiftProgram
-            | Fixture::RedhatProgram => &["default"],
-            Fixture::RedshiftProgramSlim => &[],
-            Fixture::RedshiftProgramSlimUpgraded => &["upgraded"],
-        }
-    }
 }
 
 pub type ScenarioFuture = Pin<Box<dyn Future<Output = RunRecord>>>;
@@ -137,8 +131,6 @@ pub struct ScenarioEntry {
     pub family: Family,
     pub short_name: &'static str,
     pub er: Er,
-    pub fixtures: &'static [Fixture],
-    pub optional_fixtures: &'static [Fixture],
     pub run: fn(
         ExecutionConfig,
         std::result::Result<ErCtx, String>,
@@ -154,15 +146,15 @@ impl ScenarioEntry {
 #[macro_export]
 macro_rules! scenario_catalog {
     (@execute $grouped:ident($group:expr), $scenario:expr, $fixtures:expr,
-     $optional:expr, $config:expr, $er:expr) => {
+     $config:expr, $er:expr) => {
         $crate::run_shared_scenario(
-            $scenario, $fixtures, $optional, $config, $er,
+            $scenario, $fixtures, $config, $er,
         )
     };
     (@execute $base_only:ident, $scenario:expr, $fixtures:expr,
-     $optional:expr, $config:expr, $er:expr) => {
+     $config:expr, $er:expr) => {
         $crate::run_private_er_scenario(
-            $scenario, $fixtures, $optional, $config,
+            $scenario, $fixtures, $config,
         )
     };
     (
@@ -170,7 +162,6 @@ macro_rules! scenario_catalog {
         $($short_name:ident => $($segment:ident)::+ {
             er: $er:ident $(($group:expr))?,
             fixtures: [$($fixture:expr),* $(,)?]
-            $(, optional_fixtures: [$($optional:expr),* $(,)?])?
             $(,)?
         }),* $(,)?
     ) => {
@@ -179,14 +170,11 @@ macro_rules! scenario_catalog {
                 family: $crate::catalog::Family::$family,
                 short_name: stringify!($short_name),
                 er: $crate::catalog::Er::$er $((&$group))?,
-                fixtures: &[$($fixture),*],
-                optional_fixtures: &[$($($optional),*)?],
                 run: |config, _group_er| {
                     Box::pin($crate::scenario_catalog!(
                         @execute $er $(($group))?,
                         scenarios::$($segment)::+,
                         &[$($fixture),*],
-                        &[$($($optional),*)?],
                         config,
                         _group_er
                     ))

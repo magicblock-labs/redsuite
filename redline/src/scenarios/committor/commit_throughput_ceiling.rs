@@ -86,25 +86,19 @@ async fn deliver_commits(
 ) -> Result<(Vec<(u64, Signature)>, redsuite_core::runner::RunOutcome)> {
     let delivered: Rc<RefCell<Vec<(u64, Signature)>>> =
         Rc::new(RefCell::new(Vec::with_capacity(sets.len())));
-    let sets = Rc::new(sets);
-    let request = {
-        let delivered = delivered.clone();
+    let request = |iteration: u64| {
+        let id = first_id + iteration;
+        let accounts = &sets[(iteration - 1) as usize];
+        let ix = build::commit_accounts(id, payer_pubkey, accounts);
         let sender = sender.clone();
-        let sets = sets.clone();
-        move |iteration: u64| {
-            let id = first_id + iteration;
-            let accounts = sets[(iteration - 1) as usize].clone();
-            let ix = build::commit_accounts(id, payer_pubkey, &accounts);
-            let sender = sender.clone();
-            let delivered = delivered.clone();
-            async move {
-                let tx = sender.prepare(&[ix]).await?;
-                Ok(SendTransaction(move |_: Instant| async move {
-                    let commit_signature = sender.submit_prepared(&tx).await?;
-                    delivered.borrow_mut().push((id, commit_signature));
-                    Ok(())
-                }))
-            }
+        let delivered = delivered.clone();
+        async move {
+            let tx = sender.prepare(&[ix]).await?;
+            Ok(SendTransaction(move |_: Instant| async move {
+                let commit_signature = sender.submit_prepared(&tx).await?;
+                delivered.borrow_mut().push((id, commit_signature));
+                Ok(())
+            }))
         }
     };
     let outcome = execute(
@@ -134,18 +128,13 @@ async fn quiesce_committor(er: &ErCtx) -> Result<()> {
         "the committor drains its backlog before the measured window",
         QUIESCE_TIMEOUT,
         || async {
-            match er.scrape_metrics().await {
-                Ok(metrics) => {
-                    let backlog =
-                        metrics.value_sum(BACKLOG_GAUGE).unwrap_or(0.0);
-                    let intents =
-                        metrics.value_sum(INTENTS_COUNTER).unwrap_or(0.0);
-                    let executed =
-                        metrics.value_sum(EXECUTED_COUNTER).unwrap_or(0.0);
-                    backlog == 0.0 && intents <= executed
-                }
-                Err(_) => false,
-            }
+            er.scrape_metrics().await.is_ok_and(|metrics| {
+                let backlog = metrics.value_sum(BACKLOG_GAUGE).unwrap_or(0.0);
+                let intents = metrics.value_sum(INTENTS_COUNTER).unwrap_or(0.0);
+                let executed =
+                    metrics.value_sum(EXECUTED_COUNTER).unwrap_or(0.0);
+                backlog == 0.0 && intents <= executed
+            })
         },
     )
     .await?;
@@ -173,17 +162,15 @@ async fn await_drain(
             .await?
             .value_sum(EXECUTED_COUNTER)
             .unwrap_or(0.0);
-        if executed_now >= target {
+        let fully_drained = executed_now >= target;
+        if fully_drained || tokio::time::Instant::now() >= deadline {
             return Ok(DrainResult {
-                fully_drained: true,
-                drained: expected as f64,
-                drain_wall: started.elapsed(),
-            });
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Ok(DrainResult {
-                fully_drained: false,
-                drained: (executed_now - executed_before).max(0.0),
+                fully_drained,
+                drained: if fully_drained {
+                    expected as f64
+                } else {
+                    (executed_now - executed_before).max(0.0)
+                },
                 drain_wall: started.elapsed(),
             });
         }

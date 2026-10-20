@@ -34,34 +34,21 @@ impl PrivateErScenario<(ScenarioReport, Result<()>)> for Load {
         base: &BaseCtx,
     ) -> Result<(ScenarioReport, Result<()>)> {
         let started = Instant::now();
-        let (report, outcome) = async {
-            let private = topology::private_er(
-                base,
-                topology::ErOptions {
-                    label: "load".to_owned(),
-                    ..Default::default()
-                },
-            )
-            .await?;
-            private.wait_ready(topology::ER_READY_TIMEOUT).await?;
-            let outcome = mixed_sustained_load::run(
-                base,
-                private.ctx(),
-                Some(self),
-                started,
-            )
-            .await;
-            let cleanup = private.finish().await;
-            outcome.map(|(report, outcome)| (report, outcome.and(cleanup)))
-        }
-        .await
-        .unwrap_or_else(|error| {
-            (
-                ScenarioReport::ok(self.name())
-                    .setting("profile", base.config().profile.name()),
-                Err(error),
-            )
-        });
+        let private = topology::private_er(
+            base,
+            topology::ErOptions {
+                label: "load".to_owned(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        private.wait_ready(topology::ER_READY_TIMEOUT).await?;
+        let result =
+            mixed_sustained_load::run(base, private.ctx(), Some(self), started)
+                .await;
+        let cleanup = private.finish().await;
+        let (report, outcome) = result?;
+        let outcome = outcome.and(cleanup);
         let report = report.setting(
             "completion",
             if *self.stop.borrow() {

@@ -245,14 +245,14 @@ async fn execute_cell_burst(
                         let api = api.clone();
                         std::future::ready(Ok(SendTransaction(
                             move |_: Instant| async move {
-                                match api.send_prepared(&body).await {
-                                    Ok(0) => Ok(()),
-                                    Ok(rejected) => Err(format!(
+                                let rejected = api.send_prepared(&body).await?;
+                                if rejected != 0 {
+                                    return Err(format!(
                                         "{rejected} entries rejected"
                                     )
-                                    .into()),
-                                    Err(error) => Err(error),
+                                    .into());
                                 }
+                                Ok(())
                             },
                         )))
                     },

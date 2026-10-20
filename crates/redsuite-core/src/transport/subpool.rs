@@ -99,11 +99,9 @@ impl SubscriberPool {
         for thread_index in 0..thread_count {
             let my_states: Vec<Arc<Mutex<ConnState>>> = states
                 .iter()
-                .enumerate()
-                .filter(|(conn_index, _)| {
-                    conn_index % thread_count == thread_index
-                })
-                .map(|(_, state)| state.clone())
+                .skip(thread_index)
+                .step_by(thread_count)
+                .cloned()
                 .collect();
             let url = url.to_owned();
             let accounts = accounts.clone();
@@ -118,10 +116,10 @@ impl SubscriberPool {
                     .expect("subscriber runtime build is infallible");
                 let local = tokio::task::LocalSet::new();
                 runtime.block_on(local.run_until(async move {
-                    let conn_tasks: Vec<_> = my_states
-                        .into_iter()
-                        .map(|state| {
-                            tokio::task::spawn_local(run_connection(
+                    let mut conn_tasks = Vec::with_capacity(my_states.len());
+                    for state in my_states {
+                        conn_tasks.push(tokio::task::spawn_local(
+                            run_connection(
                                 url.clone(),
                                 accounts.clone(),
                                 state,
@@ -130,9 +128,9 @@ impl SubscriberPool {
                                 extractor.clone(),
                                 shutdown_rx.clone(),
                                 threshold_micros,
-                            ))
-                        })
-                        .collect();
+                            ),
+                        ));
+                    }
                     for task in conn_tasks {
                         let _ = task.await;
                     }

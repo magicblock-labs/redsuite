@@ -1,8 +1,12 @@
+use std::time::{Duration, Instant};
+
 use instruction::Instruction;
 use pubkey::Pubkey;
 use redline_interface::{instruction::build, layout, utils::fold_hash};
 
-use crate::{ChainCtx, CheckError, Result};
+use signature::Signature;
+
+use crate::{ChainCtx, CheckError, Result, TxSender};
 
 pub const STEPS: u64 = 3;
 pub const CU_LIMIT: u32 = 1_400_000;
@@ -35,6 +39,50 @@ impl Step {
             Step::Y => vec![a, b],
             Step::Z => vec![b],
         }
+    }
+}
+
+pub struct CausalPair {
+    a: Pubkey,
+    b: Pubkey,
+    model: PairModel,
+    pub last_signature: Option<Signature>,
+    senders: Vec<TxSender>,
+}
+
+impl CausalPair {
+    pub fn new(keys: [Pubkey; 2], senders: Vec<TxSender>) -> Self {
+        Self {
+            a: keys[0],
+            b: keys[1],
+            senders,
+            model: PairModel::default(),
+            last_signature: None,
+        }
+    }
+
+    pub async fn send(
+        &mut self,
+        step: Step,
+        id: u64,
+        iters: u32,
+    ) -> Result<(Signature, Duration)> {
+        let ixs = chain_ixs(id, iters, &step.accounts(self.a, self.b));
+        let sender = &self.senders[step.index()];
+        let tx = sender.prepare(&ixs).await?;
+        let started = Instant::now();
+        let signature = sender
+            .submit_prepared(&tx)
+            .await
+            .map_err(|error| format!("step {step:?}, id {id}: {error}"))?;
+        let elapsed = started.elapsed();
+        self.last_signature = Some(signature);
+        self.model.apply(step, id, iters);
+        Ok((signature, elapsed))
+    }
+
+    pub async fn verify(&self, ctx: &impl ChainCtx, scope: &str) -> Result<()> {
+        self.model.verify(ctx, [self.a, self.b], scope).await
     }
 }
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]

@@ -317,23 +317,17 @@ impl PrivateErScenario for CacheLifecycle {
                         "ER discovers the completed undelegation",
                         RECOVERY_OBSERVATION,
                         || async {
-                            match crate::local_accounts(er, pending).await {
-                                Ok(observed)
-                                    if observed.iter().all(|a| {
-                                        crate::account_id(a.clone())
-                                            == Some(900)
-                                    }) =>
-                                {
-                                    Ok(released_at.elapsed())
-                                }
-                                Ok(observed) => Err(format!(
-                                    "{:?}",
-                                    observed
-                                        .iter()
-                                        .map(|a| crate::account_id(a.clone()))
-                                        .collect::<Vec<_>>()
-                                )),
-                                Err(error) => Err(error.to_string()),
+                            let ids: Vec<_> =
+                                crate::local_accounts(er, pending)
+                                    .await
+                                    .map_err(|error| error.to_string())?
+                                    .into_iter()
+                                    .map(crate::account_id)
+                                    .collect();
+                            if ids.iter().all(|id| *id == Some(900)) {
+                                Ok(released_at.elapsed())
+                            } else {
+                                Err(format!("{ids:?}"))
                             }
                         },
                     )

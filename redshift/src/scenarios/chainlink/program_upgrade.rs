@@ -11,7 +11,7 @@ use redsuite_core::redline::Accounts;
 use redsuite_core::{
     api::{custom_error_code, RpcError},
     catalog::Fixture,
-    check, check_eq, manifest,
+    check, check_eq,
     netfault::{Action, BaseProxies, Selector, Stage},
     prep, topology,
     topology::ErOptions,
@@ -78,11 +78,9 @@ impl PrivateErScenario for ProgramUpgrade {
     }
 
     async fn run(&self, base: &BaseCtx) -> Result<()> {
-        let mut a =
-            std::fs::read(manifest::resolve(Fixture::RedshiftProgramSlim)?)?;
-        let mut b = std::fs::read(manifest::resolve(
-            Fixture::RedshiftProgramSlimUpgraded,
-        )?)?;
+        let mut a = std::fs::read(Fixture::RedshiftProgramSlim.resolve()?)?;
+        let mut b =
+            std::fs::read(Fixture::RedshiftProgramSlimUpgraded.resolve()?)?;
         let size = a.len().max(b.len());
         a.resize(size, 0);
         b.resize(size, 0);

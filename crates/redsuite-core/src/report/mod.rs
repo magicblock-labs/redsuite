@@ -2,13 +2,9 @@ mod bmf;
 mod store;
 use std::{
     fs,
-    io::Write,
-    path::{Path, PathBuf},
+    path::PathBuf,
     process::Command,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        OnceLock,
-    },
+    sync::OnceLock,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -17,17 +13,11 @@ use json::{Deserialize, Serialize};
 use tracing::warn;
 
 use crate::{
-    api,
-    resources::LaunchRecord,
-    runner::RunOutcome,
-    scenario::{failed_check, RunRecord, ScenarioOutcome},
-    stats::ObservationsStats,
-    topology,
-    transport::http,
-    DynError, Result,
+    resources::LaunchRecord, runner::RunOutcome, scenario::RunRecord,
+    stats::ObservationsStats, topology, Result,
 };
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -218,8 +208,6 @@ pub struct ScenarioRun {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedFailure {
     pub phase: String,
-    #[serde(default)]
-    pub kind: String,
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected: Option<String>,
@@ -230,10 +218,9 @@ pub struct PersistedFailure {
 }
 
 impl PersistedFailure {
-    fn new(phase: &str, kind: &str, message: impl Into<String>) -> Self {
+    fn new(phase: &str, message: impl Into<String>) -> Self {
         Self {
             phase: phase.to_owned(),
-            kind: kind.to_owned(),
             message: message.into(),
             expected: None,
             actual: None,
@@ -255,59 +242,39 @@ fn campaign_dir() -> PathBuf {
     reports_dir().join(run_id())
 }
 
-fn slug_of(name: &str) -> String {
-    name.replace(['/', ' '], "-")
-}
-
 pub fn persist_run(record: &RunRecord) -> Result<PathBuf> {
     let failures = run_failures(record);
 
-    let fallback;
-    let report = match &record.scenario {
-        ScenarioOutcome::Passed(Some(report))
-        | ScenarioOutcome::FailedReport(_, report) => report,
-        _ => {
-            fallback = ScenarioReport::failed(&record.name).metric_if(
-                "wall seconds",
-                Unit::Seconds,
-                record.wall_seconds,
-            );
-            &fallback
-        }
-    };
+    let fallback = ScenarioReport::failed(&record.name).metric_if(
+        "wall seconds",
+        Unit::Seconds,
+        record.wall_seconds,
+    );
+    let report = record.report.as_ref().unwrap_or(&fallback);
+    let mut doc = scenario_run_doc(report, &failures, &record.launches);
+    doc.passed = record.passed();
 
-    let dir = campaign_dir();
-    ensure_campaign(&dir)?;
-    write_scenario_run(
-        &dir,
-        &scenario_run_doc(report, &failures, &record.launches),
-    )
+    store::persist(None, doc)
 }
 
 pub fn persist_summary(
     mut report: ScenarioReport,
     outcome: &Result<()>,
 ) -> Result<()> {
-    let dir = campaign_dir();
-    ensure_campaign(&dir)?;
     report.passed = outcome.is_ok();
     let failures: Vec<_> = outcome
         .as_ref()
         .err()
-        .map(|error| {
-            PersistedFailure::new("suite", "infrastructure", error.to_string())
-        })
+        .map(|error| PersistedFailure::new("suite", error.to_string()))
         .into_iter()
         .collect();
-    write_scenario_run(&dir, &scenario_run_doc(&report, &failures, &[]))?;
+    store::persist(None, scenario_run_doc(&report, &failures, &[]))?;
     Ok(())
 }
 
 pub fn persist_cell(parent: &str, report: &ScenarioReport) {
-    let dir = campaign_dir();
-    let persisted = ensure_campaign(&dir).and_then(|()| {
-        append_cell(&dir, parent, &scenario_run_doc(report, &[], &[]))
-    });
+    let persisted =
+        store::persist(Some(parent), scenario_run_doc(report, &[], &[]));
     if let Err(error) = persisted {
         warn!(%error, "cell report not persisted");
     }
@@ -330,159 +297,29 @@ fn scenario_run_doc(
     }
 }
 
-fn ensure_campaign(dir: &Path) -> Result<()> {
-    fs::create_dir_all(dir)?;
-    if dir.join("campaign.json").exists() {
-        return Ok(());
-    }
-    let (er_bin, er_version, er_fingerprint) = er_identity();
-    write_campaign_meta(
-        dir,
-        &CampaignMeta {
-            schema: SCHEMA_VERSION,
-            run: run_id().to_owned(),
-            started_at: utc_stamp(),
-            er_bin,
-            er_version,
-            er_fingerprint,
-        },
-    )
-}
-
-fn staging_path(dir: &Path, prefix: &str) -> PathBuf {
-    static STAGING_NONCE: AtomicUsize = AtomicUsize::new(0);
-    let nonce = STAGING_NONCE.fetch_add(1, Ordering::Relaxed);
-    dir.join(format!("{prefix}.tmp{}-{nonce}", std::process::id()))
-}
-
-fn write_campaign_meta(dir: &Path, meta: &CampaignMeta) -> Result<()> {
-    let staging = staging_path(dir, "campaign");
-    fs::write(&staging, json::to_string_pretty(meta)?)?;
-    fs::rename(&staging, dir.join("campaign.json"))?;
-    Ok(())
-}
-
-fn write_scenario_run(dir: &Path, doc: &ScenarioRun) -> Result<PathBuf> {
-    let body = json::to_string_pretty(doc)?;
-    let slug = slug_of(&doc.scenario);
-    let mut path = dir.join(format!("{slug}.json"));
-    // a retried scenario within one campaign keeps both attempts
-    for attempt in 2.. {
-        if !path.exists() {
-            break;
-        }
-        path = dir.join(format!("{slug}-{attempt}.json"));
-    }
-    let staging = staging_path(dir, &slug);
-    fs::write(&staging, body)?;
-    fs::rename(&staging, &path)?;
-    Ok(path)
-}
-
-fn append_cell(dir: &Path, parent: &str, doc: &ScenarioRun) -> Result<PathBuf> {
-    let line = json::to_string(doc)?;
-    let path = dir.join(format!("{}.cells.jsonl", slug_of(parent)));
-    let mut journal = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)?;
-    writeln!(journal, "{line}")?;
-    Ok(path)
-}
-
 fn run_failures(record: &RunRecord) -> Vec<PersistedFailure> {
-    let mut failures = Vec::new();
-    match &record.scenario {
-        ScenarioOutcome::Failed(error)
-        | ScenarioOutcome::FailedReport(error, _) => {
-            failures.push(scenario_failure(error))
-        }
-        ScenarioOutcome::Panicked(message) => {
-            failures.push(PersistedFailure::new("scenario", "panic", message))
-        }
-        ScenarioOutcome::Passed(_)
-        | ScenarioOutcome::Skipped(_)
-        | ScenarioOutcome::NotReached => {}
+    let Err(error) = &record.outcome else {
+        return Vec::new();
+    };
+    let mut failure = PersistedFailure::new(record.phase, error.to_string());
+    if let Some(check) = error.downcast_ref::<crate::CheckError>() {
+        failure.expected = check.expected.clone();
+        failure.actual = check.actual.clone();
+        failure.context = check.context.clone();
     }
-    for error in &record.errors {
-        failures.push(PersistedFailure::new(
-            error.phase(),
-            "infrastructure",
-            error.error().to_string(),
-        ));
-    }
-    failures
+    vec![failure]
 }
 
-fn scenario_failure(error: &DynError) -> PersistedFailure {
-    if let Some(check) = failed_check(error) {
-        return PersistedFailure {
-            expected: check.expected.clone(),
-            actual: check.actual.clone(),
-            context: check.context.clone(),
-            ..PersistedFailure::new("scenario", "check", &check.check)
-        };
+fn campaign_meta() -> CampaignMeta {
+    let (er_bin, er_version, er_fingerprint) = er_identity();
+    CampaignMeta {
+        schema: SCHEMA_VERSION,
+        run: run_id().to_owned(),
+        started_at: utc_stamp(),
+        er_bin,
+        er_version,
+        er_fingerprint,
     }
-    if let Some(tx) = error.downcast_ref::<api::TxError>() {
-        return PersistedFailure {
-            context: vec![
-                ("signature".to_owned(), tx.signature.to_string()),
-                ("error".to_owned(), format!("{:?}", tx.err)),
-            ],
-            ..PersistedFailure::new("scenario", "transaction", tx.to_string())
-        };
-    }
-    if let Some(timeout) = error.downcast_ref::<api::ConfirmTimeout>() {
-        return PersistedFailure {
-            context: vec![(
-                "signature".to_owned(),
-                timeout.signature.to_string(),
-            )],
-            ..PersistedFailure::new(
-                "scenario",
-                "confirm-timeout",
-                timeout.to_string(),
-            )
-        };
-    }
-    if let Some(rpc) = error.downcast_ref::<api::RpcError>() {
-        let mut context = vec![
-            ("code".to_owned(), rpc.code.to_string()),
-            ("method".to_owned(), rpc.method.clone()),
-            ("url".to_owned(), rpc.url.clone()),
-        ];
-        if let Some(data) = &rpc.data {
-            context.push(("data".to_owned(), format!("{data:?}")));
-        }
-        return PersistedFailure {
-            context,
-            ..PersistedFailure::new("scenario", "rpc", rpc.to_string())
-        };
-    }
-    if let Some(transport) = error.downcast_ref::<http::TransportError>() {
-        let mut context = vec![("url".to_owned(), transport.url.clone())];
-        if let Some(method) = &transport.method {
-            context.push(("method".to_owned(), method.clone()));
-        }
-        if let Some(status) = transport.status {
-            context.push(("status".to_owned(), status.to_string()));
-        }
-        if let Some(kind) = transport.kind {
-            context.push(("transport-kind".to_owned(), kind.to_owned()));
-        }
-        if let Some(cause) = &transport.cause {
-            context.push(("cause".to_owned(), cause.clone()));
-        }
-        return PersistedFailure {
-            context,
-            ..PersistedFailure::new(
-                "scenario",
-                "transport",
-                transport.to_string(),
-            )
-        };
-    }
-    PersistedFailure::new("scenario", "infrastructure", error.to_string())
 }
 
 fn er_identity() -> (String, String, String) {

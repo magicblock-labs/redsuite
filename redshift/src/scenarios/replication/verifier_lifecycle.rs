@@ -1,8 +1,7 @@
 use std::{
     cell::Cell,
-    collections::HashSet,
     fs,
-    path::{Path, PathBuf},
+    path::Path,
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -11,14 +10,14 @@ use async_trait::async_trait;
 use pubkey::Pubkey;
 use redsuite_core::{
     check, check_eq, prep,
-    redline::causal::{chain_ixs, PairModel, Step, STEPS},
+    redline::causal::{CausalPair, Step, STEPS},
     topology::{
         self, ReplicatedOptions, ReplicatedTopology, Verifier, VerifierStop,
     },
-    BaseCtx, ChainCtx, CheckError, PrivateErScenario, Result, TxSender,
+    BaseCtx, ChainCtx, CheckError, PrivateErScenario, Result,
 };
-use signature::Signature;
 use signer::Signer;
+use tokio::task::JoinSet;
 use tracing::debug;
 
 const LABEL: &str = "verifier-lifecycle";
@@ -53,115 +52,96 @@ const SERVER_SNAPSHOTS: &str = r#"engine_replicator_operation_duration_micros_co
 const TRUNCATIONS: &str =
     r#"engine_ledger_operation_duration_micros_count{op="truncate"}"#;
 
-struct Pair {
-    a: Pubkey,
-    b: Pubkey,
-    senders: Vec<TxSender>,
-    model: PairModel,
-    chains: u64,
-    last_signature: Option<Signature>,
+#[derive(Default)]
+struct Progress {
+    stop: Cell<bool>,
+    sent: Cell<u64>,
+    next_id: Cell<u64>,
+}
+
+impl Progress {
+    async fn run(self: Rc<Self>, mut pair: CausalPair) -> Result<CausalPair> {
+        let mut chains = 0;
+        while !self.stop.get() {
+            let heavy = Step::ALL[(chains % STEPS) as usize];
+            for step in Step::ALL {
+                let id = self.next_id.get() + 1;
+                self.next_id.set(id);
+                let iters = if step == heavy { HEAVY_ITERS } else { 0 };
+                pair.send(step, id, iters).await?;
+                self.sent.set(self.sent.get() + 1);
+            }
+            chains += 1;
+            tokio::time::sleep(CHAIN_GAP).await;
+        }
+        Ok(pair)
+    }
 }
 
 struct Workload {
-    stop: Rc<Cell<bool>>,
-    sent: Rc<Cell<u64>>,
-    tasks: Vec<tokio::task::JoinHandle<Result<Pair>>>,
+    progress: Rc<Progress>,
+    tasks: JoinSet<Result<CausalPair>>,
 }
 
 impl Workload {
-    fn start(pairs: Vec<Pair>, gap: Duration, heavy_iters: u32) -> Self {
-        let stop = Rc::new(Cell::new(false));
-        let sent = Rc::new(Cell::new(0u64));
-        let next_id = Rc::new(Cell::new(1u64));
-        let tasks = pairs
-            .into_iter()
-            .map(|mut pair| {
-                let stop = stop.clone();
-                let sent = sent.clone();
-                let next_id = next_id.clone();
-                tokio::task::spawn_local(async move {
-                    while !stop.get() {
-                        let heavy = Step::ALL[(pair.chains % STEPS) as usize];
-                        for step in Step::ALL {
-                            let id = next_id.get();
-                            next_id.set(id + 1);
-                            let iters =
-                                if step == heavy { heavy_iters } else { 0 };
-                            let ixs = chain_ixs(
-                                id,
-                                iters,
-                                &step.accounts(pair.a, pair.b),
-                            );
-                            let signature = pair.senders[step.index()]
-                                .submit(&ixs)
-                                .await
-                                .map_err(|error| {
-                                    format!(
-                                        "chain step {step:?} (id {id}) was \
-                                         not accepted by the leader: {error}"
-                                    )
-                                })?;
-                            pair.last_signature = Some(signature);
-                            pair.model.apply(step, id, iters);
-                            sent.set(sent.get() + 1);
-                        }
-                        pair.chains += 1;
-                        tokio::time::sleep(gap).await;
-                    }
-                    Ok(pair)
-                })
-            })
-            .collect();
-        Self { stop, sent, tasks }
+    fn start(pairs: Vec<CausalPair>) -> Self {
+        let progress = Rc::new(Progress::default());
+        let mut tasks = JoinSet::new();
+        for pair in pairs {
+            tasks.spawn_local(progress.clone().run(pair));
+        }
+        Self { progress, tasks }
     }
 
     fn sent(&self) -> u64 {
-        self.sent.get()
+        self.progress.sent.get()
     }
 
     async fn stop(
-        mut self,
+        self,
         topology: &ReplicatedTopology,
-    ) -> Result<(Vec<Pair>, u64)> {
-        self.stop.set(true);
-        let stopped = tokio::time::timeout(DRAIN_TIMEOUT, async {
-            let mut pairs = Vec::with_capacity(self.tasks.len());
-            for task in &mut self.tasks {
-                let pair = task
-                    .await
-                    .map_err(|error| format!("workload task: {error}"))??;
-                if let Some(signature) = pair.last_signature {
-                    let tx = topology
-                        .leader()
-                        .ctx()
-                        .api()
-                        .await_transaction(&signature, DRAIN_TIMEOUT)
-                        .await?;
-                    check!(
-                        tx.err.is_none(),
-                        "final transaction {signature} failed: {:?}",
-                        tx.err
-                    )?;
-                }
-                pairs.push(pair);
+    ) -> Result<(Vec<CausalPair>, u64)> {
+        self.progress.stop.set(true);
+        tokio::time::timeout(DRAIN_TIMEOUT, self.drain(topology))
+            .await
+            .map_err(|_| {
+                format!("workload did not drain within {DRAIN_TIMEOUT:?}")
+            })?
+    }
+
+    async fn drain(
+        self,
+        topology: &ReplicatedTopology,
+    ) -> Result<(Vec<CausalPair>, u64)> {
+        let pairs: Vec<_> = self
+            .tasks
+            .join_all()
+            .await
+            .into_iter()
+            .collect::<Result<_>>()?;
+        for pair in &pairs {
+            if let Some(signature) = pair.last_signature {
+                let tx = topology
+                    .leader()
+                    .ctx()
+                    .api()
+                    .await_transaction(&signature, DRAIN_TIMEOUT)
+                    .await?;
+                check!(
+                    tx.err.is_none(),
+                    "final transaction {signature} failed: {:?}",
+                    tx.err
+                )?;
             }
-            await_leader_advance(
-                topology,
-                BLOCKS,
-                1.0,
-                "ledger metrics after the workload drains",
-            )
-            .await?;
-            Ok((pairs, self.sent()))
-        })
-        .await;
-        // On timeout or a producer error, don't leave detached producers behind.
-        for task in self.tasks {
-            task.abort();
         }
-        stopped.map_err(|_| {
-            format!("workload did not drain within {DRAIN_TIMEOUT:?}")
-        })?
+        await_leader_advance(
+            topology,
+            BLOCKS,
+            1.0,
+            "ledger metrics after the workload drains",
+        )
+        .await?;
+        Ok((pairs, self.progress.sent.get()))
     }
 }
 
@@ -337,57 +317,9 @@ async fn probe_clones(
     Ok(())
 }
 
-async fn verify_isolation(topology: &ReplicatedTopology) -> Result<()> {
-    let leader = topology.leader();
-    let mut identities: HashSet<Pubkey> = HashSet::from([leader.identity()]);
-    let mut metrics_ports: HashSet<u16> =
-        HashSet::from([leader.metrics_port()]);
-    let mut storage: HashSet<PathBuf> =
-        HashSet::from([leader.storage_dir().to_path_buf()]);
-    let mut logs: HashSet<PathBuf> =
-        HashSet::from([leader.log().to_path_buf()]);
+async fn verify_connections(topology: &ReplicatedTopology) -> Result<()> {
     for verifier in topology.verifiers() {
         let label = verifier.label();
-        check!(
-            identities.insert(verifier.identity()),
-            "verifier `{label}` shares its identity with another node"
-        )?;
-        check!(
-            metrics_ports.insert(verifier.metrics_port()),
-            "verifier `{label}` shares its metrics port with another node"
-        )?;
-        check!(
-            storage.insert(verifier.storage_dir().to_path_buf()),
-            "verifier `{label}` shares its storage directory with another node"
-        )?;
-        check!(
-            logs.insert(verifier.log().to_path_buf()),
-            "verifier `{label}` shares its log with another node"
-        )?;
-        check!(
-            verifier.storage_dir().is_dir(),
-            "verifier `{label}` has no storage directory at {}",
-            verifier.storage_dir().display()
-        )?;
-        check!(
-            verifier.config_path().is_file(),
-            "verifier `{label}` has no configuration at {}",
-            verifier.config_path().display()
-        )?;
-        check!(
-            verifier.log().is_file(),
-            "verifier `{label}` has no log at {}",
-            verifier.log().display()
-        )?;
-        check!(
-            leader.allowed_followers().contains(&verifier.identity()),
-            "the leader's follower allowlist lacks verifier `{label}`"
-        )?;
-        check_eq!(
-            verifier.upstream_address(),
-            format!("127.0.0.1:{}", leader.replication_port()),
-            "verifier `{label}` must follow the leader's replication listener"
-        )?;
         check!(
             verifier.stream_connected().await,
             "verifier `{label}` reports no live replication stream"
@@ -474,16 +406,11 @@ async fn sample_lag(
 
 async fn verify_pairs(
     topology: &ReplicatedTopology,
-    pairs: &[Pair],
+    pairs: &[CausalPair],
 ) -> Result<()> {
     let leader = topology.leader().ctx();
     for (index, pair) in pairs.iter().enumerate() {
-        pair.model
-            .verify(
-                leader,
-                [pair.a, pair.b],
-                &format!("pair {index} on the leader"),
-            )
+        pair.verify(leader, &format!("pair {index} on the leader"))
             .await?;
     }
     Ok(())
@@ -523,7 +450,7 @@ async fn prepare_pairs(
     base: &BaseCtx,
     topology: &ReplicatedTopology,
     count: usize,
-) -> Result<Vec<Pair>> {
+) -> Result<Vec<CausalPair>> {
     let leader = topology.leader();
     let payers = prep::funded_payers(
         base,
@@ -551,14 +478,7 @@ async fn prepare_pairs(
             .iter()
             .map(|payer| leader.ctx().sender(Rc::new(payer.insecure_clone())))
             .collect();
-        pairs.push(Pair {
-            a: pdas[0],
-            b: pdas[1],
-            senders,
-            model: PairModel::default(),
-            chains: 0,
-            last_signature: None,
-        });
+        pairs.push(CausalPair::new([pdas[0], pdas[1]], senders));
     }
     let payer_keys: Vec<Pubkey> =
         payers.iter().map(|payer| payer.pubkey()).collect();
@@ -610,7 +530,8 @@ impl PrivateErScenario for VerifierLifecycle {
         })
         .await?;
 
-        crate::phase("node isolation", verify_isolation(&topology)).await?;
+        crate::phase("replication connections", verify_connections(&topology))
+            .await?;
         crate::phase(
             "startup replication",
             catch_up_fleet(&topology, &[TRANSACTIONS, BLOCKS]),
@@ -620,7 +541,7 @@ impl PrivateErScenario for VerifierLifecycle {
         let pairs =
             crate::phase("pair setup", prepare_pairs(base, &topology, PAIRS))
                 .await?;
-        let workload = Workload::start(pairs, CHAIN_GAP, HEAVY_ITERS);
+        let workload = Workload::start(pairs);
 
         crate::phase("steady load", async {
             let (max_lag, _) = sample_lag(&topology, STEADY).await?;

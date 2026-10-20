@@ -15,8 +15,8 @@ use magic_api::instruction::{
 use pubkey::Pubkey;
 use redshift_interface::{ephemeral_cpi, log_msg_data, schedulecommit::build};
 use redsuite_core::{
-    api::TransactionInfo, check, check_eq, dlp, manifest, phase, prep, receipt,
-    system, topology, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
+    api::TransactionInfo, check, check_eq, dlp, phase, prep, receipt, system,
+    topology, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
 use sdk::{consts::EPHEMERAL_VAULT_ID, ephemeral_accounts::rent};
 use signer::Signer;
@@ -132,7 +132,7 @@ fn observation(state: &[Account]) -> String {
         account.lamports,
         state[SPONSOR].lamports,
         state[VAULT].lamports,
-        manifest::content_hash(&account.data),
+        check::content_hash(&account.data),
     )
 }
 

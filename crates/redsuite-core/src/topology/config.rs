@@ -18,7 +18,7 @@ use signer::Signer;
 use tracing::warn;
 
 use super::{process, state};
-use crate::{catalog::Fixture, manifest, Result};
+use crate::{catalog::Fixture, Result};
 
 const LEDGER_SIZE_LIMIT_UNREACHABLE: u64 = 1 << 60;
 
@@ -188,7 +188,7 @@ struct StagedPrograms {
     loaded_fixtures: Vec<String>,
 }
 
-fn base_programs(er_bin: &Path) -> Result<StagedPrograms> {
+fn base_programs(er_bin: &Path) -> StagedPrograms {
     let mut bpf = Vec::new();
     let mut loaded_fixtures = Vec::new();
 
@@ -204,7 +204,7 @@ fn base_programs(er_bin: &Path) -> Result<StagedPrograms> {
         if !fixture.loaded_at_base_boot() {
             continue;
         }
-        match manifest::resolve(fixture) {
+        match fixture.resolve() {
             Ok(so) => {
                 bpf.push((fixture.program_id().to_string(), so));
                 loaded_fixtures.push(fixture.so_name().to_owned());
@@ -218,10 +218,10 @@ fn base_programs(er_bin: &Path) -> Result<StagedPrograms> {
             }
         }
     }
-    Ok(StagedPrograms {
+    StagedPrograms {
         bpf,
         loaded_fixtures,
-    })
+    }
 }
 
 fn redline_aliases_of(so: &Path) -> Vec<Pubkey> {
@@ -258,8 +258,8 @@ pub(super) struct BasePlan {
     // (program id, .so) loaded via --bpf-program; redline gets its aliases
     pub(super) bpf_programs: Vec<(String, PathBuf)>,
     pub(super) loaded_fixtures: Vec<String>,
-    pub(super) geyser_plugin_config: Option<PathBuf>,
-    // the Yellowstone release serving this base's gRPC feed, when it has one
+    pub(super) geyser_plugin_config: PathBuf,
+    // The Yellowstone release serving this base's gRPC feed.
     pub(super) plugin: String,
 }
 
@@ -273,40 +273,25 @@ impl BasePlan {
         rpc_port: u16,
         faucet_port: u16,
         gossip_port: u16,
-        grpc_port: Option<u16>,
+        grpc_port: u16,
     ) -> Result<Self> {
-        let mut geyser_plugin_config = None;
-        let mut plugin = String::new();
-        if let Some(port) = grpc_port {
-            let feed = async {
-                let yellowstone = super::yellowstone::ensure(&bin).await?;
-                let path = stack_dir.join(format!("geyser-{port}.json"));
-                yellowstone
-                    .write_config(&path, &format!("127.0.0.1:{port}"))?;
-                Result::Ok((path, yellowstone.tag))
-            }
-            .await;
-            match feed {
-                Ok((path, tag)) => {
-                    geyser_plugin_config = Some(path);
-                    plugin = tag;
-                }
-                Err(error) => {
-                    warn!(%error, "Yellowstone setup failed; starting base without gRPC")
-                }
-            }
-        }
+        let yellowstone = super::yellowstone::ensure(&bin).await?;
+        let geyser_plugin_config = stack_dir.join("geyser.json");
+        yellowstone.write_config(
+            &geyser_plugin_config,
+            &format!("127.0.0.1:{grpc_port}"),
+        )?;
         let mut upgradeable_v3 = Vec::new();
-        if let Ok(redshift_so) = manifest::resolve(Fixture::RedshiftProgram) {
+        if let Ok(redshift_so) = Fixture::RedshiftProgram.resolve() {
             let (v3_id, v3_authority) = redshift_loader_v3_target();
             upgradeable_v3.push((v3_id, redshift_so, v3_authority));
         }
-        if let Ok(redline_so) = manifest::resolve(Fixture::RedlineProgram) {
+        if let Ok(redline_so) = Fixture::RedlineProgram.resolve() {
             for (id, authority) in redline_loader_v3_pair() {
                 upgradeable_v3.push((id, redline_so.clone(), authority));
             }
         }
-        let staged = base_programs(er_bin)?;
+        let staged = base_programs(er_bin);
         Ok(Self {
             bin,
             rpc_port,
@@ -319,7 +304,7 @@ impl BasePlan {
             bpf_programs: staged.bpf,
             loaded_fixtures: staged.loaded_fixtures,
             geyser_plugin_config,
-            plugin,
+            plugin: yellowstone.tag,
         })
     }
 
@@ -355,9 +340,8 @@ impl BasePlan {
             }
             cmd.arg("--bpf-program").arg(id).arg(so);
         }
-        if let Some(plugin) = &self.geyser_plugin_config {
-            cmd.arg("--geyser-plugin-config").arg(plugin);
-        }
+        cmd.arg("--geyser-plugin-config")
+            .arg(&self.geyser_plugin_config);
         cmd
     }
 }
@@ -481,10 +465,6 @@ impl ErPlan {
         self.params.aperture.listen
     }
 
-    pub(super) fn metrics_port(&self) -> u16 {
-        self.params.metrics.address.port()
-    }
-
     pub(super) fn replication_port(&self) -> u16 {
         self.params.engine.replication.bind_address.port()
     }
@@ -492,25 +472,11 @@ impl ErPlan {
     pub(super) fn storage_dir(&self) -> &Path {
         &self.params.engine.ledger.directory
     }
-
-    pub(super) fn allowed_followers(&self) -> Vec<Pubkey> {
-        self.params
-            .engine
-            .replication
-            .allowed_followers
-            .iter()
-            .map(|follower| follower.0)
-            .collect()
-    }
 }
 
 impl VerifierPlan {
     pub(super) fn identity(&self) -> Pubkey {
         self.params.engine.authority.local.pubkey()
-    }
-
-    pub(super) fn metrics_port(&self) -> u16 {
-        self.params.metrics.address.port()
     }
 
     pub(super) fn storage_dir(&self) -> &Path {

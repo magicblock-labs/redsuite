@@ -364,152 +364,6 @@ where
     }
 }
 
-#[cfg(target_os = "linux")]
-fn socket_address(raw: &str) -> Option<std::net::SocketAddr> {
-    use std::net::IpAddr;
-    let (ip, port) = raw.rsplit_once(':')?;
-    let mut bytes = Vec::new();
-    for word in ip.as_bytes().chunks_exact(8) {
-        bytes.extend(
-            u32::from_str_radix(std::str::from_utf8(word).ok()?, 16)
-                .ok()?
-                .to_ne_bytes(),
-        );
-    }
-    let ip = match ip.len() {
-        8 => IpAddr::from(<[u8; 4]>::try_from(bytes).ok()?),
-        32 => IpAddr::from(<[u8; 16]>::try_from(bytes).ok()?),
-        _ => return None,
-    };
-    Some((ip, u16::from_str_radix(port, 16).ok()?).into())
-}
-
-#[cfg(target_os = "linux")]
-fn port_holders(port: u16) -> Vec<String> {
-    let mut holders = Vec::new();
-    for protocol in ["tcp", "tcp6", "udp", "udp6"] {
-        let Ok(content) = fs::read_to_string(format!("/proc/net/{protocol}"))
-        else {
-            continue;
-        };
-        for line in content.lines().skip(1) {
-            let cols: Vec<&str> = line.split_whitespace().collect();
-            if cols.len() < 10 {
-                continue;
-            }
-            let Some(local) = socket_address(cols[1]) else {
-                continue;
-            };
-            if local.port() != port {
-                continue;
-            }
-            let state = match cols[3] {
-                "01" => "ESTABLISHED",
-                "02" => "SYN_SENT",
-                "03" => "SYN_RECV",
-                "04" => "FIN_WAIT1",
-                "05" => "FIN_WAIT2",
-                "06" => "TIME_WAIT",
-                "07" if protocol.starts_with("udp") => "UNCONN",
-                "07" => "CLOSE",
-                "08" => "CLOSE_WAIT",
-                "09" => "LAST_ACK",
-                "0A" => "LISTEN",
-                "0B" => "CLOSING",
-                "0C" => "NEW_SYN_RECV",
-                _ => "UNKNOWN",
-            };
-            let owner = if cols[9] == "0" {
-                "no live owner".to_owned()
-            } else {
-                find_socket_owner(&format!("socket:[{}]", cols[9]))
-                    .map(|(pid, cmd)| format!("pid={pid} cmd={cmd}"))
-                    .unwrap_or_else(|| "owner=unavailable".to_owned())
-            };
-            let peer = socket_address(cols[2])
-                .map(|address| address.to_string())
-                .unwrap_or_default();
-            holders.push(format!(
-                "{protocol} {local} -> {peer} state={state} {owner}"
-            ));
-        }
-    }
-    holders
-}
-
-#[cfg(target_os = "linux")]
-fn find_socket_owner(target: &str) -> Option<(u32, String)> {
-    let procs = fs::read_dir("/proc").ok()?;
-    for entry in procs.flatten() {
-        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
-            continue;
-        };
-        let Ok(fds) = fs::read_dir(entry.path().join("fd")) else {
-            continue;
-        };
-        for fd in fds.flatten() {
-            if fs::read_link(fd.path())
-                .map(|link| link.to_string_lossy() == target)
-                .unwrap_or(false)
-            {
-                let cmd = cmdline(pid).unwrap_or_default().replace('\0', " ");
-                return Some((pid, cmd.trim_end().chars().take(160).collect()));
-            }
-        }
-    }
-    None
-}
-
-#[cfg(not(target_os = "linux"))]
-fn port_holders(port: u16) -> Vec<String> {
-    let output = match Command::new("lsof")
-        .args([
-            "-nP",
-            &format!("-iTCP:{port}"),
-            &format!("-iUDP:{port}"),
-            "-FpfPnT",
-        ])
-        .output()
-    {
-        Ok(output) => output,
-        Err(error) => return vec![format!("lsof lookup failed: {error}")],
-    };
-    let text = String::from_utf8_lossy(&output.stdout);
-    let mut holders: Vec<String> = Vec::new();
-    let (mut pid, mut protocol, mut current) = (0, "", None);
-    for line in text.lines().filter(|line| !line.is_empty()) {
-        let (field, value) = line.split_at(1);
-        match field {
-            "p" => pid = value.parse::<u32>().unwrap_or_default(),
-            "f" => current = None,
-            "P" => protocol = value,
-            "n" if value
-                .split("->")
-                .next()
-                .is_some_and(|local| local.ends_with(&format!(":{port}"))) =>
-            {
-                let cmd =
-                    cmdline(pid).unwrap_or_else(|| "unavailable".to_owned());
-                current = Some(holders.len());
-                holders.push(format!("{protocol} {value} pid={pid} cmd={cmd}"));
-            }
-            "T" if value.starts_with("ST=") => {
-                if let Some(index) = current {
-                    holders[index].push_str(&format!(" state={}", &value[3..]));
-                }
-            }
-            _ => {}
-        }
-    }
-    if !output.stderr.is_empty() {
-        holders.push(format!(
-            "lsof: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    holders
-}
-
 fn tail(path: &Path, lines: usize) -> String {
     let Ok(content) = fs::read_to_string(path) else {
         return format!("<no log at {}>", path.display());
@@ -565,28 +419,16 @@ impl Owned {
         let Some(child) = self.child.as_mut() else {
             return Ok(None);
         };
-        let outcome = terminate(child, self.pid, hard_kill).await;
-        let outcome = self.audit(outcome)?;
+        let outcome = terminate(child, self.pid, hard_kill).await?;
         self.child = None;
         self.record.mark_finished();
         Ok(Some(outcome))
     }
 
-    pub(super) fn relaunch(&mut self, child: Result<Child>) -> Result<()> {
-        let child = self.audit(child)?;
+    pub(super) fn relaunch(&mut self, child: Child) {
         self.pid = child.id();
         self.child = Some(child);
         self.record.relaunched(self.pid);
-        Ok(())
-    }
-
-    pub(super) fn audit<T, E: std::fmt::Display>(
-        &self,
-        outcome: std::result::Result<T, E>,
-    ) -> std::result::Result<T, E> {
-        outcome.inspect_err(|error| {
-            self.record.record_finish_error(error.to_string());
-        })
     }
 }
 
@@ -596,7 +438,7 @@ impl Drop for Owned {
         let Some(mut child) = self.child.take() else {
             return;
         };
-        match self.audit(child.try_wait()).ok().flatten() {
+        match child.try_wait().ok().flatten() {
             Some(status) => {
                 let exit = describe_exit(&status);
                 warn!(kind, label, %exit, "process exited before cleanup");
@@ -605,10 +447,8 @@ impl Drop for Owned {
             }
             None => {
                 kill_pid(pid);
-                let exit = self
-                    .audit(child.wait())
-                    .ok()
-                    .map(|status| describe_exit(&status));
+                let exit =
+                    child.wait().ok().map(|status| describe_exit(&status));
                 self.record.record_exit(match exit {
                     Some(exit) => format!("terminated by cleanup: {exit}"),
                     None => "terminated by cleanup, status unknown".to_owned(),
@@ -710,12 +550,6 @@ impl PortLease {
         error: impl std::fmt::Display,
     ) -> crate::DynError {
         let ports: Vec<_> = self.claims.iter().map(|(port, _)| *port).collect();
-        let mut message = format!("{error}\nreserved ports: {ports:?}");
-        for port in ports {
-            for holder in port_holders(port) {
-                message.push_str(&format!("\n  {holder}"));
-            }
-        }
-        message.into()
+        format!("{error}\nreserved ports: {ports:?}").into()
     }
 }

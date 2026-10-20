@@ -18,6 +18,7 @@ use redsuite_core::{
     TxSender,
 };
 use signature::Signature;
+use tokio::task::JoinSet;
 use tracing::debug;
 
 use crate::program::instruction::build;
@@ -170,105 +171,120 @@ fn archived_snapshots(storage_dir: &std::path::Path) -> Result<usize> {
     Ok(count)
 }
 
+struct LaneState {
+    admit: Cell<bool>,
+    stop: Cell<bool>,
+    records: RefCell<Vec<Record>>,
+    next_id: Rc<Cell<u64>>,
+    api: Api,
+}
+
+impl LaneState {
+    async fn run(
+        self: Rc<Self>,
+        lane: usize,
+        account: Pubkey,
+        sender: TxSender,
+    ) {
+        while self.admit.get() {
+            if self.send(lane, account, &sender).await.is_err() {
+                tokio::time::sleep(LANE_BACKOFF).await;
+            }
+        }
+    }
+
+    async fn send(
+        &self,
+        lane: usize,
+        account: Pubkey,
+        sender: &TxSender,
+    ) -> Result<()> {
+        let id = self.next_id.get();
+        self.next_id.set(id + 1);
+        let ix = build::expensive_hash_compute_at(
+            PROGRAM,
+            id,
+            HASH_INIT,
+            HASH_ITERS,
+            &[account],
+        );
+        let tx = sender.prepare(&[ix]).await?;
+        let signature = tx.signatures[0];
+        let index = {
+            let mut records = self.records.borrow_mut();
+            let index = records.len();
+            records.push(Record {
+                id,
+                lane,
+                signature,
+                outcome: Outcome::Unresolved,
+            });
+            index
+        };
+        let outcome = match sender.submit_prepared(&tx).await {
+            Err(_) => Outcome::Rejected,
+            Ok(_) => await_status(&self.api, &signature, &self.stop).await,
+        };
+        self.records.borrow_mut()[index].outcome = outcome;
+        Ok(())
+    }
+}
+
 struct Lanes {
-    admit: Rc<Cell<bool>>,
-    stop: Rc<Cell<bool>>,
-    records: Rc<RefCell<Vec<Record>>>,
-    tasks: Vec<tokio::task::JoinHandle<()>>,
+    state: Rc<LaneState>,
+    tasks: JoinSet<()>,
 }
 
 impl Lanes {
     fn start(
         api: Api,
         senders: &[TxSender],
-        pool: &Rc<Vec<Pubkey>>,
+        pool: &[Pubkey],
         next_id: Rc<Cell<u64>>,
     ) -> Self {
-        let admit = Rc::new(Cell::new(true));
-        let stop = Rc::new(Cell::new(false));
-        let records = Rc::new(RefCell::new(Vec::new()));
-        let tasks = senders
-            .iter()
-            .enumerate()
-            .map(|(lane, sender)| {
-                let account = pool[lane];
-                let sender = sender.clone();
-                let api = api.clone();
-                let admit = admit.clone();
-                let stop = stop.clone();
-                let records = records.clone();
-                let next_id = next_id.clone();
-                tokio::task::spawn_local(async move {
-                    while admit.get() && !stop.get() {
-                        let id = next_id.get();
-                        next_id.set(id + 1);
-                        let ix = build::expensive_hash_compute_at(
-                            PROGRAM,
-                            id,
-                            HASH_INIT,
-                            HASH_ITERS,
-                            &[account],
-                        );
-                        let Ok(tx) = sender.prepare(&[ix]).await else {
-                            tokio::time::sleep(LANE_BACKOFF).await;
-                            continue;
-                        };
-                        let signature = tx.signatures[0];
-                        let index = {
-                            let mut records = records.borrow_mut();
-                            records.push(Record {
-                                id,
-                                lane,
-                                signature,
-                                outcome: Outcome::Unresolved,
-                            });
-                            records.len() - 1
-                        };
-                        let outcome = match sender.submit_prepared(&tx).await {
-                            Err(_) => Outcome::Rejected,
-                            Ok(_) => {
-                                await_status(&api, &signature, &stop).await
-                            }
-                        };
-                        records.borrow_mut()[index].outcome = outcome;
-                    }
-                })
-            })
-            .collect();
-        Self {
-            admit,
-            stop,
-            records,
-            tasks,
+        let state = Rc::new(LaneState {
+            api,
+            next_id,
+            admit: Cell::new(true),
+            stop: Cell::new(false),
+            records: RefCell::new(Vec::new()),
+        });
+        let mut tasks = JoinSet::new();
+        for (lane, sender) in senders.iter().enumerate() {
+            tasks.spawn_local(state.clone().run(
+                lane,
+                pool[lane],
+                sender.clone(),
+            ));
         }
+        Self { state, tasks }
     }
 
     fn halt(&self) {
-        self.admit.set(false);
-        self.stop.set(true);
+        self.state.admit.set(false);
+        self.state.stop.set(true);
     }
 
     fn confirmed(&self) -> usize {
-        self.records
+        self.state
+            .records
             .borrow()
             .iter()
-            .filter(|record| record.outcome == Outcome::Confirmed)
+            .filter(|r| r.outcome == Outcome::Confirmed)
             .count()
     }
 
     async fn drain(self) -> Result<Vec<Record>> {
-        self.admit.set(false);
-        for task in self.tasks {
-            task.await.map_err(|error| format!("lane task: {error}"))?;
-        }
-        Ok(self.records.take())
+        self.state.admit.set(false);
+        self.tasks.join_all().await;
+        Ok(self.state.records.take())
     }
 }
 
 async fn await_status(
     api: &Api,
     signature: &Signature,
-    stop: &Rc<Cell<bool>>,
+    stop: &Cell<bool>,
 ) -> Outcome {
     let deadline = tokio::time::Instant::now() + CONFIRM_TIMEOUT;
     loop {

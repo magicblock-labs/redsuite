@@ -4,7 +4,6 @@ use std::{
 };
 
 use keypair::Keypair;
-use pubkey::Pubkey;
 use signer::Signer;
 use tracing::debug;
 
@@ -63,7 +62,6 @@ pub struct VerifierTiming {
 }
 
 pub struct Verifier {
-    index: usize,
     proc: process::Owned,
     plan: VerifierPlan,
     log: PathBuf,
@@ -72,36 +70,12 @@ pub struct Verifier {
 }
 
 impl Verifier {
-    pub fn index(&self) -> usize {
-        self.index
-    }
-
     pub fn label(&self) -> &str {
         self.proc.label()
     }
 
-    pub fn pid(&self) -> u32 {
-        self.proc.pid()
-    }
-
-    pub fn identity(&self) -> Pubkey {
-        self.plan.identity()
-    }
-
-    pub fn metrics_port(&self) -> u16 {
-        self.plan.metrics_port()
-    }
-
-    pub fn upstream_address(&self) -> String {
-        self.plan.upstream_address().to_string()
-    }
-
     pub fn storage_dir(&self) -> &Path {
         self.plan.storage_dir()
-    }
-
-    pub fn config_path(&self) -> &Path {
-        &self.plan.config_path
     }
 
     pub fn log(&self) -> &Path {
@@ -206,8 +180,8 @@ impl Verifier {
             .into());
         }
         let started = Instant::now();
-        self.proc.relaunch(self.plan.spawn(&self.log))?;
-        self.proc.audit(self.wait_ready(ready_timeout).await)?;
+        self.proc.relaunch(self.plan.spawn(&self.log)?);
+        self.wait_ready(ready_timeout).await?;
         Ok(started.elapsed())
     }
 
@@ -220,9 +194,7 @@ impl Verifier {
         let started = Instant::now();
         let stop = self.stop(hard_kill).await?;
         let startup = self.start(ready_timeout).await?;
-        let connect = self
-            .proc
-            .audit(self.wait_connected(connect_timeout).await)?;
+        let connect = self.wait_connected(connect_timeout).await?;
         Ok(VerifierTiming {
             stop,
             startup,
@@ -233,7 +205,7 @@ impl Verifier {
 
     async fn finish(&mut self) -> Result<()> {
         self.proc.terminate(false).await?;
-        self.proc.audit(self.remove_storage())
+        self.remove_storage()
     }
 }
 
@@ -392,16 +364,13 @@ pub async fn replicated(
         });
         let metrics_url = format!("http://127.0.0.1:{metrics_port}");
         let verifier = Verifier {
-            index,
             proc: process::Owned::new("verifier", label, child, record),
             plan,
             log,
             metrics: api::MetricsCollector::new(&metrics_url),
             ports,
         };
-        verifier
-            .proc
-            .audit(verifier.wait_ready(VERIFIER_READY_TIMEOUT).await)?;
+        verifier.wait_ready(VERIFIER_READY_TIMEOUT).await?;
         verifiers.push(verifier);
     }
 

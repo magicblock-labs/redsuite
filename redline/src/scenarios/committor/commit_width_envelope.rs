@@ -215,67 +215,52 @@ impl Scenario<ScenarioReport> for CommitWidthEnvelope {
 
         // the whole pipeline per request: deliver on the ER, await the
         // ScheduledCommitSent receipt, confirm its base-layer signatures
-        let make_request =
-            |width: usize, offset: u64, tally: Rc<RefCell<CellTally>>| {
-                let sender = sender.clone();
-                let er_api = er.api().clone();
-                let base_api = base.api().clone();
-                let pdas = pdas.clone();
-                move |iteration: u64| {
-                    let id = offset + iteration;
-                    let accounts = commit_set(&pdas, width, id);
-                    let ix =
-                        build::commit_accounts(id, payer_pubkey, &accounts);
-                    let sender = sender.clone();
-                    let er_api = er_api.clone();
-                    let base_api = base_api.clone();
-                    let tally = tally.clone();
-                    async move {
-                        let tx = sender.prepare(&[ix]).await?;
-                        Ok(SendTransaction(
-                            move |started: Instant| async move {
-                                let commit_signature =
-                                    sender.submit_prepared(&tx).await?;
-                                tally
-                                    .borrow_mut()
-                                    .er_delivery
-                                    .push(started.elapsed().as_micros() as u32);
-                                let commit_receipt = super::settled_receipt(
-                                    &er_api,
-                                    &commit_signature,
-                                    RECEIPT_TIMEOUT,
-                                    format!("commit {id} intent"),
-                                )
-                                .await?;
-                                let round_trip_us =
-                                    started.elapsed().as_micros() as u32;
-                                receipt::confirm_base_signatures(
-                                    &base_api,
-                                    &commit_receipt,
-                                    BASE_CONFIRM_TIMEOUT,
-                                )
-                                .await?;
-                                let mut tally = tally.borrow_mut();
-                                tally.round_trip.push(round_trip_us);
-                                tally.base_signatures +=
-                                    commit_receipt.base_signatures.len();
-                                tally.base_txs.extend(
-                                    commit_receipt.base_signatures.iter(),
-                                );
-                                let mut reported =
-                                    commit_receipt.included.clone();
-                                reported.sort();
-                                let mut expected = accounts;
-                                expected.sort();
-                                if reported != expected {
-                                    tally.included_mismatch += 1;
-                                }
-                                Ok(())
-                            },
-                        ))
+        let request = |width: usize, id: u64, tally: Rc<RefCell<CellTally>>| {
+            let accounts = commit_set(&pdas, width, id);
+            let ix = build::commit_accounts(id, payer_pubkey, &accounts);
+            let sender = sender.clone();
+            let er_api = er.api().clone();
+            let base_api = base.api().clone();
+            async move {
+                let tx = sender.prepare(&[ix]).await?;
+                Ok(SendTransaction(move |started: Instant| async move {
+                    let commit_signature = sender.submit_prepared(&tx).await?;
+                    tally
+                        .borrow_mut()
+                        .er_delivery
+                        .push(started.elapsed().as_micros() as u32);
+                    let commit_receipt = super::settled_receipt(
+                        &er_api,
+                        &commit_signature,
+                        RECEIPT_TIMEOUT,
+                        format!("commit {id} intent"),
+                    )
+                    .await?;
+                    let round_trip_us = started.elapsed().as_micros() as u32;
+                    receipt::confirm_base_signatures(
+                        &base_api,
+                        &commit_receipt,
+                        BASE_CONFIRM_TIMEOUT,
+                    )
+                    .await?;
+                    let mut tally = tally.borrow_mut();
+                    tally.round_trip.push(round_trip_us);
+                    tally.base_signatures +=
+                        commit_receipt.base_signatures.len();
+                    tally
+                        .base_txs
+                        .extend(commit_receipt.base_signatures.iter());
+                    let mut reported = commit_receipt.included.clone();
+                    reported.sort();
+                    let mut expected = accounts;
+                    expected.sort();
+                    if reported != expected {
+                        tally.included_mismatch += 1;
                     }
-                }
-            };
+                    Ok(())
+                }))
+            }
+        };
 
         let mut offset = 0u64;
         let mut cells: Vec<CellSummary> = Vec::new();
@@ -287,9 +272,12 @@ impl Scenario<ScenarioReport> for CommitWidthEnvelope {
                     rate: Pacing::PerSecond(profile.rate),
                     concurrency: profile.concurrency,
                 },
-                make_request(width, offset, warmup_tally),
+                |iteration| {
+                    request(width, offset + iteration, warmup_tally.clone())
+                },
             )
             .await?;
+            drop(warmup_tally);
             offset += WARMUP_COMMITS;
             check_eq!(
                 warmup.failed,
@@ -310,7 +298,7 @@ impl Scenario<ScenarioReport> for CommitWidthEnvelope {
                     rate: Pacing::PerSecond(profile.rate),
                     concurrency: profile.concurrency,
                 },
-                make_request(width, offset, tally.clone()),
+                |iteration| request(width, offset + iteration, tally.clone()),
             )
             .await?;
             offset += profile.commits;

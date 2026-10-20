@@ -175,16 +175,12 @@ impl Scenario<ScenarioReport> for CloneLruChurn {
                 prep::touch(cell_er, &pool).await;
             }
 
-            let request = {
-                let pool = pool.clone();
+            let request = |id: u64| {
+                let account = pick_account(&pool, id);
                 let api = cell_er.api().clone();
-                move |id: u64| {
-                    let account = pick_account(&pool, id);
-                    let api = api.clone();
-                    std::future::ready(Ok(move |_: Instant| async move {
-                        api.get_account(&account).await.map(|_| ())
-                    }))
-                }
+                std::future::ready(Ok(move |_: Instant| async move {
+                    api.get_account(&account).await.map(|_| ())
+                }))
             };
 
             let warmup = execute(
@@ -193,7 +189,7 @@ impl Scenario<ScenarioReport> for CloneLruChurn {
                     rate: Pacing::PerSecond(profile.rate),
                     concurrency: profile.concurrency,
                 },
-                request.clone(),
+                request,
             )
             .await?;
             check_eq!(

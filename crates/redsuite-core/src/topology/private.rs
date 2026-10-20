@@ -71,40 +71,16 @@ impl PrivateEr {
         self.proc.pid()
     }
 
-    pub fn label(&self) -> &str {
-        self.proc.label()
-    }
-
     pub fn identity(&self) -> Pubkey {
         self.ctx.identity()
-    }
-
-    pub fn rpc_port(&self) -> u16 {
-        self.plan.listen().port()
-    }
-
-    pub fn metrics_port(&self) -> u16 {
-        self.plan.metrics_port()
     }
 
     pub fn replication_port(&self) -> u16 {
         self.plan.replication_port()
     }
 
-    pub fn allowed_followers(&self) -> Vec<Pubkey> {
-        self.plan.allowed_followers()
-    }
-
     pub(super) fn params(&self) -> &LeaderParams {
         &self.plan.params
-    }
-
-    pub fn is_running(&self) -> bool {
-        self.proc.is_running()
-    }
-
-    pub async fn healthy(&self) -> bool {
-        self.is_running() && self.rpc_api().primary_ready().await
     }
 
     pub fn storage_dir(&self) -> &Path {
@@ -144,11 +120,10 @@ impl PrivateEr {
         Ok(())
     }
 
-    // The explicit teardown path: a graceful stop whose failure lands in the
-    // run's teardown audit, not only in the caller's return value.
+    // Explicit teardown reports errors; Drop remains the process-killing fallback.
     pub async fn finish(mut self) -> Result<()> {
         self.proc.terminate(false).await?;
-        self.proc.audit(self.remove_storage())
+        self.remove_storage()
     }
 
     fn remove_storage(&self) -> Result<()> {
@@ -183,7 +158,7 @@ impl PrivateEr {
 
         self.plan.params.ledger.reset = config.reset;
         let launch_started = std::time::Instant::now();
-        self.proc.relaunch(self.plan.spawn(&self.log))?;
+        self.proc.relaunch(self.plan.spawn(&self.log)?);
         let ready = process::wait_until_every(
             process::RESTART_POLL,
             config.ready_timeout,
@@ -194,7 +169,7 @@ impl PrivateEr {
         )
         .await
         .map_err(|error| self.ports.failure(error));
-        self.proc.audit(ready)?;
+        ready?;
         let startup = launch_started.elapsed();
         let total = restart_started.elapsed();
         self.ctx.pid = self.proc.pid();
@@ -344,8 +319,8 @@ async fn launch(
     .map_err(|e| {
         ports.failure(format_args!("private ER `{}`: {e}", proc.label()))
     });
-    proc.audit(ready)?;
-    proc.audit(await_magic_fee_vault(base, &identity_pubkey).await)?;
+    ready?;
+    await_magic_fee_vault(base, &identity_pubkey).await?;
 
     let ctx = ErCtx::new(
         format!("http://127.0.0.1:{rpc_port}"),
