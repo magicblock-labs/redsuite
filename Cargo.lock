@@ -2424,7 +2424,7 @@ dependencies = [
  "solana-system-interface 2.0.0",
  "static_assertions",
  "strum",
- "thiserror 2.0.21",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
