@@ -1,9 +1,9 @@
 use std::{
-    env,
     path::{Path, PathBuf},
     process::{exit, Command},
 };
 
+use clap::{Parser, Subcommand};
 use redsuite_core::{catalog::Fixture, frontend, logging, manifest};
 use tracing::{error, info};
 
@@ -11,37 +11,47 @@ type Result<T> = redsuite_core::Result<T>;
 
 const FAMILY_PROGRAMS: &[&str] = &["redline", "redshift", "redhat"];
 
-const USAGE_HEAD: &str = "\
-usage:
-  cargo xtask programs                                       build the family SBF programs into target/deploy/
-  cargo xtask fmt [--check]                                  format the workspace (nightly rustfmt, rustfmt-nightly.toml)
-";
+#[derive(Parser)]
+#[command(
+    name = "xtask",
+    bin_name = "cargo xtask",
+    version,
+    about = "RedSuite development tools",
+    after_long_help = frontend::env_help()
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Task,
+}
+
+#[derive(Subcommand)]
+enum Task {
+    /// Build and stage the SBF programs and fixture manifest.
+    Programs,
+    /// Format the workspace using nightly rustfmt.
+    Fmt {
+        /// Check formatting without rewriting files.
+        #[arg(long)]
+        check: bool,
+    },
+    #[command(flatten)]
+    Shared(frontend::Command),
+}
 
 fn main() {
+    let cli = Cli::parse();
     if let Err(error) = logging::init() {
         eprintln!("cannot initialize logging: {error}");
         exit(1);
     }
-    if let Err(err) = run() {
-        error!(error = %err, "command failed");
+    let outcome = match cli.command {
+        Task::Programs => programs(),
+        Task::Fmt { check } => fmt(check),
+        Task::Shared(command) => command.run(),
+    };
+    if let Err(error) = outcome {
+        error!(%error, "command failed");
         exit(1);
-    }
-}
-
-fn run() -> Result<()> {
-    let args: Vec<String> = env::args().skip(1).collect();
-    let arg = |index: usize| args.get(index).map(String::as_str);
-    match arg(0) {
-        Some("programs") => programs(),
-        Some("fmt") => match arg(1) {
-            None => fmt(false),
-            Some("--check") => fmt(true),
-            _ => usage(),
-        },
-        _ => match frontend::dispatch(&args) {
-            Some(outcome) => outcome,
-            None => usage(),
-        },
     }
 }
 
@@ -55,11 +65,6 @@ fn fmt(check: bool) -> Result<()> {
         .arg(root().join("rustfmt-nightly.toml"))
         .current_dir(root());
     run_cmd("cargo +nightly fmt", &mut cmd)
-}
-
-fn usage() -> Result<()> {
-    eprint!("{USAGE_HEAD}{}", frontend::usage("cargo xtask"));
-    exit(2);
 }
 
 fn root() -> PathBuf {

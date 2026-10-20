@@ -1,5 +1,6 @@
 use std::{future::Future, pin::Pin};
 
+use clap::ValueEnum;
 use magicblock_config::LeaderParams;
 use pubkey::Pubkey;
 
@@ -8,7 +9,7 @@ use crate::{
     topology::ErOptions,
 };
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
 pub enum Family {
     Redline,
     Redshift,
@@ -136,7 +137,6 @@ pub struct ScenarioEntry {
     pub family: Family,
     pub short_name: &'static str,
     pub er: Er,
-    pub host_exclusive: bool,
     pub fixtures: &'static [Fixture],
     pub optional_fixtures: &'static [Fixture],
     pub run: fn(
@@ -153,13 +153,7 @@ impl ScenarioEntry {
 
 #[macro_export]
 macro_rules! scenario_catalog {
-    (@execute Shared($group:expr), $scenario:expr, $fixtures:expr,
-     $optional:expr, $config:expr, $er:expr) => {
-        $crate::run_shared_scenario(
-            $scenario, $fixtures, $optional, $config, $er,
-        )
-    };
-    (@execute Exclusive($group:expr), $scenario:expr, $fixtures:expr,
+    (@execute $grouped:ident($group:expr), $scenario:expr, $fixtures:expr,
      $optional:expr, $config:expr, $er:expr) => {
         $crate::run_shared_scenario(
             $scenario, $fixtures, $optional, $config, $er,
@@ -175,7 +169,6 @@ macro_rules! scenario_catalog {
         family: $family:ident,
         $($short_name:ident => $($segment:ident)::+ {
             er: $er:ident $(($group:expr))?,
-            $(host_exclusive: $host_exclusive:literal,)?
             fixtures: [$($fixture:expr),* $(,)?]
             $(, optional_fixtures: [$($optional:expr),* $(,)?])?
             $(,)?
@@ -186,7 +179,6 @@ macro_rules! scenario_catalog {
                 family: $crate::catalog::Family::$family,
                 short_name: stringify!($short_name),
                 er: $crate::catalog::Er::$er $((&$group))?,
-                host_exclusive: false $(| $host_exclusive)?,
                 fixtures: &[$($fixture),*],
                 optional_fixtures: &[$($($optional),*)?],
                 run: |config, _group_er| {

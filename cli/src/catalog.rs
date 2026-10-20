@@ -1,4 +1,7 @@
-use redsuite_core::catalog::{ErGroup, Fixture};
+use redsuite_core::{
+    catalog::{ErGroup, Family, Fixture, ScenarioEntry},
+    Result,
+};
 
 pub static DEFAULT: ErGroup = ErGroup {
     label: "default",
@@ -28,97 +31,78 @@ pub mod redline {
         family: Redline,
         simple_load => aperture::simple_load::SimpleLoad {
             er: Exclusive(DEFAULT),
-            host_exclusive: true,
             fixtures: [Fixture::RedlineProgram],
         },
         rpc_warm_ingress => aperture::rpc_warm_ingress::WarmIngress {
             er: Exclusive(DEFAULT),
-            host_exclusive: true,
             fixtures: [Fixture::RedlineProgram],
         },
         rpc_capacity_blast => aperture::rpc_capacity_blast::RpcCapacityBlast {
             er: Exclusive(DEFAULT),
-            host_exclusive: true,
             fixtures: [Fixture::RedlineProgram],
         },
         high_cu => aperture::high_cu::HighCu {
             er: Exclusive(DEFAULT),
-            host_exclusive: true,
             fixtures: [Fixture::RedlineProgram],
         },
         ws_fanout_threshold => aperture::ws_fanout_threshold::WsFanoutThreshold {
             er: Exclusive(DEFAULT),
-            host_exclusive: true,
             fixtures: [Fixture::RedlineProgram],
         },
         ws_conn_capacity => aperture::ws_conn_capacity::WsConnCapacity {
             er: Exclusive(DEFAULT),
-            host_exclusive: true,
             fixtures: [],
         },
         hot_account_cliff => scheduler::hot_account_cliff::HotAccountCliff {
             er: Exclusive(DEFAULT),
-            host_exclusive: true,
             fixtures: [Fixture::RedlineProgram],
         },
         executor_saturation => scheduler::executor_saturation::ExecutorSaturation {
             er: Exclusive(DEFAULT),
-            host_exclusive: true,
             fixtures: [Fixture::RedlineProgram],
         },
         conflict_ordering => scheduler::conflict_ordering::ConflictOrdering {
             er: Exclusive(DEFAULT),
-            host_exclusive: true,
             fixtures: [Fixture::RedlineProgram],
         },
         mixed_sustained_load => scheduler::mixed_sustained_load::MixedSustainedLoad {
             er: Exclusive(DEFAULT),
-            host_exclusive: true,
             fixtures: [Fixture::RedlineProgram],
         },
         clone_lru_churn => chainlink::clone_lru_churn::CloneLruChurn {
             er: Exclusive(DEFAULT),
-            host_exclusive: true,
             fixtures: [Fixture::RedlineProgram],
         },
         ensure_gate_stall => chainlink::ensure_gate_stall::EnsureGateStall {
             er: Exclusive(DEFAULT),
-            host_exclusive: true,
             fixtures: [Fixture::RedlineProgram],
         },
         cold_hydration_tail => chainlink::cold_hydration_tail::ColdHydrationTail {
             er: Exclusive(DEFAULT),
-            host_exclusive: true,
             fixtures: [Fixture::RedlineProgram],
         },
         commit_width_envelope => committor::commit_width_envelope::CommitWidthEnvelope {
             er: Exclusive(DEFAULT),
-            host_exclusive: true,
             fixtures: [Fixture::RedlineProgram],
         },
         commit_throughput_ceiling => committor::commit_throughput_ceiling::CommitThroughputCeiling {
             er: Exclusive(DEFAULT),
-            host_exclusive: true,
             fixtures: [Fixture::RedlineProgram],
         },
         storage_prodsize_sustain => storage::storage_prodsize_sustain::StorageProdsizeSustain {
             er: Exclusive(DEFAULT),
-            host_exclusive: true,
             fixtures: [Fixture::RedlineProgram],
         },
         superblock_boundary_latency => storage::superblock_boundary_latency::SuperblockBoundaryLatency {
             er: Fresh,
-            host_exclusive: true,
             fixtures: [Fixture::RedlineProgram],
         },
         restart_under_load => lifecycle::restart_under_load::RestartUnderLoad {
             er: Fresh,
-            host_exclusive: true,
             fixtures: [Fixture::RedlineProgram],
         },
         protocol_boundary_selftest => harness::protocol_boundary_selftest::ProtocolBoundarySelftest {
             er: Exclusive(DEFAULT),
-            host_exclusive: true,
             fixtures: [Fixture::RedlineProgram],
         },
     }
@@ -132,6 +116,18 @@ pub mod redshift {
 
     scenario_catalog! {
         family: Redshift,
+        ledger_retention => storage::ledger_retention::LedgerRetention {
+            er: Fresh,
+            fixtures: [Fixture::RedshiftProgram],
+        },
+        verifier_lifecycle => replication::verifier_lifecycle::VerifierLifecycle {
+            er: Fresh,
+            fixtures: [Fixture::RedlineProgram],
+        },
+        checkpoint_durability => storage::checkpoint_durability::CheckpointDurability {
+            er: Fresh,
+            fixtures: [Fixture::RedshiftProgram],
+        },
         example => harness::example::Example {
             er: Shared(DEFAULT),
             fixtures: [],
@@ -185,21 +181,9 @@ pub mod redshift {
             er: Exclusive(DEFAULT),
             fixtures: [Fixture::RedshiftProgram],
         },
-        checkpoint_durability => storage::checkpoint_durability::CheckpointDurability {
-            er: Fresh,
-            fixtures: [Fixture::RedshiftProgram],
-        },
-        ledger_retention => storage::ledger_retention::LedgerRetention {
-            er: Fresh,
-            fixtures: [Fixture::RedshiftProgram],
-        },
         snapshot_read_race => storage::snapshot_read_race::SnapshotReadRace {
             er: Fresh,
             fixtures: [Fixture::RedshiftProgram],
-        },
-        verifier_lifecycle => replication::verifier_lifecycle::VerifierLifecycle {
-            er: Fresh,
-            fixtures: [Fixture::RedlineProgram],
         },
         transaction_retry_cold_fetch => aperture::transaction_retries::TransactionRetries::ColdFetch {
             er: Exclusive(RETRIES),
@@ -292,4 +276,56 @@ pub mod redhat {
             fixtures: [Fixture::RedhatProgram, Fixture::RedshiftProgram],
         },
     }
+}
+
+fn entries(family: Family) -> &'static [ScenarioEntry] {
+    match family {
+        Family::Redline => redline::SCENARIOS,
+        Family::Redshift => redshift::SCENARIOS,
+        Family::Redhat => redhat::SCENARIOS,
+    }
+}
+
+fn matching(family: Family, target: &str) -> Vec<&'static ScenarioEntry> {
+    let (exact, prefixed): (Vec<_>, Vec<_>) = entries(family)
+        .iter()
+        .filter(|entry| {
+            entry.name().starts_with(target)
+                || entry.short_name.starts_with(target)
+        })
+        .partition(|entry| {
+            entry.name() == target || entry.short_name == target
+        });
+    if exact.is_empty() {
+        prefixed
+    } else {
+        exact
+    }
+}
+
+/// Resolve selections within one family, preferring exact names over prefixes.
+/// Overlapping selections form an ordered union; no selections means the family.
+pub fn select(
+    family: Family,
+    targets: &[String],
+) -> Result<Vec<&'static ScenarioEntry>> {
+    if targets.is_empty() {
+        return Ok(entries(family).iter().collect());
+    }
+    let mut scenarios: Vec<&ScenarioEntry> = Vec::new();
+    for target in targets {
+        let matches = matching(family, target);
+        if matches.is_empty() {
+            return Err(format!("nothing matches `{target}` — `redsuite {} list` shows what exists", family.prefix()).into());
+        }
+        for entry in matches {
+            if !scenarios
+                .iter()
+                .any(|known| known.short_name == entry.short_name)
+            {
+                scenarios.push(entry);
+            }
+        }
+    }
+    Ok(scenarios)
 }
