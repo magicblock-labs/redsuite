@@ -5,10 +5,11 @@ use std::{
 
 use keypair::Keypair;
 use pubkey::Pubkey;
-use redshift_interface::schedulecommit::{build, MainAccount};
+
 use redsuite_core::{
-    check, check_eq, prep, topology,
-    topology::{ErOptions, PrivateEr, RestartConfig},
+    check, check_eq, prep,
+    programs::{CellHeader, REDSHIFT},
+    topology::{self, ErOptions, PrivateEr, RestartConfig},
     BaseCtx, ChainCtx, DynError, ErCtx, PrivateErScenario, Result,
 };
 use signature::Signature;
@@ -62,27 +63,24 @@ async fn superblocks(er: &ErCtx) -> Result<u64> {
     Ok(metrics.get(SUPERBLOCKS).unwrap_or(0.0) as u64)
 }
 
-async fn delegate_counter(base: &BaseCtx, er: &ErCtx, payer: &Keypair) -> Result<Pubkey> {
+async fn delegate_cell(base: &BaseCtx, er: &ErCtx, payer: &Keypair) -> Result<Pubkey> {
     let payer_chain = base.funded_payer(PAYER_LAMPORTS).await?;
-    let counter = base
-        .schedulecommit(payer)
-        .init_counter(er.identity(), prep::COMMIT_FREQUENCY_MS)
+    let cell = base
+        .cells(REDSHIFT, payer)
+        .create_primary(er.identity(), prep::COMMIT_FREQUENCY_MS)
         .await?;
     base.delegate_payer(&payer_chain, payer, er.identity()).await?;
-    Ok(counter)
+    Ok(cell)
 }
 
-async fn seed_history(er: &ErCtx, counter: &Pubkey, sent: &mut Vec<Sent>) -> Result<()> {
+async fn seed_history(er: &ErCtx, cell: &Pubkey, sent: &mut Vec<Sent>) -> Result<()> {
     let listed = check::poll_for(
-        "the er records the clone of the delegated counter",
+        "the er records the clone of the delegated cell",
         PROGRAM_CLONE_TIMEOUT,
         || async {
-            check!(
-                er.account(counter).await?.is_some(),
-                "counter {counter} not cloned"
-            )?;
-            let signatures = er.api().get_signatures_for_address(counter, SIGNATURE_WINDOW).await?;
-            check!(!signatures.is_empty(), "counter {counter} has no history")?;
+            check!(er.account(cell).await?.is_some(), "cell {cell} not cloned")?;
+            let signatures = er.api().get_signatures_for_address(cell, SIGNATURE_WINDOW).await?;
+            check!(!signatures.is_empty(), "cell {cell} has no history")?;
             Ok::<_, DynError>(signatures)
         },
     )
@@ -104,7 +102,16 @@ fn add_count(adds: u64) -> u8 {
 }
 
 async fn send_add(er: &ErCtx, payer: &Keypair, count: u8, sent: &mut Vec<Sent>) -> Result<()> {
-    let signature = er.submit_and_confirm(payer, &[build::add(payer.pubkey(), count)]).await?;
+    let signature = er
+        .submit_and_confirm(
+            payer,
+            &[REDSHIFT
+                .batch()
+                .add(&[REDSHIFT.primary(payer.pubkey())], i64::from(count))
+                .require_signer(payer.pubkey())
+                .build()],
+        )
+        .await?;
     let tx = er.api().await_transaction(&signature, TX_LEDGER_TIMEOUT).await?;
     check!(
         tx.err.is_none(),
@@ -137,9 +144,9 @@ async fn observe(er: &ErCtx, sent: &[Sent]) -> Result<HistoryView> {
     Ok(view)
 }
 
-async fn counter_value(er: &ErCtx, counter: &Pubkey) -> Result<u64> {
-    let account = er.account(counter).await?.ok_or("the delegated counter is missing on the er")?;
-    Ok(MainAccount::try_decode(&account.data)?.count)
+async fn cell_value(er: &ErCtx, cell: &Pubkey) -> Result<u64> {
+    let account = er.account(cell).await?.ok_or("the delegated cell is missing on the er")?;
+    Ok(CellHeader::try_decode(&account.data)?.value)
 }
 
 async fn verify(
@@ -147,7 +154,7 @@ async fn verify(
     label: &str,
     view: &HistoryView,
     previous_pruned: usize,
-    counter: &Pubkey,
+    cell: &Pubkey,
     expected_count: u64,
 ) -> Result<()> {
     check!(
@@ -193,7 +200,7 @@ async fn verify(
         )?;
     }
 
-    let listed = er.api().get_signatures_for_address(counter, SIGNATURE_WINDOW).await?;
+    let listed = er.api().get_signatures_for_address(cell, SIGNATURE_WINDOW).await?;
     let expected: Vec<Signature> =
         view.retained.iter().rev().map(|entry| entry.signature).collect();
     check_eq!(
@@ -204,9 +211,9 @@ async fn verify(
     )?;
 
     check_eq!(
-        counter_value(er, counter).await?,
+        cell_value(er, cell).await?,
         expected_count,
-        "{label}: the delegated counter must hold every add"
+        "{label}: the delegated cell must hold every add"
     )?;
     Ok(())
 }
@@ -244,13 +251,13 @@ impl PrivateErScenario for LedgerRetention {
         let mut events: u64 = 0;
         let mut previous_pruned = 0usize;
         let mut first_pruning_event: Option<u64> = None;
-        let counter;
+        let cell;
         let before;
         {
             let er = private.ctx();
             er.await_program_clone(&redshift_interface::id(), PROGRAM_CLONE_TIMEOUT).await?;
-            counter = delegate_counter(&base, er, &payer).await?;
-            seed_history(er, &counter, &mut sent).await?;
+            cell = delegate_cell(&base, er, &payer).await?;
+            seed_history(er, &cell, &mut sent).await?;
 
             let baseline = truncations(er).await?;
             let started = Instant::now();
@@ -269,7 +276,7 @@ impl PrivateErScenario for LedgerRetention {
                         &format!("retention event {events}"),
                         &view,
                         previous_pruned,
-                        &counter,
+                        &cell,
                         total,
                     )
                     .await?;
@@ -300,15 +307,7 @@ impl PrivateErScenario for LedgerRetention {
             }
 
             before = observe(er, &sent).await?;
-            verify(
-                er,
-                "before restart",
-                &before,
-                previous_pruned,
-                &counter,
-                total,
-            )
-            .await?;
+            verify(er, "before restart", &before, previous_pruned, &cell, total).await?;
             check!(
                 !before.retained.is_empty(),
                 "some of this scenario's history must still be retained \
@@ -341,7 +340,7 @@ impl PrivateErScenario for LedgerRetention {
             "after restart",
             &after,
             before.pruned.len(),
-            &counter,
+            &cell,
             total,
         )
         .await?;
@@ -359,7 +358,7 @@ impl PrivateErScenario for LedgerRetention {
             "after restart add",
             &final_view,
             after.pruned.len(),
-            &counter,
+            &cell,
             total,
         )
         .await?;

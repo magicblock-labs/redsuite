@@ -4,7 +4,8 @@ use pubkey::Pubkey;
 use redsuite_core::{
     check, check_eq, prep,
     profile::ProfileValues,
-    redline::{copy_three, execute_kernel, Accounts},
+    programs::{CellHeader, REDLINE},
+    redline::{execute_kernel, Accounts},
     report::Unit,
     runner::{Pacing, RunOutcome, ThreadRunConfig},
     stats::{ObservationsStats, StreamingStats},
@@ -71,7 +72,7 @@ const PROFILES: ProfileValues<Profile> = ProfileValues { lite: LITE, full: FULL 
 fn cell_expected_writes(pool: &[Pubkey], first_id: u64, iterations: u64) -> ExpectedWrites {
     let mut expected: ExpectedWrites = HashMap::new();
     for id in first_id + 1..=first_id + iterations {
-        let (_, dests) = copy_three(pool, id);
+        let (_, dests) = REDLINE.copy_three(pool, id);
         for dest in dests {
             expected.entry(dest).or_default().push(id);
         }
@@ -92,7 +93,7 @@ fn execute_cell(
         er_rpc_url,
         payer_bytes,
         id_offset,
-        move |id| copy_three(&pool, id).0,
+        move |id| REDLINE.copy_three(&pool, id).0,
         clock,
     )
 }
@@ -178,7 +179,7 @@ impl Scenario<ScenarioReport> for WsFanoutThreshold {
                 profile.subscriber_threads,
                 clock.clone(),
                 expected.clone(),
-                Arc::new(crate::account_update_id),
+                Arc::new(CellHeader::written_id),
                 LAG_THRESHOLD,
             );
             subscribers.await_subscribed(pool.len(), SUBSCRIBE_TIMEOUT).await?;

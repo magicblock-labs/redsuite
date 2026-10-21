@@ -4,10 +4,11 @@ use account::Account;
 use pubkey::Pubkey;
 pub use redline_interface as program;
 use redline_interface::DELEGATION_PROGRAM_ID;
-use redsuite_core::{check::CheckError, dlp, BaseCtx, ChainCtx, Result};
-pub use redsuite_core::{phase, redline::written_id};
+pub use redsuite_core::phase;
+use redsuite_core::{check::CheckError, dlp, programs::CellHeader, BaseCtx, ChainCtx, Result};
 
 pub const ACCOUNT_SPACE: u32 = 128;
+pub(crate) const LARGE_ACCOUNT_SPACE: u32 = 10 * 1024;
 pub const PAYER_LAMPORTS: u64 = 2_000_000_000;
 
 pub const LOCKOUT_REJECTIONS: [&str; 4] = [
@@ -31,7 +32,7 @@ pub fn rejection_code(
 }
 
 pub fn account_id(account: Option<Account>) -> Option<u64> {
-    account.and_then(|account| written_id(&account.data))
+    account.and_then(|account| CellHeader::written_id(&account.data))
 }
 
 pub const ACCOUNT_OWNERS: [Pubkey; 2] = [program::ID, DELEGATION_PROGRAM_ID];

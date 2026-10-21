@@ -11,6 +11,7 @@ use json::{JsonContainerTrait, JsonValueTrait, Value};
 use pubkey::Pubkey;
 use redsuite_core::{
     check, check_eq,
+    programs::{CellHeader, REDLINE},
     redline::Accounts,
     rpc_client::{
         nonblocking::rpc_client::RpcClient, rpc_client::GetConfirmedSignaturesForAddress2Config,
@@ -34,7 +35,7 @@ use solana_transaction_status_client_types::{
 };
 use transaction::Transaction;
 
-use crate::{program::instruction::build, ACCOUNT_SPACE};
+use crate::ACCOUNT_SPACE;
 
 const WRITES: usize = 256;
 const PAYERS: usize = 32;
@@ -62,7 +63,7 @@ const RAW_DRAIN_TIMEOUT: Duration = Duration::from_millis(300);
 const RAW_SILENCE_TIMEOUT: Duration = Duration::from_millis(700);
 
 struct Write {
-    pda: Pubkey,
+    address: Pubkey,
     id: u64,
     transaction: Transaction,
     signature: Signature,
@@ -222,14 +223,14 @@ async fn burst(base: &BaseCtx, er: &ErCtx, client: &RpcClient) -> Result<()> {
             let id = FIRST_ID + index as u64;
             let payer = &payers[index / per_payer];
             let transaction = Transaction::new_signed_with_payer(
-                &[build::simple_byte_set(id, &[*pda])],
+                &[REDLINE.write(id, &[*pda])],
                 Some(&payer.pubkey()),
                 &[payer],
                 blockhash,
             );
             let signature = transaction.signatures[0];
             Write {
-                pda: *pda,
+                address: *pda,
                 id,
                 transaction,
                 signature,
@@ -256,12 +257,12 @@ async fn burst(base: &BaseCtx, er: &ErCtx, client: &RpcClient) -> Result<()> {
         simulation.err
     )?;
     let after_simulation = client
-        .get_account_with_commitment(&probe.pda, confirmed())
+        .get_account_with_commitment(&probe.address, confirmed())
         .await?
         .value
         .ok_or("the probe account vanished after simulation")?;
     check_eq!(
-        crate::written_id(&after_simulation.data),
+        CellHeader::written_id(&after_simulation.data),
         Some(0),
         "simulateTransaction must not mutate the probe account"
     )?;
@@ -409,7 +410,7 @@ async fn burst(base: &BaseCtx, er: &ErCtx, client: &RpcClient) -> Result<()> {
                 .ok_or("getAccountInfo dropped a written account")?;
             let balance = client.get_balance_with_commitment(pda, confirmed()).await?.value;
             check_eq!(
-                crate::written_id(&single.data),
+                CellHeader::written_id(&single.data),
                 Some(write.id),
                 "getAccountInfo must show the written id for {pda}"
             )?;
@@ -435,7 +436,7 @@ async fn burst(base: &BaseCtx, er: &ErCtx, client: &RpcClient) -> Result<()> {
     for (write, slot) in writes.iter().zip(&slots) {
         let history = client
             .get_signatures_for_address_with_config(
-                &write.pda,
+                &write.address,
                 GetConfirmedSignaturesForAddress2Config {
                     limit: Some(HISTORY_LIMIT),
                     commitment: Some(confirmed()),
@@ -449,7 +450,7 @@ async fn burst(base: &BaseCtx, er: &ErCtx, client: &RpcClient) -> Result<()> {
             .ok_or_else(|| {
                 format!(
                     "getSignaturesForAddress({}) does not list {}",
-                    write.pda, write.signature
+                    write.address, write.signature
                 )
             })?;
         check_eq!(
@@ -465,7 +466,7 @@ async fn burst(base: &BaseCtx, er: &ErCtx, client: &RpcClient) -> Result<()> {
         )?;
     }
     let delegated: RawDelegationStatus =
-        er.api().call("getDelegationStatus", &(probe.pda.to_string(),)).await?;
+        er.api().call("getDelegationStatus", &(probe.address.to_string(),)).await?;
     check!(
         delegated.is_delegated,
         "getDelegationStatus must report the written pda as delegated"

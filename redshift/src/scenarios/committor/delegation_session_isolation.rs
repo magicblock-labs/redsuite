@@ -4,16 +4,17 @@ use std::{
     time::{Duration, Instant},
 };
 
-use borsh::BorshDeserialize;
 use keypair::Keypair;
 use pubkey::Pubkey;
-use redshift_interface::schedulecommit::{build as sc, MainAccount, ScheduleCommitType};
+
 use redsuite_core::{
     check, check_eq, dlp,
     netfault::{BaseProxies, Selector},
-    prep, receipt, topology,
-    topology::{ErOptions, PrivateEr, RestartConfig},
-    BaseCtx, ChainCtx, ErCtx, Result, Scenario,
+    prep,
+    programs::{CellHeader, CellId, SettlementMode, REDSHIFT},
+    receipt,
+    topology::{self, ErOptions, PrivateEr, RestartConfig},
+    BaseCtx, ChainCtx, DynError, ErCtx, Result, Scenario,
 };
 use signature::Signature;
 use signer::Signer;
@@ -31,43 +32,22 @@ const STALE_WINDOW: Duration = Duration::from_secs(5);
 const RECOVERY_WINDOW: Duration = Duration::from_secs(10);
 const POLL: Duration = Duration::from_millis(250);
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Target {
-    SameValidator,
-    OtherValidator,
-}
-
-impl Target {
-    fn label(self) -> &'static str {
-        match self {
-            Self::SameValidator => "redelegation",
-            Self::OtherValidator => "reassignment",
-        }
-    }
-}
-
 fn value(case: u64, step: u64) -> u64 {
     100 * case + step
 }
 
 fn count(data: &[u8]) -> Result<u64> {
-    Ok(MainAccount::try_from_slice(data)?.count)
+    Ok(CellHeader::try_decode(data)?.value)
 }
 
 async fn await_clone_count(er: &ErCtx, account: &Pubkey, id: u64) -> Result<()> {
     check::poll_for(
-        &format!(
-            "the er {} clones the committee with count {id}",
-            er.identity()
-        ),
+        &format!("the er {} clones the cell with count {id}", er.identity()),
         CLONE_TIMEOUT,
         || async {
-            match er.account(account).await {
-                Ok(Some(acc)) if count(&acc.data).ok() == Some(id) => Ok(()),
-                Ok(Some(acc)) => Err(format!("count {:?}", count(&acc.data).ok())),
-                Ok(None) => Err("absent".to_owned()),
-                Err(error) => Err(format!("read failed: {error}")),
-            }
+            let account = er.account(account).await?.ok_or("ER cell absent")?;
+            check_eq!(count(&account.data)?, id, "cloned cell value")?;
+            Ok::<_, DynError>(())
         },
     )
     .await
@@ -75,25 +55,16 @@ async fn await_clone_count(er: &ErCtx, account: &Pubkey, id: u64) -> Result<()> 
     Ok(())
 }
 
-async fn write(
-    ctx: &impl ChainCtx,
-    payer: &Keypair,
-    player: &Pubkey,
-    account: &Pubkey,
-    id: u64,
-) -> Result<()> {
-    ctx.submit_and_confirm(payer, &[sc::set_count(*player, id)]).await?;
-    let data = ctx
-        .account(account)
-        .await?
-        .ok_or("the committee vanished after the write")?
-        .data;
+async fn write(ctx: &impl ChainCtx, payer: &Keypair, account: &Pubkey, id: u64) -> Result<()> {
+    ctx.submit_and_confirm(payer, &[REDSHIFT.batch().set(&[*account], id).build()])
+        .await?;
+    let data = ctx.account(account).await?.ok_or("the cell vanished after the write")?.data;
     check_eq!(count(&data)?, id, "the write must land")?;
     Ok(())
 }
 
 async fn base_state(base: &BaseCtx, account: &Pubkey) -> Result<(Pubkey, Option<u64>)> {
-    let on_base = base.account(account).await?.ok_or("the committee vanished from base")?;
+    let on_base = base.account(account).await?.ok_or("the cell vanished from base")?;
     Ok((on_base.owner, count(&on_base.data).ok()))
 }
 
@@ -105,11 +76,12 @@ async fn await_base(
     what: &str,
 ) -> Result<()> {
     check::poll_for(what, COMPLETION_TIMEOUT, || async {
-        match base_state(base, account).await {
-            Ok((current_owner, written)) if current_owner == owner && written == Some(id) => Ok(()),
-            Ok((current_owner, written)) => Err(format!("owner {current_owner} count {written:?}")),
-            Err(error) => Err(format!("read failed: {error}")),
-        }
+        check_eq!(
+            base_state(base, account).await?,
+            (owner, Some(id)),
+            "settled cell owner and value"
+        )?;
+        Ok::<_, DynError>(())
     })
     .await
     .map_err(|error| error.expected(format!("owner {owner} count {id}")))?;
@@ -161,23 +133,12 @@ async fn hold_steady(
 async fn schedule_commit(
     er: &ErCtx,
     payer: &Keypair,
-    player: &Pubkey,
-    commit_type: ScheduleCommitType,
+    account: &Pubkey,
+    commit_type: SettlementMode,
 ) -> Result<Signature> {
-    let writable = matches!(
-        commit_type,
-        ScheduleCommitType::CommitAndUndelegate | ScheduleCommitType::CommitFinalizeAndUndelegate
-    );
     er.submit_and_confirm(
         payer,
-        &[sc::schedule_commit_cpi(
-            payer.pubkey(),
-            vec![*player],
-            false,
-            false,
-            commit_type,
-            writable,
-        )],
+        &[REDSHIFT.batch().settle(payer.pubkey(), &[*account], commit_type).build()],
     )
     .await
 }
@@ -187,13 +148,12 @@ async fn recover_session_a_commit_after_lost_response(
     er: &ErCtx,
     proxies: &BaseProxies,
     payer: &Keypair,
-    player: &Pubkey,
     account: &Pubkey,
     expected_id: u64,
 ) -> Result<()> {
     let submission =
         proxies.intercept(Selector::method("sendTransaction").http().response().account(account));
-    let signature = schedule_commit(er, payer, player, ScheduleCommitType::Commit).await?;
+    let signature = schedule_commit(er, payer, account, SettlementMode::Commit).await?;
     let held = submission.wait(INTERCEPT_TIMEOUT).await?;
     let base_signature = held.operation.signature()?;
     let base_tx = base.api().await_transaction(&base_signature, BASE_CONFIRM_TIMEOUT).await?;
@@ -202,18 +162,12 @@ async fn recover_session_a_commit_after_lost_response(
         None,
         "the intercepted session-a commit must land on base"
     )?;
-    check::poll_for(
+    await_base(
+        base,
+        account,
+        dlp::dlp_id(),
+        expected_id,
         "base records the session-a commit before the response is lost",
-        COMPLETION_TIMEOUT,
-        || async {
-            match base_state(base, account).await {
-                Ok((owner, written)) if owner == dlp::dlp_id() && written == Some(expected_id) => {
-                    Ok(())
-                }
-                Ok((owner, written)) => Err(format!("owner {owner} count {written:?}")),
-                Err(error) => Err(format!("read failed: {error}")),
-            }
-        },
     )
     .await?;
     held.discard();
@@ -234,40 +188,34 @@ async fn isolate(
     er_a: &mut PrivateEr,
     er_b: Option<&ErCtx>,
     payer: &Keypair,
-    target: Target,
 ) -> Result<()> {
-    let case = u64::from(target == Target::OtherValidator) + 1;
-    let committee = base
-        .schedulecommit(payer)
-        .init(er_a.identity(), 1)
+    let case = u64::from(er_b.is_some()) + 1;
+    let label = if er_b.is_some() { "reassignment" } else { "redelegation" };
+    let cell = base
+        .cells(REDSHIFT, payer)
+        .create_owned(er_a.identity(), 1)
         .await?
         .pop()
-        .ok_or("no committee was created")?;
-    let player = committee.player.pubkey();
-    let account = committee.pda;
-    er_a.ctx().await_committees(slice::from_ref(&committee)).await?;
+        .ok_or("no cell was created")?;
+    let authority = cell.authority.pubkey();
+    let account = cell.address;
+    er_a.ctx().await_cells(slice::from_ref(&cell)).await?;
 
     let staged = value(case, 1);
-    write(er_a.ctx(), payer, &player, &account, staged).await?;
+    write(er_a.ctx(), payer, &account, staged).await?;
     recover_session_a_commit_after_lost_response(
         base,
         er_a.ctx(),
         proxies,
         payer,
-        &player,
         &account,
         staged,
     )
     .await?;
 
     let delayed = proxies.intercept(Selector::methods(&[]).ws().notification().account(&account));
-    let undelegate = schedule_commit(
-        er_a.ctx(),
-        payer,
-        &player,
-        ScheduleCommitType::CommitAndUndelegate,
-    )
-    .await?;
+    let undelegate =
+        schedule_commit(er_a.ctx(), payer, &account, SettlementMode::Undelegate).await?;
     let undelegated =
         receipt::fetch_commit_receipt(er_a.ctx().api(), &undelegate, RECEIPT_TIMEOUT).await?;
     check!(
@@ -286,18 +234,16 @@ async fn isolate(
     let delayed = delayed.wait(INTERCEPT_TIMEOUT).await?;
 
     let base_value = value(case, 2);
-    write(base, payer, &player, &account, base_value).await?;
-    let session_b = match target {
-        Target::SameValidator => er_a.ctx(),
-        Target::OtherValidator => er_b.ok_or("the reassignment case needs a second er")?,
-    };
-    base.submit_and_confirm(
+    write(base, payer, &account, base_value).await?;
+    let session_b = er_b.unwrap_or_else(|| er_a.ctx());
+    base.submit_and_confirm_with(
         payer,
-        &[sc::delegate_cpi(
+        &[&cell.authority],
+        &[REDSHIFT.delegate(
             payer.pubkey(),
-            player,
-            prep::COMMIT_FREQUENCY_MS,
+            CellId::new(authority, 0),
             Some(session_b.identity()),
+            prep::COMMIT_FREQUENCY_MS,
         )],
     )
     .await?;
@@ -314,11 +260,11 @@ async fn isolate(
         .await_delegated(
             &account,
             CLONE_TIMEOUT,
-            "session-b er activates the committee as delegated",
+            "session-b er activates the cell as delegated",
         )
         .await?;
     let er_value = value(case, 3);
-    write(session_b, payer, &player, &account, er_value).await?;
+    write(session_b, payer, &account, er_value).await?;
     let nonce = crate::last_commit_id(base, &account).await?;
 
     delayed.release();
@@ -332,7 +278,7 @@ async fn isolate(
             nonce,
         },
         STALE_WINDOW,
-        &format!("{}: after releasing session-a observations", target.label()),
+        &format!("{label}: after releasing session-a observations"),
     )
     .await?;
 
@@ -342,10 +288,7 @@ async fn isolate(
         Some(0),
         "the session-a validator must stop cleanly before recovery"
     )?;
-    let session_b = match target {
-        Target::SameValidator => er_a.ctx(),
-        Target::OtherValidator => er_b.ok_or("the reassignment case needs a second er")?,
-    };
+    let session_b = er_b.unwrap_or_else(|| er_a.ctx());
     hold_steady(
         base,
         &SessionB {
@@ -356,40 +299,41 @@ async fn isolate(
             nonce,
         },
         RECOVERY_WINDOW,
-        &format!("{}: while the restarted validator recovers", target.label()),
+        &format!("{label}: while the restarted validator recovers"),
     )
     .await?;
 
-    if target == Target::OtherValidator {
-        {
-            let stale_write = er_a
-                .ctx()
-                .submit_and_confirm(payer, &[sc::set_count(player, value(case, 4))])
-                .await;
-            check!(
-                stale_write.is_err(),
-                "the old validator must reject writes to the reassigned \
+    if er_b.is_some() {
+        let stale_write = er_a
+            .ctx()
+            .submit_and_confirm(
+                payer,
+                &[REDSHIFT.batch().set(&[account], value(case, 4)).build()],
+            )
+            .await;
+        check!(
+            stale_write.is_err(),
+            "the old validator must reject writes to the reassigned \
                  account, got {stale_write:?}"
-            )?;
-            let stale_commit =
-                schedule_commit(er_a.ctx(), payer, &player, ScheduleCommitType::Commit).await;
-            if let Ok(signature) = stale_commit {
-                let receipt =
-                    receipt::fetch_commit_receipt(er_a.ctx().api(), &signature, RECEIPT_TIMEOUT)
-                        .await?;
-                receipt
-                    .error_message
-                    .ok_or("the old validator must not commit the reassigned account")?;
-            }
-            check_eq!(
-                base_state(base, &account).await?,
-                (dlp::dlp_id(), Some(base_value)),
-                "rejected old work must leave base untouched"
-            )?;
+        )?;
+        let stale_commit =
+            schedule_commit(er_a.ctx(), payer, &account, SettlementMode::Commit).await;
+        if let Ok(signature) = stale_commit {
+            let receipt =
+                receipt::fetch_commit_receipt(er_a.ctx().api(), &signature, RECEIPT_TIMEOUT)
+                    .await?;
+            receipt
+                .error_message
+                .ok_or("the old validator must not commit the reassigned account")?;
         }
+        check_eq!(
+            base_state(base, &account).await?,
+            (dlp::dlp_id(), Some(base_value)),
+            "rejected old work must leave base untouched"
+        )?;
     }
 
-    let fresh = schedule_commit(session_b, payer, &player, ScheduleCommitType::Commit).await?;
+    let fresh = schedule_commit(session_b, payer, &account, SettlementMode::Commit).await?;
     let fresh_receipt =
         receipt::fetch_commit_receipt(session_b.api(), &fresh, RECEIPT_TIMEOUT).await?;
     check!(
@@ -441,24 +385,8 @@ impl Scenario for DelegationSessionIsolation {
             mut er_a,
             payer,
         } = self;
-        isolate(
-            &base,
-            &proxies,
-            &mut er_a,
-            None,
-            &payer,
-            Target::SameValidator,
-        )
-        .await?;
-        isolate(
-            &base,
-            &proxies,
-            &mut er_a,
-            Some(&er),
-            &payer,
-            Target::OtherValidator,
-        )
-        .await?;
+        isolate(&base, &proxies, &mut er_a, None, &payer).await?;
+        isolate(&base, &proxies, &mut er_a, Some(&er), &payer).await?;
 
         proxies.finish()?;
         er_a.finish().await?;

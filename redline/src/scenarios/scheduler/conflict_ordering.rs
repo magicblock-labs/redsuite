@@ -15,9 +15,9 @@ use pubkey::Pubkey;
 use redsuite_core::{
     check, check_eq, prep,
     profile::ProfileValues,
+    programs::HashState,
     redline::{
-        causal,
-        causal::{independent_ixs, CausalPair, Step},
+        causal::{self, independent_ixs, CausalPair, Step},
         Accounts,
     },
     report::Unit::{Count, Micros, Ratio, Seconds, Tps},
@@ -37,11 +37,7 @@ use tokio::time;
 use tracing::debug;
 use url::Url;
 
-use crate::{
-    metrics,
-    program::{layout, utils::hash_chain},
-    ACCOUNT_SPACE,
-};
+use crate::{metrics, program::layout, ACCOUNT_SPACE};
 
 const PAYER_LAMPORTS: u64 = 200_000_000;
 const CLONE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -544,7 +540,7 @@ async fn verify_pairs(er: &ErCtx, pairs: &mut [Pair], batch: usize) -> Result<()
 }
 
 async fn verify_independent(er: &ErCtx, accounts: &[Pubkey], iters: u32) -> Result<()> {
-    let expected = hash_chain(causal::HASH_INIT.to_bytes(), iters);
+    let expected = HashState::chain(causal::HASH_INIT.to_bytes(), iters);
     for (index, address) in accounts.iter().enumerate() {
         let account = er
             .account(address)

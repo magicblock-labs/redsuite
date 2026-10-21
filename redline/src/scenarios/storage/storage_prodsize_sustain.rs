@@ -5,11 +5,11 @@ use pubkey::Pubkey;
 use redsuite_core::{
     check, check_eq, host,
     profile::ProfileValues,
-    redline::{copy_three, Accounts},
+    programs::REDLINE,
+    redline::Accounts,
     report::Unit,
     runner::{execute, Pacing, RunConfig, RunOutcome},
-    topology,
-    topology::ErOptions,
+    topology::{self, ErOptions},
     BaseCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport, TxSender,
 };
 use tracing::{debug, warn};
@@ -87,7 +87,7 @@ async fn execute_window(
         |iteration| {
             let id = first_id + iteration;
             let sender = senders[(id as usize) % senders.len()].clone();
-            let (ix, _) = copy_three(pool, id);
+            let (ix, _) = REDLINE.copy_three(pool, id);
             sender.staged([ix])
         },
     )
@@ -168,7 +168,7 @@ impl Scenario<ScenarioReport> for StorageProdsizeSustain {
                 },
                 |id| {
                     let sender = senders[(id as usize) % senders.len()].clone();
-                    let (ix, _) = copy_three(&pool, id);
+                    let (ix, _) = REDLINE.copy_three(&pool, id);
                     sender.staged([ix])
                 },
             )

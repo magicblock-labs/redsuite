@@ -5,16 +5,14 @@ use pubkey::Pubkey;
 use redsuite_core::{
     check, check_eq,
     profile::ProfileValues,
+    programs::REDLINE,
     redline::Accounts,
     report::Unit,
     runner::{execute, Pacing, RunConfig, RunOutcome},
-    topology,
-    topology::ErOptions,
+    topology::{self, ErOptions},
     BaseCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
 };
 use tracing::{debug, warn};
-
-use crate::program::instruction::build;
 
 const ACCOUNT_SPACE: u32 = 2048;
 const READ_WIDTH: usize = 4;
@@ -161,7 +159,7 @@ impl Scenario<ScenarioReport> for EnsureGateStall {
             let before = cell_er.scrape_metrics().await?;
             let request = |id: u64| {
                 let accounts = sample_accounts(&pool, id, READ_WIDTH);
-                let ix = build::read_accounts_data(id, &accounts);
+                let ix = REDLINE.inspect(&accounts);
                 let sender = sender.clone();
                 sender.staged([ix])
             };

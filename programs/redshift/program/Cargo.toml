@@ -9,11 +9,6 @@ authors.workspace = true
 crate-type = ["cdylib", "lib"]
 
 [dependencies]
-redshift-interface = { workspace = true }
-borsh = { workspace = true }
-sdk = { workspace = true }
-solana-program = { workspace = true }
-sdk-ids = { workspace = true }
-magic-api = { workspace = true }
-bincode = { workspace = true }
-system-interface = { workspace = true }
+fixture.workspace = true
+redshift-interface.workspace = true
+solana-program.workspace = true

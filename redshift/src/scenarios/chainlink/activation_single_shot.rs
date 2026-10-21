@@ -7,18 +7,23 @@ use account::Account;
 use instruction::{AccountMeta, Instruction};
 use keypair::Keypair;
 use pubkey::Pubkey;
-use redshift_interface::schedulecommit::{build as counter, MainAccount};
+
 use redsuite_core::{
-    check, check_eq, dlp,
-    dlp::{delegate_with_actions, DelegateArgs},
+    check, check_eq,
+    dlp::{self, delegate_with_actions, DelegateArgs},
     netfault::{Action, BaseProxies, Selector},
-    prep, system, topology,
-    topology::{ErOptions, PrivateEr, RestartConfig},
+    prep,
+    programs::{CellHeader, REDSHIFT},
+    system,
+    topology::{self, ErOptions, PrivateEr, RestartConfig},
     BaseCtx, ChainCtx, DynError, ErCtx, PrivateErScenario, Result,
 };
 use signature::Signature;
 use signer::Signer;
-use tokio::{task, task::JoinHandle, time};
+use tokio::{
+    task::{self, JoinHandle},
+    time,
+};
 
 use crate::PAYER_LAMPORTS;
 
@@ -39,9 +44,9 @@ const SETTLE_TIMEOUT: Duration = Duration::from_secs(20);
 const POLL: Duration = Duration::from_millis(200);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CounterState {
-    count: u64,
-    updates: u64,
+struct CellState {
+    value: u64,
+    revision: u64,
 }
 
 struct Discovery {
@@ -49,31 +54,34 @@ struct Discovery {
     submissions: Vec<JoinHandle<Result<Signature>>>,
 }
 
-fn counter_action(actor: &Pubkey, dependency: &Pubkey, count: u8, fail: bool) -> Instruction {
-    let mut instruction =
-        if fail { counter::fail(*actor) } else { counter::add_unsigned(*actor, count) };
+fn cell_action(actor: &Pubkey, dependency: &Pubkey, count: u8, fail: bool) -> Instruction {
+    let mut instruction = if fail {
+        REDSHIFT.batch().writable(&[REDSHIFT.primary(*actor)]).fail(0).build()
+    } else {
+        REDSHIFT.batch().add(&[REDSHIFT.primary(*actor)], i64::from(count)).build()
+    };
     instruction.accounts.push(AccountMeta::new_readonly(*dependency, false));
     instruction
 }
 
-async fn counter_state(er: &ErCtx, counter: &Pubkey) -> Result<CounterState> {
-    let account = er.account(counter).await?.ok_or("the counter vanished from the er")?;
-    let decoded = MainAccount::try_decode(&account.data)?;
-    Ok(CounterState {
-        count: decoded.count,
-        updates: decoded.updates,
+async fn cell_state(er: &ErCtx, cell: &Pubkey) -> Result<CellState> {
+    let account = er.account(cell).await?.ok_or("the cell vanished from the er")?;
+    let decoded = CellHeader::try_decode(&account.data)?;
+    Ok(CellState {
+        value: decoded.value,
+        revision: decoded.revision,
     })
 }
 
-async fn await_counter(
+async fn await_cell(
     er: &ErCtx,
-    counter: &Pubkey,
-    expected: CounterState,
+    cell: &Pubkey,
+    expected: CellState,
     what: &str,
     timeout: Duration,
 ) -> Result<()> {
     check::poll_for(what, timeout, || async {
-        match counter_state(er, counter).await {
+        match cell_state(er, cell).await {
             Ok(state) if state == expected => Ok(()),
             Ok(state) => Err(format!("{state:?}")),
             Err(error) => Err(format!("read failed: {error}")),
@@ -86,17 +94,17 @@ async fn await_counter(
 
 async fn hold_steady(
     er: &ErCtx,
-    counter: &Pubkey,
-    expected: CounterState,
+    cell: &Pubkey,
+    expected: CellState,
     window: Duration,
     what: &str,
 ) -> Result<()> {
     let started = Instant::now();
     while started.elapsed() < window {
         check_eq!(
-            counter_state(er, counter).await?,
+            cell_state(er, cell).await?,
             expected,
-            "{what}: the counter must keep exactly one application of the \
+            "{what}: the cell must keep exactly one application of the \
              action"
         )?;
         time::sleep(POLL).await;
@@ -174,8 +182,8 @@ async fn race_discovery(
     funder: &Keypair,
     er_payer: &Rc<Keypair>,
     trigger: &Pubkey,
-    counter: &Pubkey,
-    before: CounterState,
+    cell: &Pubkey,
+    before: CellState,
 ) -> Result<Discovery> {
     let started = Instant::now();
     let sender = er.sender(er_payer.clone());
@@ -200,7 +208,7 @@ async fn race_discovery(
         .await?;
     while started.elapsed() < HOLD_WINDOW {
         check_eq!(
-            counter_state(er, counter).await?,
+            cell_state(er, cell).await?,
             before,
             "the action must not apply while its dependency fetch is held"
         )?;
@@ -227,29 +235,21 @@ async fn run_action(
     actor: &Pubkey,
     fail: bool,
 ) -> Result<Pubkey> {
-    let (counter, _) = redshift_interface::schedulecommit::pda_and_bump(actor);
-    let counter = &counter;
-    let before = counter_state(er, counter).await?;
+    let cell = REDSHIFT.primary(*actor);
+    let cell = &cell;
+    let before = cell_state(er, cell).await?;
     let dependency = fund_dependency(base).await?;
     let stall = proxies.stall(dependency_fetch(&dependency));
     let trigger = delegate_trigger(
         base,
         funder,
         er.identity(),
-        counter_action(actor, &dependency, ACTION_COUNT, fail),
+        cell_action(actor, &dependency, ACTION_COUNT, fail),
     )
     .await?;
     await_fetch_held(proxies, &dependency).await?;
-    let discovery = race_discovery(
-        base,
-        er,
-        funder,
-        er_payer,
-        &trigger.pubkey(),
-        counter,
-        before,
-    )
-    .await?;
+    let discovery =
+        race_discovery(base, er, funder, er_payer, &trigger.pubkey(), cell, before).await?;
     stall.remove();
     settle_discovery(discovery).await;
     if fail {
@@ -269,20 +269,20 @@ async fn run_action(
         )
         .await?;
         check_eq!(
-            counter_state(er, counter).await?,
+            cell_state(er, cell).await?,
             before,
-            "failed activation leaves counter {counter} unchanged"
+            "failed activation leaves cell {cell} unchanged"
         )?;
     } else {
-        let expected = CounterState {
-            count: before.count + u64::from(ACTION_COUNT),
-            updates: before.updates + 1,
+        let expected = CellState {
+            value: before.value + u64::from(ACTION_COUNT),
+            revision: before.revision + 1,
         };
-        await_counter(
+        await_cell(
             er,
-            counter,
+            cell,
             expected,
-            "the released activation applies the counter action exactly once",
+            "the released activation applies the cell action exactly once",
             ACTIVATION_TIMEOUT,
         )
         .await?;
@@ -323,16 +323,16 @@ impl PrivateErScenario for ActivationSingleShot {
         let actor = base.funded_payer(PAYER_LAMPORTS).await?;
         let er_payer = Rc::new(base.delegated_payer(&funder, er.identity(), PAYER_LAMPORTS).await?);
 
-        let counter = base
-            .schedulecommit(&actor)
-            .init_counter(er.identity(), prep::COMMIT_FREQUENCY_MS)
+        let cell = base
+            .cells(REDSHIFT, &actor)
+            .create_primary(er.identity(), prep::COMMIT_FREQUENCY_MS)
             .await?;
-        let zero = CounterState { count: 0, updates: 0 };
-        await_counter(
+        let zero = CellState { value: 0, revision: 0 };
+        await_cell(
             er,
-            &counter,
+            &cell,
             zero,
-            "the er clones the delegated counter",
+            "the er clones the delegated cell",
             CLONE_TIMEOUT,
         )
         .await?;
@@ -347,11 +347,11 @@ impl PrivateErScenario for ActivationSingleShot {
             false,
         )
         .await?;
-        let applied = CounterState {
-            count: u64::from(ACTION_COUNT),
-            updates: 1,
+        let applied = CellState {
+            value: u64::from(ACTION_COUNT),
+            revision: 1,
         };
-        hold_steady(er, &counter, applied, STEADY_WINDOW, "after activation").await?;
+        hold_steady(er, &cell, applied, STEADY_WINDOW, "after activation").await?;
 
         base.submit_and_confirm(&funder, &[system::transfer(&funder.pubkey(), &trigger, 1)])
             .await?;
@@ -360,7 +360,7 @@ impl PrivateErScenario for ActivationSingleShot {
             .await?;
         hold_steady(
             er,
-            &counter,
+            &cell,
             applied,
             STEADY_WINDOW,
             "after reconnecting the base subscriptions",
@@ -374,11 +374,11 @@ impl PrivateErScenario for ActivationSingleShot {
             "the er must stop cleanly before the checkpointed restart"
         )?;
         let er = private.ctx();
-        await_counter(
+        await_cell(
             er,
-            &counter,
+            &cell,
             applied,
-            "the restarted er serves the counter with the action applied",
+            "the restarted er serves the cell with the action applied",
             CLONE_TIMEOUT,
         )
         .await?;
@@ -386,7 +386,7 @@ impl PrivateErScenario for ActivationSingleShot {
             .await?;
         hold_steady(
             er,
-            &counter,
+            &cell,
             applied,
             RECOVERY_WINDOW,
             "after the checkpointed restart",
@@ -403,7 +403,7 @@ impl PrivateErScenario for ActivationSingleShot {
             true,
         )
         .await?;
-        hold_steady(er, &counter, applied, STEADY_WINDOW, "after the rescue").await?;
+        hold_steady(er, &cell, applied, STEADY_WINDOW, "after the rescue").await?;
 
         proxies.finish()?;
         private.finish().await?;

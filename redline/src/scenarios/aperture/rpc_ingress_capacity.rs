@@ -5,12 +5,13 @@ use pubkey::Pubkey;
 use redsuite_core::{
     check, check_eq, prep,
     profile::ProfileValues,
+    programs::REDLINE,
     redline::{execute_kernel, Accounts},
     report::Unit,
     runner::{Pacing, ThreadRunConfig},
     BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
 };
-use tokio::{time, time::Instant};
+use tokio::time::{self, Instant};
 use tracing::{debug, warn};
 
 use crate::{metrics, ACCOUNT_SPACE};
@@ -55,14 +56,14 @@ const FULL: Profile = Profile {
 
 const PROFILES: ProfileValues<Profile> = ProfileValues { lite: LITE, full: FULL };
 
-pub struct RpcCapacityBlast {
+pub struct RpcIngressCapacity {
     er: ErCtx,
     profile: &'static Profile,
     prep_payers: Vec<Keypair>,
     pool: Arc<Vec<Pubkey>>,
 }
 
-impl Scenario<ScenarioReport> for RpcCapacityBlast {
+impl Scenario<ScenarioReport> for RpcIngressCapacity {
     async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
         let profile = PROFILES.select(base.config().profile);
         let prep_payers = base.funded_payers(profile.payers, PREP_PAYER_LAMPORTS).await?;
@@ -90,12 +91,7 @@ impl Scenario<ScenarioReport> for RpcCapacityBlast {
             er.api().url().clone(),
             prep::payer_bytes(&prep_payers),
             0,
-            move |id| {
-                crate::program::instruction::build::simple_byte_set(
-                    id,
-                    &[pool[(id as usize) % pool.len()]],
-                )
-            },
+            move |id| REDLINE.write(id, &[pool[(id as usize) % pool.len()]]),
             None,
         )?;
         if let Some(ledger_txs_before) = before.get(metrics::ENGINE_TRANSACTIONS) {
@@ -133,7 +129,7 @@ impl Scenario<ScenarioReport> for RpcCapacityBlast {
 
         Ok(ScenarioReport::ok()
             .setting("profile", profile.name)
-            .setting("shape", "write 1/tx byte-set over hot pool")
+            .setting("shape", "write 1/tx pattern write over hot pool")
             .setting("threads", threads)
             .setting("payers", profile.payers)
             .setting("accounts", profile.accounts)

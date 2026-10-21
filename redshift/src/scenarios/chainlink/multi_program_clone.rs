@@ -4,10 +4,12 @@ use instruction::Instruction;
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    check, check::CheckError, check_eq, topology, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
+    check, check_eq,
+    programs::{CellHeader, Redline, REDLINE},
+    topology, BaseCtx, ChainCtx, CheckError, ErCtx, Result, Scenario,
 };
 
-use crate::{program::instruction::build, ACCOUNT_SPACE, PAYER_LAMPORTS};
+use crate::{ACCOUNT_SPACE, PAYER_LAMPORTS};
 
 const WRITES: [u64; 2] = [61, 62];
 
@@ -23,14 +25,14 @@ impl Scenario for MultiProgramClone {
 
         let payer = base.funded_payer(PAYER_LAMPORTS).await?;
         let first_pda = base
-            .redline(&payer)
+            .cells(REDLINE, &payer)
             .at(first_program)
-            .init_delegated(ACCOUNT_SPACE, er.identity(), 0)
+            .create_delegated(ACCOUNT_SPACE, er.identity(), 0)
             .await?;
         let second_pda = base
-            .redline(&payer)
+            .cells(REDLINE, &payer)
             .at(second_program)
-            .init_delegated(ACCOUNT_SPACE, er.identity(), 1)
+            .create_delegated(ACCOUNT_SPACE, er.identity(), 1)
             .await?;
 
         Ok(Self {
@@ -44,7 +46,7 @@ impl Scenario for MultiProgramClone {
         let Self { er, payer, accounts } = self;
         let writes: [Instruction; 2] = std::array::from_fn(|index| {
             let (program, account) = accounts[index];
-            build::simple_byte_set_at(program, WRITES[index], &[account])
+            Redline::at(program).write(WRITES[index], &[account])
         });
         er.submit_and_confirm(&payer, &writes).await?;
 
@@ -65,7 +67,7 @@ impl Scenario for MultiProgramClone {
                 .await?
                 .ok_or_else(|| format!("account {key} missing on the ER"))?;
             check_eq!(
-                crate::written_id(&clone.data),
+                CellHeader::written_id(&clone.data),
                 Some(expected),
                 "program write to {key}"
             )?;

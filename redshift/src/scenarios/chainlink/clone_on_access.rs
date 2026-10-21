@@ -6,8 +6,9 @@ use std::{
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    check, check_eq, dlp,
-    dlp::{commit_state, finalize, undelegate, CommitStateArgs},
+    check, check_eq,
+    dlp::{self, commit_state, finalize, undelegate, CommitStateArgs},
+    programs::{CellHeader, SettlementMode, REDLINE},
     system, topology, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
 use signer::Signer;
@@ -122,8 +123,8 @@ impl Scenario for CloneOnAccess {
         .await?;
 
         crate::phase("plain clone", async {
-            let plain = base.redline(&payer).init(ACCOUNT_SPACE, identity, 0).await?;
-            base.redline(&payer).write(PRE_CLONE_WRITE, &[plain]).await?;
+            let plain = base.cells(REDLINE, &payer).create(ACCOUNT_SPACE, identity, 0).await?;
+            base.cells(REDLINE, &payer).write(PRE_CLONE_WRITE, &[plain]).await?;
             check::poll(
                 "the ER clones the plain account on first access",
                 CLONE_TIMEOUT,
@@ -147,21 +148,21 @@ impl Scenario for CloneOnAccess {
                 "an undelegated clone must keep its base owner"
             )?;
             check_eq!(
-                crate::written_id(&plain_clone.data),
+                CellHeader::written_id(&plain_clone.data),
                 Some(PRE_CLONE_WRITE),
                 "the first ER access must observe the state written on base before cloning"
             )?;
-            base.redline(&payer).write(POST_CLONE_WRITE, &[plain]).await?;
+            base.cells(REDLINE, &payer).write(POST_CLONE_WRITE, &[plain]).await?;
             check::poll(
                 "the base write propagates to the existing ER clone",
                 PROPAGATION_TIMEOUT,
                 || async {
-                    matches!(er.account(&plain).await, Ok(Some(clone)) if crate::written_id(&clone.data) == Some(POST_CLONE_WRITE))
+                    matches!(er.account(&plain).await, Ok(Some(clone)) if CellHeader::written_id(&clone.data) == Some(POST_CLONE_WRITE))
                 },
             )
             .await?;
             let undelegated_write =
-                er.redline(&payer).write(UNDELEGATED_WRITE, &[plain]).await;
+                er.cells(REDLINE, &payer).write(UNDELEGATED_WRITE, &[plain]).await;
             check!(
                 undelegated_write.is_err(),
                 "the ER must reject a write to an undelegated clone, got {undelegated_write:?}"
@@ -171,8 +172,10 @@ impl Scenario for CloneOnAccess {
         .await?;
 
         let (accounts, snapshot) = crate::phase("delegated write", async {
-            let delegated = base.redline(&payer).init_delegated(ACCOUNT_SPACE, identity, 1).await?;
-            let sibling = base.redline(&payer).init_delegated(ACCOUNT_SPACE, identity, 2).await?;
+            let delegated =
+                base.cells(REDLINE, &payer).create_delegated(ACCOUNT_SPACE, identity, 1).await?;
+            let sibling =
+                base.cells(REDLINE, &payer).create_delegated(ACCOUNT_SPACE, identity, 2).await?;
             let accounts = [delegated, sibling];
             for pda in &accounts {
                 let on_base = base.account(pda).await?.ok_or("delegated pda missing on base")?;
@@ -190,14 +193,14 @@ impl Scenario for CloneOnAccess {
                 crate::program::id(),
                 "the ER must present a delegated account as owned by its program"
             )?;
-            er.redline(&payer).write(ER_WRITE, &accounts).await?;
+            er.cells(REDLINE, &payer).write(ER_WRITE, &accounts).await?;
             let snapshot = er
                 .account(&delegated)
                 .await?
                 .ok_or("delegated clone vanished after the ER write")?
                 .data;
             check_eq!(
-                crate::written_id(&snapshot),
+                CellHeader::written_id(&snapshot),
                 Some(ER_WRITE),
                 "the ER copy of a delegated account must accept program writes"
             )?;
@@ -214,7 +217,10 @@ impl Scenario for CloneOnAccess {
         let [delegated, sibling] = accounts;
 
         crate::phase("commit", async {
-            let signature = er.redline(&payer).commit(1, &accounts[..1]).await?;
+            let signature = er
+                .cells(REDLINE, &payer)
+                .settle(1, &accounts[..1], SettlementMode::Commit)
+                .await?;
             let receipt = er.check_commit(&base, &signature, &accounts[..1], false).await?;
             if !receipt.failure_is_duplicate_rejection() {
                 check_eq!(
@@ -249,7 +255,7 @@ impl Scenario for CloneOnAccess {
         let wallet = base.delegated_payer(&payer, identity, WALLET_LAMPORTS).await?;
 
         crate::phase("undelegate", async {
-            er.redline(&payer).write(SECOND_WRITE, &accounts).await?;
+            er.cells(REDLINE, &payer).write(SECOND_WRITE, &accounts).await?;
             let mut finals = Vec::new();
             for pda in &accounts {
                 finals.push(
@@ -259,11 +265,14 @@ impl Scenario for CloneOnAccess {
                 );
             }
             check_eq!(
-                crate::written_id(&finals[0].data),
+                CellHeader::written_id(&finals[0].data),
                 Some(SECOND_WRITE),
                 "the second er write must land before the undelegating commit"
             )?;
-            let signature = er.redline(&payer).commit_and_undelegate(2, &accounts).await?;
+            let signature = er
+                .cells(REDLINE, &payer)
+                .settle(2, &accounts, SettlementMode::Undelegate)
+                .await?;
             let receipt = er.check_commit(&base, &signature, &accounts, true).await?;
             if !receipt.failure_is_duplicate_rejection() {
                 check!(
@@ -294,16 +303,13 @@ impl Scenario for CloneOnAccess {
             )
             .await?;
             let write_after_undelegate =
-                er.redline(&wallet).write(LOCKOUT_WRITE, &[delegated]).await;
-            check!(
-                write_after_undelegate.is_err(),
-                "the ER copy of an undelegated account must reject writes \
-                 (locked out after undelegation), got {write_after_undelegate:?}"
-            )?;
+                er.cells(REDLINE, &wallet).write(LOCKOUT_WRITE, &[delegated]).await;
+            let error =
+                check::expect_error(write_after_undelegate, "ER write locked after undelegation")?;
             crate::rejection_code(
                 "the write after undelegation",
                 &LOCKOUT_REJECTIONS,
-                &format!("{:?}", write_after_undelegate.unwrap_err()),
+                &format!("{error:?}"),
             )?;
             Ok(())
         })

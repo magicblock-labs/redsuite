@@ -4,7 +4,8 @@ use pubkey::Pubkey;
 use redsuite_core::{
     check_eq,
     profile::{LoopMode, ProfileValues},
-    redline::{copy_three, Accounts},
+    programs::{CellHeader, REDLINE},
+    redline::Accounts,
     report::Unit,
     runner::{execute, execute_and_sync, Pacing, RunConfig},
     transport::{
@@ -87,7 +88,7 @@ impl Scenario<ScenarioReport> for WarmIngress {
             },
             |id| {
                 let sender = senders[(id as usize) % senders.len()].clone();
-                let (ix, _) = copy_three(&pdas, id);
+                let (ix, _) = REDLINE.copy_three(&pdas, id);
                 sender.staged([ix])
             },
         )
@@ -102,7 +103,7 @@ impl Scenario<ScenarioReport> for WarmIngress {
         let offset = profile.warmup;
         let clock = Arc::new(SendClock::new(offset + 1, profile.iterations as usize));
         let updates = Rc::new(
-            AccountUpdates::connect(er.ws_url(), crate::account_update_id, clock.clone()).await?,
+            AccountUpdates::connect(er.ws_url(), CellHeader::written_id, clock.clone()).await?,
         );
         for pda in &pdas {
             updates.account_subscribe(pda).await?;
@@ -116,7 +117,7 @@ impl Scenario<ScenarioReport> for WarmIngress {
         let request = |iteration: u64| {
             let id = offset + iteration;
             let sender = senders[(id as usize) % senders.len()].clone();
-            let (ix, [tracked_dest, _]) = copy_three(&pdas, id);
+            let (ix, [tracked_dest, _]) = REDLINE.copy_three(&pdas, id);
             updates.track(id, tracked_dest);
             let sigs = sigs.clone();
             let clock = clock.clone();
@@ -213,13 +214,13 @@ impl Scenario<ScenarioReport> for WarmIngress {
         for (idx, pda) in pdas.iter().enumerate() {
             let last_id = (offset + 1..=offset + profile.iterations)
                 .rev()
-                .find(|&id| copy_three(&pdas, id).1.contains(pda));
+                .find(|&id| REDLINE.copy_three(&pdas, id).1.contains(pda));
             let Some(last_id) = last_id else {
                 continue;
             };
             let on_er = er.account(pda).await?.ok_or("pda not on er")?;
             check_eq!(
-                crate::account_update_id(&on_er.data),
+                CellHeader::written_id(&on_er.data),
                 Some(last_id),
                 "er copy must hold the last id written to pda {idx}"
             )?;

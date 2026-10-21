@@ -5,18 +5,17 @@ use futures_util::{future::try_join_all, TryFutureExt};
 use instruction::{AccountMeta, Instruction};
 use json::Value;
 use keypair::Keypair;
-use magic_api::instruction::{
-    MagicBlockInstruction,
-    MagicBlockInstruction::{
-        CloseEphemeralAccount as Close, CreateEphemeralAccount as Create,
-        ResizeEphemeralAccount as Resize,
-    },
+use magic_api::instruction::MagicBlockInstruction::{
+    self, CloseEphemeralAccount as Close, CreateEphemeralAccount as Create,
+    ResizeEphemeralAccount as Resize,
 };
 use pubkey::Pubkey;
-use redshift_interface::{ephemeral_cpi, log_msg_data, schedulecommit::build};
+
 use redsuite_core::{
-    api::TransactionInfo, check, check_eq, dlp, phase, receipt, system, topology, BaseCtx,
-    ChainCtx, ErCtx, Result, Scenario,
+    api::TransactionInfo,
+    check, check_eq, dlp, phase,
+    programs::{Redshift, SettlementMode, MAGIC, REDSHIFT},
+    receipt, system, topology, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
 use sdk::{consts::EPHEMERAL_VAULT_ID, ephemeral_accounts::rent};
 use signer::Signer;
@@ -67,9 +66,12 @@ impl Action {
         if self.caller == magic_api::id() {
             return native;
         }
-        let mut ix = ephemeral_cpi(native, self.fill);
-        ix.program_id = self.caller;
-        ix
+        let observed = [keys[TARGET], keys[SPONSOR], keys[VAULT]];
+        let mut batch = Redshift::at(self.caller).batch().observe(&observed).invoke(native);
+        if self.fill != 0 {
+            batch = batch.fill_bytes(keys[TARGET], self.fill);
+        }
+        batch.observe(&observed).build()
     }
 
     fn apply(&self, state: &mut [Account]) -> Option<&'static str> {
@@ -120,17 +122,20 @@ fn error(index: usize, name: &str) -> Value {
     json::json!({"InstructionError": [index, name]})
 }
 
-fn observation(state: &[Account]) -> String {
-    let account = &state[TARGET];
-    format!(
-        "{} {} {} {} {} {}",
-        account.owner,
-        account.data.len(),
-        account.lamports,
-        state[SPONSOR].lamports,
-        state[VAULT].lamports,
-        check::content_hash(&account.data),
-    )
+fn observation(state: &[Account]) -> Vec<String> {
+    [TARGET, SPONSOR, VAULT]
+        .into_iter()
+        .map(|index| {
+            let account = &state[index];
+            format!(
+                "{} {} {} {}",
+                account.owner,
+                account.data.len(),
+                account.lamports,
+                check::content_hash(&account.data)
+            )
+        })
+        .collect()
 }
 
 async fn state(er: &ErCtx, keys: &[Pubkey]) -> Result<Vec<Account>> {
@@ -190,11 +195,11 @@ impl Record {
                 .info
                 .logs
                 .iter()
-                .filter_map(|line| line.strip_prefix("Program log: Ephemeral: "))
+                .filter_map(|line| line.strip_prefix("Program log: CellObservation: "))
                 .collect();
             check_eq!(
                 observed,
-                [observation(before), observation(after)],
+                [observation(before), observation(after)].concat(),
                 "fixture account observations"
             )?;
         }
@@ -253,11 +258,7 @@ impl Workload<'_> {
 
     async fn prepare(&mut self, mut instructions: Vec<Instruction>) -> Result<Transaction> {
         self.nonce += 1;
-        instructions.push(Instruction {
-            program_id: redshift_interface::id(),
-            accounts: vec![],
-            data: log_msg_data(&self.nonce.to_string()),
-        });
+        instructions.push(REDSHIFT.batch().nonce(self.nonce as u64).build());
         let mut tx = Transaction::new_with_payer(&instructions, Some(&self.keys[PAYER]));
         let required =
             &tx.message.account_keys[..tx.message.header.num_required_signatures as usize];
@@ -332,10 +333,11 @@ impl Scenario for EphemeralAccounts {
             let signature = er
                 .submit_and_confirm(
                     payer,
-                    &[build::direct_schedule_commit(
+                    &[MAGIC.commit(
                         payer.pubkey(),
                         Some(vault),
                         &[payer.pubkey()],
+                        SettlementMode::Commit,
                     )],
                 )
                 .await?;
@@ -376,12 +378,8 @@ impl Scenario for EphemeralAccounts {
                     &[system::transfer(&funder.pubkey(), &funder.pubkey(), 1)],
                 )
                 .await;
-            check!(
-                fee_only.is_err(),
-                "a non-delegated payer must not pay ER fees for a tx touching \
-                 no delegated account"
-            )?;
-            let fee_error = format!("{:?}", fee_only.unwrap_err());
+            let error = check::expect_error(fee_only, "non-delegated payer rejected by fee gate")?;
+            let fee_error = format!("{error:?}");
             check!(
                 fee_error.contains("InvalidAccountForFee") || fee_error.contains("Immutable"),
                 "expected InvalidAccountForFee or Immutable for the \

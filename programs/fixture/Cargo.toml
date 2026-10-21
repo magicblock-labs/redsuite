@@ -1,0 +1,18 @@
+[package]
+name = "fixture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+pubkey.workspace = true
+instruction.workspace = true
+sdk = { workspace = true, features = ["instruction"] }
+sdk-ids.workspace = true
+solana-program.workspace = true
+system-interface.workspace = true
+magic-api.workspace = true
+wincode.workspace = true
+bincode.workspace = true
+sha2.workspace = true

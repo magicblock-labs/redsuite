@@ -6,8 +6,8 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+magic-api.workspace = true
 tracing = { workspace = true }
-borsh = { workspace = true }
 tokio = { workspace = true }
 futures-util = { workspace = true }
 serde = { workspace = true }
@@ -16,7 +16,6 @@ redsuite-core = { workspace = true }
 url = { workspace = true }
 redline-interface = { workspace = true }
 redshift-interface = { workspace = true }
-upgrade-probe = { workspace = true, features = ["no-entrypoint"] }
 instruction = { workspace = true }
 pubkey = { workspace = true }
 hash = { workspace = true }

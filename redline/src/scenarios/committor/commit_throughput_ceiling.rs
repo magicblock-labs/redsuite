@@ -9,6 +9,7 @@ use redsuite_core::{
     check, check_eq,
     monitor::{self, MonitorSpec},
     profile::ProfileValues,
+    programs::{SettlementMode, REDLINE},
     redline::Accounts,
     report::Unit,
     runner::{execute, Pacing, RunConfig, RunOutcome, SendTransaction},
@@ -18,8 +19,6 @@ use signature::Signature;
 use signer::Signer;
 use tokio::time;
 use tracing::{debug, warn};
-
-use crate::program::instruction::build;
 
 const COMMIT_WIDTH: usize = 8;
 const ACCOUNT_SPACE: u32 = 40;
@@ -83,7 +82,11 @@ async fn deliver_commits(
     let request = |iteration: u64| {
         let id = first_id + iteration;
         let accounts = &sets[(iteration - 1) as usize];
-        let ix = build::commit_accounts(id, payer_pubkey, accounts);
+        let ix = REDLINE
+            .batch()
+            .nonce(id)
+            .settle(payer_pubkey, accounts, SettlementMode::Commit)
+            .build();
         let sender = sender.clone();
         let delivered = delivered.clone();
         async move {

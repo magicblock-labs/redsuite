@@ -9,12 +9,12 @@ use pubkey::Pubkey;
 use redsuite_core::{
     check_eq,
     profile::ProfileValues,
+    programs::REDLINE,
     redline::Accounts,
     report::Unit,
     runner::{execute, Pacing, RunConfig, RunOutcome, SendTransaction, REQUEST_ORIGIN},
     stats::{ObservationsStats, StreamingStats},
-    topology,
-    topology::ErOptions,
+    topology::{self, ErOptions},
     BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport, TxSender,
 };
 use tracing::{debug, warn};
@@ -103,8 +103,7 @@ async fn burst_cell(
 
     if prewarm_deps {
         for sender in &senders {
-            let warm_ix =
-                crate::program::instruction::build::read_accounts_data(0, &[prewarm_account]);
+            let warm_ix = REDLINE.inspect(&[prewarm_account]);
             sender.submit(&[warm_ix]).await?;
         }
     }
@@ -114,7 +113,7 @@ async fn burst_cell(
     let request = |id: u64| {
         let sender = senders[(id as usize) % senders.len()].clone();
         let account = pool[(id as usize - 1) % pool.len()];
-        let ix = crate::program::instruction::build::read_accounts_data(id, &[account]);
+        let ix = REDLINE.inspect(&[account]);
         let slow = slow.clone();
         async move {
             let tx = sender.prepare(&[ix]).await?;

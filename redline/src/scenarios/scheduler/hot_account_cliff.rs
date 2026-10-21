@@ -4,7 +4,8 @@ use pubkey::Pubkey;
 use redsuite_core::{
     check_eq, prep,
     profile::ProfileValues,
-    redline::{copy_three, execute_kernel, Accounts},
+    programs::REDLINE,
+    redline::{execute_kernel, Accounts},
     report::Unit,
     runner::{Pacing, RunOutcome, ThreadRunConfig},
     BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
@@ -75,7 +76,7 @@ fn execute_cell(
         er_rpc_url,
         payer_bytes,
         id_offset,
-        move |id| copy_three(&hot_set, id).0,
+        move |id| REDLINE.copy_three(&hot_set, id).0,
         None,
     )
 }

@@ -3,6 +3,7 @@ use std::{rc::Rc, time::Duration};
 use redsuite_core::{
     check,
     netfault::{Action, BaseProxies, Selector},
+    programs::{CellId, SettlementMode, REDLINE},
     topology::{self, ErOptions, PrivateEr},
     BaseCtx, ChainCtx, PrivateErScenario, Result,
 };
@@ -10,10 +11,7 @@ use signer::Signer;
 use tokio::time::Instant;
 
 use super::{await_local_value, BASE_REFRESH, BASE_REWRITE, ER_WRITE, FETCHES};
-use crate::{
-    program::{self, instruction::build},
-    ACCOUNT_OWNERS, ACCOUNT_SPACE, PAYER_LAMPORTS,
-};
+use crate::{program, ACCOUNT_OWNERS, ACCOUNT_SPACE, PAYER_LAMPORTS};
 
 const LABEL: &str = "grpc-redundancy";
 const TIMEOUT: Duration = Duration::from_secs(30);
@@ -59,18 +57,23 @@ impl PrivateErScenario for GrpcRedundancy {
         let payer = shared.delegated_payer(&funder, validator, PAYER_LAMPORTS).await?;
 
         let keys = shared
-            .redline(&funder)
-            .init_many(ACCOUNT_SPACE, validator, CLONED_COUNT + PENDING_COUNT)
+            .cells(REDLINE, &funder)
+            .create_many(ACCOUNT_SPACE, validator, CLONED_COUNT + PENDING_COUNT)
             .await?;
         let (cloned, pending) = keys.split_at(CLONED_COUNT);
-        let delegates: Vec<_> = pending
-            .iter()
-            .zip(CLONED_COUNT as u8..)
-            .map(|(&key, seed)| build::delegate(owner, key, owner, seed, validator))
+        let delegates: Vec<_> = (CLONED_COUNT..keys.len())
+            .map(|index| {
+                REDLINE.delegate(
+                    owner,
+                    CellId::new(owner, index as u64),
+                    Some(validator),
+                    u32::MAX,
+                )
+            })
             .collect();
         shared.submit_and_confirm(&funder, &delegates).await?;
         er.accounts(&keys).await?;
-        er.redline(&payer).write(ER_WRITE, pending).await?;
+        er.cells(REDLINE, &payer).write(ER_WRITE, pending).await?;
         check!(
             er.local_accounts(&ACCOUNT_OWNERS, pending)
                 .await?
@@ -83,7 +86,11 @@ impl PrivateErScenario for GrpcRedundancy {
             http.stall(Selector::method("sendTransaction").request().account(&pending[0]));
         er.submit_and_confirm(
             &funder,
-            &[build::commit_and_undelegate_accounts(1, owner, pending)],
+            &[REDLINE
+                .batch()
+                .nonce(1)
+                .settle(owner, pending, SettlementMode::Undelegate)
+                .build()],
         )
         .await?;
         check::poll("undelegation submission held", TIMEOUT, || async {
@@ -110,8 +117,8 @@ impl PrivateErScenario for GrpcRedundancy {
             Result::Ok(())
         })
         .await?;
-        shared.redline(&funder).write(BASE_REWRITE, pending).await?;
-        shared.redline(&funder).write(BASE_REFRESH, cloned).await?;
+        shared.cells(REDLINE, &funder).write(BASE_REWRITE, pending).await?;
+        shared.cells(REDLINE, &funder).write(BASE_REFRESH, cloned).await?;
 
         let refresh_started = Instant::now();
         await_local_value(

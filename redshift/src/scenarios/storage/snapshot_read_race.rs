@@ -6,30 +6,29 @@ use std::{
 
 use keypair::Keypair;
 use pubkey::Pubkey;
-use redshift_interface::{schedulecommit, schedulecommit::build};
+
 use redsuite_core::{
-    check, check_eq, prep, topology,
-    topology::{ErOptions, PrivateEr, RestartConfig},
+    cells::OwnedCell,
+    check, check_eq,
+    programs::REDSHIFT,
+    topology::{self, ErOptions, PrivateEr, RestartConfig},
     Api, BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result,
 };
 use signer::Signer;
 use tokio::{task::JoinHandle, time};
 
+use crate::LARGE_ACCOUNT_SPACE;
+
 const LABEL: &str = "snapshot-read-race";
 const SUPERBLOCK_SLOTS: u64 = 10;
-const BOOKS: usize = 8;
-const GROW_BYTES: u64 = 32;
-const GROW_VARIANTS: u64 = 64;
+const ACCOUNTS: usize = 8;
+const GROW_BYTES: u32 = 32;
+const GROW_VARIANTS: usize = 64;
 const PAYER_LAMPORTS: u64 = 10_000_000_000;
 const GROW_INTERVAL: Duration = Duration::from_millis(40);
 const CHURN_BEFORE_RESTART: Duration = Duration::from_secs(6);
 const CHURN_AFTER_RESTART: Duration = Duration::from_secs(12);
 const CLONE_TIMEOUT: Duration = Duration::from_secs(20);
-
-struct Book {
-    manager: Keypair,
-    address: Pubkey,
-}
 
 struct Readers {
     stop: Rc<Cell<bool>>,
@@ -79,54 +78,32 @@ impl Readers {
     }
 }
 
-async fn delegate_books(base: &BaseCtx, er: &ErCtx, payer: &Keypair) -> Result<Vec<Book>> {
-    let mut books = Vec::with_capacity(BOOKS);
-    for _ in 0..BOOKS {
-        let manager = Keypair::new();
-        let (init, address) = build::init_order_book(payer.pubkey(), manager.pubkey());
-        let delegate = build::delegate_order_book(
-            payer.pubkey(),
-            manager.pubkey(),
-            prep::COMMIT_FREQUENCY_MS,
-            Some(er.identity()),
-        );
-        base.submit_and_confirm_with(payer, &[&manager], &[init, delegate]).await?;
-        books.push(Book { manager, address });
-    }
-    let addresses: Vec<_> = books.iter().map(|book| book.address).collect();
-    er.await_clones(
-        &addresses,
-        schedulecommit::ORDER_BOOK_INIT_SIZE,
-        CLONE_TIMEOUT,
-    )
-    .await?;
-    Ok(books)
-}
-
 async fn churn(
     er: &ErCtx,
     payer: &Keypair,
-    books: &[Book],
-    sizes: &mut [u64],
+    accounts: &[OwnedCell],
+    sizes: &mut [u32],
     duration: Duration,
     phase: &str,
 ) -> Result<()> {
     let started = Instant::now();
-    let mut grows = 0u64;
+    let mut grows = 0usize;
     while started.elapsed() < duration {
-        let index = grows as usize % books.len();
-        let book = &books[index];
-        let bytes = GROW_BYTES + (grows / books.len() as u64) % GROW_VARIANTS;
-        let grow = build::grow_order_book(payer.pubkey(), book.manager.pubkey(), bytes);
-        let submitted = er.submit_and_confirm(payer, &[grow]).await;
+        let index = grows % accounts.len();
+        let bytes = GROW_BYTES + ((grows / accounts.len()) % GROW_VARIANTS) as u32;
+        let space = sizes[index] + bytes;
+        let resize = REDSHIFT.resize(
+            payer.pubkey(),
+            REDSHIFT.primary(accounts[index].authority.pubkey()),
+            space,
+        );
+        let submitted = er.submit_and_confirm(payer, &[resize]).await;
         check!(
             submitted.is_ok(),
-            "{phase}: growing order book {} must succeed after {grows} \
-             grows: {}",
-            book.address,
+            "{phase}: resizing account {index} must succeed after {grows} grows: {}",
             submitted.err().map(|e| e.to_string()).unwrap_or_default()
         )?;
-        sizes[index] += bytes;
+        sizes[index] = space;
         grows += 1;
         time::sleep(GROW_INTERVAL).await;
     }
@@ -159,28 +136,29 @@ impl PrivateErScenario for SnapshotReadRace {
 
     async fn run(self) -> Result<()> {
         let Self { base, mut private, payer } = self;
-        let books;
-        let mut sizes = vec![schedulecommit::ORDER_BOOK_INIT_SIZE as u64; BOOKS];
-        {
-            let er = private.ctx();
-            er.await_program_clone(&redshift_interface::id(), CLONE_TIMEOUT).await?;
-            books = delegate_books(&base, er, &payer).await?;
-            let sponsor = base.funded_payer(crate::PAYER_LAMPORTS).await?;
-            base.delegate_payer(&sponsor, &payer, er.identity()).await?;
-            let addresses: Vec<Pubkey> = books.iter().map(|book| book.address).collect();
-
-            let readers = Readers::start(er.api().clone(), addresses.clone());
-            churn(
-                er,
-                &payer,
-                &books,
-                &mut sizes,
-                CHURN_BEFORE_RESTART,
-                "before restart",
-            )
+        let mut sizes = vec![LARGE_ACCOUNT_SPACE; ACCOUNTS];
+        let er = private.ctx();
+        er.await_program_clone(&redshift_interface::id(), CLONE_TIMEOUT).await?;
+        let accounts = base
+            .cells(REDSHIFT, &payer)
+            .create_owned_sized(er.identity(), ACCOUNTS, LARGE_ACCOUNT_SPACE)
             .await?;
-            readers.stop("before restart").await?;
-        }
+        let addresses: Vec<_> = accounts.iter().map(|account| account.address).collect();
+        er.await_clones(&addresses, LARGE_ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
+        let sponsor = base.funded_payer(crate::PAYER_LAMPORTS).await?;
+        base.delegate_payer(&sponsor, &payer, er.identity()).await?;
+
+        let readers = Readers::start(er.api().clone(), addresses.clone());
+        churn(
+            er,
+            &payer,
+            &accounts,
+            &mut sizes,
+            CHURN_BEFORE_RESTART,
+            "before restart",
+        )
+        .await?;
+        readers.stop("before restart").await?;
 
         let timing = private.restart(RestartConfig::default()).await?;
         check_eq!(
@@ -190,12 +168,11 @@ impl PrivateErScenario for SnapshotReadRace {
         )?;
 
         let er = private.ctx();
-        let addresses: Vec<Pubkey> = books.iter().map(|book| book.address).collect();
         let readers = Readers::start(er.api().clone(), addresses.clone());
         churn(
             er,
             &payer,
-            &books,
+            &accounts,
             &mut sizes,
             CHURN_AFTER_RESTART,
             "after restart",
@@ -203,16 +180,16 @@ impl PrivateErScenario for SnapshotReadRace {
         .await?;
         readers.stop("after restart").await?;
 
-        let observed: Vec<u64> = er
+        let observed: Vec<u32> = er
             .accounts(&addresses)
             .await?
             .into_iter()
-            .map(|account| account.map_or(0, |a| a.data.len() as u64))
+            .map(|account| account.map_or(0, |a| a.data.len() as u32))
             .collect();
         check_eq!(
             observed,
             sizes,
-            "every order book must reflect all of its grows"
+            "every account must retain its resized length"
         )?;
         private.finish().await?;
         Ok(())

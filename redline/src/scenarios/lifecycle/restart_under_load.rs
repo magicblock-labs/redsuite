@@ -12,17 +12,17 @@ use pubkey::Pubkey;
 use redsuite_core::{
     check, check_eq, host,
     profile::ProfileValues,
+    programs::{CellHeader, Redline},
     redline::{causal, Accounts},
     report::Unit,
-    topology,
-    topology::{ErOptions, RestartConfig, RestartTiming},
+    topology::{self, ErOptions, RestartConfig, RestartTiming},
     Api, BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result, ScenarioReport, TxSender,
 };
 use signature::Signature;
 use tokio::{task::JoinSet, time};
 use tracing::debug;
 
-use crate::{program::instruction::build, ACCOUNT_SPACE};
+use crate::ACCOUNT_SPACE;
 
 const PREP_PAYER_LAMPORTS: u64 = 4_000_000_000;
 const CLONE_TIMEOUT: Duration = Duration::from_secs(40);
@@ -186,13 +186,8 @@ impl LaneState {
     async fn send(&self, lane: usize, account: Pubkey, sender: &TxSender) -> Result<()> {
         let id = self.next_id.get();
         self.next_id.set(id + 1);
-        let ix = build::expensive_hash_compute_at(
-            PROGRAM,
-            id,
-            causal::HASH_INIT,
-            HASH_ITERS,
-            &[account],
-        );
+        let ix =
+            Redline::at(PROGRAM).hash(id, causal::HASH_INIT.to_bytes(), HASH_ITERS, &[account]);
         let tx = sender.prepare(&[ix]).await?;
         let signature = tx.signatures[0];
         let index = {
@@ -333,7 +328,7 @@ async fn check_state(er: &ErCtx, label: &str, pool: &[Pubkey], records: &[Record
             .account(pda)
             .await?
             .ok_or_else(|| format!("{label}: account {pda} missing on the er"))?;
-        let on_chain = crate::account_update_id(&account.data)
+        let on_chain = CellHeader::written_id(&account.data)
             .ok_or_else(|| format!("{label}: account {pda} data too short"))?;
         check_eq!(
             on_chain,

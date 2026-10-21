@@ -14,7 +14,7 @@ use redsuite_core::{
 pub fn catalog() -> Vec<ScenarioEntry> {
     vec![
         scenario!(
-            aperture::simple_load::SimpleLoad,
+            aperture::account_write_latency::AccountWriteLatency,
             exclusive(&DEFAULT, &[Fixture::RedlineProgram], ())
         ),
         scenario!(
@@ -23,11 +23,11 @@ pub fn catalog() -> Vec<ScenarioEntry> {
         )
         .named("rpc_warm_ingress"),
         scenario!(
-            aperture::rpc_capacity_blast::RpcCapacityBlast,
+            aperture::rpc_ingress_capacity::RpcIngressCapacity,
             exclusive(&DEFAULT, &[Fixture::RedlineProgram], ())
         ),
         scenario!(
-            aperture::high_cu::HighCu,
+            aperture::compute_cost_throughput::ComputeCostThroughput,
             exclusive(&DEFAULT, &[Fixture::RedlineProgram], ())
         ),
         scenario!(
@@ -35,7 +35,7 @@ pub fn catalog() -> Vec<ScenarioEntry> {
             exclusive(&DEFAULT, &[Fixture::RedlineProgram], ())
         ),
         scenario!(
-            aperture::ws_conn_capacity::WsConnCapacity,
+            aperture::ws_connection_capacity::WsConnectionCapacity,
             exclusive(&DEFAULT, &[], ())
         ),
         scenario!(

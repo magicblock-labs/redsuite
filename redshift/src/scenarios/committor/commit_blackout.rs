@@ -6,8 +6,8 @@ use std::{
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    check, check_eq, netfault::Selector, receipt, BaseCtx, ChainCtx, CheckError, ErCtx, Result,
-    Scenario,
+    check, check_eq, netfault::Selector, programs::REDLINE, receipt, BaseCtx, ChainCtx, CheckError,
+    ErCtx, Result, Scenario,
 };
 use signature::Signature;
 use tokio::time;
@@ -26,15 +26,14 @@ const SUBMISSION_WRITE: u64 = 41;
 const CONFIRMATION_WRITE: u64 = 42;
 const RECONNECT_WRITE: u64 = 43;
 
-struct Commit {
-    account: Pubkey,
-    snapshot: Vec<u8>,
-    signature: Signature,
-}
-
-async fn await_convergence(base: &BaseCtx, er: &ErCtx, commit: &Commit) -> Result<()> {
-    let receipt =
-        receipt::fetch_commit_receipt(er.api(), &commit.signature, RECEIPT_TIMEOUT).await?;
+async fn await_convergence(
+    base: &BaseCtx,
+    er: &ErCtx,
+    account: &Pubkey,
+    snapshot: &[u8],
+    signature: &Signature,
+) -> Result<()> {
+    let receipt = receipt::fetch_commit_receipt(er.api(), signature, RECEIPT_TIMEOUT).await?;
     match &receipt.error_message {
         Some(message) if receipt.failure_is_duplicate_rejection() => {
             receipt::warn_duplicate_rejection(message);
@@ -51,9 +50,7 @@ async fn await_convergence(base: &BaseCtx, er: &ErCtx, commit: &Commit) -> Resul
     check::poll(
         "the base copy still matches the er snapshot after convergence",
         BASE_STATE_TIMEOUT,
-        || async {
-            matches!(base.account(&commit.account).await, Ok(Some(acc)) if acc.data == commit.snapshot)
-        },
+        || async { matches!(base.account(account).await, Ok(Some(acc)) if acc.data == snapshot) },
     )
     .await?;
     Ok(())
@@ -62,7 +59,6 @@ async fn await_convergence(base: &BaseCtx, er: &ErCtx, commit: &Commit) -> Resul
 pub struct CommitBlackout {
     base: Rc<BaseCtx>,
     er: ErCtx,
-    identity: Pubkey,
     payer: Keypair,
     account: Pubkey,
 }
@@ -70,9 +66,11 @@ pub struct CommitBlackout {
 impl Scenario for CommitBlackout {
     async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
         er.proxies().ok_or(PROXIED_GROUP)?;
-        let identity = er.identity();
         let payer = base.funded_payer(PAYER_LAMPORTS).await?;
-        let account = base.redline(&payer).init_delegated(ACCOUNT_SPACE, identity, 0).await?;
+        let account = base
+            .cells(REDLINE, &payer)
+            .create_delegated(ACCOUNT_SPACE, er.identity(), 0)
+            .await?;
         let on_base = base.account(&account).await?.ok_or("pda not on base")?;
         check_eq!(
             on_base.owner,
@@ -81,23 +79,11 @@ impl Scenario for CommitBlackout {
         )?;
         er.await_clones(&[account], ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
 
-        Ok(Self {
-            base,
-            er,
-            identity,
-            payer,
-            account,
-        })
+        Ok(Self { base, er, payer, account })
     }
 
     async fn run(self) -> Result<()> {
-        let Self {
-            base,
-            er,
-            identity,
-            payer,
-            account,
-        } = self;
+        let Self { base, er, payer, account } = self;
         let proxies = er.proxies().ok_or(PROXIED_GROUP)?;
         let submission_trap = proxies
             .intercept(Selector::method("sendTransaction").http().response().account(&account));
@@ -107,16 +93,7 @@ impl Scenario for CommitBlackout {
         let base_signature = held.operation.signature()?;
         prove_landed(&base, &base_signature, &account, &snapshot).await?;
         held.discard();
-        await_convergence(
-            &base,
-            &er,
-            &Commit {
-                account,
-                snapshot,
-                signature: commit_signature,
-            },
-        )
-        .await?;
+        await_convergence(&base, &er, &account, &snapshot, &commit_signature).await?;
 
         let submission_probe = proxies
             .intercept(Selector::method("sendTransaction").http().response().account(&account));
@@ -155,19 +132,13 @@ impl Scenario for CommitBlackout {
         }
         held.release();
         status_blackout.remove();
-        await_convergence(
-            &base,
-            &er,
-            &Commit {
-                account,
-                snapshot,
-                signature: commit_signature,
-            },
-        )
-        .await?;
+        await_convergence(&base, &er, &account, &snapshot, &commit_signature).await?;
 
         proxies.close_connections();
-        let fresh = base.redline(&payer).init_delegated(ACCOUNT_SPACE, identity, 1).await?;
+        let fresh = base
+            .cells(REDLINE, &payer)
+            .create_delegated(ACCOUNT_SPACE, er.identity(), 1)
+            .await?;
         er.await_clones(&[fresh], ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
         let (snapshot, commit_signature) =
             write_and_commit(&er, &payer, 3, RECONNECT_WRITE, &fresh).await?;

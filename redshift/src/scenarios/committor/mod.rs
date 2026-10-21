@@ -10,7 +10,11 @@ use std::time::{Duration, Instant};
 
 use keypair::Keypair;
 use pubkey::Pubkey;
-use redsuite_core::{check, check_eq, BaseCtx, ChainCtx, ErCtx, Result};
+use redsuite_core::{
+    check, check_eq,
+    programs::{CellHeader, SettlementMode, REDLINE},
+    BaseCtx, ChainCtx, ErCtx, Result,
+};
 use signature::Signature;
 use tokio::time;
 
@@ -25,15 +29,28 @@ async fn write_and_commit(
     write: u64,
     account: &Pubkey,
 ) -> Result<(Vec<u8>, Signature)> {
-    er.redline(payer).write(write, &[*account]).await?;
-    let snapshot = er.account(account).await?.ok_or("er copy vanished after the write")?.data;
-    check_eq!(
-        crate::written_id(&snapshot),
-        Some(write),
-        "the er write must land before the commit"
-    )?;
-    let commit_signature = er.redline(payer).commit(commit_id, &[*account]).await?;
+    let snapshot = write_snapshot(er, payer, write, account).await?;
+    let commit_signature = er
+        .cells(REDLINE, payer)
+        .settle(commit_id, &[*account], SettlementMode::Commit)
+        .await?;
     Ok((snapshot, commit_signature))
+}
+
+async fn write_snapshot(
+    er: &ErCtx,
+    payer: &Keypair,
+    value: u64,
+    account: &Pubkey,
+) -> Result<Vec<u8>> {
+    er.cells(REDLINE, payer).write(value, &[*account]).await?;
+    let snapshot = er.account(account).await?.ok_or("ER cell missing after write")?.data;
+    check_eq!(
+        CellHeader::written_id(&snapshot),
+        Some(value),
+        "ER write visible before settlement"
+    )?;
+    Ok(snapshot)
 }
 
 async fn prove_landed(

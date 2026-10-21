@@ -1,21 +1,10 @@
 use pubkey::Pubkey;
 
-pub const ID: Pubkey = Pubkey::from_str_const("3JnJ727jWEmPVU8qfXwtH63sCNDX7nMgsLbg8qy8aaPX");
+pub use fixture::{layout, Batch, Program};
+pub use sdk::consts::DELEGATION_PROGRAM_ID;
 
+pub const ID: Pubkey = Pubkey::from_str_const("3JnJ727jWEmPVU8qfXwtH63sCNDX7nMgsLbg8qy8aaPX");
 pub const fn id() -> Pubkey {
     ID
 }
-
-pub use sdk::consts::DELEGATION_PROGRAM_ID;
-
-pub mod layout {
-    pub const OWNER_PUBKEY_SIZE: usize = 32;
-    pub const DATA_OFFSET: usize = OWNER_PUBKEY_SIZE;
-    pub const ID_OFFSET: usize = DATA_OFFSET;
-    pub const ID_SIZE: usize = 8;
-    pub const HASH_OFFSET: usize = ID_OFFSET + ID_SIZE;
-    pub const HASH_SIZE: usize = 32;
-}
-
-pub mod instruction;
-pub mod utils;
+pub const PROGRAM: Program = Program::at(ID);
