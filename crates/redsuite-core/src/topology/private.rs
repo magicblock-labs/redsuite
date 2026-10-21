@@ -139,10 +139,7 @@ impl PrivateEr {
     // Stop the ER (SIGTERM, or SIGKILL if hard_kill), then relaunch it on the
     // same storage dir, identity and ports, timing each phase. Ports are
     // reused, so ctx() stays valid across the restart.
-    pub async fn restart(
-        &mut self,
-        config: RestartConfig,
-    ) -> Result<RestartTiming> {
+    pub async fn restart(&mut self, config: RestartConfig) -> Result<RestartTiming> {
         let api = self.rpc_api();
         let slot_before = api.get_slot().await.ok();
         let restart_started = std::time::Instant::now();
@@ -153,8 +150,7 @@ impl PrivateEr {
             .ok_or("private ER has no running process to restart")?;
         let shutdown = restart_started.elapsed();
         let exit_code = exit_status.code();
-        let exit_signal =
-            std::os::unix::process::ExitStatusExt::signal(&exit_status);
+        let exit_signal = std::os::unix::process::ExitStatusExt::signal(&exit_status);
 
         self.plan.params.ledger.reset = config.reset;
         let launch_started = std::time::Instant::now();
@@ -195,10 +191,7 @@ const VAULT_POLL: Duration = Duration::from_millis(250);
 // On a fresh stack generation the shared ER creates the magic fee vault in a
 // startup-background task. A private ER that boots before the vault is on
 // base races that init, loses with "Invalid account owner", and exits.
-async fn await_magic_fee_vault(
-    base: &BaseCtx,
-    identity: &Pubkey,
-) -> Result<()> {
+async fn await_magic_fee_vault(base: &BaseCtx, identity: &Pubkey) -> Result<()> {
     let vault = crate::dlp::magic_fee_vault_pda(identity);
     let deadline = tokio::time::Instant::now() + MAGIC_FEE_VAULT_TIMEOUT;
     loop {
@@ -218,10 +211,7 @@ async fn await_magic_fee_vault(
     }
 }
 
-pub async fn private_er(
-    base: &BaseCtx,
-    options: ErOptions,
-) -> Result<PrivateEr> {
+pub async fn private_er(base: &BaseCtx, options: ErOptions) -> Result<PrivateEr> {
     launch(base, options, Vec::new()).await
 }
 
@@ -253,19 +243,12 @@ async fn launch(
     state::remove_storage(&storage_dir)?;
     let log = dir.join(format!("er-{}.log", options.label));
     let identity_pubkey = er_identity.pubkey();
-    let role = if allowed_followers.is_empty() {
-        "private-er"
-    } else {
-        "leader"
-    };
-    let endpoints =
-        options
-            .base_endpoints
-            .unwrap_or_else(|| config::BaseEndpoints {
-                rpc_url: base.api().url().to_owned(),
-                ws_url: base.ws_url().to_owned(),
-                grpc_url: None,
-            });
+    let role = if allowed_followers.is_empty() { "private-er" } else { "leader" };
+    let endpoints = options.base_endpoints.unwrap_or_else(|| config::BaseEndpoints {
+        rpc_url: base.api().url().to_owned(),
+        ws_url: base.ws_url().to_owned(),
+        grpc_url: None,
+    });
     let plan = config::ErPlan {
         bin: er_bin,
         config_path: config::config_path(&dir, &options.label),
@@ -316,9 +299,7 @@ async fn launch(
         || async { er_api.server_alive().await },
     )
     .await
-    .map_err(|e| {
-        ports.failure(format_args!("private ER `{}`: {e}", proc.label()))
-    });
+    .map_err(|e| ports.failure(format_args!("private ER `{}`: {e}", proc.label())));
     ready?;
     await_magic_fee_vault(base, &identity_pubkey).await?;
 
@@ -330,11 +311,5 @@ async fn launch(
         options.request_timeout,
         pid,
     );
-    Ok(PrivateEr {
-        proc,
-        plan,
-        log,
-        ctx,
-        ports,
-    })
+    Ok(PrivateEr { proc, plan, log, ctx, ports })
 }

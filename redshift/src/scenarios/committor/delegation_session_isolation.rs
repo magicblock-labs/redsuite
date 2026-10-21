@@ -4,9 +4,7 @@ use async_trait::async_trait;
 use borsh::BorshDeserialize;
 use keypair::Keypair;
 use pubkey::Pubkey;
-use redshift_interface::schedulecommit::{
-    build as sc, MainAccount, ScheduleCommitType,
-};
+use redshift_interface::schedulecommit::{build as sc, MainAccount, ScheduleCommitType};
 use redsuite_core::{
     check, check_eq, dlp,
     netfault::{BaseProxies, Selector},
@@ -53,11 +51,7 @@ fn count(data: &[u8]) -> Result<u64> {
     Ok(MainAccount::try_from_slice(data)?.count)
 }
 
-async fn await_clone_count(
-    er: &ErCtx,
-    account: &Pubkey,
-    id: u64,
-) -> Result<()> {
+async fn await_clone_count(er: &ErCtx, account: &Pubkey, id: u64) -> Result<()> {
     check::poll_for(
         &format!(
             "the er {} clones the committee with count {id}",
@@ -67,9 +61,7 @@ async fn await_clone_count(
         || async {
             match er.account(account).await {
                 Ok(Some(acc)) if count(&acc.data).ok() == Some(id) => Ok(()),
-                Ok(Some(acc)) => {
-                    Err(format!("count {:?}", count(&acc.data).ok()))
-                }
+                Ok(Some(acc)) => Err(format!("count {:?}", count(&acc.data).ok())),
                 Ok(None) => Err("absent".to_owned()),
                 Err(error) => Err(format!("read failed: {error}")),
             }
@@ -87,8 +79,7 @@ async fn write(
     account: &Pubkey,
     id: u64,
 ) -> Result<()> {
-    ctx.submit_and_confirm(payer, &[sc::set_count(*player, id)])
-        .await?;
+    ctx.submit_and_confirm(payer, &[sc::set_count(*player, id)]).await?;
     let data = ctx
         .account(account)
         .await?
@@ -98,14 +89,8 @@ async fn write(
     Ok(())
 }
 
-async fn base_state(
-    base: &BaseCtx,
-    account: &Pubkey,
-) -> Result<(Pubkey, Option<u64>)> {
-    let on_base = base
-        .account(account)
-        .await?
-        .ok_or("the committee vanished from base")?;
+async fn base_state(base: &BaseCtx, account: &Pubkey) -> Result<(Pubkey, Option<u64>)> {
+    let on_base = base.account(account).await?.ok_or("the committee vanished from base")?;
     Ok((on_base.owner, count(&on_base.data).ok()))
 }
 
@@ -118,14 +103,8 @@ async fn await_base(
 ) -> Result<()> {
     check::poll_for(what, COMPLETION_TIMEOUT, || async {
         match base_state(base, account).await {
-            Ok((current_owner, written))
-                if current_owner == owner && written == Some(id) =>
-            {
-                Ok(())
-            }
-            Ok((current_owner, written)) => {
-                Err(format!("owner {current_owner} count {written:?}"))
-            }
+            Ok((current_owner, written)) if current_owner == owner && written == Some(id) => Ok(()),
+            Ok((current_owner, written)) => Err(format!("owner {current_owner} count {written:?}")),
             Err(error) => Err(format!("read failed: {error}")),
         }
     })
@@ -184,8 +163,7 @@ async fn schedule_commit(
 ) -> Result<signature::Signature> {
     let writable = matches!(
         commit_type,
-        ScheduleCommitType::CommitAndUndelegate
-            | ScheduleCommitType::CommitFinalizeAndUndelegate
+        ScheduleCommitType::CommitAndUndelegate | ScheduleCommitType::CommitFinalizeAndUndelegate
     );
     er.submit_and_confirm(
         payer,
@@ -210,20 +188,12 @@ async fn recover_session_a_commit_after_lost_response(
     account: &Pubkey,
     expected_id: u64,
 ) -> Result<()> {
-    let submission = proxies.intercept(
-        Selector::method("sendTransaction")
-            .http()
-            .response()
-            .account(account),
-    );
-    let signature =
-        schedule_commit(er, payer, player, ScheduleCommitType::Commit).await?;
+    let submission =
+        proxies.intercept(Selector::method("sendTransaction").http().response().account(account));
+    let signature = schedule_commit(er, payer, player, ScheduleCommitType::Commit).await?;
     let held = submission.wait(INTERCEPT_TIMEOUT).await?;
     let base_signature = held.operation.signature()?;
-    let base_tx = base
-        .api()
-        .await_transaction(&base_signature, BASE_CONFIRM_TIMEOUT)
-        .await?;
+    let base_tx = base.api().await_transaction(&base_signature, BASE_CONFIRM_TIMEOUT).await?;
     check_eq!(
         base_tx.err,
         None,
@@ -234,15 +204,10 @@ async fn recover_session_a_commit_after_lost_response(
         COMPLETION_TIMEOUT,
         || async {
             match base_state(base, account).await {
-                Ok((owner, written))
-                    if owner == dlp::dlp_id()
-                        && written == Some(expected_id) =>
-                {
+                Ok((owner, written)) if owner == dlp::dlp_id() && written == Some(expected_id) => {
                     Ok(())
                 }
-                Ok((owner, written)) => {
-                    Err(format!("owner {owner} count {written:?}"))
-                }
+                Ok((owner, written)) => Err(format!("owner {owner} count {written:?}")),
                 Err(error) => Err(format!("read failed: {error}")),
             }
         },
@@ -250,9 +215,7 @@ async fn recover_session_a_commit_after_lost_response(
     .await?;
     held.discard();
 
-    let receipt =
-        receipt::fetch_commit_receipt(er.api(), &signature, RECEIPT_TIMEOUT)
-            .await?;
+    let receipt = receipt::fetch_commit_receipt(er.api(), &signature, RECEIPT_TIMEOUT).await?;
     check!(
         receipt.succeeded() || receipt.failure_is_duplicate_rejection(),
         "the session-a commit intent must converge after a lost base response, \
@@ -277,8 +240,7 @@ async fn isolate(
         .ok_or("no committee was created")?;
     let player = committee.player.pubkey();
     let account = committee.pda;
-    prep::await_committee_clones(er_a.ctx(), std::slice::from_ref(&committee))
-        .await?;
+    prep::await_committee_clones(er_a.ctx(), std::slice::from_ref(&committee)).await?;
 
     let staged = value(case, 1);
     write(er_a.ctx(), payer, &player, &account, staged).await?;
@@ -293,9 +255,7 @@ async fn isolate(
     )
     .await?;
 
-    let delayed = proxies.intercept(
-        Selector::methods(&[]).ws().notification().account(&account),
-    );
+    let delayed = proxies.intercept(Selector::methods(&[]).ws().notification().account(&account));
     let undelegate = schedule_commit(
         er_a.ctx(),
         payer,
@@ -303,12 +263,8 @@ async fn isolate(
         ScheduleCommitType::CommitAndUndelegate,
     )
     .await?;
-    let undelegated = receipt::fetch_commit_receipt(
-        er_a.ctx().api(),
-        &undelegate,
-        RECEIPT_TIMEOUT,
-    )
-    .await?;
+    let undelegated =
+        receipt::fetch_commit_receipt(er_a.ctx().api(), &undelegate, RECEIPT_TIMEOUT).await?;
     check!(
         undelegated.succeeded() || undelegated.failure_is_duplicate_rejection(),
         "the session-a undelegation must complete, got {:?}",
@@ -328,9 +284,7 @@ async fn isolate(
     write(base, payer, &player, &account, base_value).await?;
     let session_b = match target {
         Target::SameValidator => er_a.ctx(),
-        Target::OtherValidator => {
-            er_b.ok_or("the reassignment case needs a second er")?
-        }
+        Target::OtherValidator => er_b.ok_or("the reassignment case needs a second er")?,
     };
     base.submit_and_confirm(
         payer,
@@ -385,9 +339,7 @@ async fn isolate(
     )?;
     let session_b = match target {
         Target::SameValidator => er_a.ctx(),
-        Target::OtherValidator => {
-            er_b.ok_or("the reassignment case needs a second er")?
-        }
+        Target::OtherValidator => er_b.ok_or("the reassignment case needs a second er")?,
     };
     hold_steady(
         base,
@@ -407,33 +359,22 @@ async fn isolate(
         {
             let stale_write = er_a
                 .ctx()
-                .submit_and_confirm(
-                    payer,
-                    &[sc::set_count(player, value(case, 4))],
-                )
+                .submit_and_confirm(payer, &[sc::set_count(player, value(case, 4))])
                 .await;
             check!(
                 stale_write.is_err(),
                 "the old validator must reject writes to the reassigned \
                  account, got {stale_write:?}"
             )?;
-            let stale_commit = schedule_commit(
-                er_a.ctx(),
-                payer,
-                &player,
-                ScheduleCommitType::Commit,
-            )
-            .await;
+            let stale_commit =
+                schedule_commit(er_a.ctx(), payer, &player, ScheduleCommitType::Commit).await;
             if let Ok(signature) = stale_commit {
-                let receipt = receipt::fetch_commit_receipt(
-                    er_a.ctx().api(),
-                    &signature,
-                    RECEIPT_TIMEOUT,
-                )
-                .await?;
-                receipt.error_message.ok_or(
-                    "the old validator must not commit the reassigned account",
-                )?;
+                let receipt =
+                    receipt::fetch_commit_receipt(er_a.ctx().api(), &signature, RECEIPT_TIMEOUT)
+                        .await?;
+                receipt
+                    .error_message
+                    .ok_or("the old validator must not commit the reassigned account")?;
             }
             check_eq!(
                 base_state(base, &account).await?,
@@ -443,15 +384,11 @@ async fn isolate(
         }
     }
 
-    let fresh =
-        schedule_commit(session_b, payer, &player, ScheduleCommitType::Commit)
-            .await?;
+    let fresh = schedule_commit(session_b, payer, &player, ScheduleCommitType::Commit).await?;
     let fresh_receipt =
-        receipt::fetch_commit_receipt(session_b.api(), &fresh, RECEIPT_TIMEOUT)
-            .await?;
+        receipt::fetch_commit_receipt(session_b.api(), &fresh, RECEIPT_TIMEOUT).await?;
     check!(
-        fresh_receipt.succeeded()
-            || fresh_receipt.failure_is_duplicate_rejection(),
+        fresh_receipt.succeeded() || fresh_receipt.failure_is_duplicate_rejection(),
         "a fresh session-b commit must complete, got {:?}",
         fresh_receipt.error_message
     )?;

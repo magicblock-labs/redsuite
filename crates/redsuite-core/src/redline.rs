@@ -110,14 +110,12 @@ impl Accounts {
                     ));
                 }
             }
-            base.submit_and_confirm(payer, &instructions)
-                .await
-                .map_err(|error| {
-                    format!(
-                        "program {} payer {owner} seeds {first}..{end}: {error}",
-                        self.program_id
-                    )
-                })?;
+            base.submit_and_confirm(payer, &instructions).await.map_err(|error| {
+                format!(
+                    "program {} payer {owner} seeds {first}..{end}: {error}",
+                    self.program_id
+                )
+            })?;
         }
         Ok(pdas)
     }
@@ -160,15 +158,10 @@ impl Accounts {
             )
             .into());
         }
-        let batches = prep::bounded(
-            payers.len().min(count),
-            "accounts for payer",
-            |index| {
-                let len =
-                    per_payer.min(count.saturating_sub(index * per_payer));
-                self.prepare(base, &payers[index], 0..len, delegated)
-            },
-        )
+        let batches = prep::bounded(payers.len().min(count), "accounts for payer", |index| {
+            let len = per_payer.min(count.saturating_sub(index * per_payer));
+            self.prepare(base, &payers[index], 0..len, delegated)
+        })
         .await?;
         Ok(batches.into_iter().flatten().collect())
     }

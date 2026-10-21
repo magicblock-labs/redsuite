@@ -2,9 +2,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use keypair::Keypair;
-use redsuite_core::{
-    check, check_eq, prep, system, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
-};
+use redsuite_core::{check, check_eq, prep, system, BaseCtx, ChainCtx, ErCtx, Result, Scenario};
 use signer::Signer;
 
 const CLONE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -30,8 +28,7 @@ impl Scenario for AccountInfoSemantics {
     async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<()> {
         crate::phase("cold reads", async {
             // These keys must stay cold until all five requests are in flight.
-            let wallets: Vec<_> =
-                (0..COLD_WALLETS).map(|_| Keypair::new().pubkey()).collect();
+            let wallets: Vec<_> = (0..COLD_WALLETS).map(|_| Keypair::new().pubkey()).collect();
             for wallet in &wallets {
                 base.airdrop(wallet, FIRST_AIRDROP).await?;
             }
@@ -49,11 +46,7 @@ impl Scenario for AccountInfoSemantics {
                 ("batch c", c?, &wallets[6..9]),
                 ("single b", vec![single_b?], &wallets[9..10]),
             ] {
-                check_eq!(
-                    entries.len(),
-                    keys.len(),
-                    "cold {case}: response length"
-                )?;
+                check_eq!(entries.len(), keys.len(), "cold {case}: response length")?;
                 for (entry, key) in entries.iter().zip(keys) {
                     check_eq!(
                         entry.as_ref().map(|account| account.lamports),
@@ -105,22 +98,16 @@ impl Scenario for AccountInfoSemantics {
         .await?;
 
         let escrowed = crate::phase("escrow", async {
-            let escrowed =
-                prep::escrowed_payer(base, er.identity(), ESCROW_FUNDING)
-                    .await?;
+            let escrowed = prep::escrowed_payer(base, er.identity(), ESCROW_FUNDING).await?;
             let escrowed_pubkey = escrowed.payer.pubkey();
             check::poll(
                 "the ER clones the escrowed payer wallet",
                 CLONE_TIMEOUT,
-                || async {
-                    matches!(er.account(&escrowed_pubkey).await, Ok(Some(_)))
-                },
+                || async { matches!(er.account(&escrowed_pubkey).await, Ok(Some(_))) },
             )
             .await?;
-            let initial = er
-                .account(&escrowed.escrow)
-                .await?
-                .ok_or("escrow pda unreadable on the ER")?;
+            let initial =
+                er.account(&escrowed.escrow).await?.ok_or("escrow pda unreadable on the ER")?;
             check_eq!(
                 initial.lamports,
                 escrowed.escrow_lamports,
@@ -184,10 +171,8 @@ impl Scenario for AccountInfoSemantics {
                 initial.lamports,
                 "the delegated escrow must stay frozen even after the update had time to propagate"
             )?;
-            let escrow_on_base = base
-                .account(&escrowed.escrow)
-                .await?
-                .ok_or("escrow gone on base")?;
+            let escrow_on_base =
+                base.account(&escrowed.escrow).await?.ok_or("escrow gone on base")?;
             check_eq!(
                 escrow_on_base.lamports,
                 escrowed.escrow_lamports + CHAIN_TOPUP,
@@ -198,11 +183,8 @@ impl Scenario for AccountInfoSemantics {
         .await?;
 
         crate::phase("batch reads", async {
-            let all_missing = [
-                Keypair::new().pubkey(),
-                Keypair::new().pubkey(),
-                Keypair::new().pubkey(),
-            ];
+            let all_missing =
+                [Keypair::new().pubkey(), Keypair::new().pubkey(), Keypair::new().pubkey()];
             let misses = er.accounts(&all_missing).await?;
             check_eq!(
                 misses.len(),
@@ -214,20 +196,14 @@ impl Scenario for AccountInfoSemantics {
                 "a batch of unknown accounts must come back all-None without error"
             )?;
 
-            let mixed = [
-                wallet,
-                Keypair::new().pubkey(),
-                escrowed.payer.pubkey(),
-                escrowed.escrow,
-            ];
+            let mixed = [wallet, Keypair::new().pubkey(), escrowed.payer.pubkey(), escrowed.escrow];
             let batch = er.accounts(&mixed).await?;
             check_eq!(
                 batch.len(),
                 mixed.len(),
                 "the mixed batch read must return one entry per requested account"
             )?;
-            let wallet_entry =
-                batch[0].as_ref().ok_or("wallet missing from batch read")?;
+            let wallet_entry = batch[0].as_ref().ok_or("wallet missing from batch read")?;
             check_eq!(
                 wallet_entry.lamports,
                 FIRST_AIRDROP + SECOND_AIRDROP,
@@ -241,9 +217,7 @@ impl Scenario for AccountInfoSemantics {
                 batch[2].is_some(),
                 "the escrowed payer wallet must be readable in a batch"
             )?;
-            let escrow_entry = batch[3]
-                .as_ref()
-                .ok_or("escrow pda missing from batch read")?;
+            let escrow_entry = batch[3].as_ref().ok_or("escrow pda missing from batch read")?;
             check_eq!(
                 escrow_entry.lamports,
                 escrowed.escrow_lamports,
@@ -254,20 +228,10 @@ impl Scenario for AccountInfoSemantics {
         .await?;
 
         crate::phase("escrowed spender", async {
-            let funder =
-                prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
-            let spender =
-                prep::escrowed_payer(base, er.identity(), ESCROW_FUNDING)
-                    .await?;
-            prep::delegate_payer(base, &funder, &spender.payer, er.identity())
-                .await?;
-            let receiver = prep::delegated_payer(
-                base,
-                &funder,
-                er.identity(),
-                RENT_EXEMPT,
-            )
-            .await?;
+            let funder = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
+            let spender = prep::escrowed_payer(base, er.identity(), ESCROW_FUNDING).await?;
+            prep::delegate_payer(base, &funder, &spender.payer, er.identity()).await?;
+            let receiver = prep::delegated_payer(base, &funder, er.identity(), RENT_EXEMPT).await?;
             check::poll(
                 "the ER clones the delegated receiver at its rent-exempt balance",
                 CLONE_TIMEOUT,
@@ -282,17 +246,12 @@ impl Scenario for AccountInfoSemantics {
             check::poll(
                 "the ER clones the spender escrow pda",
                 CLONE_TIMEOUT,
-                || async {
-                    matches!(er.account(&spender.escrow).await, Ok(Some(_)))
-                },
+                || async { matches!(er.account(&spender.escrow).await, Ok(Some(_))) },
             )
             .await?;
-            let escrow_before = er
-                .account(&spender.escrow)
-                .await?
-                .ok_or("the spender escrow clone vanished")?;
-            let wallet_before =
-                er.api().get_balance(&spender.payer.pubkey()).await?;
+            let escrow_before =
+                er.account(&spender.escrow).await?.ok_or("the spender escrow clone vanished")?;
+            let wallet_before = er.api().get_balance(&spender.payer.pubkey()).await?;
 
             er.submit_and_confirm(
                 &spender.payer,

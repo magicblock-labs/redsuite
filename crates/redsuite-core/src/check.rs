@@ -1,5 +1,6 @@
 use std::{fmt, future::Future, time::Duration};
 
+use thiserror::Error;
 use tracing::{debug, error_span, Instrument};
 
 use crate::DynError;
@@ -11,7 +12,8 @@ pub fn content_hash(bytes: &[u8]) -> hash::Hash {
     hash::Hash::new_from_array(Sha256::digest(bytes).into())
 }
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
+#[error("{self:?}")]
 pub struct CheckError {
     pub check: String,
     pub expected: Option<String>,
@@ -41,11 +43,7 @@ impl CheckError {
         self
     }
 
-    pub fn context(
-        mut self,
-        label: impl Into<String>,
-        value: impl Into<String>,
-    ) -> Self {
+    pub fn context(mut self, label: impl Into<String>, value: impl Into<String>) -> Self {
         self.context.push((label.into(), value.into()));
         self
     }
@@ -53,37 +51,6 @@ impl CheckError {
     pub fn caused_by(mut self, source: impl Into<DynError>) -> Self {
         self.source = Some(source.into());
         self
-    }
-}
-
-impl fmt::Display for CheckError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}", self.check)?;
-        match (&self.expected, &self.actual) {
-            (Some(expected), Some(actual)) => {
-                write!(formatter, " — expected {expected}, observed {actual}")?
-            }
-            (Some(expected), None) => {
-                write!(formatter, " — expected {expected}")?
-            }
-            (None, Some(actual)) => write!(formatter, " — observed {actual}")?,
-            (None, None) => {}
-        }
-        for (label, value) in &self.context {
-            write!(formatter, "; {label}: {value}")?;
-        }
-        if let Some(source) = &self.source {
-            write!(formatter, "; caused by: {source}")?;
-        }
-        Ok(())
-    }
-}
-
-impl std::error::Error for CheckError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.source
-            .as_deref()
-            .map(|source| source as &(dyn std::error::Error + 'static))
     }
 }
 
@@ -147,9 +114,7 @@ where
         Ok::<_, CheckError>(condition().await.then_some(()))
     })
     .await?
-    .ok_or_else(|| {
-        CheckError::new(check).context("waited", format!("{timeout:?}"))
-    })
+    .ok_or_else(|| CheckError::new(check).context("waited", format!("{timeout:?}")))
 }
 
 pub async fn poll_for<T, Observed, Fut>(
@@ -204,11 +169,11 @@ pub async fn phase<T>(
     name: &str,
     work: impl Future<Output = crate::Result<T>>,
 ) -> crate::Result<T> {
-    debug!(name, "phase started");
-    work.instrument(error_span!("phase", name))
-        .await
-        .map_err(|error| match error.downcast::<CheckError>() {
+    debug!(phase = name);
+    work.instrument(error_span!("phase", phase = name)).await.map_err(|error| {
+        match error.downcast::<CheckError>() {
             Ok(error) => error.context("phase", name).into(),
             Err(error) => format!("{name}: {error}").into(),
-        })
+        }
+    })
 }

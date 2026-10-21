@@ -34,18 +34,12 @@ impl FrameHandler for EventHandler {
         shared.ready_subs += 1;
     }
 
-    fn on_notification(
-        &mut self,
-        _method: &str,
-        subscription: u64,
-        payload: &LazyValue<'_>,
-    ) {
+    fn on_notification(&mut self, _method: &str, subscription: u64, payload: &LazyValue<'_>) {
         let mut shared = self.shared.borrow_mut();
         let Some(key) = shared.key_by_subid.get(&subscription).copied() else {
             return;
         };
-        let Ok(event) = json::from_str::<json::Value>(payload.as_raw_str())
-        else {
+        let Ok(event) = json::from_str::<json::Value>(payload.as_raw_str()) else {
             shared.malformed += 1;
             return;
         };
@@ -71,17 +65,8 @@ impl EventSubscriptions {
     pub async fn connect(url: &str) -> Result<Self> {
         let (requester, stream) = conn::split(conn::connect(url).await?);
         let shared = Rc::new(RefCell::new(Shared::default()));
-        let reader = Reader::spawn(
-            stream,
-            EventHandler {
-                shared: shared.clone(),
-            },
-        );
-        Ok(Self {
-            requester,
-            shared,
-            reader,
-        })
+        let reader = Reader::spawn(stream, EventHandler { shared: shared.clone() });
+        Ok(Self { requester, shared, reader })
     }
 
     pub async fn slot_subscribe(&self) -> Result<u64> {
@@ -89,40 +74,25 @@ impl EventSubscriptions {
     }
 
     pub async fn account_subscribe(&self, account: &Pubkey) -> Result<u64> {
-        self.subscribe("accountSubscribe", &conn::account_params(account))
-            .await
+        self.subscribe("accountSubscribe", &conn::account_params(account)).await
     }
 
-    pub async fn logs_subscribe_mentions(
-        &self,
-        account: &Pubkey,
-    ) -> Result<u64> {
-        self.subscribe("logsSubscribe", &conn::logs_mentions_params(account))
-            .await
+    pub async fn logs_subscribe_mentions(&self, account: &Pubkey) -> Result<u64> {
+        self.subscribe("logsSubscribe", &conn::logs_mentions_params(account)).await
     }
 
     pub async fn program_subscribe(&self, program: &Pubkey) -> Result<u64> {
-        self.subscribe("programSubscribe", &conn::program_params(program))
-            .await
+        self.subscribe("programSubscribe", &conn::program_params(program)).await
     }
 
-    pub async fn await_subscribed(
-        &self,
-        count: usize,
-        timeout: Duration,
-    ) -> Result<()> {
+    pub async fn await_subscribed(&self, count: usize, timeout: Duration) -> Result<()> {
         self.await_shared(timeout, "subscription acks", |shared| {
             shared.ready_subs >= count
         })
         .await
     }
 
-    pub async fn await_events(
-        &self,
-        key: u64,
-        count: usize,
-        timeout: Duration,
-    ) -> Result<()> {
+    pub async fn await_events(&self, key: u64, count: usize, timeout: Duration) -> Result<()> {
         self.await_shared(timeout, "notifications", |shared| {
             shared.events.get(&key).map_or(0, Vec::len) >= count
         })
@@ -130,12 +100,7 @@ impl EventSubscriptions {
     }
 
     pub fn events(&self, key: u64) -> Vec<json::Value> {
-        self.shared
-            .borrow()
-            .events
-            .get(&key)
-            .cloned()
-            .unwrap_or_default()
+        self.shared.borrow().events.get(&key).cloned().unwrap_or_default()
     }
 
     pub fn malformed_frames(&self) -> usize {

@@ -54,33 +54,20 @@ impl Scenario<ScenarioReport> for SimpleLoad {
 
         let clock = Arc::new(SendClock::new(1, ITERATIONS as usize));
         let updates = Rc::new(
-            AccountUpdates::connect(
-                er.ws_url(),
-                crate::account_update_id,
-                clock.clone(),
-            )
-            .await?,
+            AccountUpdates::connect(er.ws_url(), crate::account_update_id, clock.clone()).await?,
         );
         for pda in &pdas {
             updates.account_subscribe(pda).await?;
         }
-        updates
-            .await_subscribed(pdas.len(), Duration::from_secs(5))
-            .await?;
-        let sigs = Rc::new(
-            SignatureConfirmations::connect(er.ws_url(), clock.clone()).await?,
-        );
+        updates.await_subscribed(pdas.len(), Duration::from_secs(5)).await?;
+        let sigs = Rc::new(SignatureConfirmations::connect(er.ws_url(), clock.clone()).await?);
         let sender = er.sender(Rc::new(payer));
 
         let request = |id: u64| {
             let target = pdas[((id - 1) % pdas.len() as u64) as usize];
-            let ix = crate::program::instruction::build::simple_byte_set(
-                id,
-                &[target],
-            );
+            let ix = crate::program::instruction::build::simple_byte_set(id, &[target]);
             updates.track(id, target);
-            let (sender, sigs, clock) =
-                (sender.clone(), sigs.clone(), clock.clone());
+            let (sender, sigs, clock) = (sender.clone(), sigs.clone(), clock.clone());
             async move {
                 let tx = sender.prepare(&[ix]).await?;
                 sigs.subscribe(id, &tx.signatures[0]).await?;
@@ -90,11 +77,9 @@ impl Scenario<ScenarioReport> for SimpleLoad {
         let sync = |id: u64| {
             let sigs = sigs.clone();
             async move {
-                tokio::time::timeout(CONFIRM_TIMEOUT, sigs.await_id(id))
-                    .await
-                    .map_err(|_| {
-                        format!("confirmation for id {id} not within {CONFIRM_TIMEOUT:?}")
-                    })?
+                tokio::time::timeout(CONFIRM_TIMEOUT, sigs.await_id(id)).await.map_err(|_| {
+                    format!("confirmation for id {id} not within {CONFIRM_TIMEOUT:?}")
+                })?
             }
         };
         let outcome = execute_and_sync(
@@ -114,9 +99,7 @@ impl Scenario<ScenarioReport> for SimpleLoad {
             outcome.first_error
         )?;
 
-        updates
-            .await_observed(ITERATIONS as usize, Duration::from_secs(15))
-            .await?;
+        updates.await_observed(ITERATIONS as usize, Duration::from_secs(15)).await?;
         let update_lag = updates.finalize().lag;
         let confirmations = sigs.finalize();
         check_eq!(

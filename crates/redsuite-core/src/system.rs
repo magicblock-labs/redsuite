@@ -18,10 +18,7 @@ pub fn create_account(
     data.extend_from_slice(owner.as_ref());
     Instruction {
         program_id: system_id(),
-        accounts: vec![
-            AccountMeta::new(*from, true),
-            AccountMeta::new(*to, true),
-        ],
+        accounts: vec![AccountMeta::new(*from, true), AccountMeta::new(*to, true)],
         data,
     }
 }
@@ -31,10 +28,7 @@ pub fn transfer(from: &Pubkey, to: &Pubkey, lamports: u64) -> Instruction {
     data.extend_from_slice(&lamports.to_le_bytes());
     Instruction {
         program_id: system_id(),
-        accounts: vec![
-            AccountMeta::new(*from, true),
-            AccountMeta::new(*to, false),
-        ],
+        accounts: vec![AccountMeta::new(*from, true), AccountMeta::new(*to, false)],
         data,
     }
 }

@@ -18,8 +18,7 @@ use signer::Signer;
 
 use crate::program::instruction::build;
 
-pub(super) const PROXIED_GROUP: &str =
-    "this scenario needs the base-chain proxies of its ER group";
+pub(super) const PROXIED_GROUP: &str = "this scenario needs the base-chain proxies of its ER group";
 const BASE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(30);
 const BASE_STATE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -60,11 +59,7 @@ async fn write_and_commit(
 ) -> Result<(Vec<u8>, Signature)> {
     er.submit_and_confirm(payer, &[build::simple_byte_set(write, &[*account])])
         .await?;
-    let snapshot = er
-        .account(account)
-        .await?
-        .ok_or("er copy vanished after the write")?
-        .data;
+    let snapshot = er.account(account).await?.ok_or("er copy vanished after the write")?.data;
     check_eq!(
         crate::written_id(&snapshot),
         Some(write),
@@ -73,11 +68,7 @@ async fn write_and_commit(
     let commit_signature = er
         .submit_and_confirm(
             payer,
-            &[build::commit_accounts(
-                commit_id,
-                payer.pubkey(),
-                &[*account],
-            )],
+            &[build::commit_accounts(commit_id, payer.pubkey(), &[*account])],
         )
         .await?;
     Ok((snapshot, commit_signature))
@@ -89,10 +80,7 @@ async fn prove_landed(
     account: &Pubkey,
     snapshot: &[u8],
 ) -> Result<()> {
-    let base_tx = base
-        .api()
-        .await_transaction(base_signature, BASE_CONFIRM_TIMEOUT)
-        .await?;
+    let base_tx = base.api().await_transaction(base_signature, BASE_CONFIRM_TIMEOUT).await?;
     check!(
         base_tx.err.is_none(),
         "the intercepted base commit {base_signature} must succeed on base, \
@@ -102,9 +90,7 @@ async fn prove_landed(
     check::poll(
         "the base copy carries the er snapshot before the fault is applied",
         BASE_STATE_TIMEOUT,
-        || async {
-            matches!(base.account(account).await, Ok(Some(acc)) if acc.data == snapshot)
-        },
+        || async { matches!(base.account(account).await, Ok(Some(acc)) if acc.data == snapshot) },
     )
     .await?;
     Ok(())

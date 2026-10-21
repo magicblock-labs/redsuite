@@ -35,8 +35,7 @@ const CLONE_TIMEOUT: Duration = Duration::from_secs(15);
 const QUIESCE_TIMEOUT: Duration = Duration::from_secs(120);
 
 const INTENTS_COUNTER: &str = "mbv_committor_intents_count";
-const EXECUTED_COUNTER: &str =
-    "mbv_committor_intent_execution_time_histogram_v2_count";
+const EXECUTED_COUNTER: &str = "mbv_committor_intent_execution_time_histogram_v2_count";
 const BACKLOG_GAUGE: &str = "mbv_committor_intent_backlog_count";
 const BUSY_GAUGE: &str = "mbv_committor_executors_busy_count";
 
@@ -71,10 +70,7 @@ const FULL: Profile = Profile {
     monitor_window: Duration::from_secs(5),
 };
 
-const PROFILES: ProfileValues<Profile> = ProfileValues {
-    lite: LITE,
-    full: FULL,
-};
+const PROFILES: ProfileValues<Profile> = ProfileValues { lite: LITE, full: FULL };
 
 async fn deliver_commits(
     sender: &redsuite_core::TxSender,
@@ -111,11 +107,7 @@ async fn deliver_commits(
     )
     .await?;
     if outcome.failed > 0 {
-        return Err(format!(
-            "commit deliveries failed: {:?}",
-            outcome.first_error
-        )
-        .into());
+        return Err(format!("commit deliveries failed: {:?}", outcome.first_error).into());
     }
     let delivered = Rc::try_unwrap(delivered)
         .unwrap_or_else(|_| panic!("delivery tasks still hold the list"))
@@ -131,8 +123,7 @@ async fn quiesce_committor(er: &ErCtx) -> Result<()> {
             er.scrape_metrics().await.is_ok_and(|metrics| {
                 let backlog = metrics.value_sum(BACKLOG_GAUGE).unwrap_or(0.0);
                 let intents = metrics.value_sum(INTENTS_COUNTER).unwrap_or(0.0);
-                let executed =
-                    metrics.value_sum(EXECUTED_COUNTER).unwrap_or(0.0);
+                let executed = metrics.value_sum(EXECUTED_COUNTER).unwrap_or(0.0);
                 backlog == 0.0 && intents <= executed
             })
         },
@@ -157,11 +148,7 @@ async fn await_drain(
     let started = Instant::now();
     let deadline = tokio::time::Instant::now() + cap;
     loop {
-        let executed_now = er
-            .scrape_metrics()
-            .await?
-            .value_sum(EXECUTED_COUNTER)
-            .unwrap_or(0.0);
+        let executed_now = er.scrape_metrics().await?.value_sum(EXECUTED_COUNTER).unwrap_or(0.0);
         let fully_drained = executed_now >= target;
         if fully_drained || tokio::time::Instant::now() >= deadline {
             return Ok(DrainResult {
@@ -191,8 +178,7 @@ impl Scenario<ScenarioReport> for CommitThroughputCeiling {
         let pool_size = profile.fresh_commits as usize * COMMIT_WIDTH;
 
         let prep_payers =
-            prep::funded_payers(base, profile.prep_payers, PREP_PAYER_LAMPORTS)
-                .await?;
+            prep::funded_payers(base, profile.prep_payers, PREP_PAYER_LAMPORTS).await?;
         let pool = Accounts::new(ACCOUNT_SPACE, er.identity())
             .init_batched(base, &prep_payers, pool_size, true)
             .await?;
@@ -203,10 +189,8 @@ impl Scenario<ScenarioReport> for CommitThroughputCeiling {
         let payer_pubkey = payer.pubkey();
         let sender = er.sender(Rc::new(payer));
 
-        let fresh_sets: Vec<Vec<Pubkey>> = pool
-            .chunks_exact(COMMIT_WIDTH)
-            .map(|window| window.to_vec())
-            .collect();
+        let fresh_sets: Vec<Vec<Pubkey>> =
+            pool.chunks_exact(COMMIT_WIDTH).map(|window| window.to_vec()).collect();
 
         quiesce_committor(er).await?;
         let before = er.scrape_metrics().await?;
@@ -269,9 +253,7 @@ impl Scenario<ScenarioReport> for CommitThroughputCeiling {
              executed nothing",
             profile.drain_cap,
         )?;
-        let failed_intents = delta
-            .counter_all("mbv_committor_failed_intents_count")
-            .unwrap_or(0.0);
+        let failed_intents = delta.counter_all("mbv_committor_failed_intents_count").unwrap_or(0.0);
         check_eq!(failed_intents, 0.0, "fresh-key intents failed")?;
         let drain_rate = drain.drained / span_wall.as_secs_f64();
         debug!(
@@ -292,12 +274,8 @@ impl Scenario<ScenarioReport> for CommitThroughputCeiling {
                     format!("fresh commit {id} intent"),
                 )
                 .await?;
-                receipt::confirm_base_signatures(
-                    base.api(),
-                    &commit_receipt,
-                    BASE_CONFIRM_TIMEOUT,
-                )
-                .await?;
+                receipt::confirm_base_signatures(base.api(), &commit_receipt, BASE_CONFIRM_TIMEOUT)
+                    .await?;
                 receipt_base_txs += commit_receipt.base_signatures.len();
             }
         } else {
@@ -339,28 +317,18 @@ impl Scenario<ScenarioReport> for CommitThroughputCeiling {
                 Unit::PerSecond,
                 steady_state.arrival_rate,
             )
-            .metric(
-                "monitor drain /s",
-                Unit::PerSecond,
-                steady_state.drain_rate,
-            )
+            .metric("monitor drain /s", Unit::PerSecond, steady_state.drain_rate)
             .metric(
                 "outstanding peak",
                 Unit::Count,
                 steady_state.outstanding_peak,
             )
-            .metric(
-                "backlog gauge peak",
-                Unit::Count,
-                steady_state.backlog_peak,
-            )
+            .metric("backlog gauge peak", Unit::Count, steady_state.backlog_peak)
             .metric_if("busy peak", Unit::Count, steady_state.busy_peak)
             .metric_if(
                 "validator intent exec avg s",
                 Unit::Seconds,
-                delta.histogram_avg_all(
-                    "mbv_committor_intent_execution_time_histogram_v2",
-                ),
+                delta.histogram_avg_all("mbv_committor_intent_execution_time_histogram_v2"),
             )
             .metric_if(
                 "alt tables used",
@@ -370,8 +338,7 @@ impl Scenario<ScenarioReport> for CommitThroughputCeiling {
             .metric_if(
                 "alt preparation avg s",
                 Unit::Seconds,
-                delta
-                    .histogram_avg("mbv_committor_intent_alt_preparation_time"),
+                delta.histogram_avg("mbv_committor_intent_alt_preparation_time"),
             );
         if drain.fully_drained {
             summary = summary.metric(

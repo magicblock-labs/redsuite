@@ -2,9 +2,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use keypair::Keypair;
-use redsuite_core::{
-    check, prep, system, BaseCtx, ChainCtx, CheckError, ErCtx, Result, Scenario,
-};
+use redsuite_core::{check, prep, system, BaseCtx, ChainCtx, CheckError, ErCtx, Result, Scenario};
 use signer::Signer;
 
 const TRANSFERS: u64 = 10;
@@ -28,22 +26,18 @@ impl Scenario for Example {
         // every transaction must differ somewhere (here: the amount)
         for unique in 1..=TRANSFERS {
             let lamports = LAMPORTS_PER_TRANSFER + unique;
-            let transfer =
-                system::transfer(&payer.pubkey(), &recipient, lamports);
+            let transfer = system::transfer(&payer.pubkey(), &recipient, lamports);
             base.submit_and_confirm(&payer, &[transfer]).await?;
             expected += lamports;
         }
-        let on_base = base
-            .account(&recipient)
-            .await?
-            .ok_or("recipient never appeared on base")?;
+        let on_base = base.account(&recipient).await?.ok_or("recipient never appeared on base")?;
         if on_base.lamports != expected {
-            return Err(CheckError::new(
-                "the base recipient holds the delivered lamports",
-            )
-            .expected(expected.to_string())
-            .actual(on_base.lamports.to_string())
-            .into());
+            return Err(
+                CheckError::new("the base recipient holds the delivered lamports")
+                    .expected(expected.to_string())
+                    .actual(on_base.lamports.to_string())
+                    .into(),
+            );
         }
 
         check::poll(

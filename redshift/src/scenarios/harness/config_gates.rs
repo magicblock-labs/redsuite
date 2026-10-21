@@ -5,8 +5,7 @@ use magicblock_config::config::AllowedProgram;
 use pubkey::Pubkey;
 use redshift_interface::flexi::{build, FlexiCounter};
 use redsuite_core::{
-    check, check_eq, prep, topology, BaseCtx, ChainCtx, ErCtx,
-    PrivateErScenario, Result,
+    check, check_eq, prep, topology, BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result,
 };
 use signer::Signer;
 use solana_address_lookup_table_interface::instruction::create_lookup_table;
@@ -25,13 +24,8 @@ fn committor_id() -> Pubkey {
     topology::COMMITTOR_ID.parse().expect("committor id")
 }
 
-async fn identity_signatures(
-    base: &BaseCtx,
-    identity: &Pubkey,
-) -> Result<Vec<String>> {
-    base.api()
-        .get_signatures_for_address(identity, SIGNATURE_WINDOW)
-        .await
+async fn identity_signatures(base: &BaseCtx, identity: &Pubkey) -> Result<Vec<String>> {
+    base.api().get_signatures_for_address(identity, SIGNATURE_WINDOW).await
 }
 
 async fn alt_transactions_since(
@@ -45,8 +39,7 @@ async fn alt_transactions_since(
         if baseline.contains(&signature) {
             continue;
         }
-        let Some(tx) = base.api().get_transaction(&signature.parse()?).await?
-        else {
+        let Some(tx) = base.api().get_transaction(&signature.parse()?).await? else {
             continue;
         };
         if tx.logs.iter().any(|line| line.contains(&alt_program)) {
@@ -82,11 +75,9 @@ async fn delegate_and_clone_counter(base: &BaseCtx, er: &ErCtx) -> Result<()> {
         prep::COMMIT_FREQUENCY_MS,
     );
     for instruction in setup {
-        base.submit_and_confirm(&payer_ephem, &[instruction])
-            .await?;
+        base.submit_and_confirm(&payer_ephem, &[instruction]).await?;
     }
-    prep::delegate_payer(base, &payer_chain, &payer_ephem, er.identity())
-        .await?;
+    prep::delegate_payer(base, &payer_chain, &payer_ephem, er.identity()).await?;
     er.submit_and_confirm(&payer_ephem, &[build::add(payer_ephem.pubkey(), 1)])
         .await?;
     let clone = er
@@ -116,19 +107,13 @@ impl PrivateErScenario for ConfigGates {
             topology::ErOptions {
                 label: RESTRICTED_ER_LABEL.to_owned(),
                 settings: Box::new(move |params| {
-                    params.chainlink.allowed_programs =
-                        Some(vec![AllowedProgram { id: allowed }]);
+                    params.chainlink.allowed_programs = Some(vec![AllowedProgram { id: allowed }]);
                 }),
                 ..Default::default()
             },
         )
         .await?;
-        prep::await_program_clone(
-            restricted.ctx(),
-            &allowed,
-            PROGRAM_CLONE_TIMEOUT,
-        )
-        .await?;
+        prep::await_program_clone(restricted.ctx(), &allowed, PROGRAM_CLONE_TIMEOUT).await?;
         assert_program_blocked(restricted.ctx(), &blocked).await?;
         restricted.finish().await?;
 
@@ -145,24 +130,20 @@ impl PrivateErScenario for ConfigGates {
         )
         .await?;
 
-        let after_start =
-            alt_transactions_since(base, &open_pubkey, &baseline).await?;
+        let after_start = alt_transactions_since(base, &open_pubkey, &baseline).await?;
         check!(
             after_start.is_empty(),
             "the er start must not send lookup table transactions on base, \
              got {after_start:?}"
         )?;
 
-        prep::await_program_clone(open.ctx(), &allowed, PROGRAM_CLONE_TIMEOUT)
-            .await?;
-        prep::await_program_clone(open.ctx(), &blocked, PROGRAM_CLONE_TIMEOUT)
-            .await?;
+        prep::await_program_clone(open.ctx(), &allowed, PROGRAM_CLONE_TIMEOUT).await?;
+        prep::await_program_clone(open.ctx(), &blocked, PROGRAM_CLONE_TIMEOUT).await?;
 
         delegate_and_clone_counter(base, open.ctx()).await?;
 
         tokio::time::sleep(ALT_SETTLE).await;
-        let after_clone =
-            alt_transactions_since(base, &open_pubkey, &baseline).await?;
+        let after_clone = alt_transactions_since(base, &open_pubkey, &baseline).await?;
         check!(
             after_clone.is_empty(),
             "cloning must not send lookup table transactions on base, got \
@@ -171,12 +152,9 @@ impl PrivateErScenario for ConfigGates {
         open.finish().await?;
 
         let recent_slot = base.api().get_slot().await?;
-        let (create_ix, _) =
-            create_lookup_table(open_pubkey, open_pubkey, recent_slot);
-        base.submit_and_confirm(&open_identity, &[create_ix])
-            .await?;
-        let control =
-            alt_transactions_since(base, &open_pubkey, &baseline).await?;
+        let (create_ix, _) = create_lookup_table(open_pubkey, open_pubkey, recent_slot);
+        base.submit_and_confirm(&open_identity, &[create_ix]).await?;
+        let control = alt_transactions_since(base, &open_pubkey, &baseline).await?;
         check_eq!(
             control.len(),
             1,

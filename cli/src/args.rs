@@ -97,12 +97,7 @@ pub struct BenchmarkRun {
     #[arg(long, env = "REDSUITE_PROFILE", value_enum, default_value = "lite")]
     pub profile: Profile,
     /// Loop mode for rpc_warm_ingress.
-    #[arg(
-        long = "loop",
-        env = "REDSUITE_LOOP",
-        value_enum,
-        default_value = "open"
-    )]
+    #[arg(long = "loop", env = "REDSUITE_LOOP", value_enum, default_value = "open")]
     pub loop_mode: LoopMode,
 }
 
@@ -126,12 +121,9 @@ pub struct Load {
 }
 
 fn duration(value: &str) -> Result<Duration, String> {
-    let duration =
-        humantime::parse_duration(value).map_err(|error| error.to_string())?;
+    let duration = humantime::parse_duration(value).map_err(|error| error.to_string())?;
     if duration.is_zero() || Instant::now().checked_add(duration).is_none() {
-        return Err(
-            "duration must be positive and fit a monotonic deadline".into()
-        );
+        return Err("duration must be positive and fit a monotonic deadline".into());
     }
     Ok(duration)
 }

@@ -23,11 +23,7 @@ pub struct FlexiCounter {
 
 impl FlexiCounter {
     pub fn new(label: String) -> Self {
-        Self {
-            count: 0,
-            updates: 0,
-            label,
-        }
+        Self { count: 0, updates: 0, label }
     }
 
     pub fn pda_and_bump(payer: &Pubkey) -> (Pubkey, u8) {
@@ -109,10 +105,7 @@ pub mod build {
 
     use super::*;
 
-    fn with_tag(
-        instruction: &FlexiInstruction,
-        metas: Vec<AccountMeta>,
-    ) -> Instruction {
+    fn with_tag(instruction: &FlexiInstruction, metas: Vec<AccountMeta>) -> Instruction {
         Instruction {
             program_id: crate::id(),
             accounts: metas,
@@ -129,10 +122,7 @@ pub mod build {
         ];
         (
             with_tag(
-                &FlexiInstruction::Init {
-                    label: label.to_owned(),
-                    bump,
-                },
+                &FlexiInstruction::Init { label: label.to_owned(), bump },
                 metas,
             ),
             pda,
@@ -173,8 +163,7 @@ pub mod build {
         amount: u64,
         fail: bool,
     ) -> Instruction {
-        let mut ix =
-            schedule_intents(&[payer], validator, destination, vec![], false);
+        let mut ix = schedule_intents(&[payer], validator, destination, vec![], false);
         ix.data = tagged(&FlexiInstruction::TransferIntent { amount, fail });
         ix
     }
@@ -186,20 +175,14 @@ pub mod build {
     ) -> Instruction {
         let (pda, _) = FlexiCounter::pda_and_bump(&payer);
         with_tag(
-            &FlexiInstruction::Delegate {
-                commit_frequency_ms,
-                validator,
-            },
+            &FlexiInstruction::Delegate { commit_frequency_ms, validator },
             crate::delegate_metas(payer, pda),
         )
     }
 
     pub fn add(payer: Pubkey, count: u8) -> Instruction {
         let (pda, _) = FlexiCounter::pda_and_bump(&payer);
-        let metas = vec![
-            AccountMeta::new_readonly(payer, true),
-            AccountMeta::new(pda, false),
-        ];
+        let metas = vec![AccountMeta::new_readonly(payer, true), AccountMeta::new(pda, false)];
         with_tag(&FlexiInstruction::Add { count }, metas)
     }
 
@@ -263,11 +246,7 @@ pub mod build {
             AccountMeta::new_readonly(MAGIC_PROGRAM_ID, false),
         ];
         with_tag(
-            &FlexiInstruction::CreateActionIntent {
-                counter,
-                count,
-                compute_units,
-            },
+            &FlexiInstruction::CreateActionIntent { counter, count, compute_units },
             metas,
         )
     }

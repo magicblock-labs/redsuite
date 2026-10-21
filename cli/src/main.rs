@@ -21,9 +21,7 @@ async fn main() -> ExitCode {
         eprintln!("cannot initialize logging: {error}");
         return ExitCode::FAILURE;
     }
-    let outcome = tokio::task::LocalSet::new()
-        .run_until(dispatch(cli.command))
-        .await;
+    let outcome = tokio::task::LocalSet::new().run_until(dispatch(cli.command)).await;
 
     match outcome {
         Ok(code) => code,
@@ -65,25 +63,17 @@ async fn checks(family: Family, command: args::Checks) -> Result<()> {
 
 async fn dispatch(command: args::Command) -> Result<ExitCode> {
     match command {
-        args::Command::Redshift(command) => {
-            checks(Family::Redshift, command).await?
-        }
-        args::Command::Redhat(command) => {
-            checks(Family::Redhat, command).await?
-        }
+        args::Command::Redshift(command) => checks(Family::Redshift, command).await?,
+        args::Command::Redhat(command) => checks(Family::Redhat, command).await?,
         args::Command::Redline(command) => match command {
-            args::Benchmarks::List { selections } => {
-                list(Family::Redline, &selections)?
-            }
+            args::Benchmarks::List { selections } => list(Family::Redline, &selections)?,
             args::Benchmarks::Run(args) => {
                 let config = ExecutionConfig {
                     profile: args.profile,
                     loop_mode: args.loop_mode,
                     ..ExecutionConfig::default()
                 };
-                suite::Suite::new(Family::Redline, args.run, config, true, 1)?
-                    .run()
-                    .await?;
+                suite::Suite::new(Family::Redline, args.run, config, true, 1)?.run().await?;
             }
             args::Benchmarks::Load(args) => return load(args).await,
         },
@@ -112,8 +102,7 @@ async fn load(args: args::Load) -> Result<ExitCode> {
         concurrency: args.concurrency,
         stop: receiver,
     };
-    let work =
-        run_private_er_scenario(scenario, &[Fixture::RedlineProgram], config);
+    let work = run_private_er_scenario(scenario, &[Fixture::RedlineProgram], config);
     tokio::pin!(work);
     let record = tokio::select! {
         record = &mut work => record,

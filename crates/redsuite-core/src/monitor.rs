@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+use derive_more::Display;
+
 use crate::{
     api::MetricsCollector,
     sampler::{Sampler, Trailing},
@@ -28,22 +30,12 @@ pub struct SteadyStateSample {
     pub busy: Option<f64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display)]
+#[display(rename_all = "UPPERCASE")]
 pub enum SteadyStateVerdict {
     Pass,
     Overload,
     Invalid,
-}
-
-impl std::fmt::Display for SteadyStateVerdict {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let label = match self {
-            SteadyStateVerdict::Pass => "PASS",
-            SteadyStateVerdict::Overload => "OVERLOAD",
-            SteadyStateVerdict::Invalid => "INVALID",
-        };
-        write!(f, "{label}")
-    }
 }
 
 #[derive(Debug)]
@@ -58,10 +50,7 @@ pub struct SteadyStateOutcome {
     pub samples: Vec<SteadyStateSample>,
 }
 
-pub fn start(
-    collector: MetricsCollector,
-    spec: MonitorSpec,
-) -> Sampler<Vec<SteadyStateSample>> {
+pub fn start(collector: MetricsCollector, spec: MonitorSpec) -> Sampler<Vec<SteadyStateSample>> {
     let started = std::time::Instant::now();
     Sampler::spawn(
         collector,
@@ -73,10 +62,7 @@ pub fn start(
                 arrivals_total: metrics.value_sum(&spec.arrival_counter)?,
                 drained_total: metrics.value_sum(&spec.drain_counter)?,
                 backlog: metrics.value_sum(&spec.backlog_gauge)?,
-                busy: spec
-                    .busy_gauge
-                    .as_deref()
-                    .and_then(|gauge| metrics.value_sum(gauge)),
+                busy: spec.busy_gauge.as_deref().and_then(|gauge| metrics.value_sum(gauge)),
             });
             Some(())
         },
@@ -84,10 +70,7 @@ pub fn start(
 }
 
 pub fn judge(samples: Vec<SteadyStateSample>) -> SteadyStateOutcome {
-    let backlog_peak = samples
-        .iter()
-        .map(|sample| sample.backlog)
-        .fold(0.0, f64::max);
+    let backlog_peak = samples.iter().map(|sample| sample.backlog).fold(0.0, f64::max);
     let first = samples.first().copied().unwrap_or_default();
     let last = samples.last().copied().unwrap_or_default();
     let outstanding = |sample: &SteadyStateSample| {
@@ -109,15 +92,10 @@ pub fn judge(samples: Vec<SteadyStateSample>) -> SteadyStateOutcome {
     for pair in samples.windows(2) {
         let window_arrivals = pair[1].arrivals_total - pair[0].arrivals_total;
         let window_drained = pair[1].drained_total - pair[0].drained_total;
-        let queue_deep = outstanding(&pair[1]).max(pair[1].backlog)
-            >= OVERLOAD_BACKLOG_FLOOR;
-        let drain_lagging = window_arrivals > 0.0
-            && window_drained < window_arrivals * DRAIN_KEEPUP_FRACTION;
-        lagging_streak = if queue_deep && drain_lagging {
-            lagging_streak + 1
-        } else {
-            0
-        };
+        let queue_deep = outstanding(&pair[1]).max(pair[1].backlog) >= OVERLOAD_BACKLOG_FLOOR;
+        let drain_lagging =
+            window_arrivals > 0.0 && window_drained < window_arrivals * DRAIN_KEEPUP_FRACTION;
+        lagging_streak = if queue_deep && drain_lagging { lagging_streak + 1 } else { 0 };
         overloaded |= lagging_streak >= OVERLOAD_STREAK;
     }
     let verdict = if samples.len() < 2 || arrivals <= 0.0 {
@@ -136,10 +114,7 @@ pub fn judge(samples: Vec<SteadyStateSample>) -> SteadyStateOutcome {
         backlog_peak,
         backlog_end: last.backlog,
         outstanding_peak,
-        busy_peak: samples
-            .iter()
-            .filter_map(|sample| sample.busy)
-            .reduce(f64::max),
+        busy_peak: samples.iter().filter_map(|sample| sample.busy).reduce(f64::max),
         samples,
     }
 }

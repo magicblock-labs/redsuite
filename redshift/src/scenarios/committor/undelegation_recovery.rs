@@ -43,19 +43,9 @@ fn value(case: u64, step: u64) -> u64 {
     100 * case + step
 }
 
-async fn write(
-    er: &ErCtx,
-    payer: &Keypair,
-    id: u64,
-    account: &Pubkey,
-) -> Result<Vec<u8>> {
-    er.submit_and_confirm(payer, &[build::simple_byte_set(id, &[*account])])
-        .await?;
-    let data = er
-        .account(account)
-        .await?
-        .ok_or("er copy vanished after the write")?
-        .data;
+async fn write(er: &ErCtx, payer: &Keypair, id: u64, account: &Pubkey) -> Result<Vec<u8>> {
+    er.submit_and_confirm(payer, &[build::simple_byte_set(id, &[*account])]).await?;
+    let data = er.account(account).await?.ok_or("er copy vanished after the write")?.data;
     check_eq!(
         crate::written_id(&data),
         Some(id),
@@ -72,9 +62,7 @@ async fn rejected_write(
     snapshot: &[u8],
     when: &str,
 ) -> Result<()> {
-    let attempt = er
-        .submit_and_confirm(payer, &[build::simple_byte_set(id, &[*account])])
-        .await;
+    let attempt = er.submit_and_confirm(payer, &[build::simple_byte_set(id, &[*account])]).await;
     check!(
         attempt.is_err(),
         "an er write {when} must be rejected while undelegation is pending, \
@@ -86,10 +74,7 @@ async fn rejected_write(
         &crate::LOCKOUT_REJECTIONS,
         &error,
     )?;
-    let on_er = er
-        .account(account)
-        .await?
-        .ok_or("er copy vanished during the lockout")?;
+    let on_er = er.account(account).await?.ok_or("er copy vanished during the lockout")?;
     check_eq!(
         on_er.data,
         snapshot,
@@ -134,12 +119,7 @@ async fn await_ownership_return(
     }
 }
 
-async fn await_er_value(
-    er: &ErCtx,
-    account: &Pubkey,
-    id: u64,
-    what: &str,
-) -> Result<()> {
+async fn await_er_value(er: &ErCtx, account: &Pubkey, id: u64, what: &str) -> Result<()> {
     check::poll_for(what, DISCOVERY_TIMEOUT, || async {
         match er.account(account).await {
             Ok(Some(acc)) if crate::written_id(&acc.data) == Some(id) => Ok(()),
@@ -189,12 +169,9 @@ async fn redelegate_and_write(
         "the er accepts writes again once the account is redelegated",
         REDELEGATE_TIMEOUT,
         || async {
-            er.submit_and_confirm(
-                payer,
-                &[build::simple_byte_set(id, &[*account])],
-            )
-            .await
-            .is_ok()
+            er.submit_and_confirm(payer, &[build::simple_byte_set(id, &[*account])])
+                .await
+                .is_ok()
         },
     )
     .await?;
@@ -220,30 +197,15 @@ async fn recover(
 ) -> Result<()> {
     let case = u64::from(seed);
     let identity = er.identity();
-    let account =
-        crate::init_delegated_account(base, payer, seed, identity).await?;
-    prep::await_clones(
-        er,
-        &[account],
-        crate::ACCOUNT_SPACE as usize,
-        CLONE_TIMEOUT,
-    )
-    .await?;
+    let account = crate::init_delegated_account(base, payer, seed, identity).await?;
+    prep::await_clones(er, &[account], crate::ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
     let snapshot = write(er, payer, value(case, 1), &account).await?;
 
-    let submission = proxies.intercept(
-        Selector::method("sendTransaction")
-            .http()
-            .request()
-            .account(&account),
-    );
+    let submission =
+        proxies.intercept(Selector::method("sendTransaction").http().request().account(&account));
     er.submit_and_confirm(
         payer,
-        &[build::commit_and_undelegate_accounts(
-            case,
-            payer.pubkey(),
-            &[account],
-        )],
+        &[build::commit_and_undelegate_accounts(case, payer.pubkey(), &[account])],
     )
     .await?;
     let held = submission.wait(INTERCEPT_TIMEOUT).await?;
@@ -257,12 +219,8 @@ async fn recover(
     )
     .await?;
 
-    let resubmission = proxies.intercept(
-        Selector::method("sendTransaction")
-            .http()
-            .request()
-            .account(&account),
-    );
+    let resubmission =
+        proxies.intercept(Selector::method("sendTransaction").http().request().account(&account));
     held.discard();
     let held = resubmission.wait(INTERCEPT_TIMEOUT).await?;
     rejected_write(
@@ -274,9 +232,10 @@ async fn recover(
         "after a failed base submission",
     )
     .await?;
-    let on_base = base.account(&account).await?.ok_or(
-        "the account vanished from base while its submission was held",
-    )?;
+    let on_base = base
+        .account(&account)
+        .await?
+        .ok_or("the account vanished from base while its submission was held")?;
     check_eq!(
         on_base.owner,
         DELEGATION_PROGRAM_ID,
@@ -289,8 +248,7 @@ async fn recover(
     );
     proxies.close_connections();
     held.release();
-    await_ownership_return(base, &account, &crate::program::id(), &snapshot)
-        .await?;
+    await_ownership_return(base, &account, &crate::program::id(), &snapshot).await?;
 
     match mode {
         Recovery::Reconnect => {
@@ -309,11 +267,8 @@ async fn recover(
     }
 
     let base_write = value(case, 5);
-    base.submit_and_confirm(
-        payer,
-        &[build::simple_byte_set(base_write, &[account])],
-    )
-    .await?;
+    base.submit_and_confirm(payer, &[build::simple_byte_set(base_write, &[account])])
+        .await?;
     await_er_value(
         er,
         &account,
@@ -325,8 +280,7 @@ async fn recover(
         ),
     )
     .await?;
-    redelegate_and_write(base, er, payer, &account, seed, value(case, 6))
-        .await?;
+    redelegate_and_write(base, er, payer, &account, seed, value(case, 6)).await?;
     Ok(())
 }
 

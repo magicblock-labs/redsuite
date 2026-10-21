@@ -8,9 +8,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use redsuite_core::{
-    topology, BaseCtx, PrivateErScenario, Result, ScenarioReport,
-};
+use redsuite_core::{topology, BaseCtx, PrivateErScenario, Result, ScenarioReport};
 use tokio::sync::watch;
 
 use crate::scenarios::scheduler::mixed_sustained_load;
@@ -29,10 +27,7 @@ impl PrivateErScenario<(ScenarioReport, Result<()>)> for Load {
         "redline/load"
     }
 
-    async fn run(
-        &self,
-        base: &BaseCtx,
-    ) -> Result<(ScenarioReport, Result<()>)> {
+    async fn run(&self, base: &BaseCtx) -> Result<(ScenarioReport, Result<()>)> {
         let started = Instant::now();
         let private = topology::private_er(
             base,
@@ -43,9 +38,7 @@ impl PrivateErScenario<(ScenarioReport, Result<()>)> for Load {
         )
         .await?;
         private.wait_ready(topology::ER_READY_TIMEOUT).await?;
-        let result =
-            mixed_sustained_load::run(base, private.ctx(), Some(self), started)
-                .await;
+        let result = mixed_sustained_load::run(base, private.ctx(), Some(self), started).await;
         let cleanup = private.finish().await;
         let (report, outcome) = result?;
         let outcome = outcome.and(cleanup);

@@ -19,8 +19,7 @@ use redsuite_core::{
 };
 use signer::Signer;
 use solana_loader_v3_interface::{
-    get_program_data_address, instruction as loader,
-    state::UpgradeableLoaderState,
+    get_program_data_address, instruction as loader, state::UpgradeableLoaderState,
 };
 
 use crate::program::layout::{DATA_OFFSET, ID_SIZE};
@@ -31,11 +30,7 @@ const PHASES: [&str; 4] = ["before upgrade", "held", "released", "converged"];
 
 pub struct ProgramUpgrade;
 
-async fn buffer(
-    base: &BaseCtx,
-    payer: &Keypair,
-    bytes: &[u8],
-) -> Result<Keypair> {
+async fn buffer(base: &BaseCtx, payer: &Keypair, bytes: &[u8]) -> Result<Keypair> {
     let buffer = Keypair::new();
     base.submit_and_confirm_with(
         payer,
@@ -79,8 +74,7 @@ impl PrivateErScenario for ProgramUpgrade {
 
     async fn run(&self, base: &BaseCtx) -> Result<()> {
         let mut a = std::fs::read(Fixture::RedshiftProgramSlim.resolve()?)?;
-        let mut b =
-            std::fs::read(Fixture::RedshiftProgramSlimUpgraded.resolve()?)?;
+        let mut b = std::fs::read(Fixture::RedshiftProgramSlimUpgraded.resolve()?)?;
         let size = a.len().max(b.len());
         a.resize(size, 0);
         b.resize(size, 0);
@@ -88,8 +82,7 @@ impl PrivateErScenario for ProgramUpgrade {
         let funder = prep::funded_payer(base, 10_000_000_000).await?;
         let authority = funder.pubkey();
         let (a_buffer, b_buffer) =
-            try_join(buffer(base, &funder, &a), buffer(base, &funder, &b))
-                .await?;
+            try_join(buffer(base, &funder, &a), buffer(base, &funder, &b)).await?;
         let program = Keypair::new();
         let program_id = program.pubkey();
         let programdata = get_program_data_address(&program_id);
@@ -119,13 +112,8 @@ impl PrivateErScenario for ProgramUpgrade {
         )
         .await?;
         let er = hot.ctx();
-        let payer = prep::delegated_payer(
-            base,
-            &funder,
-            er.identity(),
-            crate::PAYER_LAMPORTS,
-        )
-        .await?;
+        let payer =
+            prep::delegated_payer(base, &funder, er.identity(), crate::PAYER_LAMPORTS).await?;
         let keys = Accounts::new((DATA_OFFSET + ID_SIZE) as u32, er.identity())
             .init_batched(base, std::slice::from_ref(&funder), 2, true)
             .await?;
@@ -157,8 +145,7 @@ impl PrivateErScenario for ProgramUpgrade {
                 proxies.events().iter().any(|event| {
                     event.action == Action::Held
                         && event.operation.as_ref().is_some_and(|op| {
-                            op.stage == stage
-                                && op.accounts.contains(&key.to_string())
+                            op.stage == stage && op.accounts.contains(&key.to_string())
                         })
                 })
             })
@@ -166,9 +153,9 @@ impl PrivateErScenario for ProgramUpgrade {
         };
         let materialized = async |er: &ErCtx, bytes: &[u8]| -> Result<()> {
             check!(
-                local_program(er, program_id).await?.is_some_and(|account| {
-                    account.executable && account.data == bytes
-                }),
+                local_program(er, program_id)
+                    .await?
+                    .is_some_and(|account| { account.executable && account.data == bytes }),
                 "program {program_id} contains expected bytes"
             )?;
             Ok(())
@@ -176,23 +163,17 @@ impl PrivateErScenario for ProgramUpgrade {
         let traffic = async {
             let mut loading_failure = Some(
                 proxies.reject(
-                    Selector::methods(&[
-                        "getAccountInfo",
-                        "getMultipleAccounts",
-                    ])
-                    .http()
-                    .response()
-                    .account(&program_id),
+                    Selector::methods(&["getAccountInfo", "getMultipleAccounts"])
+                        .http()
+                        .response()
+                        .account(&program_id),
                     FETCH_FAILURE,
                 ),
             );
             let mut converged = false;
-            let mut accounts: Vec<_> = keys
-                .iter()
-                .map(|key| AccountMeta::new(*key, false))
-                .collect();
-            accounts
-                .push(AccountMeta::new_readonly(crate::program::id(), false));
+            let mut accounts: Vec<_> =
+                keys.iter().map(|key| AccountMeta::new(*key, false)).collect();
+            accounts.push(AccountMeta::new_readonly(crate::program::id(), false));
             let mut probe = Instruction {
                 program_id,
                 accounts,
@@ -210,9 +191,7 @@ impl PrivateErScenario for ProgramUpgrade {
                 let injecting = loading_failure.is_some();
                 match sender.submit_prepared(&tx).await {
                     Err(error) => {
-                        let rpc = error
-                            .downcast_ref::<RpcError>()
-                            .ok_or(error.to_string())?;
+                        let rpc = error.downcast_ref::<RpcError>().ok_or(error.to_string())?;
                         check!(
                             rpc.code == -32003
                                 && if injecting {
@@ -226,35 +205,26 @@ impl PrivateErScenario for ProgramUpgrade {
                     }
                     Ok(_) => {
                         check!(!injecting, "injected cold fetch must fail")?;
-                        let outcome = er
-                            .api()
-                            .await_transaction(&signature, TIMEOUT)
-                            .await?;
+                        let outcome = er.api().await_transaction(&signature, TIMEOUT).await?;
                         let versions: Vec<_> = outcome
                             .logs
                             .iter()
                             .map(String::as_str)
-                            .filter(|log| {
-                                log.starts_with("Program log: Upgrade: ")
-                            })
+                            .filter(|log| log.starts_with("Program log: Upgrade: "))
                             .collect();
                         let version = match versions.as_slice() {
                             ["Program log: Upgrade: 1"] => Some(1),
                             ["Program log: Upgrade: 2"] => Some(2),
                             [] => None,
                             _ => {
-                                return Err(format!(
-                                    "invalid version {signature}: {versions:?}"
-                                )
-                                .into());
+                                return Err(
+                                    format!("invalid version {signature}: {versions:?}").into()
+                                );
                             }
                         };
                         if let Some(version) = version {
                             check!(
-                                matches!(
-                                    (current, version),
-                                    (0, 1) | (1 | 2, 1 | 2) | (3, 2)
-                                ),
+                                matches!((current, version), (0, 1) | (1 | 2, 1 | 2) | (3, 2)),
                                 "version {version} during {} for {signature}",
                                 PHASES[current]
                             )?;
@@ -267,14 +237,9 @@ impl PrivateErScenario for ProgramUpgrade {
                                 )?;
                                 tally[current][2] += 1;
                             } else {
-                                check!(
-                                    !fail,
-                                    "failure probe {signature} must fail"
-                                )?;
+                                check!(!fail, "failure probe {signature} must fail")?;
                                 let value = id * 10 + version;
-                                for (account, value) in
-                                    expected.iter_mut().zip([value, !value])
-                                {
+                                for (account, value) in expected.iter_mut().zip([value, !value]) {
                                     account.data[DATA_OFFSET..]
                                         .copy_from_slice(&value.to_le_bytes());
                                 }
@@ -282,8 +247,7 @@ impl PrivateErScenario for ProgramUpgrade {
                             }
                         } else {
                             check!(
-                                outcome.err.is_some()
-                                    && matches!(current, 1 | 2),
+                                outcome.err.is_some() && matches!(current, 1 | 2),
                                 "missing logs for {signature}: {:?}",
                                 outcome.err
                             )?;
@@ -324,19 +288,11 @@ impl PrivateErScenario for ProgramUpgrade {
             phase.set(1);
             base.submit_and_confirm(
                 &funder,
-                &[loader::upgrade(
-                    &program_id,
-                    &b_buffer.pubkey(),
-                    &authority,
-                    &authority,
-                )],
+                &[loader::upgrade(&program_id, &b_buffer.pubkey(), &authority, &authority)],
             )
             .await?;
-            let data = base
-                .account(&programdata)
-                .await?
-                .ok_or("missing upgraded programdata")?
-                .data;
+            let data =
+                base.account(&programdata).await?.ok_or("missing upgraded programdata")?.data;
             let offset = UpgradeableLoaderState::size_of_programdata_metadata();
             check!(
                 data.get(offset..) == Some(b.as_slice()),
@@ -358,27 +314,18 @@ impl PrivateErScenario for ProgramUpgrade {
             )
             .await?;
             check!(
-                clones
-                    .iter()
-                    .all(|a| a.as_ref().is_some_and(|a| a.executable
-                        && a.owner == sdk_ids::loader_v4::ID
-                        && a.data == b)),
+                clones.iter().all(|a| a.as_ref().is_some_and(|a| a.executable
+                    && a.owner == sdk_ids::loader_v4::ID
+                    && a.data == b)),
                 "cold clones contain B"
             )?;
-            check::poll_for("fresh B materialization", TIMEOUT, || {
-                materialized(er, &b)
-            })
-            .await?;
+            check::poll_for("fresh B materialization", TIMEOUT, || materialized(er, &b)).await?;
             phase.set(3);
             progressed(3, 12).await?;
             done.set(true);
             Result::Ok(())
         };
-        tokio::time::timeout(
-            Duration::from_secs(180),
-            try_join(traffic, upgrade),
-        )
-        .await??;
+        tokio::time::timeout(Duration::from_secs(180), try_join(traffic, upgrade)).await??;
         check_eq!(
             base.accounts(&keys).await?,
             base_state,

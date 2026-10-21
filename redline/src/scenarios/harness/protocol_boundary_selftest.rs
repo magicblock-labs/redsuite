@@ -56,10 +56,7 @@ const FULL: Profile = Profile {
     expect_artifact: true,
 };
 
-const PROFILES: ProfileValues<Profile> = ProfileValues {
-    lite: LITE,
-    full: FULL,
-};
+const PROFILES: ProfileValues<Profile> = ProfileValues { lite: LITE, full: FULL };
 
 fn run_cell(
     er_rpc_url: String,
@@ -94,21 +91,13 @@ impl Scenario<ScenarioReport> for ProtocolBoundarySelftest {
 
     async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
         let profile = PROFILES.select(base.config().profile);
-        let prep_payers =
-            prep::funded_payers(base, profile.payers, PREP_PAYER_LAMPORTS)
-                .await?;
+        let prep_payers = prep::funded_payers(base, profile.payers, PREP_PAYER_LAMPORTS).await?;
         let pool = Arc::new(
             Accounts::new(crate::ACCOUNT_SPACE, er.identity())
                 .init_batched(base, &prep_payers, profile.accounts, true)
                 .await?,
         );
-        prep::await_clones(
-            er,
-            &pool,
-            crate::ACCOUNT_SPACE as usize,
-            CLONE_TIMEOUT,
-        )
-        .await?;
+        prep::await_clones(er, &pool, crate::ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
         let payer_bytes = prep::payer_bytes(&prep_payers);
         let er_rpc_url = er.api().url().to_owned();
 
@@ -172,26 +161,23 @@ impl Scenario<ScenarioReport> for ProtocolBoundarySelftest {
                 cell.outcome.first_error
             )?;
 
-            let cell_report = ScenarioReport::ok(&format!(
-                "{}/threads{threads}",
-                self.name()
-            ))
-            .setting("profile", profile.name)
-            .setting("threads", threads)
-            .setting("shape", "read-write 3/tx (1 src + 2 dst data-copy)")
-            .setting("payers", profile.payers)
-            .setting("accounts", profile.accounts)
-            .setting("measured iters", profile.iterations)
-            .setting("offered tps", profile.rate)
-            .setting("concurrency", profile.concurrency)
-            .observe("delivery us", Unit::Micros, cell.outcome.delivery)
-            .client_side(&cell.outcome)
-            .metric("achieved tps", Unit::Tps, cell.outcome.achieved_rps())
-            .metric_if(
-                "validator tx processing avg us",
-                Unit::Micros,
-                cell.tx_processing_avg_us,
-            );
+            let cell_report = ScenarioReport::ok(&format!("{}/threads{threads}", self.name()))
+                .setting("profile", profile.name)
+                .setting("threads", threads)
+                .setting("shape", "read-write 3/tx (1 src + 2 dst data-copy)")
+                .setting("payers", profile.payers)
+                .setting("accounts", profile.accounts)
+                .setting("measured iters", profile.iterations)
+                .setting("offered tps", profile.rate)
+                .setting("concurrency", profile.concurrency)
+                .observe("delivery us", Unit::Micros, cell.outcome.delivery)
+                .client_side(&cell.outcome)
+                .metric("achieved tps", Unit::Tps, cell.outcome.achieved_rps())
+                .metric_if(
+                    "validator tx processing avg us",
+                    Unit::Micros,
+                    cell.tx_processing_avg_us,
+                );
             report::persist_cell(self.name(), &cell_report);
             cells.push(cell);
         }
@@ -223,8 +209,7 @@ impl Scenario<ScenarioReport> for ProtocolBoundarySelftest {
         if profile.expect_artifact && !artifact_detected {
             warn!(
                 profile.rate,
-                p50_ratio,
-                "expected client-thread latency gap absent; try a higher rate",
+                p50_ratio, "expected client-thread latency gap absent; try a higher rate",
             );
         }
         if !profile.expect_artifact && artifact_detected {

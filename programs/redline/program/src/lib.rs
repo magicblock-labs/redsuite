@@ -22,52 +22,33 @@ fn process_instruction(
     // The dlp undelegation callback arrives with its own discriminator and
     // must be intercepted before bincode deserialization.
     if instruction_data.len() >= EXTERNAL_UNDELEGATE_DISCRIMINATOR.len() {
-        let (disc, data) =
-            instruction_data.split_at(EXTERNAL_UNDELEGATE_DISCRIMINATOR.len());
+        let (disc, data) = instruction_data.split_at(EXTERNAL_UNDELEGATE_DISCRIMINATOR.len());
         if disc == EXTERNAL_UNDELEGATE_DISCRIMINATOR {
             return undelegate(program_id, accounts, data);
         }
     }
 
-    let instruction: Instruction = bincode::deserialize(instruction_data)
-        .map_err(|err| {
-            msg!("failed to bincode deserialize instruction data: {}", err);
-            ProgramError::InvalidInstructionData
-        })?;
+    let instruction: Instruction = bincode::deserialize(instruction_data).map_err(|err| {
+        msg!("failed to bincode deserialize instruction data: {}", err);
+        ProgramError::InvalidInstructionData
+    })?;
     let mut iter = accounts.iter();
 
     match instruction {
-        Instruction::InitAccount {
-            space,
-            seed,
-            bump,
-            authority,
-        } => init_account(program_id, &mut iter, space, seed, bump, authority)?,
-        Instruction::Delegate { seed, authority } => {
-            delegate_account(accounts, seed, authority)?
+        Instruction::InitAccount { space, seed, bump, authority } => {
+            init_account(program_id, &mut iter, space, seed, bump, authority)?
         }
+        Instruction::Delegate { seed, authority } => delegate_account(accounts, seed, authority)?,
         Instruction::SimpleByteSet { id } => simple_byte_set(&mut iter, id)?,
-        Instruction::MultiAccountRead { id } => {
-            multi_account_read(&mut iter, accounts, id)?
-        }
+        Instruction::MultiAccountRead { id } => multi_account_read(&mut iter, accounts, id)?,
         Instruction::ExpensiveHashCompute { id, init, iters } => {
             expensive_hash_compute(&mut iter, id, init.to_bytes(), iters)?
         }
-        Instruction::AccountDataCopy { id } => {
-            account_data_copy(&mut iter, id)?
-        }
-        Instruction::ReadAccountsData { id } => {
-            read_accounts_data(&mut iter, id)?
-        }
-        Instruction::CommitAccounts { id } => {
-            commit_accounts(&mut iter, id, false)?
-        }
-        Instruction::CommitAndUndelegateAccounts { id } => {
-            commit_accounts(&mut iter, id, true)?
-        }
-        Instruction::Reserved9 => {
-            return Err(ProgramError::InvalidInstructionData)
-        }
+        Instruction::AccountDataCopy { id } => account_data_copy(&mut iter, id)?,
+        Instruction::ReadAccountsData { id } => read_accounts_data(&mut iter, id)?,
+        Instruction::CommitAccounts { id } => commit_accounts(&mut iter, id, false)?,
+        Instruction::CommitAndUndelegateAccounts { id } => commit_accounts(&mut iter, id, true)?,
+        Instruction::Reserved9 => return Err(ProgramError::InvalidInstructionData),
         Instruction::HashFold { id, iters } => hash_fold(&mut iter, id, iters)?,
     }
 

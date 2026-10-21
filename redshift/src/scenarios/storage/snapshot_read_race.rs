@@ -57,10 +57,7 @@ impl Readers {
                             .map(|(pk, _)| pk.to_string())
                             .collect::<Vec<_>>()
                             .join(", ");
-                        return (
-                            reads,
-                            Some(format!("missing account(s): {missing}")),
-                        );
+                        return (reads, Some(format!("missing account(s): {missing}")));
                     }
                     Err(error) => return (reads, Some(error.to_string())),
                 }
@@ -72,10 +69,8 @@ impl Readers {
 
     async fn stop(self, phase: &str) -> Result<()> {
         self.stop.set(true);
-        let (reads, failure) = self
-            .task
-            .await
-            .map_err(|error| format!("reader task {phase}: {error}"))?;
+        let (reads, failure) =
+            self.task.await.map_err(|error| format!("reader task {phase}: {error}"))?;
         check!(
             failure.is_none(),
             "{phase}: account reads must keep succeeding while the er seals \
@@ -86,29 +81,22 @@ impl Readers {
     }
 }
 
-async fn delegate_books(
-    base: &BaseCtx,
-    er: &ErCtx,
-    payer: &Keypair,
-) -> Result<Vec<Book>> {
+async fn delegate_books(base: &BaseCtx, er: &ErCtx, payer: &Keypair) -> Result<Vec<Book>> {
     let mut books = Vec::with_capacity(BOOKS);
     for _ in 0..BOOKS {
         let manager = Keypair::new();
-        let (init, address) =
-            build::init_order_book(payer.pubkey(), manager.pubkey());
+        let (init, address) = build::init_order_book(payer.pubkey(), manager.pubkey());
         let delegate = build::delegate_order_book(
             payer.pubkey(),
             manager.pubkey(),
             prep::COMMIT_FREQUENCY_MS,
             Some(er.identity()),
         );
-        base.submit_and_confirm_with(payer, &[&manager], &[init, delegate])
-            .await?;
+        base.submit_and_confirm_with(payer, &[&manager], &[init, delegate]).await?;
         books.push(Book { manager, address });
     }
     let addresses: Vec<_> = books.iter().map(|book| book.address).collect();
-    prep::await_clones(er, &addresses, ORDER_BOOK_INIT_SIZE, CLONE_TIMEOUT)
-        .await?;
+    prep::await_clones(er, &addresses, ORDER_BOOK_INIT_SIZE, CLONE_TIMEOUT).await?;
     Ok(books)
 }
 
@@ -126,11 +114,7 @@ async fn churn(
         let index = grows as usize % books.len();
         let book = &books[index];
         let bytes = GROW_BYTES + (grows / books.len() as u64) % GROW_VARIANTS;
-        let grow = build::grow_order_book(
-            payer.pubkey(),
-            book.manager.pubkey(),
-            bytes,
-        );
+        let grow = build::grow_order_book(payer.pubkey(), book.manager.pubkey(), bytes);
         let submitted = er.submit_and_confirm(payer, &[grow]).await;
         check!(
             submitted.is_ok(),
@@ -170,18 +154,11 @@ impl PrivateErScenario for SnapshotReadRace {
         let mut sizes = vec![ORDER_BOOK_INIT_SIZE as u64; BOOKS];
         {
             let er = private.ctx();
-            prep::await_program_clone(
-                er,
-                &redshift_interface::id(),
-                CLONE_TIMEOUT,
-            )
-            .await?;
+            prep::await_program_clone(er, &redshift_interface::id(), CLONE_TIMEOUT).await?;
             books = delegate_books(base, er, &payer).await?;
-            let sponsor =
-                prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
+            let sponsor = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
             prep::delegate_payer(base, &sponsor, &payer, er.identity()).await?;
-            let addresses: Vec<Pubkey> =
-                books.iter().map(|book| book.address).collect();
+            let addresses: Vec<Pubkey> = books.iter().map(|book| book.address).collect();
 
             let readers = Readers::start(er.api().clone(), addresses.clone());
             churn(
@@ -204,8 +181,7 @@ impl PrivateErScenario for SnapshotReadRace {
         )?;
 
         let er = private.ctx();
-        let addresses: Vec<Pubkey> =
-            books.iter().map(|book| book.address).collect();
+        let addresses: Vec<Pubkey> = books.iter().map(|book| book.address).collect();
         let readers = Readers::start(er.api().clone(), addresses.clone());
         churn(
             er,

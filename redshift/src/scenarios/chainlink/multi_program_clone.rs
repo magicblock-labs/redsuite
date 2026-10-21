@@ -1,7 +1,5 @@
 use async_trait::async_trait;
-use redsuite_core::{
-    check, check_eq, topology, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
-};
+use redsuite_core::{check, check_eq, topology, BaseCtx, ChainCtx, ErCtx, Result, Scenario};
 
 use crate::program::instruction::build;
 
@@ -17,49 +15,25 @@ impl Scenario for MultiProgramClone {
     }
 
     async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<()> {
-        let [(first_program, _), (second_program, _)] =
-            topology::redline_loader_v3_pair();
+        let [(first_program, _), (second_program, _)] = topology::redline_loader_v3_pair();
 
-        let payer =
-            redsuite_core::prep::funded_payer(base, crate::PAYER_LAMPORTS)
+        let payer = redsuite_core::prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
+        let first_pda =
+            crate::init_delegated_account_at(base, first_program, &payer, 0, er.identity()).await?;
+        let second_pda =
+            crate::init_delegated_account_at(base, second_program, &payer, 1, er.identity())
                 .await?;
-        let first_pda = crate::init_delegated_account_at(
-            base,
-            first_program,
-            &payer,
-            0,
-            er.identity(),
-        )
-        .await?;
-        let second_pda = crate::init_delegated_account_at(
-            base,
-            second_program,
-            &payer,
-            1,
-            er.identity(),
-        )
-        .await?;
 
         er.submit_and_confirm(
             &payer,
             &[
-                build::simple_byte_set_at(
-                    first_program,
-                    FIRST_WRITE,
-                    &[first_pda],
-                ),
-                build::simple_byte_set_at(
-                    second_program,
-                    SECOND_WRITE,
-                    &[second_pda],
-                ),
+                build::simple_byte_set_at(first_program, FIRST_WRITE, &[first_pda]),
+                build::simple_byte_set_at(second_program, SECOND_WRITE, &[second_pda]),
             ],
         )
         .await?;
 
-        for (program, label) in
-            [(first_program, "first"), (second_program, "second")]
-        {
+        for (program, label) in [(first_program, "first"), (second_program, "second")] {
             let clone = er.account(&program).await?.ok_or_else(|| {
                 check::CheckError::new(format!(
                     "the {label} program must be cloned to the ER after the tx"

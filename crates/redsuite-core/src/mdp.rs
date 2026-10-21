@@ -18,8 +18,7 @@ pub fn mdp_id() -> Pubkey {
 }
 
 pub fn record_pda(identity: &Pubkey) -> Pubkey {
-    Pubkey::find_program_address(&[b"er-record", identity.as_ref()], &mdp_id())
-        .0
+    Pubkey::find_program_address(&[b"er-record", identity.as_ref()], &mdp_id()).0
 }
 
 #[derive(Clone)]

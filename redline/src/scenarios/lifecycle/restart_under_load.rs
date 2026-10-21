@@ -14,8 +14,7 @@ use redsuite_core::{
     redline::{causal::HASH_INIT, Accounts},
     report::Unit,
     topology::{self, RestartConfig, RestartTiming},
-    Api, BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result, ScenarioReport,
-    TxSender,
+    Api, BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result, ScenarioReport, TxSender,
 };
 use signature::Signature;
 use tokio::task::JoinSet;
@@ -65,10 +64,7 @@ const FULL: Profile = Profile {
     resume_timeout: Duration::from_secs(90),
 };
 
-const PROFILES: ProfileValues<Profile> = ProfileValues {
-    lite: LITE,
-    full: FULL,
-};
+const PROFILES: ProfileValues<Profile> = ProfileValues { lite: LITE, full: FULL };
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Mode {
@@ -159,10 +155,7 @@ fn archived_snapshots(storage_dir: &std::path::Path) -> Result<usize> {
     let mut count = 0;
     for entry in std::fs::read_dir(storage_dir)? {
         let entry = entry?;
-        if entry
-            .file_name()
-            .to_str()
-            .is_some_and(|name| name.starts_with("superblock-"))
+        if entry.file_name().to_str().is_some_and(|name| name.starts_with("superblock-"))
             && entry.path().join(ACCOUNTSDB_SNAPSHOT_FILE).is_file()
         {
             count += 1;
@@ -180,12 +173,7 @@ struct LaneState {
 }
 
 impl LaneState {
-    async fn run(
-        self: Rc<Self>,
-        lane: usize,
-        account: Pubkey,
-        sender: TxSender,
-    ) {
+    async fn run(self: Rc<Self>, lane: usize, account: Pubkey, sender: TxSender) {
         while self.admit.get() {
             if self.send(lane, account, &sender).await.is_err() {
                 tokio::time::sleep(LANE_BACKOFF).await;
@@ -193,21 +181,10 @@ impl LaneState {
         }
     }
 
-    async fn send(
-        &self,
-        lane: usize,
-        account: Pubkey,
-        sender: &TxSender,
-    ) -> Result<()> {
+    async fn send(&self, lane: usize, account: Pubkey, sender: &TxSender) -> Result<()> {
         let id = self.next_id.get();
         self.next_id.set(id + 1);
-        let ix = build::expensive_hash_compute_at(
-            PROGRAM,
-            id,
-            HASH_INIT,
-            HASH_ITERS,
-            &[account],
-        );
+        let ix = build::expensive_hash_compute_at(PROGRAM, id, HASH_INIT, HASH_ITERS, &[account]);
         let tx = sender.prepare(&[ix]).await?;
         let signature = tx.signatures[0];
         let index = {
@@ -236,12 +213,7 @@ struct Lanes {
 }
 
 impl Lanes {
-    fn start(
-        api: Api,
-        senders: &[TxSender],
-        pool: &[Pubkey],
-        next_id: Rc<Cell<u64>>,
-    ) -> Self {
+    fn start(api: Api, senders: &[TxSender], pool: &[Pubkey], next_id: Rc<Cell<u64>>) -> Self {
         let state = Rc::new(LaneState {
             api,
             next_id,
@@ -251,11 +223,7 @@ impl Lanes {
         });
         let mut tasks = JoinSet::new();
         for (lane, sender) in senders.iter().enumerate() {
-            tasks.spawn_local(state.clone().run(
-                lane,
-                pool[lane],
-                sender.clone(),
-            ));
+            tasks.spawn_local(state.clone().run(lane, pool[lane], sender.clone()));
         }
         Self { state, tasks }
     }
@@ -281,11 +249,7 @@ impl Lanes {
     }
 }
 
-async fn await_status(
-    api: &Api,
-    signature: &Signature,
-    stop: &Cell<bool>,
-) -> Outcome {
+async fn await_status(api: &Api, signature: &Signature, stop: &Cell<bool>) -> Outcome {
     let deadline = tokio::time::Instant::now() + CONFIRM_TIMEOUT;
     loop {
         if let Ok(Some(status)) = api.get_signature_status(signature).await {
@@ -303,11 +267,7 @@ async fn await_status(
     }
 }
 
-async fn run_lanes_until<F, Fut>(
-    what: &str,
-    timeout: Duration,
-    mut done: F,
-) -> Result<()>
+async fn run_lanes_until<F, Fut>(what: &str, timeout: Duration, mut done: F) -> Result<()>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<bool>>,
@@ -328,16 +288,15 @@ async fn resolve(api: &Api, records: &mut [Record]) -> Result<()> {
         if !matches!(record.outcome, Outcome::Unresolved | Outcome::Rejected) {
             continue;
         }
-        record.outcome =
-            match check::poll_until(RESOLVE_GRACE, RESOLVE_POLL, async || {
-                api.get_transaction(&record.signature).await
-            })
-            .await?
-            {
-                Some(tx) if tx.err.is_none() => Outcome::Confirmed,
-                Some(_) => Outcome::Failed,
-                None => Outcome::Dropped,
-            };
+        record.outcome = match check::poll_until(RESOLVE_GRACE, RESOLVE_POLL, async || {
+            api.get_transaction(&record.signature).await
+        })
+        .await?
+        {
+            Some(tx) if tx.err.is_none() => Outcome::Confirmed,
+            Some(_) => Outcome::Failed,
+            None => Outcome::Dropped,
+        };
     }
     Ok(())
 }
@@ -356,20 +315,16 @@ fn expected_ids(records: &[Record], lanes: usize) -> Vec<Option<u64>> {
     expected
 }
 
-async fn check_state(
-    er: &ErCtx,
-    label: &str,
-    pool: &[Pubkey],
-    records: &[Record],
-) -> Result<()> {
+async fn check_state(er: &ErCtx, label: &str, pool: &[Pubkey], records: &[Record]) -> Result<()> {
     let expected = expected_ids(records, pool.len());
     for (lane, pda) in pool.iter().enumerate() {
         let Some(expected_id) = expected[lane] else {
             continue;
         };
-        let account = er.account(pda).await?.ok_or_else(|| {
-            format!("{label}: account {pda} missing on the er")
-        })?;
+        let account = er
+            .account(pda)
+            .await?
+            .ok_or_else(|| format!("{label}: account {pda} missing on the er"))?;
         let on_chain = crate::account_update_id(&account.data)
             .ok_or_else(|| format!("{label}: account {pda} data too short"))?;
         check_eq!(
@@ -393,20 +348,12 @@ async fn settle_after_restart(
     label: &str,
     records: &mut [Record],
 ) -> Result<Settlement> {
-    let lost = if mode.hard_kill() {
-        drop_lost_tail(api, label, records).await?
-    } else {
-        0
-    };
+    let lost = if mode.hard_kill() { drop_lost_tail(api, label, records).await? } else { 0 };
     let checked = check_confirmed_present(api, label, records).await?;
     Ok(Settlement { checked, lost })
 }
 
-async fn drop_lost_tail(
-    api: &Api,
-    label: &str,
-    records: &mut [Record],
-) -> Result<usize> {
+async fn drop_lost_tail(api: &Api, label: &str, records: &mut [Record]) -> Result<usize> {
     let mut per_lane: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
     for (index, record) in records.iter().enumerate() {
         if record.outcome == Outcome::Confirmed {
@@ -441,15 +388,9 @@ async fn drop_lost_tail(
     Ok(lost)
 }
 
-async fn check_confirmed_present(
-    api: &Api,
-    label: &str,
-    records: &[Record],
-) -> Result<usize> {
-    let confirmed: Vec<&Record> = records
-        .iter()
-        .filter(|record| record.outcome == Outcome::Confirmed)
-        .collect();
+async fn check_confirmed_present(api: &Api, label: &str, records: &[Record]) -> Result<usize> {
+    let confirmed: Vec<&Record> =
+        records.iter().filter(|record| record.outcome == Outcome::Confirmed).collect();
     let stride = confirmed.len().div_ceil(VERIFY_CAP).max(1);
     let mut checked = 0;
     for record in confirmed.iter().step_by(stride) {
@@ -495,8 +436,7 @@ fn check_exit(mode: Mode, label: &str, timing: &RestartTiming) -> Result<()> {
             )?;
         }
     }
-    if let (Some(before), Some(after)) = (timing.slot_before, timing.slot_after)
-    {
+    if let (Some(before), Some(after)) = (timing.slot_before, timing.slot_after) {
         check!(
             after >= before / 2,
             "INVALID: {label}: post-restart slot {after} collapsed from \
@@ -522,14 +462,9 @@ struct ModeOutcome {
     superblocks_crossed: u64,
 }
 
-async fn run_mode(
-    base: &BaseCtx,
-    profile: &Profile,
-    mode: Mode,
-) -> Result<ModeOutcome> {
+async fn run_mode(base: &BaseCtx, profile: &Profile, mode: Mode) -> Result<ModeOutcome> {
     let label = mode.label();
-    let prep_payers =
-        prep::funded_payers(base, profile.lanes, PREP_PAYER_LAMPORTS).await?;
+    let prep_payers = prep::funded_payers(base, profile.lanes, PREP_PAYER_LAMPORTS).await?;
 
     let mut private = topology::private_er(
         base,
@@ -550,13 +485,7 @@ async fn run_mode(
         let pool = Accounts::new(crate::ACCOUNT_SPACE, er.identity())
             .init_batched(base, &prep_payers, profile.lanes, true)
             .await?;
-        prep::await_clones(
-            er,
-            &pool,
-            crate::ACCOUNT_SPACE as usize,
-            CLONE_TIMEOUT,
-        )
-        .await?;
+        prep::await_clones(er, &pool, crate::ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
         Rc::new(pool)
     };
     let senders: Vec<TxSender> = prep_payers
@@ -703,11 +632,7 @@ async fn run_mode(
     })
 }
 
-fn report_mode(
-    report: ScenarioReport,
-    mode: Mode,
-    outcome: &ModeOutcome,
-) -> ScenarioReport {
+fn report_mode(report: ScenarioReport, mode: Mode, outcome: &ModeOutcome) -> ScenarioReport {
     let label = mode.label();
     let millis = |duration: Duration| duration.as_secs_f64() * 1e3;
     let mut metrics: Vec<(&str, Unit, f64)> = vec![
@@ -819,11 +744,9 @@ fn report_mode(
     if let Some(ms) = outcome.ledger_processing_ms {
         metrics.push(("ledger processing ms", Unit::Millis, ms));
     }
-    metrics
-        .into_iter()
-        .fold(report, |report, (name, unit, value)| {
-            report.metric(format!("{label} {name}"), unit, value)
-        })
+    metrics.into_iter().fold(report, |report, (name, unit, value)| {
+        report.metric(format!("{label} {name}"), unit, value)
+    })
 }
 
 pub struct RestartUnderLoad;

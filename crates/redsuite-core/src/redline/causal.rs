@@ -61,12 +61,7 @@ impl CausalPair {
         }
     }
 
-    pub async fn send(
-        &mut self,
-        step: Step,
-        id: u64,
-        iters: u32,
-    ) -> Result<(Signature, Duration)> {
+    pub async fn send(&mut self, step: Step, id: u64, iters: u32) -> Result<(Signature, Duration)> {
         let ixs = chain_ixs(id, iters, &step.accounts(self.a, self.b));
         let sender = &self.senders[step.index()];
         let tx = sender.prepare(&ixs).await?;
@@ -114,25 +109,17 @@ impl PairModel {
         }
     }
 
-    pub async fn verify(
-        &self,
-        ctx: &impl ChainCtx,
-        keys: [Pubkey; 2],
-        scope: &str,
-    ) -> Result<()> {
-        for (label, address, expected_hash, expected_id) in [
-            ("A", keys[0], self.a, self.a_id),
-            ("B", keys[1], self.b, self.b_id),
-        ] {
-            let account = ctx.account(&address).await?.ok_or_else(|| {
-                format!("{scope}: account {label} {address} is missing")
-            })?;
+    pub async fn verify(&self, ctx: &impl ChainCtx, keys: [Pubkey; 2], scope: &str) -> Result<()> {
+        for (label, address, expected_hash, expected_id) in
+            [("A", keys[0], self.a, self.a_id), ("B", keys[1], self.b, self.b_id)]
+        {
+            let account = ctx
+                .account(&address)
+                .await?
+                .ok_or_else(|| format!("{scope}: account {label} {address} is missing"))?;
             let hash = account
                 .data
-                .get(
-                    layout::HASH_OFFSET
-                        ..layout::HASH_OFFSET + layout::HASH_SIZE,
-                )
+                .get(layout::HASH_OFFSET..layout::HASH_OFFSET + layout::HASH_SIZE)
                 .ok_or_else(|| {
                     format!(
                         "{scope}: account {label} holds {} bytes, fewer than \
@@ -141,17 +128,13 @@ impl PairModel {
                         layout::HASH_OFFSET + layout::HASH_SIZE
                     )
                 })?;
-            let id =
-                super::written_id(&account.data).expect("hash follows the id");
+            let id = super::written_id(&account.data).expect("hash follows the id");
             if hash != expected_hash || id != expected_id {
                 return Err(CheckError::new(format!(
                     "{scope}: account {label} must hold the fold of its \
                      accepted X/Y/Z history"
                 ))
-                .expected(format!(
-                    "id {expected_id}, hash {}",
-                    hex(&expected_hash)
-                ))
+                .expected(format!("id {expected_id}, hash {}", hex(&expected_hash)))
                 .actual(format!("id {id}, hash {}", hex(hash)))
                 .into());
             }
@@ -177,11 +160,7 @@ pub fn chain_ixs(id: u64, iters: u32, accounts: &[Pubkey]) -> Vec<Instruction> {
         vec![fold]
     }
 }
-pub fn independent_ixs(
-    id: u64,
-    account: Pubkey,
-    iters: u32,
-) -> Vec<Instruction> {
+pub fn independent_ixs(id: u64, account: Pubkey, iters: u32) -> Vec<Instruction> {
     vec![
         compute_unit_limit(CU_LIMIT),
         build::expensive_hash_compute(id, HASH_INIT, iters, &[account]),

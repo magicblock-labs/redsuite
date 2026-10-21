@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, fs};
 
 use json::Serialize;
+use serde_with::skip_serializing_none;
 use tracing::warn;
 
 use super::{store, MeasureValue, ScenarioRun, Unit, LATENCY_ORIGIN};
@@ -25,9 +26,9 @@ fn run_gate(run: &ScenarioRun) -> Option<String> {
             None => "run failed".to_owned(),
         });
     }
-    run.failures.first().map(|failure| {
-        format!("run has a {} failure: {}", failure.phase, failure.message)
-    })
+    run.failures
+        .first()
+        .map(|failure| format!("run has a {} failure: {}", failure.phase, failure.message))
 }
 
 fn origin_suffix(run: &ScenarioRun) -> String {
@@ -57,12 +58,11 @@ fn withheld(run: &ScenarioRun) -> Option<String> {
 
 // Bencher Metric Format: {"benchmark": {"measure": {"value", "lower_value",
 // "upper_value"}}}. Latency measures are nanoseconds; ours are µs → ×1000.
+#[skip_serializing_none]
 #[derive(Serialize)]
 struct MeasureVal {
     value: f64,
-    #[serde(skip_serializing_if = "Option::is_none")]
     lower_value: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     upper_value: Option<f64>,
 }
 
@@ -77,10 +77,7 @@ fn slug(label: &str) -> String {
         .collect()
 }
 
-fn export_run(
-    doc: &mut BTreeMap<String, BTreeMap<String, MeasureVal>>,
-    run: &ScenarioRun,
-) {
+fn export_run(doc: &mut BTreeMap<String, BTreeMap<String, MeasureVal>>, run: &ScenarioRun) {
     let withheld = withheld(run);
     if let Some(reason) = &withheld {
         warn!(%run.scenario, reason, "BMF latency withheld");
@@ -98,9 +95,7 @@ fn export_run(
             benchmark.push_str(&origin);
         }
         let (measure, value) = match (measurement.unit, &measurement.value) {
-            (Unit::Micros, _) if client_latency && withheld.is_some() => {
-                continue
-            }
+            (Unit::Micros, _) if client_latency && withheld.is_some() => continue,
             (Unit::Micros, MeasureValue::Distribution(stats)) => (
                 "latency",
                 MeasureVal {
@@ -127,17 +122,12 @@ fn export_run(
             ),
             _ => continue,
         };
-        doc.entry(benchmark)
-            .or_default()
-            .insert(measure.to_owned(), value);
+        doc.entry(benchmark).or_default().insert(measure.to_owned(), value);
     }
 }
 
-fn bmf_document(
-    campaign: &store::Campaign,
-) -> BTreeMap<String, BTreeMap<String, MeasureVal>> {
-    let mut doc: BTreeMap<String, BTreeMap<String, MeasureVal>> =
-        BTreeMap::new();
+fn bmf_document(campaign: &store::Campaign) -> BTreeMap<String, BTreeMap<String, MeasureVal>> {
+    let mut doc: BTreeMap<String, BTreeMap<String, MeasureVal>> = BTreeMap::new();
     for (name, scenario) in &campaign.scenarios {
         let Some(run) = &scenario.run else {
             warn!(

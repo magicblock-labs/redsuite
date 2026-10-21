@@ -50,16 +50,10 @@ impl CommitReceipt {
     // The >= 0.14.10 committor retries an unconfirmed base tx with a fresh
     // blockhash
     pub fn failure_is_duplicate_rejection(&self) -> bool {
-        const DUPLICATE_REJECTIONS: [&str; 4] = [
-            "InvalidAccountOwner",
-            "Custom(11)",
-            "Custom(12)",
-            "invalid Commit id",
-        ];
+        const DUPLICATE_REJECTIONS: [&str; 4] =
+            ["InvalidAccountOwner", "Custom(11)", "Custom(12)", "invalid Commit id"];
         self.error_message.as_deref().is_some_and(|message| {
-            DUPLICATE_REJECTIONS
-                .iter()
-                .any(|needle| message.contains(needle))
+            DUPLICATE_REJECTIONS.iter().any(|needle| message.contains(needle))
         })
     }
 }
@@ -80,19 +74,14 @@ fn strip_program_prefix(line: &str) -> &str {
 // From the SCHEDULING tx's logs: the receipt signature announced at CPI time.
 pub fn receipt_signature_in_logs(logs: &[String]) -> Option<Signature> {
     logs.iter().find_map(|line| {
-        let rest = strip_program_prefix(line)
-            .strip_prefix("ScheduledCommitSent signature: ")?;
+        let rest = strip_program_prefix(line).strip_prefix("ScheduledCommitSent signature: ")?;
         rest.trim().parse().ok()
     })
 }
 
 pub fn intent_id_in_logs(logs: &[String]) -> Option<u64> {
     logs.iter().find_map(|line| {
-        strip_program_prefix(line)
-            .strip_prefix(SCHEDULE_MARKER)?
-            .trim()
-            .parse()
-            .ok()
+        strip_program_prefix(line).strip_prefix(SCHEDULE_MARKER)?.trim().parse().ok()
     })
 }
 
@@ -106,10 +95,7 @@ fn pubkey_list(list: &str) -> Vec<Pubkey> {
         .collect()
 }
 
-pub fn parse_receipt(
-    signature: Signature,
-    receipt_tx: &TransactionInfo,
-) -> CommitReceipt {
+pub fn parse_receipt(signature: Signature, receipt_tx: &TransactionInfo) -> CommitReceipt {
     let mut receipt = CommitReceipt {
         signature,
         commit_id: None,
@@ -122,15 +108,12 @@ pub fn parse_receipt(
         receipt_err_code: receipt_tx.err.as_ref().and_then(custom_error_code),
     };
     for line in &receipt_tx.logs {
-        let Some(rest) = strip_program_prefix(line).strip_prefix(LOG_MARKER)
-        else {
+        let Some(rest) = strip_program_prefix(line).strip_prefix(LOG_MARKER) else {
             continue;
         };
         if let Some(id_part) = rest.strip_prefix("id: ") {
-            receipt.commit_id = id_part
-                .split(',')
-                .next()
-                .and_then(|token| token.trim().parse().ok());
+            receipt.commit_id =
+                id_part.split(',').next().and_then(|token| token.trim().parse().ok());
         } else if let Some(payer) = rest.strip_prefix("payer: ") {
             receipt.payer = payer.trim().parse().ok();
         } else if let Some(list) = rest.strip_prefix("included: ") {
@@ -138,9 +121,8 @@ pub fn parse_receipt(
         } else if let Some(list) = rest.strip_prefix("excluded: ") {
             receipt.excluded = pubkey_list(list);
         } else if let Some(indexed) = rest.strip_prefix("signature[") {
-            let chain_signature = indexed
-                .split_once("]: ")
-                .and_then(|(_, sig_text)| sig_text.trim().parse().ok());
+            let chain_signature =
+                indexed.split_once("]: ").and_then(|(_, sig_text)| sig_text.trim().parse().ok());
             if let Some(chain_signature) = chain_signature {
                 receipt.base_signatures.push(chain_signature);
             }
@@ -157,15 +139,13 @@ pub async fn scheduled_receipt_signature(
     er: &Api,
     commit_signature: &Signature,
 ) -> Result<Signature> {
-    let commit_tx = er
-        .await_transaction(commit_signature, SCHEDULE_FETCH_TIMEOUT)
-        .await?;
+    let commit_tx = er.await_transaction(commit_signature, SCHEDULE_FETCH_TIMEOUT).await?;
     if let Some(err) = &commit_tx.err {
-        return Err(CheckError::new(format!(
-            "commit tx {commit_signature} succeeds on the ER"
-        ))
-        .actual(format!("failed on-chain: {err:?}"))
-        .into());
+        return Err(
+            CheckError::new(format!("commit tx {commit_signature} succeeds on the ER"))
+                .actual(format!("failed on-chain: {err:?}"))
+                .into(),
+        );
     }
     receipt_signature_in_logs(&commit_tx.logs).ok_or_else(|| {
         CheckError::new(format!(
@@ -182,19 +162,13 @@ pub async fn fetch_commit_receipt(
     commit_signature: &Signature,
     timeout: Duration,
 ) -> Result<CommitReceipt> {
-    let receipt_signature =
-        scheduled_receipt_signature(er, commit_signature).await?;
+    let receipt_signature = scheduled_receipt_signature(er, commit_signature).await?;
     let receipt_tx = er.await_transaction(&receipt_signature, timeout).await?;
     Ok(parse_receipt(receipt_signature, &receipt_tx))
 }
 
-pub async fn scheduled_intent_id(
-    er: &Api,
-    commit_signature: &Signature,
-) -> Result<u64> {
-    let commit_tx = er
-        .await_transaction(commit_signature, SCHEDULE_FETCH_TIMEOUT)
-        .await?;
+pub async fn scheduled_intent_id(er: &Api, commit_signature: &Signature) -> Result<u64> {
+    let commit_tx = er.await_transaction(commit_signature, SCHEDULE_FETCH_TIMEOUT).await?;
     intent_id_in_logs(&commit_tx.logs).ok_or_else(|| {
         CheckError::new(format!(
             "commit tx {commit_signature} logs carry no scheduled intent id"
@@ -213,9 +187,7 @@ pub async fn fetch_commit_receipt_by_intent(
     let mut seen = HashSet::new();
     let mut last_fetch_error = None;
     loop {
-        let history = er
-            .get_signatures_for_address(validator, RECEIPT_HISTORY_LIMIT)
-            .await?;
+        let history = er.get_signatures_for_address(validator, RECEIPT_HISTORY_LIMIT).await?;
         for text in history {
             if !seen.insert(text.clone()) {
                 continue;
@@ -237,9 +209,8 @@ pub async fn fetch_commit_receipt_by_intent(
             }
         }
         if tokio::time::Instant::now() >= deadline {
-            let mut message = format!(
-                "no commit receipt for intent {intent_id} within {timeout:?}"
-            );
+            let mut message =
+                format!("no commit receipt for intent {intent_id} within {timeout:?}");
             if let Some(error) = &last_fetch_error {
                 message.push_str(&format!(
                     "; last getTransaction error while scanning receipts: \
@@ -258,15 +229,10 @@ pub async fn confirm_base_signatures(
     timeout: Duration,
 ) -> Result<()> {
     for chain_signature in &receipt.base_signatures {
-        let base_tx = base
-            .await_transaction(chain_signature, timeout)
-            .await
-            .map_err(|error| {
-                CheckError::new(format!(
-                    "base commit tx {chain_signature} lands on base"
-                ))
+        let base_tx = base.await_transaction(chain_signature, timeout).await.map_err(|error| {
+            CheckError::new(format!("base commit tx {chain_signature} lands on base"))
                 .caused_by(error)
-            })?;
+        })?;
         if let Some(err) = &base_tx.err {
             return Err(CheckError::new(format!(
                 "base commit tx {chain_signature} succeeds on base"

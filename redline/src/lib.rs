@@ -22,12 +22,7 @@ pub fn consumed_cus(logs: &[String]) -> Option<f64> {
     })
 }
 
-pub async fn probe_cus(
-    er: &ErCtx,
-    signature: &Signature,
-    label: &str,
-    iters: u32,
-) -> Result<f64> {
+pub async fn probe_cus(er: &ErCtx, signature: &Signature, label: &str, iters: u32) -> Result<f64> {
     let probe = er.api().await_transaction(signature, PROBE_TIMEOUT).await?;
     check!(
         probe.err.is_none(),
@@ -45,11 +40,7 @@ pub async fn probe_cus(
     })
 }
 
-pub async fn await_executed(
-    er: &ErCtx,
-    target: f64,
-    timeout: Duration,
-) -> Result<Duration> {
+pub async fn await_executed(er: &ErCtx, target: f64, timeout: Duration) -> Result<Duration> {
     let started = Instant::now();
     check::poll(
         &format!("the validator transaction count reaches {target:.0}"),
@@ -67,10 +58,7 @@ pub async fn await_executed(
 
 pub mod metrics {
     pub const ENGINE_TRANSACTIONS: &str = "engine_ledger_transactions";
-    pub const RPC_HANDLED_TRANSACTIONS: &str =
-        "mbv_transaction_processing_time_count";
-    pub const RPC_ACCEPTED_TRANSACTIONS: &str =
-        "mbv_transaction_skip_preflight_count";
-    pub const FAILED_TRANSACTIONS: &str =
-        "engine_processor_failed_transactions";
+    pub const RPC_HANDLED_TRANSACTIONS: &str = "mbv_transaction_processing_time_count";
+    pub const RPC_ACCEPTED_TRANSACTIONS: &str = "mbv_transaction_skip_preflight_count";
+    pub const FAILED_TRANSACTIONS: &str = "engine_processor_failed_transactions";
 }

@@ -1,14 +1,11 @@
 use async_trait::async_trait;
 use pubkey::Pubkey;
 use redsuite_core::{
-    check, check_eq, check_ne, prep, BaseCtx, ChainCtx, PrivateErScenario,
-    Result,
+    check, check_eq, check_ne, prep, BaseCtx, ChainCtx, PrivateErScenario, Result,
 };
 use signer::Signer;
 use solana_address_lookup_table_interface::{
-    instruction::{
-        create_lookup_table, deactivate_lookup_table, extend_lookup_table,
-    },
+    instruction::{create_lookup_table, deactivate_lookup_table, extend_lookup_table},
     state::{AddressLookupTable, LOOKUP_TABLE_MAX_ADDRESSES},
 };
 
@@ -44,8 +41,7 @@ impl PrivateErScenario for TableManiaScenario {
         let keys = unique_pubkeys(TOTAL_PUBKEYS);
         let mut start = 0;
         for end in [10, 60, LOOKUP_TABLE_MAX_ADDRESSES] {
-            extend_table_in_chunks(base, &authority, first, &keys[start..end])
-                .await?;
+            extend_table_in_chunks(base, &authority, first, &keys[start..end]).await?;
             let table = read_table(base, &first).await?;
             check_eq!(
                 sorted(&table.addresses),
@@ -66,9 +62,7 @@ impl PrivateErScenario for TableManiaScenario {
             unique_pubkeys(1),
         );
         check!(
-            base.submit_and_confirm(&authority, &[overflow])
-                .await
-                .is_err(),
+            base.submit_and_confirm(&authority, &[overflow]).await.is_err(),
             "table {first} rejects an address past capacity"
         )?;
 
@@ -125,10 +119,7 @@ impl PrivateErScenario for TableManiaScenario {
     }
 }
 
-async fn create_table(
-    base: &BaseCtx,
-    authority: &keypair::Keypair,
-) -> Result<Pubkey> {
+async fn create_table(base: &BaseCtx, authority: &keypair::Keypair) -> Result<Pubkey> {
     let (instruction, table) = create_lookup_table(
         authority.pubkey(),
         authority.pubkey(),
@@ -149,10 +140,8 @@ async fn read_table(base: &BaseCtx, table_pda: &Pubkey) -> Result<TableState> {
         .account(table_pda)
         .await?
         .ok_or("lookup table account is missing on base")?;
-    let table =
-        AddressLookupTable::deserialize(&account.data).map_err(|err| {
-            format!("lookup table account does not decode: {err:?}")
-        })?;
+    let table = AddressLookupTable::deserialize(&account.data)
+        .map_err(|err| format!("lookup table account does not decode: {err:?}"))?;
     Ok(TableState {
         deactivation_slot: table.meta.deactivation_slot,
         authority: table.meta.authority,

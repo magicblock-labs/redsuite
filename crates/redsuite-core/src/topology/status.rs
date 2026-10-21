@@ -19,26 +19,19 @@ pub fn status() -> Result<()> {
     } else {
         "DEAD"
     };
-    let rpc_state = if process::rpc_listening(state.base_rpc_port) {
-        "rpc up"
-    } else {
-        "rpc DOWN"
-    };
+    let rpc_state = if process::rpc_listening(state.base_rpc_port) { "rpc up" } else { "rpc DOWN" };
     println!(
         "base  pid {:<8} {proc_state:8} 127.0.0.1:{:<6} {rpc_state}   ({})",
         state.base_pid, state.base_rpc_port, state.base_bin
     );
-    println!(
-        "ers   booted by each run for its ER groups, stopped when it ends"
-    );
+    println!("ers   booted by each run for its ER groups, stopped when it ends");
     println!("logs          {}", state::stack_dir().display());
     describe_orphans(&[state.base_pid]);
     Ok(())
 }
 
 fn describe_orphans(exclude: &[u32]) {
-    let orphans =
-        process::orphaned_topology_processes(&state::stack_dir(), exclude);
+    let orphans = process::orphaned_topology_processes(&state::stack_dir(), exclude);
     if orphans.is_empty() {
         return;
     }
@@ -69,9 +62,7 @@ pub fn down() -> Result<()> {
             }
         }
     }
-    for (pid, cmdline) in
-        process::orphaned_topology_processes(&state::stack_dir(), &known)
-    {
+    for (pid, cmdline) in process::orphaned_topology_processes(&state::stack_dir(), &known) {
         println!("stopping orphaned topology process (pid {pid}): {cmdline}");
         process::kill_pid(pid);
     }
@@ -109,9 +100,7 @@ fn sweep(dir: &std::path::Path) -> Result<Vec<PathBuf>> {
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
         let outcome = if path.is_dir() {
-            if !(STACK_STORAGE.contains(&name.as_str())
-                || name.starts_with("er-"))
-            {
+            if !(STACK_STORAGE.contains(&name.as_str()) || name.starts_with("er-")) {
                 continue;
             }
             fs::remove_dir_all(&path)
@@ -121,9 +110,7 @@ fn sweep(dir: &std::path::Path) -> Result<Vec<PathBuf>> {
             }
             fs::remove_file(&path)
         };
-        outcome.map_err(|error| {
-            format!("removing stack storage {}: {error}", path.display())
-        })?;
+        outcome.map_err(|error| format!("removing stack storage {}: {error}", path.display()))?;
         removed.push(path);
     }
     Ok(removed)

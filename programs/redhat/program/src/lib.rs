@@ -22,17 +22,14 @@ pub fn process_instruction(
     accounts: &[AccountInfo],
     instruction_data: &[u8],
 ) -> ProgramResult {
-    let instruction = SecurityInstruction::try_from_slice(instruction_data)
-        .map_err(|err| {
-            msg!("cannot parse the security instruction: {}", err);
-            ProgramError::InvalidInstructionData
-        })?;
+    let instruction = SecurityInstruction::try_from_slice(instruction_data).map_err(|err| {
+        msg!("cannot parse the security instruction: {}", err);
+        ProgramError::InvalidInstructionData
+    })?;
 
     let players = match instruction {
         SecurityInstruction::NonCpi => return Ok(()),
-        SecurityInstruction::SiblingScheduleCommitCpis(players) => {
-            Some(players)
-        }
+        SecurityInstruction::SiblingScheduleCommitCpis(players) => Some(players),
         SecurityInstruction::DirectScheduleCommitCpi => None,
     };
     let iter = &mut accounts.iter();

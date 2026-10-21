@@ -9,8 +9,7 @@ use redsuite_core::{
     report,
     report::Unit,
     runner::{execute, Pacing, RunConfig, RunOutcome},
-    topology, BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario,
-    ScenarioReport,
+    topology, BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
 };
 use tracing::{debug, warn};
 
@@ -36,8 +35,7 @@ async fn settled_scrape(er: &ErCtx) -> Result<redsuite_core::Metrics> {
         tokio::time::sleep(SETTLE_POLL).await;
         let next = er.scrape_metrics().await?;
         let stable = next.get(EVICTED_COUNTER) == last.get(EVICTED_COUNTER)
-            && next.value_sum(FETCHES_FOUND_COUNTER)
-                == last.value_sum(FETCHES_FOUND_COUNTER);
+            && next.value_sum(FETCHES_FOUND_COUNTER) == last.value_sum(FETCHES_FOUND_COUNTER);
         last = next;
         if stable {
             break;
@@ -87,10 +85,7 @@ const FULL: Profile = Profile {
     concurrency: 64,
 };
 
-const PROFILES: ProfileValues<Profile> = ProfileValues {
-    lite: LITE,
-    full: FULL,
-};
+const PROFILES: ProfileValues<Profile> = ProfileValues { lite: LITE, full: FULL };
 
 fn pick_account(pool: &[Pubkey], seed: u64) -> Pubkey {
     let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
@@ -128,8 +123,7 @@ impl Scenario<ScenarioReport> for CloneLruChurn {
     async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
         let profile = PROFILES.select(base.config().profile);
         let prep_payers =
-            prep::funded_payers(base, profile.prep_payers, PREP_PAYER_LAMPORTS)
-                .await?;
+            prep::funded_payers(base, profile.prep_payers, PREP_PAYER_LAMPORTS).await?;
         let pool = Accounts::new(ACCOUNT_SPACE, er.identity())
             .init_batched(base, &prep_payers, profile.working_set, false)
             .await?;
@@ -164,13 +158,7 @@ impl Scenario<ScenarioReport> for CloneLruChurn {
             .await?;
             let cell_er = private.ctx();
             if cell.closure {
-                prep::prewarm(
-                    cell_er,
-                    &pool,
-                    ACCOUNT_SPACE as usize,
-                    CLONE_TIMEOUT,
-                )
-                .await?;
+                prep::prewarm(cell_er, &pool, ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
             } else {
                 prep::touch(cell_er, &pool).await;
             }
@@ -232,64 +220,55 @@ impl Scenario<ScenarioReport> for CloneLruChurn {
                 "cache churn cell finished",
             );
 
-            let cell_report =
-                ScenarioReport::ok(&format!("{}/{}", self.name(), cell.name))
-                    .setting("profile", profile.name)
-                    .setting("cap", cell.cap)
-                    .setting("working set", profile.working_set)
-                    .setting("account space", ACCOUNT_SPACE)
-                    .setting("closure", cell.closure)
-                    .setting("warmup reads", profile.warmup)
-                    .setting("measured reads", profile.iterations)
-                    .setting("offered rate /s", profile.rate)
-                    .setting("concurrency", profile.concurrency)
-                    .setting("request timeout s", REQUEST_TIMEOUT.as_secs())
-                    .observe(
-                        "read latency us",
-                        Unit::Micros,
-                        cell_outcome.outcome.delivery,
-                    )
-                    .client_side(&cell_outcome.outcome)
-                    .metric(
-                        "achieved reads /s",
-                        Unit::PerSecond,
-                        cell_outcome.outcome.achieved_rps(),
-                    )
-                    .metric(
-                        "delivered",
-                        Unit::Count,
-                        cell_outcome.outcome.delivered as f64,
-                    )
-                    .metric(
-                        "failed",
-                        Unit::Count,
-                        cell_outcome.outcome.failed as f64,
-                    )
-                    .metric(
-                        "evictions in window",
-                        Unit::Count,
-                        cell_outcome.evictions,
-                    )
-                    .metric(
-                        "eviction rate /s",
-                        Unit::PerSecond,
-                        cell_outcome.eviction_rate,
-                    )
-                    .metric_if(
-                        "fetches found in window",
-                        Unit::Count,
-                        cell_outcome.fetches_found,
-                    )
-                    .metric_if(
-                        "validator ensure avg s",
-                        Unit::Seconds,
-                        cell_outcome.ensure_avg_s,
-                    )
-                    .metric(
-                        "monitored accounts (end)",
-                        Unit::Count,
-                        cell_outcome.monitored_end,
-                    );
+            let cell_report = ScenarioReport::ok(&format!("{}/{}", self.name(), cell.name))
+                .setting("profile", profile.name)
+                .setting("cap", cell.cap)
+                .setting("working set", profile.working_set)
+                .setting("account space", ACCOUNT_SPACE)
+                .setting("closure", cell.closure)
+                .setting("warmup reads", profile.warmup)
+                .setting("measured reads", profile.iterations)
+                .setting("offered rate /s", profile.rate)
+                .setting("concurrency", profile.concurrency)
+                .setting("request timeout s", REQUEST_TIMEOUT.as_secs())
+                .observe(
+                    "read latency us",
+                    Unit::Micros,
+                    cell_outcome.outcome.delivery,
+                )
+                .client_side(&cell_outcome.outcome)
+                .metric(
+                    "achieved reads /s",
+                    Unit::PerSecond,
+                    cell_outcome.outcome.achieved_rps(),
+                )
+                .metric(
+                    "delivered",
+                    Unit::Count,
+                    cell_outcome.outcome.delivered as f64,
+                )
+                .metric("failed", Unit::Count, cell_outcome.outcome.failed as f64)
+                .metric("evictions in window", Unit::Count, cell_outcome.evictions)
+                .metric(
+                    "eviction rate /s",
+                    Unit::PerSecond,
+                    cell_outcome.eviction_rate,
+                )
+                .metric_if(
+                    "fetches found in window",
+                    Unit::Count,
+                    cell_outcome.fetches_found,
+                )
+                .metric_if(
+                    "validator ensure avg s",
+                    Unit::Seconds,
+                    cell_outcome.ensure_avg_s,
+                )
+                .metric(
+                    "monitored accounts (end)",
+                    Unit::Count,
+                    cell_outcome.monitored_end,
+                );
             report::persist_cell(self.name(), &cell_report);
             cells.push(cell_outcome);
             drop(private);
@@ -337,8 +316,7 @@ impl Scenario<ScenarioReport> for CloneLruChurn {
             )?;
             if let Some(fetches_found) = churn_cell.fetches_found {
                 let deviation = (fetches_found - churn_cell.evictions).abs();
-                let tolerance = (churn_cell.evictions * 0.15)
-                    .max(profile.concurrency as f64);
+                let tolerance = (churn_cell.evictions * 0.15).max(profile.concurrency as f64);
                 check!(
                     deviation <= tolerance,
                     "{}: {} refetches vs {} evictions — evict/reload left \
@@ -357,12 +335,7 @@ impl Scenario<ScenarioReport> for CloneLruChurn {
             .setting("closure cap", profile.closure_cap)
             .setting(
                 "cap ladder",
-                profile
-                    .ladder
-                    .iter()
-                    .map(|cap| cap.to_string())
-                    .collect::<Vec<_>>()
-                    .join("/"),
+                profile.ladder.iter().map(|cap| cap.to_string()).collect::<Vec<_>>().join("/"),
             )
             .setting("offered rate /s", profile.rate)
             .setting("concurrency", profile.concurrency);

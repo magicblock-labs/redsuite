@@ -14,8 +14,7 @@ use async_trait::async_trait;
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    check, check_eq, dlp, prep, topology, BaseCtx, ChainCtx, ErCtx,
-    PrivateErScenario, Result,
+    check, check_eq, dlp, prep, topology, BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result,
 };
 use sdk::spl::{
     builders::{
@@ -81,16 +80,9 @@ impl MockRiskServer {
                                 .split(['&', ' '])
                                 .next()
                                 .unwrap_or("");
-                            worker_requested_addresses
-                                .write()
-                                .unwrap()
-                                .push(address.to_string());
-                            let risk_score = worker_risks
-                                .read()
-                                .unwrap()
-                                .get(address)
-                                .copied()
-                                .unwrap_or(0);
+                            worker_requested_addresses.write().unwrap().push(address.to_string());
+                            let risk_score =
+                                worker_risks.read().unwrap().get(address).copied().unwrap_or(0);
                             let is_risky = risk_score >= RISK_THRESHOLD;
                             format!(r#"{{"isRisky":{is_risky}}}"#)
                         } else {
@@ -108,9 +100,7 @@ impl MockRiskServer {
                         );
                         let _ = stream.write_all(response.as_bytes());
                     }
-                    Err(err)
-                        if err.kind() == std::io::ErrorKind::WouldBlock =>
-                    {
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(25));
                     }
                     Err(_) => break,
@@ -135,10 +125,7 @@ impl MockRiskServer {
     }
 
     pub fn set_risk(&self, address: &str, risk_score: u64) {
-        self.risks
-            .write()
-            .unwrap()
-            .insert(address.to_string(), risk_score);
+        self.risks.write().unwrap().insert(address.to_string(), risk_score);
     }
 
     pub fn base_url(&self) -> &str {
@@ -225,35 +212,22 @@ async fn run_risk_case(
 
     let (shuttle_ephemeral_ata, _) =
         find_shuttle_ephemeral_ata(&owner_pk, &mint.pubkey(), SHUTTLE_ID);
-    let (shuttle_ata, _) =
-        find_shuttle_ata(&shuttle_ephemeral_ata, &mint.pubkey());
+    let (shuttle_ata, _) = find_shuttle_ata(&shuttle_ephemeral_ata, &mint.pubkey());
 
     // 1. Create mint, source ATA, destination ATA, and mint tokens
     let setup_ixs = vec![
         spl::allocate_mint(&fee_payer.pubkey(), &mint.pubkey()),
         spl::initialize_mint(&mint.pubkey(), &owner_pk),
-        spl::create_ata_idempotent(
-            &fee_payer.pubkey(),
-            &owner_pk,
-            &mint.pubkey(),
-        ),
-        spl::create_ata_idempotent(
-            &fee_payer.pubkey(),
-            &recipient.pubkey(),
-            &mint.pubkey(),
-        ),
+        spl::create_ata_idempotent(&fee_payer.pubkey(), &owner_pk, &mint.pubkey()),
+        spl::create_ata_idempotent(&fee_payer.pubkey(), &recipient.pubkey(), &mint.pubkey()),
         spl::mint_to(&mint.pubkey(), &source_ata, &owner_pk, SHUTTLE_AMOUNT),
     ];
-    base.submit_and_confirm_with(&fee_payer, &[&mint, &owner], &setup_ixs)
-        .await?;
+    base.submit_and_confirm_with(&fee_payer, &[&mint, &owner], &setup_ixs).await?;
 
     // 2. Initialize rent PDA if it doesn't exist yet, and top it up
     let (rent_pda, _) = find_rent_pda();
     if base.account(&rent_pda).await?.is_none() {
-        let rent_pda_ix = InitializeRentPdaBuilder {
-            payer: fee_payer.pubkey(),
-        }
-        .instruction();
+        let rent_pda_ix = InitializeRentPdaBuilder { payer: fee_payer.pubkey() }.instruction();
         base.submit_and_confirm(&fee_payer, &[rent_pda_ix]).await?;
     }
     base.airdrop(&rent_pda, 1_000_000_000).await?;
@@ -288,8 +262,7 @@ async fn run_risk_case(
         validator: Some(er_identity),
     }
     .instruction();
-    base.submit_and_confirm_with(&fee_payer, &[&owner], &[shuttle_ix])
-        .await?;
+    base.submit_and_confirm_with(&fee_payer, &[&owner], &[shuttle_ix]).await?;
 
     // Verify shuttle ATA delegation record exists on base chain
     check!(
@@ -350,11 +323,7 @@ async fn run_risk_case(
         check::poll(
             &format!("high-risk owner {owner_pk}: shuttle {shuttle_ata} undelegates on base"),
             UNDELEGATION_TIMEOUT,
-            || async {
-                !delegation_record_exists(base, &shuttle_ata)
-                    .await
-                    .unwrap_or(true)
-            },
+            || async { !delegation_record_exists(base, &shuttle_ata).await.unwrap_or(true) },
         )
         .await?;
         check!(
@@ -362,9 +331,7 @@ async fn run_risk_case(
             "high-risk owner {owner_pk}: shuttle {shuttle_ata} is undelegated on base"
         )?;
         check!(
-            merge_attempt(er_ctx, &shuttle_ata, &destination_ata)
-                .await?
-                .is_none(),
+            merge_attempt(er_ctx, &shuttle_ata, &destination_ata).await?.is_none(),
             "high-risk owner {owner_pk}: no merge attempt for {shuttle_ata} and {destination_ata}"
         )?;
         check_eq!(
@@ -384,22 +351,15 @@ async fn merge_attempt(
     shuttle_ata: &Pubkey,
     destination_ata: &Pubkey,
 ) -> Result<Option<Option<String>>> {
-    let shuttle_signatures =
-        er.api().get_signatures_for_address(shuttle_ata, 10).await?;
-    let destination_signatures = er
-        .api()
-        .get_signatures_for_address(destination_ata, 10)
-        .await?;
+    let shuttle_signatures = er.api().get_signatures_for_address(shuttle_ata, 10).await?;
+    let destination_signatures = er.api().get_signatures_for_address(destination_ata, 10).await?;
     let Some(shared) = shuttle_signatures
         .iter()
         .find(|signature| destination_signatures.contains(signature))
     else {
         return Ok(None);
     };
-    let tx = er
-        .api()
-        .await_transaction(&shared.parse()?, Duration::from_secs(5))
-        .await?;
+    let tx = er.api().await_transaction(&shared.parse()?, Duration::from_secs(5)).await?;
     Ok(Some(tx.err.map(|err| format!("{err:?}"))))
 }
 
@@ -407,10 +367,7 @@ async fn er_token_amount(er: &ErCtx, ata: &Pubkey) -> Result<u64> {
     Ok(spl::token_balance(er, ata).await?.unwrap_or(0))
 }
 
-async fn delegation_record_exists(
-    base: &BaseCtx,
-    delegated_account: &Pubkey,
-) -> Result<bool> {
+async fn delegation_record_exists(base: &BaseCtx, delegated_account: &Pubkey) -> Result<bool> {
     let record_pda = dlp::delegation_record_pda(delegated_account);
     Ok(base.account(&record_pda).await?.is_some())
 }

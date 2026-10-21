@@ -243,10 +243,7 @@ pub fn panic_message(payload: Box<dyn Any + Send>) -> String {
 enum Completion {
     Iterations(u64),
     Stop(Rc<Cell<bool>>),
-    Until {
-        deadline: Instant,
-        stop: watch::Receiver<bool>,
-    },
+    Until { deadline: Instant, stop: watch::Receiver<bool> },
 }
 
 impl Completion {
@@ -332,10 +329,7 @@ where
     })
 }
 
-pub async fn execute<F, Fut, D>(
-    cfg: RunConfig,
-    request: F,
-) -> Result<RunOutcome>
+pub async fn execute<F, Fut, D>(cfg: RunConfig, request: F) -> Result<RunOutcome>
 where
     F: FnMut(u64) -> Fut,
     Fut: Future<Output = Result<D>> + 'static,
@@ -344,10 +338,7 @@ where
     Ok(execute_raw(cfg, request).await?.finalize())
 }
 
-pub async fn execute_raw<F, Fut, D>(
-    cfg: RunConfig,
-    request: F,
-) -> Result<RawRunOutcome>
+pub async fn execute_raw<F, Fut, D>(cfg: RunConfig, request: F) -> Result<RawRunOutcome>
 where
     F: FnMut(u64) -> Fut,
     Fut: Future<Output = Result<D>> + 'static,
@@ -471,10 +462,7 @@ impl<T> Drop for Workers<T> {
     }
 }
 
-pub fn spawn_workers<T, Factory, Fut>(
-    threads: usize,
-    factory: Factory,
-) -> Workers<T>
+pub fn spawn_workers<T, Factory, Fut>(threads: usize, factory: Factory) -> Workers<T>
 where
     T: Send + 'static,
     Factory: Fn(Worker) -> Fut + Clone + Send + 'static,
@@ -497,9 +485,7 @@ where
                 .expect("driver runtime build is infallible");
             let local = tokio::task::LocalSet::new();
             // Run future construction in the span too: the factory can log.
-            runtime.block_on(local.run_until(
-                async move { factory(worker).await }.instrument(span),
-            ))
+            runtime.block_on(local.run_until(async move { factory(worker).await }.instrument(span)))
         }));
     }
     Workers { stop, handles }
@@ -530,9 +516,7 @@ impl<T: Send + 'static> Workers<T> {
             }
         }
         if let Some(panic) = first_panic {
-            return Err(
-                format!("driver worker thread panicked: {panic}").into()
-            );
+            return Err(format!("driver worker thread panicked: {panic}").into());
         }
         if let Some(error) = first_error {
             return Err(error);
@@ -576,9 +560,7 @@ impl WorkerBudgets {
     ) -> Result<Self> {
         rate.interval()?;
         if concurrency == 0 {
-            return Err(
-                "an admission budget needs a concurrency above zero".into()
-            );
+            return Err("an admission budget needs a concurrency above zero".into());
         }
         let mut workers = threads.max(1).min(concurrency);
         if let Pacing::PerSecond(rate) = rate {
@@ -623,14 +605,9 @@ where
         let concurrency = budgets.concurrency[worker.index];
         let mut request = factory(worker.index);
         async move {
-            execute_raw(
-                RunConfig {
-                    iterations,
-                    rate,
-                    concurrency,
-                },
-                |iteration| request(first_id + iteration),
-            )
+            execute_raw(RunConfig { iterations, rate, concurrency }, |iteration| {
+                request(first_id + iteration)
+            })
             .await
         }
     })
@@ -638,9 +615,7 @@ where
     Ok(merge_outcomes(outcomes))
 }
 
-pub fn merge_outcomes(
-    outcomes: impl IntoIterator<Item = RawRunOutcome>,
-) -> RunOutcome {
+pub fn merge_outcomes(outcomes: impl IntoIterator<Item = RawRunOutcome>) -> RunOutcome {
     outcomes
         .into_iter()
         .reduce(|mut merged, outcome| {

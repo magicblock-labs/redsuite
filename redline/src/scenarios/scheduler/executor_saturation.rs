@@ -17,12 +17,12 @@ use redsuite_core::{
     report,
     report::Unit::{Count, Micros, Ratio, Seconds, Tps},
     runner::{
-        execute_raw, merge_outcomes, spawn_workers, Pacing, RawRunOutcome,
-        RunConfig, RunOutcome, SendTransaction, WorkerBudgets,
+        execute_raw, merge_outcomes, spawn_workers, Pacing, RawRunOutcome, RunConfig, RunOutcome,
+        SendTransaction, WorkerBudgets,
     },
     sampler::{MeanMax, Sampled, Sampler, Trailing},
-    Api, BaseCtx, ChainCtx, ErClient, ErCtx, MetricsDelta, Result, Scenario,
-    ScenarioReport, SendBody, TxSender,
+    Api, BaseCtx, ChainCtx, ErClient, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
+    SendBody, TxSender,
 };
 use signature::Signature;
 use tracing::debug;
@@ -110,10 +110,7 @@ const FULL: Profile = Profile {
     heavy_concurrency: 2_048,
 };
 
-const PROFILES: ProfileValues<Profile> = ProfileValues {
-    lite: LITE,
-    full: FULL,
-};
+const PROFILES: ProfileValues<Profile> = ProfileValues { lite: LITE, full: FULL };
 
 fn slot_of(global_id: u64, len: usize) -> usize {
     (global_id - 1) as usize % len
@@ -148,13 +145,7 @@ fn build_ixs(
     raise_budget: bool,
 ) -> Vec<Instruction> {
     let pda = accounts[slot_of(global_id, accounts.len())];
-    let compute = build::expensive_hash_compute_at(
-        PROGRAM,
-        global_id,
-        HASH_INIT,
-        iters,
-        &[pda],
-    );
+    let compute = build::expensive_hash_compute_at(PROGRAM, global_id, HASH_INIT, iters, &[pda]);
     if raise_budget {
         vec![compute_unit_limit(CU_LIMIT), compute]
     } else {
@@ -204,20 +195,15 @@ async fn execute_cell_burst(
             let mut sign_s = 0.0f64;
             let mut blast_s = 0.0f64;
             let mut staged = 0u64;
-            let ids: Vec<u64> = (1..=iterations)
-                .map(|iteration| thread_first_id + iteration)
-                .collect();
+            let ids: Vec<u64> =
+                (1..=iterations).map(|iteration| thread_first_id + iteration).collect();
             for chunk in ids.chunks(batch) {
                 let sign_started = Instant::now();
                 let mut signed = Vec::with_capacity(chunk.len());
                 for &global_id in chunk {
-                    let ixs =
-                        build_ixs(&accounts, global_id, iters, raise_budget);
+                    let ixs = build_ixs(&accounts, global_id, iters, raise_budget);
                     let sender = &senders[slot_of(global_id, senders.len())];
-                    let tx = sender
-                        .prepare(&ixs)
-                        .await
-                        .expect("pre-signing must not fail");
+                    let tx = sender.prepare(&ixs).await.expect("pre-signing must not fail");
                     let _ = probe.set(tx.signatures[0]);
                     signed.push(tx);
                 }
@@ -225,10 +211,7 @@ async fn execute_cell_burst(
                 let bodies: Vec<Rc<SendBody>> = signed
                     .chunks(rpc_batch.max(1))
                     .map(|chunk| {
-                        Rc::new(
-                            Api::send_body(chunk)
-                                .expect("send body build is infallible"),
-                        )
+                        Rc::new(Api::send_body(chunk).expect("send body build is infallible"))
                     })
                     .collect();
                 sign_s += sign_started.elapsed().as_secs_f64();
@@ -243,18 +226,13 @@ async fn execute_cell_burst(
                     |index| {
                         let body = bodies[(index - 1) as usize].clone();
                         let api = api.clone();
-                        std::future::ready(Ok(SendTransaction(
-                            move |_: Instant| async move {
-                                let rejected = api.send_prepared(&body).await?;
-                                if rejected != 0 {
-                                    return Err(format!(
-                                        "{rejected} entries rejected"
-                                    )
-                                    .into());
-                                }
-                                Ok(())
-                            },
-                        )))
+                        std::future::ready(Ok(SendTransaction(move |_: Instant| async move {
+                            let rejected = api.send_prepared(&body).await?;
+                            if rejected != 0 {
+                                return Err(format!("{rejected} entries rejected").into());
+                            }
+                            Ok(())
+                        })))
                     },
                 )
                 .await?;
@@ -284,12 +262,7 @@ async fn execute_cell_burst(
     }
     let mut outcome = merge_outcomes(all_outcomes);
     outcome.wall = Duration::from_secs_f64(blast_s.max(1e-9));
-    Ok(BurstOutcome {
-        outcome,
-        sign_s,
-        blast_s,
-        staged,
-    })
+    Ok(BurstOutcome { outcome, sign_s, blast_s, staged })
 }
 
 struct Cell {
@@ -339,8 +312,7 @@ impl Scenario<ScenarioReport> for ExecutorSaturation {
     async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
         let profile = PROFILES.select(base.config().profile);
 
-        let payers =
-            prep::funded_payers(base, profile.accounts, PAYER_LAMPORTS).await?;
+        let payers = prep::funded_payers(base, profile.accounts, PAYER_LAMPORTS).await?;
         let accounts = Accounts {
             program_id: PROGRAM,
             space: crate::ACCOUNT_SPACE,
@@ -348,13 +320,7 @@ impl Scenario<ScenarioReport> for ExecutorSaturation {
         }
         .init_batched(base, &payers, profile.accounts, true)
         .await?;
-        prep::await_clones(
-            er,
-            &accounts,
-            crate::ACCOUNT_SPACE as usize,
-            CLONE_TIMEOUT,
-        )
-        .await?;
+        prep::await_clones(er, &accounts, crate::ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
         let accounts = Arc::new(accounts);
         let payer_bytes = prep::payer_bytes(&payers);
         let er_rpc_url = er.api().url().to_owned();
@@ -385,20 +351,14 @@ impl Scenario<ScenarioReport> for ExecutorSaturation {
             warm.outcome.first_error
         )?;
         if let Some(seen) = count_before_warmup {
-            crate::await_executed(
-                er,
-                seen + profile.warmup as f64,
-                DRAIN_TIMEOUT,
-            )
-            .await?;
+            crate::await_executed(er, seen + profile.warmup as f64, DRAIN_TIMEOUT).await?;
         }
 
         let mut offset = profile.warmup;
         let mut cells: Vec<Cell> = Vec::new();
-        for (label, iters, raise_budget) in [
-            ("light", LIGHT_ITERS, false),
-            ("heavy", profile.heavy_iters, true),
-        ] {
+        for (label, iters, raise_budget) in
+            [("light", LIGHT_ITERS, false), ("heavy", profile.heavy_iters, true)]
+        {
             let cell_iterations = profile.cell_iterations(label);
             let probe: Arc<OnceLock<Signature>> = Arc::new(OnceLock::new());
             let before = er.scrape_metrics().await?;
@@ -439,12 +399,7 @@ impl Scenario<ScenarioReport> for ExecutorSaturation {
             )?;
             let drain = match before.get(TX_COUNT) {
                 Some(seen) => {
-                    crate::await_executed(
-                        er,
-                        seen + cell_iterations as f64,
-                        DRAIN_TIMEOUT,
-                    )
-                    .await?
+                    crate::await_executed(er, seen + cell_iterations as f64, DRAIN_TIMEOUT).await?
                 }
                 None => Duration::ZERO,
             };
@@ -482,10 +437,8 @@ impl Scenario<ScenarioReport> for ExecutorSaturation {
                 )?;
             }
 
-            let probe_sig =
-                probe.get().copied().ok_or("no probe signature captured")?;
-            let probe_cus =
-                crate::probe_cus(er, &probe_sig, label, iters).await?;
+            let probe_sig = probe.get().copied().ok_or("no probe signature captured")?;
+            let probe_cus = crate::probe_cus(er, &probe_sig, label, iters).await?;
 
             let thread_cores = cpu_after.thread_cores_since(&cpu_before);
             let cell = Cell {
@@ -519,24 +472,20 @@ impl Scenario<ScenarioReport> for ExecutorSaturation {
                 "executor saturation cell finished",
             );
 
-            let mut cell_report =
-                ScenarioReport::ok(&format!("{}/{label}", self.name()))
-                    .setting("profile", profile.name)
-                    .setting("sha256 iters", cell.iters)
-                    .setting(
-                        "shape",
-                        "width-1 sha256 hash-chain, one payer per account",
-                    )
-                    .setting("accounts", profile.accounts)
-                    .setting("driver threads", profile.threads)
-                    .setting("measured iters", cell_iterations)
-                    .setting("mode", profile.mode())
-                    .setting("rpc batch", profile.rpc_batch)
-                    .setting("batch per thread", profile.batch)
-                    .setting("concurrency", profile.cell_concurrency(label))
-                    .observe("delivery us", Micros, cell.outcome.delivery)
-                    .client_side(&cell.outcome)
-                    .setting("metrics sampling", &cell.busy);
+            let mut cell_report = ScenarioReport::ok(&format!("{}/{label}", self.name()))
+                .setting("profile", profile.name)
+                .setting("sha256 iters", cell.iters)
+                .setting("shape", "width-1 sha256 hash-chain, one payer per account")
+                .setting("accounts", profile.accounts)
+                .setting("driver threads", profile.threads)
+                .setting("measured iters", cell_iterations)
+                .setting("mode", profile.mode())
+                .setting("rpc batch", profile.rpc_batch)
+                .setting("batch per thread", profile.batch)
+                .setting("concurrency", profile.cell_concurrency(label))
+                .observe("delivery us", Micros, cell.outcome.delivery)
+                .client_side(&cell.outcome)
+                .setting("metrics sampling", &cell.busy);
             for (name, unit, value) in [
                 ("achieved tps", Tps, Some(cell.outcome.achieved_rps())),
                 (
@@ -566,12 +515,11 @@ impl Scenario<ScenarioReport> for ExecutorSaturation {
             cells.push(cell);
         }
 
-        let expected_hash =
-            hash_chain(HASH_INIT.to_bytes(), profile.heavy_iters);
+        let expected_hash = hash_chain(HASH_INIT.to_bytes(), profile.heavy_iters);
         for (index, pda) in accounts.iter().enumerate() {
             let on_er = er.account(pda).await?.ok_or("pda not on er")?;
-            let hash_bytes = &on_er.data
-                [layout::HASH_OFFSET..layout::HASH_OFFSET + layout::HASH_SIZE];
+            let hash_bytes =
+                &on_er.data[layout::HASH_OFFSET..layout::HASH_OFFSET + layout::HASH_SIZE];
             check_eq!(
                 hash_bytes,
                 expected_hash,
@@ -594,10 +542,7 @@ impl Scenario<ScenarioReport> for ExecutorSaturation {
 
         let mut summary = ScenarioReport::ok(self.name())
             .setting("profile", profile.name)
-            .setting(
-                "shape",
-                "width-1 sha256 hash-chain, one payer per account",
-            )
+            .setting("shape", "width-1 sha256 hash-chain, one payer per account")
             .setting("accounts", profile.accounts)
             .setting("light iters", LIGHT_ITERS)
             .setting("heavy iters", profile.heavy_iters)
@@ -613,11 +558,7 @@ impl Scenario<ScenarioReport> for ExecutorSaturation {
             .metric(
                 "heavy/light cores ratio",
                 Ratio,
-                if light.cores > 0.0 {
-                    heavy.cores / light.cores
-                } else {
-                    0.0
-                },
+                if light.cores > 0.0 { heavy.cores / light.cores } else { 0.0 },
             );
         for cell in &cells {
             summary = summary.with_flags(&cell.outcome);
@@ -651,11 +592,7 @@ impl Scenario<ScenarioReport> for ExecutorSaturation {
                 ("top thread cores", Count, Some(cell.top_thread_cores)),
                 ("busy threads", Count, Some(cell.busy_threads as f64)),
             ] {
-                summary = summary.metric_if(
-                    format!("{} {name}", cell.label),
-                    unit,
-                    value,
-                );
+                summary = summary.metric_if(format!("{} {name}", cell.label), unit, value);
             }
         }
         Ok(summary)

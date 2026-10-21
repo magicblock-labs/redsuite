@@ -20,6 +20,9 @@ redshift-interface = { workspace = true }
 redhat-interface = { workspace = true }
 
 serde = { workspace = true }
+serde_with = { workspace = true }
+thiserror = { workspace = true }
+derive_more = { workspace = true }
 toml = { workspace = true }
 magicblock-config = { workspace = true }
 json = { workspace = true }

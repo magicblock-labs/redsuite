@@ -9,8 +9,7 @@ use redsuite_core::{
     check, check_eq,
     rpc_client::nonblocking::rpc_client::RpcClient,
     rpc_client_api::{
-        config::RpcLargestAccountsConfig, request::RpcRequest,
-        response::RpcBlockCommitment,
+        config::RpcLargestAccountsConfig, request::RpcRequest, response::RpcBlockCommitment,
     },
     topology::{self, ErOptions},
     BaseCtx, ChainCtx, PrivateErScenario, Result,
@@ -91,19 +90,13 @@ fn confirmed() -> CommitmentConfig {
     CommitmentConfig::confirmed()
 }
 
-async fn run_method(
-    client: &RpcClient,
-    fixture: &Fixture,
-    method: Method,
-) -> Result<Option<u64>> {
+async fn run_method(client: &RpcClient, fixture: &Fixture, method: Method) -> Result<Option<u64>> {
     let mut observed_slot = None;
     match method {
         Method::BlockCommitment => {
             let commitment: RpcBlockCommitment<[u64; 32]> = client
                 .send(
-                    RpcRequest::Custom {
-                        method: "getBlockCommitment",
-                    },
+                    RpcRequest::Custom { method: "getBlockCommitment" },
                     serde_json::json!([fixture.slot_floor]),
                 )
                 .await?;
@@ -245,12 +238,10 @@ async fn run_method(
             observed_slot = Some(largest.context.slot);
         }
         Method::RecentPerformanceSamples => {
-            let samples = client
-                .get_recent_performance_samples(Some(PERFORMANCE_SAMPLE_LIMIT))
-                .await?;
+            let samples =
+                client.get_recent_performance_samples(Some(PERFORMANCE_SAMPLE_LIMIT)).await?;
             check!(
-                !samples.is_empty()
-                    && samples.len() <= PERFORMANCE_SAMPLE_LIMIT,
+                !samples.is_empty() && samples.len() <= PERFORMANCE_SAMPLE_LIMIT,
                 "getRecentPerformanceSamples must honour the limit of \
                  {PERFORMANCE_SAMPLE_LIMIT}, got {}",
                 samples.len()
@@ -276,12 +267,9 @@ async fn run_method(
             )?;
         }
         Method::SlotLeaders => {
-            let leaders = client
-                .get_slot_leaders(fixture.slot_floor, SLOT_LEADER_LIMIT)
-                .await?;
+            let leaders = client.get_slot_leaders(fixture.slot_floor, SLOT_LEADER_LIMIT).await?;
             check!(
-                !leaders.is_empty()
-                    && leaders.len() as u64 <= SLOT_LEADER_LIMIT,
+                !leaders.is_empty() && leaders.len() as u64 <= SLOT_LEADER_LIMIT,
                 "getSlotLeaders must answer with between 1 and \
                  {SLOT_LEADER_LIMIT} leaders, got {}",
                 leaders.len()
@@ -313,10 +301,7 @@ async fn run_method(
         }
         Method::TokenLargestAccounts => {
             let largest = client
-                .get_token_largest_accounts_with_commitment(
-                    &fixture.mint,
-                    confirmed(),
-                )
+                .get_token_largest_accounts_with_commitment(&fixture.mint, confirmed())
                 .await?;
             check!(
                 largest.value.is_empty(),
@@ -326,16 +311,11 @@ async fn run_method(
             observed_slot = Some(largest.context.slot);
         }
         Method::TokenSupply => {
-            let supply = client
-                .get_token_supply_with_commitment(&fixture.mint, confirmed())
-                .await?;
+            let supply =
+                client.get_token_supply_with_commitment(&fixture.mint, confirmed()).await?;
             check_eq!(supply.value.amount, "0", "getTokenSupply amount")?;
             check_eq!(supply.value.decimals, 0, "getTokenSupply decimals")?;
-            check_eq!(
-                supply.value.ui_amount,
-                Some(0.0),
-                "getTokenSupply uiAmount"
-            )?;
+            check_eq!(supply.value.ui_amount, Some(0.0), "getTokenSupply uiAmount")?;
             check_eq!(
                 supply.value.ui_amount_string,
                 "0.0",
@@ -354,8 +334,7 @@ async fn run_method(
             let version = client.get_version().await?;
             let parts: Vec<&str> = version.solana_core.split('.').collect();
             check!(
-                parts.len() == 3
-                    && parts.iter().all(|part| part.parse::<u32>().is_ok()),
+                parts.len() == 3 && parts.iter().all(|part| part.parse::<u32>().is_ok()),
                 "getVersion solana-core must be a dotted numeric version, got \
                  {:?}",
                 version.solana_core
@@ -374,26 +353,16 @@ async fn run_method(
             )?;
         }
         Method::MinimumLedgerSlot => {
-            check_eq!(
-                client.minimum_ledger_slot().await?,
-                0,
-                "minimumLedgerSlot"
-            )?;
+            check_eq!(client.minimum_ledger_slot().await?, 0, "minimumLedgerSlot")?;
         }
     }
     Ok(observed_slot)
 }
 
-async fn bounded<T>(
-    label: &str,
-    call: impl std::future::Future<Output = T>,
-) -> Result<T> {
+async fn bounded<T>(label: &str, call: impl std::future::Future<Output = T>) -> Result<T> {
     tokio::time::timeout(NEGATIVE_DEADLINE, call)
         .await
-        .map_err(|_| {
-            format!("{label} did not answer within {NEGATIVE_DEADLINE:?}")
-                .into()
-        })
+        .map_err(|_| format!("{label} did not answer within {NEGATIVE_DEADLINE:?}").into())
 }
 
 #[async_trait(?Send)]
@@ -415,22 +384,12 @@ impl PrivateErScenario for RpcCompatMethods {
         )
         .await?;
         let er = private.ctx();
-        let client = RpcClient::new_with_commitment(
-            er.api().url().to_owned(),
-            confirmed(),
-        );
-        let slot_floor = check::poll_for(
-            "configured epoch boundary",
-            BURST_DEADLINE,
-            || async {
-                let slot = client.get_slot().await?;
-                check!(
-                    slot > SUPERBLOCK_SLOTS,
-                    "advance beyond the first epoch"
-                )?;
-                Result::Ok(slot)
-            },
-        )
+        let client = RpcClient::new_with_commitment(er.api().url().to_owned(), confirmed());
+        let slot_floor = check::poll_for("configured epoch boundary", BURST_DEADLINE, || async {
+            let slot = client.get_slot().await?;
+            check!(slot > SUPERBLOCK_SLOTS, "advance beyond the first epoch")?;
+            Result::Ok(slot)
+        })
         .await?;
         let fixture = Fixture {
             identity: er.identity(),
@@ -438,17 +397,15 @@ impl PrivateErScenario for RpcCompatMethods {
             slot_floor,
         };
 
-        let requests = join_all((0..REQUESTS).map(|index| {
-            run_method(&client, &fixture, CYCLE[index % CYCLE.len()])
-        }));
-        let outcomes = tokio::time::timeout(BURST_DEADLINE, requests)
-            .await
-            .map_err(|_| {
-                format!(
-                    "the burst of {REQUESTS} requests exceeded \
+        let requests = join_all(
+            (0..REQUESTS).map(|index| run_method(&client, &fixture, CYCLE[index % CYCLE.len()])),
+        );
+        let outcomes = tokio::time::timeout(BURST_DEADLINE, requests).await.map_err(|_| {
+            format!(
+                "the burst of {REQUESTS} requests exceeded \
                      {BURST_DEADLINE:?}"
-                )
-            })?;
+            )
+        })?;
         let slot_ceiling = client.get_slot().await?;
 
         let mut failures = 0u64;
@@ -504,10 +461,7 @@ impl PrivateErScenario for RpcCompatMethods {
         .await?;
         match raw_airdrop {
             Ok(value) => {
-                return Err(format!(
-                    "raw requestAirdrop must be rejected, got {value}"
-                )
-                .into())
+                return Err(format!("raw requestAirdrop must be rejected, got {value}").into())
             }
             Err(error) => {
                 let rejection = error.downcast_ref::<RpcError>();
@@ -518,8 +472,7 @@ impl PrivateErScenario for RpcCompatMethods {
                      code, got {error}"
                 )?;
                 check!(
-                    rejection
-                        .is_some_and(|e| e.message.contains(AIRDROP_DISABLED)),
+                    rejection.is_some_and(|e| e.message.contains(AIRDROP_DISABLED)),
                     "requestAirdrop must be rejected with \
                      {AIRDROP_DISABLED:?}, got {error}"
                 )?;
@@ -527,22 +480,17 @@ impl PrivateErScenario for RpcCompatMethods {
         }
 
         let routes: Vec<serde_json::Value> =
-            bounded("getRoutes", er.api().call("getRoutes", &NO_PARAMS))
-                .await??;
+            bounded("getRoutes", er.api().call("getRoutes", &NO_PARAMS)).await??;
         check!(routes.is_empty(), "getRoutes must be empty, got {routes:?}")?;
 
         let unknown = bounded(
             UNKNOWN_METHOD,
-            er.api()
-                .call::<serde_json::Value>(UNKNOWN_METHOD, &NO_PARAMS),
+            er.api().call::<serde_json::Value>(UNKNOWN_METHOD, &NO_PARAMS),
         )
         .await?;
         match unknown {
             Ok(value) => {
-                return Err(format!(
-                    "{UNKNOWN_METHOD} must be rejected, got {value}"
-                )
-                .into())
+                return Err(format!("{UNKNOWN_METHOD} must be rejected, got {value}").into())
             }
             Err(error) => {
                 let code = error.downcast_ref::<RpcError>().map(|e| e.code);

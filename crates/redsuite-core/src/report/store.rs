@@ -56,9 +56,7 @@ pub fn persist(parent: Option<&str>, run: ScenarioRun) -> Result<PathBuf> {
 pub fn load() -> Result<Campaign> {
     let root = super::reports_dir();
     let run = fs::read_to_string(root.join("latest")).map_err(|error| {
-        format!(
-            "cannot read latest report campaign; run a scenario first: {error}"
-        )
+        format!("cannot read latest report campaign; run a scenario first: {error}")
     })?;
     Ok(json::from_str(&fs::read_to_string(
         root.join(run).join("campaign.json"),

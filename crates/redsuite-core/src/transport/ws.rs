@@ -32,11 +32,8 @@ struct AccountValue {
 }
 
 pub(super) fn account_update_data(payload: &LazyValue<'_>) -> Option<Vec<u8>> {
-    let payload =
-        json::from_str::<AccountPayload>(payload.as_raw_str()).ok()?;
-    base64::engine::general_purpose::STANDARD
-        .decode(&payload.value.data.0)
-        .ok()
+    let payload = json::from_str::<AccountPayload>(payload.as_raw_str()).ok()?;
+    base64::engine::general_purpose::STANDARD.decode(&payload.value.data.0).ok()
 }
 
 #[derive(Debug)]
@@ -95,12 +92,7 @@ impl<E: Fn(&[u8]) -> Option<u64>> FrameHandler for AccountHandler<E> {
         shared.ready_subs += 1;
     }
 
-    fn on_notification(
-        &mut self,
-        method: &str,
-        subscription: u64,
-        payload: &LazyValue<'_>,
-    ) {
+    fn on_notification(&mut self, method: &str, subscription: u64, payload: &LazyValue<'_>) {
         if method != "accountNotification" {
             return;
         }
@@ -118,8 +110,7 @@ impl<E: Fn(&[u8]) -> Option<u64>> FrameHandler for AccountHandler<E> {
             shared.observed += 1;
             shared.settle(id);
         }
-        let Some(account) = shared.account_by_subid.get(&subscription).copied()
-        else {
+        let Some(account) = shared.account_by_subid.get(&subscription).copied() else {
             return;
         };
         while let Some(pending_id) = shared
@@ -161,11 +152,7 @@ impl AccountUpdates {
                 clock,
             },
         );
-        Ok(Self {
-            requester,
-            shared,
-            reader,
-        })
+        Ok(Self { requester, shared, reader })
     }
 
     pub async fn account_subscribe(&self, account: &Pubkey) -> Result<()> {
@@ -176,11 +163,7 @@ impl AccountUpdates {
             .await
     }
 
-    pub async fn await_subscribed(
-        &self,
-        count: usize,
-        timeout: Duration,
-    ) -> Result<()> {
+    pub async fn await_subscribed(&self, count: usize, timeout: Duration) -> Result<()> {
         self.await_shared(timeout, "subscription acks", |shared| {
             shared.ready_subs >= count
         })
@@ -195,11 +178,7 @@ impl AccountUpdates {
         shared.by_account.entry(account).or_default().insert(id);
     }
 
-    pub async fn await_observed(
-        &self,
-        count: usize,
-        timeout: Duration,
-    ) -> Result<()> {
+    pub async fn await_observed(&self, count: usize, timeout: Duration) -> Result<()> {
         self.await_shared(timeout, "account updates", |shared| {
             shared.observed >= count
         })
@@ -230,8 +209,7 @@ impl AccountUpdates {
             shared.waiters.insert(id, tx);
             rx
         };
-        rx.await
-            .map_err(|_| "ws stream failed while awaiting update".into())
+        rx.await.map_err(|_| "ws stream failed while awaiting update".into())
     }
 
     pub fn finalize(&self) -> UpdateOutcome {
@@ -323,17 +301,11 @@ impl FrameHandler for SigHandler {
         }
     }
 
-    fn on_notification(
-        &mut self,
-        method: &str,
-        subscription: u64,
-        payload: &LazyValue<'_>,
-    ) {
+    fn on_notification(&mut self, method: &str, subscription: u64, payload: &LazyValue<'_>) {
         if method != "signatureNotification" {
             return;
         }
-        let Ok(result) = json::from_str::<SigPayload>(payload.as_raw_str())
-        else {
+        let Ok(result) = json::from_str::<SigPayload>(payload.as_raw_str()) else {
             return;
         };
         let mut shared = self.shared.borrow_mut();
@@ -352,9 +324,7 @@ impl FrameHandler for SigHandler {
             }
             Some(err) => {
                 shared.failed += 1;
-                shared
-                    .first_failure
-                    .get_or_insert(format!("id {id}: {err}"));
+                shared.first_failure.get_or_insert(format!("id {id}: {err}"));
             }
         }
         shared.settle_waiter(id);
@@ -379,25 +349,11 @@ impl SignatureConfirmations {
     pub async fn connect(url: &str, clock: Arc<SendClock>) -> Result<Self> {
         let (requester, stream) = conn::split(conn::connect(url).await?);
         let shared = Rc::new(RefCell::new(SigShared::default()));
-        let reader = Reader::spawn(
-            stream,
-            SigHandler {
-                shared: shared.clone(),
-                clock,
-            },
-        );
-        Ok(Self {
-            requester,
-            shared,
-            reader,
-        })
+        let reader = Reader::spawn(stream, SigHandler { shared: shared.clone(), clock });
+        Ok(Self { requester, shared, reader })
     }
 
-    pub async fn subscribe(
-        &self,
-        id: u64,
-        signature: &Signature,
-    ) -> Result<()> {
+    pub async fn subscribe(&self, id: u64, signature: &Signature) -> Result<()> {
         let req = self.requester.mint();
         {
             let mut shared = self.shared.borrow_mut();
@@ -425,8 +381,7 @@ impl SignatureConfirmations {
             shared.waiters.insert(id, tx);
             rx
         };
-        rx.await
-            .map_err(|_| "ws stream failed while awaiting signature".into())
+        rx.await.map_err(|_| "ws stream failed while awaiting signature".into())
     }
 
     pub async fn await_all(&self, timeout: Duration) -> Result<()> {

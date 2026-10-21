@@ -5,12 +5,13 @@ use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::dlp::{commit_state, finalize, undelegate, CommitStateArgs};
 use redsuite_core::{
-    check, check_eq, dlp, prep, system, topology, BaseCtx, ChainCtx, ErCtx,
-    Result, Scenario,
+    check, check_eq, dlp, prep, system, topology, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
 use signer::Signer;
 
 use crate::program::{instruction::build, layout, DELEGATION_PROGRAM_ID};
+
+use super::{write, ER_WRITE};
 
 const CLONE_TIMEOUT: Duration = Duration::from_secs(15);
 const PROPAGATION_TIMEOUT: Duration = Duration::from_secs(15);
@@ -18,7 +19,6 @@ const BASE_STATE_TIMEOUT: Duration = Duration::from_secs(20);
 const UNDELEGATE_TIMEOUT: Duration = Duration::from_secs(30);
 const PRE_CLONE_WRITE: u64 = 41;
 const POST_CLONE_WRITE: u64 = 42;
-const ER_WRITE: u64 = 43;
 const UNDELEGATED_WRITE: u64 = 44;
 const SECOND_WRITE: u64 = 45;
 const LOCKOUT_WRITE: u64 = 46;
@@ -55,9 +55,7 @@ async fn await_landed(
                 Ok(Some(acc))
                     if acc.owner == owner
                         && acc.data == data
-                        && lamports.is_none_or(|lamports| {
-                            acc.lamports == lamports
-                        }) =>
+                        && lamports.is_none_or(|lamports| acc.lamports == lamports) =>
                 {
                     Ok(())
                 }
@@ -114,11 +112,7 @@ impl Scenario for CloneOnAccess {
 
         crate::phase("plain clone", async {
             let plain = crate::init_account(base, &payer, 0, identity).await?;
-            base.submit_and_confirm(
-                &payer,
-                &[build::simple_byte_set(PRE_CLONE_WRITE, &[plain])],
-            )
-            .await?;
+            write(base, &payer, PRE_CLONE_WRITE, &[plain]).await?;
             check::poll(
                 "the ER clones the plain account on first access",
                 CLONE_TIMEOUT,
@@ -146,11 +140,7 @@ impl Scenario for CloneOnAccess {
                 Some(PRE_CLONE_WRITE),
                 "the first ER access must observe the state written on base before cloning"
             )?;
-            base.submit_and_confirm(
-                &payer,
-                &[build::simple_byte_set(POST_CLONE_WRITE, &[plain])],
-            )
-            .await?;
+            write(base, &payer, POST_CLONE_WRITE, &[plain]).await?;
             check::poll(
                 "the base write propagates to the existing ER clone",
                 PROPAGATION_TIMEOUT,
@@ -159,12 +149,8 @@ impl Scenario for CloneOnAccess {
                 },
             )
             .await?;
-            let undelegated_write = er
-                .submit_and_confirm(
-                    &payer,
-                    &[build::simple_byte_set(UNDELEGATED_WRITE, &[plain])],
-                )
-                .await;
+            let undelegated_write =
+                write(er, &payer, UNDELEGATED_WRITE, &[plain]).await;
             check!(
                 undelegated_write.is_err(),
                 "the ER must reject a write to an undelegated clone, got {undelegated_write:?}"
@@ -174,45 +160,26 @@ impl Scenario for CloneOnAccess {
         .await?;
 
         let (accounts, snapshot) = crate::phase("delegated write", async {
-            let delegated =
-                crate::init_delegated_account(base, &payer, 1, identity)
-                    .await?;
-            let sibling =
-                crate::init_delegated_account(base, &payer, 2, identity)
-                    .await?;
+            let delegated = crate::init_delegated_account(base, &payer, 1, identity).await?;
+            let sibling = crate::init_delegated_account(base, &payer, 2, identity).await?;
             let accounts = [delegated, sibling];
             for pda in &accounts {
-                let on_base = base
-                    .account(pda)
-                    .await?
-                    .ok_or("delegated pda missing on base")?;
+                let on_base = base.account(pda).await?.ok_or("delegated pda missing on base")?;
                 check_eq!(
                     on_base.owner,
                     DELEGATION_PROGRAM_ID,
                     "a delegated pda must be dlp-owned on base"
                 )?;
             }
-            prep::await_clones(
-                er,
-                &accounts,
-                crate::ACCOUNT_SPACE as usize,
-                CLONE_TIMEOUT,
-            )
-            .await?;
-            let delegated_clone = er
-                .account(&delegated)
-                .await?
-                .ok_or("delegated clone vanished")?;
+            prep::await_clones(er, &accounts, crate::ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
+            let delegated_clone =
+                er.account(&delegated).await?.ok_or("delegated clone vanished")?;
             check_eq!(
                 delegated_clone.owner,
                 crate::program::id(),
                 "the ER must present a delegated account as owned by its program"
             )?;
-            er.submit_and_confirm(
-                &payer,
-                &[build::simple_byte_set(ER_WRITE, &accounts)],
-            )
-            .await?;
+            write(er, &payer, ER_WRITE, &accounts).await?;
             let snapshot = er
                 .account(&delegated)
                 .await?
@@ -224,8 +191,7 @@ impl Scenario for CloneOnAccess {
                 "the ER copy of a delegated account must accept program writes"
             )?;
             for pda in &accounts {
-                let on_base =
-                    base.account(pda).await?.ok_or("delegated pda gone on base")?;
+                let on_base = base.account(pda).await?.ok_or("delegated pda gone on base")?;
                 check!(
                     untouched(&on_base.data),
                     "ER writes must not reach the base copy without an explicit commit"
@@ -240,21 +206,11 @@ impl Scenario for CloneOnAccess {
             let signature = er
                 .submit_and_confirm(
                     &payer,
-                    &[build::commit_accounts(
-                        1,
-                        payer.pubkey(),
-                        &accounts[..1],
-                    )],
+                    &[build::commit_accounts(1, payer.pubkey(), &accounts[..1])],
                 )
                 .await?;
-            let receipt = crate::assert_commit_receipt(
-                base,
-                er,
-                &signature,
-                &accounts[..1],
-                false,
-            )
-            .await?;
+            let receipt =
+                crate::assert_commit_receipt(base, er, &signature, &accounts[..1], false).await?;
             if !receipt.failure_is_duplicate_rejection() {
                 check_eq!(
                     receipt.payer,
@@ -275,10 +231,8 @@ impl Scenario for CloneOnAccess {
                 BASE_STATE_TIMEOUT,
             )
             .await?;
-            let sibling_on_base = base
-                .account(&sibling)
-                .await?
-                .ok_or("sibling pda gone on base")?;
+            let sibling_on_base =
+                base.account(&sibling).await?.ok_or("sibling pda gone on base")?;
             check!(
                 untouched(&sibling_on_base.data),
                 "committing one account must not touch its sibling on base"
@@ -287,21 +241,17 @@ impl Scenario for CloneOnAccess {
         })
         .await?;
 
-        let wallet =
-            prep::delegated_payer(base, &payer, identity, WALLET_LAMPORTS)
-                .await?;
+        let wallet = prep::delegated_payer(base, &payer, identity, WALLET_LAMPORTS).await?;
 
         crate::phase("undelegate", async {
-            er.submit_and_confirm(
-                &payer,
-                &[build::simple_byte_set(SECOND_WRITE, &accounts)],
-            )
-            .await?;
+            write(er, &payer, SECOND_WRITE, &accounts).await?;
             let mut finals = Vec::new();
             for pda in &accounts {
-                finals.push(er.account(pda).await?.ok_or(
-                    "er copy vanished before the undelegating commit",
-                )?);
+                finals.push(
+                    er.account(pda)
+                        .await?
+                        .ok_or("er copy vanished before the undelegating commit")?,
+                );
             }
             check_eq!(
                 crate::written_id(&finals[0].data),
@@ -311,17 +261,11 @@ impl Scenario for CloneOnAccess {
             let signature = er
                 .submit_and_confirm(
                     &payer,
-                    &[build::commit_and_undelegate_accounts(
-                        2,
-                        payer.pubkey(),
-                        &accounts,
-                    )],
+                    &[build::commit_and_undelegate_accounts(2, payer.pubkey(), &accounts)],
                 )
                 .await?;
-            let receipt = crate::assert_commit_receipt(
-                base, er, &signature, &accounts, true,
-            )
-            .await?;
+            let receipt =
+                crate::assert_commit_receipt(base, er, &signature, &accounts, true).await?;
             if !receipt.failure_is_duplicate_rejection() {
                 check!(
                     !receipt.base_signatures.is_empty(),
@@ -350,12 +294,7 @@ impl Scenario for CloneOnAccess {
                 },
             )
             .await?;
-            let write_after_undelegate = er
-                .submit_and_confirm(
-                    &wallet,
-                    &[build::simple_byte_set(LOCKOUT_WRITE, &[delegated])],
-                )
-                .await;
+            let write_after_undelegate = write(er, &wallet, LOCKOUT_WRITE, &[delegated]).await;
             check!(
                 write_after_undelegate.is_err(),
                 "the ER copy of an undelegated account must reject writes \
@@ -403,18 +342,9 @@ impl Scenario for CloneOnAccess {
                     &payer.pubkey(),
                 ),
                 system::assign(&wallet.pubkey(), &dlp::dlp_id()),
-                dlp::delegate_account(
-                    &payer.pubkey(),
-                    &wallet.pubkey(),
-                    &identity,
-                ),
+                dlp::delegate_account(&payer.pubkey(), &wallet.pubkey(), &identity),
             ];
-            base.submit_and_confirm_with(
-                &payer,
-                &[&validator, &wallet],
-                &cycle,
-            )
-            .await?;
+            base.submit_and_confirm_with(&payer, &[&validator, &wallet], &cycle).await?;
             let continuity_deadline = Instant::now() + CONTINUITY_WINDOW;
             while Instant::now() < continuity_deadline {
                 check!(
@@ -440,11 +370,7 @@ impl Scenario for CloneOnAccess {
             )?;
             er.submit_and_confirm(
                 &wallet,
-                &[system::transfer(
-                    &wallet.pubkey(),
-                    &wallet.pubkey(),
-                    CYCLE_SPEND,
-                )],
+                &[system::transfer(&wallet.pubkey(), &wallet.pubkey(), CYCLE_SPEND)],
             )
             .await?;
             Ok(())

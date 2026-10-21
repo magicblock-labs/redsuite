@@ -43,9 +43,7 @@ pub(super) fn spawn_detached(cmd: Command, log: &Path) -> Result<u32> {
 }
 
 fn send_signal(pid: u32, signal: &str) {
-    let _ = Command::new("kill")
-        .args([signal, &pid.to_string()])
-        .status();
+    let _ = Command::new("kill").args([signal, &pid.to_string()]).status();
 }
 
 // The one termination primitive: signal, grace window, SIGKILL escalation,
@@ -58,11 +56,7 @@ pub(super) async fn terminate(
 ) -> Result<(ExitStatus, bool)> {
     send_signal(pid, if hard_kill { "-KILL" } else { "-TERM" });
     let grace_deadline = std::time::Instant::now() + KILL_GRACE;
-    let hard_deadline = if hard_kill {
-        grace_deadline
-    } else {
-        grace_deadline + KILL_GRACE
-    };
+    let hard_deadline = if hard_kill { grace_deadline } else { grace_deadline + KILL_GRACE };
     let mut escalated = hard_kill;
     let mut needed_sigkill = false;
     loop {
@@ -76,10 +70,9 @@ pub(super) async fn terminate(
             needed_sigkill = true;
         }
         if std::time::Instant::now() >= hard_deadline {
-            return Err(format!(
-                "process {pid} did not exit within {KILL_GRACE:?} of SIGKILL"
-            )
-            .into());
+            return Err(
+                format!("process {pid} did not exit within {KILL_GRACE:?} of SIGKILL").into(),
+            );
         }
         tokio::time::sleep(RESTART_POLL).await;
     }
@@ -105,9 +98,7 @@ pub(crate) fn kill_pid(pid: u32) {
     }
     if proc_running(pid) {
         warn!(pid, "process still alive after SIGTERM; sending SIGKILL");
-        let _ = Command::new("kill")
-            .args(["-KILL", &pid.to_string()])
-            .status();
+        let _ = Command::new("kill").args(["-KILL", &pid.to_string()]).status();
     }
 }
 
@@ -121,9 +112,7 @@ pub(super) fn kill_matching(procs: &[(u32, &str)]) {
     }
     let deadline = std::time::Instant::now() + KILL_GRACE;
     while std::time::Instant::now() < deadline
-        && procs
-            .iter()
-            .any(|(pid, bin)| *pid != 0 && proc_matches(*pid, bin))
+        && procs.iter().any(|(pid, bin)| *pid != 0 && proc_matches(*pid, bin))
     {
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -137,17 +126,11 @@ pub(super) fn kill_matching(procs: &[(u32, &str)]) {
 // Every process the topology layer spawns names the stack directory on its
 // command line. Only the topology binaries qualify, so a shell or editor
 // that merely mentions the directory is never touched.
-pub(super) const TOPOLOGY_BINS: [&str; 3] = [
-    "solana-test-validator",
-    "magicblock-validator",
-    "magicblock-verifier",
-];
+pub(super) const TOPOLOGY_BINS: [&str; 3] =
+    ["solana-test-validator", "magicblock-validator", "magicblock-verifier"];
 
 #[cfg(target_os = "linux")]
-pub(super) fn orphaned_topology_processes(
-    stack_dir: &Path,
-    exclude: &[u32],
-) -> Vec<(u32, String)> {
+pub(super) fn orphaned_topology_processes(stack_dir: &Path, exclude: &[u32]) -> Vec<(u32, String)> {
     let marker = format!("{}/", stack_dir.display());
     let Ok(entries) = fs::read_dir("/proc") else {
         return Vec::new();
@@ -169,9 +152,9 @@ pub(super) fn orphaned_topology_processes(
             .map(|arg| String::from_utf8_lossy(arg).into_owned())
             .collect();
         let runs_topology_bin = argv.iter().any(|arg| {
-            Path::new(arg).file_name().is_some_and(|name| {
-                TOPOLOGY_BINS.contains(&name.to_string_lossy().as_ref())
-            })
+            Path::new(arg)
+                .file_name()
+                .is_some_and(|name| TOPOLOGY_BINS.contains(&name.to_string_lossy().as_ref()))
         });
         if !runs_topology_bin {
             continue;
@@ -186,10 +169,7 @@ pub(super) fn orphaned_topology_processes(
 }
 
 #[cfg(target_os = "macos")]
-pub(super) fn orphaned_topology_processes(
-    stack_dir: &Path,
-    exclude: &[u32],
-) -> Vec<(u32, String)> {
+pub(super) fn orphaned_topology_processes(stack_dir: &Path, exclude: &[u32]) -> Vec<(u32, String)> {
     use libproc::{
         proc_pid::pidpath,
         processes::{pids_by_type, ProcFilter},
@@ -223,9 +203,9 @@ pub(super) fn orphaned_topology_processes(
 #[cfg(target_os = "macos")]
 fn runs_topology_bin(cmdline: &str) -> bool {
     cmdline.split_whitespace().any(|arg| {
-        Path::new(arg).file_name().is_some_and(|name| {
-            TOPOLOGY_BINS.contains(&name.to_string_lossy().as_ref())
-        })
+        Path::new(arg)
+            .file_name()
+            .is_some_and(|name| TOPOLOGY_BINS.contains(&name.to_string_lossy().as_ref()))
     })
 }
 
@@ -291,9 +271,7 @@ pub(super) async fn await_base_serving(
     .await?;
     for (what, port) in listeners {
         wait_until(Duration::from_secs(20), what, log, pid, || async {
-            tokio::net::TcpStream::connect(("127.0.0.1", *port))
-                .await
-                .is_ok()
+            tokio::net::TcpStream::connect(("127.0.0.1", *port)).await.is_ok()
         })
         .await?;
     }
@@ -442,13 +420,11 @@ impl Drop for Owned {
             Some(status) => {
                 let exit = describe_exit(&status);
                 warn!(kind, label, %exit, "process exited before cleanup");
-                self.record
-                    .record_exit(format!("died before cleanup: {exit}"));
+                self.record.record_exit(format!("died before cleanup: {exit}"));
             }
             None => {
                 kill_pid(pid);
-                let exit =
-                    child.wait().ok().map(|status| describe_exit(&status));
+                let exit = child.wait().ok().map(|status| describe_exit(&status));
                 self.record.record_exit(match exit {
                     Some(exit) => format!("terminated by cleanup: {exit}"),
                     None => "terminated by cleanup, status unknown".to_owned(),
@@ -486,10 +462,7 @@ impl PortLease {
         let dir = registry_dir();
         fs::create_dir_all(&dir)?;
         let start = rand::thread_rng().gen_range(PORT_BAND);
-        for first in (start..PORT_BAND.end)
-            .chain(PORT_BAND.start..start)
-            .take(BAND_ATTEMPTS)
-        {
+        for first in (start..PORT_BAND.end).chain(PORT_BAND.start..start).take(BAND_ATTEMPTS) {
             if first + want > PORT_BAND.end {
                 continue;
             }
@@ -506,12 +479,10 @@ impl PortLease {
                     Err(fs::TryLockError::WouldBlock) => break,
                     Err(error) => return Err(error.into()),
                 }
-                let Ok(tcp) = std::net::TcpListener::bind(("127.0.0.1", port))
-                else {
+                let Ok(tcp) = std::net::TcpListener::bind(("127.0.0.1", port)) else {
                     break;
                 };
-                let Ok(udp) = std::net::UdpSocket::bind(("127.0.0.1", port))
-                else {
+                let Ok(udp) = std::net::UdpSocket::bind(("127.0.0.1", port)) else {
                     break;
                 };
                 claims.push((port, lock));
@@ -545,10 +516,7 @@ impl PortLease {
         self.holders.clear();
     }
 
-    pub(super) fn failure(
-        &self,
-        error: impl std::fmt::Display,
-    ) -> crate::DynError {
+    pub(super) fn failure(&self, error: impl std::fmt::Display) -> crate::DynError {
         let ports: Vec<_> = self.claims.iter().map(|(port, _)| *port).collect();
         format!("{error}\nreserved ports: {ports:?}").into()
     }

@@ -19,22 +19,17 @@ const IDENTITY_FUNDING_LAMPORTS: u64 = 20 * 1_000_000_000;
 const FUNDING_POLL: Duration = Duration::from_millis(250);
 
 pub fn identity_keypair(identity: &Pubkey) -> Result<Keypair> {
-    let state = state::read_state()
-        .ok_or("no shared stack state — boot the shared stack first")?;
+    let state = state::read_state().ok_or("no shared stack state — boot the shared stack first")?;
     state
         .er_identity_pool
         .iter()
         .filter_map(|bytes| Keypair::try_from(&bytes[..]).ok())
         .find(|keypair| keypair.pubkey() == *identity)
-        .ok_or_else(|| {
-            format!("{identity} is not one of this stack's ER identities")
-                .into()
-        })
+        .ok_or_else(|| format!("{identity} is not one of this stack's ER identities").into())
 }
 
 fn vault_dump_json(vault: &Pubkey) -> String {
-    let data =
-        base64::engine::general_purpose::STANDARD.encode([0u8; VAULT_SPACE]);
+    let data = base64::engine::general_purpose::STANDARD.encode([0u8; VAULT_SPACE]);
     format!(
         r#"{{"pubkey":"{vault}","account":{{"lamports":{VAULT_LAMPORTS},"data":["{data}","base64"],"owner":"{DLP_ID}","executable":false,"rentEpoch":0,"space":{VAULT_SPACE}}}}}"#
     )
@@ -53,8 +48,7 @@ pub(super) fn reset_pool(dir: &Path) {
 }
 
 pub fn identity_for_label(label: &str) -> Result<Keypair> {
-    let state = state::read_state()
-        .ok_or("no shared stack state — boot the shared stack first")?;
+    let state = state::read_state().ok_or("no shared stack state — boot the shared stack first")?;
     if state.er_identity_pool.is_empty() {
         return Err("this stack predates per-ER identities — run \
                     `redsuite stack down` and boot it again"
@@ -63,11 +57,10 @@ pub fn identity_for_label(label: &str) -> Result<Keypair> {
     let dir = state::stack_dir();
     let _guard = PoolLock::acquire(&dir)?;
     let map_path = dir.join(POOL_MAP_FILE);
-    let mut assignments: BTreeMap<String, usize> =
-        fs::read_to_string(&map_path)
-            .ok()
-            .and_then(|raw| json::from_str(&raw).ok())
-            .unwrap_or_default();
+    let mut assignments: BTreeMap<String, usize> = fs::read_to_string(&map_path)
+        .ok()
+        .and_then(|raw| json::from_str(&raw).ok())
+        .unwrap_or_default();
 
     let slot = match assignments.get(label) {
         Some(slot) => *slot,
@@ -86,9 +79,8 @@ pub fn identity_for_label(label: &str) -> Result<Keypair> {
             slot
         }
     };
-    Keypair::try_from(&state.er_identity_pool[slot][..]).map_err(|e| {
-        format!("corrupt state.json: bad pool identity {slot}: {e}").into()
-    })
+    Keypair::try_from(&state.er_identity_pool[slot][..])
+        .map_err(|e| format!("corrupt state.json: bad pool identity {slot}: {e}").into())
 }
 
 struct PoolLock(#[allow(dead_code)] fs::File);
@@ -108,13 +100,9 @@ impl PoolLock {
 // The identity SPENDS concurrently (vault init, mdp sync), so the confirm
 // polls the ABSOLUTE funding target — an exact-increment poll can never
 // land while the balance moves under it.
-pub(super) async fn ensure_identity_funded(
-    base: &BaseCtx,
-    identity: &Pubkey,
-) -> Result<()> {
+pub(super) async fn ensure_identity_funded(base: &BaseCtx, identity: &Pubkey) -> Result<()> {
     let funded = || async {
-        base.api().get_balance(identity).await.unwrap_or(0)
-            >= IDENTITY_FUNDING_LAMPORTS
+        base.api().get_balance(identity).await.unwrap_or(0) >= IDENTITY_FUNDING_LAMPORTS
     };
     let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
     let mut ticks = 0u32;
@@ -125,17 +113,11 @@ pub(super) async fn ensure_identity_funded(
         // Re-request on a cadence — a busy freshly-booted base can drop the
         // faucet transaction, so one request is not enough.
         if ticks.is_multiple_of(20) {
-            let _ = base
-                .api()
-                .request_airdrop(identity, IDENTITY_FUNDING_LAMPORTS)
-                .await;
+            let _ = base.api().request_airdrop(identity, IDENTITY_FUNDING_LAMPORTS).await;
         }
         ticks += 1;
         if tokio::time::Instant::now() >= deadline {
-            return Err(format!(
-                "the identity {identity} did not reach the funding target"
-            )
-            .into());
+            return Err(format!("the identity {identity} did not reach the funding target").into());
         }
         tokio::time::sleep(FUNDING_POLL).await;
     }

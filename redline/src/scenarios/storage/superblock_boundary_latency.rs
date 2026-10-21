@@ -36,11 +36,10 @@ const PENDING_TRANSACTIONS: &str = "engine_ledger_pending_transactions";
 const ORDERING_DEPENDENCIES: &str = "engine_processor_ordering_dependencies";
 const FINALIZE_SUPERBLOCK: &str =
     r#"engine_keeper_operation_duration_micros{op="finalize_superblock"}"#;
-const FINALIZE_SUPERBLOCK_COUNT: &str = r#"engine_keeper_operation_duration_micros_count{op="finalize_superblock"}"#;
-const SNAPSHOT: &str =
-    r#"engine_accountsdb_operation_duration_micros{op="snapshot"}"#;
-const CHECKSUM: &str =
-    r#"engine_accountsdb_operation_duration_micros{op="checksum"}"#;
+const FINALIZE_SUPERBLOCK_COUNT: &str =
+    r#"engine_keeper_operation_duration_micros_count{op="finalize_superblock"}"#;
+const SNAPSHOT: &str = r#"engine_accountsdb_operation_duration_micros{op="snapshot"}"#;
+const CHECKSUM: &str = r#"engine_accountsdb_operation_duration_micros{op="checksum"}"#;
 
 struct Profile {
     name: &'static str,
@@ -78,10 +77,7 @@ const FULL: Profile = Profile {
     min_boundaries: 30,
 };
 
-const PROFILES: ProfileValues<Profile> = ProfileValues {
-    lite: LITE,
-    full: FULL,
-};
+const PROFILES: ProfileValues<Profile> = ProfileValues { lite: LITE, full: FULL };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -159,8 +155,7 @@ async fn observe_slots(
                 };
                 intervals.push(Interval {
                     kind,
-                    micros: arrived.duration_since(previous_arrival).as_micros()
-                        as u32,
+                    micros: arrived.duration_since(previous_arrival).as_micros() as u32,
                 });
             }
         }
@@ -180,17 +175,14 @@ impl PrivateErScenario<ScenarioReport> for SuperblockBoundaryLatency {
     async fn run(&self, base: &BaseCtx) -> Result<ScenarioReport> {
         let profile = PROFILES.select(base.config().profile);
 
-        let prep_payers =
-            prep::funded_payers(base, profile.payers, PREP_PAYER_LAMPORTS)
-                .await?;
+        let prep_payers = prep::funded_payers(base, profile.payers, PREP_PAYER_LAMPORTS).await?;
         let private = topology::private_er(
             base,
             topology::ErOptions {
                 label: "superblock-boundary".to_owned(),
                 settings: Box::new(move |params| {
                     params.engine.blockstore.blocktime = BLOCKTIME;
-                    params.engine.blockstore.superblock =
-                        profile.superblock_slots;
+                    params.engine.blockstore.superblock = profile.superblock_slots;
                 }),
                 ..Default::default()
             },
@@ -201,26 +193,14 @@ impl PrivateErScenario<ScenarioReport> for SuperblockBoundaryLatency {
         let pool = Accounts::new(crate::ACCOUNT_SPACE, cell_er.identity())
             .init_batched(base, &prep_payers, profile.accounts, true)
             .await?;
-        prep::await_clones(
-            cell_er,
-            &pool,
-            crate::ACCOUNT_SPACE as usize,
-            CLONE_TIMEOUT,
-        )
-        .await?;
+        prep::await_clones(cell_er, &pool, crate::ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
 
-        let payers: Vec<Rc<keypair::Keypair>> =
-            prep_payers.into_iter().map(Rc::new).collect();
-        let senders: Vec<TxSender> = payers
-            .iter()
-            .map(|payer| cell_er.sender(payer.clone()))
-            .collect();
+        let payers: Vec<Rc<keypair::Keypair>> = prep_payers.into_iter().map(Rc::new).collect();
+        let senders: Vec<TxSender> =
+            payers.iter().map(|payer| cell_er.sender(payer.clone())).collect();
 
-        let ledger_txs_at_boot = cell_er
-            .scrape_metrics()
-            .await?
-            .get(LEDGER_TRANSACTIONS)
-            .unwrap_or(0.0);
+        let ledger_txs_at_boot =
+            cell_er.scrape_metrics().await?.get(LEDGER_TRANSACTIONS).unwrap_or(0.0);
         let fill = execute(
             RunConfig {
                 iterations: profile.fill,
@@ -263,11 +243,9 @@ impl PrivateErScenario<ScenarioReport> for SuperblockBoundaryLatency {
                 let peak = |name: &str, current: f64| {
                     metrics.value_sum(name).unwrap_or_default().max(current)
                 };
-                health.blocked_peak =
-                    peak(BLOCKED_TRANSACTIONS, health.blocked_peak);
+                health.blocked_peak = peak(BLOCKED_TRANSACTIONS, health.blocked_peak);
                 health.busy_peak = peak(BUSY_EXECUTORS, health.busy_peak);
-                health.pending_peak =
-                    peak(PENDING_TRANSACTIONS, health.pending_peak);
+                health.pending_peak = peak(PENDING_TRANSACTIONS, health.pending_peak);
                 Some(())
             },
         );
@@ -336,11 +314,8 @@ impl PrivateErScenario<ScenarioReport> for SuperblockBoundaryLatency {
         let checksum_us = delta.histogram_avg(CHECKSUM);
         let snapshot_bytes = delta.gauge(SNAPSHOT_SIZE).unwrap_or_default();
         let storage_growth = storage_after.saturating_sub(storage_before);
-        let stall_ratio = if normal.p50 > 0 {
-            boundary.p50 as f64 / normal.p50 as f64
-        } else {
-            0.0
-        };
+        let stall_ratio =
+            if normal.p50 > 0 { boundary.p50 as f64 / normal.p50 as f64 } else { 0.0 };
 
         debug!(
             boundary.count,

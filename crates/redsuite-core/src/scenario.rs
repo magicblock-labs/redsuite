@@ -2,7 +2,7 @@ use std::{panic::AssertUnwindSafe, time::Instant};
 
 use async_trait::async_trait;
 use futures_util::FutureExt;
-use tracing::{debug, error, error_span, info, Instrument};
+use tracing::{error, error_span, field, info, Instrument, Span};
 
 use crate::{
     catalog::Fixture,
@@ -79,18 +79,6 @@ impl RunRecord {
         self.outcome.is_ok() && self.report.as_ref().is_none_or(|r| r.passed)
     }
 
-    fn failure(&self) -> String {
-        match &self.outcome {
-            Err(error) if self.phase == "panic" => {
-                format!("{}: scenario panicked: {error}", self.name)
-            }
-            Err(error) => {
-                format!("{}: {} failed: {error}", self.name, self.phase)
-            }
-            Ok(()) => format!("{}: scenario verdict failed", self.name),
-        }
-    }
-
     async fn run<V: Verdict, State>(
         &mut self,
         fixtures: &[Fixture],
@@ -132,20 +120,25 @@ impl RunRecord {
     fn conclude(&mut self, reports: bool) {
         if reports {
             if let Err(error) = crate::report::persist_run(self) {
-                error!(%error, "report not persisted");
                 if self.outcome.is_ok() {
                     self.phase = "persist";
                     self.outcome = Err(error);
+                } else {
+                    error!(%error, "report not persisted");
                 }
             }
         }
         if self.passed() {
-            info!(self.wall_seconds, "scenario passed");
-        } else {
-            error!(failure = %self.failure(), "scenario failed");
-            for launch in &self.launches {
-                debug!(%launch.label, %launch.log, "node log");
-            }
+            info!("passed");
+            return;
+        }
+        Span::current().record("stage", self.phase);
+        match &self.outcome {
+            Err(error) => error!(%error, "failed"),
+            Ok(()) => error!("verdict failed"),
+        }
+        for launch in &self.launches {
+            info!(%launch.label, pid = launch.pid, %launch.log, "node log");
         }
     }
 }
@@ -196,18 +189,16 @@ async fn execute<V: Verdict, State>(
     body: impl AsyncFnOnce(BaseCtx, State) -> Result<V>,
 ) -> RunRecord {
     // Error-level spans retain context without emitting standalone events.
-    let span = error_span!("scenario", %name);
+    let span = error_span!("run", scenario = %name, stage = field::Empty);
     let run = async {
         let mut record = RunRecord::new(name);
-        info!("scenario started");
+        info!("started");
         record.outcome = record.run(fixtures, config, provision, body).await;
         record.conclude(V::REPORTS);
         record
     };
     // Dropping the LocalSet cancels scenario-owned readers and background tasks.
-    tokio::task::LocalSet::new()
-        .run_until(run.instrument(span))
-        .await
+    tokio::task::LocalSet::new().run_until(run.instrument(span)).await
 }
 
 fn preflight(fixtures: &[Fixture]) -> Result<()> {
@@ -219,9 +210,7 @@ fn preflight(fixtures: &[Fixture]) -> Result<()> {
         return Ok(());
     };
     for fixture in fixtures {
-        if fixture.loaded_at_base_boot()
-            && !loaded.iter().any(|name| name == fixture.so_name())
-        {
+        if fixture.loaded_at_base_boot() && !loaded.iter().any(|name| name == fixture.so_name()) {
             return Err(format!(
                 "{} is staged, but the running base booted without it — \
                  run `cargo xtask stack down`, then run again",

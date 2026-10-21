@@ -31,11 +31,7 @@ fn handler<'a>(
 ) -> CallHandler<'a> {
     CallHandler {
         args: ActionArgs {
-            data: tagged(&FlexiInstruction::BaseAction {
-                amount,
-                change,
-                fail,
-            }),
+            data: tagged(&FlexiInstruction::BaseAction { amount, change, fail }),
             escrow_index: ACTOR_ESCROW_INDEX,
         },
         compute_units: ACTION_COMPUTE_UNITS,
@@ -60,9 +56,7 @@ pub(super) fn schedule(
     modes: &[IntentMode],
     actions: bool,
 ) -> ProgramResult {
-    let [payer, context, magic, vault, destination, system, pairs @ ..] =
-        accounts
-    else {
+    let [payer, context, magic, vault, destination, system, pairs @ ..] = accounts else {
         return Err(ProgramError::NotEnoughAccountKeys);
     };
     if pairs.len() != modes.len() * 2 {
@@ -71,28 +65,20 @@ pub(super) fn schedule(
     if matches!(modes, [IntentMode::Commit, IntentMode::Finalize]) && !actions {
         let instruction = Instruction::new_with_bincode(
             *magic.key,
-            &MagicBlockInstruction::ScheduleIntentBundle(
-                MagicIntentBundleArgs {
-                    commit: Some(CommitTypeArgs::Standalone(vec![3])),
-                    commit_finalize: Some(CommitTypeArgs::Standalone(vec![4])),
-                    ..Default::default()
-                },
-            ),
+            &MagicBlockInstruction::ScheduleIntentBundle(MagicIntentBundleArgs {
+                commit: Some(CommitTypeArgs::Standalone(vec![3])),
+                commit_finalize: Some(CommitTypeArgs::Standalone(vec![4])),
+                ..Default::default()
+            }),
             [payer, context, vault, &pairs[1], &pairs[3]]
                 .into_iter()
-                .map(|account| {
-                    AccountMeta::new(*account.key, account.is_signer)
-                })
+                .map(|account| AccountMeta::new(*account.key, account.is_signer))
                 .collect(),
         );
         return invoke(&instruction, accounts);
     }
-    let mut builder = MagicIntentBundleBuilder::new(
-        payer.clone(),
-        context.clone(),
-        magic.clone(),
-    )
-    .magic_fee_vault(vault.clone());
+    let mut builder = MagicIntentBundleBuilder::new(payer.clone(), context.clone(), magic.clone())
+        .magic_fee_vault(vault.clone());
     for (pair, mode) in pairs.chunks_exact(2).zip(modes) {
         let owner = &pair[0];
         let counter = &pair[1];
@@ -130,9 +116,7 @@ pub(super) fn schedule(
                 .commit(std::slice::from_ref(counter))
                 .add_post_commit_actions(actions.then(post_commit))
                 .fold_builder(),
-            IntentMode::Finalize => {
-                return Err(ProgramError::InvalidInstructionData)
-            }
+            IntentMode::Finalize => return Err(ProgramError::InvalidInstructionData),
         };
     }
     builder.build_and_invoke()
@@ -153,11 +137,7 @@ pub(super) fn action(
     if !escrow.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
-    let owner = if change.is_some() {
-        crate::ID
-    } else {
-        sdk::cpi::DELEGATION_PROGRAM_ID
-    };
+    let owner = if change.is_some() { crate::ID } else { sdk::cpi::DELEGATION_PROGRAM_ID };
     if counter.owner != &owner {
         return Err(ProgramError::InvalidAccountOwner);
     }
@@ -170,14 +150,8 @@ pub(super) fn action(
     transfer_lamports(escrow, destination, system, amount)
 }
 
-pub(super) fn transfer(
-    accounts: &[AccountInfo],
-    amount: u64,
-    fail: bool,
-) -> ProgramResult {
-    let [payer, context, magic, vault, destination, system, _, counter] =
-        accounts
-    else {
+pub(super) fn transfer(accounts: &[AccountInfo], amount: u64, fail: bool) -> ProgramResult {
+    let [payer, context, magic, vault, destination, system, _, counter] = accounts else {
         return Err(ProgramError::NotEnoughAccountKeys);
     };
     transfer_lamports(payer, counter, system, amount)?;
@@ -224,14 +198,11 @@ pub(super) fn callback(accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     if signer.key != &CALLBACK_SIGNER || !signer.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
-    let response: MagicResponse = bincode::deserialize(data)
-        .map_err(|_| ProgramError::InvalidInstructionData)?;
+    let response: MagicResponse =
+        bincode::deserialize(data).map_err(|_| ProgramError::InvalidInstructionData)?;
     if !response.ok() {
         let amount = u64::from_le_bytes(
-            response
-                .data()
-                .try_into()
-                .map_err(|_| ProgramError::InvalidInstructionData)?,
+            response.data().try_into().map_err(|_| ProgramError::InvalidInstructionData)?,
         );
         **counter.try_borrow_mut_lamports()? -= amount;
         **payer.try_borrow_mut_lamports()? += amount;

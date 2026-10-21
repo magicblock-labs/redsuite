@@ -37,11 +37,7 @@ const ER_BLOCKHASH_TTL: Duration = Duration::from_secs(2);
 #[async_trait(?Send)]
 pub trait ChainCtx {
     fn api(&self) -> &Api;
-    async fn submit_and_confirm(
-        &self,
-        payer: &Keypair,
-        ixs: &[Instruction],
-    ) -> Result<Signature> {
+    async fn submit_and_confirm(&self, payer: &Keypair, ixs: &[Instruction]) -> Result<Signature> {
         self.submit_and_confirm_with(payer, &[], ixs).await
     }
     async fn submit_and_confirm_with(
@@ -66,10 +62,7 @@ pub(crate) struct BlockhashCache {
 
 impl BlockhashCache {
     fn new(ttl: Duration) -> Self {
-        Self {
-            ttl,
-            cached: RefCell::new(None),
-        }
+        Self { ttl, cached: RefCell::new(None) }
     }
 
     fn reset(&self) {
@@ -98,12 +91,7 @@ async fn submit_and_confirm(
     let hash = blockhash.get(api).await?;
     let mut signers = vec![payer];
     signers.extend_from_slice(cosigners);
-    let tx = Transaction::new_signed_with_payer(
-        ixs,
-        Some(&payer.pubkey()),
-        &signers,
-        hash,
-    );
+    let tx = Transaction::new_signed_with_payer(ixs, Some(&payer.pubkey()), &signers, hash);
     let sig = api.send_transaction(&tx).await?;
     api.confirm(&sig, ConfirmOptions::default()).await?;
     Ok(sig)
@@ -139,9 +127,9 @@ impl TxSender {
 
     pub fn deliver(&self, tx: Transaction) -> impl Delivery {
         let api = self.api.clone();
-        SendTransaction(move |_: Instant| async move {
-            api.send_transaction(&tx).await.map(|_| ())
-        })
+        SendTransaction(
+            move |_: Instant| async move { api.send_transaction(&tx).await.map(|_| ()) },
+        )
     }
 
     pub fn staged(
@@ -168,10 +156,7 @@ impl TxSender {
         self.api.send_transaction(&tx).await
     }
 
-    pub async fn submit_and_confirm(
-        &self,
-        ixs: &[Instruction],
-    ) -> Result<Signature> {
+    pub async fn submit_and_confirm(&self, ixs: &[Instruction]) -> Result<Signature> {
         let sig = self.submit(ixs).await?;
         self.api.confirm(&sig, ConfirmOptions::default()).await?;
         Ok(sig)
@@ -239,9 +224,7 @@ impl BaseCtx {
     }
 
     pub fn grpc(&self) -> Option<(&str, &str)> {
-        self.grpc
-            .as_ref()
-            .map(|(url, plugin)| (url.as_str(), plugin.as_str()))
+        self.grpc.as_ref().map(|(url, plugin)| (url.as_str(), plugin.as_str()))
     }
 
     pub fn config(&self) -> ExecutionConfig {
@@ -302,10 +285,7 @@ impl ErCtx {
         self.proxies.as_deref()
     }
 
-    pub async fn restart(
-        &self,
-        config: RestartConfig,
-    ) -> Result<RestartTiming> {
+    pub async fn restart(&self, config: RestartConfig) -> Result<RestartTiming> {
         self.owner
             .as_ref()
             .and_then(Weak::upgrade)
@@ -349,11 +329,7 @@ impl ErCtx {
     }
 }
 
-async fn airdrop_and_confirm(
-    api: &Api,
-    pk: &Pubkey,
-    lamports: u64,
-) -> Result<()> {
+async fn airdrop_and_confirm(api: &Api, pk: &Pubkey, lamports: u64) -> Result<()> {
     let before = api.get_balance(pk).await.unwrap_or(0);
     let mut requested = false;
     crate::check::poll_until(AIRDROP_TIMEOUT, AIRDROP_POLL, async || {
@@ -363,15 +339,12 @@ async fn airdrop_and_confirm(
             requested = api.request_airdrop(pk, lamports).await.is_ok();
         }
         Ok::<_, crate::DynError>(
-            (requested
-                && api.get_balance(pk).await.unwrap_or(0) >= before + lamports)
+            (requested && api.get_balance(pk).await.unwrap_or(0) >= before + lamports)
                 .then_some(()),
         )
     })
     .await?
-    .ok_or_else(|| {
-        format!("airdrop of {lamports} lamports to {pk} not confirmed").into()
-    })
+    .ok_or_else(|| format!("airdrop of {lamports} lamports to {pk} not confirmed").into())
 }
 
 #[async_trait(?Send)]
@@ -385,8 +358,7 @@ impl ChainCtx for BaseCtx {
         cosigners: &[&Keypair],
         ixs: &[Instruction],
     ) -> Result<Signature> {
-        submit_and_confirm(&self.api, &self.blockhash, payer, cosigners, ixs)
-            .await
+        submit_and_confirm(&self.api, &self.blockhash, payer, cosigners, ixs).await
     }
     async fn airdrop(&self, pk: &Pubkey, lamports: u64) -> Result<()> {
         airdrop_and_confirm(&self.api, pk, lamports).await
@@ -404,8 +376,7 @@ impl ChainCtx for ErCtx {
         cosigners: &[&Keypair],
         ixs: &[Instruction],
     ) -> Result<Signature> {
-        submit_and_confirm(&self.api, &self.blockhash, payer, cosigners, ixs)
-            .await
+        submit_and_confirm(&self.api, &self.blockhash, payer, cosigners, ixs).await
     }
     async fn airdrop(&self, _pk: &Pubkey, _lamports: u64) -> Result<()> {
         Err("the ER has no faucet — airdrop on the base; clone-on-access pulls it in".into())

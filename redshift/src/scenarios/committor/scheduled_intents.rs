@@ -6,8 +6,7 @@ use redshift_interface::flexi::{
     build as flexi, FlexiCounter, IntentMode, ACTION_PRIZE, ACTOR_ESCROW_INDEX,
 };
 use redsuite_core::{
-    api::custom_error_code, check, check_eq, dlp, prep, receipt, BaseCtx,
-    ChainCtx, ErCtx, Result,
+    api::custom_error_code, check, check_eq, dlp, prep, receipt, BaseCtx, ChainCtx, ErCtx, Result,
 };
 use signature::Signature;
 use signer::Signer;
@@ -17,12 +16,7 @@ const PAID_COMMIT_LIMIT: u64 = 25;
 const ACTION_FEE: u64 = 5_000;
 const CALLBACK_FEE: u64 = 5_000;
 
-async fn redelegate(
-    base: &BaseCtx,
-    er: &ErCtx,
-    payer: &Keypair,
-    phase: &str,
-) -> Result<()> {
+async fn redelegate(base: &BaseCtx, er: &ErCtx, payer: &Keypair, phase: &str) -> Result<()> {
     base.submit_and_confirm(
         payer,
         &[
@@ -44,26 +38,13 @@ async fn redelegate(
 
 pub(super) async fn run(base: &BaseCtx, er: &ErCtx) -> Result<()> {
     let delegated = async |key: &Pubkey| {
-        super::await_delegated(
-            er,
-            key,
-            TIMEOUT,
-            &format!("{key} is delegated locally"),
-        )
-        .await
+        super::await_delegated(er, key, TIMEOUT, &format!("{key} is delegated locally")).await
     };
-    let settled =
-        async |signature: &Signature, accounts: &[Pubkey], undelegates| {
-            let receipt = crate::assert_commit_receipt(
-                base,
-                er,
-                signature,
-                accounts,
-                undelegates,
-            )
-            .await?;
-            super::require_settled(&receipt, "scheduled intent")
-        };
+    let settled = async |signature: &Signature, accounts: &[Pubkey], undelegates| {
+        let receipt =
+            crate::assert_commit_receipt(base, er, signature, accounts, undelegates).await?;
+        super::require_settled(&receipt, "scheduled intent")
+    };
     let funder = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
     let payers = prep::funded_payers(base, 3, crate::PAYER_LAMPORTS).await?;
     let keys: Vec<_> = payers.iter().map(Signer::pubkey).collect();
@@ -81,11 +62,7 @@ pub(super) async fn run(base: &BaseCtx, er: &ErCtx) -> Result<()> {
             &[
                 setup[0].clone(),
                 setup[1].clone(),
-                dlp::top_up_ephemeral_balance(
-                    &payer.pubkey(),
-                    500_000_000,
-                    ACTOR_ESCROW_INDEX,
-                ),
+                dlp::top_up_ephemeral_balance(&payer.pubkey(), 500_000_000, ACTOR_ESCROW_INDEX),
             ],
         )
         .await?;
@@ -144,10 +121,8 @@ pub(super) async fn run(base: &BaseCtx, er: &ErCtx) -> Result<()> {
                     &format!("{} restored for {label}", counters[i]),
                     TIMEOUT,
                     || async {
-                        let account = er
-                            .account(&counters[i])
-                            .await?
-                            .ok_or("ER counter missing")?;
+                        let account =
+                            er.account(&counters[i]).await?.ok_or("ER counter missing")?;
                         check_eq!(
                             account.owner,
                             redshift_interface::ID,
@@ -163,11 +138,7 @@ pub(super) async fn run(base: &BaseCtx, er: &ErCtx) -> Result<()> {
                 )
                 .await?;
                 if additions[i] != 0 {
-                    er.submit_and_confirm(
-                        &payers[i],
-                        &[flexi::add(keys[i], additions[i])],
-                    )
-                    .await?;
+                    er.submit_and_confirm(&payers[i], &[flexi::add(keys[i], additions[i])]).await?;
                     expected[i].count += additions[i] as u64;
                     expected[i].updates += 1;
                 }
@@ -185,8 +156,7 @@ pub(super) async fn run(base: &BaseCtx, er: &ErCtx) -> Result<()> {
                     )],
                 )
                 .await?;
-            let undelegates =
-                modes.iter().any(|mode| matches!(mode, Undelegate(_)));
+            let undelegates = modes.iter().any(|mode| matches!(mode, Undelegate(_)));
             settled(&signature, &counters[..n], undelegates).await?;
             let mut prizes = 0;
             for (i, mode) in modes.iter().enumerate() {
@@ -200,10 +170,8 @@ pub(super) async fn run(base: &BaseCtx, er: &ErCtx) -> Result<()> {
                     is_delegated[i] = false;
                     prizes += 1;
                 }
-                let account = base
-                    .account(&counters[i])
-                    .await?
-                    .ok_or("committed counter missing")?;
+                let account =
+                    base.account(&counters[i]).await?.ok_or("committed counter missing")?;
                 check_eq!(
                     FlexiCounter::try_decode(&account.data)?,
                     expected[i],
@@ -212,11 +180,7 @@ pub(super) async fn run(base: &BaseCtx, er: &ErCtx) -> Result<()> {
                 )?;
                 check_eq!(
                     account.owner,
-                    if is_delegated[i] {
-                        dlp::dlp_id()
-                    } else {
-                        redshift_interface::ID
-                    },
+                    if is_delegated[i] { dlp::dlp_id() } else { redshift_interface::ID },
                     "{label}: base ownership of {}",
                     counters[i]
                 )?;
@@ -266,13 +230,7 @@ pub(super) async fn run(base: &BaseCtx, er: &ErCtx) -> Result<()> {
             .sender(Rc::new(prep::payer_from_bytes(&payer.to_bytes())))
             .submit(&[
                 flexi::add(keys[0], 99),
-                flexi::schedule_intents(
-                    &keys[..1],
-                    er.identity(),
-                    keys[1],
-                    vec![Commit],
-                    false,
-                ),
+                flexi::schedule_intents(&keys[..1], er.identity(), keys[1], vec![Commit], false),
             ])
             .await?;
         let tx = er.api().await_transaction(&signature, TIMEOUT).await?;
@@ -299,10 +257,7 @@ pub(super) async fn run(base: &BaseCtx, er: &ErCtx) -> Result<()> {
             )
             .await?;
         settled(&signature, &counters[..1], true).await?;
-        let account = base
-            .account(&counters[0])
-            .await?
-            .ok_or("undelegated counter missing")?;
+        let account = base.account(&counters[0]).await?.ok_or("undelegated counter missing")?;
         check_eq!(
             account.owner,
             redshift_interface::ID,
@@ -383,18 +338,11 @@ pub(super) async fn run(base: &BaseCtx, er: &ErCtx) -> Result<()> {
     delegated(&keys[1]).await?;
     for fail in [false, true] {
         crate::phase(
-            if fail {
-                "transfer callback refund"
-            } else {
-                "transfer callback success"
-            },
+            if fail { "transfer callback refund" } else { "transfer callback success" },
             async {
                 const AMOUNT: u64 = 890_880;
                 let destination = Keypair::new().pubkey();
-                let before = er
-                    .account(&counters[1])
-                    .await?
-                    .ok_or("transfer counter missing")?;
+                let before = er.account(&counters[1]).await?.ok_or("transfer counter missing")?;
                 let state = FlexiCounter::try_decode(&before.data)?;
                 let payer_before = er.api().get_balance(&keys[1]).await?;
                 let vault_before = er.api().get_balance(&vault).await?;
@@ -415,16 +363,10 @@ pub(super) async fn run(base: &BaseCtx, er: &ErCtx) -> Result<()> {
                     &format!("{signature}: callback completes exactly once"),
                     TIMEOUT,
                     || async {
-                        let account = er
-                            .account(&counters[1])
-                            .await?
-                            .ok_or("callback counter missing")?;
+                        let account =
+                            er.account(&counters[1]).await?.ok_or("callback counter missing")?;
                         let actual = FlexiCounter::try_decode(&account.data)?;
-                        check_eq!(
-                            actual.updates,
-                            state.updates + 1,
-                            "callback delivery count"
-                        )?;
+                        check_eq!(actual.updates, state.updates + 1, "callback delivery count")?;
                         check_eq!(
                             actual.count,
                             state.count + u64::from(fail),

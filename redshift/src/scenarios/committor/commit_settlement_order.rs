@@ -81,19 +81,9 @@ async fn buffer_accounts(base: &BaseCtx) -> Result<usize> {
     Ok(base.api().get_program_accounts(&committor).await?.len())
 }
 
-async fn write(
-    er: &ErCtx,
-    payer: &Keypair,
-    id: u64,
-    account: &Pubkey,
-) -> Result<Vec<u8>> {
-    er.submit_and_confirm(payer, &[build::simple_byte_set(id, &[*account])])
-        .await?;
-    let snapshot = er
-        .account(account)
-        .await?
-        .ok_or("er copy vanished after the write")?
-        .data;
+async fn write(er: &ErCtx, payer: &Keypair, id: u64, account: &Pubkey) -> Result<Vec<u8>> {
+    er.submit_and_confirm(payer, &[build::simple_byte_set(id, &[*account])]).await?;
+    let snapshot = er.account(account).await?.ok_or("er copy vanished after the write")?.data;
     check_eq!(
         crate::written_id(&snapshot),
         Some(id),
@@ -123,12 +113,7 @@ async fn base_data(base: &BaseCtx, account: &Pubkey) -> Result<Vec<u8>> {
         .data)
 }
 
-async fn await_base(
-    base: &BaseCtx,
-    account: &Pubkey,
-    snapshot: &[u8],
-    what: &str,
-) -> Result<()> {
+async fn await_base(base: &BaseCtx, account: &Pubkey, snapshot: &[u8], what: &str) -> Result<()> {
     check::poll(what, BASE_STATE_TIMEOUT, || async {
         matches!(base.account(account).await, Ok(Some(acc)) if acc.data == snapshot)
     })
@@ -143,12 +128,8 @@ async fn settled(
     expected: &[Pubkey],
     phase: &str,
 ) -> Result<Bundle> {
-    let receipt = receipt::fetch_commit_receipt(
-        er.api(),
-        commit_signature,
-        RECEIPT_TIMEOUT,
-    )
-    .await?;
+    let receipt =
+        receipt::fetch_commit_receipt(er.api(), commit_signature, RECEIPT_TIMEOUT).await?;
     super::require_settled(&receipt, phase)?;
     let mut included = receipt.included.clone();
     included.sort();
@@ -159,18 +140,9 @@ async fn settled(
         expected,
         "{phase}: the receipt must list exactly the bundled accounts"
     )?;
-    receipt::confirm_base_signatures(
-        base.api(),
-        &receipt,
-        BASE_CONFIRM_TIMEOUT,
-    )
-    .await?;
+    receipt::confirm_base_signatures(base.api(), &receipt, BASE_CONFIRM_TIMEOUT).await?;
     let last = receipt.base_signatures[receipt.base_signatures.len() - 1];
-    let slot = base
-        .api()
-        .await_transaction(&last, BASE_CONFIRM_TIMEOUT)
-        .await?
-        .slot;
+    let slot = base.api().await_transaction(&last, BASE_CONFIRM_TIMEOUT).await?.slot;
     Ok(Bundle { receipt, slot })
 }
 
@@ -179,17 +151,11 @@ async fn history_position(
     account: &Pubkey,
     signature: &Signature,
 ) -> Result<usize> {
-    let history = base
-        .api()
-        .get_signatures_for_address(account, HISTORY_LIMIT)
-        .await?;
+    let history = base.api().get_signatures_for_address(account, HISTORY_LIMIT).await?;
     history
         .iter()
         .position(|text| text == &signature.to_string())
-        .ok_or_else(|| {
-            format!("base history of {account} does not list {signature}")
-                .into()
-        })
+        .ok_or_else(|| format!("base history of {account} does not list {signature}").into())
 }
 
 async fn prepare_accounts(
@@ -215,13 +181,7 @@ async fn prepare_accounts(
             DELEGATION_PROGRAM_ID,
             "a delegated pda must be dlp-owned on base"
         )?;
-        prep::await_clones(
-            er,
-            &[account],
-            variant.space as usize,
-            CLONE_TIMEOUT,
-        )
-        .await?;
+        prep::await_clones(er, &[account], variant.space as usize, CLONE_TIMEOUT).await?;
         keys.push(account);
     }
     Ok(Accounts {
@@ -241,8 +201,7 @@ async fn run_variant(
 ) -> Result<()> {
     let phase = variant.name;
     let payer = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
-    let accounts =
-        prepare_accounts(base, er, &payer, identity, variant).await?;
+    let accounts = prepare_accounts(base, er, &payer, identity, variant).await?;
     let value = |offset: u64| variant.value_base + offset;
     let buffers_before = buffer_accounts(base).await?;
 
@@ -252,23 +211,15 @@ async fn run_variant(
     let nonce_b = crate::last_commit_id(base, &accounts.b).await?;
     let nonce_c = crate::last_commit_id(base, &accounts.c).await?;
     let nonce_d = crate::last_commit_id(base, &accounts.d).await?;
-    let first_submission = proxies.intercept(
-        Selector::method("sendTransaction")
-            .http()
-            .request()
-            .account(&accounts.a),
-    );
+    let first_submission = proxies
+        .intercept(Selector::method("sendTransaction").http().request().account(&accounts.a));
     let first = schedule(er, &payer, 1, &[accounts.a, accounts.b]).await?;
     let held_first = first_submission.wait(INTERCEPT_TIMEOUT).await?;
 
     let b2 = write(er, &payer, value(3), &accounts.b).await?;
     let c1 = write(er, &payer, value(4), &accounts.c).await?;
-    let second_submission = proxies.intercept(
-        Selector::method("sendTransaction")
-            .http()
-            .request()
-            .account(&accounts.c),
-    );
+    let second_submission = proxies
+        .intercept(Selector::method("sendTransaction").http().request().account(&accounts.c));
     let second = schedule(er, &payer, 2, &[accounts.b, accounts.c]).await?;
     let d1 = write(er, &payer, value(5), &accounts.d).await?;
     let third = schedule(er, &payer, 3, &[accounts.d]).await?;
@@ -300,8 +251,7 @@ async fn run_variant(
         phase,
     )
     .await?;
-    let buffers_during_hold =
-        buffer_accounts(base).await?.saturating_sub(buffers_before);
+    let buffers_during_hold = buffer_accounts(base).await?.saturating_sub(buffers_before);
     if variant.buffered {
         check!(
             buffers_during_hold > 0,
@@ -316,12 +266,8 @@ async fn run_variant(
         )?;
     }
 
-    let retry_submission = proxies.intercept(
-        Selector::method("sendTransaction")
-            .http()
-            .request()
-            .account(&accounts.a),
-    );
+    let retry_submission = proxies
+        .intercept(Selector::method("sendTransaction").http().request().account(&accounts.a));
     held_first.discard();
     let held_retry = retry_submission.wait(INTERCEPT_TIMEOUT).await?;
     let retry_held_at = held_retry.held_at;
@@ -408,18 +354,10 @@ async fn run_variant(
         first_bundle.slot,
         second_bundle.slot
     )?;
-    let first_position = history_position(
-        base,
-        &accounts.b,
-        &first_bundle.receipt.base_signatures[0],
-    )
-    .await?;
-    let second_position = history_position(
-        base,
-        &accounts.b,
-        &second_bundle.receipt.base_signatures[0],
-    )
-    .await?;
+    let first_position =
+        history_position(base, &accounts.b, &first_bundle.receipt.base_signatures[0]).await?;
+    let second_position =
+        history_position(base, &accounts.b, &second_bundle.receipt.base_signatures[0]).await?;
     check!(
         first_position > second_position,
         "{phase}: B's base history must show the delayed bundle before the \
@@ -428,8 +366,7 @@ async fn run_variant(
 
     let mut finals = Vec::with_capacity(4);
     for (offset, account) in accounts.all().iter().enumerate() {
-        finals
-            .push(write(er, &payer, value(21 + offset as u64), account).await?);
+        finals.push(write(er, &payer, value(21 + offset as u64), account).await?);
     }
     let fourth = schedule(er, &payer, 4, &accounts.all()).await?;
     settled(
@@ -478,8 +415,7 @@ impl PrivateErScenario for CommitSettlementOrder {
         let identity = private.identity();
 
         for variant in VARIANTS {
-            run_variant(&proxies, base, private.ctx(), identity, variant)
-                .await?;
+            run_variant(&proxies, base, private.ctx(), identity, variant).await?;
         }
 
         proxies.finish()?;

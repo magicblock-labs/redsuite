@@ -27,8 +27,7 @@ const CLONE_TIMEOUT: Duration = Duration::from_secs(15);
 
 const MONITORED_GAUGE: &str = "engine_keeper_account_cache_entries";
 const EVICTED_COUNTER: &str = "engine_keeper_account_cache_evictions";
-const ENSURE_HISTOGRAM: &str =
-    r#"mbv_ensure_accounts_time{kind="transaction"}"#;
+const ENSURE_HISTOGRAM: &str = r#"mbv_ensure_accounts_time{kind="transaction"}"#;
 
 struct Profile {
     name: &'static str,
@@ -67,10 +66,7 @@ const FULL: Profile = Profile {
     concurrency: 64,
 };
 
-const PROFILES: ProfileValues<Profile> = ProfileValues {
-    lite: LITE,
-    full: FULL,
-};
+const PROFILES: ProfileValues<Profile> = ProfileValues { lite: LITE, full: FULL };
 
 fn sample_accounts(pool: &[Pubkey], seed: u64, width: usize) -> Vec<Pubkey> {
     let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
@@ -113,8 +109,7 @@ impl Scenario<ScenarioReport> for EnsureGateStall {
     async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
         let profile = PROFILES.select(base.config().profile);
         let prep_payers =
-            prep::funded_payers(base, profile.prep_payers, PREP_PAYER_LAMPORTS)
-                .await?;
+            prep::funded_payers(base, profile.prep_payers, PREP_PAYER_LAMPORTS).await?;
         let pool = Accounts::new(ACCOUNT_SPACE, er.identity())
             .init_batched(base, &prep_payers, profile.working_set, false)
             .await?;
@@ -154,13 +149,7 @@ impl Scenario<ScenarioReport> for EnsureGateStall {
             .await?;
             let cell_er = private.ctx();
             if cell.prewarm {
-                prep::prewarm(
-                    cell_er,
-                    &pool,
-                    ACCOUNT_SPACE as usize,
-                    CLONE_TIMEOUT,
-                )
-                .await?;
+                prep::prewarm(cell_er, &pool, ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
             }
             let sender = cell_er.sender(payer.clone());
 
@@ -194,62 +183,44 @@ impl Scenario<ScenarioReport> for EnsureGateStall {
             };
             debug!(
                 cell_outcome.name,
-                cell_outcome.outcome.failed,
-                cell_outcome.evictions,
-                "ensure-gate cell finished",
+                cell_outcome.outcome.failed, cell_outcome.evictions, "ensure-gate cell finished",
             );
 
-            let cell_report =
-                ScenarioReport::ok(&format!("{}/{}", self.name(), cell.name))
-                    .setting("profile", profile.name)
-                    .setting("cap", cell.cap)
-                    .setting("working set", profile.working_set)
-                    .setting("read width", READ_WIDTH)
-                    .setting("account space", ACCOUNT_SPACE)
-                    .setting("prewarmed", cell.prewarm)
-                    .setting("iterations", cell.iterations)
-                    .setting("offered rate /s", profile.rate)
-                    .setting("concurrency", profile.concurrency)
-                    .setting(
-                        "request timeout s",
-                        STALL_REQUEST_TIMEOUT.as_secs(),
-                    )
-                    .observe(
-                        "delivery us",
-                        Unit::Micros,
-                        cell_outcome.outcome.delivery,
-                    )
-                    .client_side(&cell_outcome.outcome)
-                    .metric(
-                        "achieved tps",
-                        Unit::Tps,
-                        cell_outcome.outcome.achieved_rps(),
-                    )
-                    .metric(
-                        "delivered",
-                        Unit::Count,
-                        cell_outcome.outcome.delivered as f64,
-                    )
-                    .metric(
-                        "failed",
-                        Unit::Count,
-                        cell_outcome.outcome.failed as f64,
-                    )
-                    .metric_if(
-                        "validator ensure avg s",
-                        Unit::Seconds,
-                        cell_outcome.ensure_avg_s,
-                    )
-                    .metric(
-                        "monitored accounts (end)",
-                        Unit::Count,
-                        cell_outcome.monitored_end,
-                    )
-                    .metric(
-                        "evictions in window",
-                        Unit::Count,
-                        cell_outcome.evictions,
-                    );
+            let cell_report = ScenarioReport::ok(&format!("{}/{}", self.name(), cell.name))
+                .setting("profile", profile.name)
+                .setting("cap", cell.cap)
+                .setting("working set", profile.working_set)
+                .setting("read width", READ_WIDTH)
+                .setting("account space", ACCOUNT_SPACE)
+                .setting("prewarmed", cell.prewarm)
+                .setting("iterations", cell.iterations)
+                .setting("offered rate /s", profile.rate)
+                .setting("concurrency", profile.concurrency)
+                .setting("request timeout s", STALL_REQUEST_TIMEOUT.as_secs())
+                .observe("delivery us", Unit::Micros, cell_outcome.outcome.delivery)
+                .client_side(&cell_outcome.outcome)
+                .metric(
+                    "achieved tps",
+                    Unit::Tps,
+                    cell_outcome.outcome.achieved_rps(),
+                )
+                .metric(
+                    "delivered",
+                    Unit::Count,
+                    cell_outcome.outcome.delivered as f64,
+                )
+                .metric("failed", Unit::Count, cell_outcome.outcome.failed as f64)
+                .metric_if(
+                    "validator ensure avg s",
+                    Unit::Seconds,
+                    cell_outcome.ensure_avg_s,
+                )
+                .metric(
+                    "monitored accounts (end)",
+                    Unit::Count,
+                    cell_outcome.monitored_end,
+                )
+                .metric("evictions in window", Unit::Count, cell_outcome.evictions);
             report::persist_cell(self.name(), &cell_report);
             cells.push(cell_outcome);
             drop(private);
@@ -299,8 +270,7 @@ impl Scenario<ScenarioReport> for EnsureGateStall {
         )?;
 
         let slowdown = if healthy.outcome.delivery.median > 0 {
-            thrash.outcome.delivery.median as f64
-                / healthy.outcome.delivery.median as f64
+            thrash.outcome.delivery.median as f64 / healthy.outcome.delivery.median as f64
         } else {
             0.0
         };
