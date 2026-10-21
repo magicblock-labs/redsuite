@@ -1,15 +1,20 @@
-use std::{cell::Cell, time::Duration};
+use std::{cell::Cell, result, time::Duration};
 
 use derive_more::Display;
-use futures_util::{stream::SplitSink, stream::SplitStream, SinkExt, Stream, StreamExt};
-use json::{Deserialize, LazyValue};
+use futures_util::{
+    stream::{SplitSink, SplitStream},
+    SinkExt, Stream, StreamExt,
+};
+use json::{Deserialize, LazyValue, Value};
 use pubkey::Pubkey;
-use tokio::net::TcpStream;
+use signature::Signature;
+use tokio::{net::TcpStream, sync::Mutex, task, task::JoinHandle};
 use tokio_tungstenite::{
     connect_async,
-    tungstenite::{self, Message, Utf8Bytes},
+    tungstenite::{Error, Message, Utf8Bytes},
     MaybeTlsStream, WebSocketStream,
 };
+use url::Url;
 
 use crate::Result;
 
@@ -106,7 +111,7 @@ enum Received {
 
 async fn receive<S>(stream: &mut S) -> Received
 where
-    S: Stream<Item = std::result::Result<Message, tungstenite::Error>> + Unpin,
+    S: Stream<Item = result::Result<Message, Error>> + Unpin,
 {
     let Some(incoming) = stream.next().await else {
         return Received::Closed(CloseReason::StreamEnded);
@@ -135,7 +140,7 @@ pub trait FrameHandler {
 
 pub async fn drive<S, H>(stream: &mut S, handler: &mut H) -> CloseReason
 where
-    S: Stream<Item = std::result::Result<Message, tungstenite::Error>> + Unpin,
+    S: Stream<Item = result::Result<Message, Error>> + Unpin,
     H: FrameHandler,
 {
     loop {
@@ -166,19 +171,19 @@ where
 pub enum RawEvent {
     Reply {
         id: u64,
-        result: Option<json::Value>,
+        result: Option<Value>,
     },
     Notification {
         method: String,
         subscription: u64,
-        payload: json::Value,
+        payload: Value,
     },
     Malformed,
 }
 
-pub async fn next_event<S>(stream: &mut S) -> std::result::Result<RawEvent, CloseReason>
+pub async fn next_event<S>(stream: &mut S) -> result::Result<RawEvent, CloseReason>
 where
-    S: Stream<Item = std::result::Result<Message, tungstenite::Error>> + Unpin,
+    S: Stream<Item = result::Result<Message, Error>> + Unpin,
 {
     loop {
         let text = match receive(stream).await {
@@ -212,8 +217,9 @@ pub fn reply_u64(result: Option<&LazyValue<'_>>) -> Option<u64> {
     result.and_then(|value| json::from_str(value.as_raw_str()).ok())
 }
 
-pub async fn connect(url: &str) -> Result<Socket> {
-    let (socket, _) = connect_async(url).await.map_err(|error| format!("{url}: {error}"))?;
+pub async fn connect(url: &Url) -> Result<Socket> {
+    let (socket, _) =
+        connect_async(url.as_str()).await.map_err(|error| format!("{url}: {error}"))?;
     Ok(socket)
 }
 
@@ -240,21 +246,21 @@ pub fn logs_mentions_params(account: &Pubkey) -> String {
 
 pub use account_params as program_params;
 
-pub fn signature_params(signature: &str) -> String {
+pub fn signature_params(signature: &Signature) -> String {
     format!(r#"["{signature}",{{"commitment":"confirmed"}}]"#)
 }
 
 pub struct Requester {
     // tokio Mutex, not RefCell: subscribes come from concurrent tasks and
     // hold the sink across an await
-    sink: tokio::sync::Mutex<SplitSink<Socket, Message>>,
+    sink: Mutex<SplitSink<Socket, Message>>,
     next_req_id: Cell<u64>,
 }
 
 impl Requester {
     pub fn new(sink: SplitSink<Socket, Message>) -> Self {
         Self {
-            sink: tokio::sync::Mutex::new(sink),
+            sink: Mutex::new(sink),
             next_req_id: Cell::new(1),
         }
     }
@@ -274,7 +280,7 @@ impl Requester {
 }
 
 pub struct Reader {
-    handle: tokio::task::JoinHandle<CloseReason>,
+    handle: JoinHandle<CloseReason>,
 }
 
 impl Reader {
@@ -282,8 +288,7 @@ impl Reader {
     where
         H: FrameHandler + 'static,
     {
-        let handle =
-            tokio::task::spawn_local(async move { drive(&mut stream, &mut handler).await });
+        let handle = task::spawn_local(async move { drive(&mut stream, &mut handler).await });
         Self { handle }
     }
 

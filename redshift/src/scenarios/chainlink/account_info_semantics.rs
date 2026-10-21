@@ -1,9 +1,11 @@
-use std::time::Duration;
+use std::{rc::Rc, time::Duration};
 
-use async_trait::async_trait;
 use keypair::Keypair;
-use redsuite_core::{check, check_eq, prep, system, BaseCtx, ChainCtx, ErCtx, Result, Scenario};
+use redsuite_core::{check, check_eq, system, BaseCtx, ChainCtx, ErCtx, Result, Scenario};
 use signer::Signer;
+use tokio::time;
+
+use crate::PAYER_LAMPORTS;
 
 const CLONE_TIMEOUT: Duration = Duration::from_secs(15);
 const REFRESH_TIMEOUT: Duration = Duration::from_secs(15);
@@ -17,15 +19,18 @@ const EXECUTED_TRANSFER: u64 = 300_000_000;
 const RENT_EXEMPT: u64 = 890_880;
 const COLD_WALLETS: usize = 10;
 
-pub struct AccountInfoSemantics;
+pub struct AccountInfoSemantics {
+    base: Rc<BaseCtx>,
+    er: ErCtx,
+}
 
-#[async_trait(?Send)]
 impl Scenario for AccountInfoSemantics {
-    fn name(&self) -> &str {
-        "redshift/account_info_semantics"
+    async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
+        Ok(Self { base, er })
     }
 
-    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<()> {
+    async fn run(self) -> Result<()> {
+        let Self { base, er } = self;
         crate::phase("cold reads", async {
             // These keys must stay cold until all five requests are in flight.
             let wallets: Vec<_> = (0..COLD_WALLETS).map(|_| Keypair::new().pubkey()).collect();
@@ -98,7 +103,7 @@ impl Scenario for AccountInfoSemantics {
         .await?;
 
         let escrowed = crate::phase("escrow", async {
-            let escrowed = prep::escrowed_payer(base, er.identity(), ESCROW_FUNDING).await?;
+            let escrowed = base.escrowed_payer(er.identity(), ESCROW_FUNDING).await?;
             let escrowed_pubkey = escrowed.payer.pubkey();
             check::poll(
                 "the ER clones the escrowed payer wallet",
@@ -161,7 +166,7 @@ impl Scenario for AccountInfoSemantics {
                 initial.lamports,
                 "a chain-side write to a delegated escrow must not appear on the ER"
             )?;
-            tokio::time::sleep(FREEZE_SETTLE).await;
+            time::sleep(FREEZE_SETTLE).await;
             let after_settle = er
                 .account(&escrowed.escrow)
                 .await?
@@ -228,10 +233,10 @@ impl Scenario for AccountInfoSemantics {
         .await?;
 
         crate::phase("escrowed spender", async {
-            let funder = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
-            let spender = prep::escrowed_payer(base, er.identity(), ESCROW_FUNDING).await?;
-            prep::delegate_payer(base, &funder, &spender.payer, er.identity()).await?;
-            let receiver = prep::delegated_payer(base, &funder, er.identity(), RENT_EXEMPT).await?;
+            let funder = base.funded_payer(PAYER_LAMPORTS).await?;
+            let spender = base.escrowed_payer(er.identity(), ESCROW_FUNDING).await?;
+            base.delegate_payer(&funder, &spender.payer, er.identity()).await?;
+            let receiver = base.delegated_payer(&funder, er.identity(), RENT_EXEMPT).await?;
             check::poll(
                 "the ER clones the delegated receiver at its rent-exempt balance",
                 CLONE_TIMEOUT,

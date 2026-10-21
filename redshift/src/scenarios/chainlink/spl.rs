@@ -1,9 +1,14 @@
 use instruction::{AccountMeta, Instruction};
 use pubkey::Pubkey;
 use redsuite_core::{system, ChainCtx, Result};
-use sdk::spl::builders::{
-    DelegateEphemeralAtaBuilder, DepositSplTokensBuilder, InitializeEphemeralAtaBuilder,
-    InitializeGlobalVaultBuilder,
+use sdk::{
+    consts::{
+        ASSOCIATED_TOKEN_PROGRAM_ID, ESPL_TOKEN_PROGRAM_ID, MAGIC_PROGRAM_ID, TOKEN_PROGRAM_ID,
+    },
+    spl::builders::{
+        DelegateEphemeralAtaBuilder, DepositSplTokensBuilder, InitializeEphemeralAtaBuilder,
+        InitializeGlobalVaultBuilder,
+    },
 };
 
 pub(crate) const MINT_LEN: u64 = 82;
@@ -14,15 +19,15 @@ pub(crate) const OWNER_OFFSET: usize = 32;
 const TOKEN_AMOUNT_OFFSET: usize = 64;
 
 pub(crate) fn token_program() -> Pubkey {
-    sdk::consts::TOKEN_PROGRAM_ID
+    TOKEN_PROGRAM_ID
 }
 
 pub(crate) fn ata_program() -> Pubkey {
-    sdk::consts::ASSOCIATED_TOKEN_PROGRAM_ID
+    ASSOCIATED_TOKEN_PROGRAM_ID
 }
 
 pub(crate) fn eata_program() -> Pubkey {
-    sdk::consts::ESPL_TOKEN_PROGRAM_ID
+    ESPL_TOKEN_PROGRAM_ID
 }
 
 pub(crate) fn derive_eata(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
@@ -50,7 +55,7 @@ pub(crate) fn ensure_magic_ata(payer: Pubkey, owner: Pubkey, mint: Pubkey) -> In
             AccountMeta::new(derive_ata(&owner, &mint), false),
             AccountMeta::new_readonly(mint, false),
             AccountMeta::new_readonly(token_program(), false),
-            AccountMeta::new_readonly(sdk::consts::MAGIC_PROGRAM_ID, false),
+            AccountMeta::new_readonly(MAGIC_PROGRAM_ID, false),
         ],
         data: vec![36],
     }
@@ -58,7 +63,7 @@ pub(crate) fn ensure_magic_ata(payer: Pubkey, owner: Pubkey, mint: Pubkey) -> In
 
 pub(crate) fn close_magic_ata(owner: Pubkey, mint: Pubkey) -> Instruction {
     Instruction {
-        program_id: sdk::consts::MAGIC_PROGRAM_ID,
+        program_id: MAGIC_PROGRAM_ID,
         accounts: vec![
             AccountMeta::new_readonly(owner, true),
             AccountMeta::new(derive_ata(&owner, &mint), false),

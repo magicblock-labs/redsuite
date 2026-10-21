@@ -3,7 +3,6 @@ use std::time::{Duration, Instant};
 use instruction::Instruction;
 use pubkey::Pubkey;
 use redline_interface::{instruction::build, layout, utils::fold_hash};
-
 use signature::Signature;
 
 use crate::{ChainCtx, CheckError, Result, TxSender};

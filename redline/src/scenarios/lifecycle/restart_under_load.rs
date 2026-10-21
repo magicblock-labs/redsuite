@@ -1,26 +1,28 @@
 use std::{
     cell::{Cell, RefCell},
     collections::BTreeMap,
+    fs,
     future::Future,
+    path::Path,
     rc::Rc,
     time::{Duration, Instant},
 };
 
-use async_trait::async_trait;
 use pubkey::Pubkey;
 use redsuite_core::{
-    check, check_eq, host, prep,
+    check, check_eq, host,
     profile::ProfileValues,
-    redline::{causal::HASH_INIT, Accounts},
+    redline::{causal, Accounts},
     report::Unit,
-    topology::{self, RestartConfig, RestartTiming},
+    topology,
+    topology::{ErOptions, RestartConfig, RestartTiming},
     Api, BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result, ScenarioReport, TxSender,
 };
 use signature::Signature;
-use tokio::task::JoinSet;
+use tokio::{task::JoinSet, time};
 use tracing::debug;
 
-use crate::program::instruction::build;
+use crate::{program::instruction::build, ACCOUNT_SPACE};
 
 const PREP_PAYER_LAMPORTS: u64 = 4_000_000_000;
 const CLONE_TIMEOUT: Duration = Duration::from_secs(40);
@@ -151,9 +153,9 @@ async fn superblocks(er: &ErCtx) -> Result<u64> {
     Ok(er.scrape_metrics().await?.get(SUPERBLOCKS).unwrap_or(0.0) as u64)
 }
 
-fn archived_snapshots(storage_dir: &std::path::Path) -> Result<usize> {
+fn archived_snapshots(storage_dir: &Path) -> Result<usize> {
     let mut count = 0;
-    for entry in std::fs::read_dir(storage_dir)? {
+    for entry in fs::read_dir(storage_dir)? {
         let entry = entry?;
         if entry.file_name().to_str().is_some_and(|name| name.starts_with("superblock-"))
             && entry.path().join(ACCOUNTSDB_SNAPSHOT_FILE).is_file()
@@ -176,7 +178,7 @@ impl LaneState {
     async fn run(self: Rc<Self>, lane: usize, account: Pubkey, sender: TxSender) {
         while self.admit.get() {
             if self.send(lane, account, &sender).await.is_err() {
-                tokio::time::sleep(LANE_BACKOFF).await;
+                time::sleep(LANE_BACKOFF).await;
             }
         }
     }
@@ -184,7 +186,13 @@ impl LaneState {
     async fn send(&self, lane: usize, account: Pubkey, sender: &TxSender) -> Result<()> {
         let id = self.next_id.get();
         self.next_id.set(id + 1);
-        let ix = build::expensive_hash_compute_at(PROGRAM, id, HASH_INIT, HASH_ITERS, &[account]);
+        let ix = build::expensive_hash_compute_at(
+            PROGRAM,
+            id,
+            causal::HASH_INIT,
+            HASH_ITERS,
+            &[account],
+        );
         let tx = sender.prepare(&[ix]).await?;
         let signature = tx.signatures[0];
         let index = {
@@ -250,7 +258,7 @@ impl Lanes {
 }
 
 async fn await_status(api: &Api, signature: &Signature, stop: &Cell<bool>) -> Outcome {
-    let deadline = tokio::time::Instant::now() + CONFIRM_TIMEOUT;
+    let deadline = time::Instant::now() + CONFIRM_TIMEOUT;
     loop {
         if let Ok(Some(status)) = api.get_signature_status(signature).await {
             if status.err.is_some() {
@@ -260,10 +268,10 @@ async fn await_status(api: &Api, signature: &Signature, stop: &Cell<bool>) -> Ou
                 return Outcome::Confirmed;
             }
         }
-        if stop.get() || tokio::time::Instant::now() >= deadline {
+        if stop.get() || time::Instant::now() >= deadline {
             return Outcome::Unresolved;
         }
-        tokio::time::sleep(CONFIRM_POLL).await;
+        time::sleep(CONFIRM_POLL).await;
     }
 }
 
@@ -272,13 +280,13 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<bool>>,
 {
-    let deadline = tokio::time::Instant::now() + timeout;
+    let deadline = time::Instant::now() + timeout;
     while !done().await? {
         check!(
-            tokio::time::Instant::now() < deadline,
+            time::Instant::now() < deadline,
             "{what} did not happen within {timeout:?}"
         )?;
-        tokio::time::sleep(SUPERBLOCK_POLL).await;
+        time::sleep(SUPERBLOCK_POLL).await;
     }
     Ok(())
 }
@@ -464,11 +472,11 @@ struct ModeOutcome {
 
 async fn run_mode(base: &BaseCtx, profile: &Profile, mode: Mode) -> Result<ModeOutcome> {
     let label = mode.label();
-    let prep_payers = prep::funded_payers(base, profile.lanes, PREP_PAYER_LAMPORTS).await?;
+    let prep_payers = base.funded_payers(profile.lanes, PREP_PAYER_LAMPORTS).await?;
 
     let mut private = topology::private_er(
         base,
-        topology::ErOptions {
+        ErOptions {
             label: format!("restart-{label}"),
             settings: Box::new(|params| {
                 params.engine.blockstore.blocktime = BLOCKTIME;
@@ -482,10 +490,10 @@ async fn run_mode(base: &BaseCtx, profile: &Profile, mode: Mode) -> Result<ModeO
 
     let pool = {
         let er = private.ctx();
-        let pool = Accounts::new(crate::ACCOUNT_SPACE, er.identity())
+        let pool = Accounts::new(ACCOUNT_SPACE, er.identity())
             .init_batched(base, &prep_payers, profile.lanes, true)
             .await?;
-        prep::await_clones(er, &pool, crate::ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
+        er.await_clones(&pool, ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
         Rc::new(pool)
     };
     let senders: Vec<TxSender> = prep_payers
@@ -536,7 +544,7 @@ async fn run_mode(base: &BaseCtx, profile: &Profile, mode: Mode) -> Result<ModeO
         "INVALID: {label}: no transaction was confirmed before the restart"
     )?;
 
-    let log_text = std::fs::read_to_string(private.log()).unwrap_or_default();
+    let log_text = fs::read_to_string(private.log()).unwrap_or_default();
     let timing_visible = log_text.contains(LEDGER_TIMING_ANCHOR);
     let replay_ran = timing_visible.then(|| log_text.contains(REPLAY_STEP));
     let ledger_processing_ms = timing_ms(&log_text, LEDGER_TIMING_ANCHOR);
@@ -749,21 +757,23 @@ fn report_mode(report: ScenarioReport, mode: Mode, outcome: &ModeOutcome) -> Sce
     })
 }
 
-pub struct RestartUnderLoad;
+pub struct RestartUnderLoad {
+    base: Rc<BaseCtx>,
+}
 
-#[async_trait(?Send)]
 impl PrivateErScenario<ScenarioReport> for RestartUnderLoad {
-    fn name(&self) -> &str {
-        "redline/restart_under_load"
+    async fn setup(base: Rc<BaseCtx>, _: ()) -> Result<Self> {
+        Ok(Self { base })
     }
 
-    async fn run(&self, base: &BaseCtx) -> Result<ScenarioReport> {
+    async fn run(self) -> Result<ScenarioReport> {
+        let Self { base } = self;
         let profile = PROFILES.select(base.config().profile);
         let started = Instant::now();
-        let graceful = run_mode(base, profile, Mode::Graceful).await?;
-        let sigkill = run_mode(base, profile, Mode::Sigkill).await?;
+        let graceful = run_mode(&base, profile, Mode::Graceful).await?;
+        let sigkill = run_mode(&base, profile, Mode::Sigkill).await?;
 
-        let mut report = ScenarioReport::ok(self.name())
+        let mut report = ScenarioReport::ok()
             .setting("profile", profile.name)
             .setting("shape", "1-iteration sha256 write, one lane per account")
             .setting("lanes", profile.lanes)

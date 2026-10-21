@@ -3,7 +3,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::{
+    sync::{OwnedSemaphorePermit, Semaphore},
+    time,
+};
 
 use crate::{
     stats::{ObservationsStats, StreamingStats},
@@ -69,14 +72,14 @@ pub fn split_budget(total: u64, parts: usize) -> Vec<u64> {
 
 pub struct Pacer {
     interval: Option<Duration>,
-    next: tokio::time::Instant,
+    next: time::Instant,
 }
 
 impl Pacer {
     pub fn new(pacing: Pacing) -> Result<Self> {
         Ok(Self {
             interval: pacing.interval()?,
-            next: tokio::time::Instant::now(),
+            next: time::Instant::now(),
         })
     }
 
@@ -84,10 +87,10 @@ impl Pacer {
         let Some(interval) = self.interval else {
             return;
         };
-        let now = tokio::time::Instant::now();
+        let now = time::Instant::now();
         if self.next > now {
             if self.next - now >= TIMER_RESOLUTION {
-                tokio::time::sleep_until(self.next).await;
+                time::sleep_until(self.next).await;
             }
         } else if now - self.next > RESYNC_SLACK {
             self.next = now;

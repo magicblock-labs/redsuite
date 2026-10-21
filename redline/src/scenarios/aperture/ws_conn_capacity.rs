@@ -1,6 +1,9 @@
-use std::time::Duration;
+use std::{
+    future,
+    rc::Rc,
+    time::{Duration, Instant},
+};
 
-use async_trait::async_trait;
 use futures_util::future::join_all;
 use pubkey::Pubkey;
 use redsuite_core::{
@@ -9,10 +12,13 @@ use redsuite_core::{
     report::Unit,
     runner::{execute, Pacing, RunConfig},
     topology,
+    topology::{ErOptions, PrivateEr},
     transport::wsraw::RawWs,
     BaseCtx, ErCtx, Result, Scenario, ScenarioReport,
 };
+use tokio::time;
 use tracing::debug;
+use url::Url;
 
 const OPEN_CONCURRENCY: usize = 64;
 const FD_TOLERANCE: usize = 64;
@@ -42,7 +48,7 @@ const FULL: Profile = Profile {
 
 const PROFILES: ProfileValues<Profile> = ProfileValues { lite: LITE, full: FULL };
 
-async fn open_connections(url: &str, count: usize) -> Result<Vec<RawWs>> {
+async fn open_connections(url: &Url, count: usize) -> Result<Vec<RawWs>> {
     let mut connections = Vec::with_capacity(count);
     let mut remaining = count;
     while remaining > 0 {
@@ -57,14 +63,14 @@ async fn open_connections(url: &str, count: usize) -> Result<Vec<RawWs>> {
 }
 
 async fn await_fd_settle(pid: u32, baseline: usize) -> Result<(usize, f64)> {
-    let started = std::time::Instant::now();
-    let deadline = tokio::time::Instant::now() + FD_SETTLE_TIMEOUT;
+    let started = Instant::now();
+    let deadline = time::Instant::now() + FD_SETTLE_TIMEOUT;
     loop {
         let fds = host::fd_count(pid)?;
-        if fds <= baseline + FD_TOLERANCE || tokio::time::Instant::now() >= deadline {
+        if fds <= baseline + FD_TOLERANCE || time::Instant::now() >= deadline {
             return Ok((fds, started.elapsed().as_secs_f64()));
         }
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        time::sleep(Duration::from_millis(200)).await;
     }
 }
 
@@ -78,28 +84,32 @@ struct RungOutcome {
     unsubscribe_failures: usize,
 }
 
-pub struct WsConnCapacity;
+pub struct WsConnCapacity {
+    profile: &'static Profile,
+    shared_account: Pubkey,
+    private: PrivateEr,
+}
 
-#[async_trait(?Send)]
 impl Scenario<ScenarioReport> for WsConnCapacity {
-    fn name(&self) -> &str {
-        "redline/ws_conn_capacity"
-    }
-
-    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
+    async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
         let profile = PROFILES.select(base.config().profile);
         let shared_account: Pubkey = er.identity();
         let private = topology::private_er(
-            base,
-            topology::ErOptions {
+            &base,
+            ErOptions {
                 label: "s3".to_owned(),
                 ..Default::default()
             },
         )
         .await?;
-        let pid = private.pid();
-        let ws_url = private.ctx().ws_url().to_owned();
 
+        Ok(Self { profile, shared_account, private })
+    }
+
+    async fn run(self) -> Result<ScenarioReport> {
+        let Self { profile, shared_account, private } = self;
+        let pid = private.pid();
+        let ws_url = private.ctx().ws_url().clone();
         let fd_baseline = host::fd_count(pid)?;
         let rss_baseline_kb = host::rss_kb(pid)?;
 
@@ -174,7 +184,7 @@ impl Scenario<ScenarioReport> for WsConnCapacity {
             },
             |_| {
                 let ws_url = ws_url.clone();
-                std::future::ready(Ok(move |_: std::time::Instant| async move {
+                future::ready(Ok(move |_: Instant| async move {
                     let mut conn = RawWs::connect(&ws_url).await?;
                     let subid = conn.account_subscribe(&shared_account).await?;
                     if !conn.account_unsubscribe(subid).await? {
@@ -197,7 +207,7 @@ impl Scenario<ScenarioReport> for WsConnCapacity {
             "churn leaked descriptors: {fds_after_churn} vs baseline {fd_baseline}"
         )?;
 
-        let mut summary = ScenarioReport::ok(self.name())
+        let mut summary = ScenarioReport::ok()
             .setting("profile", profile.name)
             .setting(
                 "ladder",

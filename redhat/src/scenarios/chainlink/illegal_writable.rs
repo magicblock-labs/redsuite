@@ -1,12 +1,14 @@
 use std::{rc::Rc, time::Duration};
 
-use async_trait::async_trait;
 use instruction::Instruction;
+use pubkey::Pubkey;
 use redshift_interface::schedulecommit::{build, ScheduleCommitType};
 use redsuite_core::{
-    check, check_eq, dlp, prep, system, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
+    check, check_eq, dlp, system, BaseCtx, ChainCtx, ErCtx, Result, Scenario, TxSender,
 };
 use signer::Signer;
+
+use crate::PAYER_LAMPORTS;
 
 const RECEIPT_TIMEOUT: Duration = Duration::from_secs(20);
 const PROGRAM_ID_NOT_FOUND: &str = "failed to find parent program id";
@@ -14,18 +16,25 @@ const IMMUTABLE: &str = "Account is immutable";
 const INVALID_ACCOUNT_OWNER: &str = "Invalid account owner";
 const NEEDS_TO_BE_OWNED: &str = "needs to be owned by the invoking program";
 
-pub struct IllegalWritable;
+pub struct IllegalWritable {
+    base: Rc<BaseCtx>,
+    er: ErCtx,
+    sender: TxSender,
+    players: Vec<Pubkey>,
+    pdas: Vec<Pubkey>,
+}
 
-#[async_trait(?Send)]
+struct Case<'a> {
+    name: &'a str,
+    instructions: &'a [Instruction],
+    refusals: &'a [&'a [&'a str]],
+}
+
 impl Scenario for IllegalWritable {
-    fn name(&self) -> &str {
-        "redhat/illegal_writable"
-    }
-
-    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<()> {
-        let funder = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
-        let committees = prep::init_committees(base, &funder, er.identity(), 2).await?;
-        prep::await_committee_clones(er, &committees).await?;
+    async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
+        let funder = base.funded_payer(PAYER_LAMPORTS).await?;
+        let committees = base.schedulecommit(&funder).init(er.identity(), 2).await?;
+        er.await_committees(&committees).await?;
         let players: Vec<_> = committees.iter().map(|c| c.player.pubkey()).collect();
         let pdas: Vec<_> = committees.iter().map(|c| c.pda).collect();
 
@@ -33,30 +42,37 @@ impl Scenario for IllegalWritable {
         // committed accounts are the delegated PDAs, so the tx pays no ER fee
         // through the payer itself.
         let sender = er.sender(Rc::new(funder));
+        Ok(Self { base, er, sender, players, pdas })
+    }
+
+    async fn run(self) -> Result<()> {
+        let Self { base, er, sender, players, pdas } = self;
         let payer = sender.payer().pubkey();
-        let cases: [(&str, &[Instruction], &[&[&str]]); 4] = [
-            (
-                "direct invocation",
-                &[build::direct_schedule_commit(payer, None, &pdas)],
-                &[&[PROGRAM_ID_NOT_FOUND]],
-            ),
-            (
-                "surrounding transfers",
-                &[
+        let cases = [
+            Case {
+                name: "direct invocation",
+                instructions: &[build::direct_schedule_commit(payer, None, &pdas)],
+                refusals: &[&[PROGRAM_ID_NOT_FOUND]],
+            },
+            Case {
+                name: "surrounding transfers",
+                instructions: &[
                     system::transfer(&payer, &pdas[0], 1_000_000),
                     build::direct_schedule_commit(payer, None, &pdas),
                     system::transfer(&payer, &pdas[0], 2_000_000),
                 ],
-                &[&[PROGRAM_ID_NOT_FOUND, IMMUTABLE]],
-            ),
-            (
-                "sibling CPIs",
-                &[redhat_interface::build::sibling_schedule_commit_cpis(payer, &players, &pdas)],
-                &[&[INVALID_ACCOUNT_OWNER], &[NEEDS_TO_BE_OWNED]],
-            ),
-            (
-                "malicious tail",
-                &[
+                refusals: &[&[PROGRAM_ID_NOT_FOUND, IMMUTABLE]],
+            },
+            Case {
+                name: "sibling CPIs",
+                instructions: &[redhat_interface::build::sibling_schedule_commit_cpis(
+                    payer, &players, &pdas,
+                )],
+                refusals: &[&[INVALID_ACCOUNT_OWNER], &[NEEDS_TO_BE_OWNED]],
+            },
+            Case {
+                name: "malicious tail",
+                instructions: &[
                     redhat_interface::build::non_cpi(payer),
                     build::schedule_commit_cpi(
                         payer,
@@ -68,10 +84,15 @@ impl Scenario for IllegalWritable {
                     ),
                     redhat_interface::build::nested_schedule_commit_cpi(payer, &pdas),
                 ],
-                &[&[INVALID_ACCOUNT_OWNER], &[NEEDS_TO_BE_OWNED]],
-            ),
+                refusals: &[&[INVALID_ACCOUNT_OWNER], &[NEEDS_TO_BE_OWNED]],
+            },
         ];
-        for (case, instructions, needles) in cases {
+        for Case {
+            name: case,
+            instructions,
+            refusals,
+        } in cases
+        {
             let signature = sender.submit(instructions).await?;
             let tx = er.api().await_transaction(&signature, RECEIPT_TIMEOUT).await?;
             check!(
@@ -80,7 +101,7 @@ impl Scenario for IllegalWritable {
             )?;
             let observed = format!("{}\n{:?}", tx.logs.join("\n"), tx.err.as_ref().unwrap());
             // Every group must match; alternatives within a group are ORed.
-            for alternatives in needles {
+            for alternatives in refusals {
                 check!(
                     alternatives.iter().any(|needle| observed.contains(needle)),
                     "{case} ({signature}): the refusal must name one of {alternatives:?}, got: {observed}"

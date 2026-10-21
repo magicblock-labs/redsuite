@@ -4,18 +4,18 @@ use std::{
     time::{Duration, Instant},
 };
 
-use async_trait::async_trait;
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    check_eq, prep,
+    check_eq,
     profile::ProfileValues,
     redline::Accounts,
-    report,
     report::Unit,
     runner::{execute, Pacing, RunConfig, RunOutcome, SendTransaction, REQUEST_ORIGIN},
     stats::{ObservationsStats, StreamingStats},
-    topology, BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport, TxSender,
+    topology,
+    topology::ErOptions,
+    BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport, TxSender,
 };
 use tracing::{debug, warn};
 
@@ -91,7 +91,7 @@ async fn burst_cell(
 ) -> Result<BurstOutcome> {
     let private = topology::private_er(
         base,
-        topology::ErOptions {
+        ErOptions {
             label: label.to_owned(),
             request_timeout: Some(REQUEST_TIMEOUT),
             ..Default::default()
@@ -149,33 +149,36 @@ async fn burst_cell(
     })
 }
 
-pub struct ColdHydrationTail;
+pub struct ColdHydrationTail {
+    base: Rc<BaseCtx>,
+    profile: &'static Profile,
+    all_accounts: Vec<Pubkey>,
+}
 
-#[async_trait(?Send)]
 impl Scenario<ScenarioReport> for ColdHydrationTail {
-    fn name(&self) -> &str {
-        "redline/cold_hydration_tail"
-    }
-
-    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
+    async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
         let profile = PROFILES.select(base.config().profile);
-        let prep_payers =
-            prep::funded_payers(base, profile.prep_payers, PREP_PAYER_LAMPORTS).await?;
+        let prep_payers = base.funded_payers(profile.prep_payers, PREP_PAYER_LAMPORTS).await?;
         let all_accounts = Accounts::new(ACCOUNT_SPACE, er.identity())
             .init_batched(
-                base,
+                base.as_ref(),
                 &prep_payers,
                 profile.cold_accounts + profile.burst_accounts + 1,
                 false,
             )
             .await?;
+        Ok(Self { base, profile, all_accounts })
+    }
+
+    async fn run(self) -> Result<ScenarioReport> {
+        let Self { base, profile, all_accounts } = self;
         let cold_pool = &all_accounts[..profile.cold_accounts];
         let prewarm_account = all_accounts[profile.cold_accounts];
         let burst_accounts = &all_accounts[profile.cold_accounts + 1..];
 
         let touch_er = topology::private_er(
-            base,
-            topology::ErOptions {
+            &base,
+            ErOptions {
                 label: "s7-touch".to_owned(),
                 request_timeout: Some(REQUEST_TIMEOUT),
                 ..Default::default()
@@ -199,7 +202,7 @@ impl Scenario<ScenarioReport> for ColdHydrationTail {
             warn!(warm.quantile95, "warm read p95 exceeds latency bound");
         }
 
-        let touch_report = ScenarioReport::ok(&format!("{}/cold_vs_warm", self.name()))
+        let touch_report = ScenarioReport::ok()
             .setting("profile", profile.name)
             .setting("accounts", profile.cold_accounts)
             .setting("account space", ACCOUNT_SPACE)
@@ -212,18 +215,18 @@ impl Scenario<ScenarioReport> for ColdHydrationTail {
                 Unit::Seconds,
                 touch_delta.histogram_avg(ENSURE_ACCOUNT_HISTOGRAM),
             );
-        report::persist_cell(self.name(), &touch_report);
+        base.report_cell("cold_vs_warm", &touch_report)?;
 
-        let burst_payers: Vec<Rc<Keypair>> =
-            prep::funded_payers(base, profile.burst_payers, PAYER_LAMPORTS)
-                .await?
-                .into_iter()
-                .map(Rc::new)
-                .collect();
+        let burst_payers: Vec<Rc<Keypair>> = base
+            .funded_payers(profile.burst_payers, PAYER_LAMPORTS)
+            .await?
+            .into_iter()
+            .map(Rc::new)
+            .collect();
 
         let half = burst_accounts.len() / 2;
         let cold_deps = burst_cell(
-            base,
+            &base,
             "s7-burst-cold",
             &burst_accounts[..half],
             &burst_payers,
@@ -233,7 +236,7 @@ impl Scenario<ScenarioReport> for ColdHydrationTail {
         )
         .await?;
         let warm_deps = burst_cell(
-            base,
+            &base,
             "s7-burst-warm",
             &burst_accounts[half..],
             &burst_payers,
@@ -265,7 +268,7 @@ impl Scenario<ScenarioReport> for ColdHydrationTail {
         }
 
         for (slug, outcome) in [("burst_cold_deps", &cold_deps), ("burst_warm_deps", &warm_deps)] {
-            let cell_report = ScenarioReport::ok(&format!("{}/{slug}", self.name()))
+            let cell_report = ScenarioReport::ok()
                 .setting("profile", profile.name)
                 .setting("burst accounts", half)
                 .setting("payers", profile.burst_payers)
@@ -282,10 +285,10 @@ impl Scenario<ScenarioReport> for ColdHydrationTail {
                     Unit::Seconds,
                     outcome.ensure_avg_s,
                 );
-            report::persist_cell(self.name(), &cell_report);
+            base.report_cell(slug, &cell_report)?;
         }
 
-        Ok(ScenarioReport::ok(self.name())
+        Ok(ScenarioReport::ok()
             .setting("profile", profile.name)
             .setting("cold accounts", profile.cold_accounts)
             .setting("burst accounts per cell", half)

@@ -1,21 +1,22 @@
-use std::{sync::Arc, time::Duration};
+use std::{rc::Rc, sync::Arc, time::Duration};
 
-use async_trait::async_trait;
 use pubkey::Pubkey;
 use redsuite_core::{
     check_eq, prep,
     profile::ProfileValues,
     redline::{copy_three, execute_kernel, Accounts},
-    report,
     report::Unit,
     runner::{Pacing, RunOutcome, ThreadRunConfig},
     BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
 };
 use tracing::{debug, warn};
+use url::Url;
+
+use crate::{metrics, ACCOUNT_SPACE};
 
 const PAYER_LAMPORTS: u64 = 2_000_000_000;
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(300);
-const TX_COUNT: &str = crate::metrics::ENGINE_TRANSACTIONS;
+const TX_COUNT: &str = metrics::ENGINE_TRANSACTIONS;
 // healthy cells must stay within this factor of the widest cell's p50
 const FLAT_FACTOR: f64 = 3.0;
 // a cell beyond this factor is the cliff
@@ -63,7 +64,7 @@ const PROFILES: ProfileValues<Profile> = ProfileValues { lite: LITE, full: FULL 
 // same read-write 3/tx shape as S1, confined to the hot set
 // (hot-set sizes are powers of two — coprime with the stride)
 fn execute_cell(
-    er_rpc_url: String,
+    er_rpc_url: Url,
     config: ThreadRunConfig,
     id_offset: u64,
     hot_set: Arc<Vec<Pubkey>>,
@@ -84,31 +85,43 @@ struct CellResult {
     outcome: RunOutcome,
 }
 
-pub struct HotAccountCliff;
+pub struct HotAccountCliff {
+    base: Rc<BaseCtx>,
+    er: ErCtx,
+    profile: &'static Profile,
+    payer_bytes: Arc<Vec<[u8; 64]>>,
+    pdas: Vec<Pubkey>,
+}
 
-#[async_trait(?Send)]
 impl Scenario<ScenarioReport> for HotAccountCliff {
-    fn name(&self) -> &str {
-        "redline/hot_account_cliff"
-    }
-
-    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
+    async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
         let profile = PROFILES.select(base.config().profile);
         let pool = *profile.cells.iter().max().unwrap();
-        let payers = prep::funded_payers(base, profile.payers, PAYER_LAMPORTS).await?;
-        let pdas = Accounts::new(crate::ACCOUNT_SPACE, er.identity())
-            .init_delegated(base, &payers[0], pool)
+        let payers = base.funded_payers(profile.payers, PAYER_LAMPORTS).await?;
+        let pdas = Accounts::new(ACCOUNT_SPACE, er.identity())
+            .init_delegated(base.as_ref(), &payers[0], pool)
             .await?;
-        prep::await_clones(
-            er,
-            &pdas,
-            crate::ACCOUNT_SPACE as usize,
-            Duration::from_secs(15),
-        )
-        .await?;
+        er.await_clones(&pdas, ACCOUNT_SPACE as usize, Duration::from_secs(15)).await?;
         let payer_bytes = prep::payer_bytes(&payers);
-        let er_rpc_url = er.api().url().to_owned();
 
+        Ok(Self {
+            base,
+            er,
+            profile,
+            payer_bytes,
+            pdas,
+        })
+    }
+
+    async fn run(self) -> Result<ScenarioReport> {
+        let Self {
+            base,
+            er,
+            profile,
+            payer_bytes,
+            pdas,
+        } = self;
+        let er_rpc_url = er.api().url().clone();
         let mut offset = 0u64;
         let mut cells: Vec<CellResult> = Vec::new();
         for &hot in profile.cells {
@@ -135,7 +148,7 @@ impl Scenario<ScenarioReport> for HotAccountCliff {
             )?;
             offset += profile.warmup;
             if let Some(seen) = count_before_warmup {
-                crate::await_executed(er, seen + profile.warmup as f64, DRAIN_TIMEOUT).await?;
+                crate::await_executed(&er, seen + profile.warmup as f64, DRAIN_TIMEOUT).await?;
             }
 
             let before = er.scrape_metrics().await?;
@@ -159,11 +172,11 @@ impl Scenario<ScenarioReport> for HotAccountCliff {
                 outcome.first_error
             )?;
             if let Some(seen) = before.get(TX_COUNT) {
-                crate::await_executed(er, seen + profile.iterations as f64, DRAIN_TIMEOUT).await?;
+                crate::await_executed(&er, seen + profile.iterations as f64, DRAIN_TIMEOUT).await?;
             }
             let after = er.scrape_metrics().await?;
             let delta = MetricsDelta::new(before, after);
-            if let Some(failed) = delta.counter_all(crate::metrics::FAILED_TRANSACTIONS) {
+            if let Some(failed) = delta.counter_all(metrics::FAILED_TRANSACTIONS) {
                 check_eq!(
                     failed,
                     0.0,
@@ -178,7 +191,7 @@ impl Scenario<ScenarioReport> for HotAccountCliff {
                 "hot account cell finished",
             );
 
-            let cell_report = ScenarioReport::ok(&format!("{}/hot{hot}", self.name()))
+            let cell_report = ScenarioReport::ok()
                 .setting("profile", profile.name)
                 .setting("hot accounts", hot)
                 .setting("shape", "read-write 3/tx (1 src + 2 dst data-copy)")
@@ -204,9 +217,9 @@ impl Scenario<ScenarioReport> for HotAccountCliff {
                 .metric_if(
                     "validator txs in window",
                     Unit::Count,
-                    delta.counter(crate::metrics::ENGINE_TRANSACTIONS),
+                    delta.counter(metrics::ENGINE_TRANSACTIONS),
                 );
-            report::persist_cell(self.name(), &cell_report);
+            base.report_cell(&format!("hot{hot}"), &cell_report)?;
             cells.push(cell);
         }
 
@@ -243,7 +256,7 @@ impl Scenario<ScenarioReport> for HotAccountCliff {
             .map(|cell| cell.hot);
 
         let cell_names: Vec<String> = profile.cells.iter().map(|hot| hot.to_string()).collect();
-        let mut summary = ScenarioReport::ok(self.name())
+        let mut summary = ScenarioReport::ok()
             .setting("profile", profile.name)
             .setting("cells", cell_names.join("/"))
             .setting("shape", "read-write 3/tx (1 src + 2 dst data-copy)")

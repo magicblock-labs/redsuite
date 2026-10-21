@@ -1,33 +1,36 @@
-use std::{collections::HashMap, str::FromStr, time::Duration};
+use std::{collections::HashMap, mem, str::FromStr, time::Duration};
 
 use account::Account;
-use base64::Engine;
+use base64::{engine::general_purpose::STANDARD, Engine};
+use bytes::Bytes;
 use hash::Hash;
-use json::{Deserialize, Serialize};
+use json::{Deserialize, Serialize, Value};
 use pubkey::Pubkey;
+use reqwest::{Client, StatusCode};
 use serde::de::DeserializeOwned;
 use serde_with::{serde_as, DisplayFromStr};
 use signature::Signature;
 use thiserror::Error;
 use transaction::{versioned::VersionedTransaction, Transaction};
+use url::Url;
 
-use crate::{transport::http, Result};
+use crate::{transport::http, DynError, Result};
 
 #[derive(Debug, Error)]
 #[error("{self:?}")]
 pub struct RpcError {
     pub code: i64,
     pub message: String,
-    pub data: Option<json::Value>,
+    pub data: Option<Value>,
     pub method: String,
-    pub url: String,
+    pub url: Url,
 }
 
 #[derive(Debug, Error)]
 #[error("transaction {signature} failed on-chain: {err:?}")]
 pub struct TxError {
     pub signature: Signature,
-    pub err: json::Value,
+    pub err: Value,
 }
 
 #[derive(Debug, Error)]
@@ -88,7 +91,7 @@ struct Envelope<T> {
 struct EnvelopeError {
     code: i64,
     message: String,
-    data: Option<json::Value>,
+    data: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -107,7 +110,7 @@ struct RpcBlockhash {
 #[serde(rename_all = "camelCase")]
 struct RpcSignatureStatus {
     confirmation_status: Option<String>,
-    err: Option<json::Value>,
+    err: Option<Value>,
 }
 
 #[serde_as]
@@ -131,7 +134,7 @@ struct RpcKeyedAccount {
 }
 
 fn decode_rpc_account(raw: RpcAccount) -> Result<Account> {
-    let data = base64::engine::general_purpose::STANDARD
+    let data = STANDARD
         .decode(&raw.data.0)
         .map_err(|e| format!("bad base64 account data: {e}"))?;
     Ok(Account {
@@ -155,7 +158,7 @@ struct RpcTransaction {
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RpcTransactionMeta {
-    err: Option<json::Value>,
+    err: Option<Value>,
     fee: u64,
     pre_balances: Vec<u64>,
     post_balances: Vec<u64>,
@@ -173,7 +176,7 @@ pub struct TransactionInfo {
     pub slot: u64,
     pub block_time: Option<i64>,
     // on-chain execution error; None = the transaction succeeded
-    pub err: Option<json::Value>,
+    pub err: Option<Value>,
     pub fee: u64,
     pub pre_balances: Vec<u64>,
     pub post_balances: Vec<u64>,
@@ -187,7 +190,7 @@ pub struct TransactionInfo {
 pub struct SignatureStatus {
     pub confirmed: bool,
     pub finalized: bool,
-    pub err: Option<json::Value>,
+    pub err: Option<Value>,
 }
 
 impl SignatureStatus {
@@ -199,9 +202,11 @@ impl SignatureStatus {
     }
 }
 
+#[serde_as]
 #[derive(Deserialize)]
 struct RpcSignatureInfo {
-    signature: String,
+    #[serde_as(as = "DisplayFromStr")]
+    signature: Signature,
 }
 
 const TX_POLL: Duration = Duration::from_millis(200);
@@ -268,32 +273,29 @@ struct SignaturesConfig {
 }
 
 pub struct SendBody {
-    body: bytes::Bytes,
+    body: Bytes,
     expect: Vec<Signature>,
 }
 
 #[derive(Clone)]
 pub struct Api {
-    url: String,
-    client: reqwest::Client,
+    url: Url,
+    client: Client,
 }
 
 impl Api {
-    pub fn new(url: impl Into<String>) -> Self {
-        Self {
-            url: url.into(),
-            client: http::client(),
-        }
+    pub fn new(url: Url) -> Self {
+        Self { url, client: http::client() }
     }
 
-    pub fn with_timeout(url: impl Into<String>, timeout: Duration) -> Self {
+    pub fn with_timeout(url: Url, timeout: Duration) -> Self {
         Self {
-            url: url.into(),
+            url,
             client: http::client_with_timeout(timeout),
         }
     }
 
-    pub fn url(&self) -> &str {
+    pub fn url(&self) -> &Url {
         &self.url
     }
 
@@ -351,10 +353,14 @@ impl Api {
     }
 
     pub async fn primary_ready(&self) -> bool {
-        let url = format!("{}/health/primary", self.url.trim_end_matches('/'));
+        let mut url = self.url.clone();
+        url.set_path(&format!(
+            "{}/health/primary",
+            url.path().trim_end_matches('/')
+        ));
         matches!(
-            self.client.get(&url).send().await,
-            Ok(response) if response.status().as_u16() == 200
+            self.client.get(url).send().await,
+            Ok(response) if response.status() == StatusCode::OK
         )
     }
 
@@ -409,7 +415,7 @@ impl Api {
 
     fn send_params(tx: &Transaction) -> Result<(String, SendTransactionConfig)> {
         Ok((
-            base64::engine::general_purpose::STANDARD.encode(wincode::serialize(tx)?),
+            STANDARD.encode(wincode::serialize(tx)?),
             SendTransactionConfig {
                 encoding: "base64",
                 skip_preflight: true,
@@ -476,7 +482,7 @@ impl Api {
                         envelope.id
                     )
                 })?;
-            if std::mem::replace(&mut answered[id - 1], true) {
+            if mem::replace(&mut answered[id - 1], true) {
                 return Err(format!("sendTransaction: duplicate response id {id}").into());
             }
             if envelope.error.is_some() {
@@ -508,7 +514,7 @@ impl Api {
         crate::check::poll_until(options.deadline, options.poll, async || {
             if let Some(status) = self.get_signature_status(sig).await? {
                 if let Some(err) = status.err {
-                    return Err(Box::new(TxError { signature: *sig, err }) as crate::DynError);
+                    return Err(Box::new(TxError { signature: *sig, err }) as DynError);
                 }
                 if status.meets(options.commitment) {
                     return Ok(Some(()));
@@ -521,7 +527,7 @@ impl Api {
             Box::new(ConfirmTimeout {
                 signature: *sig,
                 deadline: options.deadline,
-            }) as crate::DynError
+            }) as DynError
         })
     }
 
@@ -598,7 +604,7 @@ impl Api {
         &self,
         pk: &Pubkey,
         limit: usize,
-    ) -> Result<Vec<String>> {
+    ) -> Result<Vec<Signature>> {
         let params = (
             pk.to_string(),
             SignaturesConfig {
@@ -623,12 +629,12 @@ impl Api {
 }
 
 pub(crate) fn decode_transaction(text: &str) -> Result<VersionedTransaction> {
-    let bytes = base64::engine::general_purpose::STANDARD.decode(text)?;
+    let bytes = STANDARD.decode(text)?;
     // V1's serde representation differs from the transaction wire format.
     Ok(wincode::deserialize(&bytes)?)
 }
 
-pub fn custom_error_code(err: &json::Value) -> Option<u32> {
+pub fn custom_error_code(err: &Value) -> Option<u32> {
     use json::JsonValueTrait;
     err.get("InstructionError")?
         .get(1)?
@@ -698,16 +704,14 @@ impl Metrics {
 
 #[derive(Clone)]
 pub struct MetricsCollector {
-    client: reqwest::Client,
-    url: String,
+    client: Client,
+    url: Url,
 }
 
 impl MetricsCollector {
-    pub fn new(metrics_url: &str) -> Self {
-        Self {
-            client: http::client(),
-            url: format!("{}/metrics", metrics_url.trim_end_matches('/')),
-        }
+    pub fn new(mut url: Url) -> Self {
+        url.set_path(&format!("{}/metrics", url.path().trim_end_matches('/')));
+        Self { client: http::client(), url }
     }
 
     pub async fn scrape(&self) -> Result<Metrics> {

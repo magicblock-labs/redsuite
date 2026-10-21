@@ -1,8 +1,9 @@
 mod bmf;
 mod store;
 use std::{
+    error::Error,
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
     sync::OnceLock,
     time::{SystemTime, UNIX_EPOCH},
@@ -14,8 +15,8 @@ use serde_with::skip_serializing_none;
 use tracing::warn;
 
 use crate::{
-    resources::LaunchRecord, runner::RunOutcome, scenario::RunRecord, stats::ObservationsStats,
-    topology, Result,
+    check::OperationError, resources::LaunchRecord, runner::RunOutcome, scenario::RunRecord,
+    stats::ObservationsStats, topology, CheckError, Result,
 };
 
 pub const SCHEMA_VERSION: u32 = 2;
@@ -53,24 +54,18 @@ pub struct Measurement {
 
 #[derive(Debug)]
 pub struct ScenarioReport {
-    pub scenario: String,
     pub passed: bool,
     pub config: Vec<(String, String)>,
     pub measurements: Vec<Measurement>,
 }
 
 impl ScenarioReport {
-    pub fn ok(name: &str) -> Self {
+    pub fn ok() -> Self {
         Self {
-            scenario: name.to_owned(),
             passed: true,
             config: Vec::new(),
             measurements: Vec::new(),
         }
-    }
-
-    pub fn failed(name: &str) -> Self {
-        Self { passed: false, ..Self::ok(name) }
     }
 
     pub fn setting(mut self, key: impl Into<String>, value: impl ToString) -> Self {
@@ -138,7 +133,7 @@ impl ScenarioReport {
     pub fn with_flags(self, outcome: &RunOutcome) -> Self {
         let mut report = self.latency_origin(outcome.origin);
         for (flag, reason) in outcome.flags() {
-            warn!(%report.scenario, flag, %reason, "workload validity warning");
+            warn!(flag, %reason, "workload validity warning");
             match report.config.iter_mut().find(|(key, _)| key == flag) {
                 Some((_, reasons)) => {
                     reasons.push_str("; ");
@@ -218,19 +213,16 @@ fn campaign_dir() -> PathBuf {
 pub fn persist_run(record: &RunRecord) -> Result<PathBuf> {
     let failures = run_failures(record);
 
-    let fallback = ScenarioReport::failed(&record.name).metric_if(
-        "wall seconds",
-        Unit::Seconds,
-        record.wall_seconds,
-    );
+    let fallback =
+        ScenarioReport::ok().metric_if("wall seconds", Unit::Seconds, record.wall_seconds);
     let report = record.report.as_ref().unwrap_or(&fallback);
-    let mut doc = scenario_run_doc(report, &failures, &record.launches);
+    let mut doc = scenario_run_doc(&record.name, report, &failures, &record.launches);
     doc.passed = record.passed();
 
     store::persist(None, doc)
 }
 
-pub fn persist_summary(mut report: ScenarioReport, outcome: &Result<()>) -> Result<()> {
+pub fn persist_summary(name: &str, mut report: ScenarioReport, outcome: &Result<()>) -> Result<()> {
     report.passed = outcome.is_ok();
     let failures: Vec<_> = outcome
         .as_ref()
@@ -238,18 +230,20 @@ pub fn persist_summary(mut report: ScenarioReport, outcome: &Result<()>) -> Resu
         .map(|error| PersistedFailure::new("suite", error.to_string()))
         .into_iter()
         .collect();
-    store::persist(None, scenario_run_doc(&report, &failures, &[]))?;
+    store::persist(None, scenario_run_doc(name, &report, &failures, &[]))?;
     Ok(())
 }
 
-pub fn persist_cell(parent: &str, report: &ScenarioReport) {
-    let persisted = store::persist(Some(parent), scenario_run_doc(report, &[], &[]));
+pub(crate) fn persist_cell(parent: &str, label: &str, report: &ScenarioReport) {
+    let name = format!("{parent}/{label}");
+    let persisted = store::persist(Some(parent), scenario_run_doc(&name, report, &[], &[]));
     if let Err(error) = persisted {
         warn!(%error, "cell report not persisted");
     }
 }
 
 fn scenario_run_doc(
+    name: &str,
     report: &ScenarioReport,
     failures: &[PersistedFailure],
     launches: &[LaunchRecord],
@@ -257,7 +251,7 @@ fn scenario_run_doc(
     ScenarioRun {
         schema: SCHEMA_VERSION,
         run: run_id().to_owned(),
-        scenario: report.scenario.clone(),
+        scenario: name.to_owned(),
         passed: report.passed,
         config: report.config.clone(),
         measurements: report.measurements.clone(),
@@ -271,10 +265,26 @@ fn run_failures(record: &RunRecord) -> Vec<PersistedFailure> {
         return Vec::new();
     };
     let mut failure = PersistedFailure::new(record.phase, error.to_string());
-    if let Some(check) = error.downcast_ref::<crate::CheckError>() {
+    let mut cause: Option<&(dyn Error + 'static)> = Some(error.as_ref());
+    let mut check = None;
+    while let Some(error) = cause {
+        check = check.or_else(|| error.downcast_ref::<CheckError>());
+        if let Some(operation) = error.downcast_ref::<OperationError>() {
+            operation.trace.with_spans(|metadata, fields| {
+                // The run already has an identity; retain only operation context.
+                let context = (metadata.name().to_owned(), fields.to_owned());
+                if metadata.name() != "run" && !failure.context.contains(&context) {
+                    failure.context.push(context);
+                }
+                true
+            });
+        }
+        cause = error.source();
+    }
+    if let Some(check) = check {
         failure.expected = check.expected.clone();
         failure.actual = check.actual.clone();
-        failure.context = check.context.clone();
+        failure.context.extend(check.context.iter().cloned());
     }
     vec![failure]
 }
@@ -302,13 +312,13 @@ fn er_identity() -> (String, String, String) {
     }
 }
 
-pub(crate) fn binary_provenance(path: &std::path::Path) -> (String, String) {
+pub(crate) fn binary_provenance(path: &Path) -> (String, String) {
     (binary_version(path), fingerprint(path))
 }
 
 // A validator prints its version and then its shutdown log lines; only the
 // first line names the build, and terminal colour codes are noise.
-fn binary_version(path: &std::path::Path) -> String {
+fn binary_version(path: &Path) -> String {
     Command::new(path)
         .arg("--version")
         .output()
@@ -338,7 +348,7 @@ fn version_line(output: &str) -> Option<String> {
     Some(cleaned)
 }
 
-fn fingerprint(path: &std::path::Path) -> String {
+fn fingerprint(path: &Path) -> String {
     match fs::metadata(path) {
         Ok(meta) => {
             let mtime = meta

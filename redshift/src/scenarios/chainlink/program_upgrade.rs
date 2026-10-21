@@ -1,34 +1,31 @@
-use std::{cell::Cell, rc::Rc, time::Duration};
+use std::{cell::Cell, fs, rc::Rc, slice, time::Duration};
 
 use account::Account;
-use async_trait::async_trait;
 use futures_util::future::{try_join, try_join_all};
 use instruction::{AccountMeta, Instruction};
 use keypair::Keypair;
 use pubkey::Pubkey;
-use redshift_interface::{upgrade_probe_data, UPGRADE_TAG};
-use redsuite_core::redline::Accounts;
 use redsuite_core::{
     api::{custom_error_code, RpcError},
     catalog::Fixture,
     check, check_eq,
     netfault::{Action, BaseProxies, Selector, Stage},
-    prep, topology,
-    topology::ErOptions,
+    redline::Accounts,
+    topology,
+    topology::{ErOptions, PrivateEr},
     BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result,
 };
 use signer::Signer;
 use solana_loader_v3_interface::{
     get_program_data_address, instruction as loader, state::UpgradeableLoaderState,
 };
+use tokio::time;
 
-use crate::program::layout::{DATA_OFFSET, ID_SIZE};
+use crate::{program::layout, PAYER_LAMPORTS};
 
 const TIMEOUT: Duration = Duration::from_secs(90);
 const FETCH_FAILURE: &str = "upgrade probe cold fetch unavailable";
 const PHASES: [&str; 4] = ["before upgrade", "held", "released", "converged"];
-
-pub struct ProgramUpgrade;
 
 async fn buffer(base: &BaseCtx, payer: &Keypair, bytes: &[u8]) -> Result<Keypair> {
     let buffer = Keypair::new();
@@ -66,23 +63,32 @@ async fn local_program(er: &ErCtx, program: Pubkey) -> Result<Option<Account>> {
         .find_map(|(key, account)| (key == program).then_some(account)))
 }
 
-#[async_trait(?Send)]
-impl PrivateErScenario for ProgramUpgrade {
-    fn name(&self) -> &str {
-        "redshift/program_upgrade"
-    }
+pub struct ProgramUpgrade {
+    base: Rc<BaseCtx>,
+    a: Vec<u8>,
+    b: Vec<u8>,
+    funder: Keypair,
+    authority: Pubkey,
+    b_buffer: Keypair,
+    program_id: Pubkey,
+    programdata: Pubkey,
+    proxies: BaseProxies,
+    hot: PrivateEr,
+    cold: PrivateEr,
+}
 
-    async fn run(&self, base: &BaseCtx) -> Result<()> {
-        let mut a = std::fs::read(Fixture::RedshiftProgramSlim.resolve()?)?;
-        let mut b = std::fs::read(Fixture::RedshiftProgramSlimUpgraded.resolve()?)?;
+impl PrivateErScenario for ProgramUpgrade {
+    async fn setup(base: Rc<BaseCtx>, _: ()) -> Result<Self> {
+        let mut a = fs::read(Fixture::UpgradeProbe.resolve()?)?;
+        let mut b = fs::read(Fixture::UpgradeProbeUpgraded.resolve()?)?;
         let size = a.len().max(b.len());
         a.resize(size, 0);
         b.resize(size, 0);
         check!(a != b, "fixture versions differ")?;
-        let funder = prep::funded_payer(base, 10_000_000_000).await?;
+        let funder = base.funded_payer(10_000_000_000).await?;
         let authority = funder.pubkey();
         let (a_buffer, b_buffer) =
-            try_join(buffer(base, &funder, &a), buffer(base, &funder, &b)).await?;
+            try_join(buffer(&base, &funder, &a), buffer(&base, &funder, &b)).await?;
         let program = Keypair::new();
         let program_id = program.pubkey();
         let programdata = get_program_data_address(&program_id);
@@ -99,7 +105,7 @@ impl PrivateErScenario for ProgramUpgrade {
             )?,
         )
         .await?;
-        let proxies = BaseProxies::spawn(base).await?;
+        let proxies = BaseProxies::spawn(&base).await?;
         let options = |label: &str| ErOptions {
             label: label.into(),
             base_endpoints: Some(proxies.endpoints()),
@@ -107,16 +113,47 @@ impl PrivateErScenario for ProgramUpgrade {
             ..ErOptions::default()
         };
         let (hot, cold) = try_join(
-            topology::private_er(base, options("upgrade-hot")),
-            topology::private_er(base, options("upgrade-cold")),
+            topology::private_er(&base, options("upgrade-hot")),
+            topology::private_er(&base, options("upgrade-cold")),
         )
         .await?;
+        Ok(Self {
+            base,
+            a,
+            b,
+            funder,
+            authority,
+            b_buffer,
+            program_id,
+            programdata,
+            proxies,
+            hot,
+            cold,
+        })
+    }
+
+    async fn run(self) -> Result<()> {
+        let Self {
+            base,
+            a,
+            b,
+            funder,
+            authority,
+            b_buffer,
+            program_id,
+            programdata,
+            proxies,
+            hot,
+            cold,
+        } = self;
         let er = hot.ctx();
-        let payer =
-            prep::delegated_payer(base, &funder, er.identity(), crate::PAYER_LAMPORTS).await?;
-        let keys = Accounts::new((DATA_OFFSET + ID_SIZE) as u32, er.identity())
-            .init_batched(base, std::slice::from_ref(&funder), 2, true)
-            .await?;
+        let payer = base.delegated_payer(&funder, er.identity(), PAYER_LAMPORTS).await?;
+        let keys = Accounts::new(
+            (layout::DATA_OFFSET + layout::ID_SIZE) as u32,
+            er.identity(),
+        )
+        .init_batched(base.as_ref(), slice::from_ref(&funder), 2, true)
+        .await?;
         let base_state = base.accounts(&keys).await?;
         let state = async || -> Result<Vec<Account>> {
             er.accounts(&keys)
@@ -183,8 +220,8 @@ impl PrivateErScenario for ProgramUpgrade {
             while !done.get() {
                 id += 1;
                 let fail = id.is_multiple_of(4);
-                probe.data = upgrade_probe_data(id, fail);
-                let tx = sender.prepare(std::slice::from_ref(&probe)).await?;
+                probe.data = upgrade_probe::instruction_data(id, fail).to_vec();
+                let tx = sender.prepare(slice::from_ref(&probe)).await?;
                 let signature = tx.signatures[0];
                 let current = phase.get();
                 let mut tally = counts.get();
@@ -232,7 +269,7 @@ impl PrivateErScenario for ProgramUpgrade {
                                 check!(fail, "execution failure for {signature}: {error}")?;
                                 check_eq!(
                                     custom_error_code(error),
-                                    Some(UPGRADE_TAG as u32),
+                                    Some(upgrade_probe::FAILURE_CODE),
                                     "failure after writes for {signature}"
                                 )?;
                                 tally[current][2] += 1;
@@ -240,7 +277,7 @@ impl PrivateErScenario for ProgramUpgrade {
                                 check!(!fail, "failure probe {signature} must fail")?;
                                 let value = id * 10 + version;
                                 for (account, value) in expected.iter_mut().zip([value, !value]) {
-                                    account.data[DATA_OFFSET..]
+                                    account.data[layout::DATA_OFFSET..]
                                         .copy_from_slice(&value.to_le_bytes());
                                 }
                                 tally[current][version as usize - 1] += 1;
@@ -325,7 +362,7 @@ impl PrivateErScenario for ProgramUpgrade {
             done.set(true);
             Result::Ok(())
         };
-        tokio::time::timeout(Duration::from_secs(180), try_join(traffic, upgrade)).await??;
+        time::timeout(Duration::from_secs(180), try_join(traffic, upgrade)).await??;
         check_eq!(
             base.accounts(&keys).await?,
             base_state,

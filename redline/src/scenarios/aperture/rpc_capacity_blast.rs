@@ -1,6 +1,7 @@
-use std::{sync::Arc, time::Duration};
+use std::{rc::Rc, sync::Arc, time::Duration};
 
-use async_trait::async_trait;
+use keypair::Keypair;
+use pubkey::Pubkey;
 use redsuite_core::{
     check, check_eq, prep,
     profile::ProfileValues,
@@ -9,7 +10,10 @@ use redsuite_core::{
     runner::{Pacing, ThreadRunConfig},
     BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
 };
+use tokio::{time, time::Instant};
 use tracing::{debug, warn};
+
+use crate::{metrics, ACCOUNT_SPACE};
 
 const PREP_PAYER_LAMPORTS: u64 = 4_000_000_000;
 const CLONE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -51,23 +55,28 @@ const FULL: Profile = Profile {
 
 const PROFILES: ProfileValues<Profile> = ProfileValues { lite: LITE, full: FULL };
 
-pub struct RpcCapacityBlast;
+pub struct RpcCapacityBlast {
+    er: ErCtx,
+    profile: &'static Profile,
+    prep_payers: Vec<Keypair>,
+    pool: Arc<Vec<Pubkey>>,
+}
 
-#[async_trait(?Send)]
 impl Scenario<ScenarioReport> for RpcCapacityBlast {
-    fn name(&self) -> &str {
-        "redline/rpc_capacity_blast"
-    }
-
-    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
+    async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
         let profile = PROFILES.select(base.config().profile);
-        let prep_payers = prep::funded_payers(base, profile.payers, PREP_PAYER_LAMPORTS).await?;
+        let prep_payers = base.funded_payers(profile.payers, PREP_PAYER_LAMPORTS).await?;
         let pool = Arc::new(
-            Accounts::new(crate::ACCOUNT_SPACE, er.identity())
-                .init_batched(base, &prep_payers, profile.accounts, true)
+            Accounts::new(ACCOUNT_SPACE, er.identity())
+                .init_batched(base.as_ref(), &prep_payers, profile.accounts, true)
                 .await?,
         );
-        prep::await_clones(er, &pool, crate::ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
+        er.await_clones(&pool, ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
+        Ok(Self { er, profile, prep_payers, pool })
+    }
+
+    async fn run(self) -> Result<ScenarioReport> {
+        let Self { er, profile, prep_payers, pool } = self;
         let threads = profile.threads;
 
         let before = er.scrape_metrics().await?;
@@ -78,7 +87,7 @@ impl Scenario<ScenarioReport> for RpcCapacityBlast {
                 rate: Pacing::PerSecond(profile.offered),
                 concurrency: profile.concurrency,
             },
-            er.api().url().to_owned(),
+            er.api().url().clone(),
             prep::payer_bytes(&prep_payers),
             0,
             move |id| {
@@ -89,8 +98,8 @@ impl Scenario<ScenarioReport> for RpcCapacityBlast {
             },
             None,
         )?;
-        if let Some(ledger_txs_before) = before.get(crate::metrics::ENGINE_TRANSACTIONS) {
-            settle_ledger(er, ledger_txs_before, profile.requests as f64).await;
+        if let Some(ledger_txs_before) = before.get(metrics::ENGINE_TRANSACTIONS) {
+            settle_ledger(&er, ledger_txs_before, profile.requests as f64).await;
         }
         let after = er.scrape_metrics().await?;
         let delta = MetricsDelta::new(before, after);
@@ -107,14 +116,14 @@ impl Scenario<ScenarioReport> for RpcCapacityBlast {
         if delivered_rps < CATASTROPHIC_RPS_FLOOR {
             warn!(delivered_rps, "RPC throughput below minimum",);
         }
-        if let Some(processed) = delta.counter(crate::metrics::ENGINE_TRANSACTIONS) {
+        if let Some(processed) = delta.counter(metrics::ENGINE_TRANSACTIONS) {
             check!(
                 processed >= profile.requests as f64,
                 "validator processed {processed} txs, expected at least {}",
                 profile.requests
             )?;
         }
-        if let Some(failed_txs) = delta.counter_all(crate::metrics::FAILED_TRANSACTIONS) {
+        if let Some(failed_txs) = delta.counter_all(metrics::FAILED_TRANSACTIONS) {
             check_eq!(
                 failed_txs,
                 0.0,
@@ -122,7 +131,7 @@ impl Scenario<ScenarioReport> for RpcCapacityBlast {
             )?;
         }
 
-        Ok(ScenarioReport::ok(self.name())
+        Ok(ScenarioReport::ok()
             .setting("profile", profile.name)
             .setting("shape", "write 1/tx byte-set over hot pool")
             .setting("threads", threads)
@@ -145,24 +154,24 @@ impl Scenario<ScenarioReport> for RpcCapacityBlast {
             .metric_if(
                 "validator txs in window",
                 Unit::Count,
-                delta.counter(crate::metrics::ENGINE_TRANSACTIONS),
+                delta.counter(metrics::ENGINE_TRANSACTIONS),
             ))
     }
 }
 
 async fn settle_ledger(er: &ErCtx, baseline: f64, expected: f64) {
-    let deadline = tokio::time::Instant::now() + LEDGER_SETTLE_TIMEOUT;
+    let deadline = Instant::now() + LEDGER_SETTLE_TIMEOUT;
     loop {
-        let committed = tokio::time::timeout_at(deadline, er.scrape_metrics())
+        let committed = time::timeout_at(deadline, er.scrape_metrics())
             .await
             .ok()
             .and_then(|scraped| scraped.ok())
-            .and_then(|metrics| metrics.get(crate::metrics::ENGINE_TRANSACTIONS))
+            .and_then(|metrics| metrics.get(metrics::ENGINE_TRANSACTIONS))
             .map(|total| total - baseline)
             .unwrap_or(0.0);
-        if committed >= expected || tokio::time::Instant::now() >= deadline {
+        if committed >= expected || Instant::now() >= deadline {
             return;
         }
-        tokio::time::sleep(LEDGER_SETTLE_POLL).await;
+        time::sleep(LEDGER_SETTLE_POLL).await;
     }
 }

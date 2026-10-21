@@ -1,4 +1,5 @@
 use std::{
+    fs,
     path::Path,
     process::{Command, ExitCode},
 };
@@ -71,8 +72,8 @@ fn programs(root: &Path) -> Result<()> {
             Fixture::RedlineProgram => ("redline", None),
             Fixture::RedshiftProgram => ("redshift", None),
             Fixture::RedhatProgram => ("redhat", None),
-            Fixture::RedshiftProgramSlim => ("redshift", Some("slim")),
-            Fixture::RedshiftProgramSlimUpgraded => ("redshift", Some("slim-upgraded")),
+            Fixture::UpgradeProbe => ("upgrade", Some("v1")),
+            Fixture::UpgradeProbeUpgraded => ("upgrade", Some("v2")),
         };
         let out = match variant {
             Some(label) => deploy.join(format!("{family}-{label}")),
@@ -85,8 +86,8 @@ fn programs(root: &Path) -> Result<()> {
             .arg("--sbf-out-dir")
             .arg(&out);
         if variant.is_some() {
-            command.args(["--arch", "v3", "--no-default-features"]);
-            if fixture == Fixture::RedshiftProgramSlimUpgraded {
+            command.args(["--arch", "v3"]);
+            if fixture == Fixture::UpgradeProbeUpgraded {
                 command.args(["--features", "upgraded"]);
             }
         }
@@ -95,8 +96,8 @@ fn programs(root: &Path) -> Result<()> {
         if variant.is_some() {
             let staged = deploy.join(fixture.so_name());
             // fs::copy can fail with ENOENT on virtiofs bind mounts.
-            std::fs::read(out.join("redshift_program.so"))
-                .and_then(|bytes| std::fs::write(&staged, bytes))
+            fs::read(out.join("upgrade_probe.so"))
+                .and_then(|bytes| fs::write(&staged, bytes))
                 .map_err(|error| format!("staging {}: {error}", staged.display()))?;
         }
     }

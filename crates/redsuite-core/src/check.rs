@@ -1,15 +1,18 @@
-use std::{fmt, future::Future, time::Duration};
+use std::{fmt::Debug, future::Future, result, time::Duration};
 
+use hash::Hash;
 use thiserror::Error;
-use tracing::{debug, error_span, Instrument};
+use tokio::{time, time::Instant};
+use tracing::{debug, instrument};
+use tracing_error::SpanTrace;
 
 use crate::DynError;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
-pub fn content_hash(bytes: &[u8]) -> hash::Hash {
+pub fn content_hash(bytes: &[u8]) -> Hash {
     use sha2::{Digest, Sha256};
-    hash::Hash::new_from_array(Sha256::digest(bytes).into())
+    Hash::new_from_array(Sha256::digest(bytes).into())
 }
 
 #[derive(Debug, Error)]
@@ -20,6 +23,14 @@ pub struct CheckError {
     pub actual: Option<String>,
     pub context: Vec<(String, String)>,
     pub source: Option<DynError>,
+}
+
+#[derive(Debug, Error)]
+#[error("{operation}: {source}")]
+pub(crate) struct OperationError {
+    operation: String,
+    source: DynError,
+    pub trace: SpanTrace,
 }
 
 impl CheckError {
@@ -123,8 +134,8 @@ pub async fn poll_for<T, Observed, Fut>(
     mut observe: impl FnMut() -> Fut,
 ) -> Result<T, CheckError>
 where
-    Observed: fmt::Debug,
-    Fut: Future<Output = std::result::Result<T, Observed>>,
+    Observed: Debug,
+    Fut: Future<Output = result::Result<T, Observed>>,
 {
     let mut last = None;
     poll_until(timeout, POLL_INTERVAL, async || {
@@ -151,29 +162,32 @@ pub async fn poll_until<T, E>(
     interval: Duration,
     mut observe: impl AsyncFnMut() -> Result<Option<T>, E>,
 ) -> Result<Option<T>, E> {
-    let deadline = tokio::time::Instant::now() + timeout;
+    let deadline = Instant::now() + timeout;
     loop {
         if let Some(value) = observe().await? {
             return Ok(Some(value));
         }
-        if tokio::time::Instant::now() >= deadline {
+        if Instant::now() >= deadline {
             return Ok(None);
         }
-        tokio::time::sleep(interval).await;
+        time::sleep(interval).await;
     }
 }
 
 /// Attach phase context to both tracing and returned errors.
-/// Check errors retain their type so reports preserve assertion details.
+/// Retains the original cause and captures operation spans before they unwind.
+#[instrument(skip_all, level = "error", fields(phase = name))]
 pub async fn phase<T>(
     name: &str,
     work: impl Future<Output = crate::Result<T>>,
 ) -> crate::Result<T> {
-    debug!(phase = name);
-    work.instrument(error_span!("phase", phase = name)).await.map_err(|error| {
-        match error.downcast::<CheckError>() {
-            Ok(error) => error.context("phase", name).into(),
-            Err(error) => format!("{name}: {error}").into(),
+    debug!("started");
+    work.await.map_err(|source| {
+        OperationError {
+            operation: name.to_owned(),
+            source,
+            trace: SpanTrace::capture(),
         }
+        .into()
     })
 }

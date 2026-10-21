@@ -1,17 +1,22 @@
-use std::time::{Duration, Instant};
+use std::{
+    rc::Rc,
+    time::{Duration, Instant},
+};
 
-use async_trait::async_trait;
 use keypair::Keypair;
 use pubkey::Pubkey;
-use redshift_interface::flexi::{build, FlexiCounter};
+use redshift_interface::schedulecommit::{build, MainAccount};
 use redsuite_core::{
     check, check_eq, prep, topology,
-    topology::{ErOptions, RestartConfig},
-    BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result,
+    topology::{ErOptions, PrivateEr, RestartConfig},
+    BaseCtx, ChainCtx, DynError, ErCtx, PrivateErScenario, Result,
 };
 use signature::Signature;
 use signer::Signer;
+use tokio::time;
 use tracing::debug;
+
+use crate::PAYER_LAMPORTS;
 
 const LABEL: &str = "ledger-retention";
 const SUPERBLOCK_SLOTS: u64 = 40;
@@ -25,8 +30,6 @@ const SIGNATURE_WINDOW: usize = 1_000;
 const BLOCK_SETTLE_SLOTS: u64 = 2;
 const TRUNCATIONS: &str = r#"engine_ledger_operation_duration_micros_count{op="truncate"}"#;
 const SUPERBLOCKS: &str = "engine_ledger_superblocks";
-
-pub struct LedgerRetention;
 
 #[derive(Clone)]
 struct Sent {
@@ -60,17 +63,12 @@ async fn superblocks(er: &ErCtx) -> Result<u64> {
 }
 
 async fn delegate_counter(base: &BaseCtx, er: &ErCtx, payer: &Keypair) -> Result<Pubkey> {
-    let payer_chain = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
-    let (counter, setup) = prep::flexi_counter(
-        payer.pubkey(),
-        LABEL,
-        er.identity(),
-        prep::COMMIT_FREQUENCY_MS,
-    );
-    for instruction in setup {
-        base.submit_and_confirm(payer, &[instruction]).await?;
-    }
-    prep::delegate_payer(base, &payer_chain, payer, er.identity()).await?;
+    let payer_chain = base.funded_payer(PAYER_LAMPORTS).await?;
+    let counter = base
+        .schedulecommit(payer)
+        .init_counter(er.identity(), prep::COMMIT_FREQUENCY_MS)
+        .await?;
+    base.delegate_payer(&payer_chain, payer, er.identity()).await?;
     Ok(counter)
 }
 
@@ -85,12 +83,12 @@ async fn seed_history(er: &ErCtx, counter: &Pubkey, sent: &mut Vec<Sent>) -> Res
             )?;
             let signatures = er.api().get_signatures_for_address(counter, SIGNATURE_WINDOW).await?;
             check!(!signatures.is_empty(), "counter {counter} has no history")?;
-            Ok::<_, redsuite_core::DynError>(signatures)
+            Ok::<_, DynError>(signatures)
         },
     )
     .await?;
     for signature in listed.iter().rev() {
-        let signature: Signature = signature.parse()?;
+        let signature = *signature;
         let tx = er
             .api()
             .get_transaction(&signature)
@@ -141,7 +139,7 @@ async fn observe(er: &ErCtx, sent: &[Sent]) -> Result<HistoryView> {
 
 async fn counter_value(er: &ErCtx, counter: &Pubkey) -> Result<u64> {
     let account = er.account(counter).await?.ok_or("the delegated counter is missing on the er")?;
-    Ok(FlexiCounter::try_decode(&account.data)?.count)
+    Ok(MainAccount::try_decode(&account.data)?.count)
 }
 
 async fn verify(
@@ -196,8 +194,8 @@ async fn verify(
     }
 
     let listed = er.api().get_signatures_for_address(counter, SIGNATURE_WINDOW).await?;
-    let expected: Vec<String> =
-        view.retained.iter().rev().map(|entry| entry.signature.to_string()).collect();
+    let expected: Vec<Signature> =
+        view.retained.iter().rev().map(|entry| entry.signature).collect();
     check_eq!(
         listed,
         expected,
@@ -213,15 +211,16 @@ async fn verify(
     Ok(())
 }
 
-#[async_trait(?Send)]
-impl PrivateErScenario for LedgerRetention {
-    fn name(&self) -> &str {
-        "redshift/ledger_retention"
-    }
+pub struct LedgerRetention {
+    base: Rc<BaseCtx>,
+    private: PrivateEr,
+    payer: Keypair,
+}
 
-    async fn run(&self, base: &BaseCtx) -> Result<()> {
-        let mut private = topology::private_er(
-            base,
+impl PrivateErScenario for LedgerRetention {
+    async fn setup(base: Rc<BaseCtx>, _: ()) -> Result<Self> {
+        let private = topology::private_er(
+            &base,
             ErOptions {
                 label: LABEL.to_owned(),
                 settings: Box::new(|params| {
@@ -233,7 +232,12 @@ impl PrivateErScenario for LedgerRetention {
         )
         .await?;
 
-        let payer = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
+        let payer = base.funded_payer(PAYER_LAMPORTS).await?;
+        Ok(Self { base, private, payer })
+    }
+
+    async fn run(self) -> Result<()> {
+        let Self { base, mut private, payer } = self;
         let mut sent: Vec<Sent> = Vec::new();
         let mut adds: u64 = 0;
         let mut total: u64 = 0;
@@ -244,8 +248,8 @@ impl PrivateErScenario for LedgerRetention {
         let before;
         {
             let er = private.ctx();
-            prep::await_program_clone(er, &redshift_interface::id(), PROGRAM_CLONE_TIMEOUT).await?;
-            counter = delegate_counter(base, er, &payer).await?;
+            er.await_program_clone(&redshift_interface::id(), PROGRAM_CLONE_TIMEOUT).await?;
+            counter = delegate_counter(&base, er, &payer).await?;
             seed_history(er, &counter, &mut sent).await?;
 
             let baseline = truncations(er).await?;
@@ -292,7 +296,7 @@ impl PrivateErScenario for LedgerRetention {
                      transactions",
                     previous_pruned
                 )?;
-                tokio::time::sleep(TX_INTERVAL).await;
+                time::sleep(TX_INTERVAL).await;
             }
 
             before = observe(er, &sent).await?;

@@ -3,8 +3,11 @@ use std::{fs, path::Path};
 use keypair::Keypair;
 use signer::Signer;
 use tracing::debug;
+use url::Url;
 
-use super::{config, identity, process, state, state::StackState};
+use super::{
+    config, config::BasePlan, identity, process, process::PortLease, state, state::StackState,
+};
 use crate::{
     api::Api,
     context::{BaseCtx, ChainCtx},
@@ -21,7 +24,7 @@ pub async fn base_only(config: ExecutionConfig) -> Result<BaseCtx> {
     let _lock = state::acquire_lock().await?;
 
     let state = ensure_base(config).await?;
-    Ok(base_ctx(&state, config))
+    base_ctx(&state, config)
 }
 
 async fn ensure_base(config: ExecutionConfig) -> Result<StackState> {
@@ -42,20 +45,23 @@ async fn ensure_base(config: ExecutionConfig) -> Result<StackState> {
     }
 }
 
-fn base_ctx(state: &StackState, config: ExecutionConfig) -> BaseCtx {
-    BaseCtx::new(
-        format!("http://127.0.0.1:{}", state.base_rpc_port),
-        format!("ws://127.0.0.1:{}", state.base_ws_port),
+fn base_ctx(state: &StackState, config: ExecutionConfig) -> Result<BaseCtx> {
+    Ok(BaseCtx::new(
+        format!("http://127.0.0.1:{}", state.base_rpc_port).parse()?,
+        format!("ws://127.0.0.1:{}", state.base_ws_port).parse()?,
         Some((
-            format!("grpc://127.0.0.1:{}", state.base_grpc_port),
+            format!("grpc://127.0.0.1:{}", state.base_grpc_port).parse()?,
             state.base_plugin.clone(),
         )),
         config,
-    )
+    ))
 }
 
 async fn base_healthy(state: &StackState) -> bool {
-    let base = Api::new(format!("http://127.0.0.1:{}", state.base_rpc_port));
+    let Ok(url) = Url::parse(&format!("http://127.0.0.1:{}", state.base_rpc_port)) else {
+        return false;
+    };
+    let base = Api::new(url);
     matches!(base.get_health().await.as_deref(), Ok("ok"))
 }
 
@@ -64,7 +70,7 @@ async fn boot_base(config: ExecutionConfig) -> Result<StackState> {
     let base_bin = config::find_base_bin()?;
     let er_bin = config::er_bin_path()?;
 
-    let mut base_ports = process::PortLease::default();
+    let mut base_ports = PortLease::default();
     let (base_rpc_port, base_ws_port) = base_ports.pair()?;
     let base_faucet_port = base_ports.single()?;
     let base_gossip_port = base_ports.single()?;
@@ -72,9 +78,8 @@ async fn boot_base(config: ExecutionConfig) -> Result<StackState> {
 
     let identity_pool: Vec<Keypair> =
         (0..identity::IDENTITY_POOL_SIZE).map(|_| Keypair::new()).collect();
-    let clone_url = config::clone_url();
     let base_log = dir.join("base.log");
-    let plan = config::BasePlan::gather(
+    let plan = BasePlan::gather(
         base_bin,
         &er_bin,
         &dir,
@@ -106,7 +111,7 @@ async fn boot_base(config: ExecutionConfig) -> Result<StackState> {
             .iter()
             .map(|reserved| reserved.to_bytes().to_vec())
             .collect(),
-        clone_url,
+        clone_url: plan.clone_url.clone(),
         base_programs: plan.loaded_fixtures,
     };
     if let Err(error) = await_base_ready(&state, &base_log, config).await {
@@ -126,7 +131,7 @@ async fn await_base_ready(
     config: ExecutionConfig,
 ) -> Result<()> {
     process::await_base_serving(
-        &format!("http://127.0.0.1:{}", state.base_rpc_port),
+        &format!("http://127.0.0.1:{}", state.base_rpc_port).parse()?,
         base_log,
         state.base_pid,
         // The ER dials the base WS first and exits if it cannot connect.
@@ -137,11 +142,8 @@ async fn await_base_ready(
     )
     .await?;
 
-    let base = base_ctx(state, config);
-    let mut required = Vec::new();
-    for id in config::CLONED_ACCOUNTS {
-        required.push(id.parse()?);
-    }
+    let base = base_ctx(state, config)?;
+    let mut required = config::CLONED_ACCOUNTS.to_vec();
     for reserved in &state.er_identity_pool {
         let reserved =
             Keypair::try_from(&reserved[..]).map_err(|e| format!("corrupt pool identity: {e}"))?;

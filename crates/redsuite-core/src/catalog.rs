@@ -1,11 +1,19 @@
-use std::{future::Future, path::PathBuf, pin::Pin};
+use std::{path::PathBuf, result};
 
 use clap::ValueEnum;
+use futures_util::future::LocalBoxFuture;
 use magicblock_config::LeaderParams;
 use pubkey::Pubkey;
 
 use crate::{
-    context::ErCtx, profile::ExecutionConfig, scenario::RunRecord, topology::ErOptions, Result,
+    context::ErCtx,
+    profile::ExecutionConfig,
+    scenario::{
+        run_private_er_scenario, run_shared_scenario, PrivateErScenario, RunRecord, Scenario,
+        Verdict,
+    },
+    topology::ErOptions,
+    Result,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
@@ -32,6 +40,12 @@ pub struct ErGroup {
     pub proxied: bool,
 }
 
+pub static DEFAULT: ErGroup = ErGroup {
+    label: "default",
+    settings: |_| {},
+    proxied: false,
+};
+
 impl ErGroup {
     pub fn options(&self) -> ErOptions {
         let settings = self.settings;
@@ -48,14 +62,13 @@ pub enum Er {
     Shared(&'static ErGroup),
     Exclusive(&'static ErGroup),
     Fresh,
-    None,
 }
 
 impl Er {
     pub fn group(self) -> Option<&'static ErGroup> {
         match self {
             Er::Shared(group) | Er::Exclusive(group) => Some(group),
-            Er::Fresh | Er::None => None,
+            Er::Fresh => None,
         }
     }
 }
@@ -65,8 +78,8 @@ pub enum Fixture {
     RedlineProgram,
     RedshiftProgram,
     RedhatProgram,
-    RedshiftProgramSlim,
-    RedshiftProgramSlimUpgraded,
+    UpgradeProbe,
+    UpgradeProbeUpgraded,
 }
 
 impl Fixture {
@@ -86,8 +99,8 @@ impl Fixture {
         Fixture::RedlineProgram,
         Fixture::RedshiftProgram,
         Fixture::RedhatProgram,
-        Fixture::RedshiftProgramSlim,
-        Fixture::RedshiftProgramSlimUpgraded,
+        Fixture::UpgradeProbe,
+        Fixture::UpgradeProbeUpgraded,
     ];
 
     pub const fn so_name(self) -> &'static str {
@@ -95,82 +108,131 @@ impl Fixture {
             Fixture::RedlineProgram => "redline_program.so",
             Fixture::RedshiftProgram => "redshift_program.so",
             Fixture::RedhatProgram => "redhat_program.so",
-            Fixture::RedshiftProgramSlim => "redshift_program_slim.so",
-            Fixture::RedshiftProgramSlimUpgraded => "redshift_program_slim_upgraded.so",
+            Fixture::UpgradeProbe => "upgrade_probe.so",
+            Fixture::UpgradeProbeUpgraded => "upgrade_probe_upgraded.so",
         }
     }
 
-    pub const fn loaded_at_base_boot(self) -> bool {
-        matches!(
-            self,
-            Fixture::RedlineProgram | Fixture::RedshiftProgram | Fixture::RedhatProgram
-        )
-    }
-
-    pub const fn program_id(self) -> Pubkey {
+    /// Fixed address for base-startup fixtures; dynamically deployed probes have none.
+    pub const fn program_id(self) -> Option<Pubkey> {
         match self {
-            Fixture::RedlineProgram => redline_interface::ID,
-            Fixture::RedshiftProgram
-            | Fixture::RedshiftProgramSlim
-            | Fixture::RedshiftProgramSlimUpgraded => redshift_interface::ID,
-            Fixture::RedhatProgram => redhat_interface::ID,
+            Fixture::RedlineProgram => Some(redline_interface::ID),
+            Fixture::RedshiftProgram => Some(redshift_interface::ID),
+            Fixture::RedhatProgram => Some(redhat_interface::ID),
+            Fixture::UpgradeProbe | Fixture::UpgradeProbeUpgraded => None,
         }
     }
 }
 
-pub type ScenarioFuture = Pin<Box<dyn Future<Output = RunRecord>>>;
+pub type ScenarioFuture = LocalBoxFuture<'static, RunRecord>;
+type ScenarioRunner = Box<
+    dyn FnOnce(
+        String,
+        &'static [Fixture],
+        ExecutionConfig,
+        Option<result::Result<ErCtx, String>>,
+    ) -> ScenarioFuture,
+>;
 
+/// Registration is side-effect-free; setup only runs when the entry is consumed.
 pub struct ScenarioEntry {
-    pub family: Family,
     pub short_name: &'static str,
     pub er: Er,
-    pub run: fn(ExecutionConfig, std::result::Result<ErCtx, String>) -> ScenarioFuture,
+    fixtures: &'static [Fixture],
+    run: ScenarioRunner,
+}
+
+/// Registers a scenario using its snake-cased type name. Use `named` for aliases.
+#[macro_export]
+macro_rules! scenario {
+    ($scenario:path, $kind:ident($($args:expr),* $(,)?)) => {{
+        const PARTS: &[&str] = &$crate::__const_str::split!(stringify!($scenario), "::");
+        const NAME: &str = $crate::__const_str::convert_ascii_case!(
+            snake,
+            $crate::__const_str::trim_ascii!(PARTS[PARTS.len() - 1])
+        );
+        <$scenario>::$kind(NAME, $($args),*)
+    }};
 }
 
 impl ScenarioEntry {
-    pub fn name(&self) -> String {
-        format!("{}/{}", self.family.prefix(), self.short_name)
+    pub fn named(mut self, name: &'static str) -> Self {
+        self.short_name = name;
+        self
     }
-}
 
-#[macro_export]
-macro_rules! scenario_catalog {
-    (@execute $grouped:ident($group:expr), $scenario:expr, $fixtures:expr,
-     $config:expr, $er:expr) => {
-        $crate::run_shared_scenario(
-            $scenario, $fixtures, $config, $er,
-        )
-    };
-    (@execute $base_only:ident, $scenario:expr, $fixtures:expr,
-     $config:expr, $er:expr) => {
-        $crate::run_private_er_scenario(
-            $scenario, $fixtures, $config,
-        )
-    };
-    (
-        family: $family:ident,
-        $($short_name:ident => $($segment:ident)::+ {
-            er: $er:ident $(($group:expr))?,
-            fixtures: [$($fixture:expr),* $(,)?]
-            $(,)?
-        }),* $(,)?
-    ) => {
-        pub const SCENARIOS: &[$crate::catalog::ScenarioEntry] = &[
-            $($crate::catalog::ScenarioEntry {
-                family: $crate::catalog::Family::$family,
-                short_name: stringify!($short_name),
-                er: $crate::catalog::Er::$er $((&$group))?,
-                run: |config, _group_er| {
-                    Box::pin($crate::scenario_catalog!(
-                        @execute $er $(($group))?,
-                        scenarios::$($segment)::+,
-                        &[$($fixture),*],
-                        config,
-                        _group_er
-                    ))
-                },
-            },)*
-        ];
+    pub fn name(&self, family: Family) -> String {
+        format!("{}/{}", family.prefix(), self.short_name)
+    }
 
-    };
+    pub fn run(
+        self,
+        family: Family,
+        config: ExecutionConfig,
+        er: Option<result::Result<ErCtx, String>>,
+    ) -> ScenarioFuture {
+        let name = self.name(family);
+        (self.run)(name, self.fixtures, config, er)
+    }
+
+    pub(crate) fn shared<S, V, Options>(
+        short_name: &'static str,
+        er: Er,
+        fixtures: &'static [Fixture],
+        options: Options,
+    ) -> Self
+    where
+        S: Scenario<V, Options>,
+        V: Verdict + 'static,
+        Options: 'static,
+    {
+        Self {
+            short_name,
+            er,
+            fixtures,
+            run: Box::new(move |name, fixtures, config, er| {
+                let er = er.unwrap_or_else(|| Err("shared scenario requires an ER group".into()));
+                Box::pin(run_shared_scenario(
+                    name,
+                    fixtures,
+                    config,
+                    er,
+                    async move |base, er, stage| {
+                        let scenario = S::setup(base, er, options).await?;
+                        *stage = "scenario";
+                        scenario.run().await
+                    },
+                ))
+            }),
+        }
+    }
+
+    pub(crate) fn private<S, V, Options>(
+        short_name: &'static str,
+        fixtures: &'static [Fixture],
+        options: Options,
+    ) -> Self
+    where
+        S: PrivateErScenario<V, Options>,
+        V: Verdict + 'static,
+        Options: 'static,
+    {
+        Self {
+            short_name,
+            er: Er::Fresh,
+            fixtures,
+            run: Box::new(move |name, fixtures, config, _er| {
+                Box::pin(run_private_er_scenario(
+                    name,
+                    fixtures,
+                    config,
+                    async move |base, stage| {
+                        let scenario = S::setup(base, options).await?;
+                        *stage = "scenario";
+                        scenario.run().await
+                    },
+                ))
+            }),
+        }
+    }
 }

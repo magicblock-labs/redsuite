@@ -45,8 +45,12 @@ pub enum Instruction {
 }
 
 pub mod build {
+
     use instruction::{AccountMeta, Instruction as SolanaInstruction};
-    use sdk::consts::{MAGIC_CONTEXT_ID, MAGIC_PROGRAM_ID};
+    use sdk::{
+        consts::{MAGIC_CONTEXT_ID, MAGIC_PROGRAM_ID},
+        delegate_args::{DelegateAccountMetas, DelegateAccounts},
+    };
     use sdk_ids::system_program;
 
     use super::*;
@@ -109,8 +113,8 @@ pub mod build {
         seed: u8,
         authority: Pubkey,
     ) -> SolanaInstruction {
-        let accounts = sdk::delegate_args::DelegateAccounts::new(pda, program_id);
-        let m = sdk::delegate_args::DelegateAccountMetas::from(accounts);
+        let accounts = DelegateAccounts::new(pda, program_id);
+        let m = DelegateAccountMetas::from(accounts);
         let metas = vec![
             AccountMeta::new(payer, true),
             m.delegated_account,

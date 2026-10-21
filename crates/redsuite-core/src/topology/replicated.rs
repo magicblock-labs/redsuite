@@ -1,20 +1,24 @@
 use std::{
+    os::unix::process::ExitStatusExt,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
 use keypair::Keypair;
 use signer::Signer;
+use tokio::time;
 use tracing::debug;
 
 use super::{
     config,
     config::{ErOptions, Settings, VerifierPlan},
     private::{leader_er, PrivateEr},
-    process, state,
+    process,
+    process::PortLease,
+    state,
 };
 use crate::{
-    api::{self, Metrics},
+    api::{Metrics, MetricsCollector},
     context::BaseCtx,
     report,
     resources::LaunchRecord,
@@ -65,8 +69,8 @@ pub struct Verifier {
     proc: process::Owned,
     plan: VerifierPlan,
     log: PathBuf,
-    metrics: api::MetricsCollector,
-    ports: process::PortLease,
+    metrics: MetricsCollector,
+    ports: PortLease,
 }
 
 impl Verifier {
@@ -140,7 +144,7 @@ impl Verifier {
             shutdown: started.elapsed(),
             needed_sigkill,
             exit_code: exit_status.code(),
-            exit_signal: std::os::unix::process::ExitStatusExt::signal(&exit_status),
+            exit_signal: ExitStatusExt::signal(&exit_status),
         })
     }
 
@@ -242,9 +246,9 @@ impl ReplicatedTopology {
 
     pub async fn wait_verifiers_connected(&self, timeout: Duration) -> Result<Duration> {
         let started = Instant::now();
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = time::Instant::now() + timeout;
         for verifier in self.verifiers.iter().filter(|v| v.is_running()) {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let remaining = deadline.saturating_duration_since(time::Instant::now());
             verifier.wait_connected(remaining).await?;
         }
         let expected = self.running_verifiers() as f64;
@@ -252,14 +256,14 @@ impl ReplicatedTopology {
             if self.leader_connections().await? >= expected {
                 return Ok(started.elapsed());
             }
-            if tokio::time::Instant::now() >= deadline {
+            if time::Instant::now() >= deadline {
                 return Err(format!(
                     "the leader did not report {expected:.0} replication \
                      connections within {timeout:?}"
                 )
                 .into());
             }
-            tokio::time::sleep(CONNECT_POLL).await;
+            time::sleep(CONNECT_POLL).await;
         }
     }
 
@@ -308,7 +312,7 @@ pub async fn replicated(base: &BaseCtx, options: ReplicatedOptions) -> Result<Re
         let label = format!("{}-verifier{index}", options.label);
         let storage_dir = dir.join(format!("er-{label}"));
         state::remove_storage(&storage_dir)?;
-        let mut ports = process::PortLease::default();
+        let mut ports = PortLease::default();
         let metrics_port = ports.single()?;
         let plan = VerifierPlan {
             bin: verifier_bin.clone(),
@@ -337,12 +341,12 @@ pub async fn replicated(base: &BaseCtx, options: ReplicatedOptions) -> Result<Re
             pid,
             ..LaunchRecord::default()
         });
-        let metrics_url = format!("http://127.0.0.1:{metrics_port}");
+        let metrics_url = format!("http://127.0.0.1:{metrics_port}").parse()?;
         let verifier = Verifier {
             proc: process::Owned::new("verifier", label, child, record),
             plan,
             log,
-            metrics: api::MetricsCollector::new(&metrics_url),
+            metrics: MetricsCollector::new(metrics_url),
             ports,
         };
         verifier.wait_ready(VERIFIER_READY_TIMEOUT).await?;

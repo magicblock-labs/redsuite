@@ -1,9 +1,12 @@
 use std::{collections::VecDeque, time::Duration};
 
 use futures_util::SinkExt;
-use json::JsonValueTrait;
+use json::{JsonValueTrait, Value};
 use pubkey::Pubkey;
+use signature::Signature;
+use tokio::{time, time::Instant};
 use tokio_tungstenite::tungstenite::Message;
+use url::Url;
 
 use super::conn::{self, CloseReason, RawEvent, Socket};
 use crate::Result;
@@ -13,12 +16,12 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct RawWs {
     socket: Socket,
     next_req_id: u64,
-    queue: VecDeque<(String, u64, json::Value)>,
+    queue: VecDeque<(String, u64, Value)>,
     malformed: usize,
 }
 
 impl RawWs {
-    pub async fn connect(url: &str) -> Result<Self> {
+    pub async fn connect(url: &Url) -> Result<Self> {
         Ok(Self {
             socket: conn::connect(url).await?,
             next_req_id: 1,
@@ -27,7 +30,7 @@ impl RawWs {
         })
     }
 
-    async fn request(&mut self, method: &str, params: &str) -> Result<json::Value> {
+    async fn request(&mut self, method: &str, params: &str) -> Result<Value> {
         let req_id = self.next_req_id;
         self.next_req_id += 1;
         self.socket
@@ -36,12 +39,11 @@ impl RawWs {
             ))
             .await
             .map_err(|error| format!("{method} send: {error}"))?;
-        let deadline = tokio::time::Instant::now() + REQUEST_TIMEOUT;
+        let deadline = Instant::now() + REQUEST_TIMEOUT;
         loop {
-            let remaining = deadline
-                .checked_duration_since(tokio::time::Instant::now())
-                .unwrap_or(Duration::ZERO);
-            let event = tokio::time::timeout(remaining, conn::next_event(&mut self.socket))
+            let remaining =
+                deadline.checked_duration_since(Instant::now()).unwrap_or(Duration::ZERO);
+            let event = time::timeout(remaining, conn::next_event(&mut self.socket))
                 .await
                 .map_err(|_| format!("{method}: no reply within {REQUEST_TIMEOUT:?}"))?;
             match event {
@@ -115,7 +117,7 @@ impl RawWs {
         self.unsubscribe("slotUnsubscribe", subid).await
     }
 
-    pub async fn signature_subscribe(&mut self, signature: &str) -> Result<u64> {
+    pub async fn signature_subscribe(&mut self, signature: &Signature) -> Result<u64> {
         self.subscribe("signatureSubscribe", &conn::signature_params(signature)).await
     }
 
@@ -126,16 +128,15 @@ impl RawWs {
     pub async fn next_notification(
         &mut self,
         timeout: Duration,
-    ) -> Result<Option<(String, u64, json::Value)>> {
+    ) -> Result<Option<(String, u64, Value)>> {
         if let Some(notification) = self.queue.pop_front() {
             return Ok(Some(notification));
         }
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = Instant::now() + timeout;
         loop {
-            let remaining = deadline
-                .checked_duration_since(tokio::time::Instant::now())
-                .unwrap_or(Duration::ZERO);
-            let event = tokio::time::timeout(remaining, conn::next_event(&mut self.socket)).await;
+            let remaining =
+                deadline.checked_duration_since(Instant::now()).unwrap_or(Duration::ZERO);
+            let event = time::timeout(remaining, conn::next_event(&mut self.socket)).await;
             match event {
                 Err(_) => return Ok(None),
                 Ok(Ok(RawEvent::Notification { method, subscription, payload })) => {

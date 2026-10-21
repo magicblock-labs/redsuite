@@ -1,308 +1,33 @@
 use redsuite_core::{
-    catalog::{ErGroup, Family, Fixture, ScenarioEntry},
+    catalog::{Family, ScenarioEntry},
     Result,
 };
 
-pub static DEFAULT: ErGroup = ErGroup {
-    label: "default",
-    settings: |_| {},
-    proxied: false,
-};
-
-pub static RETRIES: ErGroup = ErGroup {
-    label: "transaction-retries",
-    settings: |_| {},
-    proxied: true,
-};
-
-pub static COMMITTOR: ErGroup = ErGroup {
-    label: "committor-faults",
-    settings: |_| {},
-    proxied: true,
-};
-
-pub mod redline {
-    use ::redline::scenarios;
-    use redsuite_core::scenario_catalog;
-
-    use super::{Fixture, DEFAULT};
-
-    scenario_catalog! {
-        family: Redline,
-        simple_load => aperture::simple_load::SimpleLoad {
-            er: Exclusive(DEFAULT),
-            fixtures: [Fixture::RedlineProgram],
-        },
-        rpc_warm_ingress => aperture::rpc_warm_ingress::WarmIngress {
-            er: Exclusive(DEFAULT),
-            fixtures: [Fixture::RedlineProgram],
-        },
-        rpc_capacity_blast => aperture::rpc_capacity_blast::RpcCapacityBlast {
-            er: Exclusive(DEFAULT),
-            fixtures: [Fixture::RedlineProgram],
-        },
-        high_cu => aperture::high_cu::HighCu {
-            er: Exclusive(DEFAULT),
-            fixtures: [Fixture::RedlineProgram],
-        },
-        ws_fanout_threshold => aperture::ws_fanout_threshold::WsFanoutThreshold {
-            er: Exclusive(DEFAULT),
-            fixtures: [Fixture::RedlineProgram],
-        },
-        ws_conn_capacity => aperture::ws_conn_capacity::WsConnCapacity {
-            er: Exclusive(DEFAULT),
-            fixtures: [],
-        },
-        hot_account_cliff => scheduler::hot_account_cliff::HotAccountCliff {
-            er: Exclusive(DEFAULT),
-            fixtures: [Fixture::RedlineProgram],
-        },
-        executor_saturation => scheduler::executor_saturation::ExecutorSaturation {
-            er: Exclusive(DEFAULT),
-            fixtures: [Fixture::RedlineProgram],
-        },
-        conflict_ordering => scheduler::conflict_ordering::ConflictOrdering {
-            er: Exclusive(DEFAULT),
-            fixtures: [Fixture::RedlineProgram],
-        },
-        mixed_sustained_load => scheduler::mixed_sustained_load::MixedSustainedLoad {
-            er: Exclusive(DEFAULT),
-            fixtures: [Fixture::RedlineProgram],
-        },
-        clone_lru_churn => chainlink::clone_lru_churn::CloneLruChurn {
-            er: Exclusive(DEFAULT),
-            fixtures: [Fixture::RedlineProgram],
-        },
-        ensure_gate_stall => chainlink::ensure_gate_stall::EnsureGateStall {
-            er: Exclusive(DEFAULT),
-            fixtures: [Fixture::RedlineProgram],
-        },
-        cold_hydration_tail => chainlink::cold_hydration_tail::ColdHydrationTail {
-            er: Exclusive(DEFAULT),
-            fixtures: [Fixture::RedlineProgram],
-        },
-        commit_width_envelope => committor::commit_width_envelope::CommitWidthEnvelope {
-            er: Exclusive(DEFAULT),
-            fixtures: [Fixture::RedlineProgram],
-        },
-        commit_throughput_ceiling => committor::commit_throughput_ceiling::CommitThroughputCeiling {
-            er: Exclusive(DEFAULT),
-            fixtures: [Fixture::RedlineProgram],
-        },
-        storage_prodsize_sustain => storage::storage_prodsize_sustain::StorageProdsizeSustain {
-            er: Exclusive(DEFAULT),
-            fixtures: [Fixture::RedlineProgram],
-        },
-        superblock_boundary_latency => storage::superblock_boundary_latency::SuperblockBoundaryLatency {
-            er: Fresh,
-            fixtures: [Fixture::RedlineProgram],
-        },
-        restart_under_load => lifecycle::restart_under_load::RestartUnderLoad {
-            er: Fresh,
-            fixtures: [Fixture::RedlineProgram],
-        },
-        protocol_boundary_selftest => harness::protocol_boundary_selftest::ProtocolBoundarySelftest {
-            er: Exclusive(DEFAULT),
-            fixtures: [Fixture::RedlineProgram],
-        },
-    }
-}
-
-pub mod redshift {
-    use ::redshift::scenarios;
-    use redsuite_core::scenario_catalog;
-
-    use super::{Fixture, COMMITTOR, DEFAULT, RETRIES};
-
-    scenario_catalog! {
-        family: Redshift,
-        ledger_retention => storage::ledger_retention::LedgerRetention {
-            er: Fresh,
-            fixtures: [Fixture::RedshiftProgram],
-        },
-        verifier_lifecycle => replication::verifier_lifecycle::VerifierLifecycle {
-            er: Fresh,
-            fixtures: [Fixture::RedlineProgram],
-        },
-        checkpoint_durability => storage::checkpoint_durability::CheckpointDurability {
-            er: Fresh,
-            fixtures: [Fixture::RedshiftProgram],
-        },
-        example => harness::example::Example {
-            er: Shared(DEFAULT),
-            fixtures: [],
-        },
-        clone_on_access => chainlink::clone_on_access::CloneOnAccess {
-            er: Shared(DEFAULT),
-            fixtures: [Fixture::RedlineProgram],
-        },
-        cache_lifecycle => chainlink::cache_lifecycle::CacheLifecycle::Churn {
-            er: Fresh,
-            fixtures: [Fixture::RedlineProgram],
-        },
-        undelegation_reconnect_gap => chainlink::cache_lifecycle::CacheLifecycle::UndelegationReconnectGap {
-            er: Fresh,
-            fixtures: [Fixture::RedlineProgram],
-        },
-        undelegation_grpc_redundancy => chainlink::undelegation_grpc_redundancy::GrpcRedundancy {
-            er: Fresh,
-            fixtures: [Fixture::RedlineProgram],
-        },
-        commit_blackout => committor::commit_blackout::CommitBlackout {
-            er: Exclusive(COMMITTOR),
-            fixtures: [Fixture::RedlineProgram],
-        },
-        commit_exactly_once => committor::commit_exactly_once::CommitExactlyOnce {
-            er: Exclusive(COMMITTOR),
-            fixtures: [Fixture::RedlineProgram, Fixture::RedshiftProgram],
-        },
-        commit_settlement_order => committor::commit_settlement_order::CommitSettlementOrder {
-            er: Fresh,
-            fixtures: [Fixture::RedlineProgram],
-        },
-        undelegation_recovery => committor::undelegation_recovery::UndelegationRecovery {
-            er: Exclusive(COMMITTOR),
-            fixtures: [Fixture::RedlineProgram],
-        },
-        delegation_session_isolation => committor::delegation_session_isolation::DelegationSessionIsolation {
-            er: Shared(DEFAULT),
-            fixtures: [Fixture::RedshiftProgram],
-        },
-        commit_and_undelegate => committor::commit_and_undelegate::CommitAndUndelegate {
-            er: Shared(DEFAULT),
-            fixtures: [Fixture::RedshiftProgram],
-        },
-        config_gates => harness::config_gates::ConfigGates {
-            er: Fresh,
-            fixtures: [Fixture::RedshiftProgram],
-        },
-        task_scheduler => scheduler::task_scheduler::TaskScheduler {
-            er: Exclusive(DEFAULT),
-            fixtures: [Fixture::RedshiftProgram],
-        },
-        snapshot_read_race => storage::snapshot_read_race::SnapshotReadRace {
-            er: Fresh,
-            fixtures: [Fixture::RedshiftProgram],
-        },
-        transaction_retry_cold_fetch => aperture::transaction_retries::TransactionRetries::ColdFetch {
-            er: Exclusive(RETRIES),
-            fixtures: [Fixture::RedshiftProgram],
-        },
-        transaction_retry_concurrent => aperture::transaction_retries::TransactionRetries::Concurrent {
-            er: Exclusive(RETRIES),
-            fixtures: [Fixture::RedshiftProgram],
-        },
-        transaction_retry_subscriptions => aperture::transaction_retries::TransactionRetries::Subscriptions {
-            er: Exclusive(RETRIES),
-            fixtures: [Fixture::RedshiftProgram, Fixture::RedlineProgram],
-        },
-        transaction_retry_expiry_restart => aperture::transaction_retries::TransactionRetries::ExpiryRestart {
-            er: Fresh,
-            fixtures: [Fixture::RedshiftProgram],
-        },
-        rpc_lifecycle => aperture::rpc_lifecycle::RpcLifecycle {
-            er: Shared(DEFAULT),
-            fixtures: [Fixture::RedlineProgram],
-        },
-        rpc_token_queries => aperture::rpc_token_queries::RpcTokenQueries {
-            er: Shared(DEFAULT),
-            fixtures: [],
-        },
-        rpc_compat_methods => aperture::rpc_compat_methods::RpcCompatMethods {
-            er: Fresh,
-            fixtures: [],
-        },
-        api_invariants => harness::api_invariants::ApiInvariants {
-            er: None,
-            fixtures: [],
-        },
-        claim_fees => committor::claim_fees::ClaimFees {
-            er: None,
-            fixtures: [],
-        },
-        account_info_semantics => chainlink::account_info_semantics::AccountInfoSemantics {
-            er: Shared(DEFAULT),
-            fixtures: [],
-        },
-        multi_program_clone => chainlink::multi_program_clone::MultiProgramClone {
-            er: Shared(DEFAULT),
-            fixtures: [Fixture::RedlineProgram],
-        },
-        program_upgrade => chainlink::program_upgrade::ProgramUpgrade {
-            er: Fresh,
-            fixtures: [Fixture::RedlineProgram, Fixture::RedshiftProgramSlim, Fixture::RedshiftProgramSlimUpgraded],
-        },
-        loader_matrix => chainlink::loader_matrix::LoaderMatrix {
-            er: Shared(DEFAULT),
-            fixtures: [Fixture::RedshiftProgram],
-        },
-        projected_token_lifecycle => chainlink::projected_token_lifecycle::ProjectedTokenLifecycle {
-            er: Fresh,
-            fixtures: [Fixture::RedlineProgram],
-        },
-        aml_gate => chainlink::aml_gate::AmlGate {
-            er: Fresh,
-            fixtures: [],
-        },
-        activation_single_shot => chainlink::activation_single_shot::ActivationSingleShot {
-            er: Fresh,
-            fixtures: [Fixture::RedshiftProgram],
-        },
-        table_mania => committor::table_mania::TableManiaScenario {
-            er: None,
-            fixtures: [],
-        },
-    }
-}
-
-pub mod redhat {
-    use ::redhat::scenarios;
-    use redsuite_core::scenario_catalog;
-
-    use super::{Fixture, DEFAULT};
-
-    scenario_catalog! {
-        family: Redhat,
-        ephemeral_accounts => magicblock::ephemeral_accounts::EphemeralAccounts {
-            er: Exclusive(DEFAULT),
-            fixtures: [Fixture::RedshiftProgram],
-        },
-        illegal_writable => chainlink::illegal_writable::IllegalWritable {
-            er: Shared(DEFAULT),
-            fixtures: [Fixture::RedhatProgram, Fixture::RedshiftProgram],
-        },
-    }
-}
-
-fn entries(family: Family) -> &'static [ScenarioEntry] {
+fn entries(family: Family) -> Vec<ScenarioEntry> {
     match family {
-        Family::Redline => redline::SCENARIOS,
-        Family::Redshift => redshift::SCENARIOS,
-        Family::Redhat => redhat::SCENARIOS,
-    }
-}
-
-fn matching(family: Family, target: &str) -> Vec<&'static ScenarioEntry> {
-    let (exact, prefixed): (Vec<_>, Vec<_>) = entries(family)
-        .iter()
-        .filter(|entry| entry.name().starts_with(target) || entry.short_name.starts_with(target))
-        .partition(|entry| entry.name() == target || entry.short_name == target);
-    if exact.is_empty() {
-        prefixed
-    } else {
-        exact
+        Family::Redline => redline::scenarios::catalog(),
+        Family::Redshift => redshift::scenarios::catalog(),
+        Family::Redhat => redhat::scenarios::catalog(),
     }
 }
 
 /// Resolve selections within one family, preferring exact names over prefixes.
 /// Overlapping selections form an ordered union; no selections means the family.
-pub fn select(family: Family, targets: &[String]) -> Result<Vec<&'static ScenarioEntry>> {
+pub fn select(family: Family, targets: &[String]) -> Result<Vec<ScenarioEntry>> {
+    let entries = entries(family);
     if targets.is_empty() {
-        return Ok(entries(family).iter().collect());
+        return Ok(entries);
     }
-    let mut scenarios: Vec<&ScenarioEntry> = Vec::new();
+    let mut selected = Vec::new();
     for target in targets {
-        let matches = matching(family, target);
+        let (exact, prefixed): (Vec<_>, Vec<_>) = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                entry.name(family).starts_with(target) || entry.short_name.starts_with(target)
+            })
+            .partition(|(_, entry)| entry.name(family) == *target || entry.short_name == target);
+        let matches = if exact.is_empty() { prefixed } else { exact };
         if matches.is_empty() {
             return Err(format!(
                 "nothing matches `{target}` — `redsuite {} list` shows what exists",
@@ -310,11 +35,12 @@ pub fn select(family: Family, targets: &[String]) -> Result<Vec<&'static Scenari
             )
             .into());
         }
-        for entry in matches {
-            if !scenarios.iter().any(|known| known.short_name == entry.short_name) {
-                scenarios.push(entry);
+        for (index, _) in matches {
+            if !selected.contains(&index) {
+                selected.push(index);
             }
         }
     }
-    Ok(scenarios)
+    let mut entries: Vec<_> = entries.into_iter().map(Some).collect();
+    Ok(selected.into_iter().filter_map(|index| entries[index].take()).collect())
 }

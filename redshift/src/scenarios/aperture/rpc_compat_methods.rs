@@ -1,7 +1,7 @@
-use std::time::Duration;
+use std::{future::Future, rc::Rc, time::Duration};
 
-use async_trait::async_trait;
 use futures_util::future::join_all;
+use hash::Hash;
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
@@ -11,11 +11,13 @@ use redsuite_core::{
     rpc_client_api::{
         config::RpcLargestAccountsConfig, request::RpcRequest, response::RpcBlockCommitment,
     },
-    topology::{self, ErOptions},
+    topology::{self, ErOptions, PrivateEr},
     BaseCtx, ChainCtx, PrivateErScenario, Result,
 };
+use serde_json::Value;
 use signer::Signer;
 use solana_commitment_config::CommitmentConfig;
+use tokio::time;
 
 const REQUESTS: usize = 256;
 const BURST_DEADLINE: Duration = Duration::from_secs(20);
@@ -30,8 +32,6 @@ const INVALID_REQUEST: i64 = -32600;
 const METHOD_NOT_FOUND: i64 = -32601;
 const UNKNOWN_METHOD: &str = "getSomethingThatDoesNotExist";
 const NO_PARAMS: [u8; 0] = [];
-
-pub struct RpcCompatMethods;
 
 struct Fixture {
     identity: Pubkey,
@@ -199,7 +199,7 @@ async fn run_method(client: &RpcClient, fixture: &Fixture, method: Method) -> Re
         Method::GenesisHash => {
             check_eq!(
                 client.get_genesis_hash().await?,
-                hash::Hash::default(),
+                Hash::default(),
                 "getGenesisHash must be the default hash"
             )?;
         }
@@ -359,21 +359,22 @@ async fn run_method(client: &RpcClient, fixture: &Fixture, method: Method) -> Re
     Ok(observed_slot)
 }
 
-async fn bounded<T>(label: &str, call: impl std::future::Future<Output = T>) -> Result<T> {
-    tokio::time::timeout(NEGATIVE_DEADLINE, call)
+async fn bounded<T>(label: &str, call: impl Future<Output = T>) -> Result<T> {
+    time::timeout(NEGATIVE_DEADLINE, call)
         .await
         .map_err(|_| format!("{label} did not answer within {NEGATIVE_DEADLINE:?}").into())
 }
 
-#[async_trait(?Send)]
-impl PrivateErScenario for RpcCompatMethods {
-    fn name(&self) -> &str {
-        "redshift/rpc_compat_methods"
-    }
+pub struct RpcCompatMethods {
+    private: PrivateEr,
+    client: RpcClient,
+    fixture: Fixture,
+}
 
-    async fn run(&self, base: &BaseCtx) -> Result<()> {
+impl PrivateErScenario for RpcCompatMethods {
+    async fn setup(base: Rc<BaseCtx>, _: ()) -> Result<Self> {
         let private = topology::private_er(
-            base,
+            &base,
             ErOptions {
                 label: "rpc-compat-methods".into(),
                 settings: Box::new(|params| {
@@ -384,7 +385,7 @@ impl PrivateErScenario for RpcCompatMethods {
         )
         .await?;
         let er = private.ctx();
-        let client = RpcClient::new_with_commitment(er.api().url().to_owned(), confirmed());
+        let client = RpcClient::new_with_commitment(er.api().url().to_string(), confirmed());
         let slot_floor = check::poll_for("configured epoch boundary", BURST_DEADLINE, || async {
             let slot = client.get_slot().await?;
             check!(slot > SUPERBLOCK_SLOTS, "advance beyond the first epoch")?;
@@ -397,10 +398,16 @@ impl PrivateErScenario for RpcCompatMethods {
             slot_floor,
         };
 
+        Ok(Self { private, client, fixture })
+    }
+
+    async fn run(self) -> Result<()> {
+        let Self { private, client, fixture } = self;
+        let er = private.ctx();
         let requests = join_all(
             (0..REQUESTS).map(|index| run_method(&client, &fixture, CYCLE[index % CYCLE.len()])),
         );
-        let outcomes = tokio::time::timeout(BURST_DEADLINE, requests).await.map_err(|_| {
+        let outcomes = time::timeout(BURST_DEADLINE, requests).await.map_err(|_| {
             format!(
                 "the burst of {REQUESTS} requests exceeded \
                      {BURST_DEADLINE:?}"
@@ -453,7 +460,7 @@ impl PrivateErScenario for RpcCompatMethods {
         )?;
         let raw_airdrop = bounded(
             "raw requestAirdrop",
-            er.api().call::<serde_json::Value>(
+            er.api().call::<Value>(
                 "requestAirdrop",
                 &(fixture.identity.to_string(), AIRDROP_LAMPORTS),
             ),
@@ -479,13 +486,13 @@ impl PrivateErScenario for RpcCompatMethods {
             }
         }
 
-        let routes: Vec<serde_json::Value> =
+        let routes: Vec<Value> =
             bounded("getRoutes", er.api().call("getRoutes", &NO_PARAMS)).await??;
         check!(routes.is_empty(), "getRoutes must be empty, got {routes:?}")?;
 
         let unknown = bounded(
             UNKNOWN_METHOD,
-            er.api().call::<serde_json::Value>(UNKNOWN_METHOD, &NO_PARAMS),
+            er.api().call::<Value>(UNKNOWN_METHOD, &NO_PARAMS),
         )
         .await?;
         match unknown {

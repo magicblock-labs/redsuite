@@ -1,12 +1,10 @@
 use std::{cell::RefCell, rc::Rc, sync::Arc, time::Duration};
 
-use async_trait::async_trait;
 use pubkey::Pubkey;
 use redsuite_core::{
-    check, check_eq, prep,
+    check, check_eq,
     profile::ProfileValues,
-    redline::{causal::HASH_INIT, Accounts},
-    report,
+    redline::{causal, Accounts},
     report::Unit,
     runner::{execute, Pacing, RunConfig, RunOutcome},
     transport::{
@@ -18,12 +16,16 @@ use redsuite_core::{
 use signature::Signature;
 use tracing::debug;
 
-use crate::program::{instruction::build, layout, utils::hash_chain};
+use crate::{
+    metrics,
+    program::{instruction::build, layout, utils::hash_chain},
+    ACCOUNT_SPACE,
+};
 
 const PAYER_LAMPORTS: u64 = 2_000_000_000;
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(300);
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(20);
-const TX_COUNT: &str = crate::metrics::ENGINE_TRANSACTIONS;
+const TX_COUNT: &str = metrics::ENGINE_TRANSACTIONS;
 const LIGHT_ITERS: u32 = 1;
 const HEAVY_ITERS: u32 = 20;
 const CU_CONTRAST_FLOOR: f64 = 10.0;
@@ -89,9 +91,10 @@ async fn run_cell(
     let warmup_request = |iteration: u64| {
         let global_id = offset + iteration;
         let pda_index = ((global_id - 1) % pdas.len() as u64) as usize;
-        let ix = build::expensive_hash_compute(global_id, HASH_INIT, iters, &[pdas[pda_index]]);
+        let ix =
+            build::expensive_hash_compute(global_id, causal::HASH_INIT, iters, &[pdas[pda_index]]);
         let sender = senders[(global_id as usize) % senders.len()].clone();
-        sender.staged(&[ix])
+        sender.staged([ix])
     };
     let count_before_warmup = er.scrape_metrics().await?.get(TX_COUNT);
     let warm = execute(
@@ -130,7 +133,8 @@ async fn run_cell(
     let request = |iteration: u64| {
         let global_id = offset + iteration;
         let pda_index = ((global_id - 1) % pdas.len() as u64) as usize;
-        let ix = build::expensive_hash_compute(global_id, HASH_INIT, iters, &[pdas[pda_index]]);
+        let ix =
+            build::expensive_hash_compute(global_id, causal::HASH_INIT, iters, &[pdas[pda_index]]);
         updates.track(global_id, pdas[pda_index]);
         let sender = senders[(global_id as usize) % senders.len()].clone();
         let probe = probe.clone();
@@ -172,7 +176,7 @@ async fn run_cell(
     updates.await_settled(SETTLE_TIMEOUT).await?;
     let after = er.scrape_metrics().await?;
     let delta = MetricsDelta::new(before, after);
-    if let Some(failed) = delta.counter_all(crate::metrics::FAILED_TRANSACTIONS) {
+    if let Some(failed) = delta.counter_all(metrics::FAILED_TRANSACTIONS) {
         check_eq!(failed, 0.0, "{label}: transactions failed on the validator")?;
     }
     let update_outcome = updates.finalize();
@@ -197,34 +201,34 @@ async fn run_cell(
     })
 }
 
-pub struct HighCu;
+pub struct HighCu {
+    base: Rc<BaseCtx>,
+    er: ErCtx,
+    profile: &'static Profile,
+    senders: Vec<TxSender>,
+    pdas: Vec<Pubkey>,
+}
 
-#[async_trait(?Send)]
 impl Scenario<ScenarioReport> for HighCu {
-    fn name(&self) -> &str {
-        "redline/high_cu"
-    }
-
-    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
+    async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
         let profile = PROFILES.select(base.config().profile);
-        let payers = prep::funded_payers(base, profile.payers, PAYER_LAMPORTS).await?;
-        let pdas = Accounts::new(crate::ACCOUNT_SPACE, er.identity())
-            .init_delegated(base, &payers[0], profile.accounts)
+        let payers = base.funded_payers(profile.payers, PAYER_LAMPORTS).await?;
+        let pdas = Accounts::new(ACCOUNT_SPACE, er.identity())
+            .init_delegated(base.as_ref(), &payers[0], profile.accounts)
             .await?;
-        prep::await_clones(
-            er,
-            &pdas,
-            crate::ACCOUNT_SPACE as usize,
-            Duration::from_secs(15),
-        )
-        .await?;
+        er.await_clones(&pdas, ACCOUNT_SPACE as usize, Duration::from_secs(15)).await?;
         let senders: Vec<TxSender> =
             payers.into_iter().map(|payer| er.sender(Rc::new(payer))).collect();
 
+        Ok(Self { base, er, profile, senders, pdas })
+    }
+
+    async fn run(self) -> Result<ScenarioReport> {
+        let Self { base, er, profile, senders, pdas } = self;
         let mut offset = 0u64;
         let mut cells: Vec<Cell> = Vec::new();
         for (label, iters) in [("light", LIGHT_ITERS), ("heavy", HEAVY_ITERS)] {
-            let cell = run_cell(er, &senders, &pdas, profile, label, iters, offset).await?;
+            let cell = run_cell(&er, &senders, &pdas, profile, label, iters, offset).await?;
             offset += profile.warmup + profile.iterations;
             debug!(
                 label,
@@ -232,7 +236,7 @@ impl Scenario<ScenarioReport> for HighCu {
                 "compute cell finished",
             );
 
-            let cell_report = ScenarioReport::ok(&format!("{}/{label}", self.name()))
+            let cell_report = ScenarioReport::ok()
                 .setting("profile", profile.name)
                 .setting("sha256 iters", cell.iters)
                 .setting("shape", "width-1 sha256 hash-chain compute")
@@ -259,13 +263,13 @@ impl Scenario<ScenarioReport> for HighCu {
                     cell.validator_avg_us,
                 )
                 .metric_if("validator txs in window", Unit::Count, cell.validator_txs);
-            report::persist_cell(self.name(), &cell_report);
+            base.report_cell(label, &cell_report)?;
             cells.push(cell);
         }
 
         let heavy_start = offset - profile.iterations + 1;
         let heavy_end = offset;
-        let expected_hash = hash_chain(HASH_INIT.to_bytes(), HEAVY_ITERS);
+        let expected_hash = hash_chain(causal::HASH_INIT.to_bytes(), HEAVY_ITERS);
         let pool = pdas.len() as u64;
         let end_index = (heavy_end - 1) % pool;
         for (index, pda) in pdas.iter().enumerate() {
@@ -309,7 +313,7 @@ impl Scenario<ScenarioReport> for HighCu {
             _ => None,
         };
 
-        let mut summary = ScenarioReport::ok(self.name())
+        let mut summary = ScenarioReport::ok()
             .setting("profile", profile.name)
             .setting("shape", "width-1 sha256 hash-chain compute")
             .setting("light iters", LIGHT_ITERS)

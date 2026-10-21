@@ -1,4 +1,8 @@
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    io::ErrorKind,
+    path::{Path, PathBuf},
+};
 
 use super::{process, state};
 use crate::Result;
@@ -56,7 +60,7 @@ pub fn down() -> Result<()> {
             }
             known.push(state.base_pid);
             if let Err(error) = fs::remove_file(state::state_path()) {
-                if error.kind() != std::io::ErrorKind::NotFound {
+                if error.kind() != ErrorKind::NotFound {
                     return Err(error.into());
                 }
             }
@@ -91,7 +95,7 @@ pub fn wipe_storage() -> Result<Vec<PathBuf>> {
     Ok(removed)
 }
 
-fn sweep(dir: &std::path::Path) -> Result<Vec<PathBuf>> {
+fn sweep(dir: &Path) -> Result<Vec<PathBuf>> {
     let Ok(entries) = fs::read_dir(dir) else {
         return Ok(Vec::new());
     };

@@ -1,18 +1,24 @@
-use std::time::{Duration, Instant};
+use std::{
+    rc::Rc,
+    time::{Duration, Instant},
+};
 
-use async_trait::async_trait;
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
     check, check_eq,
     netfault::{BaseProxies, Selector},
-    prep,
     topology::RestartConfig,
     BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
 use signer::Signer;
+use tokio::time;
 
-use crate::program::{instruction::build, DELEGATION_PROGRAM_ID};
+use super::PROXIED_GROUP;
+use crate::{
+    program::{instruction::build, DELEGATION_PROGRAM_ID},
+    ACCOUNT_SPACE, LOCKOUT_REJECTIONS, PAYER_LAMPORTS,
+};
 
 const CLONE_TIMEOUT: Duration = Duration::from_secs(30);
 const INTERCEPT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -22,7 +28,11 @@ const REDELEGATE_TIMEOUT: Duration = Duration::from_secs(60);
 const POLL: Duration = Duration::from_millis(250);
 const HIDDEN: &str = "notification hidden by redsuite";
 
-pub struct UndelegationRecovery;
+pub struct UndelegationRecovery {
+    base: Rc<BaseCtx>,
+    er: ErCtx,
+    payer: Keypair,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Recovery {
@@ -44,7 +54,7 @@ fn value(case: u64, step: u64) -> u64 {
 }
 
 async fn write(er: &ErCtx, payer: &Keypair, id: u64, account: &Pubkey) -> Result<Vec<u8>> {
-    er.submit_and_confirm(payer, &[build::simple_byte_set(id, &[*account])]).await?;
+    er.redline(payer).write(id, &[*account]).await?;
     let data = er.account(account).await?.ok_or("er copy vanished after the write")?.data;
     check_eq!(
         crate::written_id(&data),
@@ -62,18 +72,14 @@ async fn rejected_write(
     snapshot: &[u8],
     when: &str,
 ) -> Result<()> {
-    let attempt = er.submit_and_confirm(payer, &[build::simple_byte_set(id, &[*account])]).await;
+    let attempt = er.redline(payer).write(id, &[*account]).await;
     check!(
         attempt.is_err(),
         "an er write {when} must be rejected while undelegation is pending, \
          got {attempt:?}"
     )?;
     let error = format!("{:?}", attempt.unwrap_err());
-    crate::rejection_code(
-        &format!("the er write {when}"),
-        &crate::LOCKOUT_REJECTIONS,
-        &error,
-    )?;
+    crate::rejection_code(&format!("the er write {when}"), &LOCKOUT_REJECTIONS, &error)?;
     let on_er = er.account(account).await?.ok_or("er copy vanished during the lockout")?;
     check_eq!(
         on_er.data,
@@ -115,7 +121,7 @@ async fn await_ownership_return(
             "base must complete the undelegation of {account} within \
              {COMPLETION_TIMEOUT:?}"
         )?;
-        tokio::time::sleep(POLL).await;
+        time::sleep(POLL).await;
     }
 }
 
@@ -168,11 +174,7 @@ async fn redelegate_and_write(
     check::poll(
         "the er accepts writes again once the account is redelegated",
         REDELEGATE_TIMEOUT,
-        || async {
-            er.submit_and_confirm(payer, &[build::simple_byte_set(id, &[*account])])
-                .await
-                .is_ok()
-        },
+        || async { er.redline(payer).write(id, &[*account]).await.is_ok() },
     )
     .await?;
     let on_er = er
@@ -197,17 +199,13 @@ async fn recover(
 ) -> Result<()> {
     let case = u64::from(seed);
     let identity = er.identity();
-    let account = crate::init_delegated_account(base, payer, seed, identity).await?;
-    prep::await_clones(er, &[account], crate::ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
+    let account = base.redline(payer).init_delegated(ACCOUNT_SPACE, identity, seed).await?;
+    er.await_clones(&[account], ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
     let snapshot = write(er, payer, value(case, 1), &account).await?;
 
     let submission =
         proxies.intercept(Selector::method("sendTransaction").http().request().account(&account));
-    er.submit_and_confirm(
-        payer,
-        &[build::commit_and_undelegate_accounts(case, payer.pubkey(), &[account])],
-    )
-    .await?;
+    er.redline(payer).commit_and_undelegate(case, &[account]).await?;
     let held = submission.wait(INTERCEPT_TIMEOUT).await?;
     rejected_write(
         er,
@@ -267,8 +265,7 @@ async fn recover(
     }
 
     let base_write = value(case, 5);
-    base.submit_and_confirm(payer, &[build::simple_byte_set(base_write, &[account])])
-        .await?;
+    base.redline(payer).write(base_write, &[account]).await?;
     await_er_value(
         er,
         &account,
@@ -284,18 +281,19 @@ async fn recover(
     Ok(())
 }
 
-#[async_trait(?Send)]
 impl Scenario for UndelegationRecovery {
-    fn name(&self) -> &str {
-        "redshift/undelegation_recovery"
+    async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
+        er.proxies().ok_or(PROXIED_GROUP)?;
+        let payer = base.funded_payer(PAYER_LAMPORTS).await?;
+
+        Ok(Self { base, er, payer })
     }
 
-    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<()> {
-        let proxies = er.proxies().ok_or(super::PROXIED_GROUP)?;
-        let payer = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
-
-        recover(base, er, proxies, &payer, 1, Recovery::Reconnect).await?;
-        recover(base, er, proxies, &payer, 2, Recovery::Restart).await?;
+    async fn run(self) -> Result<()> {
+        let Self { base, er, payer } = self;
+        let proxies = er.proxies().ok_or(PROXIED_GROUP)?;
+        recover(&base, &er, proxies, &payer, 1, Recovery::Reconnect).await?;
+        recover(&base, &er, proxies, &payer, 2, Recovery::Restart).await?;
 
         Ok(())
     }

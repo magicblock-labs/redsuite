@@ -1,23 +1,85 @@
-use std::{ops::Range, sync::Arc};
+use std::{ops::Range, slice, sync::Arc};
 
 use instruction::Instruction;
 use keypair::Keypair;
 use pubkey::Pubkey;
-use redline_interface::instruction::build;
+use redline_interface::{instruction::build, layout};
+use signature::Signature;
 use signer::Signer;
+use url::Url;
 
 use crate::{
     prep,
     runner::{execute_threaded, RunOutcome, ThreadRunConfig},
     transport::clock::{SendClock, Stamped},
-    ChainCtx, Result,
+    ChainCtx, CheckError, Result,
 };
 
 pub mod causal;
 
+pub struct Program<'a, C> {
+    pub(crate) chain: &'a C,
+    pub(crate) payer: &'a Keypair,
+    pub(crate) id: Pubkey,
+}
+
+impl<C: ChainCtx> Program<'_, C> {
+    pub fn at(mut self, id: Pubkey) -> Self {
+        self.id = id;
+        self
+    }
+
+    fn accounts(&self, space: u32, authority: Pubkey) -> Accounts {
+        Accounts {
+            program_id: self.id,
+            space,
+            authority,
+        }
+    }
+
+    pub async fn init(&self, space: u32, authority: Pubkey, seed: u8) -> Result<Pubkey> {
+        self.accounts(space, authority).init(self.chain, self.payer, seed, false).await
+    }
+
+    pub async fn init_delegated(&self, space: u32, authority: Pubkey, seed: u8) -> Result<Pubkey> {
+        self.accounts(space, authority).init(self.chain, self.payer, seed, true).await
+    }
+
+    pub async fn write(&self, value: u64, keys: &[Pubkey]) -> Result<Signature> {
+        self.chain
+            .submit_and_confirm(
+                self.payer,
+                &[build::simple_byte_set_at(self.id, value, keys)],
+            )
+            .await
+    }
+
+    pub async fn init_many(
+        &self,
+        space: u32,
+        authority: Pubkey,
+        count: usize,
+    ) -> Result<Vec<Pubkey>> {
+        self.accounts(space, authority)
+            .init_batched(self.chain, slice::from_ref(self.payer), count, false)
+            .await
+    }
+
+    pub async fn commit(&self, id: u64, keys: &[Pubkey]) -> Result<Signature> {
+        let mut ix = build::commit_accounts(id, self.payer.pubkey(), keys);
+        ix.program_id = self.id;
+        self.chain.submit_and_confirm(self.payer, &[ix]).await
+    }
+
+    pub async fn commit_and_undelegate(&self, id: u64, keys: &[Pubkey]) -> Result<Signature> {
+        let mut ix = build::commit_and_undelegate_accounts(id, self.payer.pubkey(), keys);
+        ix.program_id = self.id;
+        self.chain.submit_and_confirm(self.payer, &[ix]).await
+    }
+}
+
 pub fn written_id(data: &[u8]) -> Option<u64> {
-    use redline_interface::layout::{ID_OFFSET, ID_SIZE};
-    let bytes = data.get(ID_OFFSET..ID_OFFSET + ID_SIZE)?;
+    let bytes = data.get(layout::ID_OFFSET..layout::ID_OFFSET + layout::ID_SIZE)?;
     Some(u64::from_le_bytes(bytes.try_into().ok()?))
 }
 
@@ -35,7 +97,7 @@ pub fn copy_three(pool: &[Pubkey], id: u64) -> (Instruction, [Pubkey; 2]) {
 
 pub fn execute_kernel<K>(
     config: ThreadRunConfig,
-    rpc_url: String,
+    rpc_url: Url,
     payers: Arc<Vec<[u8; 64]>>,
     first_id: u64,
     kernel: K,
@@ -54,7 +116,7 @@ where
             let ix = kernel(id);
             let sender = senders[(id as usize) % senders.len()].clone();
             let clock = clock.clone();
-            let staged = sender.staged(&[ix]);
+            let staged = sender.staged([ix]);
             async move { Ok(Stamped::new(clock, id, staged.await?)) }
         }
     })
@@ -111,10 +173,11 @@ impl Accounts {
                 }
             }
             base.submit_and_confirm(payer, &instructions).await.map_err(|error| {
-                format!(
-                    "program {} payer {owner} seeds {first}..{end}: {error}",
+                CheckError::new(format!(
+                    "program {} payer {owner} seeds {first}..{end}",
                     self.program_id
-                )
+                ))
+                .caused_by(error)
             })?;
         }
         Ok(pdas)

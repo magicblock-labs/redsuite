@@ -1,17 +1,20 @@
-use std::{rc::Rc, time::Duration};
+use std::{path::Path, rc::Rc, time::Duration};
 
-use async_trait::async_trait;
+use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    check, check_eq, host, prep,
+    check, check_eq, host,
     profile::ProfileValues,
     redline::{copy_three, Accounts},
-    report,
     report::Unit,
     runner::{execute, Pacing, RunConfig, RunOutcome},
-    topology, BaseCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport, TxSender,
+    topology,
+    topology::ErOptions,
+    BaseCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport, TxSender,
 };
 use tracing::{debug, warn};
+
+use crate::ACCOUNT_SPACE;
 
 const PREP_PAYER_LAMPORTS: u64 = 4_000_000_000;
 const CLONE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -67,7 +70,7 @@ struct WindowOutcome {
 
 async fn execute_window(
     er: &ErCtx,
-    storage_dir: &std::path::Path,
+    storage_dir: &Path,
     senders: &[TxSender],
     pool: &[Pubkey],
     first_id: u64,
@@ -85,7 +88,7 @@ async fn execute_window(
             let id = first_id + iteration;
             let sender = senders[(id as usize) % senders.len()].clone();
             let (ix, _) = copy_three(pool, id);
-            sender.staged(&[ix])
+            sender.staged([ix])
         },
     )
     .await?;
@@ -109,22 +112,27 @@ struct CellOutcome {
     windows: [WindowOutcome; 2],
 }
 
-pub struct StorageProdsizeSustain;
+pub struct StorageProdsizeSustain {
+    base: Rc<BaseCtx>,
+    profile: &'static Profile,
+    pool: Vec<Pubkey>,
+    payers: Vec<Rc<Keypair>>,
+}
 
-#[async_trait(?Send)]
 impl Scenario<ScenarioReport> for StorageProdsizeSustain {
-    fn name(&self) -> &str {
-        "redline/storage_prodsize_sustain"
+    async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
+        let profile = PROFILES.select(base.config().profile);
+        let prep_payers = base.funded_payers(profile.payers, PREP_PAYER_LAMPORTS).await?;
+        let pool = Accounts::new(ACCOUNT_SPACE, er.identity())
+            .init_batched(base.as_ref(), &prep_payers, profile.accounts, true)
+            .await?;
+        let payers: Vec<Rc<Keypair>> = prep_payers.into_iter().map(Rc::new).collect();
+
+        Ok(Self { base, profile, pool, payers })
     }
 
-    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
-        let profile = PROFILES.select(base.config().profile);
-        let prep_payers = prep::funded_payers(base, profile.payers, PREP_PAYER_LAMPORTS).await?;
-        let pool = Accounts::new(crate::ACCOUNT_SPACE, er.identity())
-            .init_batched(base, &prep_payers, profile.accounts, true)
-            .await?;
-        let payers: Vec<Rc<keypair::Keypair>> = prep_payers.into_iter().map(Rc::new).collect();
-
+    async fn run(self) -> Result<ScenarioReport> {
+        let Self { base, profile, pool, payers } = self;
         let cells_spec = [
             ("prod_cadence", PROD_SUPERBLOCK_SLOTS),
             ("frequent_snapshot", profile.frequent_superblock_slots),
@@ -133,8 +141,8 @@ impl Scenario<ScenarioReport> for StorageProdsizeSustain {
         let mut cells: Vec<CellOutcome> = Vec::new();
         for (cell_name, superblock_slots) in cells_spec {
             let private = topology::private_er(
-                base,
-                topology::ErOptions {
+                &base,
+                ErOptions {
                     label: format!("s11-{cell_name}"),
                     settings: Box::new(move |params| {
                         params.engine.blockstore.blocktime = BLOCKTIME;
@@ -145,8 +153,7 @@ impl Scenario<ScenarioReport> for StorageProdsizeSustain {
             )
             .await?;
             let cell_er = private.ctx();
-            prep::await_clones(cell_er, &pool, crate::ACCOUNT_SPACE as usize, CLONE_TIMEOUT)
-                .await?;
+            cell_er.await_clones(&pool, ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
             let senders: Vec<TxSender> =
                 payers.iter().map(|payer| cell_er.sender(payer.clone())).collect();
 
@@ -162,7 +169,7 @@ impl Scenario<ScenarioReport> for StorageProdsizeSustain {
                 |id| {
                     let sender = senders[(id as usize) % senders.len()].clone();
                     let (ix, _) = copy_three(&pool, id);
-                    sender.staged(&[ix])
+                    sender.staged([ix])
                 },
             )
             .await?;
@@ -227,7 +234,7 @@ impl Scenario<ScenarioReport> for StorageProdsizeSustain {
                 cell.fill_ledger_txs, "storage sustain cell finished",
             );
 
-            let mut cell_report = ScenarioReport::ok(&format!("{}/{}", self.name(), cell.name))
+            let mut cell_report = ScenarioReport::ok()
                 .setting("profile", profile.name)
                 .setting("superblock slots", cell.superblock_slots)
                 .setting("block time", "50ms")
@@ -270,7 +277,7 @@ impl Scenario<ScenarioReport> for StorageProdsizeSustain {
                         window.tx_processing_avg_us,
                     );
             }
-            report::persist_cell(self.name(), &cell_report);
+            base.report_cell(cell.name, &cell_report)?;
             cells.push(cell);
             drop(private);
         }
@@ -295,7 +302,7 @@ impl Scenario<ScenarioReport> for StorageProdsizeSustain {
             }
         }
 
-        let mut summary = ScenarioReport::ok(self.name())
+        let mut summary = ScenarioReport::ok()
             .setting("profile", profile.name)
             .setting("shape", "read-write 3/tx (1 src + 2 dst data-copy)")
             .setting("block time", "50ms")

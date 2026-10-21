@@ -1,6 +1,5 @@
 use std::{cell::Cell, rc::Rc, time::Duration};
 
-use async_trait::async_trait;
 use futures_util::future::{try_join, try_join_all};
 use json::JsonValueTrait;
 use keypair::Keypair;
@@ -8,16 +7,17 @@ use pubkey::Pubkey;
 use redsuite_core::{
     check, check_eq,
     netfault::{Action, BaseProxies, Selector},
-    prep, system, topology,
-    topology::ErOptions,
+    system, topology,
+    topology::{ErOptions, PrivateEr},
     BaseCtx, ChainCtx, PrivateErScenario, Result,
 };
 use signer::Signer;
+use tokio::{time, time::Instant};
 
-use crate::program::{self, instruction::build, layout::*, utils::fold_hash};
-
-use super::{
-    await_local_value, init_accounts, write, BASE_REFRESH, BASE_REWRITE, ER_WRITE, FETCHES,
+use super::{await_local_value, BASE_REFRESH, BASE_REWRITE, ER_WRITE, FETCHES};
+use crate::{
+    program::{self, instruction::build, layout, utils::fold_hash, DELEGATION_PROGRAM_ID},
+    ACCOUNT_OWNERS, ACCOUNT_SPACE, PAYER_LAMPORTS,
 };
 
 const LRU_CAPACITY: usize = 256;
@@ -31,39 +31,37 @@ const EVICTIONS: &str = "engine_keeper_account_cache_evictions";
 const RECOVERY_OBSERVATION: Duration = Duration::from_secs(100);
 const SCENARIO_TIMEOUT: Duration = Duration::from_secs(180);
 
-pub enum CacheLifecycle {
+pub enum Mode {
     Churn,
     UndelegationReconnectGap,
 }
 
-#[async_trait(?Send)]
-impl PrivateErScenario for CacheLifecycle {
-    fn name(&self) -> &str {
-        match self {
-            Self::Churn => "redshift/cache_lifecycle",
-            Self::UndelegationReconnectGap => "redshift/undelegation_reconnect_gap",
-        }
-    }
+pub struct CacheLifecycle {
+    base: Rc<BaseCtx>,
+    churn_cycles: usize,
+    reconnect_before_settlement: bool,
+    http: BaseProxies,
+    ws: BaseProxies,
+    private: PrivateEr,
+}
 
-    async fn run(&self, base: &BaseCtx) -> Result<()> {
-        let (label, churn_cycles) = match self {
-            Self::Churn => ("cache-lifecycle", READONLY_COUNT),
-            Self::UndelegationReconnectGap => ("undelegation-reconnect-gap", 0),
+impl PrivateErScenario<(), Mode> for CacheLifecycle {
+    async fn setup(base: Rc<BaseCtx>, mode: Mode) -> Result<Self> {
+        let (label, churn_cycles) = match mode {
+            Mode::Churn => ("cache-lifecycle", READONLY_COUNT),
+            Mode::UndelegationReconnectGap => ("undelegation-reconnect-gap", 0),
         };
-        let reconnect_before_settlement = matches!(self, Self::UndelegationReconnectGap);
-        let http = BaseProxies::spawn(base).await?;
-        let ws = BaseProxies::spawn(base).await?;
-        let observe = |method, key: &Pubkey| {
-            ws.intercept(Selector::method(method).response().notification().account(key))
-        };
+        let reconnect_before_settlement = matches!(mode, Mode::UndelegationReconnectGap);
+        let http = BaseProxies::spawn(&base).await?;
+        let ws = BaseProxies::spawn(&base).await?;
         let mut endpoints = http.endpoints();
         endpoints.ws_url = ws.endpoints().ws_url;
         if reconnect_before_settlement {
             let (grpc_url, _) = base.grpc().ok_or("base L1 Yellowstone gRPC endpoint missing")?;
-            endpoints.grpc_url = Some(grpc_url.to_owned());
+            endpoints.grpc_url = Some(grpc_url.clone());
         }
         let private = topology::private_er(
-            base,
+            &base,
             ErOptions {
                 label: label.into(),
                 settings: Box::new(|params| {
@@ -74,18 +72,41 @@ impl PrivateErScenario for CacheLifecycle {
             },
         )
         .await?;
+        Ok(Self {
+            base,
+            churn_cycles,
+            reconnect_before_settlement,
+            http,
+            ws,
+            private,
+        })
+    }
+
+    async fn run(self) -> Result<()> {
+        let Self {
+            base,
+            churn_cycles,
+            reconnect_before_settlement,
+            http,
+            ws,
+            private,
+        } = self;
+        let observe = |method, key: &Pubkey| {
+            ws.intercept(Selector::method(method).response().notification().account(key))
+        };
         let er = private.ctx();
         let validator = er.identity();
-        let funder = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
+        let funder = base.funded_payer(PAYER_LAMPORTS).await?;
         let owner = funder.pubkey();
-        let payer = prep::delegated_payer(base, &funder, validator, crate::PAYER_LAMPORTS).await?;
-        let keys = init_accounts(
-            base,
-            &funder,
-            validator,
-            READONLY_COUNT + DELEGATED_COUNT + PENDING_COUNT,
-        )
-        .await?;
+        let payer = base.delegated_payer(&funder, validator, PAYER_LAMPORTS).await?;
+        let keys = base
+            .redline(&funder)
+            .init_many(
+                ACCOUNT_SPACE,
+                validator,
+                READONLY_COUNT + DELEGATED_COUNT + PENDING_COUNT,
+            )
+            .await?;
         let (readonly, protected_keys) = keys.split_at(READONLY_COUNT);
         let (delegated, pending) = protected_keys.split_at(DELEGATED_COUNT);
         let (traffic_keys, er_written_keys) = protected_keys.split_at(1);
@@ -102,7 +123,7 @@ impl PrivateErScenario for CacheLifecycle {
         base.submit_and_confirm(&funder, &delegates).await?;
         let stale = try_join_all(stale.iter().map(|trap| trap.wait(TIMEOUT))).await?;
         er.accounts(protected_keys).await?;
-        write(er, &payer, ER_WRITE, er_written_keys).await?;
+        er.redline(&payer).write(ER_WRITE, er_written_keys).await?;
         let settlement =
             http.stall(Selector::method("sendTransaction").request().account(&pending[0]));
         er.submit_and_confirm(
@@ -114,7 +135,7 @@ impl PrivateErScenario for CacheLifecycle {
             http.events().iter().any(|e| e.action == Action::Held)
         })
         .await?;
-        let protected = crate::local_accounts(er, protected_keys).await?;
+        let protected = er.local_accounts(&ACCOUNT_OWNERS, protected_keys).await?;
         check!(protected.iter().all(Option::is_some), "protected residency")?;
         let base_delegated = base.accounts(delegated).await?;
         let pool: Vec<_> = (0..LRU_CAPACITY * 2).map(|_| Keypair::new().pubkey()).collect();
@@ -143,7 +164,7 @@ impl PrivateErScenario for CacheLifecycle {
         let sender = er.sender(Rc::new(payer));
         let traffic = async {
             let mut expected = protected.clone();
-            let mut hash = [0; HASH_SIZE];
+            let mut hash = [0; layout::HASH_SIZE];
             let mut id = 0;
             while !done.get() {
                 id += 1;
@@ -162,11 +183,12 @@ impl PrivateErScenario for CacheLifecycle {
                 } else {
                     hash = fold_hash(id, &[hash], 0);
                     let data = &mut expected[0].as_mut().unwrap().data;
-                    data[ID_OFFSET..HASH_OFFSET].copy_from_slice(&id.to_le_bytes());
-                    data[HASH_OFFSET..HASH_OFFSET + HASH_SIZE].copy_from_slice(&hash);
+                    data[layout::ID_OFFSET..layout::HASH_OFFSET].copy_from_slice(&id.to_le_bytes());
+                    data[layout::HASH_OFFSET..layout::HASH_OFFSET + layout::HASH_SIZE]
+                        .copy_from_slice(&hash);
                 }
                 let count = if completed.get() { delegated.len() } else { protected_keys.len() };
-                let actual = crate::local_accounts(er, &protected_keys[..count]).await?;
+                let actual = er.local_accounts(&ACCOUNT_OWNERS, &protected_keys[..count]).await?;
                 check_eq!(actual, expected[..count], "protected local state")?;
                 if outcome.err.is_none() {
                     progress.set(progress.get() + 1);
@@ -201,7 +223,7 @@ impl PrivateErScenario for CacheLifecycle {
                 let next = eviction_count().await?;
                 check!(next > evictions, "evictions before reconnect {cycle}")?;
                 evictions = next;
-                let cold = crate::local_accounts(er, &[target]).await?;
+                let cold = er.local_accounts(&ACCOUNT_OWNERS, &[target]).await?;
                 check!(cold[0].is_none(), "new subscription target is cold")?;
                 let reconnect = observe("accountSubscribe", &pending[0]);
                 ws.close_connections();
@@ -213,7 +235,7 @@ impl PrivateErScenario for CacheLifecycle {
                     registered.wait(TIMEOUT).await?.release();
                     let old = old.wait(TIMEOUT).await?;
                     let notification = observe("accountNotification", &target);
-                    write(base, &funder, latest, &[target]).await?;
+                    base.redline(&funder).write(latest, &[target]).await?;
                     notification.wait(TIMEOUT).await?.release();
                     await_local_value(
                         er,
@@ -246,7 +268,7 @@ impl PrivateErScenario for CacheLifecycle {
                     base.accounts(pending)
                         .await?
                         .iter()
-                        .all(|a| matches!(a, Some(a) if a.owner == program::DELEGATION_PROGRAM_ID)),
+                        .all(|a| matches!(a, Some(a) if a.owner == DELEGATION_PROGRAM_ID)),
                     "undelegation stayed pending through churn"
                 )?;
             }
@@ -262,8 +284,8 @@ impl PrivateErScenario for CacheLifecycle {
                 Result::Ok(())
             })
             .await?;
-            let released_at = tokio::time::Instant::now();
-            write(base, &funder, BASE_REWRITE, pending).await?;
+            let released_at = Instant::now();
+            base.redline(&funder).write(BASE_REWRITE, pending).await?;
             let recovery = if reconnect_before_settlement {
                 // Observe late recovery for diagnostics, but retain the
                 // TIMEOUT deadline checked after teardown below.
@@ -302,7 +324,7 @@ impl PrivateErScenario for CacheLifecycle {
                 .await?;
                 None
             };
-            write(base, &funder, BASE_REFRESH, readonly).await?;
+            base.redline(&funder).write(BASE_REFRESH, readonly).await?;
             // Base confirmation does not wait for ER subscription delivery.
             check::poll_for("final readonly mirrors synchronized", TIMEOUT, || async {
                 let fetched = er.accounts(readonly).await?;
@@ -316,7 +338,7 @@ impl PrivateErScenario for CacheLifecycle {
                 Result::Ok(())
             })
             .await?;
-            let local = crate::local_accounts(er, readonly).await?;
+            let local = er.local_accounts(&ACCOUNT_OWNERS, readonly).await?;
             for (key, local) in readonly.iter().zip(local) {
                 // Readonly entries may be evicted after the fetch.
                 if let Some(local) = local {
@@ -330,8 +352,7 @@ impl PrivateErScenario for CacheLifecycle {
             done.set(true);
             Result::Ok(recovery)
         };
-        let (_, recovery) =
-            tokio::time::timeout(SCENARIO_TIMEOUT, try_join(traffic, faults)).await??;
+        let (_, recovery) = time::timeout(SCENARIO_TIMEOUT, try_join(traffic, faults)).await??;
         let actual = base.accounts(delegated).await?;
         check_eq!(actual, base_delegated, "base unchanged by ER-only writes")?;
         private.finish().await?;

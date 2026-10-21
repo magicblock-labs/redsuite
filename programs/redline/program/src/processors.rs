@@ -1,3 +1,5 @@
+use std::slice;
+
 use borsh::BorshDeserialize;
 use pubkey::Pubkey;
 use sdk::{
@@ -11,7 +13,7 @@ use solana_program::{
     program_error::ProgramError,
 };
 
-use crate::layout::{DATA_OFFSET, HASH_OFFSET, HASH_SIZE, ID_OFFSET, OWNER_PUBKEY_SIZE};
+use crate::layout;
 
 fn prepare_buffer(index: &mut usize, target: &mut [u8], data: &[u8]) {
     target[*index..*index + data.len()].copy_from_slice(data);
@@ -36,12 +38,12 @@ fn verify_account_owner(
     }
 
     let data = account.try_borrow_data()?;
-    if data.len() < OWNER_PUBKEY_SIZE {
+    if data.len() < layout::OWNER_PUBKEY_SIZE {
         msg!("Error: Account data too small to contain owner pubkey");
         return Err(ProgramError::InvalidAccountData);
     }
 
-    let stored_owner = Pubkey::try_from(&data[..OWNER_PUBKEY_SIZE])
+    let stored_owner = Pubkey::try_from(&data[..layout::OWNER_PUBKEY_SIZE])
         .map_err(|_| ProgramError::InvalidAccountData)?;
 
     if stored_owner != *signer.key {
@@ -58,7 +60,7 @@ fn verify_account_owner(
 
 pub fn init_account(
     program_id: &Pubkey,
-    iter: &mut std::slice::Iter<AccountInfo>,
+    iter: &mut slice::Iter<AccountInfo>,
     space: u32,
     seed: u8,
     bump: u8,
@@ -67,7 +69,7 @@ pub fn init_account(
     let payer = next_account_info(iter)?;
     let pda = next_account_info(iter)?;
     let base = next_account_info(iter)?;
-    require_space(space as usize, OWNER_PUBKEY_SIZE)?;
+    require_space(space as usize, layout::OWNER_PUBKEY_SIZE)?;
     let seeds = crate::utils::pda_seed(space, seed, &authority);
     let seeds = [base.key.as_ref(), &seeds, &[bump]];
 
@@ -82,7 +84,7 @@ pub fn init_account(
     )?;
 
     let mut data = pda.try_borrow_mut_data()?;
-    data[..OWNER_PUBKEY_SIZE].copy_from_slice(payer.key.as_ref());
+    data[..layout::OWNER_PUBKEY_SIZE].copy_from_slice(payer.key.as_ref());
 
     msg!("initialized PDA: {} with owner: {}", pda.key, payer.key);
     Ok(())
@@ -118,7 +120,7 @@ pub fn delegate_account(accs: &[AccountInfo], seed: u8, authority: Pubkey) -> Pr
     Ok(())
 }
 
-pub fn simple_byte_set(iter: &mut std::slice::Iter<AccountInfo>, id: u64) -> ProgramResult {
+pub fn simple_byte_set(iter: &mut slice::Iter<AccountInfo>, id: u64) -> ProgramResult {
     let mut count = 0;
     let mut total_bytes = 0;
 
@@ -128,13 +130,13 @@ pub fn simple_byte_set(iter: &mut std::slice::Iter<AccountInfo>, id: u64) -> Pro
         }
         let mut data = pda.try_borrow_mut_data()?;
         let buffer = id.to_le_bytes();
-        let mut index = DATA_OFFSET;
+        let mut index = layout::DATA_OFFSET;
 
         while index + buffer.len() <= data.len() {
             prepare_buffer(&mut index, &mut data, &buffer);
         }
 
-        total_bytes += index - DATA_OFFSET;
+        total_bytes += index - layout::DATA_OFFSET;
         count += 1;
     }
 
@@ -148,7 +150,7 @@ pub fn simple_byte_set(iter: &mut std::slice::Iter<AccountInfo>, id: u64) -> Pro
 }
 
 pub fn multi_account_read(
-    iter: &mut std::slice::Iter<AccountInfo>,
+    iter: &mut slice::Iter<AccountInfo>,
     accounts: &[AccountInfo],
     id: u64,
 ) -> ProgramResult {
@@ -157,11 +159,11 @@ pub fn multi_account_read(
         return Err(ProgramError::UninitializedAccount);
     }
     let mut data = pda.try_borrow_mut_data()?;
-    require_space(data.len(), DATA_OFFSET + 16)?;
+    require_space(data.len(), layout::DATA_OFFSET + 16)?;
     let sum = iter.clone().map(|a| a.data_len() as u64).sum::<u64>();
     let buffer = id.to_le_bytes();
     let buffer_sum = sum.to_le_bytes();
-    let mut index = DATA_OFFSET;
+    let mut index = layout::DATA_OFFSET;
 
     prepare_buffer(&mut index, &mut data, &buffer);
     prepare_buffer(&mut index, &mut data, &buffer_sum);
@@ -176,7 +178,7 @@ pub fn multi_account_read(
 }
 
 pub fn expensive_hash_compute(
-    iter: &mut std::slice::Iter<AccountInfo>,
+    iter: &mut slice::Iter<AccountInfo>,
     id: u64,
     hash: [u8; 32],
     iters: u32,
@@ -191,9 +193,9 @@ pub fn expensive_hash_compute(
             continue; // Skip uninitialized accounts
         }
         let mut data = pda.try_borrow_mut_data()?;
-        require_space(data.len(), DATA_OFFSET + 8 + hash.len())?;
+        require_space(data.len(), layout::DATA_OFFSET + 8 + hash.len())?;
         let buffer = id.to_le_bytes();
-        let mut index = DATA_OFFSET;
+        let mut index = layout::DATA_OFFSET;
 
         prepare_buffer(&mut index, &mut data, &buffer);
         prepare_buffer(&mut index, &mut data, &hash);
@@ -209,7 +211,7 @@ pub fn expensive_hash_compute(
     Ok(())
 }
 
-pub fn account_data_copy(iter: &mut std::slice::Iter<AccountInfo>, id: u64) -> ProgramResult {
+pub fn account_data_copy(iter: &mut slice::Iter<AccountInfo>, id: u64) -> ProgramResult {
     let accounts = iter.as_slice();
     if accounts.is_empty() {
         return Err(ProgramError::NotEnoughAccountKeys);
@@ -234,17 +236,17 @@ pub fn account_data_copy(iter: &mut std::slice::Iter<AccountInfo>, id: u64) -> P
 
         let src_data = src.try_borrow_data()?;
         let mut dst_data = dest.try_borrow_mut_data()?;
-        require_space(src_data.len(), DATA_OFFSET)?;
-        require_space(dst_data.len(), DATA_OFFSET + 8)?;
+        require_space(src_data.len(), layout::DATA_OFFSET)?;
+        require_space(dst_data.len(), layout::DATA_OFFSET + 8)?;
 
         let buffer = id.to_le_bytes();
-        let mut index = DATA_OFFSET;
+        let mut index = layout::DATA_OFFSET;
         prepare_buffer(&mut index, &mut dst_data, &buffer);
 
-        let copy_len = (src_data.len() - DATA_OFFSET).min(dst_data.len() - index);
+        let copy_len = (src_data.len() - layout::DATA_OFFSET).min(dst_data.len() - index);
         if copy_len > 0 {
             dst_data[index..index + copy_len]
-                .copy_from_slice(&src_data[DATA_OFFSET..DATA_OFFSET + copy_len]);
+                .copy_from_slice(&src_data[layout::DATA_OFFSET..layout::DATA_OFFSET + copy_len]);
             total_bytes += copy_len;
         }
     }
@@ -259,7 +261,7 @@ pub fn account_data_copy(iter: &mut std::slice::Iter<AccountInfo>, id: u64) -> P
     Ok(())
 }
 
-pub fn read_accounts_data(iter: &mut std::slice::Iter<AccountInfo>, id: u64) -> ProgramResult {
+pub fn read_accounts_data(iter: &mut slice::Iter<AccountInfo>, id: u64) -> ProgramResult {
     while let Ok(account) = next_account_info(iter) {
         msg!(
             "account {} has {} space, txn: {}",
@@ -271,7 +273,7 @@ pub fn read_accounts_data(iter: &mut std::slice::Iter<AccountInfo>, id: u64) -> 
     Ok(())
 }
 
-pub fn hash_fold(iter: &mut std::slice::Iter<AccountInfo>, id: u64, iters: u32) -> ProgramResult {
+pub fn hash_fold(iter: &mut slice::Iter<AccountInfo>, id: u64, iters: u32) -> ProgramResult {
     let accounts = iter.as_slice();
     if accounts.is_empty() {
         return Err(ProgramError::NotEnoughAccountKeys);
@@ -283,16 +285,16 @@ pub fn hash_fold(iter: &mut std::slice::Iter<AccountInfo>, id: u64, iters: u32) 
             return Err(ProgramError::UninitializedAccount);
         }
         let data = account.try_borrow_data()?;
-        require_space(data.len(), HASH_OFFSET + HASH_SIZE)?;
-        let mut hash = [0u8; HASH_SIZE];
-        hash.copy_from_slice(&data[HASH_OFFSET..HASH_OFFSET + HASH_SIZE]);
+        require_space(data.len(), layout::HASH_OFFSET + layout::HASH_SIZE)?;
+        let mut hash = [0u8; layout::HASH_SIZE];
+        hash.copy_from_slice(&data[layout::HASH_OFFSET..layout::HASH_OFFSET + layout::HASH_SIZE]);
         hashes.push(hash);
     }
 
     let digest = crate::utils::fold_hash(id, &hashes, iters);
     for account in accounts {
         let mut data = account.try_borrow_mut_data()?;
-        let mut index = ID_OFFSET;
+        let mut index = layout::ID_OFFSET;
         prepare_buffer(&mut index, &mut data, &id.to_le_bytes());
         prepare_buffer(&mut index, &mut data, &digest);
     }
@@ -307,7 +309,7 @@ pub fn hash_fold(iter: &mut std::slice::Iter<AccountInfo>, id: u64, iters: u32) 
 }
 
 pub fn commit_accounts(
-    iter: &mut std::slice::Iter<AccountInfo>,
+    iter: &mut slice::Iter<AccountInfo>,
     id: u64,
     undelegate: bool,
 ) -> ProgramResult {

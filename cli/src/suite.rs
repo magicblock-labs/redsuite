@@ -1,12 +1,22 @@
-use std::{process::Command, rc::Rc, time::Instant};
+use std::{
+    env,
+    env::consts::{ARCH, OS},
+    mem,
+    process::Command,
+    rc::Rc,
+    result, thread,
+    time::Instant,
+};
 
 use futures_util::{future::join_all, StreamExt};
 use redsuite_core::{
     catalog::{Er, ErGroup, Family, ScenarioEntry},
     netfault::BaseProxies,
     profile::ExecutionConfig,
-    report::{self, ScenarioReport, Unit},
-    topology::{self, PrivateEr, ER_READY_TIMEOUT},
+    report,
+    report::{ScenarioReport, Unit},
+    topology,
+    topology::PrivateEr,
     BaseCtx, ErCtx, Result, RunRecord,
 };
 use tokio::sync::Mutex;
@@ -14,7 +24,6 @@ use tracing::{error, info};
 
 use crate::{args::Run, catalog};
 
-const NO_GROUP: &str = "the catalog entry declares no ER group";
 type LaneResult = (&'static str, f64, Vec<RunRecord>);
 
 struct GroupEr {
@@ -37,7 +46,7 @@ impl GroupEr {
         if let Some(proxies) = &proxies {
             er = er.with_proxies(proxies.clone());
         }
-        er.wait_ready(ER_READY_TIMEOUT).await?;
+        er.wait_ready(topology::ER_READY_TIMEOUT).await?;
         Ok(Self { er: er.shared(), proxies })
     }
 
@@ -58,7 +67,7 @@ impl GroupEr {
 struct Lane {
     label: &'static str,
     group: Option<&'static ErGroup>,
-    entries: Vec<&'static ScenarioEntry>,
+    entries: Vec<ScenarioEntry>,
 }
 
 impl Lane {
@@ -69,19 +78,19 @@ impl Lane {
             None => None,
         };
         let er = match &group {
-            Some(Ok(group)) => Ok(group.er.lock().await.ctx().clone()),
-            Some(Err(error)) => Err(error.to_string()),
-            None => Err(NO_GROUP.to_owned()),
+            Some(Ok(group)) => Some(Ok(group.er.lock().await.ctx().clone())),
+            Some(Err(error)) => Some(Err(error.to_string())),
+            None => None,
         };
         let records = if suite.serial || self.group.is_none() {
             let limit = if suite.serial { 1 } else { suite.fresh_concurrency };
-            run_entries(self.entries, limit, suite.config, er).await
+            suite.run_entries(self.entries, limit, er).await
         } else {
             let (shared, exclusive): (Vec<_>, Vec<_>) =
                 self.entries.into_iter().partition(|entry| matches!(entry.er, Er::Shared(_)));
             let limit = shared.len();
-            let mut records = run_entries(shared, limit, suite.config, er.clone()).await;
-            records.extend(run_entries(exclusive, 1, suite.config, er).await);
+            let mut records = suite.run_entries(shared, limit, er.clone()).await;
+            records.extend(suite.run_entries(exclusive, 1, er).await);
             records
         };
         let elapsed = started.elapsed().as_secs_f64();
@@ -92,22 +101,10 @@ impl Lane {
     }
 }
 
-async fn run_entries(
-    entries: Vec<&'static ScenarioEntry>,
-    limit: usize,
-    config: ExecutionConfig,
-    er: std::result::Result<ErCtx, String>,
-) -> Vec<RunRecord> {
-    futures_util::stream::iter(entries)
-        .map(|entry| (entry.run)(config, er.clone()))
-        .buffer_unordered(limit.max(1))
-        .collect()
-        .await
-}
-
 pub struct Suite {
+    family: Family,
     selection: String,
-    entries: Vec<&'static ScenarioEntry>,
+    entries: Vec<ScenarioEntry>,
     config: ExecutionConfig,
     serial: bool,
     fresh_concurrency: usize,
@@ -129,6 +126,7 @@ impl Suite {
             args.selections.join(" ")
         };
         let mut suite = Self {
+            family,
             selection,
             entries: catalog::select(family, &args.selections)?,
             config,
@@ -144,25 +142,25 @@ impl Suite {
     }
 
     fn summary(&self) -> ScenarioReport {
-        let mut names: Vec<_> = self.entries.iter().map(|entry| entry.name()).collect();
+        let mut names: Vec<_> = self.entries.iter().map(|entry| entry.name(self.family)).collect();
         names.sort();
-        let hostname = std::env::var("HOSTNAME")
+        let hostname = env::var("HOSTNAME")
             .ok()
             .or_else(|| {
                 let output = Command::new("hostname").output().ok()?;
                 Some(String::from_utf8_lossy(&output.stdout).trim().to_owned())
             })
             .unwrap_or_else(|| "unknown".to_owned());
-        ScenarioReport::ok(&format!("suite/{}", self.selection))
+        ScenarioReport::ok()
             .setting("loop", self.config.loop_mode.name())
             .setting(
                 "host",
                 format!(
                     "{} {} {} {} cpus",
                     hostname,
-                    std::env::consts::OS,
-                    std::env::consts::ARCH,
-                    std::thread::available_parallelism().map_or(0, |n| n.get())
+                    OS,
+                    ARCH,
+                    thread::available_parallelism().map_or(0, |n| n.get())
                 ),
             )
             .setting("serial", self.serial)
@@ -171,9 +169,9 @@ impl Suite {
             .setting("redline profile", self.config.profile.name())
     }
 
-    fn lanes(&self) -> Vec<Lane> {
+    fn lanes(&mut self) -> Vec<Lane> {
         let mut lanes: Vec<Lane> = Vec::new();
-        for &entry in &self.entries {
+        for entry in mem::take(&mut self.entries) {
             let group = entry.er.group();
             let label = group.map_or("fresh", |group| group.label);
             let lane = if self.serial {
@@ -193,7 +191,20 @@ impl Suite {
         lanes
     }
 
-    async fn execute(&self, base: &Result<BaseCtx>) -> Vec<LaneResult> {
+    async fn run_entries(
+        &self,
+        entries: Vec<ScenarioEntry>,
+        limit: usize,
+        er: Option<result::Result<ErCtx, String>>,
+    ) -> Vec<RunRecord> {
+        futures_util::stream::iter(entries)
+            .map(|entry| entry.run(self.family, self.config, er.clone()))
+            .buffer_unordered(limit.max(1))
+            .collect()
+            .await
+    }
+
+    async fn execute(&mut self, base: &Result<BaseCtx>) -> Vec<LaneResult> {
         let mut lanes = self.lanes();
         if !self.serial {
             lanes.sort_by_key(|lane| lane.group.is_none());
@@ -231,8 +242,9 @@ impl Suite {
                 Unit::Seconds,
                 started.elapsed().as_secs_f64(),
             );
-            let persisted = report::persist_summary(report, &outcome)
-                .inspect_err(|error| error!(%error, "suite report not persisted"));
+            let persisted =
+                report::persist_summary(&format!("suite/{}", self.selection), report, &outcome)
+                    .inspect_err(|error| error!(%error, "suite report not persisted"));
             outcome = outcome.and(persisted);
         }
         info!(

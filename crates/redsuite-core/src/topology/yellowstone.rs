@@ -1,11 +1,13 @@
 use std::{
-    fs,
+    env, fs,
+    net::SocketAddr,
     path::{Path, PathBuf},
     process::Command,
 };
 
 use sha2::{Digest, Sha256};
 use tracing::info;
+use url::Url;
 
 use super::state;
 use crate::Result;
@@ -28,7 +30,7 @@ pub struct Plugin {
 }
 
 impl Plugin {
-    pub fn config_json(&self, address: &str) -> String {
+    pub fn config_json(&self, address: SocketAddr) -> String {
         json::to_string(&json::json!({
             "libpath": self.libpath.display().to_string(),
             "log": { "level": "warn" },
@@ -37,7 +39,7 @@ impl Plugin {
         .unwrap_or_default()
     }
 
-    pub fn write_config(&self, path: &Path, address: &str) -> Result<()> {
+    pub fn write_config(&self, path: &Path, address: SocketAddr) -> Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -47,7 +49,7 @@ impl Plugin {
 }
 
 pub async fn ensure(base_bin: &Path) -> Result<Plugin> {
-    if let Some(path) = std::env::var_os(PLUGIN_ENV) {
+    if let Some(path) = env::var_os(PLUGIN_ENV) {
         let libpath = PathBuf::from(path);
         if !libpath.is_file() {
             return Err(format!(
@@ -121,7 +123,7 @@ fn base_version(base_bin: &Path) -> Result<String> {
 }
 
 fn cache_dir(tag: &str) -> PathBuf {
-    match std::env::var_os(CACHE_ENV) {
+    match env::var_os(CACHE_ENV) {
         Some(dir) => PathBuf::from(dir).join(tag),
         None => state::workspace_root().join("target/yellowstone").join(tag),
     }
@@ -166,16 +168,18 @@ async fn expected_digest(tag: &str) -> Result<String> {
         .ok_or_else(|| format!("{name} has no entry for {LIB}").into())
 }
 
-fn asset_url(tag: &str, asset: &str) -> String {
-    format!("{DOWNLOADS}/{}/{}", encode(tag), encode(asset))
+fn asset_url(tag: &str, asset: &str) -> Url {
+    let mut url = Url::parse(DOWNLOADS).expect("release base URL");
+    url.path_segments_mut()
+        .expect("release URL supports path segments")
+        .extend([tag, asset]);
+    url
 }
 
-fn encode(value: &str) -> String {
-    value.replace('+', "%2B")
-}
-
-async fn fetch(url: &str) -> Result<Vec<u8>> {
-    let response = reqwest::get(url).await.map_err(|err| format!("fetching {url}: {err}"))?;
+async fn fetch(url: &Url) -> Result<Vec<u8>> {
+    let response = reqwest::get(url.clone())
+        .await
+        .map_err(|err| format!("fetching {url}: {err}"))?;
     if !response.status().is_success() {
         return Err(format!("fetching {url}: HTTP {}", response.status()).into());
     }

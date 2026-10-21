@@ -1,7 +1,8 @@
 use std::{cell::RefCell, collections::HashMap, rc::Rc, time::Duration};
 
-use json::LazyValue;
+use json::{LazyValue, Value};
 use pubkey::Pubkey;
+use url::Url;
 
 use super::conn::{self, CloseReason, FrameHandler, Reader, Requester};
 use crate::Result;
@@ -11,7 +12,7 @@ struct Shared {
     error: Option<String>,
     ready_subs: usize,
     key_by_subid: HashMap<u64, u64>,
-    events: HashMap<u64, Vec<json::Value>>,
+    events: HashMap<u64, Vec<Value>>,
     malformed: usize,
 }
 
@@ -39,7 +40,7 @@ impl FrameHandler for EventHandler {
         let Some(key) = shared.key_by_subid.get(&subscription).copied() else {
             return;
         };
-        let Ok(event) = json::from_str::<json::Value>(payload.as_raw_str()) else {
+        let Ok(event) = json::from_str::<Value>(payload.as_raw_str()) else {
             shared.malformed += 1;
             return;
         };
@@ -62,7 +63,7 @@ pub struct EventSubscriptions {
 }
 
 impl EventSubscriptions {
-    pub async fn connect(url: &str) -> Result<Self> {
+    pub async fn connect(url: &Url) -> Result<Self> {
         let (requester, stream) = conn::split(conn::connect(url).await?);
         let shared = Rc::new(RefCell::new(Shared::default()));
         let reader = Reader::spawn(stream, EventHandler { shared: shared.clone() });
@@ -99,7 +100,7 @@ impl EventSubscriptions {
         .await
     }
 
-    pub fn events(&self, key: u64) -> Vec<json::Value> {
+    pub fn events(&self, key: u64) -> Vec<Value> {
         self.shared.borrow().events.get(&key).cloned().unwrap_or_default()
     }
 

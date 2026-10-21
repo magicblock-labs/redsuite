@@ -1,27 +1,31 @@
-use std::time::{Duration, Instant};
+use std::{
+    rc::Rc,
+    time::{Duration, Instant},
+};
 
-use async_trait::async_trait;
 use keypair::Keypair;
 use pubkey::Pubkey;
-use redshift_interface::flexi::{build as flexi, FlexiCounter, ACTOR_ESCROW_INDEX};
+use redshift_interface::{
+    schedulecommit,
+    schedulecommit::{build as counter, MainAccount},
+};
 use redsuite_core::{
     check, check_eq, dlp,
     netfault::{BaseProxies, RuleHandle, Selector},
-    prep,
     receipt::{self, CommitReceipt},
     topology::RestartConfig,
     BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
 use signature::Signature;
 use signer::Signer;
-
-use crate::program::DELEGATION_PROGRAM_ID;
+use tokio::time;
 
 use super::{
     hold_nonces, prove_landed, write_and_commit, BASE_CONFIRM_TIMEOUT, BASE_STATE_TIMEOUT,
+    PROXIED_GROUP,
 };
+use crate::{program::DELEGATION_PROGRAM_ID, ACCOUNT_SPACE, PAYER_LAMPORTS};
 
-const LABEL: &str = "commit-exactly-once";
 const CLONE_TIMEOUT: Duration = Duration::from_secs(30);
 const INTERCEPT_TIMEOUT: Duration = Duration::from_secs(60);
 const RECEIPT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -37,8 +41,6 @@ const ACTION_ESCROW_LAMPORTS: u64 = 500_000_000;
 const ACTION_COMPUTE_UNITS: u32 = 50_000;
 const ACTION_COUNT: u8 = 1;
 
-pub struct CommitExactlyOnce;
-
 struct FaultedCommit<'a> {
     phase: &'a str,
     commit_id: u64,
@@ -48,7 +50,7 @@ struct FaultedCommit<'a> {
 
 async fn base_count(base: &BaseCtx, counter: &Pubkey) -> Result<u64> {
     let account = base.account(counter).await?.ok_or("the base counter is missing")?;
-    Ok(FlexiCounter::try_decode(&account.data)?.count)
+    Ok(MainAccount::try_decode(&account.data)?.count)
 }
 
 async fn hold_count(
@@ -70,7 +72,7 @@ async fn hold_count(
         if Instant::now() >= deadline {
             return Ok(());
         }
-        tokio::time::sleep(SAMPLE_INTERVAL).await;
+        time::sleep(SAMPLE_INTERVAL).await;
     }
 }
 
@@ -111,8 +113,8 @@ async fn settled_receipt(
          alone, got {:?}",
         receipt.error_message
     )?;
-    super::require_settled(&receipt, phase)?;
-    receipt::confirm_base_signatures(base.api(), &receipt, BASE_CONFIRM_TIMEOUT).await?;
+    receipt.check_success(phase)?;
+    receipt.confirm(base.api(), BASE_CONFIRM_TIMEOUT).await?;
     Ok(receipt)
 }
 
@@ -202,8 +204,8 @@ async fn follow_up_commit(
 }
 
 async fn action_blackout(proxies: &BaseProxies, base: &BaseCtx, er: &ErCtx) -> Result<()> {
-    let payer = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
-    let (init, counter) = flexi::init_counter(payer.pubkey(), LABEL);
+    let payer = base.funded_payer(PAYER_LAMPORTS).await?;
+    let (init, counter) = counter::init_account(payer.pubkey(), payer.pubkey());
     base.submit_and_confirm(
         &payer,
         &[
@@ -211,7 +213,7 @@ async fn action_blackout(proxies: &BaseProxies, base: &BaseCtx, er: &ErCtx) -> R
             dlp::top_up_ephemeral_balance(
                 &payer.pubkey(),
                 ACTION_ESCROW_LAMPORTS,
-                ACTOR_ESCROW_INDEX,
+                schedulecommit::ACTOR_ESCROW_INDEX,
             ),
         ],
     )
@@ -226,7 +228,7 @@ async fn action_blackout(proxies: &BaseProxies, base: &BaseCtx, er: &ErCtx) -> R
     let intent_signature = er
         .submit_and_confirm(
             &payer,
-            &[flexi::create_action_intent(
+            &[counter::create_action_intent(
                 payer.pubkey(),
                 counter,
                 ACTION_COUNT,
@@ -262,36 +264,44 @@ async fn action_blackout(proxies: &BaseProxies, base: &BaseCtx, er: &ErCtx) -> R
             "a succeeded action receipt must name the base transaction it \
              confirmed"
         )?;
-        receipt::confirm_base_signatures(base.api(), &receipt, BASE_CONFIRM_TIMEOUT).await?;
+        receipt.confirm(base.api(), BASE_CONFIRM_TIMEOUT).await?;
     }
     hold_count(base, &counter, 1, SETTLE_WINDOW, "action settle").await?;
     Ok(())
 }
 
-#[async_trait(?Send)]
-impl Scenario for CommitExactlyOnce {
-    fn name(&self) -> &str {
-        "redshift/commit_exactly_once"
-    }
+pub struct CommitExactlyOnce {
+    base: Rc<BaseCtx>,
+    er: ErCtx,
+    payer: Keypair,
+    account: Pubkey,
+}
 
-    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<()> {
-        let proxies = er.proxies().ok_or(super::PROXIED_GROUP)?;
+impl Scenario for CommitExactlyOnce {
+    async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
+        er.proxies().ok_or(PROXIED_GROUP)?;
         let identity = er.identity();
-        let payer = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
-        let account = crate::init_delegated_account(base, &payer, 0, identity).await?;
+        let payer = base.funded_payer(PAYER_LAMPORTS).await?;
+        let account = base.redline(&payer).init_delegated(ACCOUNT_SPACE, identity, 0).await?;
         let on_base = base.account(&account).await?.ok_or("pda not on base")?;
         check_eq!(
             on_base.owner,
             DELEGATION_PROGRAM_ID,
             "a delegated pda must be dlp-owned on base"
         )?;
-        prep::await_clones(er, &[account], crate::ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
+        er.await_clones(&[account], ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
 
-        follow_up_commit(base, er, &payer, account, 1, WARMUP_WRITE, "warm-up").await?;
+        Ok(Self { base, er, payer, account })
+    }
+
+    async fn run(self) -> Result<()> {
+        let Self { base, er, payer, account } = self;
+        let proxies = er.proxies().ok_or(PROXIED_GROUP)?;
+        follow_up_commit(&base, &er, &payer, account, 1, WARMUP_WRITE, "warm-up").await?;
         commit_blackout(
             proxies,
-            base,
-            er,
+            &base,
+            &er,
             &payer,
             account,
             FaultedCommit {
@@ -303,8 +313,8 @@ impl Scenario for CommitExactlyOnce {
         )
         .await?;
         follow_up_commit(
-            base,
-            er,
+            &base,
+            &er,
             &payer,
             account,
             3,
@@ -312,11 +322,11 @@ impl Scenario for CommitExactlyOnce {
             "post-blackout",
         )
         .await?;
-        action_blackout(proxies, base, er).await?;
+        action_blackout(proxies, &base, &er).await?;
         commit_blackout(
             proxies,
-            base,
-            er,
+            &base,
+            &er,
             &payer,
             account,
             FaultedCommit {
@@ -328,8 +338,8 @@ impl Scenario for CommitExactlyOnce {
         )
         .await?;
         follow_up_commit(
-            base,
-            er,
+            &base,
+            &er,
             &payer,
             account,
             5,
@@ -338,6 +348,6 @@ impl Scenario for CommitExactlyOnce {
         )
         .await?;
 
-        super::scheduled_intents::run(base, er).await
+        super::scheduled_intents::run(&base, &er).await
     }
 }

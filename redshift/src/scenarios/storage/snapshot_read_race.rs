@@ -4,16 +4,16 @@ use std::{
     time::{Duration, Instant},
 };
 
-use async_trait::async_trait;
 use keypair::Keypair;
 use pubkey::Pubkey;
-use redshift_interface::schedulecommit::{build, ORDER_BOOK_INIT_SIZE};
+use redshift_interface::{schedulecommit, schedulecommit::build};
 use redsuite_core::{
     check, check_eq, prep, topology,
-    topology::{ErOptions, RestartConfig},
+    topology::{ErOptions, PrivateEr, RestartConfig},
     Api, BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result,
 };
 use signer::Signer;
+use tokio::{task::JoinHandle, time};
 
 const LABEL: &str = "snapshot-read-race";
 const SUPERBLOCK_SLOTS: u64 = 10;
@@ -26,8 +26,6 @@ const CHURN_BEFORE_RESTART: Duration = Duration::from_secs(6);
 const CHURN_AFTER_RESTART: Duration = Duration::from_secs(12);
 const CLONE_TIMEOUT: Duration = Duration::from_secs(20);
 
-pub struct SnapshotReadRace;
-
 struct Book {
     manager: Keypair,
     address: Pubkey,
@@ -35,7 +33,7 @@ struct Book {
 
 struct Readers {
     stop: Rc<Cell<bool>>,
-    task: tokio::task::JoinHandle<(u64, Option<String>)>,
+    task: JoinHandle<(u64, Option<String>)>,
 }
 
 impl Readers {
@@ -96,7 +94,12 @@ async fn delegate_books(base: &BaseCtx, er: &ErCtx, payer: &Keypair) -> Result<V
         books.push(Book { manager, address });
     }
     let addresses: Vec<_> = books.iter().map(|book| book.address).collect();
-    prep::await_clones(er, &addresses, ORDER_BOOK_INIT_SIZE, CLONE_TIMEOUT).await?;
+    er.await_clones(
+        &addresses,
+        schedulecommit::ORDER_BOOK_INIT_SIZE,
+        CLONE_TIMEOUT,
+    )
+    .await?;
     Ok(books)
 }
 
@@ -125,20 +128,21 @@ async fn churn(
         )?;
         sizes[index] += bytes;
         grows += 1;
-        tokio::time::sleep(GROW_INTERVAL).await;
+        time::sleep(GROW_INTERVAL).await;
     }
     Ok(())
 }
 
-#[async_trait(?Send)]
-impl PrivateErScenario for SnapshotReadRace {
-    fn name(&self) -> &str {
-        "redshift/snapshot_read_race"
-    }
+pub struct SnapshotReadRace {
+    base: Rc<BaseCtx>,
+    private: PrivateEr,
+    payer: Keypair,
+}
 
-    async fn run(&self, base: &BaseCtx) -> Result<()> {
-        let mut private = topology::private_er(
-            base,
+impl PrivateErScenario for SnapshotReadRace {
+    async fn setup(base: Rc<BaseCtx>, _: ()) -> Result<Self> {
+        let private = topology::private_er(
+            &base,
             ErOptions {
                 label: LABEL.to_owned(),
                 settings: Box::new(|params| {
@@ -149,15 +153,20 @@ impl PrivateErScenario for SnapshotReadRace {
         )
         .await?;
 
-        let payer = prep::funded_payer(base, PAYER_LAMPORTS).await?;
+        let payer = base.funded_payer(PAYER_LAMPORTS).await?;
+        Ok(Self { base, private, payer })
+    }
+
+    async fn run(self) -> Result<()> {
+        let Self { base, mut private, payer } = self;
         let books;
-        let mut sizes = vec![ORDER_BOOK_INIT_SIZE as u64; BOOKS];
+        let mut sizes = vec![schedulecommit::ORDER_BOOK_INIT_SIZE as u64; BOOKS];
         {
             let er = private.ctx();
-            prep::await_program_clone(er, &redshift_interface::id(), CLONE_TIMEOUT).await?;
-            books = delegate_books(base, er, &payer).await?;
-            let sponsor = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
-            prep::delegate_payer(base, &sponsor, &payer, er.identity()).await?;
+            er.await_program_clone(&redshift_interface::id(), CLONE_TIMEOUT).await?;
+            books = delegate_books(&base, er, &payer).await?;
+            let sponsor = base.funded_payer(crate::PAYER_LAMPORTS).await?;
+            base.delegate_payer(&sponsor, &payer, er.identity()).await?;
             let addresses: Vec<Pubkey> = books.iter().map(|book| book.address).collect();
 
             let readers = Readers::start(er.api().clone(), addresses.clone());

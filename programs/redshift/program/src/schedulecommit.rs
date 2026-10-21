@@ -1,9 +1,15 @@
+use std::slice;
+
 use borsh::{BorshDeserialize, BorshSerialize};
 use redshift_interface::schedulecommit::*;
 use sdk::{
     cpi::{delegate_account, undelegate_account, DelegateAccounts, DelegateConfig},
-    ephem::{commit_and_undelegate_accounts, FoldableIntentBuilder, MagicIntentBundleBuilder},
+    ephem::{
+        commit_and_undelegate_accounts, CallHandler, FoldableIntentBuilder,
+        MagicIntentBundleBuilder,
+    },
     utils::create_pda,
+    ActionArgs, ShortAccountMeta,
 };
 use solana_program::{
     account_info::{next_account_info, AccountInfo},
@@ -16,6 +22,9 @@ use solana_program::{
     rent::Rent,
     sysvar::Sysvar,
 };
+use system_interface::instruction as system_instruction;
+
+mod intents;
 
 fn invoke_commit<'a, 'info>(
     commit_type: ScheduleCommitType,
@@ -92,6 +101,9 @@ fn invoke_schedule_commit_raw<'a, 'info>(
 }
 
 pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], payload: &[u8]) -> ProgramResult {
+    if let Some(response) = payload.strip_prefix(&TRANSFER_CALLBACK[1..]) {
+        return intents::callback(accounts, response);
+    }
     let instruction = ScheduleCommitInstruction::try_from_slice(payload).map_err(|err| {
         msg!("cannot parse the schedulecommit instruction: {}", err);
         ProgramError::InvalidInstructionData
@@ -110,7 +122,31 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], payload: &[u8]) ->
         ScheduleCommitAndUndelegateCpiTwice(players) => {
             process_commit_undelegate_twice(accounts, &players)
         }
-        IncreaseCount => process_increase_count(accounts),
+        AdjustCount(change) => {
+            let counter = accounts.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
+            adjust(counter, change)
+        }
+        Fail => Err(ProgramError::Custom(0)),
+        ScheduleCounterTask {
+            task_id,
+            execution_interval_millis,
+            iterations,
+            signer,
+        } => process_schedule_counter_task(
+            accounts,
+            task_id,
+            execution_interval_millis,
+            iterations,
+            signer,
+        ),
+        CancelCounterTask { task_id } => process_cancel_counter_task(accounts, task_id),
+        CreateActionIntent { counter, count, compute_units } => {
+            process_create_action_intent(accounts, counter, count, compute_units)
+        }
+        AddActionHandler { count } => process_add_action_handler(accounts, count),
+        ScheduleIntents { modes, actions } => intents::schedule(accounts, &modes, actions),
+        BaseAction { amount, change, fail } => intents::action(accounts, amount, change, fail),
+        TransferIntent { amount, fail } => intents::transfer(accounts, amount, fail),
         SetCount(value) => process_set_count(accounts, value),
         InitOrderBook => process_init_order_book(accounts),
         GrowOrderBook(additional_space) => process_grow_order_book(accounts, additional_space),
@@ -285,7 +321,11 @@ fn process_init(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult 
         true,
     )?;
 
-    let account = MainAccount { player: *player.key, count: 0 };
+    let account = MainAccount {
+        player: *player.key,
+        count: 0,
+        updates: 0,
+    };
     account.serialize(&mut &mut pda.try_borrow_mut_data()?.as_mut())?;
     Ok(())
 }
@@ -304,14 +344,26 @@ fn process_delegate_cpi(accounts: &[AccountInfo], args: DelegateCpiArgs) -> Prog
     Ok(())
 }
 
+fn update_count(
+    account: &AccountInfo,
+    update: impl FnOnce(u64) -> Result<u64, ProgramError>,
+) -> ProgramResult {
+    let mut state = MainAccount::try_from_slice(&account.try_borrow_data()?)?;
+    state.count = update(state.count)?;
+    state.updates = state.updates.checked_add(1).ok_or(ProgramError::ArithmeticOverflow)?;
+    state.serialize(&mut account.try_borrow_mut_data()?.as_mut())?;
+    Ok(())
+}
+
+fn adjust(account: &AccountInfo, change: i64) -> ProgramResult {
+    update_count(account, |count| {
+        count.checked_add_signed(change).ok_or(ProgramError::ArithmeticOverflow)
+    })
+}
+
 fn increase_committee_counts(committees: &[AccountInfo]) -> ProgramResult {
     for committee in committees {
-        let mut account = {
-            let data = committee.try_borrow_data()?;
-            MainAccount::try_from_slice(&data)?
-        };
-        account.count += 1;
-        account.serialize(&mut &mut committee.try_borrow_mut_data()?.as_mut())?;
+        adjust(committee, 1)?;
     }
     Ok(())
 }
@@ -424,22 +476,10 @@ fn process_commit_undelegate_twice(accounts: &[AccountInfo], players: &[Pubkey])
     invoke_signed(&instruction, &infos, &signer_seeds)
 }
 
-fn process_increase_count(accounts: &[AccountInfo]) -> ProgramResult {
-    let iter = &mut accounts.iter();
-    let account = next_account_info(iter)?;
-    increase_committee_counts(std::slice::from_ref(account))
-}
-
 fn process_set_count(accounts: &[AccountInfo], value: u64) -> ProgramResult {
     let iter = &mut accounts.iter();
     let account = next_account_info(iter)?;
-    let mut main_account = {
-        let data = account.try_borrow_data()?;
-        MainAccount::try_from_slice(&data)?
-    };
-    main_account.count = value;
-    main_account.serialize(&mut &mut account.try_borrow_mut_data()?.as_mut())?;
-    Ok(())
+    update_count(account, |_| Ok(value))
 }
 
 pub fn process_undelegate_request(
@@ -498,4 +538,105 @@ pub(crate) fn delegate_accounts<'a, 'info>(
         delegation_program,
         system_program,
     })
+}
+
+fn process_create_action_intent(
+    accounts: &[AccountInfo],
+    counter: Pubkey,
+    count: u8,
+    compute_units: u32,
+) -> ProgramResult {
+    let [payer, magic_context, magic_program] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+    let action = ScheduleCommitInstruction::AddActionHandler { count };
+    let handler = CallHandler {
+        args: ActionArgs {
+            data: tagged(&action),
+            escrow_index: ACTOR_ESCROW_INDEX,
+        },
+        compute_units,
+        escrow_authority: payer.clone(),
+        destination_program: crate::ID,
+        accounts: vec![ShortAccountMeta {
+            pubkey: counter,
+            is_writable: true,
+        }],
+    };
+    MagicIntentBundleBuilder::new(payer.clone(), magic_context.clone(), magic_program.clone())
+        .add_standalone_actions([handler])
+        .build_and_invoke()
+}
+
+fn process_add_action_handler(accounts: &[AccountInfo], count: u8) -> ProgramResult {
+    let [counter, source_program, _, escrow_account] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+    if !escrow_account.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if source_program.key != &crate::ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if counter.owner != &crate::ID {
+        return Err(ProgramError::InvalidAccountOwner);
+    }
+    adjust(counter, i64::from(count))
+}
+
+fn process_schedule_counter_task(
+    accounts: &[AccountInfo],
+    task_id: i64,
+    execution_interval_millis: i64,
+    iterations: i64,
+    signer: bool,
+) -> ProgramResult {
+    use magic_api::{args::ScheduleTaskArgs, instruction::MagicBlockInstruction};
+
+    let [magic_program, payer, counter] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+    let (expected_pda, bump) = pda_and_bump(payer.key);
+    if counter.key != &expected_pda {
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    let task_instruction = if signer {
+        build::add(*payer.key, 1)
+    } else {
+        build::add_unsigned(*payer.key, 1)
+    };
+    let data = bincode::serialize(&MagicBlockInstruction::ScheduleTask(ScheduleTaskArgs {
+        task_id,
+        execution_interval_millis,
+        iterations,
+        instructions: vec![task_instruction],
+    }))
+    .map_err(|_| ProgramError::InvalidArgument)?;
+
+    let instruction = Instruction::new_with_bytes(
+        *magic_program.key,
+        &data,
+        vec![AccountMeta::new(*payer.key, true), AccountMeta::new(*counter.key, true)],
+    );
+
+    let bump_slice = [bump];
+    let seeds: [&[u8]; 3] = [PDA_SEED, payer.key.as_ref(), &bump_slice];
+    invoke_signed(&instruction, &[payer.clone(), counter.clone()], &[&seeds])
+}
+
+fn process_cancel_counter_task(accounts: &[AccountInfo], task_id: i64) -> ProgramResult {
+    use magic_api::instruction::MagicBlockInstruction;
+
+    let [magic_program, payer] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+    let data = bincode::serialize(&MagicBlockInstruction::CancelTask { task_id })
+        .map_err(|_| ProgramError::InvalidArgument)?;
+    let instruction = Instruction::new_with_bytes(
+        *magic_program.key,
+        &data,
+        vec![AccountMeta::new(*payer.key, true)],
+    );
+    invoke(&instruction, slice::from_ref(payer))
 }

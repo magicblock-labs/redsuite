@@ -1,3 +1,4 @@
+use instruction::{AccountMeta, Instruction};
 use pubkey::Pubkey;
 
 pub const ID: Pubkey = Pubkey::from_str_const("AijneHkXJVVWyimuwfSJdrJktARZu2WiMaZBqHsq7CS5");
@@ -6,13 +7,28 @@ pub const fn id() -> Pubkey {
     ID
 }
 
-pub mod flexi;
-
 pub mod schedulecommit {
+
+    use std::io;
+
     use borsh::{BorshDeserialize, BorshSerialize};
     use pubkey::Pubkey;
     use solana_program_error::ProgramError;
 
+    use crate::SCHEDULE_COMMIT_TAG;
+
+    pub const ACTOR_ESCROW_INDEX: u8 = 1;
+    pub const TRANSFER_CALLBACK: &[u8] = &[SCHEDULE_COMMIT_TAG, 255];
+    pub const TRANSFER_FAILURE: u32 = 0xFA11;
+    pub const ACTION_PRIZE: u64 = 1_000_000;
+    pub const ACTION_COMPUTE_UNITS: u32 = 100_000;
+
+    #[derive(BorshSerialize, BorshDeserialize, Debug, Clone, Copy)]
+    pub enum IntentMode {
+        Commit,
+        Undelegate(i64),
+        Finalize,
+    }
     pub const FAIL_UNDELEGATION_COUNT: u64 = u64::MAX - 1;
     pub const PDA_SEED: &[u8] = b"magic_schedule_commit";
     pub const ORDER_BOOK_SEED: &[u8] = b"order_book";
@@ -28,10 +44,15 @@ pub mod schedulecommit {
     pub struct MainAccount {
         pub player: Pubkey,
         pub count: u64,
+        pub updates: u64,
     }
 
     impl MainAccount {
-        pub const SIZE: usize = 40;
+        pub const SIZE: usize = 48;
+
+        pub fn try_decode(data: &[u8]) -> io::Result<Self> {
+            Self::try_from_slice(data)
+        }
     }
 
     #[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
@@ -77,7 +98,6 @@ pub mod schedulecommit {
         ScheduleCommitCpi(ScheduleCommitCpiArgs, ScheduleCommitType) = 2,
         ScheduleCommitAndUndelegateCpiModAfter(Vec<Pubkey>) = 4,
         ScheduleCommitAndUndelegateCpiTwice(Vec<Pubkey>) = 5,
-        IncreaseCount = 6,
         SetCount(u64) = 7,
         InitOrderBook = 8,
         GrowOrderBook(u64) = 9,
@@ -85,6 +105,44 @@ pub mod schedulecommit {
         UpdateOrderBook(BookUpdate) = 11,
         ScheduleCommitForOrderBook(ScheduleCommitType) = 13,
         RequestUndelegation(Pubkey) = 16,
+        AdjustCount(i64) = 17,
+        Fail = 18,
+        ScheduleCounterTask {
+            task_id: i64,
+            execution_interval_millis: i64,
+            iterations: i64,
+            signer: bool,
+        } = 19,
+        CancelCounterTask {
+            task_id: i64,
+        } = 20,
+        CreateActionIntent {
+            counter: Pubkey,
+            count: u8,
+            compute_units: u32,
+        } = 21,
+        AddActionHandler {
+            count: u8,
+        } = 22,
+        ScheduleIntents {
+            modes: Vec<IntentMode>,
+            actions: bool,
+        } = 23,
+        BaseAction {
+            amount: u64,
+            change: Option<i64>,
+            fail: bool,
+        } = 24,
+        TransferIntent {
+            amount: u64,
+            fail: bool,
+        } = 25,
+    }
+
+    pub fn tagged(instruction: &ScheduleCommitInstruction) -> Vec<u8> {
+        let mut data = vec![SCHEDULE_COMMIT_TAG];
+        instruction.serialize(&mut data).expect("instruction serialization cannot fail");
+        data
     }
 
     pub fn book_lens(data: &[u8]) -> Option<(usize, usize, usize)> {
@@ -170,8 +228,7 @@ pub mod schedulecommit {
             instruction: &ScheduleCommitInstruction,
             metas: Vec<AccountMeta>,
         ) -> Instruction {
-            let mut data = vec![crate::SCHEDULE_COMMIT_TAG];
-            data.extend(borsh::to_vec(instruction).expect("instruction serialization cannot fail"));
+            let data = tagged(instruction);
             Instruction {
                 program_id: crate::id(),
                 accounts: metas,
@@ -307,19 +364,122 @@ pub mod schedulecommit {
             )
         }
 
-        pub fn increase_count(player: Pubkey) -> Instruction {
-            let (pda, _) = pda_and_bump(&player);
-            with_tag(
-                &ScheduleCommitInstruction::IncreaseCount,
-                vec![AccountMeta::new(pda, false)],
-            )
-        }
-
         pub fn set_count(player: Pubkey, value: u64) -> Instruction {
             let (pda, _) = pda_and_bump(&player);
             with_tag(
                 &ScheduleCommitInstruction::SetCount(value),
                 vec![AccountMeta::new(pda, false)],
+            )
+        }
+
+        pub fn schedule_intents(
+            payers: &[Pubkey],
+            validator: Pubkey,
+            destination: Pubkey,
+            modes: Vec<IntentMode>,
+            actions: bool,
+        ) -> Instruction {
+            let mut metas = vec![
+                AccountMeta::new(payers[0], true),
+                AccountMeta::new(MAGIC_CONTEXT_ID, false),
+                AccountMeta::new_readonly(MAGIC_PROGRAM_ID, false),
+                AccountMeta::new(
+                    sdk::pda::magic_fee_vault_pda_from_validator(&validator),
+                    false,
+                ),
+                AccountMeta::new_readonly(destination, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ];
+            for payer in payers {
+                metas.extend([
+                    AccountMeta::new_readonly(*payer, true),
+                    AccountMeta::new(pda_and_bump(payer).0, false),
+                ]);
+            }
+            with_tag(
+                &ScheduleCommitInstruction::ScheduleIntents { modes, actions },
+                metas,
+            )
+        }
+
+        pub fn transfer_intent(
+            payer: Pubkey,
+            validator: Pubkey,
+            destination: Pubkey,
+            amount: u64,
+            fail: bool,
+        ) -> Instruction {
+            let mut ix = schedule_intents(&[payer], validator, destination, vec![], false);
+            ix.data = tagged(&ScheduleCommitInstruction::TransferIntent { amount, fail });
+            ix
+        }
+
+        pub fn add(player: Pubkey, count: u8) -> Instruction {
+            let mut instruction = add_unsigned(player, count);
+            instruction.accounts.push(AccountMeta::new_readonly(player, true));
+            instruction
+        }
+        pub fn add_unsigned(player: Pubkey, count: u8) -> Instruction {
+            with_tag(
+                &ScheduleCommitInstruction::AdjustCount(i64::from(count)),
+                vec![AccountMeta::new(pda_and_bump(&player).0, false)],
+            )
+        }
+        pub fn fail(player: Pubkey) -> Instruction {
+            with_tag(
+                &ScheduleCommitInstruction::Fail,
+                vec![AccountMeta::new(pda_and_bump(&player).0, false)],
+            )
+        }
+        pub fn schedule_counter_task(
+            payer: Pubkey,
+            task_id: i64,
+            execution_interval_millis: i64,
+            iterations: i64,
+            signer: bool,
+        ) -> Instruction {
+            let (pda, _) = pda_and_bump(&payer);
+            let metas = vec![
+                AccountMeta::new_readonly(MAGIC_PROGRAM_ID, false),
+                AccountMeta::new(payer, true),
+                AccountMeta::new(pda, false),
+            ];
+            with_tag(
+                &ScheduleCommitInstruction::ScheduleCounterTask {
+                    task_id,
+                    execution_interval_millis,
+                    iterations,
+                    signer,
+                },
+                metas,
+            )
+        }
+
+        pub fn cancel_counter_task(payer: Pubkey, task_id: i64) -> Instruction {
+            let metas = vec![
+                AccountMeta::new_readonly(MAGIC_PROGRAM_ID, false),
+                AccountMeta::new(payer, true),
+            ];
+            with_tag(
+                &ScheduleCommitInstruction::CancelCounterTask { task_id },
+                metas,
+            )
+        }
+
+        pub fn create_action_intent(
+            payer: Pubkey,
+            counter: Pubkey,
+            count: u8,
+            compute_units: u32,
+        ) -> Instruction {
+            let metas = vec![
+                AccountMeta::new(payer, true),
+                AccountMeta::new(MAGIC_CONTEXT_ID, false),
+                AccountMeta::new_readonly(MAGIC_PROGRAM_ID, false),
+            ];
+            with_tag(
+                &ScheduleCommitInstruction::CreateActionIntent { counter, count, compute_units },
+                metas,
             )
         }
 
@@ -404,15 +564,7 @@ pub mod schedulecommit {
 
 pub const LOG_MSG_TAG: u8 = 4;
 pub const SCHEDULE_COMMIT_TAG: u8 = 5;
-pub const FLEXI_TAG: u8 = 6;
-pub const UPGRADE_TAG: u8 = 7;
 pub const EPHEMERAL_TAG: u8 = 8;
-
-pub fn upgrade_probe_data(id: u64, fail: bool) -> Vec<u8> {
-    let mut data = vec![UPGRADE_TAG, u8::from(fail)];
-    data.extend_from_slice(&id.to_le_bytes());
-    data
-}
 
 pub fn log_msg_data(message: &str) -> Vec<u8> {
     let mut data = Vec::with_capacity(1 + message.len());
@@ -421,20 +573,16 @@ pub fn log_msg_data(message: &str) -> Vec<u8> {
     data
 }
 
-pub fn ephemeral_cpi(
-    mut instruction: instruction::Instruction,
-    fill: u8,
-) -> instruction::Instruction {
-    instruction.accounts.push(instruction::AccountMeta::new_readonly(
-        instruction.program_id,
-        false,
-    ));
+pub fn ephemeral_cpi(mut instruction: Instruction, fill: u8) -> Instruction {
+    instruction
+        .accounts
+        .push(AccountMeta::new_readonly(instruction.program_id, false));
     instruction.program_id = id();
     instruction.data.splice(..0, [EPHEMERAL_TAG, fill]);
     instruction
 }
 
-fn delegate_metas(payer: Pubkey, pda: Pubkey) -> Vec<instruction::AccountMeta> {
+fn delegate_metas(payer: Pubkey, pda: Pubkey) -> Vec<AccountMeta> {
     use instruction::AccountMeta;
     use sdk::delegate_args::{DelegateAccountMetas, DelegateAccounts};
 
