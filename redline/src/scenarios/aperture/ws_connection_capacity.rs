@@ -4,7 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{anyhow, ensure};
+use anyhow::ensure;
 use futures_util::future::join_all;
 use pubkey::Pubkey;
 use redsuite_core::{
@@ -148,27 +148,10 @@ impl Scenario<ScenarioReport> for WsConnectionCapacity {
             };
             debug!(rung.connections, "connection rung finished");
 
-            ensure!(
-                rung.fds_idle + FD_BASELINE_SLACK >= fd_baseline + connections,
-                "{} conns: only {} fds at hold — connections not held open",
-                connections,
-                rung.fds_idle
-            );
-            ensure!(
-                rung.fds_idle <= fd_baseline + connections + FD_TOLERANCE,
-                "{} conns: {} fds at hold exceeds conns + tolerance",
-                connections,
-                rung.fds_idle
-            );
+            ensure!(rung.fds_idle + FD_BASELINE_SLACK >= fd_baseline + connections);
+            ensure!(rung.fds_idle <= fd_baseline + connections + FD_TOLERANCE);
             ensure!(rung.unsubscribe_failures == 0);
-            ensure!(
-                rung.fds_after_close <= fd_baseline + FD_TOLERANCE,
-                "{} conns: {} fds after close-all — leaked descriptors \
-                 (baseline {})",
-                connections,
-                rung.fds_after_close,
-                fd_baseline
-            );
+            ensure!(rung.fds_after_close <= fd_baseline + FD_TOLERANCE);
             rungs.push(rung);
         }
 
@@ -183,9 +166,7 @@ impl Scenario<ScenarioReport> for WsConnectionCapacity {
                 future::ready(Ok(move |_: Instant| async move {
                     let mut conn = RawWs::connect(&ws_url).await?;
                     let subid = conn.account_subscribe(&shared_account).await?;
-                    if !conn.account_unsubscribe(subid).await? {
-                        return Err(anyhow!("unsubscribe returned false"));
-                    }
+                    ensure!(conn.account_unsubscribe(subid).await?);
                     conn.close().await
                 }))
             },
@@ -197,16 +178,8 @@ impl Scenario<ScenarioReport> for WsConnectionCapacity {
             churn.failed,
             fds_after_churn, fd_baseline, "connection churn finished",
         );
-        ensure!(
-            churn.failed == 0,
-            "failures={:?}; first error={:?}",
-            churn.failed,
-            churn.first_error
-        );
-        ensure!(
-            fds_after_churn <= fd_baseline + FD_TOLERANCE,
-            "churn leaked descriptors: {fds_after_churn} vs baseline {fd_baseline}"
-        );
+        ensure!(churn.failed == 0);
+        ensure!(fds_after_churn <= fd_baseline + FD_TOLERANCE);
 
         let mut summary = ScenarioReport::ok()
             .setting("profile", profile.name)

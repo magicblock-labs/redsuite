@@ -8,16 +8,19 @@ use std::{
     time::{Duration, Instant},
 };
 
+use tokio::sync::watch;
+
 use anyhow::{ensure, Context};
 use pubkey::Pubkey;
 use redsuite_core::{
-    check, host,
+    api::transaction_meta,
+    host,
     profile::ProfileValues,
-    programs::{CellHeader, Redline},
+    programs::{CellHeader, REDLINE},
     redline::{causal, Accounts},
     report::Unit,
     topology::{self, ErOptions, RestartConfig, RestartTiming},
-    Api, BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result, ScenarioReport, TxSender,
+    wait, Api, BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result, ScenarioReport, TxSender,
 };
 use signature::Signature;
 use tokio::{task::JoinSet, time};
@@ -26,19 +29,13 @@ use tracing::debug;
 use crate::ACCOUNT_SPACE;
 
 const PREP_PAYER_LAMPORTS: u64 = 4_000_000_000;
-const CLONE_TIMEOUT: Duration = Duration::from_secs(40);
 const READY_TIMEOUT: Duration = Duration::from_secs(120);
-const CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
-const CONFIRM_POLL: Duration = Duration::from_millis(50);
-const RESOLVE_GRACE: Duration = Duration::from_secs(3);
-const RESOLVE_POLL: Duration = Duration::from_millis(200);
 const SUPERBLOCK_POLL: Duration = Duration::from_millis(250);
 const LANE_BACKOFF: Duration = Duration::from_millis(100);
 const BLOCKTIME_MS: u64 = 50;
 const BLOCKTIME: Duration = Duration::from_millis(BLOCKTIME_MS);
 const SUPERBLOCK_SLOTS: u64 = 100;
 const HASH_ITERS: u32 = 1;
-const PROGRAM: Pubkey = crate::program::ID;
 const VERIFY_CAP: usize = 4_000;
 const SIGKILL: i32 = 9;
 const SUPERBLOCKS: &str = "engine_ledger_superblocks";
@@ -169,7 +166,7 @@ fn archived_snapshots(storage_dir: &Path) -> Result<usize> {
 
 struct LaneState {
     admit: Cell<bool>,
-    stop: Cell<bool>,
+    stop: watch::Sender<bool>,
     records: RefCell<Vec<Record>>,
     next_id: Rc<Cell<u64>>,
     api: Api,
@@ -187,8 +184,7 @@ impl LaneState {
     async fn send(&self, lane: usize, account: Pubkey, sender: &TxSender) -> Result<()> {
         let id = self.next_id.get();
         self.next_id.set(id + 1);
-        let ix =
-            Redline::at(PROGRAM).hash(id, causal::HASH_INIT.to_bytes(), HASH_ITERS, &[account]);
+        let ix = REDLINE.hash(id, causal::HASH_INIT.to_bytes(), HASH_ITERS, &[account]);
         let tx = sender.prepare(&[ix]).await?;
         let signature = tx.signatures[0];
         let index = {
@@ -222,7 +218,7 @@ impl Lanes {
             api,
             next_id,
             admit: Cell::new(true),
-            stop: Cell::new(false),
+            stop: watch::channel(false).0,
             records: RefCell::new(Vec::new()),
         });
         let mut tasks = JoinSet::new();
@@ -234,7 +230,7 @@ impl Lanes {
 
     fn halt(&self) {
         self.state.admit.set(false);
-        self.state.stop.set(true);
+        self.state.stop.send_replace(true);
     }
 
     fn confirmed(&self) -> usize {
@@ -253,21 +249,18 @@ impl Lanes {
     }
 }
 
-async fn await_status(api: &Api, signature: &Signature, stop: &Cell<bool>) -> Outcome {
-    let deadline = time::Instant::now() + CONFIRM_TIMEOUT;
-    loop {
-        if let Ok(Some(status)) = api.get_signature_status(signature).await {
-            if status.err.is_some() {
-                return Outcome::Failed;
-            }
-            if status.confirmed {
-                return Outcome::Confirmed;
-            }
+async fn await_status(api: &Api, signature: &Signature, stop: &watch::Sender<bool>) -> Outcome {
+    let mut stopped = stop.subscribe();
+    if *stopped.borrow() {
+        return Outcome::Unresolved;
+    }
+    tokio::select! {
+        _ = stopped.changed() => Outcome::Unresolved,
+        outcome = api.try_confirm(signature) => match outcome {
+            Ok(Ok(())) => Outcome::Confirmed,
+            Ok(Err(_)) => Outcome::Failed,
+            Err(_) => Outcome::Unresolved,
         }
-        if stop.get() || time::Instant::now() >= deadline {
-            return Outcome::Unresolved;
-        }
-        time::sleep(CONFIRM_POLL).await;
     }
 }
 
@@ -276,15 +269,11 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<bool>>,
 {
-    let deadline = time::Instant::now() + timeout;
-    while !done().await? {
-        ensure!(
-            time::Instant::now() < deadline,
-            "{what} did not happen within {timeout:?}"
-        );
-        time::sleep(SUPERBLOCK_POLL).await;
-    }
-    Ok(())
+    wait::retry_every(what, timeout, SUPERBLOCK_POLL, async || {
+        ensure!(done().await?);
+        Ok(())
+    })
+    .await
 }
 
 async fn resolve(api: &Api, records: &mut [Record]) -> Result<()> {
@@ -292,14 +281,13 @@ async fn resolve(api: &Api, records: &mut [Record]) -> Result<()> {
         if !matches!(record.outcome, Outcome::Unresolved | Outcome::Rejected) {
             continue;
         }
-        record.outcome = match check::poll_until(RESOLVE_GRACE, RESOLVE_POLL, async || {
-            api.get_transaction(&record.signature).await
-        })
-        .await?
-        {
-            Some(tx) if tx.err.is_none() => Outcome::Confirmed,
-            Some(_) => Outcome::Failed,
-            None => Outcome::Dropped,
+        record.outcome = match api.await_transaction(&record.signature).await {
+            Ok(tx) if transaction_meta(&tx)?.err.is_none() => Outcome::Confirmed,
+            Ok(_) => Outcome::Failed,
+            Err(error) if error.downcast_ref::<time::error::Elapsed>().is_some() => {
+                Outcome::Dropped
+            }
+            Err(error) => return Err(error),
         };
     }
     Ok(())
@@ -328,9 +316,9 @@ async fn check_state(er: &ErCtx, label: &str, pool: &[Pubkey], records: &[Record
         let account = er
             .account(pda)
             .await?
-            .with_context(|| format!("{label}: account {pda} missing on the er"))?;
+            .with_context(|| format!("{label}: account missing on the ER"))?;
         let on_chain = CellHeader::written_id(&account.data)
-            .with_context(|| format!("{label}: account {pda} data too short"))?;
+            .with_context(|| format!("{label}: account data too short"))?;
         ensure!(on_chain == expected_id);
     }
     Ok(())
@@ -341,18 +329,13 @@ struct Settlement {
     lost: usize,
 }
 
-async fn settle_after_restart(
-    api: &Api,
-    mode: Mode,
-    label: &str,
-    records: &mut [Record],
-) -> Result<Settlement> {
-    let lost = if mode.hard_kill() { drop_lost_tail(api, label, records).await? } else { 0 };
-    let checked = check_confirmed_present(api, label, records).await?;
+async fn settle_after_restart(api: &Api, mode: Mode, records: &mut [Record]) -> Result<Settlement> {
+    let lost = if mode.hard_kill() { drop_lost_tail(api, records).await? } else { 0 };
+    let checked = check_confirmed_present(api, records).await?;
     Ok(Settlement { checked, lost })
 }
 
-async fn drop_lost_tail(api: &Api, label: &str, records: &mut [Record]) -> Result<usize> {
+async fn drop_lost_tail(api: &Api, records: &mut [Record]) -> Result<usize> {
     let mut per_lane: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
     for (index, record) in records.iter().enumerate() {
         if record.outcome == Outcome::Confirmed {
@@ -360,20 +343,14 @@ async fn drop_lost_tail(api: &Api, label: &str, records: &mut [Record]) -> Resul
         }
     }
     let mut lost = 0;
-    for (lane, mut indices) in per_lane {
+    for mut indices in per_lane.into_values() {
         indices.sort_by_key(|&index| records[index].id);
         while let Some(&index) = indices.last() {
             let record = &records[index];
             match api.get_transaction(&record.signature).await? {
                 Some(tx) => {
-                    ensure!(
-                        tx.err.is_none(),
-                        "{label}: surviving confirmed transaction {} (id {}, \
-                         lane {lane}) replayed as a failure: {:?}",
-                        record.signature,
-                        record.id,
-                        tx.err
-                    );
+                    let meta = transaction_meta(&tx)?;
+                    ensure!(meta.err == None);
                     break;
                 }
                 None => {
@@ -387,34 +364,26 @@ async fn drop_lost_tail(api: &Api, label: &str, records: &mut [Record]) -> Resul
     Ok(lost)
 }
 
-async fn check_confirmed_present(api: &Api, label: &str, records: &[Record]) -> Result<usize> {
+async fn check_confirmed_present(api: &Api, records: &[Record]) -> Result<usize> {
     let confirmed: Vec<&Record> =
         records.iter().filter(|record| record.outcome == Outcome::Confirmed).collect();
     let stride = confirmed.len().div_ceil(VERIFY_CAP).max(1);
     let mut checked = 0;
     for record in confirmed.iter().step_by(stride) {
         let tx = api.get_transaction(&record.signature).await?;
-        ensure!(
-            tx.as_ref().is_some_and(|tx| tx.err.is_none()),
-            "{label}: confirmed transaction {} (id {}) is no longer a \
-             successful ledger entry: {:?}",
-            record.signature,
-            record.id,
-            tx.map(|tx| tx.err)
-        );
+        ensure!(tx
+            .as_ref()
+            .and_then(|tx| tx.transaction.meta.as_ref())
+            .is_some_and(|meta| meta.err.is_none()));
         checked += 1;
     }
     Ok(checked)
 }
 
-fn check_exit(mode: Mode, label: &str, timing: &RestartTiming) -> Result<()> {
+fn check_exit(mode: Mode, timing: &RestartTiming) -> Result<()> {
     match mode {
         Mode::Graceful => {
-            ensure!(
-                !timing.needed_sigkill,
-                "{label}: the ER did not exit on SIGTERM within the grace \
-                 window and had to be SIGKILLed"
-            );
+            ensure!(!timing.needed_sigkill);
             ensure!(timing.exit_code == Some(0));
         }
         Mode::Sigkill => {
@@ -422,11 +391,7 @@ fn check_exit(mode: Mode, label: &str, timing: &RestartTiming) -> Result<()> {
         }
     }
     if let (Some(before), Some(after)) = (timing.slot_before, timing.slot_after) {
-        ensure!(
-            after >= before / 2,
-            "INVALID: {label}: post-restart slot {after} collapsed from \
-             {before} — the ER did not reopen its database"
-        );
+        ensure!(after >= before / 2);
     }
     Ok(())
 }
@@ -470,7 +435,7 @@ async fn run_mode(base: &BaseCtx, profile: &Profile, mode: Mode) -> Result<ModeO
         let pool = Accounts::new(ACCOUNT_SPACE, er.identity())
             .init_batched(base, &prep_payers, profile.lanes, true)
             .await?;
-        er.await_clones(&pool, ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
+        er.await_clones(&pool, ACCOUNT_SPACE as usize).await?;
         Rc::new(pool)
     };
     let senders: Vec<TxSender> = prep_payers
@@ -506,20 +471,14 @@ async fn run_mode(base: &BaseCtx, profile: &Profile, mode: Mode) -> Result<ModeO
     .await?;
     let db_size_at_restart = host::dir_size_bytes(private.storage_dir())?;
     let fill_growth = db_size_at_restart.saturating_sub(storage_at_boot);
-    ensure!(
-        fill_growth > 0,
-        "INVALID: {label}: the fill phase did not grow the on-disk database"
-    );
+    ensure!(fill_growth > 0);
 
     lanes.halt();
     let first = private.restart(mode.restart_config()).await?;
-    check_exit(mode, &format!("{label} first restart"), &first)?;
+    check_exit(mode, &first)?;
     let mut records = lanes.drain().await?;
     let at_kill = Tally::of(&records);
-    ensure!(
-        at_kill.confirmed > 0,
-        "INVALID: {label}: no transaction was confirmed before the restart"
-    );
+    ensure!(at_kill.confirmed > 0);
 
     let log_text = fs::read_to_string(private.log()).unwrap_or_default();
     let timing_visible = log_text.contains(LEDGER_TIMING_ANCHOR);
@@ -528,13 +487,7 @@ async fn run_mode(base: &BaseCtx, profile: &Profile, mode: Mode) -> Result<ModeO
 
     let api = private.ctx().api().clone();
     resolve(&api, &mut records).await?;
-    let settled = settle_after_restart(
-        &api,
-        mode,
-        &format!("{label} after first restart"),
-        &mut records,
-    )
-    .await?;
+    let settled = settle_after_restart(&api, mode, &mut records).await?;
     let confirmed_checked = settled.checked;
     let lost_first = settled.lost;
     let resolved = Tally::of(&records);
@@ -564,24 +517,14 @@ async fn run_mode(base: &BaseCtx, profile: &Profile, mode: Mode) -> Result<ModeO
     let mut resumed_records = resumed.drain().await?;
     resolve(&api, &mut resumed_records).await?;
     let resume = Tally::of(&resumed_records);
-    ensure!(
-        resume.confirmed > 0,
-        "INVALID: {label}: the resumed load confirmed nothing"
-    );
+    ensure!(resume.confirmed > 0);
     ensure!((resume.unresolved + resume.rejected + resume.dropped + resume.failed) == 0);
     records.extend(resumed_records);
     check_state(er, &format!("{label} after resume"), &pool, &records).await?;
 
     let second = private.restart(mode.restart_config()).await?;
-    check_exit(mode, &format!("{label} second restart"), &second)?;
-    let lost_second = settle_after_restart(
-        &api,
-        mode,
-        &format!("{label} after second restart"),
-        &mut records,
-    )
-    .await?
-    .lost;
+    check_exit(mode, &second)?;
+    let lost_second = settle_after_restart(&api, mode, &mut records).await?.lost;
     check_state(
         private.ctx(),
         &format!("{label} after second restart"),

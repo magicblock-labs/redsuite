@@ -1,151 +1,162 @@
 use std::{collections::VecDeque, time::Duration};
 
-use anyhow::{anyhow, Context};
-use futures_util::SinkExt;
-use json::{JsonValueTrait, Value};
+use anyhow::Context;
+use json::Value;
 use pubkey::Pubkey;
+use serde::{de::DeserializeOwned, Serialize};
 use signature::Signature;
+use solana_rpc_client_types::{config::RpcTransactionLogsFilter, request::RpcRequest};
 use tokio::{time, time::Instant};
-use tokio_tungstenite::tungstenite::Message;
 use url::Url;
 
-use super::conn::{self, CloseReason, RawEvent, Socket};
+use super::{
+    rpc::NO_PARAMS,
+    socket::{self, Frame, Notification, Socket},
+    subscription::{self, Topic},
+    NETWORK_TIMEOUT,
+};
 use crate::Result;
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+type RawNotification = (String, u64, Value);
 
 pub struct RawWs {
     socket: Socket,
-    next_req_id: u64,
-    queue: VecDeque<(String, u64, Value)>,
+    next_id: u64,
+    queue: VecDeque<RawNotification>,
     malformed: usize,
 }
 
 impl RawWs {
     pub async fn connect(url: &Url) -> Result<Self> {
         Ok(Self {
-            socket: conn::connect(url).await?,
-            next_req_id: 1,
+            socket: socket::connect(url).await?,
+            next_id: 1,
             queue: VecDeque::new(),
             malformed: 0,
         })
     }
 
-    async fn request(&mut self, method: &str, params: &str) -> Result<Value> {
-        let req_id = self.next_req_id;
-        self.next_req_id += 1;
-        self.socket
-            .send(Message::Text(
-                conn::request_text(req_id, method, params).into(),
-            ))
-            .await
-            .with_context(|| format!("{method} send"))?;
-        let deadline = Instant::now() + REQUEST_TIMEOUT;
+    async fn request<T: DeserializeOwned>(
+        &mut self,
+        method: RpcRequest,
+        params: &impl Serialize,
+    ) -> Result<T> {
+        let id = self.next_id;
+        self.next_id += 1;
+        socket::send(&mut self.socket, id, method, params).await?;
+        let deadline = Instant::now() + NETWORK_TIMEOUT;
         loop {
-            let remaining =
-                deadline.checked_duration_since(Instant::now()).unwrap_or(Duration::ZERO);
-            let event = time::timeout(remaining, conn::next_event(&mut self.socket))
+            let text = time::timeout_at(deadline, socket::receive(&mut self.socket))
                 .await
-                .with_context(|| format!("{method}: no reply within {REQUEST_TIMEOUT:?}"))?;
-            match event {
-                Ok(RawEvent::Reply { id, result }) if id == req_id => {
-                    return result.with_context(|| format!("{method}: reply had no result"));
+                .with_context(|| format!("{method}: no reply within {NETWORK_TIMEOUT:?}"))?
+                .with_context(|| method.to_string())?;
+            match socket::parse(&text).with_context(|| method.to_string())? {
+                Some(Frame::Reply { id: reply, result }) if reply == id => {
+                    return Ok(json::from_str(result.as_raw_str())?);
                 }
-                Ok(RawEvent::Reply { .. }) => {}
-                Ok(RawEvent::Notification {
-                    method: notified,
-                    subscription,
-                    payload,
-                }) => self.queue.push_back((notified, subscription, payload)),
-                Ok(RawEvent::Malformed) => self.malformed += 1,
-                Err(CloseReason::ServerError(error)) => {
-                    return Err(anyhow!("{method}: {error:#}"));
+                // A cancelled request may leave a late reply on the socket.
+                Some(Frame::Reply { .. }) | None => {}
+                Some(Frame::Notification { method, params }) => {
+                    if let Some(notification) = self.decode_notification(method, params) {
+                        self.queue.push_back(notification);
+                    }
                 }
-                Err(reason) => {
-                    return Err(anyhow!("{method}: {reason}"));
-                }
+                Some(Frame::Malformed) => self.malformed += 1,
             }
         }
     }
 
-    async fn subscribe(&mut self, method: &str, params: &str) -> Result<u64> {
-        let result = self.request(method, params).await?;
-        result
-            .as_u64()
-            .with_context(|| format!("non-numeric subscription id: {result:?}"))
+    async fn subscribe(&mut self, topic: Topic, params: &impl Serialize) -> Result<u64> {
+        self.request(topic.subscribe(), params).await
     }
 
-    async fn unsubscribe(&mut self, method: &str, subid: u64) -> Result<bool> {
-        let result = self.request(method, &format!("[{subid}]")).await?;
-        result
-            .as_bool()
-            .with_context(|| format!("non-boolean unsubscribe reply: {result:?}"))
+    async fn unsubscribe(&mut self, topic: Topic, subscription: u64) -> Result<bool> {
+        self.request(topic.unsubscribe(), &(subscription,)).await
     }
 
     pub async fn account_subscribe(&mut self, account: &Pubkey) -> Result<u64> {
-        self.subscribe("accountSubscribe", &conn::account_params(account)).await
+        self.subscribe(Topic::Account, &subscription::account_params(account)).await
     }
 
-    pub async fn account_unsubscribe(&mut self, subid: u64) -> Result<bool> {
-        self.unsubscribe("accountUnsubscribe", subid).await
+    pub async fn account_unsubscribe(&mut self, subscription: u64) -> Result<bool> {
+        self.unsubscribe(Topic::Account, subscription).await
     }
 
     pub async fn logs_subscribe_all(&mut self) -> Result<u64> {
-        self.subscribe("logsSubscribe", conn::logs_all_params()).await
+        let params = subscription::logs_params(RpcTransactionLogsFilter::All);
+        self.subscribe(Topic::Logs, &params).await
     }
 
     pub async fn logs_subscribe_mentions(&mut self, account: &Pubkey) -> Result<u64> {
-        self.subscribe("logsSubscribe", &conn::logs_mentions_params(account)).await
+        let filter = RpcTransactionLogsFilter::Mentions(vec![account.to_string()]);
+        let params = subscription::logs_params(filter);
+        self.subscribe(Topic::Logs, &params).await
     }
 
-    pub async fn logs_unsubscribe(&mut self, subid: u64) -> Result<bool> {
-        self.unsubscribe("logsUnsubscribe", subid).await
+    pub async fn logs_unsubscribe(&mut self, subscription: u64) -> Result<bool> {
+        self.unsubscribe(Topic::Logs, subscription).await
     }
 
     pub async fn program_subscribe(&mut self, program: &Pubkey) -> Result<u64> {
-        self.subscribe("programSubscribe", &conn::program_params(program)).await
+        self.subscribe(Topic::Program, &subscription::program_params(program)).await
     }
 
-    pub async fn program_unsubscribe(&mut self, subid: u64) -> Result<bool> {
-        self.unsubscribe("programUnsubscribe", subid).await
+    pub async fn program_unsubscribe(&mut self, subscription: u64) -> Result<bool> {
+        self.unsubscribe(Topic::Program, subscription).await
     }
 
     pub async fn slot_subscribe(&mut self) -> Result<u64> {
-        self.subscribe("slotSubscribe", "[]").await
+        self.subscribe(Topic::Slot, &NO_PARAMS).await
     }
 
-    pub async fn slot_unsubscribe(&mut self, subid: u64) -> Result<bool> {
-        self.unsubscribe("slotUnsubscribe", subid).await
+    pub async fn slot_unsubscribe(&mut self, subscription: u64) -> Result<bool> {
+        self.unsubscribe(Topic::Slot, subscription).await
     }
 
     pub async fn signature_subscribe(&mut self, signature: &Signature) -> Result<u64> {
-        self.subscribe("signatureSubscribe", &conn::signature_params(signature)).await
+        self.subscribe(Topic::Signature, &subscription::signature_params(signature))
+            .await
     }
 
-    pub async fn signature_unsubscribe(&mut self, subid: u64) -> Result<bool> {
-        self.unsubscribe("signatureUnsubscribe", subid).await
+    pub async fn signature_unsubscribe(&mut self, subscription: u64) -> Result<bool> {
+        self.unsubscribe(Topic::Signature, subscription).await
     }
 
     pub async fn next_notification(
         &mut self,
         timeout: Duration,
-    ) -> Result<Option<(String, u64, Value)>> {
+    ) -> Result<Option<RawNotification>> {
         if let Some(notification) = self.queue.pop_front() {
             return Ok(Some(notification));
         }
         let deadline = Instant::now() + timeout;
         loop {
-            let remaining =
-                deadline.checked_duration_since(Instant::now()).unwrap_or(Duration::ZERO);
-            let event = time::timeout(remaining, conn::next_event(&mut self.socket)).await;
-            match event {
+            let text = match time::timeout_at(deadline, socket::receive(&mut self.socket)).await {
+                Ok(text) => text.context("ws notification")?,
                 Err(_) => return Ok(None),
-                Ok(Ok(RawEvent::Notification { method, subscription, payload })) => {
-                    return Ok(Some((method, subscription, payload)))
+            };
+            match socket::parse(&text).context("ws notification")? {
+                Some(Frame::Notification { method, params }) => {
+                    if let Some(notification) = self.decode_notification(method, params) {
+                        return Ok(Some(notification));
+                    }
                 }
-                Ok(Ok(RawEvent::Reply { .. })) => {}
-                Ok(Ok(RawEvent::Malformed)) => self.malformed += 1,
-                Ok(Err(reason)) => return Err(anyhow!("ws: {reason}")),
+                Some(Frame::Reply { .. }) | None => {}
+                Some(Frame::Malformed) => self.malformed += 1,
+            }
+        }
+    }
+
+    fn decode_notification(
+        &mut self,
+        method: &str,
+        params: Notification<'_>,
+    ) -> Option<RawNotification> {
+        match json::from_str(params.result.as_raw_str()) {
+            Ok(payload) => Some((method.to_owned(), params.subscription, payload)),
+            Err(_) => {
+                self.malformed += 1;
+                None
             }
         }
     }
@@ -155,7 +166,10 @@ impl RawWs {
     }
 
     pub async fn close(mut self) -> Result<()> {
-        self.socket.close(None).await.context("ws close")?;
+        time::timeout(NETWORK_TIMEOUT, self.socket.close(None))
+            .await
+            .context("ws close timed out")?
+            .context("ws close")?;
         Ok(())
     }
 }

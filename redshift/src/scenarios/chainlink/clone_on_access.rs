@@ -21,10 +21,6 @@ use crate::{
     ACCOUNT_SPACE, LOCKOUT_REJECTIONS, PAYER_LAMPORTS,
 };
 
-const CLONE_TIMEOUT: Duration = Duration::from_secs(15);
-const PROPAGATION_TIMEOUT: Duration = Duration::from_secs(15);
-const BASE_STATE_TIMEOUT: Duration = Duration::from_secs(20);
-const UNDELEGATE_TIMEOUT: Duration = Duration::from_secs(30);
 const PRE_CLONE_WRITE: u64 = 41;
 const POST_CLONE_WRITE: u64 = 42;
 const UNDELEGATED_WRITE: u64 = 44;
@@ -48,49 +44,24 @@ fn untouched(data: &[u8]) -> bool {
         .is_some_and(|rest| rest.iter().all(|&byte| byte == 0))
 }
 
-fn head(bytes: &[u8]) -> String {
-    format!("{:02x?}", &bytes[..48.min(bytes.len())])
-}
-
 async fn await_landed(
     base: &BaseCtx,
     pda: Pubkey,
     owner: Pubkey,
     data: &[u8],
     lamports: Option<u64>,
-    timeout: Duration,
 ) -> Result<()> {
-    check::poll_for(
-        &format!("{pda} lands on base with the expected owner and bytes"),
-        timeout,
-        || async {
-            match base.account(&pda).await {
-                Ok(Some(acc))
-                    if acc.owner == owner
-                        && acc.data == data
-                        && lamports.is_none_or(|lamports| acc.lamports == lamports) =>
-                {
-                    Ok(())
-                }
-                Ok(Some(acc)) => Err(format!(
-                    "owner {} lamports {} data[..48] {}",
-                    acc.owner,
-                    acc.lamports,
-                    head(&acc.data)
-                )),
-                Ok(None) => Err("absent".to_owned()),
-                Err(error) => Err(format!("read failed: {error:#}")),
+    base.api()
+        .await_accounts(&[pda], "base account state", async || {
+            let account = base.account(&pda).await?.context("base account missing")?;
+            ensure!(account.owner == owner);
+            ensure!(account.data == data);
+            if let Some(lamports) = lamports {
+                ensure!(account.lamports == lamports);
             }
-        },
-    )
-    .await
-    .with_context(|| {
-        format!(
-            "owner {owner} lamports {lamports:?} data[..48] {}",
-            head(data)
-        )
-    })?;
-    Ok(())
+            Ok(())
+        })
+        .await
 }
 
 impl Scenario for CloneOnAccess {
@@ -105,17 +76,15 @@ impl Scenario for CloneOnAccess {
         let Self { base, er, payer, identity } = self;
         crate::phase("negative cache", async {
             let ghost = Keypair::new().pubkey();
-            ensure!(er.account(&ghost).await?.is_none(), "an account that exists nowhere must read as absent on the ER");
+            ensure!(er.account(&ghost).await?.is_none());
             base.airdrop(&ghost, GHOST_LAMPORTS).await?;
-            check::poll(
-                "the base airdrop invalidates the ER's negative cache for the \
-                 ghost",
-                PROPAGATION_TIMEOUT,
-                || async {
-                    matches!(er.account(&ghost).await, Ok(Some(acc)) if acc.lamports == GHOST_LAMPORTS)
-                },
-            )
-            .await?;
+            er.api()
+                .await_accounts(&[ghost], "negative cache invalidated", async || {
+                    let account = er.account(&ghost).await?.context("ghost not cloned")?;
+                    ensure!(account.lamports == GHOST_LAMPORTS);
+                    Ok(())
+                })
+                .await?;
             Ok(())
         })
         .await?;
@@ -123,33 +92,29 @@ impl Scenario for CloneOnAccess {
         crate::phase("plain clone", async {
             let plain = base.cells(REDLINE, &payer).create(ACCOUNT_SPACE, identity, 0).await?;
             base.cells(REDLINE, &payer).write(PRE_CLONE_WRITE, &[plain]).await?;
-            check::poll(
-                "the ER clones the plain account on first access",
-                CLONE_TIMEOUT,
-                || async {
-                    matches!(er.account(&plain).await, Ok(Some(clone)) if clone.data.len() == ACCOUNT_SPACE as usize)
-                },
-            )
-            .await?;
-            let plain_clone =
-                er.account(&plain).await?.context("plain clone vanished")?;
-            let plain_on_base =
-                base.account(&plain).await?.context("plain gone on base")?;
+            let plain_clone = er
+                .api()
+                .await_accounts(&[plain], "plain account cloned", async || {
+                    let account = er.account(&plain).await?.context("plain clone missing")?;
+                    ensure!(account.data.len() == ACCOUNT_SPACE as usize);
+                    Ok(account)
+                })
+                .await?;
+            let plain_on_base = base.account(&plain).await?.context("plain gone on base")?;
             ensure!(plain_clone.lamports == plain_on_base.lamports);
             ensure!(plain_clone.owner == crate::program::id());
             ensure!(CellHeader::written_id(&plain_clone.data) == Some(PRE_CLONE_WRITE));
             base.cells(REDLINE, &payer).write(POST_CLONE_WRITE, &[plain]).await?;
-            check::poll(
-                "the base write propagates to the existing ER clone",
-                PROPAGATION_TIMEOUT,
-                || async {
-                    matches!(er.account(&plain).await, Ok(Some(clone)) if CellHeader::written_id(&clone.data) == Some(POST_CLONE_WRITE))
-                },
-            )
-            .await?;
+            er.api()
+                .await_accounts(&[plain], "base write propagated", async || {
+                    let account = er.account(&plain).await?.context("plain clone missing")?;
+                    ensure!(CellHeader::written_id(&account.data) == Some(POST_CLONE_WRITE));
+                    Ok(())
+                })
+                .await?;
             let undelegated_write =
                 er.cells(REDLINE, &payer).write(UNDELEGATED_WRITE, &[plain]).await;
-            ensure!(undelegated_write.is_err(), "undelegated write rejected; actual={undelegated_write:?}");
+            ensure!(undelegated_write.is_err());
             Ok(())
         })
         .await?;
@@ -164,7 +129,7 @@ impl Scenario for CloneOnAccess {
                 let on_base = base.account(pda).await?.context("delegated pda missing on base")?;
                 ensure!(on_base.owner == DELEGATION_PROGRAM_ID);
             }
-            er.await_clones(&accounts, ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
+            er.await_clones(&accounts, ACCOUNT_SPACE as usize).await?;
             let delegated_clone =
                 er.account(&delegated).await?.context("delegated clone vanished")?;
             ensure!(delegated_clone.owner == crate::program::id());
@@ -177,7 +142,7 @@ impl Scenario for CloneOnAccess {
             ensure!(CellHeader::written_id(&snapshot) == Some(ER_WRITE));
             for pda in &accounts {
                 let on_base = base.account(pda).await?.context("delegated pda gone on base")?;
-                ensure!(untouched(&on_base.data), "base unchanged before commit");
+                ensure!(untouched(&on_base.data));
             }
             Ok((accounts, snapshot))
         })
@@ -192,26 +157,12 @@ impl Scenario for CloneOnAccess {
             let receipt = er.check_commit(&base, &signature, &accounts[..1], false).await?;
             if !receipt.failure_is_duplicate_rejection() {
                 ensure!(receipt.payer == Some(payer.pubkey()));
-                ensure!(
-                    !receipt.base_signatures.is_empty(),
-                    "a commit receipt must name at least one base tx"
-                );
+                ensure!(!receipt.base_signatures.is_empty());
             }
-            await_landed(
-                &base,
-                delegated,
-                DELEGATION_PROGRAM_ID,
-                &snapshot,
-                None,
-                BASE_STATE_TIMEOUT,
-            )
-            .await?;
+            await_landed(&base, delegated, DELEGATION_PROGRAM_ID, &snapshot, None).await?;
             let sibling_on_base =
                 base.account(&sibling).await?.context("sibling pda gone on base")?;
-            ensure!(
-                untouched(&sibling_on_base.data),
-                "committing one account must not touch its sibling on base"
-            );
+            ensure!(untouched(&sibling_on_base.data));
             Ok(())
         })
         .await?;
@@ -235,10 +186,7 @@ impl Scenario for CloneOnAccess {
                 .await?;
             let receipt = er.check_commit(&base, &signature, &accounts, true).await?;
             if !receipt.failure_is_duplicate_rejection() {
-                ensure!(
-                    !receipt.base_signatures.is_empty(),
-                    "an undelegating commit must name at least one base tx"
-                );
+                ensure!(!receipt.base_signatures.is_empty());
             }
             for (pda, expected) in accounts.iter().zip(&finals) {
                 await_landed(
@@ -247,21 +195,20 @@ impl Scenario for CloneOnAccess {
                     crate::program::id(),
                     &expected.data,
                     Some(expected.lamports),
-                    UNDELEGATE_TIMEOUT,
                 )
                 .await?;
             }
-            check::poll(
-                "the er re-clones the undelegated account with its base owner",
-                UNDELEGATE_TIMEOUT,
-                || async {
-                    matches!(
-                        er.account(&delegated).await,
-                        Ok(Some(clone)) if clone.owner == crate::program::id()
-                    )
-                },
-            )
-            .await?;
+            er.api()
+                .await_accounts(
+                    &[delegated],
+                    "the er re-clones the undelegated account with its base owner",
+                    async || {
+                        let account = er.account(&delegated).await?.context("clone missing")?;
+                        ensure!(account.owner == crate::program::id());
+                        Ok(())
+                    },
+                )
+                .await?;
             let write_after_undelegate =
                 er.cells(REDLINE, &wallet).write(LOCKOUT_WRITE, &[delegated]).await;
             let error =
@@ -276,17 +223,17 @@ impl Scenario for CloneOnAccess {
         .await?;
 
         crate::phase("redelegation continuity", async {
-            check::poll(
-                "the ER clones the delegated wallet at full balance",
-                CLONE_TIMEOUT,
-                || async {
-                    matches!(
-                        er.api().get_balance(&wallet.pubkey()).await,
-                        Ok(balance) if balance == WALLET_LAMPORTS
-                    )
-                },
-            )
-            .await?;
+            er.api()
+                .await_accounts(
+                    &[wallet.pubkey()],
+                    "the ER clones the delegated wallet at full balance",
+                    async || {
+                        let balance = er.api().get_balance(&wallet.pubkey()).await?;
+                        ensure!(balance == WALLET_LAMPORTS);
+                        Ok(())
+                    },
+                )
+                .await?;
             let validator = topology::identity_keypair(&identity)?;
             let cycle = [
                 commit_state(
@@ -313,11 +260,7 @@ impl Scenario for CloneOnAccess {
             base.submit_and_confirm_with(&payer, &[&validator, &wallet], &cycle).await?;
             let continuity_deadline = Instant::now() + CONTINUITY_WINDOW;
             while Instant::now() < continuity_deadline {
-                ensure!(
-                    er.account(&wallet.pubkey()).await?.is_some(),
-                    "the er clone must survive a one-transaction undelegate + \
-                     redelegate"
-                );
+                ensure!(er.account(&wallet.pubkey()).await?.is_some());
                 time::sleep(CONTINUITY_STEP).await;
             }
             let wallet_on_base = base

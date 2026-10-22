@@ -4,7 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{anyhow, Context};
+use anyhow::{ensure, Context};
 use keypair::Keypair;
 use signer::Signer;
 use tokio::time;
@@ -36,7 +36,6 @@ pub struct ReplicatedOptions {
     pub label: String,
     pub verifiers: usize,
     pub settings: Settings,
-    pub request_timeout: Option<Duration>,
 }
 
 impl Default for ReplicatedOptions {
@@ -45,7 +44,6 @@ impl Default for ReplicatedOptions {
             label: String::new(),
             verifiers: 0,
             settings: Box::new(|_| {}),
-            request_timeout: None,
         }
     }
 }
@@ -153,12 +151,11 @@ impl Verifier {
     // storage; wiping it lets the next start rejoin from the leader's
     // snapshot under the same identity, ports and configuration.
     pub fn reset_storage(&mut self) -> Result<()> {
-        if self.proc.has_child() {
-            return Err(anyhow!(
-                "verifier `{}` must be stopped before its storage is reset",
-                self.proc.label()
-            ));
-        }
+        ensure!(
+            !(self.proc.has_child()),
+            "verifier `{}` must be stopped before its storage is reset",
+            self.proc.label()
+        );
         self.remove_storage()
     }
 
@@ -168,13 +165,12 @@ impl Verifier {
     }
 
     pub async fn start(&mut self, ready_timeout: Duration) -> Result<Duration> {
-        if self.proc.has_child() {
-            return Err(anyhow!(
-                "verifier `{}` is already running (pid {})",
-                self.proc.label(),
-                self.proc.pid()
-            ));
-        }
+        ensure!(
+            !(self.proc.has_child()),
+            "verifier `{}` is already running (pid {})",
+            self.proc.label(),
+            self.proc.pid()
+        );
         let started = Instant::now();
         self.proc.relaunch(self.plan.spawn(&self.log)?);
         self.wait_ready(ready_timeout).await?;
@@ -250,12 +246,11 @@ impl ReplicatedTopology {
             if self.leader_connections().await? >= expected {
                 return Ok(started.elapsed());
             }
-            if time::Instant::now() >= deadline {
-                return Err(anyhow!(
-                    "the leader did not report {expected:.0} replication \
+            ensure!(
+                time::Instant::now() < deadline,
+                "the leader did not report {expected:.0} replication \
                      connections within {timeout:?}"
-                ));
-            }
+            );
             time::sleep(CONNECT_POLL).await;
         }
     }
@@ -280,9 +275,10 @@ impl ReplicatedTopology {
 }
 
 pub async fn replicated(base: &BaseCtx, options: ReplicatedOptions) -> Result<ReplicatedTopology> {
-    if options.verifiers == 0 {
-        return Err(anyhow!("a replicated topology needs at least one verifier"));
-    }
+    ensure!(
+        options.verifiers != 0,
+        "a replicated topology needs at least one verifier"
+    );
     let verifier_bin = config::find_verifier_bin()?;
     let identities: Vec<Keypair> = (0..options.verifiers).map(|_| Keypair::new()).collect();
     let leader = leader_er(
@@ -290,7 +286,7 @@ pub async fn replicated(base: &BaseCtx, options: ReplicatedOptions) -> Result<Re
         ErOptions {
             label: options.label.clone(),
             settings: options.settings,
-            request_timeout: options.request_timeout,
+
             ..ErOptions::default()
         },
         identities.iter().map(|identity| identity.pubkey()).collect(),

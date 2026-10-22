@@ -1,4 +1,4 @@
-use std::{slice, time::Duration};
+use std::slice;
 
 use anyhow::Context;
 use instruction::Instruction;
@@ -155,6 +155,6 @@ impl<C: ChainCtx> Program<'_, C> {
 impl ErCtx {
     pub async fn await_cells(&self, cells: &[OwnedCell]) -> Result<()> {
         let keys: Vec<_> = cells.iter().map(|cell| cell.address).collect();
-        self.await_clones(&keys, CellHeader::SIZE, Duration::from_secs(15)).await
+        self.await_clones(&keys, CellHeader::SIZE).await
     }
 }

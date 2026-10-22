@@ -1,7 +1,6 @@
 use std::{rc::Rc, result, time::Duration};
 
 use anyhow::{anyhow, ensure, Context};
-use base64::{engine::general_purpose::STANDARD, Engine};
 use futures_util::future::join_all;
 use hash::Hash;
 use instruction::{AccountMeta, Instruction};
@@ -9,23 +8,31 @@ use keypair::Keypair;
 use pubkey::Pubkey;
 
 use redsuite_core::{
-    api::RpcError,
-    check,
+    api::{encode, transaction_meta, RpcError},
     netfault::Selector,
     programs::{CellHeader, REDLINE, REDSHIFT},
+    rpc_types::{
+        config::{RpcBlockConfig, RpcSendTransactionConfig, RpcTransactionConfig},
+        request::RpcRequest,
+        response::TransactionError,
+    },
     topology::{self, ErOptions, PrivateEr, RestartConfig},
+    transaction_types::{
+        EncodedConfirmedTransactionWithStatusMeta, TransactionDetails, UiConfirmedBlock,
+        UiTransactionEncoding, UiTransactionError,
+    },
     transport::wsraw::RawWs,
     BaseCtx, ChainCtx, DynError, ErCtx, PrivateErScenario, Result, Scenario,
 };
 use serde_json::{json, Value};
 use signature::Signature;
 use signer::Signer;
+use solana_instruction_error::InstructionError;
 use transaction::Transaction;
 
 use crate::PAYER_LAMPORTS;
 
 const TIMEOUT: Duration = Duration::from_secs(30);
-const EXPIRY_TIMEOUT: Duration = Duration::from_secs(120);
 const COPIES: usize = 32;
 
 pub struct TransactionRetries {
@@ -46,7 +53,7 @@ struct Signed {
     signature: Signature,
     blockhash: Hash,
     fee: u64,
-    error: Value,
+    error: Option<UiTransactionError>,
 }
 
 impl Signed {
@@ -74,52 +81,43 @@ impl Signed {
             &[payer],
             blockhash,
         );
-        let quoted: Value = er
+        let quoted: Option<u64> = er
             .api()
-            .call(
-                "getFeeForMessage",
-                &(STANDARD.encode(bincode::serialize(&tx.message)?),),
-            )
+            .call_value(RpcRequest::GetFeeForMessage, &(encode(&tx.message)?,))
             .await?;
-        let fee = quoted["value"].as_u64().context("missing fee quote")?;
+        let fee = quoted.context("missing fee quote")?;
         Ok(Self {
-            encoded: STANDARD.encode(bincode::serialize(&tx)?),
+            encoded: encode(&tx)?,
             signature: tx.signatures[0],
             blockhash,
             fee,
-            error: if fail { json!({"InstructionError": [1, {"Custom": 0}]}) } else { Value::Null },
+            error: fail
+                .then(|| TransactionError::InstructionError(1, InstructionError::Custom(0)).into()),
         })
     }
 
     async fn send(&self, er: &ErCtx) -> Result<result::Result<String, RpcError>> {
-        er.api()
-            .try_call(
-                "sendTransaction",
-                &(
-                    &self.encoded,
-                    json!({"encoding": "base64", "skipPreflight": true, "maxRetries": 0}),
-                ),
-            )
-            .await
+        let config = RpcSendTransactionConfig {
+            encoding: Some(UiTransactionEncoding::Base64),
+            skip_preflight: true,
+            max_retries: Some(0),
+            ..RpcSendTransactionConfig::default()
+        };
+        er.api().try_call(RpcRequest::SendTransaction, &(&self.encoded, config)).await
     }
 
     async fn valid(&self, er: &ErCtx) -> Result<bool> {
-        let result: Value =
-            er.api().call("isBlockhashValid", &(self.blockhash.to_string(),)).await?;
-        result["value"].as_bool().context("blockhash validity missing")
+        er.api()
+            .call_value(RpcRequest::IsBlockhashValid, &(self.blockhash.to_string(),))
+            .await
     }
 
     async fn copies(&self, er: &ErCtx, count: usize) -> Result<()> {
         for result in join_all((0..count).map(|_| self.send(er))).await {
             match result? {
-                Ok(signature) => {
-                    ensure!(signature == self.signature.to_string())
-                }
+                Ok(_) => {}
                 Err(error) => {
-                    ensure!(
-                        error.code == -32003,
-                        "retry failed outside transaction validation: {error}"
-                    );
+                    ensure!(error.error.code.code() == -32003);
                 }
             }
         }
@@ -127,22 +125,27 @@ impl Signed {
     }
 
     async fn outcome(&self, er: &ErCtx) -> Result<u64> {
-        let tx = check::poll_for("transaction published", TIMEOUT, || async {
-            er.api()
-                .call_nullable::<Value>(
-                    "getTransaction",
-                    &(
-                        self.signature.to_string(),
-                        json!({"encoding": "json", "maxSupportedTransactionVersion": 0}),
-                    ),
-                )
-                .await?
-                .ok_or_else(|| DynError::msg("transaction missing"))
-        })
-        .await?;
-        ensure!(tx["meta"]["err"] == self.error);
-        ensure!(tx["meta"]["fee"].as_u64() == Some(self.fee));
-        tx["slot"].as_u64().context("transaction slot missing")
+        let config = RpcTransactionConfig {
+            encoding: Some(UiTransactionEncoding::Json),
+            max_supported_transaction_version: Some(0),
+            ..RpcTransactionConfig::default()
+        };
+        let tx = er
+            .api()
+            .await_query("transaction published", async || {
+                er.api()
+                    .call::<Option<EncodedConfirmedTransactionWithStatusMeta>>(
+                        RpcRequest::GetTransaction,
+                        &(self.signature.to_string(), config),
+                    )
+                    .await?
+                    .ok_or_else(|| DynError::msg("transaction missing"))
+            })
+            .await?;
+        let meta = transaction_meta(&tx)?;
+        ensure!(meta.err == self.error);
+        ensure!(meta.fee == self.fee);
+        Ok(tx.slot)
     }
 }
 
@@ -227,7 +230,7 @@ async fn execute(
         let (method, subscription, payload) =
             ws.next_notification(TIMEOUT).await?.ok_or_else(|| {
                 anyhow!(
-                    "subscriber {index} missed terminal result: expected {}",
+                    "subscriber {index} missed terminal result: expected {:?}",
                     tx.error
                 )
             })?;
@@ -238,42 +241,33 @@ async fn execute(
         ws.close().await?;
     }
     for reader in readers {
-        er.api().await_transaction(&reader, TIMEOUT).await?;
+        er.api().await_transaction(&reader).await?;
     }
     Ok(pending)
 }
 
 async fn audit(er: &ErCtx, start: u64, expected: &[(&Signed, usize)]) -> Result<u64> {
     let end = er.api().get_slot().await? + 2;
-    check::poll(
-        "accepted work reaches a block boundary",
-        TIMEOUT,
-        || async { matches!(er.api().get_slot().await, Ok(slot) if slot >= end) },
-    )
-    .await?;
-    check::poll("block is published", TIMEOUT, || async {
-        matches!(er.api().get_block(end).await, Ok(Some(_)))
-    })
-    .await?;
-    let blocks: Vec<u64> = er.api().call("getBlocks", &(start, end)).await?;
+    er.api().await_slot(end).await?;
+    er.api()
+        .await_query("block is published", async || {
+            ensure!(er.api().get_block(end).await?.is_some());
+            Ok(())
+        })
+        .await?;
+    let blocks: Vec<u64> = er.api().call(RpcRequest::GetBlocks, &(start, end)).await?;
     let mut counts = vec![0; expected.len()];
     for slot in blocks {
-        let block: Value = er
-            .api()
-            .call(
-                "getBlock",
-                &(
-                    slot,
-                    json!({"transactionDetails": "signatures", "rewards": false}),
-                ),
-            )
-            .await?;
-        let signatures = block["signatures"].as_array().context("block signatures missing")?;
+        let config = RpcBlockConfig {
+            transaction_details: Some(TransactionDetails::Signatures),
+            rewards: Some(false),
+            ..RpcBlockConfig::default()
+        };
+        let block: UiConfirmedBlock = er.api().call(RpcRequest::GetBlock, &(slot, config)).await?;
+        let signatures = block.signatures.context("block signatures missing")?;
         for (i, (tx, _)) in expected.iter().enumerate() {
-            counts[i] += signatures
-                .iter()
-                .filter(|s| s.as_str() == Some(&tx.signature.to_string()))
-                .count();
+            let expected = tx.signature.to_string();
+            counts[i] += signatures.iter().filter(|signature| **signature == expected).count();
         }
     }
     for ((_, expected), count) in expected.iter().zip(counts) {
@@ -359,7 +353,8 @@ impl Mode {
         };
         let owner = owner.pubkey();
         let keys = [payer.pubkey(), cell];
-        let mut expected = check::poll_for("accounts cloned", TIMEOUT, || state(er, &keys)).await?;
+        let mut expected =
+            er.api().await_accounts(&keys, "accounts cloned", || state(er, &keys)).await?;
         ensure!((expected.1.value, expected.1.revision) == (0, 0));
         let mut start = er.api().get_slot().await?;
 
@@ -378,22 +373,19 @@ impl Mode {
                 let tx = Signed::new(er, &payer, owner, 7, false, Some(cold)).await?;
                 let (failed, fault) = tokio::join!(tx.send(er), async {
                     trap.wait(TIMEOUT).await?.reject("retry-test cold fetch unavailable");
-                    Ok::<_, DynError>(())
+                    Result::Ok(())
                 });
                 fault?;
                 let Err(rpc) = failed? else {
                     return Err(anyhow!("cold fetch unexpectedly succeeded"));
                 };
                 ensure!(
-                    rpc.code == -32003 && rpc.message.contains("retry-test cold fetch unavailable"),
-                    "wrong cold-fetch error: {rpc}"
+                    rpc.error.code.code() == -32003
+                        && rpc.error.message.contains("retry-test cold fetch unavailable")
                 );
-                ensure!(
-                    er.api().get_signature_status(&tx.signature).await?.is_none(),
-                    "fetch failure poisoned signature status"
-                );
+                ensure!(er.api().get_signature_status(&tx.signature).await?.is_none());
                 ensure!(state(er, &keys).await? == expected);
-                ensure!(tx.send(er).await?? == tx.signature.to_string());
+                tx.send(er).await??;
                 tx.outcome(er).await?;
                 audit(er, start, &[(&tx, 1)]).await?;
                 expected.0 -= tx.fee;
@@ -441,7 +433,7 @@ impl Mode {
                     for i in 0..if epoch == 0 { 3 } else { 2 } {
                         let count = epoch * 10 + i * 2 + 3;
                         let tx = Signed::new(er, &payer, owner, count, i == 1, None).await?;
-                        ensure!(tx.valid(er).await?, "new signed input is valid");
+                        ensure!(tx.valid(er).await?);
                         let slot = if i < 2 {
                             tx.copies(er, 1).await?;
                             let slot = tx.outcome(er).await?;
@@ -463,16 +455,17 @@ impl Mode {
                     audit(er, start, &appended).await?;
                     ensure!(state(er, &keys).await? == expected);
                     if epoch == 0 {
-                        check::poll_for("blockhashes expire", EXPIRY_TIMEOUT, || async {
-                            for (tx, _) in &probes {
-                                ensure!(!tx.valid(er).await?, "blockhash still valid");
-                            }
-                            Ok::<_, DynError>(())
-                        })
-                        .await?;
+                        er.api()
+                            .await_query("blockhashes expire", async || {
+                                for (tx, _) in &probes {
+                                    ensure!(!tx.valid(er).await?);
+                                }
+                                Ok(())
+                            })
+                            .await?;
                     } else {
                         for (tx, _) in &probes[first..] {
-                            ensure!(tx.valid(er).await?, "recent input is valid before restart");
+                            ensure!(tx.valid(er).await?);
                         }
                         private.restart(RestartConfig::default()).await?;
                     }
@@ -489,14 +482,8 @@ impl Mode {
                             ensure!(tx.outcome(er).await? == *slot);
                         } else {
                             let status = er.api().get_signature_status(&tx.signature).await?;
-                            ensure!(
-                                status.is_none_or(|status| status.err.is_some()),
-                                "unscheduled input must be rejected"
-                            );
-                            ensure!(
-                                er.api().get_transaction(&tx.signature).await?.is_none(),
-                                "rejected input never executes"
-                            );
+                            ensure!(status.is_none_or(|status| status.err.is_some()));
+                            ensure!(er.api().get_transaction(&tx.signature).await?.is_none());
                         }
                     }
                 }

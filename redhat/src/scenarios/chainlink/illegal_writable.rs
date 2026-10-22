@@ -1,10 +1,11 @@
-use std::{rc::Rc, time::Duration};
+use std::rc::Rc;
 
 use anyhow::{ensure, Context};
 use instruction::Instruction;
 use pubkey::Pubkey;
 
 use redsuite_core::{
+    api::{transaction_logs, transaction_meta},
     dlp,
     programs::{SettlementMode, MAGIC, REDHAT, REDSHIFT},
     system, BaseCtx, ChainCtx, ErCtx, Result, Scenario, TxSender,
@@ -13,7 +14,6 @@ use signer::Signer;
 
 use crate::PAYER_LAMPORTS;
 
-const RECEIPT_TIMEOUT: Duration = Duration::from_secs(20);
 const PROGRAM_ID_NOT_FOUND: &str = "failed to find parent program id";
 const IMMUTABLE: &str = "Account is immutable";
 const INVALID_ACCOUNT_OWNER: &str = "Invalid account owner";
@@ -97,18 +97,18 @@ impl Scenario for IllegalWritable {
         } in cases
         {
             let signature = sender.submit(instructions).await?;
-            let tx = er.api().await_transaction(&signature, RECEIPT_TIMEOUT).await?;
-            let error = tx
+            let tx = er.api().await_transaction(&signature).await?;
+            let error = transaction_meta(&tx)?
                 .err
                 .as_ref()
-                .with_context(|| format!("{case} ({signature}): attack unexpectedly succeeded"))?;
-            let observed = format!("{}\n{error:?}", tx.logs.join("\n"));
+                .with_context(|| format!("{case}: attack unexpectedly succeeded"))?;
+            let observed = format!(
+                "{}\n{error:?}",
+                transaction_logs(transaction_meta(&tx)?).join("\n")
+            );
             // Every group must match; alternatives within a group are ORed.
             for alternatives in refusals {
-                ensure!(
-                    alternatives.iter().any(|needle| observed.contains(needle)),
-                    "{case}: expected refusal {alternatives:?}; actual={observed}"
-                );
+                ensure!(alternatives.iter().any(|needle| observed.contains(needle)));
             }
         }
 

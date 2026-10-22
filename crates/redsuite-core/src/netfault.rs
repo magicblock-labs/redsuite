@@ -29,14 +29,13 @@ use url::Url;
 
 use crate::{
     api::decode_transaction,
-    check,
     context::{BaseCtx, ChainCtx},
     topology::BaseEndpoints,
-    transport::http,
-    Result,
+    transport::http::{self, TransportError},
+    transport::NETWORK_TIMEOUT,
+    wait, Result,
 };
 
-const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(60);
 const REJECTION_CODE: i64 = -32000;
 const MAX_HEAD: usize = 64 * 1024;
 const MAX_BODY: usize = 16 * 1024 * 1024;
@@ -189,6 +188,7 @@ struct Rule {
 
 struct State {
     started: Instant,
+    changed: Rc<Notify>,
     traps: Vec<Rc<TrapState>>,
     unfired: Vec<String>,
     holding: usize,
@@ -204,6 +204,7 @@ type Shared = Rc<RefCell<State>>;
 impl State {
     fn record(&mut self, action: Action, operation: Option<Operation>) {
         self.events.push(FaultEvent { action, operation });
+        self.changed.notify_waiters();
     }
 
     fn track(&mut self, handle: JoinHandle<()>) {
@@ -264,7 +265,9 @@ struct Holding(Shared);
 
 impl Drop for Holding {
     fn drop(&mut self) {
-        self.0.borrow_mut().holding -= 1;
+        let mut state = self.0.borrow_mut();
+        state.holding -= 1;
+        state.changed.notify_waiters();
     }
 }
 
@@ -394,6 +397,7 @@ impl BaseProxies {
     pub async fn spawn(base: &BaseCtx) -> Result<Self> {
         let shared: Shared = Rc::new(RefCell::new(State {
             started: Instant::now(),
+            changed: Rc::default(),
             traps: Vec::new(),
             unfired: Vec::new(),
             holding: 0,
@@ -412,7 +416,7 @@ impl BaseProxies {
         };
         let upstream_rpc = base.api().url().clone();
         let upstream_ws = base.ws_url().clone();
-        let client = http::client_with_timeout(UPSTREAM_TIMEOUT);
+        let client = http::client();
         let listeners = vec![
             task::spawn_local(accept_http(
                 http_listener,
@@ -500,19 +504,21 @@ impl BaseProxies {
     }
 
     pub async fn await_held(&self, selector: Selector, timeout: Duration) -> Result<()> {
-        check::poll("base operation held", timeout, || async {
-            self.held_count(&selector) > 0
+        let changed = self.shared.borrow().changed.clone();
+        wait::on_change(&changed, timeout, "base operation held", || {
+            Ok((self.held_count(&selector) > 0).then_some(()))
         })
-        .await?;
-        Ok(())
+        .await
     }
 
     pub async fn reset(&self) -> Result<()> {
         self.restore();
-        check::poll(
+        let changed = self.shared.borrow().changed.clone();
+        wait::on_change(
+            &changed,
+            NETWORK_TIMEOUT,
             "released interceptions resuming",
-            UPSTREAM_TIMEOUT,
-            || async { self.shared.borrow().holding == 0 },
+            || Ok((self.shared.borrow().holding == 0).then_some(())),
         )
         .await?;
         self.shared.borrow_mut().events.clear();
@@ -768,10 +774,8 @@ async fn serve_http(mut socket: TcpStream, upstream: Url, client: Client, shared
         }
         let (status, text) = match http::post_json(&client, &upstream, body).await {
             Ok(text) => (StatusCode::OK, text),
-            Err(error) => (
-                error.status.unwrap_or(StatusCode::BAD_GATEWAY),
-                error.detail,
-            ),
+            Err(TransportError::Status { status, body }) => (status, body),
+            Err(error) => (StatusCode::BAD_GATEWAY, error.to_string()),
         };
         let extra = parse(&text).map(|parsed| parsed.strings).unwrap_or_default();
         let response = merged(request, Stage::Response, extra);

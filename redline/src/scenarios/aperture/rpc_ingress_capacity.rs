@@ -18,7 +18,6 @@ use tracing::{debug, warn};
 use crate::{metrics, ACCOUNT_SPACE};
 
 const PREP_PAYER_LAMPORTS: u64 = 4_000_000_000;
-const CLONE_TIMEOUT: Duration = Duration::from_secs(15);
 const LEDGER_SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
 const LEDGER_SETTLE_POLL: Duration = Duration::from_millis(50);
 const CATASTROPHIC_RPS_FLOOR: f64 = 1_000.0;
@@ -73,7 +72,7 @@ impl Scenario<ScenarioReport> for RpcIngressCapacity {
                 .init_batched(base.as_ref(), &prep_payers, profile.accounts, true)
                 .await?,
         );
-        er.await_clones(&pool, ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
+        er.await_clones(&pool, ACCOUNT_SPACE as usize).await?;
         Ok(Self { er, profile, prep_payers, pool })
     }
 
@@ -90,6 +89,7 @@ impl Scenario<ScenarioReport> for RpcIngressCapacity {
                 concurrency: profile.concurrency,
             },
             er.api().url().clone(),
+            er.ws_url().clone(),
             prep::payer_bytes(&prep_payers),
             0,
             move |id| REDLINE.write(id, &[pool[(id as usize) % pool.len()]]),
@@ -104,21 +104,12 @@ impl Scenario<ScenarioReport> for RpcIngressCapacity {
         let delivered_rps = outcome.achieved_rps();
         debug!(delivered_rps, outcome.failed, "RPC blast finished");
 
-        ensure!(
-            outcome.failed == 0,
-            "failures={:?}; first error={:?}",
-            outcome.failed,
-            outcome.first_error
-        );
+        ensure!(outcome.failed == 0);
         if delivered_rps < CATASTROPHIC_RPS_FLOOR {
             warn!(delivered_rps, "RPC throughput below minimum",);
         }
         if let Some(processed) = delta.counter(metrics::ENGINE_TRANSACTIONS) {
-            ensure!(
-                processed >= profile.requests as f64,
-                "validator processed {processed} txs, expected at least {}",
-                profile.requests
-            );
+            ensure!(processed >= profile.requests as f64);
         }
         if let Some(failed_txs) = delta.counter_all(metrics::FAILED_TRANSACTIONS) {
             ensure!(failed_txs == 0.0);

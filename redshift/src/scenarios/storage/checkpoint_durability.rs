@@ -5,14 +5,16 @@ use keypair::Keypair;
 use pubkey::Pubkey;
 
 use redsuite_core::{
-    api::TransactionInfo,
-    check,
+    api::transaction_meta,
     programs::{CellHeader, REDSHIFT},
+    rpc_types::response::TransactionError,
     topology::{self, ErOptions, PrivateEr, RestartConfig},
-    BaseCtx, ChainCtx, DynError, ErCtx, PrivateErScenario, Result,
+    transaction_types::EncodedConfirmedTransactionWithStatusMeta as TransactionInfo,
+    wait, BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result,
 };
 use signature::Signature;
 use signer::Signer;
+use solana_instruction_error::InstructionError;
 use transaction::Transaction;
 
 use crate::PAYER_LAMPORTS;
@@ -20,7 +22,6 @@ use crate::PAYER_LAMPORTS;
 const ROUNDS: usize = 3;
 const BLOCKTIME: Duration = Duration::from_millis(50);
 const SUPERBLOCK_SLOTS: u64 = 40;
-const TIMEOUT: Duration = Duration::from_secs(30);
 const CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32,6 +33,7 @@ struct State {
 
 impl State {
     fn apply(&mut self, record: &Record, evidence: &TransactionInfo) -> Result<()> {
+        let evidence = transaction_meta(evidence)?;
         self.payer_lamports =
             self.payer_lamports.checked_sub(evidence.fee).context("fee payer exhausted")?;
         if !Record::fails(record.id) {
@@ -55,13 +57,14 @@ impl Record {
     }
 
     fn check(&self, evidence: &TransactionInfo) -> Result<()> {
-        let error =
-            Self::fails(self.id).then(|| json::json!({"InstructionError": [1, {"Custom": 0}]}));
-        ensure!(evidence.err == error);
-        let mut balances = evidence.pre_balances.clone();
+        let meta = transaction_meta(evidence)?;
+        let error = Self::fails(self.id)
+            .then(|| TransactionError::InstructionError(1, InstructionError::Custom(0)).into());
+        ensure!(meta.err == error);
+        let mut balances = meta.pre_balances.clone();
         let payer = balances.first_mut().context("missing payer balance")?;
-        *payer = payer.checked_sub(evidence.fee).context("fee exceeds balance")?;
-        ensure!(evidence.post_balances == balances);
+        *payer = payer.checked_sub(meta.fee).context("fee exceeds balance")?;
+        ensure!(meta.post_balances == balances);
         if let Some(before) = &self.evidence {
             ensure!(evidence == before);
         }
@@ -116,7 +119,7 @@ impl Workload {
         };
         er.api().send_transaction(&tx).await?;
         if confirm {
-            let evidence = er.api().await_transaction(&record.signature, TIMEOUT).await?;
+            let evidence = er.api().await_transaction(&record.signature).await?;
             record.check(&evidence)?;
             self.expected.apply(&record, &evidence)?;
             self.check(er).await?;
@@ -137,17 +140,14 @@ async fn head(er: &ErCtx) -> Result<u64> {
 async fn checkpoint(er: &ErCtx, storage: &Path) -> Result<u64> {
     let sealed = head(er).await?;
     let archive = storage.join(format!("superblock-{:09}", sealed + 1)).join("accountsdb.tar.zst");
-    check::poll_for(
+    wait::retry(
         &format!("checkpoint {sealed} archived at {}", archive.display()),
         CHECKPOINT_TIMEOUT,
-        || async {
-            ensure!(head(er).await? > sealed, "ledger seal pending");
+        async || {
+            ensure!(head(er).await? > sealed);
             let metadata = archive.metadata()?;
-            ensure!(
-                metadata.is_file() && metadata.len() > 0,
-                "archive incomplete"
-            );
-            Ok::<_, DynError>(())
+            ensure!(metadata.is_file() && metadata.len() > 0);
+            Ok(())
         },
     )
     .await?;
@@ -186,8 +186,11 @@ impl PrivateErScenario for CheckpointDurability {
         base.submit_and_confirm(&owner, &setup).await?;
         let payer = base.delegated_payer(&owner, private.identity(), PAYER_LAMPORTS).await?;
         let keys = [payer.pubkey(), cell];
-        let expected =
-            check::poll_for("accounts cloned", TIMEOUT, || state(private.ctx(), &keys)).await?;
+        let expected = private
+            .ctx()
+            .api()
+            .await_accounts(&keys, "accounts cloned", || state(private.ctx(), &keys))
+            .await?;
         ensure!((expected.cell.value, expected.cell.revision) == (0, 0));
         let workload = Workload {
             payer,
@@ -210,7 +213,7 @@ impl PrivateErScenario for CheckpointDurability {
                 protected.push(workload.submit(er, true).await?);
             }
             let boundary = checkpoint(er, private.storage_dir()).await?;
-            ensure!(boundary > previous_boundary, "checkpoint must advance");
+            ensure!(boundary > previous_boundary);
             previous_boundary = boundary;
             verify(er, &protected).await?;
             workload.check(er).await?;

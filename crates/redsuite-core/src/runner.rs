@@ -4,16 +4,12 @@ use std::{
     future::{Future, Ready},
     mem,
     rc::Rc,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
     thread,
     thread::JoinHandle,
     time::{Duration, Instant},
 };
 
-use anyhow::{anyhow, Context};
+use anyhow::{anyhow, ensure, Context};
 use tokio::{
     runtime::Builder,
     sync::{watch, OwnedSemaphorePermit},
@@ -30,7 +26,6 @@ use crate::{
     Result,
 };
 
-const STOP_POLL: Duration = Duration::from_millis(20);
 const SUSTAINED_FRACTION: f64 = 0.9;
 
 pub const SEND_ORIGIN: &str = "client, immediately before sendTransaction";
@@ -441,21 +436,21 @@ where
 pub struct Worker {
     pub index: usize,
     pub threads: usize,
-    stop: Arc<AtomicBool>,
+    stop: watch::Sender<bool>,
 }
 
 impl Worker {
-    pub fn stop_flag(&self) -> Arc<AtomicBool> {
-        self.stop.clone()
+    pub fn stop_signal(&self) -> watch::Receiver<bool> {
+        self.stop.subscribe()
     }
 
     pub fn stop_cell(&self) -> Rc<Cell<bool>> {
         let cell = Rc::new(Cell::new(false));
-        let stop = self.stop.clone();
+        let mut stop = self.stop.subscribe();
         let bridge = cell.clone();
         task::spawn_local(async move {
-            while !stop.load(Ordering::Relaxed) {
-                time::sleep(STOP_POLL).await;
+            if !*stop.borrow_and_update() {
+                let _ = stop.changed().await;
             }
             bridge.set(true);
         });
@@ -464,7 +459,7 @@ impl Worker {
 }
 
 pub struct Workers<T> {
-    stop: Arc<AtomicBool>,
+    stop: watch::Sender<bool>,
     handles: Vec<JoinHandle<Result<T>>>,
 }
 
@@ -480,7 +475,7 @@ where
     Factory: Fn(Worker) -> Fut + Clone + Send + 'static,
     Fut: Future<Output = Result<T>>,
 {
-    let stop = Arc::new(AtomicBool::new(false));
+    let (stop, _) = watch::channel(false);
     let mut handles = Vec::with_capacity(threads);
     for index in 0..threads {
         let factory = factory.clone();
@@ -506,7 +501,7 @@ where
 
 impl<T> Workers<T> {
     pub fn stop(&self) {
-        self.stop.store(true, Ordering::Relaxed);
+        self.stop.send_replace(true);
     }
 }
 
@@ -575,11 +570,10 @@ impl WorkerBudgets {
         concurrency: usize,
     ) -> Result<Self> {
         rate.interval()?;
-        if concurrency == 0 {
-            return Err(anyhow!(
-                "an admission budget needs a concurrency above zero"
-            ));
-        }
+        ensure!(
+            concurrency != 0,
+            "an admission budget needs a concurrency above zero"
+        );
         let mut workers = threads.max(1).min(concurrency);
         if let Pacing::PerSecond(rate) = rate {
             workers = workers.min(rate as usize);

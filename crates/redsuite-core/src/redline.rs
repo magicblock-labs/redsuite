@@ -1,6 +1,6 @@
 use std::{ops::Range, sync::Arc};
 
-use anyhow::{anyhow, Context};
+use anyhow::ensure;
 use instruction::Instruction;
 use keypair::Keypair;
 use pubkey::Pubkey;
@@ -21,6 +21,7 @@ pub mod causal;
 pub fn execute_kernel<K>(
     config: ThreadRunConfig,
     rpc_url: Url,
+    ws_url: Url,
     payers: Arc<Vec<[u8; 64]>>,
     first_id: u64,
     kernel: K,
@@ -31,7 +32,7 @@ where
 {
     let threads = config.threads;
     execute_threaded(config, move |worker| {
-        let senders = prep::worker_senders(&rpc_url, &payers, worker, threads);
+        let senders = prep::worker_senders(&rpc_url, &ws_url, &payers, worker, threads);
         let kernel = kernel.clone();
         let clock = clock.clone();
         move |id: u64| {
@@ -84,12 +85,7 @@ impl Accounts {
                     instructions.push(program.delegate(owner, id, Some(self.authority), u32::MAX));
                 }
             }
-            base.submit_and_confirm(payer, &instructions).await.with_context(|| {
-                format!(
-                    "program {} payer {owner} seeds {first}..{end}",
-                    self.program_id
-                )
-            })?;
+            base.submit_and_confirm(payer, &instructions).await?;
         }
         Ok(pdas)
     }
@@ -121,9 +117,7 @@ impl Accounts {
         count: usize,
         delegated: bool,
     ) -> Result<Vec<Pubkey>> {
-        if payers.is_empty() {
-            return Err(anyhow!("at least one prep payer is required"));
-        }
+        ensure!(!payers.is_empty(), "at least one prep payer is required");
         let per_payer = count.div_ceil(payers.len());
         let batches = prep::bounded(payers.len().min(count), "accounts for payer", |index| {
             let len = per_payer.min(count.saturating_sub(index * per_payer));

@@ -1,4 +1,4 @@
-use std::{rc::Rc, sync::Arc, time::Duration};
+use std::{rc::Rc, sync::Arc};
 
 use anyhow::{ensure, Context};
 use keypair::Keypair;
@@ -14,7 +14,6 @@ use redsuite_core::{
     },
     BaseCtx, ChainCtx, ErCtx, Result, Scenario, ScenarioReport,
 };
-use tokio::time;
 
 use crate::{
     program::{layout, DELEGATION_PROGRAM_ID},
@@ -25,7 +24,6 @@ const ACCOUNTS: u8 = 4;
 const ITERATIONS: u64 = 40;
 const RATE: u32 = 20;
 const CONCURRENCY: usize = 1;
-const CONFIRM_TIMEOUT: Duration = Duration::from_secs(20);
 const PAYER_LAMPORTS: u64 = 2_000_000_000;
 
 pub struct AccountWriteLatency {
@@ -46,7 +44,7 @@ impl Scenario<ScenarioReport> for AccountWriteLatency {
             let on_base = base.account(pda).await?.context("pda not on base")?;
             ensure!(on_base.owner == DELEGATION_PROGRAM_ID);
         }
-        er.await_clones(&pdas, ACCOUNT_SPACE as usize, Duration::from_secs(15)).await?;
+        er.await_clones(&pdas, ACCOUNT_SPACE as usize).await?;
 
         Ok(Self { base, er, payer, pdas })
     }
@@ -60,7 +58,7 @@ impl Scenario<ScenarioReport> for AccountWriteLatency {
         for pda in &pdas {
             updates.account_subscribe(pda).await?;
         }
-        updates.await_subscribed(pdas.len(), Duration::from_secs(5)).await?;
+        updates.await_subscribed(pdas.len()).await?;
         let sigs = Rc::new(SignatureConfirmations::connect(er.ws_url(), clock.clone()).await?);
         let sender = er.sender(Rc::new(payer));
 
@@ -77,11 +75,7 @@ impl Scenario<ScenarioReport> for AccountWriteLatency {
         };
         let sync = |id: u64| {
             let sigs = sigs.clone();
-            async move {
-                time::timeout(CONFIRM_TIMEOUT, sigs.await_id(id)).await.with_context(|| {
-                    format!("confirmation for id {id} not within {CONFIRM_TIMEOUT:?}")
-                })?
-            }
+            async move { sigs.await_id(id).await }
         };
         let outcome = execute_and_sync(
             RunConfig {
@@ -93,22 +87,12 @@ impl Scenario<ScenarioReport> for AccountWriteLatency {
             sync,
         )
         .await?;
-        ensure!(
-            outcome.failed == 0,
-            "failures={:?}; first error={:?}",
-            outcome.failed,
-            outcome.first_error
-        );
+        ensure!(outcome.failed == 0);
 
-        updates.await_observed(ITERATIONS as usize, Duration::from_secs(15)).await?;
+        updates.await_observed(ITERATIONS as usize).await?;
         let update_lag = updates.finalize().lag;
         let confirmations = sigs.finalize();
-        ensure!(
-            confirmations.failed == 0,
-            "failures={:?}; first error={:?}",
-            confirmations.failed,
-            confirmations.first_failure
-        );
+        ensure!(confirmations.failed == 0);
 
         for (i, pda) in pdas.iter().enumerate() {
             let last_id = ITERATIONS - ACCOUNTS as u64 + 1 + i as u64;
@@ -116,10 +100,7 @@ impl Scenario<ScenarioReport> for AccountWriteLatency {
             ensure!(CellHeader::written_id(&on_er.data) == Some(last_id));
 
             let on_base = base.account(pda).await?.context("pda gone on base")?;
-            ensure!(
-                on_base.data[layout::DATA_OFFSET..].iter().all(|&b| b == 0),
-                "base copy must stay untouched until an explicit commit"
-            );
+            ensure!(on_base.data[layout::DATA_OFFSET..].iter().all(|&b| b == 0));
         }
 
         Ok(ScenarioReport::ok()

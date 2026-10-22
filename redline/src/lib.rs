@@ -1,7 +1,8 @@
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, ensure};
-use redsuite_core::{check, ChainCtx, ErCtx, Result};
+use anyhow::{anyhow, ensure, Context};
+use redsuite_core::api::{transaction_logs, transaction_meta};
+use redsuite_core::{wait, ChainCtx, ErCtx, Result};
 use signature::Signature;
 
 pub mod load;
@@ -9,7 +10,6 @@ pub mod scenarios;
 pub use redline_interface as program;
 
 pub const ACCOUNT_SPACE: u32 = 256;
-const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub fn consumed_cus(logs: &[String]) -> Option<f64> {
     logs.iter().find_map(|line| {
@@ -22,34 +22,24 @@ pub fn consumed_cus(logs: &[String]) -> Option<f64> {
     })
 }
 
-pub async fn probe_cus(er: &ErCtx, signature: &Signature, label: &str, iters: u32) -> Result<f64> {
-    let probe = er.api().await_transaction(signature, PROBE_TIMEOUT).await?;
-    ensure!(
-        probe.err.is_none(),
-        "{label}: compute probe ({iters} iterations): {:?}; logs={:?}",
-        probe.err,
-        probe.logs
-    );
-    consumed_cus(&probe.logs).ok_or_else(|| {
-        anyhow!(
-            "{label}: missing compute-unit consumption: {:?}",
-            probe.logs
-        )
-    })
+pub async fn probe_cus(er: &ErCtx, signature: &Signature, label: &str, _iters: u32) -> Result<f64> {
+    let probe = er.api().await_transaction(signature).await?;
+    let meta = transaction_meta(&probe)?;
+    let logs = transaction_logs(meta);
+    ensure!(meta.err == None);
+    consumed_cus(logs).ok_or_else(|| anyhow!("{label}: missing compute-unit consumption: {logs:?}"))
 }
 
 pub async fn await_executed(er: &ErCtx, target: f64, timeout: Duration) -> Result<Duration> {
     let started = Instant::now();
-    check::poll(
-        &format!("the validator transaction count reaches {target:.0}"),
-        timeout,
-        || async {
-            matches!(
-                er.scrape_metrics().await.ok().and_then(|metrics| metrics.get(metrics::ENGINE_TRANSACTIONS)),
-                Some(count) if count >= target
-            )
-        },
-    )
+    wait::retry("validator transaction count", timeout, async || {
+        let metrics = er.scrape_metrics().await?;
+        let count = metrics
+            .get(metrics::ENGINE_TRANSACTIONS)
+            .context("transaction count metric missing")?;
+        ensure!(count >= target);
+        Ok(())
+    })
     .await?;
     Ok(started.elapsed())
 }

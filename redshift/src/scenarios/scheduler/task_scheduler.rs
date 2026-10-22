@@ -1,4 +1,4 @@
-use std::{rc::Rc, time::Duration};
+use std::rc::Rc;
 
 use account::Account;
 use anyhow::{ensure, Context};
@@ -7,17 +7,15 @@ use keypair::Keypair;
 use pubkey::Pubkey;
 
 use redsuite_core::{
-    api::ConfirmOptions,
-    check, prep,
+    prep,
     programs::{CellId, Task, MAGIC, REDSHIFT},
-    topology, BaseCtx, ChainCtx, DynError, ErCtx, Result, Scenario,
+    topology, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
 use signer::Signer;
 
 use crate::PAYER_LAMPORTS;
 
 const TASK_INTERVAL_MS: i64 = 100;
-const TIMEOUT: Duration = Duration::from_secs(30);
 const SCHEDULER_PROGRAM: Pubkey = topology::HYDRA_EPHEMERAL_ID;
 
 struct Actor {
@@ -45,10 +43,13 @@ async fn scheduled_actor(base: &BaseCtx, er: &ErCtx, funder: &Keypair) -> Result
         .create_primary(er.identity(), prep::COMMIT_FREQUENCY_MS)
         .await?;
     base.delegate_payer(funder, &payer, er.identity()).await?;
-    check::poll("the ER clones the cell", TIMEOUT, || async {
-        matches!(er.account(&cell).await, Ok(Some(account)) if !account.data.is_empty())
-    })
-    .await?;
+    er.api()
+        .await_accounts(&[cell], "the ER clones the cell", async || {
+            let account = er.account(&cell).await?.context("cell not cloned")?;
+            ensure!(!account.data.is_empty());
+            Ok(())
+        })
+        .await?;
     Ok(Actor { payer, cell })
 }
 
@@ -61,22 +62,16 @@ async fn tasks(er: &ErCtx) -> Result<Vec<(Pubkey, Account)>> {
 }
 
 async fn await_tasks(er: &ErCtx, expected: usize) -> Result<Vec<(Pubkey, Account)>> {
-    let found = check::poll_for(
-        &format!("the validator holds {expected} scheduled task account(s)"),
-        TIMEOUT,
-        || async {
-            let found = tasks(er).await?;
+    let found = er
+        .api()
+        .await_program_accounts(&SCHEDULER_PROGRAM, |found| {
             ensure!(found.len() == expected);
-            Ok::<_, DynError>(found)
-        },
-    )
-    .await?;
-    for (address, account) in &found {
+            Ok(found)
+        })
+        .await?;
+    for (_, account) in &found {
         ensure!(account.owner == SCHEDULER_PROGRAM);
-        ensure!(
-            !account.data.is_empty(),
-            "task account {address} is materialized"
-        );
+        ensure!(!account.data.is_empty());
     }
     Ok(found)
 }
@@ -133,10 +128,7 @@ async fn test_reschedule(er: &ErCtx, actor: &Actor) -> Result<()> {
     schedule(er, actor, 102, 2 * TASK_INTERVAL_MS, 2).await?;
     let (readdress, replacement) = await_tasks(er, 1).await?.remove(0);
     ensure!(readdress == address);
-    ensure!(
-        replacement.data != original.data,
-        "the reused task id carries the new schedule"
-    );
+    ensure!(replacement.data != original.data);
     cancel(er, actor, 102).await?;
     await_tasks(er, 0).await?;
     Ok(())
@@ -158,14 +150,11 @@ async fn test_signed_refusal(er: &ErCtx, actor: &Actor) -> Result<()> {
                 .build(),
         )])
         .await?;
-    let Err(error) = er.api().try_confirm(&signature, ConfirmOptions::default()).await? else {
+    let Err(error) = er.api().try_confirm(&signature).await? else {
         anyhow::bail!("signed task payload unexpectedly succeeded");
     };
     let detail = format!("{:?}", error.err);
-    ensure!(
-        detail.contains("MissingRequiredSignature"),
-        "a task payload with a signer is refused as MissingRequiredSignature: {detail}"
-    );
+    ensure!(detail.contains("MissingRequiredSignature"));
     ensure!(tasks(er).await?.len() == 0);
     Ok(())
 }
@@ -181,16 +170,10 @@ async fn test_authority_isolation(
     let owners = await_tasks(er, 1).await?;
     schedule(er, &other, 106, 2 * TASK_INTERVAL_MS, 3).await?;
     let both = await_tasks(er, 2).await?;
-    ensure!(
-        both.iter().any(|(address, _)| *address == owners[0].0),
-        "task ID isolated by authority"
-    );
+    ensure!(both.iter().any(|(address, _)| *address == owners[0].0));
     cancel(er, owner, 106).await?;
     let remaining = await_tasks(er, 1).await?;
-    ensure!(
-        remaining[0].0 != owners[0].0,
-        "cancelling by the owner removes only the owner's task"
-    );
+    ensure!(remaining[0].0 != owners[0].0);
     cancel(er, &other, 106).await?;
     await_tasks(er, 0).await?;
     Ok(())
@@ -222,18 +205,19 @@ async fn test_sponsor_refund(er: &ErCtx, actor: &Actor) -> Result<()> {
     schedule(er, actor, 109, TASK_INTERVAL_MS, 3).await?;
     await_tasks(er, 1).await?;
     let funded = sponsor_balance(er).await?;
-    ensure!(
-        funded < before,
-        "the validator identity sponsors the scheduled task ({funded} < {before})"
-    );
+    ensure!(funded < before);
     cancel(er, actor, 109).await?;
     await_tasks(er, 0).await?;
-    check::poll(
-        "cancellation refunds the validator identity in full",
-        TIMEOUT,
-        || async { sponsor_balance(er).await.ok() == Some(before) },
-    )
-    .await?;
+    er.api()
+        .await_accounts(
+            &[er.identity()],
+            "cancellation refunds the validator identity in full",
+            async || {
+                ensure!(sponsor_balance(er).await? == before);
+                Ok(())
+            },
+        )
+        .await?;
     Ok(())
 }
 
@@ -247,8 +231,7 @@ pub struct TaskScheduler {
 impl Scenario for TaskScheduler {
     async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
         ensure!(
-            matches!(base.account(&SCHEDULER_PROGRAM).await?, Some(program) if program.executable),
-            "the base chain hosts the ephemeral scheduler program"
+            matches!(base.account(&SCHEDULER_PROGRAM).await?, Some(program) if program.executable)
         );
         let funder = base.funded_payer(PAYER_LAMPORTS).await?;
         ensure!(tasks(&er).await?.len() == 0);

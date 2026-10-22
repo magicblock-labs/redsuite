@@ -55,16 +55,10 @@ impl Scenario for MultiProgramClone {
                 .account(program)
                 .await?
                 .ok_or_else(|| anyhow!("{label} program not cloned after the transaction"))?;
-            ensure!(
-                clone.executable,
-                "the {label} cloned program must be executable on the ER"
-            );
+            ensure!(clone.executable);
         }
         for ((_, key), expected) in accounts.iter().zip(WRITES) {
-            let clone = er
-                .account(key)
-                .await?
-                .with_context(|| format!("account {key} missing on the ER"))?;
+            let clone = er.account(key).await?.context("cloned account missing")?;
             ensure!(CellHeader::written_id(&clone.data) == Some(expected));
         }
 

@@ -6,11 +6,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{anyhow, Context};
+use anyhow::{ensure, Context};
 use magicblock_config::LeaderParams;
 use pubkey::Pubkey;
 use signer::Signer;
-use tokio::{sync::Mutex, time};
+use tokio::sync::Mutex;
 use tracing::debug;
 
 use super::{
@@ -98,7 +98,7 @@ impl PrivateEr {
     }
 
     fn rpc_api(&self) -> Api {
-        Api::new(self.ctx.api().url().clone())
+        Api::new(self.ctx.api().url().clone(), self.ctx.ws_url().clone())
     }
 
     pub async fn wait_ready(&self, timeout: Duration) -> Result<()> {
@@ -184,29 +184,17 @@ impl PrivateEr {
     }
 }
 
-const MAGIC_FEE_VAULT_TIMEOUT: Duration = Duration::from_secs(30);
-const VAULT_POLL: Duration = Duration::from_millis(250);
-
 // On a fresh stack generation the shared ER creates the magic fee vault in a
 // startup-background task. A private ER that boots before the vault is on
 // base races that init, loses with "Invalid account owner", and exits.
 async fn await_magic_fee_vault(base: &BaseCtx, identity: &Pubkey) -> Result<()> {
     let vault = crate::dlp::magic_fee_vault_pda(identity);
-    let deadline = time::Instant::now() + MAGIC_FEE_VAULT_TIMEOUT;
-    loop {
-        if let Ok(Some(account)) = base.account(&vault).await {
-            if account.owner == crate::dlp::dlp_id() {
-                return Ok(());
-            }
-        }
-        if time::Instant::now() >= deadline {
-            return Err(anyhow!(
-                "the magic fee vault {vault} for identity {identity} is not \
-                 on base — the er did not create it in time"
-            ));
-        }
-        time::sleep(VAULT_POLL).await;
-    }
+    base.await_account(&vault, |account| {
+        ensure!(account.owner == crate::dlp::dlp_id());
+        Ok(())
+    })
+    .await?;
+    Ok(())
 }
 
 pub async fn private_er(base: &BaseCtx, options: ErOptions) -> Result<PrivateEr> {
@@ -288,7 +276,10 @@ async fn launch(
     });
 
     let proc = process::Owned::new("private ER", options.label, child, record);
-    let er_api = Api::new(format!("http://127.0.0.1:{rpc_port}").parse()?);
+    let er_api = Api::new(
+        format!("http://127.0.0.1:{rpc_port}").parse()?,
+        format!("ws://127.0.0.1:{ws_port}").parse()?,
+    );
     let ready = process::wait_until(
         config::ER_READY_TIMEOUT,
         "private ER RPC answering",
@@ -306,7 +297,6 @@ async fn launch(
         format!("ws://127.0.0.1:{ws_port}").parse()?,
         format!("http://127.0.0.1:{metrics_port}").parse()?,
         identity_pubkey,
-        options.request_timeout,
         pid,
     );
     Ok(PrivateEr { proc, plan, log, ctx, ports })

@@ -1,43 +1,28 @@
 use std::{
-    cell::RefCell,
     collections::{BTreeSet, HashMap, HashSet},
     mem,
-    rc::Rc,
+    ops::ControlFlow::{self, Break, Continue},
     sync::Arc,
-    time::Duration,
 };
 
 use anyhow::Context;
-use base64::{engine::general_purpose::STANDARD, Engine};
-use json::{Deserialize, LazyValue, Value};
+use json::LazyValue;
 use pubkey::Pubkey;
 use signature::Signature;
-use tokio::sync::oneshot;
+use solana_rpc_client_types::response::{Response, RpcSignatureResult};
+use tokio::{sync::oneshot, time};
 use url::Url;
 
 use super::{
     clock::SendClock,
-    conn::{self, CloseReason, FrameHandler, Reader, Requester},
+    socket::CloseReason,
+    subscription::{self, Connection, SubscriptionState, Topic},
+    NETWORK_TIMEOUT,
 };
 use crate::{
     stats::{ObservationsStats, StreamingStats},
     Result,
 };
-
-#[derive(Deserialize)]
-struct AccountPayload {
-    value: AccountValue,
-}
-
-#[derive(Deserialize)]
-struct AccountValue {
-    data: (String, String),
-}
-
-pub(super) fn account_update_data(payload: &LazyValue<'_>) -> Option<Vec<u8>> {
-    let payload = json::from_str::<AccountPayload>(payload.as_raw_str()).ok()?;
-    STANDARD.decode(&payload.value.data.0).ok()
-}
 
 #[derive(Debug)]
 pub struct UpdateOutcome {
@@ -47,99 +32,54 @@ pub struct UpdateOutcome {
 }
 
 #[derive(Default)]
-struct Shared {
-    ready_subs: usize,
-    error: Option<String>,
-    subs_by_req: HashMap<u64, Pubkey>,
-    account_by_subid: HashMap<u64, Pubkey>,
+struct AccountState {
+    // Both indexes contain the same pending writes.
     pending: HashMap<u64, Pubkey>,
     by_account: HashMap<Pubkey, BTreeSet<u64>>,
-    // closed-loop per-id wake-ups, fired the moment an id settles
     waiters: HashMap<u64, oneshot::Sender<()>>,
     lag: StreamingStats,
     observed: usize,
     superseded: usize,
 }
 
-impl Shared {
+impl SubscriptionState for AccountState {
+    type Key = Pubkey;
+
+    fn on_close(&mut self, _reason: &CloseReason) {
+        // Dropping the senders errors every parked waiter.
+        self.waiters.clear();
+    }
+}
+
+impl AccountState {
     fn settle(&mut self, id: u64) {
-        if let Some(account) = self.pending.remove(&id) {
-            self.by_account.entry(account).or_default().remove(&id);
-        }
+        let account = self.pending.remove(&id).unwrap();
+        self.by_account.get_mut(&account).unwrap().remove(&id);
         if let Some(tx) = self.waiters.remove(&id) {
             let _ = tx.send(());
         }
     }
 
-    fn fail(&mut self, msg: impl Into<String>) {
-        self.error = Some(msg.into());
-        // dropping the senders errors every parked waiter
-        self.waiters.clear();
-    }
-}
-
-struct AccountHandler<E> {
-    shared: Rc<RefCell<Shared>>,
-    extractor: E,
-    clock: Arc<SendClock>,
-}
-
-impl<E> FrameHandler for AccountHandler<E>
-where
-    E: Fn(&[u8]) -> Option<u64>,
-{
-    fn on_reply(&mut self, id: u64, result: Option<&LazyValue<'_>>) {
-        let mut shared = self.shared.borrow_mut();
-        if let (Some(account), Some(subid)) =
-            (shared.subs_by_req.remove(&id), conn::reply_u64(result))
-        {
-            shared.account_by_subid.insert(subid, account);
-        }
-        shared.ready_subs += 1;
-    }
-
-    fn on_notification(&mut self, method: &str, subscription: u64, payload: &LazyValue<'_>) {
-        if method != "accountNotification" {
-            return;
-        }
-        let Some(data) = account_update_data(payload) else {
-            return;
-        };
-        let Some(id) = (self.extractor)(&data) else {
-            return;
-        };
-        let mut shared = self.shared.borrow_mut();
-        if shared.pending.contains_key(&id) {
-            if let Some(lag) = self.clock.elapsed_micros(id) {
-                shared.lag.push(lag);
+    fn observe(&mut self, account: Pubkey, id: u64, clock: &SendClock) {
+        if self.pending.contains_key(&id) {
+            if let Some(lag) = clock.elapsed_micros(id) {
+                self.lag.push(lag);
             }
-            shared.observed += 1;
-            shared.settle(id);
+            self.observed += 1;
+            self.settle(id);
         }
-        let Some(account) = shared.account_by_subid.get(&subscription).copied() else {
-            return;
-        };
-        while let Some(pending_id) = shared
-            .by_account
-            .get(&account)
-            .and_then(BTreeSet::first)
-            .copied()
-            .filter(|&pending_id| pending_id < id)
-        {
-            shared.superseded += 1;
-            shared.settle(pending_id);
+        while let Some(&pending_id) = self.by_account.get(&account).and_then(BTreeSet::first) {
+            if pending_id >= id {
+                break;
+            }
+            self.superseded += 1;
+            self.settle(pending_id);
         }
-    }
-
-    fn on_closed(&mut self, reason: &CloseReason) {
-        self.shared.borrow_mut().fail(reason.to_string());
     }
 }
 
 pub struct AccountUpdates {
-    requester: Requester,
-    shared: Rc<RefCell<Shared>>,
-    reader: Reader,
+    connection: Connection<AccountState>,
 }
 
 impl AccountUpdates {
@@ -151,129 +91,98 @@ impl AccountUpdates {
     where
         Extract: Fn(&[u8]) -> Option<u64> + 'static,
     {
-        let (requester, stream) = conn::split(conn::connect(url).await?);
-        let shared = Rc::new(RefCell::new(Shared::default()));
-        let reader = Reader::spawn(
-            stream,
-            AccountHandler {
-                shared: shared.clone(),
-                extractor,
-                clock,
+        let connection = Connection::connect(
+            url,
+            AccountState::default(),
+            move |state, account, payload| {
+                if let Some(id) =
+                    subscription::account_data(payload).and_then(|data| extractor(&data))
+                {
+                    state.observe(account, id, &clock);
+                }
+                Continue(())
             },
-        );
-        Ok(Self { requester, shared, reader })
+        )
+        .await?;
+        Ok(Self { connection })
     }
 
     pub async fn account_subscribe(&self, account: &Pubkey) -> Result<()> {
-        let id = self.requester.mint();
-        self.shared.borrow_mut().subs_by_req.insert(id, *account);
-        self.requester
-            .send(id, "accountSubscribe", &conn::account_params(account))
+        self.connection
+            .subscribe(
+                Topic::Account,
+                &subscription::account_params(account),
+                *account,
+            )
             .await
     }
 
-    pub async fn await_subscribed(&self, count: usize, timeout: Duration) -> Result<()> {
-        self.await_shared(timeout, "subscription acks", |shared| {
-            shared.ready_subs >= count
-        })
-        .await
+    pub async fn await_subscribed(&self, count: usize) -> Result<()> {
+        self.connection.await_subscribed(count).await
     }
 
     pub fn track(&self, id: u64, account: Pubkey) {
-        let mut shared = self.shared.borrow_mut();
-        if let Some(previous) = shared.pending.insert(id, account) {
-            shared.by_account.entry(previous).or_default().remove(&id);
+        let mut state = self.connection.state_mut();
+        if let Some(previous) = state.pending.insert(id, account) {
+            state.by_account.get_mut(&previous).unwrap().remove(&id);
         }
-        shared.by_account.entry(account).or_default().insert(id);
+        state.by_account.entry(account).or_default().insert(id);
     }
 
-    pub async fn await_observed(&self, count: usize, timeout: Duration) -> Result<()> {
-        self.await_shared(timeout, "account updates", |shared| {
-            shared.observed >= count
-        })
-        .await
+    pub async fn await_observed(&self, count: usize) -> Result<()> {
+        self.connection
+            .wait_for("account updates", |state| state.observed >= count)
+            .await
     }
 
-    // Writes coalesce per slot, so completion is "nothing pending" rather
-    // than "every id observed": a newer id for the same account settles the
-    // older ones as superseded.
-    pub async fn await_settled(&self, timeout: Duration) -> Result<()> {
-        self.await_shared(timeout, "pending account updates", |shared| {
-            shared.pending.is_empty()
-        })
-        .await
+    // Writes coalesce per slot: newer updates settle older writes for the same account.
+    pub async fn await_settled(&self) -> Result<()> {
+        self.connection
+            .wait_for("pending account updates", |state| state.pending.is_empty())
+            .await
     }
 
-    // Event-driven single-id wait (closed loop) — resolves when the id is
-    // observed or superseded; immediate if it already settled or was never
-    // tracked. Wrap in a timeout at the call site.
+    // Resolves immediately for settled or untracked ids.
     pub async fn await_id(&self, id: u64) -> Result<()> {
+        self.connection.check_error()?;
         let rx = {
-            let mut shared = self.shared.borrow_mut();
-            conn::check_stream(&shared.error)?;
-            if !shared.pending.contains_key(&id) {
+            let mut state = self.connection.state_mut();
+            if !state.pending.contains_key(&id) {
                 return Ok(());
             }
             let (tx, rx) = oneshot::channel();
-            shared.waiters.insert(id, tx);
+            state.waiters.insert(id, tx);
             rx
         };
-        rx.await.context("ws stream failed while awaiting update")
+        time::timeout(NETWORK_TIMEOUT, rx)
+            .await
+            .context("account update timed out")?
+            .context("ws stream failed while awaiting update")
     }
 
     pub fn finalize(&self) -> UpdateOutcome {
-        self.reader.stop();
-        let mut shared = self.shared.borrow_mut();
+        self.connection.stop();
+        let mut state = self.connection.state_mut();
         UpdateOutcome {
-            lag: mem::take(&mut shared.lag).finalize(false),
-            observed: shared.observed,
-            superseded: shared.superseded,
+            lag: mem::take(&mut state.lag).finalize(false),
+            observed: state.observed,
+            superseded: state.superseded,
         }
     }
-
-    async fn await_shared(
-        &self,
-        timeout: Duration,
-        what: &str,
-        done: impl Fn(&Shared) -> bool,
-    ) -> Result<()> {
-        conn::await_condition(timeout, what, || {
-            let shared = self.shared.borrow();
-            conn::check_stream(&shared.error)?;
-            Ok(done(&shared))
-        })
-        .await
-    }
-}
-
-// ---- signature confirmations -------------------------------------------
-
-#[derive(Deserialize)]
-struct SigPayload {
-    value: SigValue,
-}
-
-#[derive(Deserialize)]
-struct SigValue {
-    err: Option<Value>,
 }
 
 #[derive(Debug)]
 pub struct SignatureOutcome {
     pub latency: ObservationsStats,
     pub confirmed: usize,
-    // notification carried an on-chain error
     pub failed: usize,
     pub first_failure: Option<String>,
-    // still pending when finalized — always report against the timeout used
+    // Still pending when finalized; report against the observation window.
     pub unconfirmed: usize,
 }
 
 #[derive(Default)]
-struct SigShared {
-    error: Option<String>,
-    id_by_req: HashMap<u64, u64>,
-    id_by_subid: HashMap<u64, u64>,
+struct SignatureState {
     pending: HashSet<u64>,
     waiters: HashMap<u64, oneshot::Sender<()>>,
     latency: StreamingStats,
@@ -282,135 +191,106 @@ struct SigShared {
     first_failure: Option<String>,
 }
 
-impl SigShared {
-    fn settle_waiter(&mut self, id: u64) {
-        if let Some(tx) = self.waiters.remove(&id) {
-            let _ = tx.send(());
-        }
-    }
+impl SubscriptionState for SignatureState {
+    type Key = u64;
 
-    fn fail(&mut self, msg: impl Into<String>) {
-        self.error = Some(msg.into());
+    fn on_close(&mut self, _reason: &CloseReason) {
         self.waiters.clear();
     }
 }
 
-struct SigHandler {
-    shared: Rc<RefCell<SigShared>>,
-    clock: Arc<SendClock>,
-}
-
-impl FrameHandler for SigHandler {
-    fn on_reply(&mut self, id: u64, result: Option<&LazyValue<'_>>) {
-        let mut shared = self.shared.borrow_mut();
-        if let (Some(tracked), Some(subid)) =
-            (shared.id_by_req.remove(&id), conn::reply_u64(result))
-        {
-            shared.id_by_subid.insert(subid, tracked);
-        }
-    }
-
-    fn on_notification(&mut self, method: &str, subscription: u64, payload: &LazyValue<'_>) {
-        if method != "signatureNotification" {
-            return;
-        }
-        let Ok(result) = json::from_str::<SigPayload>(payload.as_raw_str()) else {
-            return;
+impl SignatureState {
+    fn observe(&mut self, id: u64, payload: &LazyValue<'_>, clock: &SendClock) -> ControlFlow<()> {
+        let Ok(Response {
+            value: RpcSignatureResult::ProcessedSignature(result),
+            ..
+        }) = json::from_str::<Response<RpcSignatureResult>>(payload.as_raw_str())
+        else {
+            return Continue(());
         };
-        let mut shared = self.shared.borrow_mut();
-        let Some(id) = shared.id_by_subid.remove(&subscription) else {
-            return;
-        };
-        if !shared.pending.remove(&id) {
-            return;
+        if !self.pending.remove(&id) {
+            return Break(());
         }
-        match result.value.err {
+        match result.err {
             None => {
-                if let Some(latency) = self.clock.elapsed_micros(id) {
-                    shared.latency.push(latency);
+                if let Some(latency) = clock.elapsed_micros(id) {
+                    self.latency.push(latency);
                 }
-                shared.confirmed += 1;
+                self.confirmed += 1;
             }
             Some(err) => {
-                shared.failed += 1;
-                shared.first_failure.get_or_insert(format!("id {id}: {err}"));
+                self.failed += 1;
+                self.first_failure.get_or_insert(format!("id {id}: {err}"));
             }
         }
-        shared.settle_waiter(id);
-    }
-
-    fn on_closed(&mut self, reason: &CloseReason) {
-        self.shared.borrow_mut().fail(reason.to_string());
+        if let Some(tx) = self.waiters.remove(&id) {
+            let _ = tx.send(());
+        }
+        Break(())
     }
 }
 
-// signatureSubscribe is one-shot: one notification at the commitment level,
-// then the server auto-unsubscribes. Subscribe BEFORE delivering the tx
-// (`TxSender::prepare` exposes the signature) — a post-delivery subscribe
-// races the confirmation and can miss it.
+// Signature subscriptions are one-shot. Subscribe before delivering the transaction
+// to avoid racing confirmation (`TxSender::prepare` exposes the signature).
 pub struct SignatureConfirmations {
-    requester: Requester,
-    shared: Rc<RefCell<SigShared>>,
-    reader: Reader,
+    connection: Connection<SignatureState>,
 }
 
 impl SignatureConfirmations {
     pub async fn connect(url: &Url, clock: Arc<SendClock>) -> Result<Self> {
-        let (requester, stream) = conn::split(conn::connect(url).await?);
-        let shared = Rc::new(RefCell::new(SigShared::default()));
-        let reader = Reader::spawn(stream, SigHandler { shared: shared.clone(), clock });
-        Ok(Self { requester, shared, reader })
+        let connection =
+            Connection::connect(url, SignatureState::default(), move |state, id, payload| {
+                state.observe(id, payload, &clock)
+            })
+            .await?;
+        Ok(Self { connection })
     }
 
     pub async fn subscribe(&self, id: u64, signature: &Signature) -> Result<()> {
-        let req = self.requester.mint();
-        {
-            let mut shared = self.shared.borrow_mut();
-            conn::check_stream(&shared.error)?;
-            shared.id_by_req.insert(req, id);
-            shared.pending.insert(id);
-        }
-        self.requester
-            .send(
-                req,
-                "signatureSubscribe",
-                &conn::signature_params(signature),
+        self.connection.check_error()?;
+        self.connection.state_mut().pending.insert(id);
+        self.connection
+            .subscribe(
+                Topic::Signature,
+                &subscription::signature_params(signature),
+                id,
             )
-            .await
+            .await?;
+        self.connection.await_ack(id).await
     }
 
     pub async fn await_id(&self, id: u64) -> Result<()> {
+        self.connection.check_error()?;
         let rx = {
-            let mut shared = self.shared.borrow_mut();
-            conn::check_stream(&shared.error)?;
-            if !shared.pending.contains(&id) {
+            let mut state = self.connection.state_mut();
+            if !state.pending.contains(&id) {
                 return Ok(());
             }
             let (tx, rx) = oneshot::channel();
-            shared.waiters.insert(id, tx);
+            state.waiters.insert(id, tx);
             rx
         };
-        rx.await.context("ws stream failed while awaiting signature")
+        time::timeout(NETWORK_TIMEOUT, rx)
+            .await
+            .context("signature confirmation timed out")?
+            .context("ws stream failed while awaiting signature")
     }
 
-    pub async fn await_all(&self, timeout: Duration) -> Result<()> {
-        conn::await_condition(timeout, "signature confirmations", || {
-            let shared = self.shared.borrow();
-            conn::check_stream(&shared.error)?;
-            Ok(shared.pending.is_empty())
-        })
-        .await
+    pub async fn await_all(&self) -> Result<()> {
+        self.connection
+            .wait_for("signature confirmations", |state| state.pending.is_empty())
+            .await
     }
 
     pub fn finalize(&self) -> SignatureOutcome {
-        self.reader.stop();
-        let mut shared = self.shared.borrow_mut();
+        self.connection.stop();
+        let mut state = self.connection.state_mut();
         SignatureOutcome {
-            latency: mem::take(&mut shared.latency).finalize(false),
-            confirmed: shared.confirmed,
-            failed: shared.failed,
-            first_failure: shared.first_failure.take(),
-            unconfirmed: shared.pending.len(),
+            latency: mem::take(&mut state.latency).finalize(false),
+            confirmed: state.confirmed,
+            failed: state.failed,
+            first_failure: state.first_failure.take(),
+            unconfirmed: state.pending.len(),
         }
     }
 }

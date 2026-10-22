@@ -1,5 +1,6 @@
 use std::{
     rc::Rc,
+    slice,
     time::{Duration, Instant},
 };
 
@@ -8,10 +9,11 @@ use keypair::Keypair;
 use pubkey::Pubkey;
 
 use redsuite_core::{
-    check, prep,
+    api::transaction_meta,
+    prep,
     programs::{CellHeader, REDSHIFT},
     topology::{self, ErOptions, PrivateEr, RestartConfig},
-    BaseCtx, ChainCtx, DynError, ErCtx, PrivateErScenario, Result,
+    BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result,
 };
 use signature::Signature;
 use signer::Signer;
@@ -26,8 +28,6 @@ const LEDGER_SIZE_LIMIT_BYTES: u64 = 1;
 const RETENTION_EVENTS: u64 = 3;
 const RETENTION_TIMEOUT: Duration = Duration::from_secs(180);
 const TX_INTERVAL: Duration = Duration::from_millis(200);
-const PROGRAM_CLONE_TIMEOUT: Duration = Duration::from_secs(20);
-const TX_LEDGER_TIMEOUT: Duration = Duration::from_secs(10);
 const SIGNATURE_WINDOW: usize = 1_000;
 const BLOCK_SETTLE_SLOTS: u64 = 2;
 const TRUNCATIONS: &str = r#"engine_ledger_operation_duration_micros_count{op="truncate"}"#;
@@ -75,24 +75,27 @@ async fn delegate_cell(base: &BaseCtx, er: &ErCtx, payer: &Keypair) -> Result<Pu
 }
 
 async fn seed_history(er: &ErCtx, cell: &Pubkey, sent: &mut Vec<Sent>) -> Result<()> {
-    let listed = check::poll_for(
-        "the er records the clone of the delegated cell",
-        PROGRAM_CLONE_TIMEOUT,
-        || async {
-            ensure!(er.account(cell).await?.is_some(), "cell {cell} not cloned");
-            let signatures = er.api().get_signatures_for_address(cell, SIGNATURE_WINDOW).await?;
-            ensure!(!signatures.is_empty(), "cell {cell} has no history");
-            Ok::<_, DynError>(signatures)
-        },
-    )
-    .await?;
+    let listed = er
+        .api()
+        .await_accounts(
+            slice::from_ref(cell),
+            "the er records the clone of the delegated cell",
+            async || {
+                ensure!(er.account(cell).await?.is_some());
+                let signatures =
+                    er.api().get_signatures_for_address(cell, SIGNATURE_WINDOW).await?;
+                ensure!(!signatures.is_empty());
+                Ok(signatures)
+            },
+        )
+        .await?;
     for signature in listed.iter().rev() {
         let signature = *signature;
         let tx = er
             .api()
             .get_transaction(&signature)
             .await?
-            .with_context(|| format!("listed transaction {signature} is missing on the er"))?;
+            .context("listed transaction missing")?;
         sent.push(Sent { signature, slot: tx.slot });
     }
     Ok(())
@@ -113,12 +116,9 @@ async fn send_add(er: &ErCtx, payer: &Keypair, count: u8, sent: &mut Vec<Sent>) 
                 .build()],
         )
         .await?;
-    let tx = er.api().await_transaction(&signature, TX_LEDGER_TIMEOUT).await?;
-    ensure!(
-        tx.err.is_none(),
-        "add {signature} must succeed on the er, got {:?}",
-        tx.err
-    );
+    let tx = er.api().await_transaction(&signature).await?;
+    let meta = transaction_meta(&tx)?;
+    ensure!(meta.err == None);
     sent.push(Sent { signature, slot: tx.slot });
     Ok(())
 }
@@ -147,53 +147,29 @@ async fn cell_value(er: &ErCtx, cell: &Pubkey) -> Result<u64> {
 
 async fn verify(
     er: &ErCtx,
-    label: &str,
     view: &HistoryView,
     previous_pruned: usize,
     cell: &Pubkey,
     expected_count: u64,
 ) -> Result<()> {
-    ensure!(
-        view.pruned.len() >= previous_pruned,
-        "{label}: pruned history must not come back — {} pruned before, {} \
-         now",
-        previous_pruned,
-        view.pruned.len()
-    );
+    ensure!(view.pruned.len() >= previous_pruned);
     if let (Some(max_pruned), Some(min_retained)) =
         (view.max_pruned_slot(), view.min_retained_slot())
     {
-        ensure!(
-            max_pruned < min_retained,
-            "{label}: retention must remove only the oldest history — a \
-             pruned transaction sits in slot {max_pruned} while slot \
-             {min_retained} is still retained"
-        );
+        ensure!(max_pruned < min_retained);
     }
 
     let tip = er.api().get_slot().await?;
     for entry in &view.pruned {
         let block = er.api().get_block(entry.slot).await?;
-        ensure!(
-            block.is_none(),
-            "{label}: slot {} holds pruned transaction {} but getBlock still \
-             returns it",
-            entry.slot,
-            entry.signature
-        );
+        ensure!(block.is_none());
     }
     for entry in &view.retained {
         if entry.slot + BLOCK_SETTLE_SLOTS > tip {
             continue;
         }
         let block = er.api().get_block(entry.slot).await?;
-        ensure!(
-            block.is_some(),
-            "{label}: slot {} holds retained transaction {} but getBlock \
-             returns nothing",
-            entry.slot,
-            entry.signature
-        );
+        ensure!(block.is_some());
     }
 
     let listed = er.api().get_signatures_for_address(cell, SIGNATURE_WINDOW).await?;
@@ -242,7 +218,7 @@ impl PrivateErScenario for LedgerRetention {
         let before;
         {
             let er = private.ctx();
-            er.await_program_clone(&redshift_interface::id(), PROGRAM_CLONE_TIMEOUT).await?;
+            er.await_program_clone(&redshift_interface::id()).await?;
             cell = delegate_cell(&base, er, &payer).await?;
             seed_history(er, &cell, &mut sent).await?;
 
@@ -258,15 +234,7 @@ impl PrivateErScenario for LedgerRetention {
                 if observed > events {
                     events = observed;
                     let view = observe(er, &sent).await?;
-                    verify(
-                        er,
-                        &format!("retention event {events}"),
-                        &view,
-                        previous_pruned,
-                        &cell,
-                        total,
-                    )
-                    .await?;
+                    verify(er, &view, previous_pruned, &cell, total).await?;
                     if view.pruned.len() > previous_pruned && first_pruning_event.is_none() {
                         first_pruning_event = Some(events);
                     }
@@ -282,69 +250,30 @@ impl PrivateErScenario for LedgerRetention {
                 if events >= RETENTION_EVENTS && first_pruning_event.is_some() {
                     break;
                 }
-                ensure!(
-                    started.elapsed() < RETENTION_TIMEOUT,
-                    "retention must purge {RETENTION_EVENTS} superblocks and \
-                     reach this scenario's history within \
-                     {RETENTION_TIMEOUT:?}; saw {events} events and {} pruned \
-                     transactions",
-                    previous_pruned
-                );
+                ensure!(started.elapsed() < RETENTION_TIMEOUT);
                 time::sleep(TX_INTERVAL).await;
             }
 
             before = observe(er, &sent).await?;
-            verify(er, "before restart", &before, previous_pruned, &cell, total).await?;
-            ensure!(
-                !before.retained.is_empty(),
-                "some of this scenario's history must still be retained \
-                 before the restart"
-            );
+            verify(er, &before, previous_pruned, &cell, total).await?;
+            ensure!(!before.retained.is_empty());
         }
 
         let timing = private.restart(RestartConfig::default()).await?;
         ensure!(timing.exit_code == Some(0));
-        ensure!(
-            !timing.needed_sigkill,
-            "the graceful stop must not escalate to SIGKILL"
-        );
+        ensure!(!timing.needed_sigkill);
 
         let er = private.ctx();
         let after = observe(er, &sent).await?;
-        ensure!(
-            after.pruned.len() >= before.pruned.len(),
-            "a restart must not resurrect pruned history — {} pruned before, \
-             {} after",
-            before.pruned.len(),
-            after.pruned.len()
-        );
-        verify(
-            er,
-            "after restart",
-            &after,
-            before.pruned.len(),
-            &cell,
-            total,
-        )
-        .await?;
-        ensure!(
-            !after.retained.is_empty(),
-            "the restart must preserve the retained history"
-        );
+        ensure!(after.pruned.len() >= before.pruned.len());
+        verify(er, &after, before.pruned.len(), &cell, total).await?;
+        ensure!(!after.retained.is_empty());
 
         let count = add_count(adds);
         send_add(er, &payer, count, &mut sent).await?;
         total += u64::from(count);
         let final_view = observe(er, &sent).await?;
-        verify(
-            er,
-            "after restart add",
-            &final_view,
-            after.pruned.len(),
-            &cell,
-            total,
-        )
-        .await?;
+        verify(er, &final_view, after.pruned.len(), &cell, total).await?;
         private.finish().await?;
         Ok(())
     }

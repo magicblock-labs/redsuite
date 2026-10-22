@@ -4,6 +4,7 @@ use anyhow::{ensure, Context};
 use keypair::Keypair;
 
 use redsuite_core::{
+    api::{transaction_logs, transaction_meta},
     prep,
     programs::{CellHeader, REDSHIFT},
     topology::{self, ErOptions, PrivateEr},
@@ -17,7 +18,6 @@ use tokio::time;
 use crate::PAYER_LAMPORTS;
 
 const LABEL: &str = "clone-without-alt-writes";
-const CLONE_TIMEOUT: Duration = Duration::from_secs(20);
 const ALT_SETTLE: Duration = Duration::from_secs(1);
 const SIGNATURE_WINDOW: usize = 50;
 
@@ -73,7 +73,10 @@ impl PrivateErScenario for CloneWithoutAltWrites {
                 let Some(tx) = base.api().get_transaction(&signature).await? else {
                     continue;
                 };
-                if tx.logs.iter().any(|line| line.contains(&alt_program)) {
+                if transaction_logs(transaction_meta(&tx)?)
+                    .iter()
+                    .any(|line| line.contains(&alt_program))
+                {
                     count += 1;
                 }
             }
@@ -82,8 +85,8 @@ impl PrivateErScenario for CloneWithoutAltWrites {
 
         ensure!(alt_transactions().await? == 0);
         let er = private.ctx();
-        er.await_program_clone(&redshift_interface::ID, CLONE_TIMEOUT).await?;
-        er.await_program_clone(&topology::COMMITTOR_ID, CLONE_TIMEOUT).await?;
+        er.await_program_clone(&redshift_interface::ID).await?;
+        er.await_program_clone(&topology::COMMITTOR_ID).await?;
 
         let payer_chain = base.funded_payer(PAYER_LAMPORTS).await?;
         let payer_ephem = base.funded_payer(PAYER_LAMPORTS).await?;

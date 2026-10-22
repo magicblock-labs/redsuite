@@ -13,6 +13,7 @@ use redsuite_core::{
     transport::{
         clock::SendClock,
         subpool::{ConnReport, ExpectedWrites, SubscriberPool},
+        NETWORK_TIMEOUT,
     },
     BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
 };
@@ -23,9 +24,6 @@ use crate::{metrics, ACCOUNT_SPACE};
 
 const PREP_PAYER_LAMPORTS: u64 = 4_000_000_000;
 
-const SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(15);
-const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
-const CLONE_TIMEOUT: Duration = Duration::from_secs(15);
 const LAG_THRESHOLD: Duration = Duration::from_secs(1);
 const CLIFF_P95_US: i32 = 1_000_000;
 
@@ -83,6 +81,7 @@ fn cell_expected_writes(pool: &[Pubkey], first_id: u64, iterations: u64) -> Expe
 
 fn execute_cell(
     er_rpc_url: Url,
+    er_ws_url: Url,
     config: ThreadRunConfig,
     id_offset: u64,
     pool: Arc<Vec<Pubkey>>,
@@ -92,6 +91,7 @@ fn execute_cell(
     execute_kernel(
         config,
         er_rpc_url,
+        er_ws_url,
         payer_bytes,
         id_offset,
         move |id| REDLINE.copy_three(&pool, id).0,
@@ -126,7 +126,7 @@ impl Scenario<ScenarioReport> for WsFanoutThreshold {
         let pool = Accounts::new(ACCOUNT_SPACE, er.identity())
             .init_batched(base.as_ref(), &prep_payers, profile.accounts, true)
             .await?;
-        er.await_clones(&pool, ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
+        er.await_clones(&pool, ACCOUNT_SPACE as usize).await?;
         let payer_bytes = prep::payer_bytes(&prep_payers);
         let pool: Arc<Vec<Pubkey>> = Arc::new(pool);
 
@@ -150,6 +150,7 @@ impl Scenario<ScenarioReport> for WsFanoutThreshold {
         let er_rpc_url = er.api().url().clone();
         let warmup = execute_cell(
             er_rpc_url.clone(),
+            er.ws_url().clone(),
             ThreadRunConfig {
                 threads: profile.threads,
                 iterations: profile.warmup,
@@ -161,12 +162,7 @@ impl Scenario<ScenarioReport> for WsFanoutThreshold {
             payer_bytes.clone(),
             None,
         )?;
-        ensure!(
-            warmup.failed == 0,
-            "failures={:?}; first error={:?}",
-            warmup.failed,
-            warmup.first_error
-        );
+        ensure!(warmup.failed == 0);
 
         let mut id_cursor = profile.warmup;
         let mut cells: Vec<CellOutcome> = Vec::new();
@@ -183,11 +179,12 @@ impl Scenario<ScenarioReport> for WsFanoutThreshold {
                 Arc::new(CellHeader::written_id),
                 LAG_THRESHOLD,
             );
-            subscribers.await_subscribed(pool.len(), SUBSCRIBE_TIMEOUT).await?;
+            subscribers.await_subscribed(pool.len()).await?;
 
             let before = er.scrape_metrics().await?;
             let outcome = execute_cell(
                 er_rpc_url.clone(),
+                er.ws_url().clone(),
                 ThreadRunConfig {
                     threads: profile.threads,
                     iterations: profile.iterations,
@@ -199,14 +196,9 @@ impl Scenario<ScenarioReport> for WsFanoutThreshold {
                 payer_bytes.clone(),
                 Some(clock.clone()),
             )?;
-            ensure!(
-                outcome.failed == 0,
-                "failures={:?}; first error={:?}",
-                outcome.failed,
-                outcome.first_error
-            );
+            ensure!(outcome.failed == 0);
 
-            let missing_final = subscribers.await_final(&expected, DRAIN_TIMEOUT).await;
+            let missing_final = subscribers.await_final(&expected).await;
             let incomplete = subscribers.incomplete(&expected);
             let after = er.scrape_metrics().await?;
             let delta = MetricsDelta::new(before, after);
@@ -254,7 +246,7 @@ impl Scenario<ScenarioReport> for WsFanoutThreshold {
                 .setting("measured iters", profile.iterations)
                 .setting("offered tps", profile.rate)
                 .setting("concurrency", profile.concurrency)
-                .setting("drain timeout s", DRAIN_TIMEOUT.as_secs())
+                .setting("drain timeout s", NETWORK_TIMEOUT.as_secs())
                 .observe("delivery us", Unit::Micros, cell_outcome.outcome.delivery)
                 .client_side(&cell_outcome.outcome)
                 .observe("fanout lag us", Unit::Micros, cell_outcome.lag)
@@ -326,11 +318,7 @@ impl Scenario<ScenarioReport> for WsFanoutThreshold {
         }
 
         for cell in &cells {
-            ensure!(
-                cell.outcome.delivered > 0,
-                "INVALID: ws{} delivered nothing",
-                cell.connections
-            );
+            ensure!(cell.outcome.delivered > 0);
         }
 
         let cliff = cells

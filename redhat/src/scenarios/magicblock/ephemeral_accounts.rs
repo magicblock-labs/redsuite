@@ -1,22 +1,26 @@
-use std::{rc::Rc, result, time::Duration};
+use std::{rc::Rc, result};
 
 use account::Account;
 use anyhow::{ensure, Context};
 use futures_util::{future::try_join_all, TryFutureExt};
 use instruction::{AccountMeta, Instruction};
-use json::Value;
 use keypair::Keypair;
 use magic_api::instruction::MagicBlockInstruction::{
     self, CloseEphemeralAccount as Close, CreateEphemeralAccount as Create,
     ResizeEphemeralAccount as Resize,
 };
 use pubkey::Pubkey;
+use solana_instruction_error::InstructionError;
 
 use redsuite_core::{
-    api::TransactionInfo,
+    api::transaction_logs,
     check, dlp, phase,
     programs::{Redshift, SettlementMode, MAGIC, REDSHIFT},
-    receipt, system, topology, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
+    receipt,
+    rpc_types::response::TransactionError,
+    system, topology,
+    transaction_types::{UiTransactionError, UiTransactionStatusMeta},
+    BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
 use sdk::{consts::EPHEMERAL_VAULT_ID, ephemeral_accounts::rent};
 use signer::Signer;
@@ -24,7 +28,6 @@ use transaction::Transaction;
 
 use crate::PAYER_LAMPORTS;
 
-const TIMEOUT: Duration = Duration::from_secs(30);
 const PAYER: usize = 0;
 const SPONSOR: usize = 1;
 const TARGET: usize = 2;
@@ -75,14 +78,14 @@ impl Action {
         batch.observe(&observed).build()
     }
 
-    fn apply(&self, state: &mut [Account]) -> Option<&'static str> {
+    fn apply(&self, state: &mut [Account]) -> Option<InstructionError> {
         let account = &mut state[TARGET];
         let exists = account.owner != system::system_id();
         let old_rent = if exists { rent(account.data.len() as u32) } else { 0 };
         match self.operation {
             Create { data_len } => {
                 if exists || account.lamports != 0 {
-                    return Some("InvalidAccountData");
+                    return Some(InstructionError::InvalidAccountData);
                 }
                 account.owner = self.caller;
                 account.rent_epoch = u64::MAX;
@@ -90,10 +93,10 @@ impl Action {
             }
             Resize { .. } | Close => {
                 if !exists {
-                    return Some("InvalidAccountData");
+                    return Some(InstructionError::InvalidAccountData);
                 }
                 if account.owner != self.caller {
-                    return Some("InvalidAccountOwner");
+                    return Some(InstructionError::InvalidAccountOwner);
                 }
                 if let Resize { new_data_len } = self.operation {
                     account.data.resize(new_data_len as usize, 0);
@@ -119,8 +122,8 @@ impl Action {
     }
 }
 
-fn error(index: usize, name: &str) -> Value {
-    json::json!({"InstructionError": [index, name]})
+fn error(index: usize, error: InstructionError) -> UiTransactionError {
+    TransactionError::InstructionError(index as u8, error).into()
 }
 
 fn observation(state: &[Account]) -> Vec<String> {
@@ -145,14 +148,19 @@ async fn state(er: &ErCtx, keys: &[Pubkey]) -> Result<Vec<Account>> {
 
 struct Record {
     tx: Transaction,
-    info: TransactionInfo,
+    info: UiTransactionStatusMeta,
 }
 
 impl Record {
     async fn submit(er: &ErCtx, tx: Transaction) -> Result<Self> {
         let api = er.api();
         api.send_transaction(&tx).await?;
-        let info = api.await_transaction(&tx.signatures[0], TIMEOUT).await?;
+        let info = api
+            .await_transaction(&tx.signatures[0])
+            .await?
+            .transaction
+            .meta
+            .context("transaction has no execution metadata")?;
         Ok(Self { tx, info })
     }
 
@@ -161,14 +169,9 @@ impl Record {
         keys: &[Pubkey],
         before: &[Account],
         after: &[Account],
-        expected_error: Option<Value>,
+        expected_error: Option<UiTransactionError>,
     ) -> Result<()> {
-        ensure!(
-            self.info.err == expected_error,
-            "expected {expected_error:?}, got {:?}; logs={:?}",
-            self.info.err,
-            self.info.logs
-        );
+        ensure!(self.info.err == expected_error);
         let mut balances = self.info.pre_balances.clone();
         ensure!(balances.len() == self.tx.message.account_keys.len());
         for (index, key) in self.tx.message.account_keys.iter().enumerate() {
@@ -179,21 +182,15 @@ impl Record {
         }
         ensure!(self.info.post_balances == balances);
         if self.info.err.is_none() {
-            let observed: Vec<_> = self
-                .info
-                .logs
+            let observed: Vec<_> = transaction_logs(&self.info)
                 .iter()
                 .filter_map(|line| line.strip_prefix("Program log: CellObservation: "))
                 .collect();
             ensure!(observed == [observation(before), observation(after)].concat());
         }
-        ensure!(
-            self.info
-                .logs
-                .iter()
-                .any(|line| line.starts_with(&format!("Program {} invoke", magic_api::id()))),
-            "ephemeral instruction executed"
-        );
+        ensure!(transaction_logs(&self.info)
+            .iter()
+            .any(|line| line.starts_with(&format!("Program {} invoke", magic_api::id()))));
         Ok(())
     }
 }
@@ -256,7 +253,7 @@ impl Workload<'_> {
         &mut self,
         label: &str,
         instructions: Vec<Instruction>,
-        effect: result::Result<&Action, &str>,
+        effect: result::Result<&Action, InstructionError>,
     ) -> Result<()> {
         ensure!(state(self.er, &self.keys).await? == self.expected);
         let error_index = instructions.len() - 1;
@@ -302,10 +299,7 @@ impl Scenario for EphemeralAccounts {
         phase("mapped-signing self-commit", async {
             let payer = &signers[2];
             let vault = dlp::magic_fee_vault_pda(&er.identity());
-            ensure!(
-                er.account(&vault).await?.is_some(),
-                "magic fee vault exists"
-            );
+            ensure!(er.account(&vault).await?.is_some());
             let signature = er
                 .submit_and_confirm(
                     payer,
@@ -317,15 +311,10 @@ impl Scenario for EphemeralAccounts {
                     )],
                 )
                 .await?;
-            let commit_receipt =
-                receipt::fetch_commit_receipt(er.api(), &signature, TIMEOUT).await?;
+            let commit_receipt = receipt::fetch_commit_receipt(er.api(), &signature).await?;
             commit_receipt.check_success("mapped-signing self-commit")?;
-            ensure!(
-                commit_receipt.included.contains(&payer.pubkey()),
-                "self-commit includes payer; actual={:?}",
-                commit_receipt.included
-            );
-            commit_receipt.confirm(base.api(), TIMEOUT).await
+            ensure!(commit_receipt.included.contains(&payer.pubkey()));
+            commit_receipt.confirm(base.api()).await
         })
         .await?;
 
@@ -337,10 +326,7 @@ impl Scenario for EphemeralAccounts {
                 .await;
             let error = check::expect_error(attempt, "non-delegated payer cannot spend")?;
             let error = format!("{error:#}");
-            ensure!(
-                error.contains("InvalidAccountForFee") || error.contains("Immutable"),
-                "non-delegated debit rejected by the access gate: {error:#}"
-            );
+            ensure!(error.contains("InvalidAccountForFee") || error.contains("Immutable"));
             ensure!(er.accounts(&accounts).await? == before);
             Ok(())
         })
@@ -373,12 +359,17 @@ impl Scenario for EphemeralAccounts {
             let mut action = Action::new(operation);
             let ix = action.instruction(&keys);
             for (case, index, value, reason) in [
-                ("unsigned sponsor", 0, None, "MissingRequiredSignature"),
+                (
+                    "unsigned sponsor",
+                    0,
+                    None,
+                    InstructionError::MissingRequiredSignature,
+                ),
                 (
                     "substituted vault",
                     2,
                     Some(keys[SUBSTITUTE]),
-                    "InvalidAccountData",
+                    InstructionError::InvalidAccountData,
                 ),
             ] {
                 let mut invalid = ix.clone();
@@ -395,7 +386,7 @@ impl Scenario for EphemeralAccounts {
                 .run(
                     &format!("{label}: top-level"),
                     vec![direct.instruction(&keys)],
-                    Err("IncorrectProgramId"),
+                    Err(InstructionError::IncorrectProgramId),
                 )
                 .await?;
             if matches!(action.operation, Create { .. }) {
@@ -405,7 +396,7 @@ impl Scenario for EphemeralAccounts {
                     .run(
                         "create: unsigned address",
                         vec![unsigned],
-                        Err("MissingRequiredSignature"),
+                        Err(InstructionError::MissingRequiredSignature),
                     )
                     .await?;
                 let mut occupied = ix.clone();
@@ -414,7 +405,7 @@ impl Scenario for EphemeralAccounts {
                     .run(
                         "create: funded address",
                         vec![occupied],
-                        Err("InvalidAccountData"),
+                        Err(InstructionError::InvalidAccountData),
                     )
                     .await?;
             } else {
@@ -424,7 +415,7 @@ impl Scenario for EphemeralAccounts {
                     .run(
                         &format!("{label}: foreign caller"),
                         vec![outsider.instruction(&keys)],
-                        Err("InvalidAccountOwner"),
+                        Err(InstructionError::InvalidAccountOwner),
                     )
                     .await?;
             }
@@ -432,7 +423,7 @@ impl Scenario for EphemeralAccounts {
                 .run(
                     &format!("{label}: rollback"),
                     vec![ix, direct.instruction(&keys)],
-                    Err("IncorrectProgramId"),
+                    Err(InstructionError::IncorrectProgramId),
                 )
                 .await?;
             action.fill = if matches!(action.operation, Create { .. }) { 0xa5 } else { 0 };
@@ -442,7 +433,7 @@ impl Scenario for EphemeralAccounts {
                     .run(
                         "create: occupied ephemeral",
                         vec![action.instruction(&keys)],
-                        Err("InvalidAccountData"),
+                        Err(InstructionError::InvalidAccountData),
                     )
                     .await?;
             }
@@ -464,7 +455,7 @@ impl Scenario for EphemeralAccounts {
                 .run(
                     "recreate: previous/foreign owner",
                     vec![close.instruction(&keys)],
-                    Err("InvalidAccountOwner"),
+                    Err(InstructionError::InvalidAccountOwner),
                 )
                 .await?;
             close.caller = caller;
@@ -510,12 +501,7 @@ impl Scenario for EphemeralAccounts {
                 workload.step("conflicts: close", &close).await?;
             }
         }
-        let failures = workload.failures;
-        ensure!(
-            failures.is_empty(),
-            "ephemeral receipt/accounting failures: {}",
-            failures.join("; ")
-        );
+        ensure!(workload.failures.is_empty());
         Ok(())
     }
 }

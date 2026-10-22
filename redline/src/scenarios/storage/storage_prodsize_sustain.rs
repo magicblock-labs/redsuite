@@ -4,21 +4,20 @@ use anyhow::ensure;
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    check, host,
+    host,
     profile::ProfileValues,
     programs::REDLINE,
     redline::Accounts,
     report::Unit,
     runner::{execute, Pacing, RunConfig, RunOutcome},
     topology::{self, ErOptions},
-    BaseCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport, TxSender,
+    wait, BaseCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport, TxSender,
 };
 use tracing::{debug, warn};
 
 use crate::ACCOUNT_SPACE;
 
 const PREP_PAYER_LAMPORTS: u64 = 4_000_000_000;
-const CLONE_TIMEOUT: Duration = Duration::from_secs(15);
 const FLATNESS_P50_FACTOR: f64 = 1.5;
 
 const TX_PROCESSING_HISTOGRAM: &str = "mbv_transaction_processing_time";
@@ -154,7 +153,7 @@ impl Scenario<ScenarioReport> for StorageProdsizeSustain {
             )
             .await?;
             let cell_er = private.ctx();
-            cell_er.await_clones(&pool, ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
+            cell_er.await_clones(&pool, ACCOUNT_SPACE as usize).await?;
             let senders: Vec<TxSender> =
                 payers.iter().map(|payer| cell_er.sender(payer.clone())).collect();
 
@@ -174,27 +173,19 @@ impl Scenario<ScenarioReport> for StorageProdsizeSustain {
                 },
             )
             .await?;
-            ensure!(
-                fill.failed == 0,
-                "failures={:?}; first error={:?}",
-                fill.failed,
-                fill.first_error
-            );
-            check::poll(
+            ensure!(fill.failed == 0);
+            wait::retry(
                 &format!(
                     "{cell_name}: the ledger records the {} fill transactions",
                     profile.fill
                 ),
                 LEDGER_FILL_TIMEOUT,
-                || async {
-                    matches!(
-                        cell_er.scrape_metrics().await,
-                        Ok(metrics) if metrics
-                            .get(LEDGER_TRANSACTIONS_GAUGE)
-                            .unwrap_or(0.0)
-                            - ledger_txs_at_boot
-                            >= profile.fill as f64
-                    )
+                async || {
+                    let metrics = cell_er.scrape_metrics().await?;
+                    let filled =
+                        metrics.get(LEDGER_TRANSACTIONS_GAUGE).unwrap_or(0.0) - ledger_txs_at_boot;
+                    ensure!(filled >= profile.fill as f64);
+                    Ok(())
                 },
             )
             .await?;
@@ -285,12 +276,7 @@ impl Scenario<ScenarioReport> for StorageProdsizeSustain {
 
         for cell in &cells {
             for window in &cell.windows {
-                ensure!(
-                    window.outcome.failed == 0,
-                    "failures={:?}; first error={:?}",
-                    window.outcome.failed,
-                    window.outcome.first_error
-                );
+                ensure!(window.outcome.failed == 0);
             }
             let window_a_p50_us = cell.windows[0].outcome.delivery.median.max(1) as f64;
             let window_b_p50_us = cell.windows[1].outcome.delivery.median as f64;

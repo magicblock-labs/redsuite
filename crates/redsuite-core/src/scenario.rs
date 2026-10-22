@@ -1,6 +1,7 @@
 use std::{future::Future, panic::AssertUnwindSafe, rc::Rc, result, time::Instant};
 
-use anyhow::anyhow;
+use anyhow::ensure;
+
 use futures_util::FutureExt;
 use tokio::task::LocalSet;
 use tracing::{error, info, instrument, Span};
@@ -259,13 +260,12 @@ fn preflight(fixtures: &[Fixture]) -> Result<()> {
         return Ok(());
     };
     for fixture in fixtures {
-        if fixture.program_id().is_some() && !loaded.iter().any(|name| name == fixture.so_name()) {
-            return Err(anyhow!(
-                "{} is staged, but the running base booted without it — \
+        ensure!(
+            fixture.program_id().is_none() || loaded.iter().any(|name| name == fixture.so_name()),
+            "{} is staged, but the running base booted without it — \
                  run `cargo xtask stack down`, then run again",
-                fixture.so_name()
-            ));
-        }
+            fixture.so_name()
+        );
     }
     Ok(())
 }

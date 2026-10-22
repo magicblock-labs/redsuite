@@ -10,7 +10,6 @@ use tokio::time;
 
 use crate::PAYER_LAMPORTS;
 
-const TIMEOUT: Duration = Duration::from_secs(15);
 const FREEZE_SETTLE: Duration = Duration::from_millis(800);
 const FIRST_AIRDROP: u64 = 2_000_000_000;
 const SECOND_AIRDROP: u64 = 1_000_000_000;
@@ -26,7 +25,7 @@ pub struct AccountInfoSemantics {
 }
 
 async fn await_balance(er: &ErCtx, address: Pubkey, expected: u64) -> Result<Account> {
-    er.await_account(&address, TIMEOUT, |account| {
+    er.await_account(&address, |account| {
         ensure!(account.lamports == expected);
         Ok(())
     })
@@ -71,14 +70,8 @@ impl Scenario for AccountInfoSemantics {
 
         crate::phase("absent", async {
             let ghost = Keypair::new().pubkey();
-            ensure!(
-                er.account(&ghost).await?.is_none(),
-                "unknown account absent on ER"
-            );
-            ensure!(
-                base.account(&ghost).await?.is_none(),
-                "negative ER read leaves base unchanged"
-            );
+            ensure!(er.account(&ghost).await?.is_none());
+            ensure!(base.account(&ghost).await?.is_none());
             Ok(())
         })
         .await?;
@@ -134,10 +127,7 @@ impl Scenario for AccountInfoSemantics {
                 [Keypair::new().pubkey(), Keypair::new().pubkey(), Keypair::new().pubkey()];
             let misses = er.accounts(&all_missing).await?;
             ensure!(misses.len() == all_missing.len());
-            ensure!(
-                misses.iter().all(Option::is_none),
-                "unknown batch entries absent"
-            );
+            ensure!(misses.iter().all(Option::is_none));
 
             let mixed =
                 [wallet.pubkey(), Keypair::new().pubkey(), receiver.pubkey(), spender.pubkey()];

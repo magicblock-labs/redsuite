@@ -4,7 +4,7 @@ use std::{
     process::{Command, ExitCode},
 };
 
-use anyhow::{anyhow, Context};
+use anyhow::{ensure, Context};
 use clap::Parser;
 use redsuite_core::{catalog::Fixture, frontend, logging, Result};
 use tracing::error;
@@ -58,9 +58,7 @@ fn main() -> ExitCode {
 
 fn run(command: &mut Command) -> Result<()> {
     let status = command.status().with_context(|| format!("{command:?}: failed to spawn"))?;
-    if !status.success() {
-        return Err(anyhow!("{command:?} failed ({status})"));
-    }
+    ensure!(status.success(), "{command:?} failed ({status})");
     Ok(())
 }
 

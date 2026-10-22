@@ -1,7 +1,4 @@
-use std::{
-    rc::Rc,
-    time::{Duration, Instant},
-};
+use std::{rc::Rc, slice, time::Duration};
 
 use anyhow::{ensure, Context};
 use keypair::Keypair;
@@ -11,7 +8,7 @@ use redsuite_core::{
     netfault::{BaseProxies, Selector},
     programs::{CellHeader, CellId, SettlementMode, REDLINE},
     topology::RestartConfig,
-    BaseCtx, ChainCtx, DynError, ErCtx, Result, Scenario,
+    wait, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
 use signer::Signer;
 use tokio::time;
@@ -19,12 +16,9 @@ use tokio::time;
 use super::{write_snapshot, PROXIED_GROUP};
 use crate::{program::DELEGATION_PROGRAM_ID, ACCOUNT_SPACE, LOCKOUT_REJECTIONS, PAYER_LAMPORTS};
 
-const CLONE_TIMEOUT: Duration = Duration::from_secs(30);
 const INTERCEPT_TIMEOUT: Duration = Duration::from_secs(60);
 const COMPLETION_TIMEOUT: Duration = Duration::from_secs(90);
-const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(60);
 const REDELEGATE_TIMEOUT: Duration = Duration::from_secs(60);
-const POLL: Duration = Duration::from_millis(250);
 const HIDDEN: &str = "notification hidden by redsuite";
 
 pub struct UndelegationRecovery {
@@ -75,34 +69,33 @@ async fn await_ownership_return(
     owner: &Pubkey,
     snapshot: &[u8],
 ) -> Result<()> {
-    let started = Instant::now();
-    loop {
-        let on_base = base
-            .account(account)
-            .await?
-            .context("the account vanished from base during undelegation")?;
-        if on_base.owner == *owner {
-            ensure!(on_base.data == snapshot);
-            return Ok(());
+    time::timeout(COMPLETION_TIMEOUT, async {
+        let events = base.api().events().await?;
+        let mut changes = events.account(account).await?;
+        loop {
+            let on_base =
+                base.account(account).await?.context("account vanished during undelegation")?;
+            if on_base.owner == *owner {
+                ensure!(on_base.data == snapshot);
+                return Ok(());
+            }
+            ensure!(on_base.owner == DELEGATION_PROGRAM_ID);
+            changes.next().await?;
         }
-        ensure!(on_base.owner == DELEGATION_PROGRAM_ID);
-        ensure!(
-            started.elapsed() < COMPLETION_TIMEOUT,
-            "base must complete the undelegation of {account} within \
-             {COMPLETION_TIMEOUT:?}"
-        );
-        time::sleep(POLL).await;
-    }
+    })
+    .await
+    .context("base undelegation timed out")?
 }
 
 async fn await_er_value(er: &ErCtx, account: &Pubkey, id: u64, what: &str) -> Result<()> {
-    check::poll_for(what, DISCOVERY_TIMEOUT, || async {
-        let account = er.account(account).await?.context("ER cell absent")?;
-        ensure!(CellHeader::try_decode(&account.data)?.value == id);
-        Ok::<_, DynError>(())
-    })
-    .await
-    .with_context(|| format!("written id {id}"))?;
+    er.api()
+        .await_accounts(slice::from_ref(account), what, async || {
+            let account = er.account(account).await?.context("ER cell absent")?;
+            ensure!(CellHeader::try_decode(&account.data)?.value == id);
+            Ok(())
+        })
+        .await
+        .with_context(|| format!("written id {id}"))?;
     Ok(())
 }
 
@@ -129,10 +122,10 @@ async fn redelegate_and_write(
         .await?
         .context("the account vanished from base during redelegation")?;
     ensure!(on_base.owner == DELEGATION_PROGRAM_ID);
-    check::poll(
+    wait::retry(
         "the er accepts writes again once the account is redelegated",
         REDELEGATE_TIMEOUT,
-        || async { er.cells(REDLINE, payer).write(id, &[*account]).await.is_ok() },
+        async || er.cells(REDLINE, payer).write(id, &[*account]).await,
     )
     .await?;
     let on_er = er
@@ -157,7 +150,7 @@ async fn recover(
         .cells(REDLINE, payer)
         .create_delegated(ACCOUNT_SPACE, identity, seed)
         .await?;
-    er.await_clones(&[account], ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
+    er.await_clones(&[account], ACCOUNT_SPACE as usize).await?;
     let snapshot = write_snapshot(er, payer, value(case, 1), &account).await?;
 
     let submission =

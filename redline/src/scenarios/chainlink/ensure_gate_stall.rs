@@ -10,6 +10,7 @@ use redsuite_core::{
     report::Unit,
     runner::{execute, Pacing, RunConfig, RunOutcome},
     topology::{self, ErOptions},
+    transport::NETWORK_TIMEOUT,
     BaseCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
 };
 use tracing::{debug, warn};
@@ -21,8 +22,6 @@ const PAYER_LAMPORTS: u64 = 2_000_000_000;
 const PREP_PAYER_LAMPORTS: u64 = 4_000_000_000;
 
 const RESUBSCRIBE: Duration = Duration::from_millis(50);
-const STALL_REQUEST_TIMEOUT: Duration = Duration::from_secs(75);
-const CLONE_TIMEOUT: Duration = Duration::from_secs(15);
 
 const MONITORED_GAUGE: &str = "engine_keeper_account_cache_entries";
 const EVICTED_COUNTER: &str = "engine_keeper_account_cache_evictions";
@@ -145,14 +144,14 @@ impl Scenario<ScenarioReport> for EnsureGateStall {
                         // churn cadence high
                         params.chainlink.resubscription_delay = RESUBSCRIBE;
                     }),
-                    request_timeout: Some(STALL_REQUEST_TIMEOUT),
+
                     ..Default::default()
                 },
             )
             .await?;
             let cell_er = private.ctx();
             if cell.prewarm {
-                cell_er.prewarm(&pool, ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
+                cell_er.prewarm(&pool, ACCOUNT_SPACE as usize).await?;
             }
             let sender = cell_er.sender(payer.clone());
 
@@ -199,7 +198,7 @@ impl Scenario<ScenarioReport> for EnsureGateStall {
                 .setting("iterations", cell.iterations)
                 .setting("offered rate /s", profile.rate)
                 .setting("concurrency", profile.concurrency)
-                .setting("request timeout s", STALL_REQUEST_TIMEOUT.as_secs())
+                .setting("request timeout s", NETWORK_TIMEOUT.as_secs())
                 .observe("delivery us", Unit::Micros, cell_outcome.outcome.delivery)
                 .client_side(&cell_outcome.outcome)
                 .metric(
@@ -232,12 +231,7 @@ impl Scenario<ScenarioReport> for EnsureGateStall {
         let healthy = &cells[0];
         let thrash = &cells[1];
 
-        ensure!(
-            healthy.outcome.failed == 0,
-            "failures={:?}; first error={:?}",
-            healthy.outcome.failed,
-            healthy.outcome.first_error
-        );
+        ensure!(healthy.outcome.failed == 0);
         if healthy.outcome.delivery.median >= 1_000_000 {
             warn!(
                 healthy.outcome.delivery.median,
@@ -257,20 +251,10 @@ impl Scenario<ScenarioReport> for EnsureGateStall {
         // fraction of the working set can evict below capacity; only
         // systematic eviction marks a broken knob.
         let healthy_tolerance = (profile.working_set as f64) * 0.15;
-        ensure!(
-            healthy.evictions <= healthy_tolerance,
-            "healthy cell (cap ≥ working set) evicted {} accounts",
-            healthy.evictions
-        );
+        ensure!(healthy.evictions <= healthy_tolerance);
 
-        ensure!(
-            thrash.outcome.delivered > 0,
-            "INVALID: the thrash cell delivered nothing"
-        );
-        ensure!(
-            thrash.evictions > 0.0,
-            "INVALID: no evictions — the cap knob did not engage"
-        );
+        ensure!(thrash.outcome.delivered > 0);
+        ensure!(thrash.evictions > 0.0);
 
         let slowdown = if healthy.outcome.delivery.median > 0 {
             thrash.outcome.delivery.median as f64 / healthy.outcome.delivery.median as f64
@@ -292,7 +276,7 @@ impl Scenario<ScenarioReport> for EnsureGateStall {
             )
             .setting("offered rate /s", profile.rate)
             .setting("concurrency", profile.concurrency)
-            .setting("request timeout s", STALL_REQUEST_TIMEOUT.as_secs())
+            .setting("request timeout s", NETWORK_TIMEOUT.as_secs())
             .metric("thrash p50 slowdown x", Unit::Ratio, slowdown);
         for cell in &cells {
             summary = summary

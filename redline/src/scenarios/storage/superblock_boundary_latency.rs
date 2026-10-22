@@ -25,7 +25,6 @@ use url::Url;
 use crate::{metrics, ACCOUNT_SPACE};
 
 const PREP_PAYER_LAMPORTS: u64 = 4_000_000_000;
-const CLONE_TIMEOUT: Duration = Duration::from_secs(30);
 const LEDGER_FILL_TIMEOUT: Duration = Duration::from_secs(30);
 const NOTIFICATION_POLL: Duration = Duration::from_millis(200);
 const HEALTH_SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
@@ -213,7 +212,7 @@ impl PrivateErScenario<ScenarioReport> for SuperblockBoundaryLatency {
         let pool = Accounts::new(ACCOUNT_SPACE, cell_er.identity())
             .init_batched(base.as_ref(), &prep_payers, profile.accounts, true)
             .await?;
-        cell_er.await_clones(&pool, ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
+        cell_er.await_clones(&pool, ACCOUNT_SPACE as usize).await?;
 
         let payers: Vec<Rc<Keypair>> = prep_payers.into_iter().map(Rc::new).collect();
         let senders: Vec<TxSender> =
@@ -234,12 +233,7 @@ impl PrivateErScenario<ScenarioReport> for SuperblockBoundaryLatency {
             },
         )
         .await?;
-        ensure!(
-            fill.failed == 0,
-            "failures={:?}; first error={:?}",
-            fill.failed,
-            fill.first_error
-        );
+        ensure!(fill.failed == 0);
         crate::await_executed(
             cell_er,
             ledger_txs_at_boot + profile.fill as f64,
@@ -294,12 +288,7 @@ impl PrivateErScenario<ScenarioReport> for SuperblockBoundaryLatency {
         let delta = MetricsDelta::new(before, after);
         let storage_after = host::dir_size_bytes(private.storage_dir())?;
 
-        ensure!(
-            outcome.failed == 0,
-            "failures={:?}; first error={:?}",
-            outcome.failed,
-            outcome.first_error
-        );
+        ensure!(outcome.failed == 0);
 
         let boundary = timings(
             intervals
@@ -315,17 +304,8 @@ impl PrivateErScenario<ScenarioReport> for SuperblockBoundaryLatency {
                 .map(|interval| interval.micros)
                 .collect(),
         );
-        ensure!(
-            boundary.count >= profile.min_boundaries,
-            "observed {} superblock boundaries, fewer than the {} this \
-             profile must capture under one unchanged load",
-            boundary.count,
-            profile.min_boundaries
-        );
-        ensure!(
-            normal.count > 0,
-            "observed no normal block intervals to compare boundaries against"
-        );
+        ensure!(boundary.count >= profile.min_boundaries);
+        ensure!(normal.count > 0);
 
         let sealed = delta.counter(SUPERBLOCKS).unwrap_or_default();
         let finalize_us = delta.histogram_avg(FINALIZE_SUPERBLOCK);

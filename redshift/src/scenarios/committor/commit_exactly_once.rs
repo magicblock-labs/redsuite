@@ -7,7 +7,8 @@ use anyhow::{ensure, Context};
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    check, dlp,
+    api::transaction_meta,
+    dlp,
     netfault::{BaseProxies, RuleHandle, Selector},
     programs::{Action, CellHeader, CellId, IntentBundle, REDLINE, REDSHIFT},
     receipt::{self, CommitReceipt},
@@ -18,15 +19,10 @@ use signature::Signature;
 use signer::Signer;
 use tokio::time;
 
-use super::{
-    hold_nonces, prove_landed, write_and_commit, BASE_CONFIRM_TIMEOUT, BASE_STATE_TIMEOUT,
-    PROXIED_GROUP,
-};
+use super::{hold_nonces, prove_landed, write_and_commit, PROXIED_GROUP};
 use crate::{program::DELEGATION_PROGRAM_ID, ACCOUNT_SPACE, PAYER_LAMPORTS};
 
-const CLONE_TIMEOUT: Duration = Duration::from_secs(30);
 const INTERCEPT_TIMEOUT: Duration = Duration::from_secs(60);
-const RECEIPT_TIMEOUT: Duration = Duration::from_secs(120);
 const BLACKOUT_WINDOW: Duration = Duration::from_secs(5);
 const SETTLE_WINDOW: Duration = Duration::from_secs(3);
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
@@ -84,24 +80,13 @@ async fn settled_receipt(
     phase: &str,
 ) -> Result<CommitReceipt> {
     let receipt = if let Some(intent_id) = restart_intent_id {
-        receipt::fetch_commit_receipt_by_intent(
-            er.api(),
-            &er.identity(),
-            intent_id,
-            RECEIPT_TIMEOUT,
-        )
-        .await?
+        receipt::fetch_commit_receipt_by_intent(er.api(), &er.identity(), intent_id).await?
     } else {
-        receipt::fetch_commit_receipt(er.api(), commit_signature, RECEIPT_TIMEOUT).await?
+        receipt::fetch_commit_receipt(er.api(), commit_signature).await?
     };
-    ensure!(
-        !receipt.failure_is_duplicate_rejection(),
-        "{phase}: a duplicate-rejection receipt does not pass on base bytes \
-         alone, got {:?}",
-        receipt.error_message
-    );
+    ensure!(!receipt.failure_is_duplicate_rejection());
     receipt.check_success(phase)?;
-    receipt.confirm(base.api(), BASE_CONFIRM_TIMEOUT).await?;
+    receipt.confirm(base.api()).await?;
     Ok(receipt)
 }
 
@@ -143,18 +128,10 @@ async fn commit_blackout(
         rule.remove();
     }
     let receipt = settled_receipt(base, er, &commit_signature, restart_intent_id, phase).await?;
-    ensure!(
-        receipt.base_signatures.contains(&landed),
-        "{phase}: the receipt must name the base transaction that landed \
-         ({landed}), got {:?}",
-        receipt.base_signatures
-    );
+    ensure!(receipt.base_signatures.contains(&landed));
     hold_nonces(base, &[account], &[settled], SETTLE_WINDOW).await?;
     let on_base = base.account(&account).await?.context("the delegated pda vanished from base")?;
-    ensure!(
-        on_base.data == snapshot,
-        "{phase}: the base copy must still carry the settled er snapshot"
-    );
+    ensure!(on_base.data == snapshot);
     Ok(())
 }
 
@@ -171,12 +148,17 @@ async fn follow_up_commit(
     let (snapshot, commit_signature) =
         write_and_commit(er, payer, commit_id, write, &account).await?;
     settled_receipt(base, er, &commit_signature, None, phase).await?;
-    check::poll(
-        "the base copy matches the er snapshot after the follow-up commit",
-        BASE_STATE_TIMEOUT,
-        || async { matches!(base.account(&account).await, Ok(Some(acc)) if acc.data == snapshot) },
-    )
-    .await?;
+    base.api()
+        .await_accounts(
+            &[account],
+            "the base copy matches the er snapshot after the follow-up commit",
+            async || {
+                let account = base.account(&account).await?.context("base account missing")?;
+                ensure!(account.data == snapshot);
+                Ok(())
+            },
+        )
+        .await?;
     let nonce = crate::last_commit_id(base, &account).await?;
     ensure!(nonce == (nonce_before + 1));
     Ok(())
@@ -208,33 +190,29 @@ async fn action_blackout(proxies: &BaseProxies, base: &BaseCtx, er: &ErCtx) -> R
         .await?;
     let held = submission.wait(INTERCEPT_TIMEOUT).await?;
     let landed = held.operation.signature()?;
-    let base_tx = base.api().await_transaction(&landed, BASE_CONFIRM_TIMEOUT).await?;
-    ensure!(
-        base_tx.err.is_none(),
-        "the intercepted base action {landed} must succeed on base, got {:?}",
-        base_tx.err
-    );
-    check::poll(
-        "the base cell shows the action once before the fault is applied",
-        BASE_STATE_TIMEOUT,
-        || async { matches!(base_count(base, &cell).await, Ok(1)) },
-    )
-    .await?;
+    let base_tx = base.api().await_transaction(&landed).await?;
+    let meta = transaction_meta(&base_tx)?;
+    ensure!(meta.err == None);
+    base.api()
+        .await_accounts(
+            &[cell],
+            "the base cell shows the action once before the fault is applied",
+            async || {
+                ensure!(base_count(base, &cell).await? == 1);
+                Ok(())
+            },
+        )
+        .await?;
     let confirmations = withhold_confirmations(proxies, &landed);
     held.discard();
     hold_count(base, &cell, 1, BLACKOUT_WINDOW).await?;
     for rule in confirmations {
         rule.remove();
     }
-    let receipt =
-        receipt::fetch_commit_receipt(er.api(), &intent_signature, RECEIPT_TIMEOUT).await?;
+    let receipt = receipt::fetch_commit_receipt(er.api(), &intent_signature).await?;
     if receipt.succeeded() {
-        ensure!(
-            !receipt.base_signatures.is_empty(),
-            "a succeeded action receipt must name the base transaction it \
-             confirmed"
-        );
-        receipt.confirm(base.api(), BASE_CONFIRM_TIMEOUT).await?;
+        ensure!(!receipt.base_signatures.is_empty());
+        receipt.confirm(base.api()).await?;
     }
     hold_count(base, &cell, 1, SETTLE_WINDOW).await?;
     Ok(())
@@ -256,7 +234,7 @@ impl Scenario for CommitExactlyOnce {
             base.cells(REDLINE, &payer).create_delegated(ACCOUNT_SPACE, identity, 0).await?;
         let on_base = base.account(&account).await?.context("pda not on base")?;
         ensure!(on_base.owner == DELEGATION_PROGRAM_ID);
-        er.await_clones(&[account], ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
+        er.await_clones(&[account], ACCOUNT_SPACE as usize).await?;
 
         Ok(Self { base, er, payer, account })
     }

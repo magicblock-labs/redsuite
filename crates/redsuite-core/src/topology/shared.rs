@@ -1,6 +1,6 @@
 use std::{fs, path::Path};
 
-use anyhow::{anyhow, Context};
+use anyhow::{ensure, Context};
 use keypair::Keypair;
 use signer::Signer;
 use tracing::debug;
@@ -62,7 +62,10 @@ async fn base_healthy(state: &StackState) -> bool {
     let Ok(url) = Url::parse(&format!("http://127.0.0.1:{}", state.base_rpc_port)) else {
         return false;
     };
-    let base = Api::new(url);
+    let base = Api::new(
+        url,
+        format!("ws://127.0.0.1:{}", state.base_ws_port).parse().unwrap(),
+    );
     matches!(base.get_health().await.as_deref(), Ok("ok"))
 }
 
@@ -133,6 +136,7 @@ async fn await_base_ready(
 ) -> Result<()> {
     process::await_base_serving(
         &format!("http://127.0.0.1:{}", state.base_rpc_port).parse()?,
+        &format!("ws://127.0.0.1:{}", state.base_ws_port).parse()?,
         base_log,
         state.base_pid,
         // The ER dials the base WS first and exits if it cannot connect.
@@ -150,15 +154,14 @@ async fn await_base_ready(
         required.push(crate::dlp::validator_fees_vault_pda(&reserved.pubkey()));
     }
     for account in required {
-        if base.account(&account).await?.is_none() {
-            return Err(anyhow!(
-                "account {account} missing on the freshly booted base — \
+        ensure!(
+            base.account(&account).await?.is_some(),
+            "required account missing on the freshly booted base — \
                  genesis injection or the clone from {} failed; check \
                  {}",
-                state.clone_url,
-                config::CLONE_URL_ENV
-            ));
-        }
+            state.clone_url,
+            config::CLONE_URL_ENV
+        );
     }
     Ok(())
 }

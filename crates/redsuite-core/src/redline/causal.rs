@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Context};
+use anyhow::{ensure, Context};
 use instruction::Instruction;
 use pubkey::Pubkey;
 use signature::Signature;
@@ -118,17 +118,12 @@ impl PairModel {
             let account = ctx
                 .account(&address)
                 .await?
-                .with_context(|| format!("{scope}: account {label} {address} is missing"))?;
+                .with_context(|| format!("{scope}: account {label} missing"))?;
             let id = CellHeader::try_decode(&account.data)?.value;
             let hash = CellHeader::payload(&account.data)?
                 .first_chunk::<{ layout::HASH_SIZE }>()
                 .with_context(|| format!("{scope}: account {label} has no hash"))?;
-            if hash != &expected_hash || id != expected_id {
-                return Err(anyhow!(
-                    "{scope}: account {label}: expected id {expected_id}, hash {}; got id {id}, hash {}",
-                    hex(&expected_hash), hex(hash)
-                ));
-            }
+            ensure!((hash, id) == (&expected_hash, expected_id));
         }
         Ok(())
     }
