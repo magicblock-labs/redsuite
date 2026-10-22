@@ -1,5 +1,4 @@
 pub mod api;
-pub mod attack;
 pub mod catalog;
 pub mod check;
 pub mod context;
@@ -12,6 +11,7 @@ pub mod monitor;
 pub mod netfault;
 pub mod prep;
 pub mod profile;
+pub mod random;
 pub mod receipt;
 pub mod redline;
 pub mod report;
