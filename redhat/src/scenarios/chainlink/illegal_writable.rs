@@ -47,20 +47,19 @@ impl Scenario for IllegalWritable {
     }
 
     async fn run(self) -> Result<()> {
-        let Self { base, er, sender, pdas } = self;
-        let payer = sender.payer().pubkey();
+        let payer = self.sender.payer().pubkey();
         let cases = [
             Case {
                 name: "direct invocation",
-                instructions: &[MAGIC.commit(payer, None, &pdas, SettlementMode::Commit)],
+                instructions: &[MAGIC.commit(payer, None, &self.pdas, SettlementMode::Commit)],
                 refusals: &[&[PROGRAM_ID_NOT_FOUND]],
             },
             Case {
                 name: "surrounding transfers",
                 instructions: &[
-                    system::transfer(&payer, &pdas[0], 1_000_000),
-                    MAGIC.commit(payer, None, &pdas, SettlementMode::Commit),
-                    system::transfer(&payer, &pdas[0], 2_000_000),
+                    system::transfer(&payer, &self.pdas[0], 1_000_000),
+                    MAGIC.commit(payer, None, &self.pdas, SettlementMode::Commit),
+                    system::transfer(&payer, &self.pdas[0], 2_000_000),
                 ],
                 refusals: &[&[PROGRAM_ID_NOT_FOUND, IMMUTABLE]],
             },
@@ -68,8 +67,8 @@ impl Scenario for IllegalWritable {
                 name: "sibling CPIs",
                 instructions: &[REDHAT
                     .batch()
-                    .invoke(REDSHIFT.settle(payer, &pdas, SettlementMode::Commit))
-                    .invoke(MAGIC.commit(payer, None, &pdas, SettlementMode::Commit))
+                    .invoke(REDSHIFT.settle(payer, &self.pdas, SettlementMode::Commit))
+                    .invoke(MAGIC.commit(payer, None, &self.pdas, SettlementMode::Commit))
                     .build()],
                 refusals: &[&[INVALID_ACCOUNT_OWNER], &[NEEDS_TO_BE_OWNED]],
             },
@@ -79,12 +78,12 @@ impl Scenario for IllegalWritable {
                     REDHAT.batch().build(),
                     REDSHIFT
                         .batch()
-                        .add(&pdas, 1)
-                        .settle(payer, &pdas, SettlementMode::Commit)
+                        .add(&self.pdas, 1)
+                        .settle(payer, &self.pdas, SettlementMode::Commit)
                         .build(),
                     REDHAT
                         .batch()
-                        .invoke(MAGIC.commit(payer, None, &pdas, SettlementMode::Commit))
+                        .invoke(MAGIC.commit(payer, None, &self.pdas, SettlementMode::Commit))
                         .build(),
                 ],
                 refusals: &[&[INVALID_ACCOUNT_OWNER], &[NEEDS_TO_BE_OWNED]],
@@ -96,8 +95,8 @@ impl Scenario for IllegalWritable {
             refusals,
         } in cases
         {
-            let signature = sender.submit(instructions).await?;
-            let tx = er.api().await_transaction(&signature).await?;
+            let signature = self.sender.submit(instructions).await?;
+            let tx = self.er.api().await_transaction(&signature).await?;
             let error = transaction_meta(&tx)?
                 .err
                 .as_ref()
@@ -114,8 +113,9 @@ impl Scenario for IllegalWritable {
 
         // The refused attacks must not have scheduled anything: no base commit
         // moved the PDAs off dlp.
-        for pda in &pdas {
-            let on_base = base.account(pda).await?.context("the cell pda vanished from base")?;
+        for pda in &self.pdas {
+            let on_base =
+                self.base.account(pda).await?.context("the cell pda vanished from base")?;
             ensure!(on_base.owner == dlp::dlp_id());
         }
 

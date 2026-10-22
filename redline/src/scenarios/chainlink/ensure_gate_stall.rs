@@ -13,7 +13,7 @@ use redsuite_core::{
     transport::NETWORK_TIMEOUT,
     BaseCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
 };
-use tracing::{debug, warn};
+use tracing::{debug, instrument, warn};
 
 const ACCOUNT_SPACE: u32 = 2048;
 const READ_WIDTH: usize = 4;
@@ -116,118 +116,134 @@ impl Scenario<ScenarioReport> for EnsureGateStall {
     }
 
     async fn run(self) -> Result<ScenarioReport> {
-        let Self { base, profile, pool, payer } = self;
         let cells_spec = [
             Cell {
                 name: "healthy",
-                cap: profile.healthy_cap,
-                iterations: profile.healthy_iterations,
+                cap: self.profile.healthy_cap,
+                iterations: self.profile.healthy_iterations,
                 prewarm: true,
             },
             Cell {
                 name: "thrash",
-                cap: profile.thrash_cap,
-                iterations: profile.thrash_iterations,
+                cap: self.profile.thrash_cap,
+                iterations: self.profile.thrash_iterations,
                 prewarm: false,
             },
         ];
 
         let mut cells: Vec<CellOutcome> = Vec::new();
         for cell in cells_spec {
-            let private = topology::private_er(
-                &base,
-                ErOptions {
-                    label: format!("s6-{}", cell.name),
-                    settings: Box::new(move |params| {
-                        params.engine.accountsdb.lru_capacity = cell.cap;
-                        // campaign parity: fast resubscription keeps the
-                        // churn cadence high
-                        params.chainlink.resubscription_delay = RESUBSCRIBE;
-                    }),
-
-                    ..Default::default()
-                },
-            )
-            .await?;
-            let cell_er = private.ctx();
-            if cell.prewarm {
-                cell_er.prewarm(&pool, ACCOUNT_SPACE as usize).await?;
-            }
-            let sender = cell_er.sender(payer.clone());
-
-            let before = cell_er.scrape_metrics().await?;
-            let request = |id: u64| {
-                let accounts = sample_accounts(&pool, id, READ_WIDTH);
-                let ix = REDLINE.inspect(&accounts);
-                let sender = sender.clone();
-                sender.staged([ix])
-            };
-            let outcome = execute(
-                RunConfig {
-                    iterations: cell.iterations,
-                    rate: Pacing::PerSecond(profile.rate),
-                    concurrency: profile.concurrency,
-                },
-                request,
-            )
-            .await?;
-            let after = cell_er.scrape_metrics().await?;
-            let delta = MetricsDelta::new(before, after);
-
-            let cell_outcome = CellOutcome {
-                name: cell.name,
-                outcome,
-                ensure_avg_s: delta.histogram_avg(ENSURE_HISTOGRAM),
-                // recorded for context only: the gauge refreshes on the
-                // 60 s subscription reconciler, so short windows read stale
-                monitored_end: delta.gauge(MONITORED_GAUGE).unwrap_or(0.0),
-                evictions: delta.counter(EVICTED_COUNTER).unwrap_or(0.0),
-            };
-            debug!(
-                cell_outcome.name,
-                cell_outcome.outcome.failed, cell_outcome.evictions, "ensure-gate cell finished",
-            );
-
-            let cell_report = ScenarioReport::ok()
-                .setting("profile", profile.name)
-                .setting("cap", cell.cap)
-                .setting("working set", profile.working_set)
-                .setting("read width", READ_WIDTH)
-                .setting("account space", ACCOUNT_SPACE)
-                .setting("prewarmed", cell.prewarm)
-                .setting("iterations", cell.iterations)
-                .setting("offered rate /s", profile.rate)
-                .setting("concurrency", profile.concurrency)
-                .setting("request timeout s", NETWORK_TIMEOUT.as_secs())
-                .observe("delivery us", Unit::Micros, cell_outcome.outcome.delivery)
-                .client_side(&cell_outcome.outcome)
-                .metric(
-                    "achieved tps",
-                    Unit::Tps,
-                    cell_outcome.outcome.achieved_rps(),
-                )
-                .metric(
-                    "delivered",
-                    Unit::Count,
-                    cell_outcome.outcome.delivered as f64,
-                )
-                .metric("failed", Unit::Count, cell_outcome.outcome.failed as f64)
-                .metric_if(
-                    "validator ensure avg s",
-                    Unit::Seconds,
-                    cell_outcome.ensure_avg_s,
-                )
-                .metric(
-                    "monitored accounts (end)",
-                    Unit::Count,
-                    cell_outcome.monitored_end,
-                )
-                .metric("evictions in window", Unit::Count, cell_outcome.evictions);
-            base.report_cell(cell.name, &cell_report)?;
-            cells.push(cell_outcome);
-            drop(private);
+            cells.push(self.measure_cell(cell).await?);
         }
 
+        self.check_cells(&cells)?;
+        Ok(self.summarize(&cells))
+    }
+}
+
+impl EnsureGateStall {
+    #[instrument(skip_all, err, fields(cell = %cell.name))]
+    async fn measure_cell(&self, cell: Cell) -> Result<CellOutcome> {
+        let private = topology::private_er(
+            &self.base,
+            ErOptions {
+                label: format!("s6-{}", cell.name),
+                settings: Box::new(move |params| {
+                    params.engine.accountsdb.lru_capacity = cell.cap;
+                    // campaign parity: fast resubscription keeps the
+                    // churn cadence high
+                    params.chainlink.resubscription_delay = RESUBSCRIBE;
+                }),
+
+                ..Default::default()
+            },
+        )
+        .await?;
+        let cell_er = private.ctx();
+        if cell.prewarm {
+            cell_er.prewarm(&self.pool, ACCOUNT_SPACE as usize).await?;
+        }
+        let sender = cell_er.sender(self.payer.clone());
+
+        let before = cell_er.scrape_metrics().await?;
+        let request = |id: u64| {
+            let accounts = sample_accounts(&self.pool, id, READ_WIDTH);
+            let ix = REDLINE.inspect(&accounts);
+            let sender = sender.clone();
+            sender.staged([ix])
+        };
+        let outcome = execute(
+            RunConfig {
+                iterations: cell.iterations,
+                rate: Pacing::PerSecond(self.profile.rate),
+                concurrency: self.profile.concurrency,
+            },
+            request,
+        )
+        .await?;
+        let after = cell_er.scrape_metrics().await?;
+        let delta = MetricsDelta::new(before, after);
+
+        let cell_outcome = CellOutcome {
+            name: cell.name,
+            outcome,
+            ensure_avg_s: delta.histogram_avg(ENSURE_HISTOGRAM),
+            // recorded for context only: the gauge refreshes on the
+            // 60 s subscription reconciler, so short windows read stale
+            monitored_end: delta.gauge(MONITORED_GAUGE).unwrap_or(0.0),
+            evictions: delta.counter(EVICTED_COUNTER).unwrap_or(0.0),
+        };
+        debug!(
+            cell_outcome.name,
+            cell_outcome.outcome.failed, cell_outcome.evictions, "ensure-gate cell finished",
+        );
+
+        self.report_cell(&cell, &cell_outcome)?;
+        drop(private);
+        Ok(cell_outcome)
+    }
+
+    fn report_cell(&self, cell: &Cell, cell_outcome: &CellOutcome) -> Result<()> {
+        let cell_report = ScenarioReport::ok()
+            .setting("profile", self.profile.name)
+            .setting("cap", cell.cap)
+            .setting("working set", self.profile.working_set)
+            .setting("read width", READ_WIDTH)
+            .setting("account space", ACCOUNT_SPACE)
+            .setting("prewarmed", cell.prewarm)
+            .setting("iterations", cell.iterations)
+            .setting("offered rate /s", self.profile.rate)
+            .setting("concurrency", self.profile.concurrency)
+            .setting("request timeout s", NETWORK_TIMEOUT.as_secs())
+            .observe("delivery us", Unit::Micros, cell_outcome.outcome.delivery)
+            .client_side(&cell_outcome.outcome)
+            .metric(
+                "achieved tps",
+                Unit::Tps,
+                cell_outcome.outcome.achieved_rps(),
+            )
+            .metric(
+                "delivered",
+                Unit::Count,
+                cell_outcome.outcome.delivered as f64,
+            )
+            .metric("failed", Unit::Count, cell_outcome.outcome.failed as f64)
+            .metric_if(
+                "validator ensure avg s",
+                Unit::Seconds,
+                cell_outcome.ensure_avg_s,
+            )
+            .metric(
+                "monitored accounts (end)",
+                Unit::Count,
+                cell_outcome.monitored_end,
+            )
+            .metric("evictions in window", Unit::Count, cell_outcome.evictions);
+        self.base.report_cell(cell.name, &cell_report)
+    }
+
+    #[instrument(skip_all, err)]
+    fn check_cells(&self, cells: &[CellOutcome]) -> Result<()> {
         let healthy = &cells[0];
         let thrash = &cells[1];
 
@@ -250,12 +266,18 @@ impl Scenario<ScenarioReport> for EnsureGateStall {
         // The engine's account cache is a per-bucket sampled LRU, so a
         // fraction of the working set can evict below capacity; only
         // systematic eviction marks a broken knob.
-        let healthy_tolerance = (profile.working_set as f64) * 0.15;
+        let healthy_tolerance = (self.profile.working_set as f64) * 0.15;
         ensure!(healthy.evictions <= healthy_tolerance);
 
         ensure!(thrash.outcome.delivered > 0);
         ensure!(thrash.evictions > 0.0);
 
+        Ok(())
+    }
+
+    fn summarize(&self, cells: &[CellOutcome]) -> ScenarioReport {
+        let healthy = &cells[0];
+        let thrash = &cells[1];
         let slowdown = if healthy.outcome.delivery.median > 0 {
             thrash.outcome.delivery.median as f64 / healthy.outcome.delivery.median as f64
         } else {
@@ -263,22 +285,22 @@ impl Scenario<ScenarioReport> for EnsureGateStall {
         };
 
         let mut summary = ScenarioReport::ok()
-            .setting("profile", profile.name)
-            .setting("working set", profile.working_set)
+            .setting("profile", self.profile.name)
+            .setting("working set", self.profile.working_set)
             .setting("read width", READ_WIDTH)
             .setting("account space", ACCOUNT_SPACE)
             .setting(
                 "caps",
                 format!(
                     "healthy {} / thrash {}",
-                    profile.healthy_cap, profile.thrash_cap
+                    self.profile.healthy_cap, self.profile.thrash_cap
                 ),
             )
-            .setting("offered rate /s", profile.rate)
-            .setting("concurrency", profile.concurrency)
+            .setting("offered rate /s", self.profile.rate)
+            .setting("concurrency", self.profile.concurrency)
             .setting("request timeout s", NETWORK_TIMEOUT.as_secs())
             .metric("thrash p50 slowdown x", Unit::Ratio, slowdown);
-        for cell in &cells {
+        for cell in cells {
             summary = summary
                 .metric(
                     format!("{} achieved tps", cell.name),
@@ -317,6 +339,6 @@ impl Scenario<ScenarioReport> for EnsureGateStall {
                     cell.ensure_avg_s,
                 );
         }
-        Ok(summary)
+        summary
     }
 }

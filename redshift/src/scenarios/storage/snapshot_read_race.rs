@@ -12,7 +12,7 @@ use redsuite_core::{
     cells::OwnedCell,
     programs::REDSHIFT,
     topology::{self, ErOptions, PrivateEr, RestartConfig},
-    Api, BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result,
+    Api, BaseCtx, ChainCtx, PrivateErScenario, Result,
 };
 use signer::Signer;
 use tokio::{task::JoinHandle, time};
@@ -80,31 +80,6 @@ impl Readers {
     }
 }
 
-async fn churn(
-    er: &ErCtx,
-    payer: &Keypair,
-    accounts: &[OwnedCell],
-    sizes: &mut [u32],
-    duration: Duration,
-    phase: &str,
-) -> Result<()> {
-    let started = Instant::now();
-    let mut grows = 0usize;
-    while started.elapsed() < duration {
-        let index = grows % accounts.len();
-        let bytes = GROW_BYTES + ((grows / accounts.len()) % GROW_VARIANTS) as u32;
-        let space = sizes[index] + bytes;
-        let resize = REDSHIFT.resize(payer.pubkey(), accounts[index].address, space);
-        er.submit_and_confirm(payer, &[resize]).await.with_context(|| {
-            format!("resizing account {index} {phase}; completed grows={grows}")
-        })?;
-        sizes[index] = space;
-        grows += 1;
-        time::sleep(GROW_INTERVAL).await;
-    }
-    Ok(())
-}
-
 pub struct SnapshotReadRace {
     base: Rc<BaseCtx>,
     private: PrivateEr,
@@ -129,24 +104,22 @@ impl PrivateErScenario for SnapshotReadRace {
         Ok(Self { base, private, payer })
     }
 
-    async fn run(self) -> Result<()> {
-        let Self { base, mut private, payer } = self;
+    async fn run(mut self) -> Result<()> {
         let mut sizes = vec![LARGE_ACCOUNT_SPACE; ACCOUNTS];
-        let er = private.ctx();
+        let er = self.private.ctx();
         er.await_program_clone(&redshift_interface::id()).await?;
-        let accounts = base
-            .cells(REDSHIFT, &payer)
+        let accounts = self
+            .base
+            .cells(REDSHIFT, &self.payer)
             .create_owned_sized(er.identity(), ACCOUNTS, LARGE_ACCOUNT_SPACE)
             .await?;
         let addresses: Vec<_> = accounts.iter().map(|account| account.address).collect();
         er.await_clones(&addresses, LARGE_ACCOUNT_SPACE as usize).await?;
-        let sponsor = base.funded_payer(crate::PAYER_LAMPORTS).await?;
-        base.delegate_payer(&sponsor, &payer, er.identity()).await?;
+        let sponsor = self.base.funded_payer(crate::PAYER_LAMPORTS).await?;
+        self.base.delegate_payer(&sponsor, &self.payer, er.identity()).await?;
 
         let readers = Readers::start(er.api().clone(), addresses.clone());
-        churn(
-            er,
-            &payer,
+        self.churn(
             &accounts,
             &mut sizes,
             CHURN_BEFORE_RESTART,
@@ -155,20 +128,12 @@ impl PrivateErScenario for SnapshotReadRace {
         .await?;
         readers.stop("before restart").await?;
 
-        let timing = private.restart(RestartConfig::default()).await?;
+        let timing = self.private.restart(RestartConfig::default()).await?;
         ensure!(timing.exit_code == Some(0));
 
-        let er = private.ctx();
+        let er = self.private.ctx();
         let readers = Readers::start(er.api().clone(), addresses.clone());
-        churn(
-            er,
-            &payer,
-            &accounts,
-            &mut sizes,
-            CHURN_AFTER_RESTART,
-            "after restart",
-        )
-        .await?;
+        self.churn(&accounts, &mut sizes, CHURN_AFTER_RESTART, "after restart").await?;
         readers.stop("after restart").await?;
 
         let observed: Vec<u32> = er
@@ -178,7 +143,37 @@ impl PrivateErScenario for SnapshotReadRace {
             .map(|account| account.map_or(0, |a| a.data.len() as u32))
             .collect();
         ensure!(observed == sizes);
-        private.finish().await?;
+        self.private.finish().await?;
+        Ok(())
+    }
+}
+
+impl SnapshotReadRace {
+    async fn churn(
+        &self,
+        accounts: &[OwnedCell],
+        sizes: &mut [u32],
+        duration: Duration,
+        phase: &str,
+    ) -> Result<()> {
+        let started = Instant::now();
+        let mut grows = 0usize;
+        while started.elapsed() < duration {
+            let index = grows % accounts.len();
+            let bytes = GROW_BYTES + ((grows / accounts.len()) % GROW_VARIANTS) as u32;
+            let space = sizes[index] + bytes;
+            let resize = REDSHIFT.resize(self.payer.pubkey(), accounts[index].address, space);
+            self.private
+                .ctx()
+                .submit_and_confirm(&self.payer, &[resize])
+                .await
+                .with_context(|| {
+                    format!("resizing account {index} {phase}; completed grows={grows}")
+                })?;
+            sizes[index] = space;
+            grows += 1;
+            time::sleep(GROW_INTERVAL).await;
+        }
         Ok(())
     }
 }

@@ -119,13 +119,12 @@ impl Activation<'_> {
         Ok(trigger)
     }
     async fn race_discovery(&self, trigger: &Pubkey, before: CellState) -> Result<Discovery> {
-        let Self { base, er, funder, er_payer, .. } = *self;
         let started = Instant::now();
-        let sender = er.sender(er_payer.clone());
+        let sender = self.er.sender(self.er_payer.clone());
         let trigger = *trigger;
         let mut reads = Vec::with_capacity(CONCURRENT_READS);
         for _ in 0..CONCURRENT_READS {
-            let api = er.api().clone();
+            let api = self.er.api().clone();
             reads.push(task::spawn_local(
                 async move { api.get_account(&trigger).await },
             ));
@@ -139,7 +138,11 @@ impl Activation<'_> {
                     .await
             }));
         }
-        base.submit_and_confirm(funder, &[system::transfer(&funder.pubkey(), &trigger, 1)])
+        self.base
+            .submit_and_confirm(
+                self.funder,
+                &[system::transfer(&self.funder.pubkey(), &trigger, 1)],
+            )
             .await?;
         while started.elapsed() < HOLD_WINDOW {
             ensure!(self.state().await? == before);
@@ -149,27 +152,30 @@ impl Activation<'_> {
     }
 
     async fn run(&self, fail: bool) -> Result<Pubkey> {
-        let Self { base, proxies, er, .. } = *self;
         let before = self.state().await?;
-        let dependency = base.funded_payer(DEPENDENCY_LAMPORTS).await?.pubkey();
+        let dependency = self.base.funded_payer(DEPENDENCY_LAMPORTS).await?.pubkey();
         let selector = Selector::methods(&["getMultipleAccounts", "getAccountInfo"])
             .http()
             .response()
             .account(&dependency);
-        let stall = proxies.stall(selector.clone());
+        let stall = self.proxies.stall(selector.clone());
         let trigger = self.delegate_trigger(&dependency, fail).await?;
-        proxies.await_held(selector, INTERCEPT_TIMEOUT).await?;
+        self.proxies.await_held(selector, INTERCEPT_TIMEOUT).await?;
         let discovery = self.race_discovery(&trigger.pubkey(), before).await?;
         stall.remove();
         discovery.settle().await;
         if fail {
-            base.api()
+            self.base
+                .api()
                 .await_accounts(
                     &[trigger.pubkey()],
                     "the failed activation completes the rescue undelegation on base",
                     async || {
-                        let owner =
-                            base.account(&trigger.pubkey()).await?.map(|account| account.owner);
+                        let owner = self
+                            .base
+                            .account(&trigger.pubkey())
+                            .await?
+                            .map(|account| account.owner);
                         ensure!(owner == Some(system::system_id()));
                         Ok(())
                     },
@@ -186,7 +192,7 @@ impl Activation<'_> {
                 "the released activation applies the cell action exactly once",
             )
             .await?;
-            ensure!(er.account(&trigger.pubkey()).await?.is_some());
+            ensure!(self.er.account(&trigger.pubkey()).await?.is_some());
         }
         Ok(trigger.pubkey())
     }
@@ -224,20 +230,21 @@ impl PrivateErScenario for ActivationSingleShot {
         Ok(Self { base, proxies, private })
     }
 
-    async fn run(self) -> Result<()> {
-        let Self { base, proxies, mut private } = self;
-        let er = private.ctx();
-        let funder = base.funded_payer(PAYER_LAMPORTS).await?;
-        let actor = base.funded_payer(PAYER_LAMPORTS).await?;
-        let er_payer = Rc::new(base.delegated_payer(&funder, er.identity(), PAYER_LAMPORTS).await?);
+    async fn run(mut self) -> Result<()> {
+        let er = self.private.ctx();
+        let funder = self.base.funded_payer(PAYER_LAMPORTS).await?;
+        let actor = self.base.funded_payer(PAYER_LAMPORTS).await?;
+        let er_payer =
+            Rc::new(self.base.delegated_payer(&funder, er.identity(), PAYER_LAMPORTS).await?);
 
-        let cell = base
+        let cell = self
+            .base
             .cells(REDSHIFT, &actor)
             .create_primary(er.identity(), prep::COMMIT_FREQUENCY_MS)
             .await?;
         let activation = Activation {
-            base: &base,
-            proxies: &proxies,
+            base: &self.base,
+            proxies: &self.proxies,
             er,
             funder: &funder,
             er_payer: &er_payer,
@@ -253,19 +260,21 @@ impl PrivateErScenario for ActivationSingleShot {
         };
         activation.hold_steady(applied, STEADY_WINDOW).await?;
 
-        base.submit_and_confirm(&funder, &[system::transfer(&funder.pubkey(), &trigger, 1)])
+        self.base
+            .submit_and_confirm(&funder, &[system::transfer(&funder.pubkey(), &trigger, 1)])
             .await?;
-        proxies.close_connections();
-        base.submit_and_confirm(&funder, &[system::transfer(&funder.pubkey(), &trigger, 1)])
+        self.proxies.close_connections();
+        self.base
+            .submit_and_confirm(&funder, &[system::transfer(&funder.pubkey(), &trigger, 1)])
             .await?;
         activation.hold_steady(applied, STEADY_WINDOW).await?;
 
-        let restart = private.restart(RestartConfig::default()).await?;
+        let restart = self.private.restart(RestartConfig::default()).await?;
         ensure!(restart.exit_code == Some(0));
-        let er = private.ctx();
+        let er = self.private.ctx();
         let activation = Activation {
-            base: &base,
-            proxies: &proxies,
+            base: &self.base,
+            proxies: &self.proxies,
             er,
             funder: &funder,
             er_payer: &er_payer,
@@ -277,15 +286,16 @@ impl PrivateErScenario for ActivationSingleShot {
                 "the restarted er serves the cell with the action applied",
             )
             .await?;
-        base.submit_and_confirm(&funder, &[system::transfer(&funder.pubkey(), &trigger, 1)])
+        self.base
+            .submit_and_confirm(&funder, &[system::transfer(&funder.pubkey(), &trigger, 1)])
             .await?;
         activation.hold_steady(applied, RECOVERY_WINDOW).await?;
 
         activation.run(true).await?;
         activation.hold_steady(applied, STEADY_WINDOW).await?;
 
-        proxies.finish()?;
-        private.finish().await?;
+        self.proxies.finish()?;
+        self.private.finish().await?;
         Ok(())
     }
 }

@@ -42,7 +42,7 @@ pub const ENV_VARS: &[(&str, &str)] = &[
     ),
     (
         "RUST_LOG",
-        "log filter for RedSuite and launched validators (default info; debug includes phase and workload progress)",
+        "log filter for RedSuite and launched validators (default info; debug includes workload progress)",
     ),
 ];
 

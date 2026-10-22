@@ -14,7 +14,7 @@ use solana_instruction_error::InstructionError;
 
 use redsuite_core::{
     api::transaction_logs,
-    check, dlp, phase,
+    check, dlp,
     programs::{Redshift, SettlementMode, MAGIC, REDSHIFT},
     receipt,
     rpc_types::response::TransactionError,
@@ -24,6 +24,7 @@ use redsuite_core::{
 };
 use sdk::{consts::EPHEMERAL_VAULT_ID, ephemeral_accounts::rent};
 use signer::Signer;
+use tracing::instrument;
 use transaction::Transaction;
 
 use crate::PAYER_LAMPORTS;
@@ -223,8 +224,8 @@ fn serialized(
     None
 }
 
-struct Workload<'a> {
-    er: &'a ErCtx,
+struct Workload {
+    er: ErCtx,
     signers: Vec<Keypair>,
     keys: [Pubkey; 5],
     expected: Vec<Account>,
@@ -232,7 +233,7 @@ struct Workload<'a> {
     failures: Vec<String>,
 }
 
-impl Workload<'_> {
+impl Workload {
     async fn step(&mut self, label: &str, action: &Action) -> Result<()> {
         self.run(label, vec![action.instruction(&self.keys)], Ok(action)).await
     }
@@ -255,11 +256,10 @@ impl Workload<'_> {
         instructions: Vec<Instruction>,
         effect: result::Result<&Action, InstructionError>,
     ) -> Result<()> {
-        ensure!(state(self.er, &self.keys).await? == self.expected);
+        ensure!(state(&self.er, &self.keys).await? == self.expected);
         let error_index = instructions.len() - 1;
-        let record = Record::submit(self.er, self.prepare(instructions).await?)
-            .await
-            .with_context(|| label.to_owned())?;
+        let tx = self.prepare(instructions).await?;
+        let record = Record::submit(&self.er, tx).await.with_context(|| label.to_owned())?;
         let before = self.expected.clone();
         let mut after = before.clone();
         let expected_error = match effect {
@@ -271,11 +271,171 @@ impl Workload<'_> {
         };
         after[PAYER].lamports =
             after[PAYER].lamports.checked_sub(record.info.fee).context("payer exhausted")?;
-        ensure!(state(self.er, &self.keys).await? == after);
+        ensure!(state(&self.er, &self.keys).await? == after);
         if let Err(error) = record.check(&self.keys, &before, &after, expected_error) {
             self.failures.push(format!("{label}: {error:#}"));
         }
         self.expected = after;
+        Ok(())
+    }
+
+    #[instrument(skip_all, err, fields(case = label))]
+    async fn check_operation(
+        &mut self,
+        label: &str,
+        operation: MagicBlockInstruction,
+    ) -> Result<()> {
+        let keys = self.keys;
+        let foreign = topology::redshift_loader_v3_target().0;
+
+        let mut action = Action::new(operation);
+        let ix = action.instruction(&keys);
+        for (case, index, value, reason) in [
+            (
+                "unsigned sponsor",
+                0,
+                None,
+                InstructionError::MissingRequiredSignature,
+            ),
+            (
+                "substituted vault",
+                2,
+                Some(keys[SUBSTITUTE]),
+                InstructionError::InvalidAccountData,
+            ),
+        ] {
+            let mut invalid = ix.clone();
+            if let Some(key) = value {
+                invalid.accounts[index].pubkey = key;
+            } else {
+                invalid.accounts[index].is_signer = false;
+            }
+            self.run(&format!("{label}: {case}"), vec![invalid], Err(reason)).await?;
+        }
+        let mut direct = action.clone();
+        direct.caller = magic_api::id();
+        self.run(
+            &format!("{label}: top-level"),
+            vec![direct.instruction(&keys)],
+            Err(InstructionError::IncorrectProgramId),
+        )
+        .await?;
+        if matches!(action.operation, Create { .. }) {
+            let mut unsigned = ix.clone();
+            unsigned.accounts[1].is_signer = false;
+            self.run(
+                "create: unsigned address",
+                vec![unsigned],
+                Err(InstructionError::MissingRequiredSignature),
+            )
+            .await?;
+            let mut occupied = ix.clone();
+            occupied.accounts[1].pubkey = keys[SUBSTITUTE];
+            self.run(
+                "create: funded address",
+                vec![occupied],
+                Err(InstructionError::InvalidAccountData),
+            )
+            .await?;
+        } else {
+            let mut outsider = action.clone();
+            outsider.caller = foreign;
+            self.run(
+                &format!("{label}: foreign caller"),
+                vec![outsider.instruction(&keys)],
+                Err(InstructionError::InvalidAccountOwner),
+            )
+            .await?;
+        }
+        self.run(
+            &format!("{label}: rollback"),
+            vec![ix, direct.instruction(&keys)],
+            Err(InstructionError::IncorrectProgramId),
+        )
+        .await?;
+        action.fill = if matches!(action.operation, Create { .. }) { 0xa5 } else { 0 };
+        self.step(label, &action).await?;
+        if matches!(action.operation, Create { .. }) {
+            self.run(
+                "create: occupied ephemeral",
+                vec![action.instruction(&keys)],
+                Err(InstructionError::InvalidAccountData),
+            )
+            .await?;
+        }
+        if matches!(action.operation, Resize { .. }) {
+            for (size, fill) in [(16, 0), (64, 0), (0, 0), (24, 0x3c)] {
+                let mut resize = Action::new(Resize { new_data_len: size });
+                resize.fill = fill;
+                self.step(&format!("resize: {size}"), &resize).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    #[instrument(skip_all, err)]
+    async fn check_recreation(&mut self, caller: Pubkey) -> Result<()> {
+        let keys = self.keys;
+        let foreign = topology::redshift_loader_v3_target().0;
+
+        let mut create = Action::new(Create { data_len: 48 });
+        create.caller = caller;
+        self.step("recreate", &create).await?;
+        let mut close = Action::new(Close);
+        close.caller = if caller == foreign { redshift_interface::id() } else { foreign };
+        self.run(
+            "recreate: previous/foreign owner",
+            vec![close.instruction(&keys)],
+            Err(InstructionError::InvalidAccountOwner),
+        )
+        .await?;
+        close.caller = caller;
+        self.step("recreate: close", &close).await?;
+
+        Ok(())
+    }
+
+    #[instrument(skip_all, err)]
+    async fn check_conflicts(&mut self) -> Result<()> {
+        let keys = self.keys;
+
+        let mut create = Action::new(Create { data_len: 40 });
+        create.fill = 0x5a;
+        self.step("conflicts: initialize", &create).await?;
+        let mut prepared = Vec::new();
+        for operation in [
+            Resize { new_data_len: 80 },
+            Resize { new_data_len: 8 },
+            Close,
+            Close,
+            Create { data_len: 56 },
+            Create { data_len: 112 },
+        ] {
+            let action = Action::new(operation);
+            let tx = self.prepare(vec![action.instruction(&keys)]).await?;
+            prepared.push((action, tx));
+        }
+        let records = try_join_all(prepared.into_iter().map(|(action, tx)| {
+            Record::submit(&self.er, tx).map_ok(move |record| (action, record))
+        }))
+        .await?;
+        let after = state(&self.er, &keys).await?;
+        let order = serialized(&keys, &self.expected, &after, &records, 0)
+            .context("conflicts have no valid serialized outcome")?;
+        for index in order {
+            let (action, record) = &records[index];
+            if record.info.err.is_none() {
+                action.apply(&mut self.expected);
+            }
+            self.expected[PAYER].lamports -= record.info.fee;
+        }
+        ensure!(self.expected == after);
+        if after[TARGET].owner != system::system_id() {
+            let close = Action::new(Close);
+            self.step("conflicts: close", &close).await?;
+        }
+
         Ok(())
     }
 }
@@ -291,217 +451,92 @@ impl Scenario for EphemeralAccounts {
     }
 
     async fn run(self) -> Result<()> {
-        let Self { base, er, funder, mut signers } = self;
-        // A delegated (mapped-signing) fee payer may commit ITSELF directly
-        // via the magic program: it is the transaction signer and is delegated
-        // to this ER, so the pipeline maps the signature and schedules the
-        // commit. The vault is required because the payer is delegated.
-        phase("mapped-signing self-commit", async {
-            let payer = &signers[2];
-            let vault = dlp::magic_fee_vault_pda(&er.identity());
-            ensure!(er.account(&vault).await?.is_some());
-            let signature = er
-                .submit_and_confirm(
-                    payer,
-                    &[MAGIC.commit(
-                        payer.pubkey(),
-                        Some(vault),
-                        &[payer.pubkey()],
-                        SettlementMode::Commit,
-                    )],
-                )
-                .await?;
-            let commit_receipt = receipt::fetch_commit_receipt(er.api(), &signature).await?;
-            commit_receipt.check_success("mapped-signing self-commit")?;
-            ensure!(commit_receipt.included.contains(&payer.pubkey()));
-            commit_receipt.confirm(base.api()).await
-        })
-        .await?;
+        self.check_self_commit().await?;
+        self.check_readonly_payer().await?;
 
-        phase("readonly payer", async {
-            let accounts = [funder.pubkey(), signers[0].pubkey()];
-            let before = er.accounts(&accounts).await?;
-            let attempt = er
-                .submit_and_confirm(&funder, &[system::transfer(&accounts[0], &accounts[1], 1)])
-                .await;
-            let error = check::expect_error(attempt, "non-delegated payer cannot spend")?;
-            let error = format!("{error:#}");
-            ensure!(error.contains("InvalidAccountForFee") || error.contains("Immutable"));
-            ensure!(er.accounts(&accounts).await? == before);
-            Ok(())
-        })
-        .await?;
-
-        let target = Keypair::new();
-        let keys = [
-            signers[0].pubkey(),
-            signers[1].pubkey(),
-            target.pubkey(),
-            EPHEMERAL_VAULT_ID,
-            signers[2].pubkey(),
-        ];
-        signers.push(target);
-        let foreign = topology::redshift_loader_v3_target().0;
-        let mut workload = Workload {
-            er: &er,
-            signers,
-            keys,
-            expected: state(&er, &keys).await?,
-            nonce: 0,
-            failures: Vec::new(),
-        };
+        let mut workload = self.into_workload().await?;
         ensure!(workload.expected[TARGET] == Account::default());
         for (label, operation) in [
             ("create", Create { data_len: 32 }),
             ("resize", Resize { new_data_len: 96 }),
             ("close", Close),
         ] {
-            let mut action = Action::new(operation);
-            let ix = action.instruction(&keys);
-            for (case, index, value, reason) in [
-                (
-                    "unsigned sponsor",
-                    0,
-                    None,
-                    InstructionError::MissingRequiredSignature,
-                ),
-                (
-                    "substituted vault",
-                    2,
-                    Some(keys[SUBSTITUTE]),
-                    InstructionError::InvalidAccountData,
-                ),
-            ] {
-                let mut invalid = ix.clone();
-                if let Some(key) = value {
-                    invalid.accounts[index].pubkey = key;
-                } else {
-                    invalid.accounts[index].is_signer = false;
-                }
-                workload.run(&format!("{label}: {case}"), vec![invalid], Err(reason)).await?;
-            }
-            let mut direct = action.clone();
-            direct.caller = magic_api::id();
-            workload
-                .run(
-                    &format!("{label}: top-level"),
-                    vec![direct.instruction(&keys)],
-                    Err(InstructionError::IncorrectProgramId),
-                )
-                .await?;
-            if matches!(action.operation, Create { .. }) {
-                let mut unsigned = ix.clone();
-                unsigned.accounts[1].is_signer = false;
-                workload
-                    .run(
-                        "create: unsigned address",
-                        vec![unsigned],
-                        Err(InstructionError::MissingRequiredSignature),
-                    )
-                    .await?;
-                let mut occupied = ix.clone();
-                occupied.accounts[1].pubkey = keys[SUBSTITUTE];
-                workload
-                    .run(
-                        "create: funded address",
-                        vec![occupied],
-                        Err(InstructionError::InvalidAccountData),
-                    )
-                    .await?;
-            } else {
-                let mut outsider = action.clone();
-                outsider.caller = foreign;
-                workload
-                    .run(
-                        &format!("{label}: foreign caller"),
-                        vec![outsider.instruction(&keys)],
-                        Err(InstructionError::InvalidAccountOwner),
-                    )
-                    .await?;
-            }
-            workload
-                .run(
-                    &format!("{label}: rollback"),
-                    vec![ix, direct.instruction(&keys)],
-                    Err(InstructionError::IncorrectProgramId),
-                )
-                .await?;
-            action.fill = if matches!(action.operation, Create { .. }) { 0xa5 } else { 0 };
-            workload.step(label, &action).await?;
-            if matches!(action.operation, Create { .. }) {
-                workload
-                    .run(
-                        "create: occupied ephemeral",
-                        vec![action.instruction(&keys)],
-                        Err(InstructionError::InvalidAccountData),
-                    )
-                    .await?;
-            }
-            if matches!(action.operation, Resize { .. }) {
-                for (size, fill) in [(16, 0), (64, 0), (0, 0), (24, 0x3c)] {
-                    let mut resize = Action::new(Resize { new_data_len: size });
-                    resize.fill = fill;
-                    workload.step(&format!("resize: {size}"), &resize).await?;
-                }
-            }
+            workload.check_operation(label, operation).await?;
         }
+        let foreign = topology::redshift_loader_v3_target().0;
         for caller in [foreign, redshift_interface::id()] {
-            let mut create = Action::new(Create { data_len: 48 });
-            create.caller = caller;
-            workload.step("recreate", &create).await?;
-            let mut close = Action::new(Close);
-            close.caller = if caller == foreign { redshift_interface::id() } else { foreign };
-            workload
-                .run(
-                    "recreate: previous/foreign owner",
-                    vec![close.instruction(&keys)],
-                    Err(InstructionError::InvalidAccountOwner),
-                )
-                .await?;
-            close.caller = caller;
-            workload.step("recreate: close", &close).await?;
+            workload.check_recreation(caller).await?;
         }
         for _ in 0..3 {
-            let mut create = Action::new(Create { data_len: 40 });
-            create.fill = 0x5a;
-            workload.step("conflicts: initialize", &create).await?;
-            let mut prepared = Vec::new();
-            for operation in [
-                Resize { new_data_len: 80 },
-                Resize { new_data_len: 8 },
-                Close,
-                Close,
-                Create { data_len: 56 },
-                Create { data_len: 112 },
-            ] {
-                let action = Action::new(operation);
-                let tx = workload.prepare(vec![action.instruction(&keys)]).await?;
-                prepared.push((action, tx));
-            }
-            let records = phase(
-                "conflicts",
-                try_join_all(prepared.into_iter().map(|(action, tx)| {
-                    Record::submit(&er, tx).map_ok(move |record| (action, record))
-                })),
-            )
-            .await?;
-            let after = state(&er, &keys).await?;
-            let order = serialized(&keys, &workload.expected, &after, &records, 0)
-                .context("conflicts have no valid serialized outcome")?;
-            for index in order {
-                let (action, record) = &records[index];
-                if record.info.err.is_none() {
-                    action.apply(&mut workload.expected);
-                }
-                workload.expected[PAYER].lamports -= record.info.fee;
-            }
-            ensure!(workload.expected == after);
-            if after[TARGET].owner != system::system_id() {
-                let close = Action::new(Close);
-                workload.step("conflicts: close", &close).await?;
-            }
+            workload.check_conflicts().await?;
         }
         ensure!(workload.failures.is_empty());
         Ok(())
+    }
+}
+
+impl EphemeralAccounts {
+    #[instrument(skip_all, err)]
+    async fn check_self_commit(&self) -> Result<()> {
+        // A delegated fee payer can commit itself through mapped signing;
+        // its delegation requires the validator's fee vault.
+        let payer = &self.signers[2];
+        let vault = dlp::magic_fee_vault_pda(&self.er.identity());
+        ensure!(self.er.account(&vault).await?.is_some());
+        let signature = self
+            .er
+            .submit_and_confirm(
+                payer,
+                &[MAGIC.commit(
+                    payer.pubkey(),
+                    Some(vault),
+                    &[payer.pubkey()],
+                    SettlementMode::Commit,
+                )],
+            )
+            .await?;
+        let commit_receipt = receipt::fetch_commit_receipt(self.er.api(), &signature).await?;
+        commit_receipt.check_success("mapped-signing self-commit")?;
+        ensure!(commit_receipt.included.contains(&payer.pubkey()));
+        commit_receipt.confirm(self.base.api()).await
+    }
+
+    #[instrument(skip_all, err)]
+    async fn check_readonly_payer(&self) -> Result<()> {
+        let accounts = [self.funder.pubkey(), self.signers[0].pubkey()];
+        let before = self.er.accounts(&accounts).await?;
+        let attempt = self
+            .er
+            .submit_and_confirm(
+                &self.funder,
+                &[system::transfer(&accounts[0], &accounts[1], 1)],
+            )
+            .await;
+        let error = check::expect_error(attempt, "non-delegated payer cannot spend")?;
+        let error = format!("{error:#}");
+        ensure!(error.contains("InvalidAccountForFee") || error.contains("Immutable"));
+        ensure!(self.er.accounts(&accounts).await? == before);
+        Ok(())
+    }
+
+    async fn into_workload(mut self) -> Result<Workload> {
+        let target = Keypair::new();
+        let keys = [
+            self.signers[0].pubkey(),
+            self.signers[1].pubkey(),
+            target.pubkey(),
+            EPHEMERAL_VAULT_ID,
+            self.signers[2].pubkey(),
+        ];
+        self.signers.push(target);
+        let expected = state(&self.er, &keys).await?;
+        Ok(Workload {
+            er: self.er,
+            signers: self.signers,
+            keys,
+            expected,
+            nonce: 0,
+            failures: Vec::new(),
+        })
     }
 }

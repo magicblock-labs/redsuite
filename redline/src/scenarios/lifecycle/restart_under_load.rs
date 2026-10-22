@@ -19,12 +19,12 @@ use redsuite_core::{
     programs::{CellHeader, REDLINE},
     redline::{causal, Accounts},
     report::Unit,
-    topology::{self, ErOptions, RestartConfig, RestartTiming},
+    topology::{self, ErOptions, PrivateEr, RestartConfig, RestartTiming},
     wait, Api, BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result, ScenarioReport, TxSender,
 };
 use signature::Signature;
 use tokio::{task::JoinSet, time};
-use tracing::debug;
+use tracing::{debug, instrument};
 
 use crate::ACCOUNT_SPACE;
 
@@ -444,34 +444,8 @@ async fn run_mode(base: &BaseCtx, profile: &Profile, mode: Mode) -> Result<ModeO
         .collect();
     let next_id = Rc::new(Cell::new(1u64));
 
-    let storage_at_boot = host::dir_size_bytes(private.storage_dir())?;
-    let superblocks_at_boot = superblocks(private.ctx()).await?;
-    let snapshots_at_boot = archived_snapshots(private.storage_dir())?;
-    let lanes = Lanes::start(
-        private.ctx().api().clone(),
-        &senders,
-        &pool,
-        next_id.clone(),
-    );
-    let er = private.ctx();
-    let storage_dir = private.storage_dir();
-    run_lanes_until(
-        &format!(
-            "{label}: the fill of {} confirmed transactions and a sealed \
-             superblock with its archived snapshot",
-            profile.fill
-        ),
-        profile.resume_timeout * 4,
-        || async {
-            Ok(lanes.confirmed() >= profile.fill
-                && superblocks(er).await? > superblocks_at_boot
-                && archived_snapshots(storage_dir)? > snapshots_at_boot)
-        },
-    )
-    .await?;
-    let db_size_at_restart = host::dir_size_bytes(private.storage_dir())?;
-    let fill_growth = db_size_at_restart.saturating_sub(storage_at_boot);
-    ensure!(fill_growth > 0);
+    let (lanes, db_size_at_restart, fill_growth) =
+        fill(&private, profile, &senders, &pool, next_id.clone(), label).await?;
 
     lanes.halt();
     let first = private.restart(mode.restart_config()).await?;
@@ -554,7 +528,7 @@ async fn run_mode(base: &BaseCtx, profile: &Profile, mode: Mode) -> Result<ModeO
 fn report_mode(report: ScenarioReport, mode: Mode, outcome: &ModeOutcome) -> ScenarioReport {
     let label = mode.label();
     let millis = |duration: Duration| duration.as_secs_f64() * 1e3;
-    let mut metrics: Vec<(&str, Unit, f64)> = vec![
+    let metrics = [
         (
             "first restart total ms",
             Unit::Millis,
@@ -657,15 +631,20 @@ fn report_mode(report: ScenarioReport, mode: Mode, outcome: &ModeOutcome) -> Sce
             outcome.superblocks_crossed as f64,
         ),
     ];
-    if let Some(ran) = outcome.replay_ran {
-        metrics.push(("replay ran", Unit::Count, ran as u8 as f64));
-    }
-    if let Some(ms) = outcome.ledger_processing_ms {
-        metrics.push(("ledger processing ms", Unit::Millis, ms));
-    }
-    metrics.into_iter().fold(report, |report, (name, unit, value)| {
+    let report = metrics.into_iter().fold(report, |report, (name, unit, value)| {
         report.metric(format!("{label} {name}"), unit, value)
-    })
+    });
+    report
+        .metric_if(
+            format!("{label} replay ran"),
+            Unit::Count,
+            outcome.replay_ran.map(|ran| f64::from(u8::from(ran))),
+        )
+        .metric_if(
+            format!("{label} ledger processing ms"),
+            Unit::Millis,
+            outcome.ledger_processing_ms,
+        )
 }
 
 pub struct RestartUnderLoad {
@@ -678,11 +657,10 @@ impl PrivateErScenario<ScenarioReport> for RestartUnderLoad {
     }
 
     async fn run(self) -> Result<ScenarioReport> {
-        let Self { base } = self;
-        let profile = PROFILES.select(base.config().profile);
+        let profile = PROFILES.select(self.base.config().profile);
         let started = Instant::now();
-        let graceful = run_mode(&base, profile, Mode::Graceful).await?;
-        let sigkill = run_mode(&base, profile, Mode::Sigkill).await?;
+        let graceful = run_mode(&self.base, profile, Mode::Graceful).await?;
+        let sigkill = run_mode(&self.base, profile, Mode::Sigkill).await?;
 
         let mut report = ScenarioReport::ok()
             .setting("profile", profile.name)
@@ -705,4 +683,40 @@ impl PrivateErScenario<ScenarioReport> for RestartUnderLoad {
         report = report_mode(report, Mode::Sigkill, &sigkill);
         Ok(report)
     }
+}
+
+#[instrument(skip_all, err, fields(mode = label))]
+async fn fill(
+    private: &PrivateEr,
+    profile: &Profile,
+    senders: &[TxSender],
+    pool: &Rc<Vec<Pubkey>>,
+    next_id: Rc<Cell<u64>>,
+    label: &str,
+) -> Result<(Lanes, u64, u64)> {
+    let storage_at_boot = host::dir_size_bytes(private.storage_dir())?;
+    let superblocks_at_boot = superblocks(private.ctx()).await?;
+    let snapshots_at_boot = archived_snapshots(private.storage_dir())?;
+    let lanes = Lanes::start(private.ctx().api().clone(), senders, pool, next_id);
+    let er = private.ctx();
+    let storage_dir = private.storage_dir();
+    run_lanes_until(
+        &format!(
+            "{label}: the fill of {} confirmed transactions and a sealed \
+             superblock with its archived snapshot",
+            profile.fill
+        ),
+        profile.resume_timeout * 4,
+        || async {
+            Ok(lanes.confirmed() >= profile.fill
+                && superblocks(er).await? > superblocks_at_boot
+                && archived_snapshots(storage_dir)? > snapshots_at_boot)
+        },
+    )
+    .await?;
+    let db_size_at_restart = host::dir_size_bytes(private.storage_dir())?;
+    let fill_growth = db_size_at_restart.saturating_sub(storage_at_boot);
+    ensure!(fill_growth > 0);
+
+    Ok((lanes, db_size_at_restart, fill_growth))
 }

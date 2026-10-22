@@ -28,7 +28,6 @@ pub mod wait;
 
 pub use anyhow::Error as DynError;
 pub use api::{Api, Metrics, MetricsDelta, SendBody};
-pub use check::phase;
 pub use context::{BaseCtx, ChainCtx, ErClient, ErCtx, TxSender};
 pub use report::ScenarioReport;
 pub use resources::LaunchRecord;

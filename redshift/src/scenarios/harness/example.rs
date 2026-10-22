@@ -26,25 +26,28 @@ impl Scenario for Example {
     }
 
     async fn run(self) -> Result<()> {
-        let Self { base, er, payer, recipient } = self;
         let mut expected = 0;
         // identical transactions share a signature and get deduplicated —
         // every transaction must differ somewhere (here: the amount)
         for unique in 1..=TRANSFERS {
             let lamports = LAMPORTS_PER_TRANSFER + unique;
-            let transfer = system::transfer(&payer.pubkey(), &recipient, lamports);
-            base.submit_and_confirm(&payer, &[transfer]).await?;
+            let transfer = system::transfer(&self.payer.pubkey(), &self.recipient, lamports);
+            self.base.submit_and_confirm(&self.payer, &[transfer]).await?;
             expected += lamports;
         }
-        let on_base =
-            base.account(&recipient).await?.context("recipient never appeared on base")?;
+        let on_base = self
+            .base
+            .account(&self.recipient)
+            .await?
+            .context("recipient never appeared on base")?;
         ensure!(on_base.lamports == expected);
 
-        er.await_account(&recipient, |account| {
-            ensure!(account.lamports == expected);
-            Ok(())
-        })
-        .await?;
+        self.er
+            .await_account(&self.recipient, |account| {
+                ensure!(account.lamports == expected);
+                Ok(())
+            })
+            .await?;
         Ok(())
     }
 }

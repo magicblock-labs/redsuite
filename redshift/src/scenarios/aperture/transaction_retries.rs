@@ -28,6 +28,7 @@ use serde_json::{json, Value};
 use signature::Signature;
 use signer::Signer;
 use solana_instruction_error::InstructionError;
+use tracing::instrument;
 use transaction::Transaction;
 
 use crate::PAYER_LAMPORTS;
@@ -304,11 +305,10 @@ impl PrivateErScenario for ExpiryRestart {
         Ok(Self { base, private })
     }
 
-    async fn run(self) -> Result<()> {
-        let Self { base, mut private } = self;
-        let er = private.ctx().clone();
-        Mode::ExpiryRestart.run_phases(&base, &er, Some(&mut private)).await?;
-        private.finish().await
+    async fn run(mut self) -> Result<()> {
+        let er = self.private.ctx().clone();
+        Mode::ExpiryRestart.run_phases(&self.base, &er, Some(&mut self.private)).await?;
+        self.private.finish().await
     }
 }
 
@@ -326,15 +326,12 @@ impl Mode {
         };
         for &phase in phases {
             // Each outcome owns fresh payer/cell state and its ledger window.
-            crate::phase(
-                phase,
-                self.run_case(base, er, phase, private.as_deref_mut()),
-            )
-            .await?;
+            self.run_case(base, er, phase, private.as_deref_mut()).await?;
         }
         Ok(())
     }
 
+    #[instrument(skip_all, err, fields(case = phase))]
     async fn run_case(
         &self,
         base: &BaseCtx,

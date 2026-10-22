@@ -11,8 +11,7 @@ use redsuite_core::{
     runner::{Pacing, RunOutcome, ThreadRunConfig},
     BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
 };
-use tracing::{debug, warn};
-use url::Url;
+use tracing::{debug, instrument, warn};
 
 use crate::ACCOUNT_SPACE;
 
@@ -60,25 +59,6 @@ const FULL: Profile = Profile {
 
 const PROFILES: ProfileValues<Profile> = ProfileValues { lite: LITE, full: FULL };
 
-fn run_cell(
-    er_rpc_url: Url,
-    er_ws_url: Url,
-    config: ThreadRunConfig,
-    id_offset: u64,
-    pool: Arc<Vec<Pubkey>>,
-    payer_bytes: Arc<Vec<[u8; 64]>>,
-) -> Result<RunOutcome> {
-    execute_kernel(
-        config,
-        er_rpc_url,
-        er_ws_url,
-        payer_bytes,
-        0,
-        move |id| REDLINE.copy_three(&pool, id_offset + id).0,
-        None,
-    )
-}
-
 struct CellOutcome {
     threads: usize,
     outcome: RunOutcome,
@@ -115,86 +95,94 @@ impl Scenario<ScenarioReport> for ProtocolBoundarySelftest {
     }
 
     async fn run(self) -> Result<ScenarioReport> {
-        let Self {
-            base,
-            er,
-            profile,
-            pool,
-            payer_bytes,
-        } = self;
-        let er_rpc_url = er.api().url().clone();
-        let warmup = run_cell(
-            er_rpc_url.clone(),
-            er.ws_url().clone(),
-            ThreadRunConfig {
-                threads: profile.threads,
-                iterations: profile.warmup,
-                rate: Pacing::PerSecond(profile.rate),
-                concurrency: profile.concurrency,
-            },
-            0,
-            pool.clone(),
-            payer_bytes.clone(),
-        )?;
-        ensure!(warmup.failed == 0);
-
-        let mut id_offset = profile.warmup;
+        self.warm_up()?;
+        let mut id_offset = self.profile.warmup;
         let mut cells: Vec<CellOutcome> = Vec::new();
-        for threads in [1, profile.threads] {
-            let before = er.scrape_metrics().await?;
-            let outcome = run_cell(
-                er_rpc_url.clone(),
-                er.ws_url().clone(),
-                ThreadRunConfig {
-                    threads,
-                    iterations: profile.iterations,
-                    rate: Pacing::PerSecond(profile.rate),
-                    concurrency: profile.concurrency,
-                },
-                id_offset,
-                pool.clone(),
-                payer_bytes.clone(),
-            )?;
-            let after = er.scrape_metrics().await?;
-            let delta = MetricsDelta::new(before, after);
-            id_offset += profile.iterations;
-
-            let cell = CellOutcome {
-                threads,
-                outcome,
-                tx_processing_avg_us: delta
-                    .histogram_avg(TX_PROCESSING_HISTOGRAM)
-                    .map(|seconds| seconds * 1e6),
-            };
-            debug!(
-                cell.threads,
-                cell.outcome.delivery.median,
-                cell.tx_processing_avg_us,
-                "protocol boundary cell finished",
-            );
-            ensure!(cell.outcome.failed == 0);
-
-            let cell_report = ScenarioReport::ok()
-                .setting("profile", profile.name)
-                .setting("threads", threads)
-                .setting("shape", "read-write 3/tx (1 src + 2 dst data-copy)")
-                .setting("payers", profile.payers)
-                .setting("accounts", profile.accounts)
-                .setting("measured iters", profile.iterations)
-                .setting("offered tps", profile.rate)
-                .setting("concurrency", profile.concurrency)
-                .observe("delivery us", Unit::Micros, cell.outcome.delivery)
-                .client_side(&cell.outcome)
-                .metric("achieved tps", Unit::Tps, cell.outcome.achieved_rps())
-                .metric_if(
-                    "validator tx processing avg us",
-                    Unit::Micros,
-                    cell.tx_processing_avg_us,
-                );
-            base.report_cell(&format!("threads{threads}"), &cell_report)?;
-            cells.push(cell);
+        for threads in [1, self.profile.threads] {
+            cells.push(self.measure_cell(threads, &mut id_offset).await?);
         }
 
+        Ok(self.summarize(&cells))
+    }
+}
+
+impl ProtocolBoundarySelftest {
+    fn execute(&self, threads: usize, iterations: u64, offset: u64) -> Result<RunOutcome> {
+        let pool = self.pool.clone();
+        execute_kernel(
+            ThreadRunConfig {
+                threads,
+                iterations,
+                rate: Pacing::PerSecond(self.profile.rate),
+                concurrency: self.profile.concurrency,
+            },
+            self.er.api().url().clone(),
+            self.er.ws_url().clone(),
+            self.payer_bytes.clone(),
+            0,
+            move |id| REDLINE.copy_three(&pool, offset + id).0,
+            None,
+        )
+    }
+
+    #[instrument(skip_all, err)]
+    fn warm_up(&self) -> Result<()> {
+        let warmup = self.execute(self.profile.threads, self.profile.warmup, 0)?;
+        ensure!(warmup.failed == 0);
+
+        Ok(())
+    }
+
+    #[instrument(skip_all, err)]
+    async fn measure_cell(&self, threads: usize, id_offset: &mut u64) -> Result<CellOutcome> {
+        let before = self.er.scrape_metrics().await?;
+        let outcome = self.execute(threads, self.profile.iterations, *id_offset)?;
+        let after = self.er.scrape_metrics().await?;
+        let delta = MetricsDelta::new(before, after);
+        *id_offset += self.profile.iterations;
+
+        let cell = CellOutcome {
+            threads,
+            outcome,
+            tx_processing_avg_us: delta
+                .histogram_avg(TX_PROCESSING_HISTOGRAM)
+                .map(|seconds| seconds * 1e6),
+        };
+        debug!(
+            cell.threads,
+            cell.outcome.delivery.median,
+            cell.tx_processing_avg_us,
+            "protocol boundary cell finished",
+        );
+        ensure!(cell.outcome.failed == 0);
+
+        self.report_cell(&cell)?;
+
+        Ok(cell)
+    }
+
+    fn report_cell(&self, cell: &CellOutcome) -> Result<()> {
+        let cell_report = ScenarioReport::ok()
+            .setting("profile", self.profile.name)
+            .setting("threads", cell.threads)
+            .setting("shape", "read-write 3/tx (1 src + 2 dst data-copy)")
+            .setting("payers", self.profile.payers)
+            .setting("accounts", self.profile.accounts)
+            .setting("measured iters", self.profile.iterations)
+            .setting("offered tps", self.profile.rate)
+            .setting("concurrency", self.profile.concurrency)
+            .observe("delivery us", Unit::Micros, cell.outcome.delivery)
+            .client_side(&cell.outcome)
+            .metric("achieved tps", Unit::Tps, cell.outcome.achieved_rps())
+            .metric_if(
+                "validator tx processing avg us",
+                Unit::Micros,
+                cell.tx_processing_avg_us,
+            );
+        self.base.report_cell(&format!("threads{}", cell.threads), &cell_report)
+    }
+
+    fn summarize(&self, cells: &[CellOutcome]) -> ScenarioReport {
         let single = &cells[0];
         let multi = &cells[1];
 
@@ -219,29 +207,29 @@ impl Scenario<ScenarioReport> for ProtocolBoundarySelftest {
             p50_ratio,
             artifact_detected, "client boundary comparison finished",
         );
-        if profile.expect_artifact && !artifact_detected {
+        if self.profile.expect_artifact && !artifact_detected {
             warn!(
-                profile.rate,
+                self.profile.rate,
                 p50_ratio, "expected client-thread latency gap absent; try a higher rate",
             );
         }
-        if !profile.expect_artifact && artifact_detected {
+        if !self.profile.expect_artifact && artifact_detected {
             warn!(
                 p50_ratio,
                 "unexpected client-thread latency gap at baseline rate",
             );
         }
 
-        Ok(ScenarioReport::ok()
-            .setting("profile", profile.name)
+        ScenarioReport::ok()
+            .setting("profile", self.profile.name)
             .setting("shape", "read-write 3/tx (1 src + 2 dst data-copy)")
-            .setting("threads boundary", profile.threads)
-            .setting("payers", profile.payers)
-            .setting("accounts", profile.accounts)
-            .setting("measured iters per cell", profile.iterations)
-            .setting("offered tps", profile.rate)
-            .setting("concurrency", profile.concurrency)
-            .setting("expect artifact", profile.expect_artifact)
+            .setting("threads boundary", self.profile.threads)
+            .setting("payers", self.profile.payers)
+            .setting("accounts", self.profile.accounts)
+            .setting("measured iters per cell", self.profile.iterations)
+            .setting("offered tps", self.profile.rate)
+            .setting("concurrency", self.profile.concurrency)
+            .setting("expect artifact", self.profile.expect_artifact)
             .with_flags(&single.outcome)
             .with_flags(&multi.outcome)
             .metric(
@@ -289,6 +277,6 @@ impl Scenario<ScenarioReport> for ProtocolBoundarySelftest {
                 "multi validator tx avg us",
                 Unit::Micros,
                 multi.tx_processing_avg_us,
-            ))
+            )
     }
 }

@@ -34,7 +34,7 @@ use redsuite_core::{
 use signature::Signature;
 use signer::Signer;
 use tokio::time;
-use tracing::debug;
+use tracing::{debug, instrument};
 use url::Url;
 
 use crate::{metrics, program::layout, ACCOUNT_SPACE};
@@ -628,27 +628,35 @@ impl Scenario<ScenarioReport> for ConflictOrdering {
         })
     }
 
-    async fn run(self) -> Result<ScenarioReport> {
-        let Self {
-            base,
-            er,
-            profile,
-            mut pairs,
-            independent,
-            independent_payer_bytes,
-        } = self;
-        let calibration_before = er.scrape_metrics().await?;
+    async fn run(mut self) -> Result<ScenarioReport> {
+        let (executors, contention_lanes) = self.calibrate().await?;
+        let mut batches = Vec::with_capacity(self.profile.batches);
+        for batch in 0..self.profile.batches {
+            let outcome = self.measure_batch(batch, contention_lanes).await?;
+            self.check_batch(batch, &outcome).await?;
+            self.report_batch(batch, &outcome, executors, contention_lanes)?;
+            batches.push(outcome);
+        }
+        verify_independent(&self.er, &self.independent, self.profile.independent_iters).await?;
+        Ok(self.summarize(&batches, executors, contention_lanes))
+    }
+}
+
+impl ConflictOrdering {
+    #[instrument(skip_all, err)]
+    async fn calibrate(&self) -> Result<(f64, usize)> {
+        let calibration_before = self.er.scrape_metrics().await?;
         let mut handles = Some(spawn_load(
-            er.api().url().clone(),
-            er.ws_url().clone(),
+            self.er.api().url().clone(),
+            self.er.ws_url().clone(),
             LoadMode::Open { concurrency: OPEN_CONCURRENCY },
-            profile.driver_threads,
-            independent.clone(),
-            independent_payer_bytes.clone(),
-            profile.independent_iters,
+            self.profile.driver_threads,
+            self.independent.clone(),
+            self.independent_payer_bytes.clone(),
+            self.profile.independent_iters,
         ));
-        await_load_reaching_executors(&er, &mut handles).await?;
-        let sampler = spawn_sampler(&er);
+        await_load_reaching_executors(&self.er, &mut handles).await?;
+        let sampler = spawn_sampler(&self.er);
         time::sleep(CALIBRATION).await;
         let calibration = match handles.take() {
             Some(handles) => join_load(handles).await?,
@@ -659,177 +667,206 @@ impl Scenario<ScenarioReport> for ConflictOrdering {
         let executors = calibration_samples.value.busy.max;
         ensure!(executors >= MIN_EXECUTORS);
         let contention_lanes = (executors as usize * LANES_PER_EXECUTOR)
-            .min(profile.independent_accounts)
+            .min(self.profile.independent_accounts)
             .max(1);
         let calibration_target =
             calibration_before.get(TX_COUNT).unwrap_or_default() + calibration.delivered as f64;
-        drain(&er, calibration_target).await?;
+        drain(&self.er, calibration_target).await?;
         debug!(
             executors,
             contention_lanes, "contention calibration finished"
         );
 
+        Ok((executors, contention_lanes))
+    }
+
+    #[instrument(skip_all, err, fields(batch = batch))]
+    async fn measure_batch(
+        &mut self,
+        batch: usize,
+        contention_lanes: usize,
+    ) -> Result<BatchOutcome> {
         let space = ChainSpace {
-            pairs: profile.pairs as u64,
-            chains: profile.chains,
+            pairs: self.profile.pairs as u64,
+            chains: self.profile.chains,
         };
         let modes = [
             LoadMode::Bounded { lanes: contention_lanes },
             LoadMode::Open { concurrency: OPEN_CONCURRENCY },
         ];
-        let ranges = phase_ranges(profile.chains);
+        let ranges = phase_ranges(self.profile.chains);
 
-        let mut batches: Vec<BatchOutcome> = Vec::with_capacity(profile.batches);
-        for batch in 0..profile.batches {
-            let before = er.scrape_metrics().await?;
-            ensure!(is_idle(&before));
-            let txs_before = before.get(TX_COUNT).unwrap_or_default();
+        let before = self.er.scrape_metrics().await?;
+        ensure!(is_idle(&before));
+        let txs_before = before.get(TX_COUNT).unwrap_or_default();
 
-            let mut phases = Vec::with_capacity(modes.len());
-            for (mode, range) in modes.iter().zip(ranges) {
-                let plan = PhasePlan {
-                    batch: batch as u64,
-                    space,
-                    range,
-                    heavy_iters: profile.heavy_iters,
-                    span: profile.phase_span,
-                    mode: *mode,
-                    independent_iters: profile.independent_iters,
-                    driver_threads: profile.driver_threads,
-                };
-                let phase = run_phase(
-                    &er,
-                    &mut pairs,
-                    &independent,
-                    &independent_payer_bytes,
-                    plan,
-                )
-                .await?;
-                ensure!(phase.load.failed == 0);
-                debug!(
-                    batch,
-                    phase.label, phase.chain_txs, "contention phase finished",
-                );
-                phases.push(phase);
-            }
-
-            let workload: u64 =
-                phases.iter().map(|phase| phase.chain_txs + phase.load.delivered).sum();
-            let drained = drain(&er, txs_before + workload as f64).await?;
-            let after = er.scrape_metrics().await?;
-            let delta = MetricsDelta::new(before, after);
-            let engine_txs = delta.counter(TX_COUNT).unwrap_or_default();
-            let dependencies = delta.counter(ORDERING_DEPENDENCIES).unwrap_or_default();
-            let failed_kind = |kind: &str| {
-                delta.counter(&format!(
-                    "{}{{kind=\"{kind}\"}}",
-                    metrics::FAILED_TRANSACTIONS
-                ))
+        let mut phases = Vec::with_capacity(modes.len());
+        for (mode, range) in modes.iter().zip(ranges) {
+            let plan = PhasePlan {
+                batch: batch as u64,
+                space,
+                range,
+                heavy_iters: self.profile.heavy_iters,
+                span: self.profile.phase_span,
+                mode: *mode,
+                independent_iters: self.profile.independent_iters,
+                driver_threads: self.profile.driver_threads,
             };
-            let outcome = BatchOutcome {
-                phases,
-                drained,
-                engine_txs,
-                dependencies,
-                dropped: failed_kind("dropped"),
-                execution_failed: failed_kind("execution"),
-            };
-
-            for phase in &outcome.phases {
-                let samples = &phase.samples.value;
-                ensure!(samples.busy.max >= MIN_EXECUTORS);
-                ensure!(samples.busy.mean() > 1.0);
-                ensure!(samples.max_stall <= STALL_BOUND);
-            }
-            for (_label, value) in [
-                ("blocked", outcome.drained.blocked),
-                ("busy", outcome.drained.busy),
-                ("pending", outcome.drained.pending),
-            ] {
-                ensure!(value == 0.0);
-            }
-            ensure!(engine_txs >= workload as f64);
-            if let Some(dropped) = outcome.dropped {
-                ensure!(dropped == 0.0);
-            }
-            if let Some(execution_failed) = outcome.execution_failed {
-                ensure!(execution_failed == 0.0);
-            }
-            let contention_chains = outcome.phases[0].chains * profile.pairs as u64;
-            ensure!(dependencies >= contention_chains as f64);
-            verify_pairs(&er, &mut pairs, batch).await?;
+            let phase = run_phase(
+                &self.er,
+                &mut self.pairs,
+                &self.independent,
+                &self.independent_payer_bytes,
+                plan,
+            )
+            .await?;
+            ensure!(phase.load.failed == 0);
             debug!(
                 batch,
-                dependencies, "contention batch drained; all pairs match accepted fold",
+                phase.label, phase.chain_txs, "contention phase finished",
             );
-
-            let mut cell = ScenarioReport::ok()
-                .setting("profile", profile.name)
-                .setting("batch", batch)
-                .setting("pairs", profile.pairs)
-                .setting("chains per pair", profile.chains)
-                .setting("heavy step iters", profile.heavy_iters)
-                .setting("independent iters", profile.independent_iters)
-                .setting("executors", executors)
-                .setting("contention lanes", contention_lanes)
-                .setting("open concurrency", OPEN_CONCURRENCY)
-                .metric("chain txs", Count, outcome.chain_txs() as f64)
-                .metric("independent txs", Count, outcome.independent_txs() as f64)
-                .metric("engine txs in window", Count, engine_txs)
-                .metric(
-                    "engine txs beyond workload",
-                    Count,
-                    engine_txs - workload as f64,
-                )
-                .metric("ordering dependencies", Count, dependencies)
-                .metric(
-                    "dependencies per chain",
-                    Ratio,
-                    dependencies / (outcome.chains() * profile.pairs as u64) as f64,
-                )
-                .metric("drain s", Seconds, outcome.drained.elapsed.as_secs_f64())
-                .metric("blocked at drain", Count, outcome.drained.blocked)
-                .metric("busy at drain", Count, outcome.drained.busy)
-                .metric("pending at drain", Count, outcome.drained.pending)
-                .metric_if("dropped txs", Count, outcome.dropped)
-                .metric_if("execution failed txs", Count, outcome.execution_failed);
-            for phase in &outcome.phases {
-                let samples = &phase.samples.value;
-                cell = cell
-                    .setting(format!("{} scrapes", phase.label), &phase.samples)
-                    .observe(format!("{} chain send us", phase.label), Micros, phase.send)
-                    .observe(
-                        format!("{} independent delivery us", phase.label),
-                        Micros,
-                        phase.load.delivery,
-                    )
-                    .client_side_as(format!("{} scheduling delay us", phase.label), &phase.load);
-                for (label, unit, value) in [
-                    ("chain txs", Count, phase.chain_txs as f64),
-                    ("independent txs", Count, phase.load.delivered as f64),
-                    (
-                        "independent tps",
-                        Tps,
-                        phase.load.delivered as f64 / phase.load.wall.as_secs_f64().max(1e-9),
-                    ),
-                    ("busy executors mean", Count, samples.busy.mean()),
-                    ("busy executors max", Count, samples.busy.max),
-                    ("blocked max", Count, samples.blocked_max),
-                    ("longest stall s", Seconds, samples.max_stall.as_secs_f64()),
-                    ("wall s", Seconds, phase.wall.as_secs_f64()),
-                ] {
-                    cell = cell.metric(format!("{} {label}", phase.label), unit, value);
-                }
-            }
-            base.report_cell(&format!("batch{batch}"), &cell)?;
-            batches.push(outcome);
+            phases.push(phase);
         }
 
-        verify_independent(&er, &independent, profile.independent_iters).await?;
+        let workload: u64 = phases.iter().map(|phase| phase.chain_txs + phase.load.delivered).sum();
+        let drained = drain(&self.er, txs_before + workload as f64).await?;
+        let after = self.er.scrape_metrics().await?;
+        let delta = MetricsDelta::new(before, after);
+        let engine_txs = delta.counter(TX_COUNT).unwrap_or_default();
+        let dependencies = delta.counter(ORDERING_DEPENDENCIES).unwrap_or_default();
+        let failed_kind = |kind: &str| {
+            delta.counter(&format!(
+                "{}{{kind=\"{kind}\"}}",
+                metrics::FAILED_TRANSACTIONS
+            ))
+        };
+        let outcome = BatchOutcome {
+            phases,
+            drained,
+            engine_txs,
+            dependencies,
+            dropped: failed_kind("dropped"),
+            execution_failed: failed_kind("execution"),
+        };
 
+        Ok(outcome)
+    }
+
+    #[instrument(skip_all, err, fields(batch = batch))]
+    async fn check_batch(&mut self, batch: usize, outcome: &BatchOutcome) -> Result<()> {
+        let workload: u64 =
+            outcome.phases.iter().map(|phase| phase.chain_txs + phase.load.delivered).sum();
+        for phase in &outcome.phases {
+            let samples = &phase.samples.value;
+            ensure!(samples.busy.max >= MIN_EXECUTORS);
+            ensure!(samples.busy.mean() > 1.0);
+            ensure!(samples.max_stall <= STALL_BOUND);
+        }
+        for (_label, value) in [
+            ("blocked", outcome.drained.blocked),
+            ("busy", outcome.drained.busy),
+            ("pending", outcome.drained.pending),
+        ] {
+            ensure!(value == 0.0);
+        }
+        ensure!(outcome.engine_txs >= workload as f64);
+        if let Some(dropped) = outcome.dropped {
+            ensure!(dropped == 0.0);
+        }
+        if let Some(execution_failed) = outcome.execution_failed {
+            ensure!(execution_failed == 0.0);
+        }
+        let contention_chains = outcome.phases[0].chains * self.profile.pairs as u64;
+        ensure!(outcome.dependencies >= contention_chains as f64);
+        verify_pairs(&self.er, &mut self.pairs, batch).await?;
+        debug!(
+            batch,
+            outcome.dependencies, "contention batch drained; all pairs match accepted fold",
+        );
+
+        Ok(())
+    }
+
+    fn report_batch(
+        &self,
+        batch: usize,
+        outcome: &BatchOutcome,
+        executors: f64,
+        contention_lanes: usize,
+    ) -> Result<()> {
+        let workload: u64 =
+            outcome.phases.iter().map(|phase| phase.chain_txs + phase.load.delivered).sum();
+        let mut cell = ScenarioReport::ok()
+            .setting("profile", self.profile.name)
+            .setting("batch", batch)
+            .setting("pairs", self.profile.pairs)
+            .setting("chains per pair", self.profile.chains)
+            .setting("heavy step iters", self.profile.heavy_iters)
+            .setting("independent iters", self.profile.independent_iters)
+            .setting("executors", executors)
+            .setting("contention lanes", contention_lanes)
+            .setting("open concurrency", OPEN_CONCURRENCY)
+            .metric("chain txs", Count, outcome.chain_txs() as f64)
+            .metric("independent txs", Count, outcome.independent_txs() as f64)
+            .metric("engine txs in window", Count, outcome.engine_txs)
+            .metric(
+                "engine txs beyond workload",
+                Count,
+                outcome.engine_txs - workload as f64,
+            )
+            .metric("ordering dependencies", Count, outcome.dependencies)
+            .metric(
+                "dependencies per chain",
+                Ratio,
+                outcome.dependencies / (outcome.chains() * self.profile.pairs as u64) as f64,
+            )
+            .metric("drain s", Seconds, outcome.drained.elapsed.as_secs_f64())
+            .metric("blocked at drain", Count, outcome.drained.blocked)
+            .metric("busy at drain", Count, outcome.drained.busy)
+            .metric("pending at drain", Count, outcome.drained.pending)
+            .metric_if("dropped txs", Count, outcome.dropped)
+            .metric_if("execution failed txs", Count, outcome.execution_failed);
+        for phase in &outcome.phases {
+            let samples = &phase.samples.value;
+            cell = cell
+                .setting(format!("{} scrapes", phase.label), &phase.samples)
+                .observe(format!("{} chain send us", phase.label), Micros, phase.send)
+                .observe(
+                    format!("{} independent delivery us", phase.label),
+                    Micros,
+                    phase.load.delivery,
+                )
+                .client_side_as(format!("{} scheduling delay us", phase.label), &phase.load);
+            for (label, unit, value) in [
+                ("chain txs", Count, phase.chain_txs as f64),
+                ("independent txs", Count, phase.load.delivered as f64),
+                (
+                    "independent tps",
+                    Tps,
+                    phase.load.delivered as f64 / phase.load.wall.as_secs_f64().max(1e-9),
+                ),
+                ("busy executors mean", Count, samples.busy.mean()),
+                ("busy executors max", Count, samples.busy.max),
+                ("blocked max", Count, samples.blocked_max),
+                ("longest stall s", Seconds, samples.max_stall.as_secs_f64()),
+                ("wall s", Seconds, phase.wall.as_secs_f64()),
+            ] {
+                cell = cell.metric(format!("{} {label}", phase.label), unit, value);
+            }
+        }
+        self.base.report_cell(&format!("batch{batch}"), &cell)
+    }
+
+    fn summarize(
+        &self,
+        batches: &[BatchOutcome],
+        executors: f64,
+        contention_lanes: usize,
+    ) -> ScenarioReport {
         let chain_txs: u64 = batches.iter().map(BatchOutcome::chain_txs).sum();
         let independent_txs: u64 = batches.iter().map(BatchOutcome::independent_txs).sum();
-        let chains: u64 = batches.iter().map(|batch| batch.chains() * profile.pairs as u64).sum();
+        let chains: u64 =
+            batches.iter().map(|batch| batch.chains() * self.profile.pairs as u64).sum();
         let dependencies: f64 = batches.iter().map(|batch| batch.dependencies).sum();
         let engine_txs: f64 = batches.iter().map(|batch| batch.engine_txs).sum();
         let longest_stall = batches
@@ -841,20 +878,20 @@ impl Scenario<ScenarioReport> for ConflictOrdering {
         let slowest_drain =
             batches.iter().map(|batch| batch.drained.elapsed).max().unwrap_or_default();
         let mut summary = ScenarioReport::ok()
-            .setting("profile", profile.name)
+            .setting("profile", self.profile.name)
             .setting(
                 "shape",
                 "X(A) -> Y(A,B) -> Z(B) hash-fold chains, one payer per \
                  step, beside high-cu work on disjoint accounts",
             )
-            .setting("pairs", profile.pairs)
-            .setting("chains per pair per batch", profile.chains)
-            .setting("batches", profile.batches)
-            .setting("heavy step iters", profile.heavy_iters)
-            .setting("independent accounts", profile.independent_accounts)
-            .setting("independent iters", profile.independent_iters)
-            .setting("driver threads", profile.driver_threads)
-            .setting("phase span s", profile.phase_span.as_secs())
+            .setting("pairs", self.profile.pairs)
+            .setting("chains per pair per batch", self.profile.chains)
+            .setting("batches", self.profile.batches)
+            .setting("heavy step iters", self.profile.heavy_iters)
+            .setting("independent accounts", self.profile.independent_accounts)
+            .setting("independent iters", self.profile.independent_iters)
+            .setting("driver threads", self.profile.driver_threads)
+            .setting("phase span s", self.profile.phase_span.as_secs())
             .setting("executors", executors)
             .setting("contention lanes", contention_lanes)
             .setting(
@@ -912,6 +949,6 @@ impl Scenario<ScenarioReport> for ConflictOrdering {
                 }
             }
         }
-        Ok(summary)
+        summary
     }
 }

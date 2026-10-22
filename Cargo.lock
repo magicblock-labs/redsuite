@@ -2905,6 +2905,7 @@ dependencies = [
  "solana-signer",
  "solana-transaction 4.1.6",
  "sonic-rs",
+ "tracing",
 ]
 
 [[package]]

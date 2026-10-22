@@ -21,7 +21,7 @@ use redsuite_core::{
 };
 use signer::Signer;
 use tokio::{task::JoinSet, time};
-use tracing::debug;
+use tracing::{debug, instrument};
 
 use crate::{ACCOUNT_SPACE, PAYER_LAMPORTS};
 
@@ -170,17 +170,6 @@ async fn await_catch_up(verifier: &Verifier, name: &str, target: f64) -> Result<
     Ok(started.elapsed())
 }
 
-async fn catch_up_fleet(topology: &ReplicatedTopology, names: &[&str]) -> Result<Duration> {
-    let mut slowest = Duration::ZERO;
-    for name in names {
-        let target = leader_metric(topology, name).await?;
-        for verifier in topology.verifiers() {
-            slowest = slowest.max(await_catch_up(verifier, name, target).await?);
-        }
-    }
-    Ok(slowest)
-}
-
 async fn await_leader_advance(
     topology: &ReplicatedTopology,
     name: &str,
@@ -199,19 +188,6 @@ async fn await_leader_advance(
     )
     .await?;
     Ok(target)
-}
-
-async fn await_leader_connections(topology: &ReplicatedTopology, expected: usize) -> Result<()> {
-    wait::retry(
-        &format!("the leader serving {expected} replication connection(s)"),
-        DETACH_TIMEOUT,
-        async || {
-            ensure!(topology.leader_connections().await? == expected as f64);
-            Ok(())
-        },
-    )
-    .await?;
-    Ok(())
 }
 
 async fn stop_verifier(verifier: &mut Verifier, hard_kill: bool) -> Result<VerifierStop> {
@@ -233,31 +209,6 @@ async fn blocks_advance(verifier: &Verifier) -> Result<f64> {
     let after = verifier_metric(verifier, BLOCKS).await?;
     ensure!(after > before);
     Ok(after - before)
-}
-
-async fn probe_clones(base: &BaseCtx, topology: &ReplicatedTopology) -> Result<()> {
-    let leader = topology.leader().ctx();
-    for _ in 0..PROBES {
-        let probe = base.funded_payer(PROBE_LAMPORTS).await?;
-        let address = probe.pubkey();
-        leader
-            .api()
-            .await_accounts(&[address], "leader clones the probe", async || {
-                let account = leader.account(&address).await?.context("probe account missing")?;
-                ensure!(account.lamports > 0);
-                Ok(())
-            })
-            .await?;
-    }
-    Ok(())
-}
-
-async fn verify_connections(topology: &ReplicatedTopology) -> Result<()> {
-    for verifier in topology.verifiers() {
-        ensure!(verifier.stream_connected().await);
-    }
-    ensure!(topology.leader_connections().await? == (VERIFIERS as f64));
-    Ok(())
 }
 
 fn strip_ansi(line: &str) -> String {
@@ -309,69 +260,6 @@ fn log_mentions_mismatch(log: &Path) -> Result<Option<String>> {
         .map(strip_ansi))
 }
 
-async fn sample_lag(topology: &ReplicatedTopology, window: Duration) -> Result<(Vec<f64>, usize)> {
-    let deadline = time::Instant::now() + window;
-    let mut max_lag = vec![0.0f64; topology.verifiers().len()];
-    let mut samples = 0usize;
-    while time::Instant::now() < deadline {
-        let leader = leader_metric(topology, TRANSACTIONS).await?;
-        for (index, verifier) in topology.verifiers().iter().enumerate() {
-            let seen = verifier_metric(verifier, TRANSACTIONS).await?;
-            max_lag[index] = max_lag[index].max(leader - seen);
-        }
-        samples += 1;
-        time::sleep(LAG_SAMPLE).await;
-    }
-    Ok((max_lag, samples))
-}
-
-async fn verify_pairs(topology: &ReplicatedTopology, pairs: &[CausalPair]) -> Result<()> {
-    let leader = topology.leader().ctx();
-    for (index, pair) in pairs.iter().enumerate() {
-        pair.verify(leader, &format!("pair {index} on the leader")).await?;
-    }
-    Ok(())
-}
-
-async fn verify_no_mismatch(topology: &ReplicatedTopology) -> Result<()> {
-    for verifier in topology.verifiers() {
-        ensure!(verifier.is_running());
-        ensure!(verifier.stream_connected().await);
-        ensure!(verifier_count(verifier, STATE_MISMATCHES).await? == 0.0);
-        if let Some(line) = log_mentions_mismatch(verifier.log())? {
-            return Err(anyhow!(
-                "verifier {}: replication mismatch: {line}",
-                verifier.label()
-            ));
-        }
-    }
-    Ok(())
-}
-
-async fn prepare_pairs(
-    base: &BaseCtx,
-    topology: &ReplicatedTopology,
-    count: usize,
-) -> Result<Vec<CausalPair>> {
-    let leader = topology.leader();
-    let payers = base.funded_payers(count * PAYERS_PER_PAIR, PAYER_LAMPORTS).await?;
-    let accounts = Accounts::new(ACCOUNT_SPACE, leader.identity());
-    let mut pairs = Vec::with_capacity(count);
-    for index in 0..count {
-        let owner = &payers[index * PAYERS_PER_PAIR];
-        let pdas = accounts.init_delegated(base, owner, 2).await?;
-        leader.ctx().await_clones(&pdas, ACCOUNT_SPACE as usize).await?;
-        let senders = payers[index * PAYERS_PER_PAIR..(index + 1) * PAYERS_PER_PAIR]
-            .iter()
-            .map(|payer| leader.ctx().sender(Rc::new(payer.insecure_clone())))
-            .collect();
-        pairs.push(CausalPair::new([pdas[0], pdas[1]], senders));
-    }
-    let payer_keys: Vec<Pubkey> = payers.iter().map(|payer| payer.pubkey()).collect();
-    leader.ctx().await_cloned_payers(&payer_keys).await?;
-    Ok(pairs)
-}
-
 pub struct VerifierLifecycle {
     base: Rc<BaseCtx>,
     topology: ReplicatedTopology,
@@ -379,251 +267,372 @@ pub struct VerifierLifecycle {
 
 impl PrivateErScenario for VerifierLifecycle {
     async fn setup(base: Rc<BaseCtx>, _: ()) -> Result<Self> {
-        let topology = crate::phase(
-            "boot",
-            topology::replicated(
-                &base,
-                ReplicatedOptions {
-                    label: LABEL.to_owned(),
-                    verifiers: VERIFIERS,
-                    settings: Box::new(|params| {
-                        params.engine.blockstore.superblock = SUPERBLOCK_SLOTS;
-                        params.engine.ledger.size_limit = LEDGER_SIZE_LIMIT_BYTES;
-                    }),
-                },
-            ),
+        let topology = topology::replicated(
+            &base,
+            ReplicatedOptions {
+                label: LABEL.to_owned(),
+                verifiers: VERIFIERS,
+                settings: Box::new(|params| {
+                    params.engine.blockstore.superblock = SUPERBLOCK_SLOTS;
+                    params.engine.ledger.size_limit = LEDGER_SIZE_LIMIT_BYTES;
+                }),
+            },
         )
         .await?;
 
         Ok(Self { base, topology })
     }
 
-    async fn run(self) -> Result<()> {
-        let Self { base, mut topology } = self;
-        crate::phase("boot", async {
-            topology.leader().wait_ready(READY_TIMEOUT).await?;
-            topology.wait_verifiers_connected(CONNECT_TIMEOUT).await?;
-            let leader_executors = executors_in_log(topology.leader().log())?;
-            let mut verifier_executors = Vec::with_capacity(VERIFIERS);
-            for verifier in topology.verifiers() {
-                verifier_executors.push(executors_in_log(verifier.log())?);
-            }
-            debug!(
-                leader_executors,
-                ?verifier_executors,
-                "replicated topology ready",
-            );
-            Ok(())
-        })
-        .await?;
+    async fn run(mut self) -> Result<()> {
+        self.check_ready().await?;
 
-        crate::phase("replication connections", verify_connections(&topology)).await?;
-        crate::phase(
-            "startup replication",
-            catch_up_fleet(&topology, &[TRANSACTIONS, BLOCKS]),
-        )
-        .await?;
+        self.verify_connections().await?;
+        self.catch_up_fleet(&[TRANSACTIONS, BLOCKS]).await?;
 
-        let pairs = crate::phase("pair setup", prepare_pairs(&base, &topology, PAIRS)).await?;
+        let pairs = self.prepare_pairs(PAIRS).await?;
         let workload = Workload::start(pairs);
 
-        crate::phase("steady load", async {
-            let (max_lag, _) = sample_lag(&topology, STEADY).await?;
-            catch_up_fleet(&topology, &[TRANSACTIONS]).await?;
-            verify_no_mismatch(&topology).await?;
-            debug!(
-                sent = workload.sent(),
-                ?max_lag,
-                "steady replication load finished",
-            );
-            Ok(())
-        })
-        .await?;
+        self.check_steady_load(&workload).await?;
 
-        crate::phase("verifier 0 retained-cursor restart", async {
-            await_leader_advance(
-                &topology,
-                BLOCKS,
-                SUPERBLOCK_SLOTS as f64,
-                "a fresh superblock boundary before the retained-cursor \
+        self.restart_retained_cursor().await?;
+
+        let server_snapshots_before = leader_count(&self.topology, SERVER_SNAPSHOTS).await?;
+        let truncations_before = leader_count(&self.topology, TRUNCATIONS).await?;
+        stop_verifier(self.topology.verifier_mut(1), false).await?;
+
+        self.check_retention_gap().await?;
+
+        self.recover_snapshot(server_snapshots_before, truncations_before).await?;
+
+        self.kill_verifier().await?;
+
+        self.rejoin_wiped().await?;
+
+        let (pairs, _) = workload.stop(&self.topology).await?;
+        self.check_final_boundary(&pairs).await?;
+
+        self.topology.finish().await
+    }
+}
+
+impl VerifierLifecycle {
+    #[instrument(skip_all, err)]
+    async fn check_ready(&self) -> Result<()> {
+        self.topology.leader().wait_ready(READY_TIMEOUT).await?;
+        self.topology.wait_verifiers_connected(CONNECT_TIMEOUT).await?;
+        let leader_executors = executors_in_log(self.topology.leader().log())?;
+        let mut verifier_executors = Vec::with_capacity(VERIFIERS);
+        for verifier in self.topology.verifiers() {
+            verifier_executors.push(executors_in_log(verifier.log())?);
+        }
+        debug!(
+            leader_executors,
+            ?verifier_executors,
+            "replicated topology ready",
+        );
+        Ok(())
+    }
+
+    #[instrument(skip_all, err)]
+    async fn check_steady_load(&self, workload: &Workload) -> Result<()> {
+        let (max_lag, _) = self.sample_lag(STEADY).await?;
+        self.catch_up_fleet(&[TRANSACTIONS]).await?;
+        self.verify_no_mismatch().await?;
+        debug!(
+            sent = workload.sent(),
+            ?max_lag,
+            "steady replication load finished",
+        );
+        Ok(())
+    }
+
+    #[instrument(skip_all, err)]
+    async fn restart_retained_cursor(&mut self) -> Result<()> {
+        await_leader_advance(
+            &self.topology,
+            BLOCKS,
+            SUPERBLOCK_SLOTS as f64,
+            "a fresh superblock boundary before the retained-cursor \
                  restart",
-            )
-            .await?;
-            let restart_started = Instant::now();
-            stop_verifier(topology.verifier_mut(0), false).await?;
-            topology.verifier_mut(0).start(READY_TIMEOUT).await?;
-            let restart_elapsed = restart_started.elapsed();
-            ensure!(restart_elapsed <= RESTART_BUDGET);
-            topology.verifier(0).wait_connected(CONNECT_TIMEOUT).await?;
-            let snapshots = verifier_count(topology.verifier(0), CLIENT_SNAPSHOTS).await?;
-            ensure!(snapshots == 0.0);
-            let target = leader_metric(&topology, TRANSACTIONS).await?;
-            let catch_up = await_catch_up(topology.verifier(0), TRANSACTIONS, target).await?;
-            await_leader_connections(&topology, VERIFIERS).await?;
-            verify_no_mismatch(&topology).await?;
-            debug!(
-                catch_up_secs = catch_up.as_secs_f64(),
-                snapshots, "verifier restarted on retained cursor",
-            );
-            Ok(())
-        })
-        .await?;
-
-        let server_snapshots_before = leader_count(&topology, SERVER_SNAPSHOTS).await?;
-        let truncations_before = leader_count(&topology, TRUNCATIONS).await?;
-        crate::phase(
-            "verifier 1 clean stop out of retention",
-            stop_verifier(topology.verifier_mut(1), false),
         )
         .await?;
+        let restart_started = Instant::now();
+        stop_verifier(self.topology.verifier_mut(0), false).await?;
+        self.topology.verifier_mut(0).start(READY_TIMEOUT).await?;
+        let restart_elapsed = restart_started.elapsed();
+        ensure!(restart_elapsed <= RESTART_BUDGET);
+        self.topology.verifier(0).wait_connected(CONNECT_TIMEOUT).await?;
+        let snapshots = verifier_count(self.topology.verifier(0), CLIENT_SNAPSHOTS).await?;
+        ensure!(snapshots == 0.0);
+        let target = leader_metric(&self.topology, TRANSACTIONS).await?;
+        let catch_up = await_catch_up(self.topology.verifier(0), TRANSACTIONS, target).await?;
+        self.await_leader_connections(VERIFIERS).await?;
+        self.verify_no_mismatch().await?;
+        debug!(
+            catch_up_secs = catch_up.as_secs_f64(),
+            snapshots, "verifier restarted on retained cursor",
+        );
+        Ok(())
+    }
 
-        crate::phase("verifier 1 clean stop out of retention", async {
-            await_leader_connections(&topology, 1).await?;
-            // A block produced after shutdown is beyond the stopped
-            // cursor. Observe it before waiting for retention to remove
-            // its superblock.
-            let slot = topology.leader().ctx().api().get_slot().await? + 1;
-            let pruned = async {
-                for retained in [true, false] {
-                    topology
-                        .leader()
-                        .ctx()
-                        .api()
-                        .await_query(
-                            &format!(
-                                "leader block {slot} retained={retained} \
+    #[instrument(skip_all, err)]
+    async fn check_retention_gap(&self) -> Result<()> {
+        self.await_leader_connections(1).await?;
+        // A block produced after shutdown is beyond the stopped
+        // cursor. Observe it before waiting for retention to remove
+        // its superblock.
+        let slot = self.topology.leader().ctx().api().get_slot().await? + 1;
+        let pruned = async {
+            for retained in [true, false] {
+                self.topology
+                    .leader()
+                    .ctx()
+                    .api()
+                    .await_query(
+                        &format!(
+                            "leader block {slot} retained={retained} \
                                  after verifier 1 stopped"
-                            ),
-                            async || {
-                                let block = topology.leader().ctx().api().get_block(slot).await?;
-                                ensure!(block.is_some() == retained);
-                                Ok(())
-                            },
-                        )
-                        .await?;
-                }
-                Result::Ok(())
-            };
-            let survivor = async {
-                let slot_before = topology.leader().ctx().api().get_slot().await?;
-                let blocks = blocks_advance(topology.verifier(0)).await?;
-                let slot_after = topology.leader().ctx().api().get_slot().await?;
-                ensure!(slot_after > slot_before);
-                let target = leader_metric(&topology, TRANSACTIONS).await?;
-                await_catch_up(topology.verifier(0), TRANSACTIONS, target).await?;
-                Result::Ok(blocks)
-            };
-            let ((), blocks) = tokio::try_join!(pruned, survivor)?;
-            Ok(blocks)
-        })
-        .await?;
-
-        crate::phase("verifier 1 snapshot recovery", async {
-            topology.verifier_mut(1).start(READY_TIMEOUT).await?;
-            topology.verifier(1).wait_connected(CONNECT_TIMEOUT).await?;
-            let client_snapshots = verifier_count(topology.verifier(1), CLIENT_SNAPSHOTS).await?;
-            ensure!(client_snapshots >= 1.0);
-            let server_snapshots =
-                leader_count(&topology, SERVER_SNAPSHOTS).await? - server_snapshots_before;
-            ensure!(server_snapshots >= 1.0);
-            let target = leader_metric(&topology, TRANSACTIONS).await?;
-            await_catch_up(topology.verifier(1), TRANSACTIONS, target).await?;
-            await_leader_connections(&topology, VERIFIERS).await?;
-            let sealed = await_leader_advance(
-                &topology,
-                SUPERBLOCKS,
-                1.0,
-                "a superblock sealed after the snapshot recovery",
-            )
-            .await?;
-            await_catch_up(topology.verifier(1), SUPERBLOCKS, sealed).await?;
-            verify_no_mismatch(&topology).await?;
-            let truncations = leader_count(&topology, TRUNCATIONS).await? - truncations_before;
-            debug!(
-                truncations,
-                client_snapshots,
-                server_snapshots,
-                "verifier recovered beyond retention via snapshot",
-            );
-            Ok(())
-        })
-        .await?;
-
-        crate::phase("verifier 1 sigkill", async {
-            stop_verifier(topology.verifier_mut(1), true).await?;
-            await_leader_connections(&topology, 1).await?;
-            let slot_before = topology.leader().ctx().api().get_slot().await?;
-            let lone_blocks = blocks_advance(topology.verifier(0)).await?;
-            let slot_after = topology.leader().ctx().api().get_slot().await?;
+                        ),
+                        async || {
+                            let block = self.topology.leader().ctx().api().get_block(slot).await?;
+                            ensure!(block.is_some() == retained);
+                            Ok(())
+                        },
+                    )
+                    .await?;
+            }
+            Result::Ok(())
+        };
+        let survivor = async {
+            let slot_before = self.topology.leader().ctx().api().get_slot().await?;
+            blocks_advance(self.topology.verifier(0)).await?;
+            let slot_after = self.topology.leader().ctx().api().get_slot().await?;
             ensure!(slot_after > slot_before);
-            probe_clones(&base, &topology).await?;
-            let target = leader_metric(&topology, TRANSACTIONS).await?;
-            await_catch_up(topology.verifier(0), TRANSACTIONS, target).await?;
-            ensure!(!topology.verifier(1).is_running());
-            debug!(
-                slots_advanced = slot_after - slot_before,
-                lone_blocks, target, "surviving verifier kept up while peer offline",
-            );
-            Ok(())
-        })
-        .await?;
+            let target = leader_metric(&self.topology, TRANSACTIONS).await?;
+            await_catch_up(self.topology.verifier(0), TRANSACTIONS, target).await?;
+            Result::Ok(())
+        };
+        tokio::try_join!(pruned, survivor)?;
+        Ok(())
+    }
 
-        crate::phase("verifier 1 wiped rejoin", async {
-            let served_before = leader_count(&topology, SERVER_SNAPSHOTS).await?;
-            topology.verifier_mut(1).reset_storage()?;
-            topology.verifier_mut(1).start(READY_TIMEOUT).await?;
-            topology.verifier(1).wait_connected(CONNECT_TIMEOUT).await?;
-            let client_snapshots = verifier_count(topology.verifier(1), CLIENT_SNAPSHOTS).await?;
-            ensure!(client_snapshots >= 1.0);
-            let server_snapshots = leader_count(&topology, SERVER_SNAPSHOTS).await? - served_before;
-            ensure!(server_snapshots >= 1.0);
-            let target = leader_metric(&topology, TRANSACTIONS).await?;
-            await_catch_up(topology.verifier(1), TRANSACTIONS, target).await?;
-            let blocks = blocks_advance(topology.verifier(1)).await?;
-            await_leader_connections(&topology, VERIFIERS).await?;
-            verify_no_mismatch(&topology).await?;
-            debug!(
-                client_snapshots,
-                blocks, "verifier rejoined from wiped storage",
-            );
-            Ok(())
-        })
+    #[instrument(skip_all, err)]
+    async fn recover_snapshot(
+        &mut self,
+        server_snapshots_before: f64,
+        truncations_before: f64,
+    ) -> Result<()> {
+        self.topology.verifier_mut(1).start(READY_TIMEOUT).await?;
+        self.topology.verifier(1).wait_connected(CONNECT_TIMEOUT).await?;
+        let client_snapshots = verifier_count(self.topology.verifier(1), CLIENT_SNAPSHOTS).await?;
+        ensure!(client_snapshots >= 1.0);
+        let server_snapshots =
+            leader_count(&self.topology, SERVER_SNAPSHOTS).await? - server_snapshots_before;
+        ensure!(server_snapshots >= 1.0);
+        let target = leader_metric(&self.topology, TRANSACTIONS).await?;
+        await_catch_up(self.topology.verifier(1), TRANSACTIONS, target).await?;
+        self.await_leader_connections(VERIFIERS).await?;
+        let sealed = await_leader_advance(
+            &self.topology,
+            SUPERBLOCKS,
+            1.0,
+            "a superblock sealed after the snapshot recovery",
+        )
         .await?;
+        await_catch_up(self.topology.verifier(1), SUPERBLOCKS, sealed).await?;
+        self.verify_no_mismatch().await?;
+        let truncations = leader_count(&self.topology, TRUNCATIONS).await? - truncations_before;
+        debug!(
+            truncations,
+            client_snapshots, server_snapshots, "verifier recovered beyond retention via snapshot",
+        );
+        Ok(())
+    }
 
-        crate::phase("final sealed boundary", async {
-            let (pairs, _) = workload.stop(&topology).await?;
-            let final_txs = leader_metric(&topology, TRANSACTIONS).await?;
-            await_leader_advance(
-                &topology,
-                BLOCKS,
-                SUPERBLOCK_SLOTS as f64 + 1.0,
-                "the final sealed boundary after the load",
-            )
-            .await?;
-            let leader_blocks = leader_metric(&topology, BLOCKS).await?;
-            let leader_txs = leader_metric(&topology, TRANSACTIONS).await?;
-            ensure!(leader_txs == final_txs);
-            catch_up_fleet(&topology, &[TRANSACTIONS, SUPERBLOCKS]).await?;
-            await_catch_up(topology.verifier(0), BLOCKS, leader_blocks).await?;
-            for verifier in topology.verifiers() {
-                ensure!(verifier_metric(verifier, TRANSACTIONS).await? == leader_txs);
+    #[instrument(skip_all, err)]
+    async fn kill_verifier(&mut self) -> Result<()> {
+        stop_verifier(self.topology.verifier_mut(1), true).await?;
+        self.await_leader_connections(1).await?;
+        let slot_before = self.topology.leader().ctx().api().get_slot().await?;
+        let lone_blocks = blocks_advance(self.topology.verifier(0)).await?;
+        let slot_after = self.topology.leader().ctx().api().get_slot().await?;
+        ensure!(slot_after > slot_before);
+        self.probe_clones().await?;
+        let target = leader_metric(&self.topology, TRANSACTIONS).await?;
+        await_catch_up(self.topology.verifier(0), TRANSACTIONS, target).await?;
+        ensure!(!self.topology.verifier(1).is_running());
+        debug!(
+            slots_advanced = slot_after - slot_before,
+            lone_blocks, target, "surviving verifier kept up while peer offline",
+        );
+        Ok(())
+    }
+
+    #[instrument(skip_all, err)]
+    async fn rejoin_wiped(&mut self) -> Result<()> {
+        let served_before = leader_count(&self.topology, SERVER_SNAPSHOTS).await?;
+        self.topology.verifier_mut(1).reset_storage()?;
+        self.topology.verifier_mut(1).start(READY_TIMEOUT).await?;
+        self.topology.verifier(1).wait_connected(CONNECT_TIMEOUT).await?;
+        let client_snapshots = verifier_count(self.topology.verifier(1), CLIENT_SNAPSHOTS).await?;
+        ensure!(client_snapshots >= 1.0);
+        let server_snapshots =
+            leader_count(&self.topology, SERVER_SNAPSHOTS).await? - served_before;
+        ensure!(server_snapshots >= 1.0);
+        let target = leader_metric(&self.topology, TRANSACTIONS).await?;
+        await_catch_up(self.topology.verifier(1), TRANSACTIONS, target).await?;
+        let blocks = blocks_advance(self.topology.verifier(1)).await?;
+        self.await_leader_connections(VERIFIERS).await?;
+        self.verify_no_mismatch().await?;
+        debug!(
+            client_snapshots,
+            blocks, "verifier rejoined from wiped storage",
+        );
+        Ok(())
+    }
+
+    #[instrument(skip_all, err)]
+    async fn check_final_boundary(&self, pairs: &[CausalPair]) -> Result<()> {
+        let final_txs = leader_metric(&self.topology, TRANSACTIONS).await?;
+        await_leader_advance(
+            &self.topology,
+            BLOCKS,
+            SUPERBLOCK_SLOTS as f64 + 1.0,
+            "the final sealed boundary after the load",
+        )
+        .await?;
+        let leader_blocks = leader_metric(&self.topology, BLOCKS).await?;
+        let leader_txs = leader_metric(&self.topology, TRANSACTIONS).await?;
+        ensure!(leader_txs == final_txs);
+        self.catch_up_fleet(&[TRANSACTIONS, SUPERBLOCKS]).await?;
+        await_catch_up(self.topology.verifier(0), BLOCKS, leader_blocks).await?;
+        for verifier in self.topology.verifiers() {
+            ensure!(verifier_metric(verifier, TRANSACTIONS).await? == leader_txs);
+        }
+        self.verify_no_mismatch().await?;
+        self.verify_pairs(pairs).await?;
+        leader_metric(&self.topology, SUPERBLOCKS).await?;
+        let mut verifier_superblocks = Vec::with_capacity(VERIFIERS);
+        for verifier in self.topology.verifiers() {
+            verifier_superblocks.push(verifier_metric(verifier, SUPERBLOCKS).await?);
+        }
+        debug!(
+            leader_txs,
+            ?verifier_superblocks,
+            "final replicated account state verified",
+        );
+        Ok(())
+    }
+
+    #[instrument(skip_all, err)]
+    async fn catch_up_fleet(&self, names: &[&str]) -> Result<Duration> {
+        let mut slowest = Duration::ZERO;
+        for name in names {
+            let target = leader_metric(&self.topology, name).await?;
+            for verifier in self.topology.verifiers() {
+                slowest = slowest.max(await_catch_up(verifier, name, target).await?);
             }
-            verify_no_mismatch(&topology).await?;
-            verify_pairs(&topology, &pairs).await?;
-            leader_metric(&topology, SUPERBLOCKS).await?;
-            let mut verifier_superblocks = Vec::with_capacity(VERIFIERS);
-            for verifier in topology.verifiers() {
-                verifier_superblocks.push(verifier_metric(verifier, SUPERBLOCKS).await?);
-            }
-            debug!(
-                leader_txs,
-                ?verifier_superblocks,
-                "final replicated account state verified",
-            );
-            Ok(())
-        })
-        .await?;
+        }
+        Ok(slowest)
+    }
 
-        crate::phase("teardown", topology.finish()).await
+    async fn await_leader_connections(&self, expected: usize) -> Result<()> {
+        wait::retry(
+            &format!("the leader serving {expected} replication connection(s)"),
+            DETACH_TIMEOUT,
+            async || {
+                ensure!(self.topology.leader_connections().await? == expected as f64);
+                Ok(())
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
+    #[instrument(skip_all, err)]
+    async fn verify_connections(&self) -> Result<()> {
+        for verifier in self.topology.verifiers() {
+            ensure!(verifier.stream_connected().await);
+        }
+        ensure!(self.topology.leader_connections().await? == (VERIFIERS as f64));
+        Ok(())
+    }
+
+    async fn sample_lag(&self, window: Duration) -> Result<(Vec<f64>, usize)> {
+        let deadline = time::Instant::now() + window;
+        let mut max_lag = vec![0.0f64; self.topology.verifiers().len()];
+        let mut samples = 0usize;
+        while time::Instant::now() < deadline {
+            let leader = leader_metric(&self.topology, TRANSACTIONS).await?;
+            for (index, verifier) in self.topology.verifiers().iter().enumerate() {
+                let seen = verifier_metric(verifier, TRANSACTIONS).await?;
+                max_lag[index] = max_lag[index].max(leader - seen);
+            }
+            samples += 1;
+            time::sleep(LAG_SAMPLE).await;
+        }
+        Ok((max_lag, samples))
+    }
+
+    async fn verify_pairs(&self, pairs: &[CausalPair]) -> Result<()> {
+        let leader = self.topology.leader().ctx();
+        for (index, pair) in pairs.iter().enumerate() {
+            pair.verify(leader, &format!("pair {index} on the leader")).await?;
+        }
+        Ok(())
+    }
+
+    async fn verify_no_mismatch(&self) -> Result<()> {
+        for verifier in self.topology.verifiers() {
+            ensure!(verifier.is_running());
+            ensure!(verifier.stream_connected().await);
+            ensure!(verifier_count(verifier, STATE_MISMATCHES).await? == 0.0);
+            if let Some(line) = log_mentions_mismatch(verifier.log())? {
+                return Err(anyhow!(
+                    "verifier {}: replication mismatch: {line}",
+                    verifier.label()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    async fn probe_clones(&self) -> Result<()> {
+        let leader = self.topology.leader().ctx();
+        for _ in 0..PROBES {
+            let probe = self.base.funded_payer(PROBE_LAMPORTS).await?;
+            let address = probe.pubkey();
+            leader
+                .api()
+                .await_accounts(&[address], "leader clones the probe", async || {
+                    let account =
+                        leader.account(&address).await?.context("probe account missing")?;
+                    ensure!(account.lamports > 0);
+                    Ok(())
+                })
+                .await?;
+        }
+        Ok(())
+    }
+
+    #[instrument(skip_all, err)]
+    async fn prepare_pairs(&self, count: usize) -> Result<Vec<CausalPair>> {
+        let leader = self.topology.leader();
+        let payers = self.base.funded_payers(count * PAYERS_PER_PAIR, PAYER_LAMPORTS).await?;
+        let accounts = Accounts::new(ACCOUNT_SPACE, leader.identity());
+        let mut pairs = Vec::with_capacity(count);
+        for index in 0..count {
+            let owner = &payers[index * PAYERS_PER_PAIR];
+            let pdas = accounts.init_delegated(self.base.as_ref(), owner, 2).await?;
+            leader.ctx().await_clones(&pdas, ACCOUNT_SPACE as usize).await?;
+            let senders = payers[index * PAYERS_PER_PAIR..(index + 1) * PAYERS_PER_PAIR]
+                .iter()
+                .map(|payer| leader.ctx().sender(Rc::new(payer.insecure_clone())))
+                .collect();
+            pairs.push(CausalPair::new([pdas[0], pdas[1]], senders));
+        }
+        let payer_keys: Vec<Pubkey> = payers.iter().map(|payer| payer.pubkey()).collect();
+        leader.ctx().await_cloned_payers(&payer_keys).await?;
+        Ok(pairs)
     }
 }

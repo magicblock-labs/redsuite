@@ -2,17 +2,16 @@ use std::time::{Duration, Instant};
 
 use account::Account;
 use anyhow::{ensure, Context};
-use keypair::Keypair;
-use pubkey::Pubkey;
-use redsuite_core::{check, dlp, system, BaseCtx, ChainCtx, ErCtx, Result};
+use redsuite_core::{check, dlp, system, ChainCtx, Result};
 use sdk::spl::{
     builders::{InitializeRentPdaBuilder, WithdrawThroughDelegatedShuttleWithMergeBuilder},
     find_rent_pda,
 };
 use signer::Signer;
 use tokio::time;
+use tracing::instrument;
 
-use super::{amount, balances, spl, Wallet, SUPPLY};
+use super::{amount, spl, ProjectedTokenLifecycle, Wallet, SUPPLY};
 
 const RECEIVE: u64 = 60;
 const DEPOSIT: u64 = 45;
@@ -47,12 +46,7 @@ impl Case {
 }
 
 pub(super) struct MagicAtas<'a> {
-    base: &'a BaseCtx,
-    er: &'a ErCtx,
-    funder: &'a Keypair,
-    mint: Pubkey,
-    wallets: &'a [Wallet; 4],
-    vault: &'a [Pubkey; 2],
+    tokens: &'a ProjectedTokenLifecycle,
     source_balance: u64,
     extra_base: u64,
     extra_claims: u64,
@@ -60,70 +54,64 @@ pub(super) struct MagicAtas<'a> {
 }
 
 impl MagicAtas<'_> {
-    pub(super) async fn run(
-        base: &BaseCtx,
-        er: &ErCtx,
-        funder: &Keypair,
-        mint: Pubkey,
-        wallets: &[Wallet; 4],
-        vault: &[Pubkey; 2],
-    ) -> Result<()> {
+    pub(super) async fn run(tokens: &ProjectedTokenLifecycle) -> Result<()> {
         let mut suite = MagicAtas {
-            base,
-            er,
-            funder,
-            mint,
-            wallets,
-            vault,
-            source_balance: amount(er, &wallets[1].ata).await?,
+            tokens,
+            source_balance: amount(tokens.private.ctx(), &tokens.wallets[1].ata).await?,
             extra_base: 0,
             extra_claims: 0,
             supply: SUPPLY,
         };
-        let destinations: [Wallet; 5] = std::array::from_fn(|_| Wallet::new(&mint));
+        let destinations: [Wallet; 5] = std::array::from_fn(|_| Wallet::new(&tokens.mint.pubkey()));
         suite.prepare().await?;
-        crate::phase("empty Magic ATA creation", suite.empty()).await?;
+        suite.empty().await?;
         for (case, destination) in Case::ALL.into_iter().zip(&destinations) {
-            crate::phase(case.label(), suite.run_case(destination, case)).await?;
+            suite.run_case(destination, case).await?;
         }
         Ok(())
     }
 
     async fn prepare(&self) -> Result<()> {
+        let tokens = self.tokens;
         let rent = find_rent_pda().0;
-        if self.base.account(&rent).await?.is_none() {
-            self.base
+        if tokens.base.account(&rent).await?.is_none() {
+            tokens
+                .base
                 .submit_and_confirm(
-                    self.funder,
-                    &[InitializeRentPdaBuilder { payer: self.funder.pubkey() }.instruction()],
+                    &tokens.payer,
+                    &[InitializeRentPdaBuilder { payer: tokens.payer.pubkey() }.instruction()],
                 )
                 .await?;
         }
-        self.base
+        tokens
+            .base
             .submit_and_confirm(
-                self.funder,
+                &tokens.payer,
                 &[
-                    system::transfer(&self.funder.pubkey(), &rent, 100_000_000),
-                    dlp::top_up_ephemeral_balance(&self.funder.pubkey(), 10_000_000, 255),
+                    system::transfer(&tokens.payer.pubkey(), &rent, 100_000_000),
+                    dlp::top_up_ephemeral_balance(&tokens.payer.pubkey(), 10_000_000, 255),
                 ],
             )
             .await?;
         Ok(())
     }
 
+    #[instrument(skip_all, err)]
     async fn empty(&self) -> Result<()> {
-        let empty = Wallet::new(&self.mint);
-        self.er
-            .submit_and_confirm(self.funder, &[empty.ensure(self.funder.pubkey())])
+        let tokens = self.tokens;
+        let er = tokens.private.ctx();
+        let empty = Wallet::new(&tokens.mint.pubkey());
+        er.submit_and_confirm(&tokens.payer, &[empty.ensure(tokens.payer.pubkey())])
             .await?;
-        let account = self.er.account(&empty.ata).await?.context("empty Magic ATA missing")?;
+        let account = er.account(&empty.ata).await?.context("empty Magic ATA missing")?;
         ensure!(spl::is_magic_ata(&account.data));
-        ensure!(amount(self.er, &empty.ata).await? == 0);
+        ensure!(amount(er, &empty.ata).await? == 0);
         self.close(&empty).await?;
-        ensure!(self.er.account(&empty.ata).await?.is_none());
+        ensure!(er.account(&empty.ata).await?.is_none());
         Ok(())
     }
 
+    #[instrument(skip_all, err, fields(case = case.label()))]
     async fn run_case(&mut self, destination: &Wallet, case: Case) -> Result<()> {
         let readonly = if case == Case::Readonly {
             Some(self.readonly(destination).await?)
@@ -152,28 +140,30 @@ impl MagicAtas<'_> {
     }
 
     async fn readonly(&mut self, destination: &Wallet) -> Result<Account> {
-        let source = &self.wallets[1];
-        self.base
+        let tokens = self.tokens;
+        let er = tokens.private.ctx();
+        let source = &tokens.wallets[1];
+        tokens
+            .base
             .submit_and_confirm(
-                self.funder,
+                &tokens.payer,
                 &[
-                    destination.create(self.funder.pubkey()),
-                    destination.mint_to(self.funder.pubkey(), DEPOSIT),
+                    destination.create(tokens.payer.pubkey()),
+                    destination.mint_to(tokens.payer.pubkey(), DEPOSIT),
                 ],
             )
             .await?;
         self.supply += DEPOSIT;
         self.extra_base += DEPOSIT;
-        let original = self.base.account(&destination.ata).await?.context("base ATA missing")?;
-        ensure!(self.er.account(&destination.ata).await?.as_ref() == Some(&original));
-        let attempt = self
-            .er
+        let original = tokens.base.account(&destination.ata).await?.context("base ATA missing")?;
+        ensure!(er.account(&destination.ata).await?.as_ref() == Some(&original));
+        let attempt = er
             .submit_and_confirm_with(
-                self.funder,
+                &tokens.payer,
                 &[&destination.owner, &source.owner],
                 &[
                     destination.transfer_to(source, DEPOSIT),
-                    destination.ensure(self.funder.pubkey()),
+                    destination.ensure(tokens.payer.pubkey()),
                     source.transfer_to(destination, RECEIVE),
                 ],
             )
@@ -189,55 +179,60 @@ impl MagicAtas<'_> {
             ],
             &format!("{error:#}"),
         )?;
-        ensure!(self.er.account(&destination.ata).await?.as_ref() == Some(&original));
-        ensure!(amount(self.er, &source.ata).await? == self.source_balance);
+        ensure!(er.account(&destination.ata).await?.as_ref() == Some(&original));
+        ensure!(amount(er, &source.ata).await? == self.source_balance);
         Ok(original)
     }
 
     async fn receive(&self, destination: &Wallet, expected_base: Option<u64>) -> Result<()> {
-        let source = &self.wallets[1];
-        self.er
-            .submit_and_confirm_with(
-                self.funder,
-                &[&source.owner],
-                &[
-                    destination.ensure(self.funder.pubkey()),
-                    source.transfer_to(destination, RECEIVE),
-                ],
-            )
-            .await?;
-        ensure!(amount(self.er, &destination.ata).await? == RECEIVE);
-        ensure!(amount(self.er, &source.ata).await? == (self.source_balance - RECEIVE));
-        let account = self.er.account(&destination.ata).await?.context("Magic ATA missing")?;
+        let tokens = self.tokens;
+        let er = tokens.private.ctx();
+        let source = &tokens.wallets[1];
+        er.submit_and_confirm_with(
+            &tokens.payer,
+            &[&source.owner],
+            &[
+                destination.ensure(tokens.payer.pubkey()),
+                source.transfer_to(destination, RECEIVE),
+            ],
+        )
+        .await?;
+        ensure!(amount(er, &destination.ata).await? == RECEIVE);
+        ensure!(amount(er, &source.ata).await? == (self.source_balance - RECEIVE));
+        let account = er.account(&destination.ata).await?.context("Magic ATA missing")?;
         ensure!(spl::is_magic_ata(&account.data));
-        ensure!(spl::token_balance(self.base, &destination.ata).await? == expected_base);
+        ensure!(spl::token_balance(tokens.base.as_ref(), &destination.ata).await? == expected_base);
         Ok(())
     }
 
     async fn drain(&self, destination: &Wallet) -> Result<()> {
-        let source = &self.wallets[1];
-        self.er
-            .submit_and_confirm_with(
-                self.funder,
-                &[&destination.owner],
-                &[destination.transfer_to(source, RECEIVE)],
-            )
-            .await?;
-        ensure!(amount(self.er, &source.ata).await? == self.source_balance);
+        let tokens = self.tokens;
+        let er = tokens.private.ctx();
+        let source = &tokens.wallets[1];
+        er.submit_and_confirm_with(
+            &tokens.payer,
+            &[&destination.owner],
+            &[destination.transfer_to(source, RECEIVE)],
+        )
+        .await?;
+        ensure!(amount(er, &source.ata).await? == self.source_balance);
         Ok(())
     }
 
     async fn project(&mut self, destination: &Wallet) -> Result<()> {
-        self.base
+        let tokens = self.tokens;
+        let er = tokens.private.ctx();
+        tokens
+            .base
             .submit_and_confirm_with(
-                self.funder,
+                &tokens.payer,
                 &[&destination.owner],
                 &[
-                    destination.create(self.funder.pubkey()),
-                    destination.mint_to(self.funder.pubkey(), DEPOSIT),
-                    destination.initialize(self.funder.pubkey()),
+                    destination.create(tokens.payer.pubkey()),
+                    destination.mint_to(tokens.payer.pubkey(), DEPOSIT),
+                    destination.initialize(tokens.payer.pubkey()),
                     destination.deposit(DEPOSIT),
-                    destination.delegate(self.funder.pubkey(), self.er.identity()),
+                    destination.delegate(tokens.payer.pubkey(), er.identity()),
                 ],
             )
             .await?;
@@ -246,9 +241,9 @@ impl MagicAtas<'_> {
         let until = Instant::now() + Duration::from_secs(5);
         loop {
             let account =
-                self.er.account(&destination.ata).await?.context("empty overlay disappeared")?;
+                er.account(&destination.ata).await?.context("empty overlay disappeared")?;
             ensure!(spl::is_magic_ata(&account.data));
-            ensure!(amount(self.er, &destination.ata).await? == 0);
+            ensure!(amount(er, &destination.ata).await? == 0);
             if Instant::now() >= until {
                 break;
             }
@@ -258,20 +253,23 @@ impl MagicAtas<'_> {
     }
 
     async fn close(&self, destination: &Wallet) -> Result<()> {
-        self.er
-            .submit_and_confirm_with(self.funder, &[&destination.owner], &[destination.close()])
+        let tokens = self.tokens;
+        tokens
+            .private
+            .ctx()
+            .submit_and_confirm_with(&tokens.payer, &[&destination.owner], &[destination.close()])
             .await?;
         Ok(())
     }
 
     async fn await_restored(&self, destination: &Wallet, original: Option<Account>) -> Result<()> {
-        self.er
-            .api()
+        let er = self.tokens.private.ctx();
+        er.api()
             .await_accounts(
                 &[destination.ata],
                 "close restores the base ATA or permits eATA projection",
                 async || {
-                    ensure!(self.er.account(&destination.ata).await? == original);
+                    ensure!(er.account(&destination.ata).await? == original);
                     Ok(())
                 },
             )
@@ -280,20 +278,21 @@ impl MagicAtas<'_> {
     }
 
     async fn await_projection(&self, destination: &Wallet) -> Result<()> {
-        let base_ata = self.base.account(&destination.ata).await?.context("base ATA missing")?;
-        self.er
-            .api()
+        let tokens = self.tokens;
+        let er = tokens.private.ctx();
+        let base_ata = tokens.base.account(&destination.ata).await?.context("base ATA missing")?;
+        er.api()
             .await_accounts(
                 &[destination.ata],
                 "close restores the base ATA or permits eATA projection",
                 async || {
                     let account =
-                        self.er.account(&destination.ata).await?.context("projection missing")?;
+                        er.account(&destination.ata).await?.context("projection missing")?;
                     ensure!(!spl::is_magic_ata(&account.data));
                     ensure!(account.owner == spl::token_program());
                     ensure!(account.data.len() == spl::TOKEN_ACCOUNT_LEN);
                     ensure!(account.lamports == base_ata.lamports);
-                    ensure!(amount(self.er, &destination.ata).await? == DEPOSIT);
+                    ensure!(amount(er, &destination.ata).await? == DEPOSIT);
                     Ok(())
                 },
             )
@@ -302,45 +301,50 @@ impl MagicAtas<'_> {
     }
 
     async fn withdraw(&mut self, destination: &Wallet, case: Case) -> Result<()> {
+        let tokens = self.tokens;
+        let er = tokens.private.ctx();
         let shuttle = WithdrawThroughDelegatedShuttleWithMergeBuilder {
-            payer: self.funder.pubkey(),
+            payer: tokens.payer.pubkey(),
             owner: destination.owner.pubkey(),
             owner_ata: destination.ata,
-            mint: self.mint,
+            mint: tokens.mint.pubkey(),
             shuttle_id: if case == Case::FullShuttle { 3 } else { 4 },
             amount: RECEIVE,
-            validator: Some(self.er.identity()),
+            validator: Some(er.identity()),
         }
         .instruction();
         let shuttle_accounts: Vec<_> =
             shuttle.accounts[2..5].iter().map(|meta| meta.pubkey).collect();
-        let mut instructions = vec![destination.create(self.funder.pubkey())];
+        let mut instructions = vec![destination.create(tokens.payer.pubkey())];
         if case == Case::TransparentShuttle {
             instructions.extend([
-                destination.initialize(self.funder.pubkey()),
-                destination.delegate(self.funder.pubkey(), self.er.identity()),
+                destination.initialize(tokens.payer.pubkey()),
+                destination.delegate(tokens.payer.pubkey(), er.identity()),
             ]);
         }
         instructions.push(shuttle);
-        self.base
-            .submit_and_confirm_with(self.funder, &[&destination.owner], &instructions)
+        tokens
+            .base
+            .submit_and_confirm_with(&tokens.payer, &[&destination.owner], &instructions)
             .await?;
-        self.base
+        tokens
+            .base
             .api()
             .await_query("shuttle settlement and cleanup", async || {
-                ensure!(amount(self.base, &destination.ata).await? == RECEIVE);
-                if let Some(local) = self.er.account(&destination.ata).await? {
+                ensure!(amount(tokens.base.as_ref(), &destination.ata).await? == RECEIVE);
+                if let Some(local) = er.account(&destination.ata).await? {
                     ensure!(!spl::is_magic_ata(&local.data));
                 }
                 for address in &shuttle_accounts {
-                    ensure!(self.base.account(address).await?.is_none());
+                    ensure!(tokens.base.account(address).await?.is_none());
                 }
                 Ok(())
             })
             .await?;
         if case == Case::TransparentShuttle {
             ensure!(
-                self.base.account(&destination.eata).await?.map(|a| a.owner) == Some(dlp::dlp_id())
+                tokens.base.account(&destination.eata).await?.map(|a| a.owner)
+                    == Some(dlp::dlp_id())
             );
         }
         self.source_balance -= RECEIVE;
@@ -349,8 +353,9 @@ impl MagicAtas<'_> {
     }
 
     async fn check_conservation(&self) -> Result<()> {
-        ensure!(amount(self.er, &self.wallets[1].ata).await? == self.source_balance);
-        let state = balances(self.base, self.er, self.wallets, self.vault).await?;
+        let tokens = self.tokens;
+        ensure!(amount(tokens.private.ctx(), &tokens.wallets[1].ata).await? == self.source_balance);
+        let state = tokens.balances().await?;
         state.check_supply(
             state.projected[..2].iter().sum::<u64>() + self.extra_claims,
             self.extra_base,

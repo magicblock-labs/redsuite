@@ -42,54 +42,53 @@ impl Scenario for LoaderMatrix {
     }
 
     async fn run(self) -> Result<()> {
-        let Self { base, er, payer } = self;
-        let payer = &payer;
         let memo_v1 = MEMO_V1_ID;
         let memo_v2 = MEMO_V2_ID;
 
         let base_memo_v1 =
-            base.account(&memo_v1).await?.context("memo v1 is not on the base chain")?;
+            self.base.account(&memo_v1).await?.context("memo v1 is not on the base chain")?;
         invoke_until(
-            &er,
-            payer,
+            &self.er,
+            &self.payer,
             |attempt| memo_instruction(memo_v1, attempt),
             |logs| program_succeeded(logs, &memo_v1),
         )
         .await?;
-        let (v1_owner, v1_data) = cloned_program(&er, &memo_v1).await?;
+        let (v1_owner, v1_data) = cloned_program(&self.er, &memo_v1).await?;
         ensure!(v1_owner == sdk_ids::bpf_loader_deprecated::ID);
         ensure!(v1_data == base_memo_v1.data);
 
         let base_memo_v2 =
-            base.account(&memo_v2).await?.context("memo v2 is not on the base chain")?;
+            self.base.account(&memo_v2).await?.context("memo v2 is not on the base chain")?;
         invoke_until(
-            &er,
-            payer,
+            &self.er,
+            &self.payer,
             |attempt| memo_instruction(memo_v2, attempt),
             has_memo,
         )
         .await?;
-        let (v2_owner, v2_data) = cloned_program(&er, &memo_v2).await?;
+        let (v2_owner, v2_data) = cloned_program(&self.er, &memo_v2).await?;
         ensure!(v2_owner == sdk_ids::loader_v4::ID);
         ensure!(v2_data == base_memo_v2.data);
 
         let (v3_id, _) = topology::redshift_loader_v3_target();
         let v3_logs = invoke_until(
-            &er,
-            payer,
+            &self.er,
+            &self.payer,
             |attempt| Redshift::at(v3_id).log(&format!("probe {attempt}")),
             has_log_msg,
         )
         .await?;
         let v3_programdata =
             Pubkey::find_program_address(&[v3_id.as_ref()], &sdk_ids::bpf_loader_upgradeable::ID).0;
-        let mut base_v3_programdata = base
+        let mut base_v3_programdata = self
+            .base
             .account(&v3_programdata)
             .await?
             .context("the v3 programdata account is not on the base chain")?
             .data;
         let base_v3_elf = base_v3_programdata.split_off(LOADER_V3_PROGRAMDATA_METADATA);
-        let (v3_owner, v3_data) = cloned_program(&er, &v3_id).await?;
+        let (v3_owner, v3_data) = cloned_program(&self.er, &v3_id).await?;
         ensure!(v3_owner == sdk_ids::loader_v4::ID);
         ensure!(v3_data == base_v3_elf);
         ensure!(v3_logs.iter().any(|line| line.contains("LogMsg:")));
