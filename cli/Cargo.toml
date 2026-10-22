@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 clap = { workspace = true }
 humantime = { workspace = true }
+rand = { workspace = true }
 tracing = { workspace = true }
 redsuite-core = { workspace = true }
 redline = { workspace = true }

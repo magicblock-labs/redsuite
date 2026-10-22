@@ -79,6 +79,8 @@ pub struct Run {
 pub struct CheckRun {
     #[command(flatten)]
     pub run: Run,
+    #[arg(long, value_name = "U64")]
+    pub seed: Option<u64>,
     /// Maximum concurrent fresh scenarios.
     #[arg(long, default_value = "2", value_name = "N")]
     pub fresh_concurrency: NonZeroUsize,
