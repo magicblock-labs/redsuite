@@ -43,7 +43,6 @@ fn stream_rng(
     StdRng::from_seed(digest.finalize().into())
 }
 
-/// Generate shared fixtures before planning cases.
 pub fn fixtures_rng(
     seed: u64,
     group: &str,
@@ -64,8 +63,6 @@ pub struct Case<T> {
     description: String,
 }
 
-/// Generate the full plan before submitting work. Serialize public inputs only;
-/// use supplied streams and immutable fixtures.
 pub fn plan<'a, T: Serialize>(
     seed: u64,
     group: &str,
