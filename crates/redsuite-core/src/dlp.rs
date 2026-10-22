@@ -1,21 +1,20 @@
 // Convenience layer over dlp-api: shorter argument lists and the ids/pdas in
 // one place. Nothing here encodes DLP instructions itself.
-use dlp_api::{
-    args::DelegateEphemeralBalanceArgs,
-    instruction_builder::{self, Encryptable},
-    state::DelegationMetadata,
-};
+use anyhow::Context;
 pub use dlp_api::{
     args::{CommitStateArgs, DelegateArgs},
     pda::{
         delegate_buffer_pda_from_delegated_account_and_owner_program as delegate_buffer_pda,
         delegation_metadata_pda_from_delegated_account as delegation_metadata_pda,
         delegation_record_pda_from_delegated_account as delegation_record_pda,
-        ephemeral_balance_pda_from_payer as ephemeral_balance_pda,
         magic_fee_vault_pda_from_validator as magic_fee_vault_pda,
         validator_fees_vault_pda_from_validator as validator_fees_vault_pda,
     },
     ID as DELEGATION_PROGRAM_ID,
+};
+use dlp_api::{
+    instruction_builder::{self, Encryptable},
+    state::DelegationMetadata,
 };
 use instruction::Instruction;
 use pubkey::Pubkey;
@@ -87,49 +86,11 @@ pub fn undelegate(
 }
 
 pub fn top_up_ephemeral_balance(payer: &Pubkey, lamports: u64, index: u8) -> Instruction {
-    top_up_ephemeral_balance_for(payer, payer, lamports, index)
-}
-
-pub fn top_up_ephemeral_balance_for(
-    funder: &Pubkey,
-    beneficiary: &Pubkey,
-    lamports: u64,
-    index: u8,
-) -> Instruction {
-    instruction_builder::top_up_ephemeral_balance(
-        *funder,
-        *beneficiary,
-        Some(lamports),
-        Some(index),
-    )
-}
-
-pub fn delegate_ephemeral_balance(payer: &Pubkey, validator: &Pubkey, index: u8) -> Instruction {
-    delegate_ephemeral_balance_for(payer, payer, validator, index)
-}
-
-pub fn delegate_ephemeral_balance_for(
-    funder: &Pubkey,
-    beneficiary: &Pubkey,
-    validator: &Pubkey,
-    index: u8,
-) -> Instruction {
-    instruction_builder::delegate_ephemeral_balance(
-        *funder,
-        *beneficiary,
-        DelegateEphemeralBalanceArgs {
-            delegate_args: delegate_args(0, validator),
-            index,
-        },
-    )
-}
-
-pub fn close_ephemeral_balance(payer: &Pubkey, index: u8) -> Instruction {
-    instruction_builder::close_ephemeral_balance(*payer, index)
+    instruction_builder::top_up_ephemeral_balance(*payer, *payer, Some(lamports), Some(index))
 }
 
 pub fn last_commit_id(delegation_metadata: &[u8]) -> Result<u64> {
     let metadata = DelegationMetadata::try_from_bytes_with_discriminator(delegation_metadata)
-        .map_err(|error| format!("decoding delegation metadata: {error:?}"))?;
+        .context("decoding delegation metadata")?;
     Ok(metadata.last_commit_id)
 }

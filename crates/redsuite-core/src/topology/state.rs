@@ -6,6 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use anyhow::Context;
 use json::{Deserialize, Serialize};
 use tokio::task;
 use url::Url;
@@ -118,6 +119,6 @@ pub(super) async fn acquire_lock() -> Result<LockGuard> {
         Ok(file)
     })
     .await
-    .map_err(|e| format!("lock task panicked: {e}"))??;
+    .context("lock task panicked")??;
     Ok(LockGuard(file))
 }

@@ -1,5 +1,6 @@
 use std::{cell::Cell, result, time::Duration};
 
+use anyhow::{anyhow, Context};
 use derive_more::Display;
 use futures_util::{
     stream::{SplitSink, SplitStream},
@@ -22,7 +23,7 @@ pub type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 pub(super) fn check_stream(error: &Option<String>) -> Result<()> {
     match error {
-        Some(error) => Err(format!("ws stream: {error}").into()),
+        Some(error) => Err(anyhow!("ws stream: {error:#}")),
         None => Ok(()),
     }
 }
@@ -36,7 +37,7 @@ pub(super) async fn await_condition(
         condition().map(|ready| ready.then_some(()))
     })
     .await?
-    .ok_or_else(|| format!("timed out waiting for {what} ({timeout:?})").into())
+    .with_context(|| format!("timed out waiting for {what} ({timeout:?})"))
 }
 
 #[derive(Debug, Clone, Display)]
@@ -120,7 +121,7 @@ where
         Ok(Message::Text(text)) => Received::Text(text),
         Ok(Message::Close(_)) => Received::Closed(CloseReason::ServerClose),
         Ok(_) => Received::Skip,
-        Err(error) => Received::Closed(CloseReason::Transport(error.to_string())),
+        Err(error) => Received::Closed(CloseReason::Transport(format!("{error:#}"))),
     }
 }
 
@@ -218,8 +219,7 @@ pub fn reply_u64(result: Option<&LazyValue<'_>>) -> Option<u64> {
 }
 
 pub async fn connect(url: &Url) -> Result<Socket> {
-    let (socket, _) =
-        connect_async(url.as_str()).await.map_err(|error| format!("{url}: {error}"))?;
+    let (socket, _) = connect_async(url.as_str()).await.with_context(|| format!("{url}"))?;
     Ok(socket)
 }
 
@@ -275,7 +275,7 @@ impl Requester {
             .await
             .send(Message::Text(request_text(id, method, params).into()))
             .await
-            .map_err(|error| format!("{method} send: {error}").into())
+            .with_context(|| format!("{method} send"))
     }
 }
 

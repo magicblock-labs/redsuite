@@ -3165,6 +3165,7 @@ dependencies = [
 name = "redhat"
 version = "2.0.0"
 dependencies = [
+ "anyhow",
  "ephemeral-rollups-sdk",
  "futures-util",
  "magicblock-magic-program-api",
@@ -3201,6 +3202,7 @@ dependencies = [
 name = "redline"
 version = "2.0.0"
 dependencies = [
+ "anyhow",
  "futures-util",
  "redline-interface",
  "redsuite-core",
@@ -3247,6 +3249,7 @@ dependencies = [
 name = "redshift"
 version = "2.0.0"
 dependencies = [
+ "anyhow",
  "base64 0.22.1",
  "bincode",
  "ephemeral-rollups-sdk",
@@ -3300,6 +3303,7 @@ dependencies = [
 name = "redsuite"
 version = "2.0.0"
 dependencies = [
+ "anyhow",
  "clap",
  "futures-util",
  "humantime",
@@ -3316,6 +3320,7 @@ dependencies = [
 name = "redsuite-core"
 version = "2.0.0"
 dependencies = [
+ "anyhow",
  "base64 0.22.1",
  "bytes",
  "clap",
@@ -3351,7 +3356,6 @@ dependencies = [
  "tokio-tungstenite",
  "toml 0.8.23",
  "tracing",
- "tracing-error",
  "tracing-subscriber",
  "upgrade-probe",
  "url",
@@ -7001,16 +7005,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tracing-error"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b1581020d7a273442f5b45074a6a57d5757ad0a47dac0e9f0bd57b81936f3db"
-dependencies = [
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "tracing-subscriber"
 version = "0.3.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7625,6 +7619,7 @@ dependencies = [
 name = "xtask"
 version = "2.0.0"
 dependencies = [
+ "anyhow",
  "clap",
  "redsuite-core",
  "tracing",

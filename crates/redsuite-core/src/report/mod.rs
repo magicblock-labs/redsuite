@@ -1,7 +1,6 @@
 mod bmf;
 mod store;
 use std::{
-    error::Error,
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -11,15 +10,14 @@ use std::{
 
 pub use bmf::bmf;
 use json::{Deserialize, Serialize};
-use serde_with::skip_serializing_none;
 use tracing::warn;
 
 use crate::{
-    check::OperationError, resources::LaunchRecord, runner::RunOutcome, scenario::RunRecord,
-    stats::ObservationsStats, topology, CheckError, Result,
+    resources::LaunchRecord, runner::RunOutcome, scenario::RunRecord, stats::ObservationsStats,
+    topology, Result,
 };
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -174,15 +172,10 @@ pub struct ScenarioRun {
     pub launches: Vec<LaunchRecord>,
 }
 
-#[skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedFailure {
     pub phase: String,
     pub message: String,
-    pub expected: Option<String>,
-    pub actual: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub context: Vec<(String, String)>,
 }
 
 impl PersistedFailure {
@@ -190,9 +183,6 @@ impl PersistedFailure {
         Self {
             phase: phase.to_owned(),
             message: message.into(),
-            expected: None,
-            actual: None,
-            context: Vec::new(),
         }
     }
 }
@@ -227,7 +217,7 @@ pub fn persist_summary(name: &str, mut report: ScenarioReport, outcome: &Result<
     let failures: Vec<_> = outcome
         .as_ref()
         .err()
-        .map(|error| PersistedFailure::new("suite", error.to_string()))
+        .map(|error| PersistedFailure::new("suite", format!("{error:#}")))
         .into_iter()
         .collect();
     store::persist(None, scenario_run_doc(name, &report, &failures, &[]))?;
@@ -238,7 +228,7 @@ pub(crate) fn persist_cell(parent: &str, label: &str, report: &ScenarioReport) {
     let name = format!("{parent}/{label}");
     let persisted = store::persist(Some(parent), scenario_run_doc(&name, report, &[], &[]));
     if let Err(error) = persisted {
-        warn!(%error, "cell report not persisted");
+        warn!(error = %format_args!("{error:#}"), "cell report not persisted");
     }
 }
 
@@ -264,29 +254,7 @@ fn run_failures(record: &RunRecord) -> Vec<PersistedFailure> {
     let Err(error) = &record.outcome else {
         return Vec::new();
     };
-    let mut failure = PersistedFailure::new(record.phase, error.to_string());
-    let mut cause: Option<&(dyn Error + 'static)> = Some(error.as_ref());
-    let mut check = None;
-    while let Some(error) = cause {
-        check = check.or_else(|| error.downcast_ref::<CheckError>());
-        if let Some(operation) = error.downcast_ref::<OperationError>() {
-            operation.trace.with_spans(|metadata, fields| {
-                // The run already has an identity; retain only operation context.
-                let context = (metadata.name().to_owned(), fields.to_owned());
-                if metadata.name() != "run" && !failure.context.contains(&context) {
-                    failure.context.push(context);
-                }
-                true
-            });
-        }
-        cause = error.source();
-    }
-    if let Some(check) = check {
-        failure.expected = check.expected.clone();
-        failure.actual = check.actual.clone();
-        failure.context.extend(check.context.iter().cloned());
-    }
-    vec![failure]
+    vec![PersistedFailure::new(record.phase, format!("{error:#}"))]
 }
 
 fn campaign_meta() -> CampaignMeta {

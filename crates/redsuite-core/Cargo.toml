@@ -6,10 +6,10 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+anyhow.workspace = true
 fixture.workspace = true
 clap = { workspace = true }
 tracing = { workspace = true }
-tracing-error = { workspace = true }
 const-str = { workspace = true }
 tracing-subscriber = { workspace = true }
 tokio = { workspace = true }

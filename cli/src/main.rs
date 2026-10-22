@@ -21,7 +21,7 @@ use tracing::{error, info};
 async fn main() -> ExitCode {
     let cli = Cli::parse();
     if let Err(error) = logging::init() {
-        eprintln!("cannot initialize logging: {error}");
+        eprintln!("cannot initialize logging: {error:#}");
         return ExitCode::FAILURE;
     }
     let outcome = LocalSet::new().run_until(dispatch(cli.command)).await;
@@ -29,7 +29,7 @@ async fn main() -> ExitCode {
     match outcome {
         Ok(code) => code,
         Err(error) => {
-            error!(%error, "command failed");
+            error!(error = %format_args!("{error:#}"), "command failed");
             ExitCode::FAILURE
         }
     }
@@ -123,7 +123,7 @@ async fn load(args: args::Load) -> Result<ExitCode> {
     let outcome = suite::finish(&[record], args.cleanup);
     if *stop.borrow() {
         if let Err(error) = outcome {
-            error!(%error, "interrupted load failed");
+            error!(error = %format_args!("{error:#}"), "interrupted load failed");
         }
         return Ok(ExitCode::from(130));
     }

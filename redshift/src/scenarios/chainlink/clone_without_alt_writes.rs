@@ -1,9 +1,10 @@
 use std::{rc::Rc, time::Duration};
 
+use anyhow::{ensure, Context};
 use keypair::Keypair;
 
 use redsuite_core::{
-    check_eq, prep,
+    prep,
     programs::{CellHeader, REDSHIFT},
     topology::{self, ErOptions, PrivateEr},
     BaseCtx, ChainCtx, PrivateErScenario, Result,
@@ -79,11 +80,7 @@ impl PrivateErScenario for CloneWithoutAltWrites {
             Ok(count)
         };
 
-        check_eq!(
-            alt_transactions().await?,
-            0,
-            "ER startup must not send lookup table transactions to L1"
-        )?;
+        ensure!(alt_transactions().await? == 0);
         let er = private.ctx();
         er.await_program_clone(&redshift_interface::ID, CLONE_TIMEOUT).await?;
         er.await_program_clone(&topology::COMMITTOR_ID, CLONE_TIMEOUT).await?;
@@ -104,30 +101,18 @@ impl PrivateErScenario for CloneWithoutAltWrites {
                 .build()],
         )
         .await?;
-        let clone = er.account(&cell).await?.ok_or("the cell clone is missing after the add")?;
-        check_eq!(
-            CellHeader::try_decode(&clone.data)?.value,
-            1,
-            "the ER clone must show the add"
-        )?;
+        let clone = er.account(&cell).await?.context("the cell clone is missing after the add")?;
+        ensure!(CellHeader::try_decode(&clone.data)?.value == 1);
 
         time::sleep(ALT_SETTLE).await;
-        check_eq!(
-            alt_transactions().await?,
-            0,
-            "cloning must not send lookup table transactions to L1"
-        )?;
+        ensure!(alt_transactions().await? == 0);
         // Keep the detector's positive control out of the ER observation window.
         private.finish().await?;
 
         let recent_slot = base.api().get_slot().await?;
         let (create, _) = create_lookup_table(identity.pubkey(), identity.pubkey(), recent_slot);
         base.submit_and_confirm(&identity, &[create]).await?;
-        check_eq!(
-            alt_transactions().await?,
-            1,
-            "the detector must see the lookup table created by its positive control"
-        )?;
+        ensure!(alt_transactions().await? == 1);
         Ok(())
     }
 }

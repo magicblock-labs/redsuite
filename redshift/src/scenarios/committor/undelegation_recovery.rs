@@ -3,10 +3,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+use anyhow::{ensure, Context};
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    check, check_eq,
+    check,
     netfault::{BaseProxies, Selector},
     programs::{CellHeader, CellId, SettlementMode, REDLINE},
     topology::RestartConfig,
@@ -61,14 +62,10 @@ async fn rejected_write(
 ) -> Result<()> {
     let attempt = er.cells(REDLINE, payer).write(id, &[*account]).await;
     let error = check::expect_error(attempt, &format!("ER write rejected {when}"))?;
-    let error = format!("{error:?}");
+    let error = format!("{error:#}");
     crate::rejection_code(&format!("the er write {when}"), &LOCKOUT_REJECTIONS, &error)?;
-    let on_er = er.account(account).await?.ok_or("er copy vanished during the lockout")?;
-    check_eq!(
-        on_er.data,
-        snapshot,
-        "the rejected write {when} must leave the er copy untouched"
-    )?;
+    let on_er = er.account(account).await?.context("er copy vanished during the lockout")?;
+    ensure!(on_er.data == snapshot);
     Ok(())
 }
 
@@ -83,43 +80,29 @@ async fn await_ownership_return(
         let on_base = base
             .account(account)
             .await?
-            .ok_or("the account vanished from base during undelegation")?;
+            .context("the account vanished from base during undelegation")?;
         if on_base.owner == *owner {
-            check_eq!(
-                on_base.data,
-                snapshot,
-                "the latest committed value must reach base before ownership \
-                 returns to the program"
-            )?;
+            ensure!(on_base.data == snapshot);
             return Ok(());
         }
-        check_eq!(
-            on_base.owner,
-            DELEGATION_PROGRAM_ID,
-            "an undelegating account must stay dlp-owned until the program \
-             owns it again"
-        )?;
-        check!(
+        ensure!(on_base.owner == DELEGATION_PROGRAM_ID);
+        ensure!(
             started.elapsed() < COMPLETION_TIMEOUT,
             "base must complete the undelegation of {account} within \
              {COMPLETION_TIMEOUT:?}"
-        )?;
+        );
         time::sleep(POLL).await;
     }
 }
 
 async fn await_er_value(er: &ErCtx, account: &Pubkey, id: u64, what: &str) -> Result<()> {
     check::poll_for(what, DISCOVERY_TIMEOUT, || async {
-        let account = er.account(account).await?.ok_or("ER cell absent")?;
-        check_eq!(
-            CellHeader::try_decode(&account.data)?.value,
-            id,
-            "ER cell value"
-        )?;
+        let account = er.account(account).await?.context("ER cell absent")?;
+        ensure!(CellHeader::try_decode(&account.data)?.value == id);
         Ok::<_, DynError>(())
     })
     .await
-    .map_err(|error| error.expected(format!("written id {id}")))?;
+    .with_context(|| format!("written id {id}"))?;
     Ok(())
 }
 
@@ -144,12 +127,8 @@ async fn redelegate_and_write(
     let on_base = base
         .account(account)
         .await?
-        .ok_or("the account vanished from base during redelegation")?;
-    check_eq!(
-        on_base.owner,
-        DELEGATION_PROGRAM_ID,
-        "dlp must own the redelegated account on base"
-    )?;
+        .context("the account vanished from base during redelegation")?;
+    ensure!(on_base.owner == DELEGATION_PROGRAM_ID);
     check::poll(
         "the er accepts writes again once the account is redelegated",
         REDELEGATE_TIMEOUT,
@@ -159,12 +138,8 @@ async fn redelegate_and_write(
     let on_er = er
         .account(account)
         .await?
-        .ok_or("er copy vanished after the redelegated write")?;
-    check_eq!(
-        CellHeader::written_id(&on_er.data),
-        Some(id),
-        "the er must hold the write made after redelegation"
-    )?;
+        .context("er copy vanished after the redelegated write")?;
+    ensure!(CellHeader::written_id(&on_er.data) == Some(id));
     Ok(())
 }
 
@@ -217,12 +192,8 @@ async fn recover(
     let on_base = base
         .account(&account)
         .await?
-        .ok_or("the account vanished from base while its submission was held")?;
-    check_eq!(
-        on_base.owner,
-        DELEGATION_PROGRAM_ID,
-        "base must still hold the delegation while the submission is held"
-    )?;
+        .context("the account vanished from base while its submission was held")?;
+    ensure!(on_base.owner == DELEGATION_PROGRAM_ID);
 
     let blind = proxies.reject(
         Selector::methods(&[]).ws().notification().account(&account),
@@ -239,11 +210,7 @@ async fn recover(
         }
         Recovery::Restart => {
             let timing = er.restart(RestartConfig::default()).await?;
-            check_eq!(
-                timing.exit_code,
-                Some(0),
-                "the er must stop cleanly before the same-storage relaunch"
-            )?;
+            ensure!(timing.exit_code == Some(0));
             blind.remove();
         }
     }
@@ -267,7 +234,7 @@ async fn recover(
 
 impl Scenario for UndelegationRecovery {
     async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
-        er.proxies().ok_or(PROXIED_GROUP)?;
+        er.proxies().context(PROXIED_GROUP)?;
         let payer = base.funded_payer(PAYER_LAMPORTS).await?;
 
         Ok(Self { base, er, payer })
@@ -275,7 +242,7 @@ impl Scenario for UndelegationRecovery {
 
     async fn run(self) -> Result<()> {
         let Self { base, er, payer } = self;
-        let proxies = er.proxies().ok_or(PROXIED_GROUP)?;
+        let proxies = er.proxies().context(PROXIED_GROUP)?;
         recover(&base, &er, proxies, &payer, 1, Recovery::Reconnect).await?;
         recover(&base, &er, proxies, &payer, 2, Recovery::Restart).await?;
 

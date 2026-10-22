@@ -1,5 +1,6 @@
 use std::{collections::HashSet, time::Duration};
 
+use anyhow::{anyhow, ensure, Context};
 use pubkey::Pubkey;
 use signature::Signature;
 use tokio::{time, time::Instant};
@@ -7,9 +8,7 @@ use tracing::warn;
 
 use crate::{
     api::{custom_error_code, Api, TransactionInfo},
-    check,
-    check::CheckError,
-    check_eq, BaseCtx, ChainCtx, ErCtx, Result,
+    BaseCtx, ChainCtx, ErCtx, Result,
 };
 
 pub const INTENT_FAILED_CODE: u32 = 0x7461_636F;
@@ -63,55 +62,53 @@ impl ErCtx {
                 warn_duplicate_rejection(message);
                 return Ok(receipt);
             }
-            return Err(CheckError::new("the commit intent succeeds").actual(message).into());
+            return Err(anyhow!("commit intent failed: {message}"));
         }
-        let mut included = receipt.included.clone();
-        included.sort();
-        let mut expected = expected.to_vec();
-        expected.sort();
-        check_eq!(
-            included,
-            expected,
-            "the receipt must list exactly the committed accounts"
-        )?;
-        check!(
-            receipt.excluded.is_empty(),
-            "the receipt must exclude no accounts"
-        )?;
-        check_eq!(
-            receipt.requested_undelegation,
-            expect_undelegation,
-            "the receipt undelegation flag must match the commit type"
-        )?;
+        receipt.check_accounts(expected, expect_undelegation)?;
         receipt.confirm(base.api(), BASE_CONFIRM_TIMEOUT).await?;
         Ok(receipt)
     }
 }
 
 impl CommitReceipt {
+    pub fn check_included(&self, expected: &[Pubkey]) -> Result<()> {
+        let mut included = self.included.clone();
+        included.sort();
+        let mut expected = expected.to_vec();
+        expected.sort();
+        ensure!(included == expected);
+        Ok(())
+    }
+
+    pub fn check_accounts(&self, expected: &[Pubkey], expect_undelegation: bool) -> Result<()> {
+        self.check_included(expected)?;
+        ensure!(self.excluded.as_slice() == []);
+        ensure!(self.requested_undelegation == expect_undelegation);
+        Ok(())
+    }
     /// Requires success and base signatures, without confirming those transactions.
     pub fn check_success(&self, phase: &str) -> Result<()> {
-        check!(self.succeeded(), "{phase}: settlement failed: {self:?}")?;
-        check!(
+        ensure!(
+            self.succeeded(),
+            "{phase}: settlement failed: {:?} (code {:?})",
+            self.error_message,
+            self.receipt_err_code
+        );
+        ensure!(
             !self.base_signatures.is_empty(),
-            "{phase}: a settled receipt names its base transactions"
-        )?;
+            "{phase}: missing base transactions"
+        );
         Ok(())
     }
 
     pub async fn confirm(&self, base: &Api, timeout: Duration) -> Result<()> {
         for chain_signature in &self.base_signatures {
-            let base_tx =
-                base.await_transaction(chain_signature, timeout).await.map_err(|error| {
-                    CheckError::new(format!("base commit tx {chain_signature} lands on base"))
-                        .caused_by(error)
-                })?;
+            let base_tx = base
+                .await_transaction(chain_signature, timeout)
+                .await
+                .context("base settlement confirmation")?;
             if let Some(err) = &base_tx.err {
-                return Err(CheckError::new(format!(
-                    "base commit tx {chain_signature} succeeds on base"
-                ))
-                .actual(format!("failed on-chain: {err:?}"))
-                .into());
+                return Err(anyhow!("base settlement failed: {err:?}"));
             }
         }
         Ok(())
@@ -133,7 +130,7 @@ impl CommitReceipt {
 }
 
 pub fn warn_duplicate_rejection(error: &str) {
-    warn!(%error, "intent rejected as duplicate; verifying base state");
+    warn!(error = %format_args!("{error:#}"), "intent rejected as duplicate; verifying base state");
 }
 
 // Builtin ic_msg lines arrive bare; tolerate a BPF-style prefix anyway.
@@ -211,20 +208,10 @@ pub async fn scheduled_receipt_signature(
 ) -> Result<Signature> {
     let commit_tx = er.await_transaction(commit_signature, SCHEDULE_FETCH_TIMEOUT).await?;
     if let Some(err) = &commit_tx.err {
-        return Err(
-            CheckError::new(format!("commit tx {commit_signature} succeeds on the ER"))
-                .actual(format!("failed on-chain: {err:?}"))
-                .into(),
-        );
+        return Err(anyhow!("commit scheduling failed: {err:?}"));
     }
-    receipt_signature_in_logs(&commit_tx.logs).ok_or_else(|| {
-        CheckError::new(format!(
-            "commit tx {commit_signature} logs carry no \
-             ScheduledCommitSent signature — was a commit actually \
-             scheduled?"
-        ))
-        .into()
-    })
+    receipt_signature_in_logs(&commit_tx.logs)
+        .ok_or_else(|| anyhow!("missing ScheduledCommitSent signature"))
 }
 
 pub async fn fetch_commit_receipt(
@@ -239,12 +226,7 @@ pub async fn fetch_commit_receipt(
 
 pub async fn scheduled_intent_id(er: &Api, commit_signature: &Signature) -> Result<u64> {
     let commit_tx = er.await_transaction(commit_signature, SCHEDULE_FETCH_TIMEOUT).await?;
-    intent_id_in_logs(&commit_tx.logs).ok_or_else(|| {
-        CheckError::new(format!(
-            "commit tx {commit_signature} logs carry no scheduled intent id"
-        ))
-        .into()
-    })
+    intent_id_in_logs(&commit_tx.logs).ok_or_else(|| anyhow!("missing scheduled intent ID"))
 }
 
 pub async fn fetch_commit_receipt_by_intent(
@@ -266,7 +248,7 @@ pub async fn fetch_commit_receipt_by_intent(
                 Ok(Some(tx)) => tx,
                 Ok(None) => continue,
                 Err(error) => {
-                    last_fetch_error = Some(error.to_string());
+                    last_fetch_error = Some(format!("{error:#}"));
                     continue;
                 }
             };
@@ -279,12 +261,9 @@ pub async fn fetch_commit_receipt_by_intent(
             let mut message =
                 format!("no commit receipt for intent {intent_id} within {timeout:?}");
             if let Some(error) = &last_fetch_error {
-                message.push_str(&format!(
-                    "; last getTransaction error while scanning receipts: \
-                     {error}"
-                ));
+                message.push_str(&format!("; last fetch error: {error:#}"));
             }
-            return Err(message.into());
+            return Err(crate::DynError::msg(message));
         }
         time::sleep(RECEIPT_POLL).await;
     }

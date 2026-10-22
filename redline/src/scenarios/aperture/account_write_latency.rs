@@ -1,9 +1,9 @@
 use std::{rc::Rc, sync::Arc, time::Duration};
 
+use anyhow::{ensure, Context};
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    check, check_eq,
     programs::{CellHeader, REDLINE},
     redline::Accounts,
     report::Unit,
@@ -43,12 +43,8 @@ impl Scenario<ScenarioReport> for AccountWriteLatency {
             .await?;
 
         for pda in &pdas {
-            let on_base = base.account(pda).await?.ok_or("pda not on base")?;
-            check_eq!(
-                on_base.owner,
-                DELEGATION_PROGRAM_ID,
-                "delegated pda must be dlp-owned on base"
-            )?;
+            let on_base = base.account(pda).await?.context("pda not on base")?;
+            ensure!(on_base.owner == DELEGATION_PROGRAM_ID);
         }
         er.await_clones(&pdas, ACCOUNT_SPACE as usize, Duration::from_secs(15)).await?;
 
@@ -82,7 +78,7 @@ impl Scenario<ScenarioReport> for AccountWriteLatency {
         let sync = |id: u64| {
             let sigs = sigs.clone();
             async move {
-                time::timeout(CONFIRM_TIMEOUT, sigs.await_id(id)).await.map_err(|_| {
+                time::timeout(CONFIRM_TIMEOUT, sigs.await_id(id)).await.with_context(|| {
                     format!("confirmation for id {id} not within {CONFIRM_TIMEOUT:?}")
                 })?
             }
@@ -97,37 +93,33 @@ impl Scenario<ScenarioReport> for AccountWriteLatency {
             sync,
         )
         .await?;
-        check_eq!(
+        ensure!(
+            outcome.failed == 0,
+            "failures={:?}; first error={:?}",
             outcome.failed,
-            0,
-            "deliveries or confirmations failed: {:?}",
             outcome.first_error
-        )?;
+        );
 
         updates.await_observed(ITERATIONS as usize, Duration::from_secs(15)).await?;
         let update_lag = updates.finalize().lag;
         let confirmations = sigs.finalize();
-        check_eq!(
+        ensure!(
+            confirmations.failed == 0,
+            "failures={:?}; first error={:?}",
             confirmations.failed,
-            0,
-            "transactions failed on-chain: {:?}",
             confirmations.first_failure
-        )?;
+        );
 
         for (i, pda) in pdas.iter().enumerate() {
             let last_id = ITERATIONS - ACCOUNTS as u64 + 1 + i as u64;
-            let on_er = er.account(pda).await?.ok_or("pda not on er")?;
-            check_eq!(
-                CellHeader::written_id(&on_er.data),
-                Some(last_id),
-                "er copy must hold the last id written to pda {i}"
-            )?;
+            let on_er = er.account(pda).await?.context("pda not on er")?;
+            ensure!(CellHeader::written_id(&on_er.data) == Some(last_id));
 
-            let on_base = base.account(pda).await?.ok_or("pda gone on base")?;
-            check!(
+            let on_base = base.account(pda).await?.context("pda gone on base")?;
+            ensure!(
                 on_base.data[layout::DATA_OFFSET..].iter().all(|&b| b == 0),
                 "base copy must stay untouched until an explicit commit"
-            )?;
+            );
         }
 
         Ok(ScenarioReport::ok()

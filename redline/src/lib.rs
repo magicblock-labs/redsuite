@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
-use redsuite_core::{check, ChainCtx, CheckError, ErCtx, Result};
+use anyhow::{anyhow, ensure};
+use redsuite_core::{check, ChainCtx, ErCtx, Result};
 use signature::Signature;
 
 pub mod load;
@@ -23,19 +24,17 @@ pub fn consumed_cus(logs: &[String]) -> Option<f64> {
 
 pub async fn probe_cus(er: &ErCtx, signature: &Signature, label: &str, iters: u32) -> Result<f64> {
     let probe = er.api().await_transaction(signature, PROBE_TIMEOUT).await?;
-    check!(
+    ensure!(
         probe.err.is_none(),
-        "{label}: probe tx failed on-chain (sha256 iters {iters} over the \
-         compute budget?): {:?}\nlogs: {:#?}",
+        "{label}: compute probe ({iters} iterations): {:?}; logs={:?}",
         probe.err,
         probe.logs
-    )?;
+    );
     consumed_cus(&probe.logs).ok_or_else(|| {
-        CheckError::new(format!(
-            "{label}: probe logs carry no `consumed .. compute units` line"
-        ))
-        .actual(format!("{:#?}", probe.logs))
-        .into()
+        anyhow!(
+            "{label}: missing compute-unit consumption: {:?}",
+            probe.logs
+        )
     })
 }
 

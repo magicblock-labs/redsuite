@@ -1,8 +1,9 @@
 use std::{collections::HashMap, rc::Rc, sync::Arc, time::Duration};
 
+use anyhow::{anyhow, ensure};
 use pubkey::Pubkey;
 use redsuite_core::{
-    check, check_eq, prep,
+    prep,
     profile::ProfileValues,
     programs::{CellHeader, REDLINE},
     redline::{execute_kernel, Accounts},
@@ -160,12 +161,12 @@ impl Scenario<ScenarioReport> for WsFanoutThreshold {
             payer_bytes.clone(),
             None,
         )?;
-        check_eq!(
+        ensure!(
+            warmup.failed == 0,
+            "failures={:?}; first error={:?}",
             warmup.failed,
-            0,
-            "warmup deliveries failed: {:?}",
             warmup.first_error
-        )?;
+        );
 
         let mut id_cursor = profile.warmup;
         let mut cells: Vec<CellOutcome> = Vec::new();
@@ -198,19 +199,21 @@ impl Scenario<ScenarioReport> for WsFanoutThreshold {
                 payer_bytes.clone(),
                 Some(clock.clone()),
             )?;
-            check_eq!(
+            ensure!(
+                outcome.failed == 0,
+                "failures={:?}; first error={:?}",
                 outcome.failed,
-                0,
-                "ws{connections}: measured deliveries failed: {:?}",
                 outcome.first_error
-            )?;
+            );
 
             let missing_final = subscribers.await_final(&expected, DRAIN_TIMEOUT).await;
             let incomplete = subscribers.incomplete(&expected);
             let after = er.scrape_metrics().await?;
             let delta = MetricsDelta::new(before, after);
             if let Some(error) = subscribers.first_error() {
-                return Err(format!("ws{connections}: subscriber pool failed: {error}").into());
+                return Err(anyhow!(
+                    "ws{connections}: subscriber pool failed: {error:#}"
+                ));
             }
             let conn_reports: Vec<ConnReport> = subscribers.finalize();
 
@@ -294,11 +297,7 @@ impl Scenario<ScenarioReport> for WsFanoutThreshold {
                 );
             base.report_cell(&format!("ws{connections}"), &cell_report)?;
             if let Some(failed_txs) = delta.counter_all(metrics::FAILED_TRANSACTIONS) {
-                check_eq!(
-                    failed_txs,
-                    0.0,
-                    "ws{connections}: transactions failed on the validator"
-                )?;
+                ensure!(failed_txs == 0.0);
             }
             cells.push(cell_outcome);
             id_cursor += profile.iterations;
@@ -327,11 +326,11 @@ impl Scenario<ScenarioReport> for WsFanoutThreshold {
         }
 
         for cell in &cells {
-            check!(
+            ensure!(
                 cell.outcome.delivered > 0,
                 "INVALID: ws{} delivered nothing",
                 cell.connections
-            )?;
+            );
         }
 
         let cliff = cells

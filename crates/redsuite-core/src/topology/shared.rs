@@ -1,5 +1,6 @@
 use std::{fs, path::Path};
 
+use anyhow::{anyhow, Context};
 use keypair::Keypair;
 use signer::Signer;
 use tracing::debug;
@@ -145,20 +146,18 @@ async fn await_base_ready(
     let base = base_ctx(state, config)?;
     let mut required = config::CLONED_ACCOUNTS.to_vec();
     for reserved in &state.er_identity_pool {
-        let reserved =
-            Keypair::try_from(&reserved[..]).map_err(|e| format!("corrupt pool identity: {e}"))?;
+        let reserved = Keypair::try_from(&reserved[..]).context("corrupt pool identity")?;
         required.push(crate::dlp::validator_fees_vault_pda(&reserved.pubkey()));
     }
     for account in required {
         if base.account(&account).await?.is_none() {
-            return Err(format!(
+            return Err(anyhow!(
                 "account {account} missing on the freshly booted base — \
                  genesis injection or the clone from {} failed; check \
                  {}",
                 state.clone_url,
                 config::CLONE_URL_ENV
-            )
-            .into());
+            ));
         }
     }
     Ok(())

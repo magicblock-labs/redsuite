@@ -1,8 +1,9 @@
 use std::{rc::Rc, time::Duration};
 
+use anyhow::{ensure, Context};
 use keypair::Keypair;
 use pubkey::Pubkey;
-use redsuite_core::{check, system, BaseCtx, ChainCtx, CheckError, ErCtx, Result, Scenario};
+use redsuite_core::{check, system, BaseCtx, ChainCtx, ErCtx, Result, Scenario};
 use signer::Signer;
 
 const TRANSFERS: u64 = 10;
@@ -35,15 +36,9 @@ impl Scenario for Example {
             base.submit_and_confirm(&payer, &[transfer]).await?;
             expected += lamports;
         }
-        let on_base = base.account(&recipient).await?.ok_or("recipient never appeared on base")?;
-        if on_base.lamports != expected {
-            return Err(
-                CheckError::new("the base recipient holds the delivered lamports")
-                    .expected(expected.to_string())
-                    .actual(on_base.lamports.to_string())
-                    .into(),
-            );
-        }
+        let on_base =
+            base.account(&recipient).await?.context("recipient never appeared on base")?;
+        ensure!(on_base.lamports == expected);
 
         check::poll(
             "the er clones the recipient at the delivered balance",

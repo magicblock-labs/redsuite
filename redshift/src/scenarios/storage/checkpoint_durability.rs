@@ -1,11 +1,12 @@
 use std::{path::Path, rc::Rc, time::Duration};
 
+use anyhow::{ensure, Context};
 use keypair::Keypair;
 use pubkey::Pubkey;
 
 use redsuite_core::{
     api::TransactionInfo,
-    check, check_eq,
+    check,
     programs::{CellHeader, REDSHIFT},
     topology::{self, ErOptions, PrivateEr, RestartConfig},
     BaseCtx, ChainCtx, DynError, ErCtx, PrivateErScenario, Result,
@@ -32,7 +33,7 @@ struct State {
 impl State {
     fn apply(&mut self, record: &Record, evidence: &TransactionInfo) -> Result<()> {
         self.payer_lamports =
-            self.payer_lamports.checked_sub(evidence.fee).ok_or("fee payer exhausted")?;
+            self.payer_lamports.checked_sub(evidence.fee).context("fee payer exhausted")?;
         if !Record::fails(record.id) {
             self.cell.value += u64::from(record.id);
             self.cell.revision += 1;
@@ -56,23 +57,13 @@ impl Record {
     fn check(&self, evidence: &TransactionInfo) -> Result<()> {
         let error =
             Self::fails(self.id).then(|| json::json!({"InstructionError": [1, {"Custom": 0}]}));
-        check_eq!(evidence.err, error, "{}: execution outcome", self.signature)?;
+        ensure!(evidence.err == error);
         let mut balances = evidence.pre_balances.clone();
-        let payer = balances.first_mut().ok_or("missing payer balance")?;
-        *payer = payer.checked_sub(evidence.fee).ok_or("fee exceeds balance")?;
-        check_eq!(
-            evidence.post_balances,
-            balances,
-            "{}: only fees affect balances",
-            self.signature
-        )?;
+        let payer = balances.first_mut().context("missing payer balance")?;
+        *payer = payer.checked_sub(evidence.fee).context("fee exceeds balance")?;
+        ensure!(evidence.post_balances == balances);
         if let Some(before) = &self.evidence {
-            check_eq!(
-                evidence,
-                before,
-                "{}: execution evidence changed",
-                self.signature
-            )?;
+            ensure!(evidence == before);
         }
         Ok(())
     }
@@ -80,8 +71,8 @@ impl Record {
 
 async fn state(er: &ErCtx, keys: &[Pubkey; 2]) -> Result<State> {
     let accounts = er.accounts(keys).await?;
-    let payer = accounts[0].as_ref().ok_or("fee payer missing")?;
-    let cell = accounts[1].as_ref().ok_or("cell missing")?;
+    let payer = accounts[0].as_ref().context("fee payer missing")?;
+    let cell = accounts[1].as_ref().context("cell missing")?;
     Ok(State {
         payer_lamports: payer.lamports,
         cell_lamports: cell.lamports,
@@ -99,16 +90,12 @@ struct Workload {
 
 impl Workload {
     async fn check(&self, er: &ErCtx) -> Result<()> {
-        check_eq!(
-            state(er, &self.keys).await?,
-            self.expected,
-            "cell, rollback and fees must match transaction evidence"
-        )?;
+        ensure!(state(er, &self.keys).await? == self.expected);
         Ok(())
     }
 
     async fn submit(&mut self, er: &ErCtx, confirm: bool) -> Result<Record> {
-        self.next_id = self.next_id.checked_add(1).ok_or("transaction ids exhausted")?;
+        self.next_id = self.next_id.checked_add(1).context("transaction ids exhausted")?;
         let id = self.next_id;
         let mut instructions =
             vec![REDSHIFT.batch().add(&[REDSHIFT.primary(self.owner)], i64::from(id)).build()];
@@ -144,7 +131,7 @@ async fn head(er: &ErCtx) -> Result<u64> {
         .scrape_metrics()
         .await?
         .get("engine_ledger_superblocks")
-        .ok_or("missing ledger head metric")? as u64)
+        .context("missing ledger head metric")? as u64)
 }
 
 async fn checkpoint(er: &ErCtx, storage: &Path) -> Result<u64> {
@@ -154,12 +141,12 @@ async fn checkpoint(er: &ErCtx, storage: &Path) -> Result<u64> {
         &format!("checkpoint {sealed} archived at {}", archive.display()),
         CHECKPOINT_TIMEOUT,
         || async {
-            check!(head(er).await? > sealed, "ledger seal pending")?;
+            ensure!(head(er).await? > sealed, "ledger seal pending");
             let metadata = archive.metadata()?;
-            check!(
+            ensure!(
                 metadata.is_file() && metadata.len() > 0,
                 "archive incomplete"
-            )?;
+            );
             Ok::<_, DynError>(())
         },
     )
@@ -167,14 +154,9 @@ async fn checkpoint(er: &ErCtx, storage: &Path) -> Result<u64> {
     Ok(sealed)
 }
 
-async fn verify(er: &ErCtx, boundary: u64, protected: &[Record]) -> Result<()> {
+async fn verify(er: &ErCtx, protected: &[Record]) -> Result<()> {
     for record in protected {
-        check_eq!(
-            er.api().get_transaction(&record.signature).await?,
-            record.evidence,
-            "checkpoint {boundary}: protected transaction {} lost or changed",
-            record.signature
-        )?;
+        ensure!(er.api().get_transaction(&record.signature).await? == record.evidence);
     }
     Ok(())
 }
@@ -206,11 +188,7 @@ impl PrivateErScenario for CheckpointDurability {
         let keys = [payer.pubkey(), cell];
         let expected =
             check::poll_for("accounts cloned", TIMEOUT, || state(private.ctx(), &keys)).await?;
-        check_eq!(
-            (expected.cell.value, expected.cell.revision),
-            (0, 0),
-            "fresh cell"
-        )?;
+        ensure!((expected.cell.value, expected.cell.revision) == (0, 0));
         let workload = Workload {
             payer,
             owner: owner.pubkey(),
@@ -226,15 +204,15 @@ impl PrivateErScenario for CheckpointDurability {
         let mut protected = Vec::new();
         let mut previous_boundary = 0;
 
-        for round in 1..=ROUNDS {
+        for _ in 0..ROUNDS {
             let er = private.ctx();
             for _ in 0..8 {
                 protected.push(workload.submit(er, true).await?);
             }
             let boundary = checkpoint(er, private.storage_dir()).await?;
-            check!(boundary > previous_boundary, "checkpoint must advance")?;
+            ensure!(boundary > previous_boundary, "checkpoint must advance");
             previous_boundary = boundary;
-            verify(er, boundary, &protected).await?;
+            verify(er, &protected).await?;
             workload.check(er).await?;
             let baseline = workload.expected.clone();
 
@@ -249,13 +227,9 @@ impl PrivateErScenario for CheckpointDurability {
                     ready_timeout: CHECKPOINT_TIMEOUT,
                 })
                 .await?;
-            check_eq!(
-                timing.exit_signal,
-                Some(9),
-                "round {round}: SIGKILL required"
-            )?;
+            ensure!(timing.exit_signal == Some(9));
             let er = private.ctx();
-            verify(er, boundary, &protected).await?;
+            verify(er, &protected).await?;
             workload.expected = baseline;
             for mut record in tail {
                 let found = er.api().get_transaction(&record.signature).await?;

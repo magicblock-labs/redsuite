@@ -25,7 +25,7 @@ impl TransportError {
             url: url.clone(),
             method: None,
             status: None,
-            detail: error.to_string(),
+            detail: format!("{error:#}"),
             kind: classify(&error),
             cause: cause_chain(&error),
         }

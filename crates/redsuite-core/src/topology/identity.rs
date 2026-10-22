@@ -6,6 +6,7 @@ use std::{
     time::Duration,
 };
 
+use anyhow::{anyhow, Context};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use keypair::Keypair;
 use pubkey::Pubkey;
@@ -26,13 +27,14 @@ const IDENTITY_FUNDING_LAMPORTS: u64 = 20 * 1_000_000_000;
 const FUNDING_POLL: Duration = Duration::from_millis(250);
 
 pub fn identity_keypair(identity: &Pubkey) -> Result<Keypair> {
-    let state = state::read_state().ok_or("no shared stack state — boot the shared stack first")?;
+    let state =
+        state::read_state().context("no shared stack state — boot the shared stack first")?;
     state
         .er_identity_pool
         .iter()
         .filter_map(|bytes| Keypair::try_from(&bytes[..]).ok())
         .find(|keypair| keypair.pubkey() == *identity)
-        .ok_or_else(|| format!("{identity} is not one of this stack's ER identities").into())
+        .with_context(|| format!("{identity} is not one of this stack's ER identities"))
 }
 
 fn vault_dump_json(vault: &Pubkey) -> String {
@@ -55,11 +57,13 @@ pub(super) fn reset_pool(dir: &Path) {
 }
 
 pub fn identity_for_label(label: &str) -> Result<Keypair> {
-    let state = state::read_state().ok_or("no shared stack state — boot the shared stack first")?;
+    let state =
+        state::read_state().context("no shared stack state — boot the shared stack first")?;
     if state.er_identity_pool.is_empty() {
-        return Err("this stack predates per-ER identities — run \
+        return Err(anyhow!(
+            "this stack predates per-ER identities — run \
                     `redsuite stack down` and boot it again"
-            .into());
+        ));
     }
     let dir = state::stack_dir();
     let _guard = PoolLock::acquire(&dir)?;
@@ -74,12 +78,11 @@ pub fn identity_for_label(label: &str) -> Result<Keypair> {
         None => {
             let slot = assignments.len();
             if slot >= state.er_identity_pool.len() {
-                return Err(format!(
+                return Err(anyhow!(
                     "the stack reserved {} private-ER identities and all are \
                      bound; raise IDENTITY_POOL_SIZE and boot a fresh stack",
                     state.er_identity_pool.len()
-                )
-                .into());
+                ));
             }
             assignments.insert(label.to_owned(), slot);
             fs::write(&map_path, json::to_string(&assignments)?)?;
@@ -87,7 +90,7 @@ pub fn identity_for_label(label: &str) -> Result<Keypair> {
         }
     };
     Keypair::try_from(&state.er_identity_pool[slot][..])
-        .map_err(|e| format!("corrupt state.json: bad pool identity {slot}: {e}").into())
+        .with_context(|| format!("corrupt state.json: bad pool identity {slot}"))
 }
 
 struct PoolLock(#[allow(dead_code)] File);
@@ -124,7 +127,9 @@ pub(super) async fn ensure_identity_funded(base: &BaseCtx, identity: &Pubkey) ->
         }
         ticks += 1;
         if Instant::now() >= deadline {
-            return Err(format!("the identity {identity} did not reach the funding target").into());
+            return Err(anyhow!(
+                "the identity {identity} did not reach the funding target"
+            ));
         }
         time::sleep(FUNDING_POLL).await;
     }

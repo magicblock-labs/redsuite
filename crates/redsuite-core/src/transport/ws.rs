@@ -7,6 +7,7 @@ use std::{
     time::Duration,
 };
 
+use anyhow::Context;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use json::{Deserialize, LazyValue, Value};
 use pubkey::Pubkey;
@@ -217,7 +218,7 @@ impl AccountUpdates {
             shared.waiters.insert(id, tx);
             rx
         };
-        rx.await.map_err(|_| "ws stream failed while awaiting update".into())
+        rx.await.context("ws stream failed while awaiting update")
     }
 
     pub fn finalize(&self) -> UpdateOutcome {
@@ -389,7 +390,7 @@ impl SignatureConfirmations {
             shared.waiters.insert(id, tx);
             rx
         };
-        rx.await.map_err(|_| "ws stream failed while awaiting signature".into())
+        rx.await.context("ws stream failed while awaiting signature")
     }
 
     pub async fn await_all(&self, timeout: Duration) -> Result<()> {

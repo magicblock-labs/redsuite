@@ -1,5 +1,6 @@
 use std::{collections::BTreeMap, fs};
 
+use anyhow::anyhow;
 use json::Serialize;
 use serde_with::skip_serializing_none;
 use tracing::warn;
@@ -154,7 +155,9 @@ pub fn bmf(out: Option<&str>) -> Result<()> {
     let latest = store::load()?;
     let doc = bmf_document(&latest);
     if doc.is_empty() {
-        return Err("the latest campaign has no exportable measurements".into());
+        return Err(anyhow!(
+            "the latest campaign has no exportable measurements"
+        ));
     }
     let body = json::to_string_pretty(&doc)?;
     match out {

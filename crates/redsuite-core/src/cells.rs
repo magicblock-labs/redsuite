@@ -1,5 +1,6 @@
 use std::{slice, time::Duration};
 
+use anyhow::Context;
 use instruction::Instruction;
 use keypair::Keypair;
 use pubkey::Pubkey;
@@ -121,7 +122,7 @@ impl<C: ChainCtx> Program<'_, C> {
         Ok(cell)
     }
     pub async fn read(&self, address: &Pubkey) -> Result<CellHeader> {
-        let account = self.chain.account(address).await?.ok_or("cell missing")?;
+        let account = self.chain.account(address).await?.context("cell missing")?;
         Ok(CellHeader::try_decode(&account.data)?)
     }
     pub async fn create_owned(&self, validator: Pubkey, count: usize) -> Result<Vec<OwnedCell>> {

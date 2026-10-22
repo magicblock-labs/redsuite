@@ -4,10 +4,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+use anyhow::ensure;
 use json::JsonValueTrait;
 use keypair::Keypair;
 use redsuite_core::{
-    check, check_eq, host,
+    host,
     profile::ProfileValues,
     programs::REDLINE,
     redline::Accounts,
@@ -233,12 +234,12 @@ impl PrivateErScenario<ScenarioReport> for SuperblockBoundaryLatency {
             },
         )
         .await?;
-        check_eq!(
+        ensure!(
+            fill.failed == 0,
+            "failures={:?}; first error={:?}",
             fill.failed,
-            0,
-            "fill deliveries failed: {:?}",
             fill.first_error
-        )?;
+        );
         crate::await_executed(
             cell_er,
             ledger_txs_at_boot + profile.fill as f64,
@@ -293,12 +294,12 @@ impl PrivateErScenario<ScenarioReport> for SuperblockBoundaryLatency {
         let delta = MetricsDelta::new(before, after);
         let storage_after = host::dir_size_bytes(private.storage_dir())?;
 
-        check_eq!(
+        ensure!(
+            outcome.failed == 0,
+            "failures={:?}; first error={:?}",
             outcome.failed,
-            0,
-            "measured deliveries failed: {:?}",
             outcome.first_error
-        )?;
+        );
 
         let boundary = timings(
             intervals
@@ -314,17 +315,17 @@ impl PrivateErScenario<ScenarioReport> for SuperblockBoundaryLatency {
                 .map(|interval| interval.micros)
                 .collect(),
         );
-        check!(
+        ensure!(
             boundary.count >= profile.min_boundaries,
             "observed {} superblock boundaries, fewer than the {} this \
              profile must capture under one unchanged load",
             boundary.count,
             profile.min_boundaries
-        )?;
-        check!(
+        );
+        ensure!(
             normal.count > 0,
             "observed no normal block intervals to compare boundaries against"
-        )?;
+        );
 
         let sealed = delta.counter(SUPERBLOCKS).unwrap_or_default();
         let finalize_us = delta.histogram_avg(FINALIZE_SUPERBLOCK);

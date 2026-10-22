@@ -4,6 +4,7 @@ use std::{
     process::{Command, ExitCode},
 };
 
+use anyhow::{anyhow, Context};
 use clap::Parser;
 use redsuite_core::{catalog::Fixture, frontend, logging, Result};
 use tracing::error;
@@ -32,7 +33,7 @@ enum Task {
 fn main() -> ExitCode {
     let task = Task::parse();
     if let Err(error) = logging::init() {
-        eprintln!("cannot initialize logging: {error}");
+        eprintln!("cannot initialize logging: {error:#}");
         return ExitCode::FAILURE;
     }
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
@@ -49,18 +50,16 @@ fn main() -> ExitCode {
         Task::Shared(command) => command.run(),
     };
     if let Err(error) = outcome {
-        error!(%error, "command failed");
+        error!(error = %format_args!("{error:#}"), "command failed");
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
 }
 
 fn run(command: &mut Command) -> Result<()> {
-    let status = command
-        .status()
-        .map_err(|error| format!("{command:?}: failed to spawn: {error}"))?;
+    let status = command.status().with_context(|| format!("{command:?}: failed to spawn"))?;
     if !status.success() {
-        return Err(format!("{command:?} failed ({status})").into());
+        return Err(anyhow!("{command:?} failed ({status})"));
     }
     Ok(())
 }
@@ -98,7 +97,7 @@ fn programs(root: &Path) -> Result<()> {
             // fs::copy can fail with ENOENT on virtiofs bind mounts.
             fs::read(out.join("upgrade_probe.so"))
                 .and_then(|bytes| fs::write(&staged, bytes))
-                .map_err(|error| format!("staging {}: {error}", staged.display()))?;
+                .with_context(|| format!("staging {}", staged.display()))?;
         }
     }
     Ok(())

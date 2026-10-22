@@ -7,7 +7,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use futures_util::{SinkExt, StreamExt};
+use anyhow::{anyhow, Context};
+use futures_util::{stream::SplitSink, SinkExt, StreamExt};
 use json::{JsonContainerTrait, JsonValueTrait, Value};
 use pubkey::Pubkey;
 use reqwest::{Client, StatusCode};
@@ -20,11 +21,15 @@ use tokio::{
     task::JoinHandle,
     time,
 };
-use tokio_tungstenite::tungstenite::{Message, Utf8Bytes};
+use tokio_tungstenite::{
+    tungstenite::{Message, Utf8Bytes},
+    MaybeTlsStream, WebSocketStream,
+};
 use url::Url;
 
 use crate::{
     api::decode_transaction,
+    check,
     context::{BaseCtx, ChainCtx},
     topology::BaseEndpoints,
     transport::http,
@@ -63,7 +68,7 @@ impl Operation {
         let first = self
             .signatures
             .first()
-            .ok_or("the intercepted operation carries no signature")?;
+            .context("the intercepted operation carries no signature")?;
         Ok(first.parse()?)
     }
 }
@@ -170,6 +175,7 @@ struct TrapState {
     notify: Notify,
 }
 
+#[derive(Clone)]
 enum Effect {
     Reject(String),
     Stall,
@@ -213,51 +219,45 @@ enum GateStart {
 
 fn gate_start(shared: &Shared, operation: Operation) -> GateStart {
     let mut state = shared.borrow_mut();
-    let rule = state.rules.iter().find(|rule| rule.selector.matches(&operation)).map(|rule| {
-        (
-            rule.id,
-            match &rule.effect {
-                Effect::Reject(message) => Some(message.clone()),
-                Effect::Stall => None,
-            },
-        )
-    });
-    match rule {
-        Some((_, Some(message))) => {
-            state.record(Action::Rejected, Some(operation));
-            GateStart::Decided(Decision::Reject(message))
-        }
-        Some((id, None)) => {
-            let (sender, receiver) = oneshot::channel();
-            state.stalled.push((id, sender));
-            state.record(Action::Held, Some(operation.clone()));
-            state.holding += 1;
-            GateStart::Pending(receiver, operation, Holding(shared.clone()))
-        }
-        None => {
-            let trap = state
-                .traps
-                .iter()
-                .find(|trap| trap.fired.borrow().is_none() && trap.selector.matches(&operation))
-                .cloned();
-            match trap {
-                None => GateStart::Decided(Decision::Release),
-                Some(trap) => {
-                    let (sender, receiver) = oneshot::channel();
-                    let held_at = state.started.elapsed();
-                    *trap.fired.borrow_mut() = Some(Pending {
-                        operation: operation.clone(),
-                        held_at,
-                        decide: Some(sender),
-                    });
-                    state.record(Action::Held, Some(operation.clone()));
-                    state.holding += 1;
-                    trap.notify.notify_waiters();
-                    GateStart::Pending(receiver, operation, Holding(shared.clone()))
-                }
+    let rule = state
+        .rules
+        .iter()
+        .find(|rule| rule.selector.matches(&operation))
+        .map(|rule| (rule.id, rule.effect.clone()));
+    if let Some((id, effect)) = rule {
+        return match effect {
+            Effect::Reject(message) => {
+                state.record(Action::Rejected, Some(operation));
+                GateStart::Decided(Decision::Reject(message))
             }
-        }
+            Effect::Stall => {
+                let (sender, receiver) = oneshot::channel();
+                state.stalled.push((id, sender));
+                state.record(Action::Held, Some(operation.clone()));
+                state.holding += 1;
+                GateStart::Pending(receiver, operation, Holding(shared.clone()))
+            }
+        };
     }
+    let trap = state
+        .traps
+        .iter()
+        .find(|trap| trap.fired.borrow().is_none() && trap.selector.matches(&operation))
+        .cloned();
+    let Some(trap) = trap else {
+        return GateStart::Decided(Decision::Release);
+    };
+    let (sender, receiver) = oneshot::channel();
+    let held_at = state.started.elapsed();
+    *trap.fired.borrow_mut() = Some(Pending {
+        operation: operation.clone(),
+        held_at,
+        decide: Some(sender),
+    });
+    state.record(Action::Held, Some(operation.clone()));
+    state.holding += 1;
+    trap.notify.notify_waiters();
+    GateStart::Pending(receiver, operation, Holding(shared.clone()))
 }
 
 struct Holding(Shared);
@@ -352,17 +352,15 @@ impl Trap {
                         decide,
                     });
                 }
-                return Err(format!(
+                return Err(anyhow!(
                     "the interception `{:?}` was already taken",
                     self.state.selector
-                )
-                .into());
+                ));
             }
             let remaining =
-                deadline.checked_duration_since(time::Instant::now()).ok_or_else(|| {
+                deadline.checked_duration_since(time::Instant::now()).with_context(|| {
                     format!(
-                        "the interception `{:?}` did not occur within \
-                         {timeout:?}",
+                        "the interception `{:?}` did not occur within {timeout:?}",
                         self.state.selector
                     )
                 })?;
@@ -380,10 +378,7 @@ impl RuleHandle {
     pub fn remove(self) {
         let mut state = self.shared.borrow_mut();
         state.rules.retain(|rule| rule.id != self.id);
-        let (release, keep): (Vec<_>, Vec<_>) =
-            state.stalled.drain(..).partition(|(rule, _)| *rule == self.id);
-        state.stalled = keep;
-        for (_, decide) in release {
+        for (_, decide) in state.stalled.extract_if(.., |(rule, _)| *rule == self.id) {
             let _ = decide.send(Decision::Release);
         }
     }
@@ -474,8 +469,7 @@ impl BaseProxies {
         for (_, decide) in state.stalled.drain(..) {
             let _ = decide.send(Decision::Release);
         }
-        let traps: Vec<Rc<TrapState>> = state.traps.drain(..).collect();
-        for trap in traps {
+        for trap in mem::take(&mut state.traps) {
             let mut fired = trap.fired.borrow_mut();
             match fired.as_mut() {
                 Some(pending) => {
@@ -493,9 +487,29 @@ impl BaseProxies {
         self.shared.borrow().events.clone()
     }
 
+    pub fn held_count(&self, selector: &Selector) -> usize {
+        self.shared
+            .borrow()
+            .events
+            .iter()
+            .filter(|event| {
+                event.action == Action::Held
+                    && event.operation.as_ref().is_some_and(|operation| selector.matches(operation))
+            })
+            .count()
+    }
+
+    pub async fn await_held(&self, selector: Selector, timeout: Duration) -> Result<()> {
+        check::poll("base operation held", timeout, || async {
+            self.held_count(&selector) > 0
+        })
+        .await?;
+        Ok(())
+    }
+
     pub async fn reset(&self) -> Result<()> {
         self.restore();
-        crate::check::poll(
+        check::poll(
             "released interceptions resuming",
             UPSTREAM_TIMEOUT,
             || async { self.shared.borrow().holding == 0 },
@@ -515,11 +529,10 @@ impl BaseProxies {
         if unfired.is_empty() {
             return Ok(());
         }
-        Err(format!(
+        Err(anyhow!(
             "requested interceptions never occurred: {}",
             unfired.join("; ")
-        )
-        .into())
+        ))
     }
 
     fn shutdown(&mut self) {
@@ -824,15 +837,91 @@ fn response_operation(
     merged(request, Stage::Response, parsed.strings)
 }
 
+type UpstreamSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+struct WsRelay {
+    server: SplitSink<UpstreamSocket, Message>,
+    outbound: Outbound,
+    shared: Shared,
+    pending: HashMap<String, Operation>,
+    subscriptions: HashMap<u64, Operation>,
+}
+
+impl WsRelay {
+    async fn request(&mut self, frame: Message) -> result::Result<(), ()> {
+        let text = match frame {
+            Message::Text(text) => text,
+            Message::Close(_) => return Err(()),
+            other => return self.server.send(other).await.map_err(|_| ()),
+        };
+        let Some(parsed) = parse(&text) else {
+            return self.server.send(Message::Text(text)).await.map_err(|_| ());
+        };
+        let request = operation(
+            Transport::Ws,
+            Stage::Request,
+            parsed.method.as_deref().unwrap_or("?"),
+            parsed.strings,
+        );
+        let (decision, _hold) = gate(&self.shared, request.clone()).await;
+        match decision {
+            Decision::Discard => Err(()),
+            Decision::Reject(message) => {
+                let reply = rejection(&parsed.id, &message);
+                self.outbound.send(Some((Message::Text(reply.into()), None))).map_err(|_| ())
+            }
+            Decision::Release => {
+                if let Some(id) = parsed.id.as_ref().and_then(|id| json::to_string(id).ok()) {
+                    self.pending.insert(id, request);
+                }
+                self.server.send(Message::Text(text)).await.map_err(|_| ())
+            }
+        }
+    }
+
+    fn response(&mut self, frame: Message) -> result::Result<(), ()> {
+        let text = match frame {
+            Message::Text(text) => text,
+            Message::Close(_) => return Err(()),
+            other => return self.outbound.send(Some((other, None))).map_err(|_| ()),
+        };
+        let Some(parsed) = parse(&text) else {
+            return self.outbound.send(Some((Message::Text(text), None))).map_err(|_| ());
+        };
+        let is_notification = parsed.subscription.is_some();
+        let id = parsed.id.clone();
+        let inbound = response_operation(parsed, &mut self.pending, &mut self.subscriptions);
+        match gate_start(&self.shared, inbound) {
+            GateStart::Decided(decision) => {
+                deliver(&self.outbound, decision, text, is_notification, &id, None)
+            }
+            GateStart::Pending(receiver, operation, holding) => {
+                let shared = self.shared.clone();
+                let outbound = self.outbound.clone();
+                task::spawn_local(async move {
+                    let decision = gate_finish(&shared, receiver, operation).await;
+                    let _ = deliver(
+                        &outbound,
+                        decision,
+                        text,
+                        is_notification,
+                        &id,
+                        Some(holding),
+                    );
+                });
+                Ok(())
+            }
+        }
+    }
+}
+
 async fn serve_ws(socket: TcpStream, upstream: Url, shared: Shared) {
-    let Ok(client) = tokio_tungstenite::accept_async(socket).await else {
-        return;
-    };
+    let Ok(client) = tokio_tungstenite::accept_async(socket).await else { return };
     let Ok((server, _)) = tokio_tungstenite::connect_async(upstream.as_str()).await else {
         return;
     };
     let (mut client_sink, mut client_stream) = client.split();
-    let (mut server_sink, mut server_stream) = server.split();
+    let (server, mut server_stream) = server.split();
     let (outbound, mut outbound_rx) = mpsc::unbounded_channel();
     task::spawn_local(async move {
         while let Some(Some((message, _hold))) = outbound_rx.recv().await {
@@ -842,92 +931,25 @@ async fn serve_ws(socket: TcpStream, upstream: Url, shared: Shared) {
         }
         let _ = client_sink.close().await;
     });
-    let mut pending: HashMap<String, Operation> = HashMap::new();
-    let mut subscriptions: HashMap<u64, Operation> = HashMap::new();
+    let mut relay = WsRelay {
+        server,
+        outbound,
+        shared,
+        pending: HashMap::new(),
+        subscriptions: HashMap::new(),
+    };
     loop {
         tokio::select! {
             frame = client_stream.next() => {
                 let Some(Ok(frame)) = frame else { break };
-                let text = match frame {
-                    Message::Text(text) => text,
-                    Message::Close(_) => break,
-                    other => {
-                        if server_sink.send(other).await.is_err() {
-                            break;
-                        }
-                        continue;
-                    }
-                };
-                let Some(parsed) = parse(&text) else {
-                    if server_sink.send(Message::Text(text)).await.is_err() {
-                        break;
-                    }
-                    continue;
-                };
-                let request = operation(
-                    Transport::Ws,
-                    Stage::Request,
-                    parsed.method.as_deref().unwrap_or("?"),
-                    parsed.strings,
-                );
-                let (decision, _hold) = gate(&shared, request.clone()).await;
-                match decision {
-                    Decision::Discard => break,
-                    Decision::Reject(message) => {
-                        let reply = rejection(&parsed.id, &message);
-                        if outbound.send(Some((Message::Text(reply.into()), None))).is_err() {
-                            break;
-                        }
-                    }
-                    Decision::Release => {
-                        if let Some(id) = parsed.id.as_ref().and_then(|id| json::to_string(id).ok()) {
-                            pending.insert(id, request);
-                        }
-                        if server_sink.send(Message::Text(text)).await.is_err() {
-                            break;
-                        }
-                    }
-                }
+                if relay.request(frame).await.is_err() { break; }
             }
             frame = server_stream.next() => {
                 let Some(Ok(frame)) = frame else { break };
-                let text = match frame {
-                    Message::Text(text) => text,
-                    Message::Close(_) => break,
-                    other => {
-                        if outbound.send(Some((other, None))).is_err() {
-                            break;
-                        }
-                        continue;
-                    }
-                };
-                let Some(parsed) = parse(&text) else {
-                    if outbound.send(Some((Message::Text(text), None))).is_err() {
-                        break;
-                    }
-                    continue;
-                };
-                let is_notification = parsed.subscription.is_some();
-                let id = parsed.id.clone();
-                let inbound = response_operation(parsed, &mut pending, &mut subscriptions);
-                match gate_start(&shared, inbound) {
-                    GateStart::Decided(decision) => {
-                        if deliver(&outbound, decision, text, is_notification, &id, None).is_err() {
-                            break;
-                        }
-                    }
-                    GateStart::Pending(receiver, operation, holding) => {
-                        let shared = shared.clone();
-                        let outbound = outbound.clone();
-                        task::spawn_local(async move {
-                            let decision = gate_finish(&shared, receiver, operation).await;
-                            let _ = deliver(&outbound, decision, text, is_notification, &id, Some(holding));
-                        });
-                    }
-                }
+                if relay.response(frame).is_err() { break; }
             }
         }
     }
-    let _ = outbound.send(None);
-    let _ = server_sink.close().await;
+    let _ = relay.outbound.send(None);
+    let _ = relay.server.close().await;
 }

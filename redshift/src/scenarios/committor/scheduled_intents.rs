@@ -1,12 +1,13 @@
 use std::{rc::Rc, time::Duration};
 
+use anyhow::{ensure, Context};
 use instruction::Instruction;
 use keypair::Keypair;
 use magic_api::args::{CommitTypeArgs, MagicIntentBundleArgs};
 use pubkey::Pubkey;
 use redsuite_core::{
     api::custom_error_code,
-    check, check_eq, dlp, prep,
+    check, dlp, prep,
     programs::{
         Action, CellHeader, CellId, Commit, IntentBundle, Refund, ResultCallback, SettlementMode,
         MAGIC, REDSHIFT,
@@ -161,7 +162,7 @@ pub(super) async fn run(base: &BaseCtx, er: &ErCtx) -> Result<()> {
         )
         .await?;
         expected.push(CellHeader::try_decode(
-            &base.account(&cell).await?.ok_or("cell missing")?.data,
+            &base.account(&cell).await?.context("cell missing")?.data,
         )?);
         cells.push(cell);
     }
@@ -210,13 +211,9 @@ pub(super) async fn run(base: &BaseCtx, er: &ErCtx) -> Result<()> {
                     &format!("{} restored for {label}", cells[i]),
                     TIMEOUT,
                     || async {
-                        let account = er.account(&cells[i]).await?.ok_or("ER cell missing")?;
-                        check_eq!(account.owner, redshift_interface::ID, "ER cell ownership")?;
-                        check_eq!(
-                            CellHeader::try_decode(&account.data)?,
-                            expected[i],
-                            "ER sees the latest cell before another intent"
-                        )?;
+                        let account = er.account(&cells[i]).await?.context("ER cell missing")?;
+                        ensure!(account.owner == redshift_interface::ID);
+                        ensure!(CellHeader::try_decode(&account.data)? == expected[i]);
                         Ok::<_, DynError>(())
                     },
                 )
@@ -251,30 +248,22 @@ pub(super) async fn run(base: &BaseCtx, er: &ErCtx) -> Result<()> {
                     expected[i].value = expected[i]
                         .value
                         .checked_add_signed(*change)
-                        .ok_or("cell model underflow")?;
+                        .context("cell model underflow")?;
                     expected[i].revision += 1;
                     is_delegated[i] = false;
                     transfers += 1;
                 }
-                let account = base.account(&cells[i]).await?.ok_or("committed cell missing")?;
-                check_eq!(
-                    CellHeader::try_decode(&account.data)?,
-                    expected[i],
-                    "{label} {signature}: exact cell {}",
-                    cells[i]
-                )?;
-                check_eq!(
-                    account.owner,
-                    if is_delegated[i] { dlp::dlp_id() } else { redshift_interface::ID },
-                    "{label}: base ownership of {}",
-                    cells[i]
-                )?;
+                let account = base.account(&cells[i]).await?.context("committed cell missing")?;
+                ensure!(CellHeader::try_decode(&account.data)? == expected[i]);
+                ensure!(
+                    account.owner
+                        == if is_delegated[i] { dlp::dlp_id() } else { redshift_interface::ID }
+                );
             }
-            check_eq!(
-                base.api().get_balance(&destination).await?,
-                transfers as u64 * TRANSFER_LAMPORTS,
-                "{label} {signature}: exactly one transfer per routed action"
-            )?;
+            ensure!(
+                base.api().get_balance(&destination).await?
+                    == (transfers as u64 * TRANSFER_LAMPORTS)
+            );
             Ok(())
         })
         .await?;
@@ -283,10 +272,10 @@ pub(super) async fn run(base: &BaseCtx, er: &ErCtx) -> Result<()> {
     crate::phase("sponsored quota and undelegation", async {
         let payer = &payers[0];
         let initial_nonce = crate::last_commit_id(base, &cells[0]).await?;
-        check!(
+        ensure!(
             initial_nonce < receipt::SPONSORED_COMMIT_LIMIT,
             "quota preparation starts below the sponsored limit"
-        )?;
+        );
         for nonce in initial_nonce..receipt::SPONSORED_COMMIT_LIMIT {
             let signature = er
                 .submit_and_confirm(
@@ -302,11 +291,7 @@ pub(super) async fn run(base: &BaseCtx, er: &ErCtx) -> Result<()> {
                 )
                 .await?;
             settled(&signature, &cells[..1], false).await?;
-            check_eq!(
-                crate::last_commit_id(base, &cells[0]).await?,
-                nonce + 1,
-                "sponsored commit advances exactly one nonce"
-            )?;
+            ensure!(crate::last_commit_id(base, &cells[0]).await? == (nonce + 1));
         }
         let before = er.account(&cells[0]).await?;
         let signature = er
@@ -317,16 +302,8 @@ pub(super) async fn run(base: &BaseCtx, er: &ErCtx) -> Result<()> {
             ])
             .await?;
         let tx = er.api().await_transaction(&signature, TIMEOUT).await?;
-        check_eq!(
-            tx.err.as_ref().and_then(custom_error_code),
-            Some(receipt::COMMIT_LIMIT_ERR),
-            "{signature}: precise sponsored-limit refusal"
-        )?;
-        check_eq!(
-            er.account(&cells[0]).await?,
-            before,
-            "quota refusal rolls back the preceding write"
-        )?;
+        ensure!(tx.err.as_ref().and_then(custom_error_code) == Some(receipt::COMMIT_LIMIT_ERR));
+        ensure!(er.account(&cells[0]).await? == before);
         let signature = er
             .submit_and_confirm(
                 payer,
@@ -334,17 +311,9 @@ pub(super) async fn run(base: &BaseCtx, er: &ErCtx) -> Result<()> {
             )
             .await?;
         settled(&signature, &cells[..1], true).await?;
-        let account = base.account(&cells[0]).await?.ok_or("undelegated cell missing")?;
-        check_eq!(
-            account.owner,
-            redshift_interface::ID,
-            "quota exhaustion still permits undelegation"
-        )?;
-        check_eq!(
-            account.data,
-            before.ok_or("ER cell missing")?.data,
-            "quota undelegation settles unchanged bytes"
-        )?;
+        let account = base.account(&cells[0]).await?.context("undelegated cell missing")?;
+        ensure!(account.owner == redshift_interface::ID);
+        ensure!(account.data == before.context("ER cell missing")?.data);
         redelegate(base, er, payer, "after sponsored quota").await?;
         Ok(())
     })
@@ -356,10 +325,10 @@ pub(super) async fn run(base: &BaseCtx, er: &ErCtx) -> Result<()> {
     let vault = dlp::magic_fee_vault_pda(&er.identity());
     crate::phase("paid commit threshold and combined action charge", async {
         let initial_nonce = crate::last_commit_id(base, &cells[0]).await?;
-        check!(
+        ensure!(
             initial_nonce < PAID_COMMIT_LIMIT,
             "paid threshold starts above sponsored coverage"
-        )?;
+        );
         for nonce in initial_nonce..=PAID_COMMIT_LIMIT + 1 {
             let actions = nonce == PAID_COMMIT_LIMIT + 1;
             let destination = Keypair::new().pubkey();
@@ -381,26 +350,13 @@ pub(super) async fn run(base: &BaseCtx, er: &ErCtx) -> Result<()> {
             settled(&signature, &cells[..1], false).await?;
             let fee = if nonce >= PAID_COMMIT_LIMIT { COMMIT_FEE_LAMPORTS } else { 0 }
                 + if actions { ACTION_FEE } else { 0 };
-            check_eq!(
-                er.api().get_balance(&keys[0]).await?,
-                payer_before - fee,
-                "{signature}: exact payer debit at nonce {nonce}"
-            )?;
-            check_eq!(
-                er.api().get_balance(&vault).await?,
-                vault_before + fee,
-                "{signature}: exact vault credit at nonce {nonce}"
-            )?;
-            check_eq!(
-                crate::last_commit_id(base, &cells[0]).await?,
-                nonce + 1,
-                "paid commit nonce"
-            )?;
-            check_eq!(
-                base.api().get_balance(&destination).await?,
-                if actions { TRANSFER_LAMPORTS } else { 0 },
-                "combined charge retains action execution"
-            )?;
+            ensure!(er.api().get_balance(&keys[0]).await? == (payer_before - fee));
+            ensure!(er.api().get_balance(&vault).await? == (vault_before + fee));
+            ensure!(crate::last_commit_id(base, &cells[0]).await? == (nonce + 1));
+            ensure!(
+                base.api().get_balance(&destination).await?
+                    == if actions { TRANSFER_LAMPORTS } else { 0 }
+            );
         }
         Ok(())
     })
@@ -414,7 +370,7 @@ pub(super) async fn run(base: &BaseCtx, er: &ErCtx) -> Result<()> {
             async {
                 const AMOUNT: u64 = 890_880;
                 let destination = Keypair::new().pubkey();
-                let before = er.account(&cells[1]).await?.ok_or("transfer cell missing")?;
+                let before = er.account(&cells[1]).await?.context("transfer cell missing")?;
                 let state = CellHeader::try_decode(&before.data)?;
                 let payer_before = er.api().get_balance(&keys[1]).await?;
                 let vault_before = er.api().get_balance(&vault).await?;
@@ -430,45 +386,31 @@ pub(super) async fn run(base: &BaseCtx, er: &ErCtx) -> Result<()> {
                     TIMEOUT,
                     || async {
                         let account =
-                            er.account(&cells[1]).await?.ok_or("callback cell missing")?;
+                            er.account(&cells[1]).await?.context("callback cell missing")?;
                         let actual = CellHeader::try_decode(&account.data)?;
-                        check_eq!(
-                            actual.revision,
-                            state.revision + 1,
-                            "callback delivery count"
-                        )?;
-                        check_eq!(
-                            actual.value,
-                            state.value + u64::from(fail),
-                            "callback success/failure result"
-                        )?;
-                        check_eq!(
-                            account.lamports,
-                            before.lamports + if fail { 0 } else { AMOUNT },
-                            "callback retains or refunds prepayment"
-                        )?;
-                        check_eq!(
-                            er.api().get_balance(&keys[1]).await?,
-                            payer_before
-                                - ACTION_FEE
-                                - CALLBACK_FEE
-                                - if fail { 0 } else { AMOUNT },
-                            "exact payer balance after callback"
-                        )?;
+                        ensure!(actual.revision == (state.revision + 1));
+                        ensure!(actual.value == (state.value + u64::from(fail)));
+                        ensure!(
+                            account.lamports == (before.lamports + if fail { 0 } else { AMOUNT })
+                        );
+                        ensure!(
+                            er.api().get_balance(&keys[1]).await?
+                                == (payer_before
+                                    - ACTION_FEE
+                                    - CALLBACK_FEE
+                                    - if fail { 0 } else { AMOUNT })
+                        );
                         Ok::<_, DynError>(())
                     },
                 )
                 .await?;
-                check_eq!(
-                    base.api().get_balance(&destination).await?,
-                    if fail { 0 } else { AMOUNT },
-                    "{signature}: transferred amount or zero on rollback"
-                )?;
-                check_eq!(
-                    er.api().get_balance(&vault).await?,
-                    vault_before + ACTION_FEE + CALLBACK_FEE,
-                    "{signature}: action and callback fees are retained"
-                )?;
+                ensure!(
+                    base.api().get_balance(&destination).await? == if fail { 0 } else { AMOUNT }
+                );
+                ensure!(
+                    er.api().get_balance(&vault).await?
+                        == (vault_before + ACTION_FEE + CALLBACK_FEE)
+                );
                 Ok(())
             },
         )

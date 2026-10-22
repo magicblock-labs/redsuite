@@ -1,3 +1,4 @@
+use anyhow::anyhow;
 use redsuite_core::{
     catalog::{Family, ScenarioEntry},
     Result,
@@ -29,11 +30,10 @@ pub fn select(family: Family, targets: &[String]) -> Result<Vec<ScenarioEntry>> 
             .partition(|(_, entry)| entry.name(family) == *target || entry.short_name == target);
         let matches = if exact.is_empty() { prefixed } else { exact };
         if matches.is_empty() {
-            return Err(format!(
+            return Err(anyhow!(
                 "nothing matches `{target}` — `redsuite {} list` shows what exists",
                 family.prefix()
-            )
-            .into());
+            ));
         }
         for (index, _) in matches {
             if !selected.contains(&index) {

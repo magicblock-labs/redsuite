@@ -1,12 +1,12 @@
 use std::rc::Rc;
 
+use anyhow::{anyhow, ensure, Context};
 use instruction::Instruction;
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    check, check_eq,
     programs::{CellHeader, Redline, REDLINE},
-    topology, BaseCtx, ChainCtx, CheckError, ErCtx, Result, Scenario,
+    topology, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
 
 use crate::{ACCOUNT_SPACE, PAYER_LAMPORTS};
@@ -51,26 +51,21 @@ impl Scenario for MultiProgramClone {
         er.submit_and_confirm(&payer, &writes).await?;
 
         for ((program, _), label) in accounts.iter().zip(["first", "second"]) {
-            let clone = er.account(program).await?.ok_or_else(|| {
-                CheckError::new(format!(
-                    "the {label} program must be cloned to the ER after the tx"
-                ))
-            })?;
-            check!(
+            let clone = er
+                .account(program)
+                .await?
+                .ok_or_else(|| anyhow!("{label} program not cloned after the transaction"))?;
+            ensure!(
                 clone.executable,
                 "the {label} cloned program must be executable on the ER"
-            )?;
+            );
         }
         for ((_, key), expected) in accounts.iter().zip(WRITES) {
             let clone = er
                 .account(key)
                 .await?
-                .ok_or_else(|| format!("account {key} missing on the ER"))?;
-            check_eq!(
-                CellHeader::written_id(&clone.data),
-                Some(expected),
-                "program write to {key}"
-            )?;
+                .with_context(|| format!("account {key} missing on the ER"))?;
+            ensure!(CellHeader::written_id(&clone.data) == Some(expected));
         }
 
         Ok(())

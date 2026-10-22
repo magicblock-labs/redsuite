@@ -3,6 +3,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use anyhow::anyhow;
 use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore},
     time,
@@ -29,7 +30,7 @@ impl Pacing {
     pub fn interval(self) -> Result<Option<Duration>> {
         match self {
             Pacing::Unlimited => Ok(None),
-            Pacing::PerSecond(0) => Err("a paced run needs an offered rate above zero".into()),
+            Pacing::PerSecond(0) => Err(anyhow!("a paced run needs an offered rate above zero")),
             Pacing::PerSecond(rate) => Ok(Some(ONESEC / rate)),
         }
     }
@@ -40,11 +41,10 @@ impl Pacing {
             Pacing::PerSecond(rate) => {
                 self.interval()?;
                 if (rate as usize) < workers {
-                    return Err(format!(
+                    return Err(anyhow!(
                         "an offered rate of {rate}/s cannot be split across \
                          {workers} workers"
-                    )
-                    .into());
+                    ));
                 }
                 Ok(split_budget(u64::from(rate), workers)
                     .into_iter()
@@ -106,7 +106,9 @@ pub struct Admission {
 impl Admission {
     pub fn new(concurrency: usize) -> Result<Self> {
         if concurrency == 0 {
-            return Err("an admission budget needs a concurrency above zero".into());
+            return Err(anyhow!(
+                "an admission budget needs a concurrency above zero"
+            ));
         }
         Ok(Self {
             permits: Arc::new(Semaphore::new(concurrency)),

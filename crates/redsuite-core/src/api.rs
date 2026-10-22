@@ -1,6 +1,7 @@
-use std::{collections::HashMap, mem, str::FromStr, time::Duration};
+use std::{collections::HashMap, mem, result, str::FromStr, time::Duration};
 
 use account::Account;
+use anyhow::{anyhow, Context};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use bytes::Bytes;
 use hash::Hash;
@@ -34,10 +35,7 @@ pub struct TxError {
 }
 
 #[derive(Debug, Error)]
-#[error(
-    "transaction {signature} not confirmed within {deadline:?} — execution \
-     outcome unknown, do not resubmit"
-)]
+#[error("transaction {signature} unconfirmed after {deadline:?} (outcome unknown)")]
 pub struct ConfirmTimeout {
     pub signature: Signature,
     pub deadline: Duration,
@@ -134,9 +132,7 @@ struct RpcKeyedAccount {
 }
 
 fn decode_rpc_account(raw: RpcAccount) -> Result<Account> {
-    let data = STANDARD
-        .decode(&raw.data.0)
-        .map_err(|e| format!("bad base64 account data: {e}"))?;
+    let data = STANDARD.decode(&raw.data.0).context("bad base64 account data")?;
     Ok(Account {
         lamports: raw.lamports,
         data,
@@ -304,9 +300,21 @@ impl Api {
         method: &str,
         params: &impl Serialize,
     ) -> Result<T> {
-        self.call_nullable(method, params)
-            .await?
-            .ok_or_else(|| format!("{method}: response carried neither result nor error").into())
+        self.try_call(method, params).await?.map_err(Into::into)
+    }
+
+    /// Keeps RPC rejection typed; transport and decoding failures use the outer error.
+    pub async fn try_call<T: DeserializeOwned>(
+        &self,
+        method: &str,
+        params: &impl Serialize,
+    ) -> Result<result::Result<T, RpcError>> {
+        match self.request(method, params).await? {
+            Ok(value) => Ok(Ok(value.with_context(|| {
+                format!("{method}: response carried neither result nor error")
+            })?)),
+            Err(error) => Ok(Err(error)),
+        }
     }
 
     // For methods where a null result is a legitimate answer (getTransaction
@@ -316,6 +324,14 @@ impl Api {
         method: &str,
         params: &impl Serialize,
     ) -> Result<Option<T>> {
+        self.request(method, params).await?.map_err(Into::into)
+    }
+
+    async fn request<T: DeserializeOwned>(
+        &self,
+        method: &str,
+        params: &impl Serialize,
+    ) -> Result<result::Result<Option<T>, RpcError>> {
         let params = json::to_string(params)?;
         let body = crate::transport::conn::request_text(1, method, &params);
         let response =
@@ -324,9 +340,9 @@ impl Api {
                 error
             })?;
         let envelope: Envelope<T> = json::from_str(&response)
-            .map_err(|e| format!("{method}: unexpected response shape: {e} ({response})"))?;
+            .with_context(|| format!("{method}: unexpected response shape ({response})"))?;
         if let Some(err) = envelope.error {
-            return Err(Box::new(RpcError {
+            return Ok(Err(RpcError {
                 code: err.code,
                 message: err.message,
                 data: err.data,
@@ -334,7 +350,7 @@ impl Api {
                 url: self.url.clone(),
             }));
         }
-        Ok(envelope.result)
+        Ok(Ok(envelope.result))
     }
 
     pub async fn get_health(&self) -> Result<String> {
@@ -346,10 +362,7 @@ impl Api {
     }
 
     pub async fn server_alive(&self) -> bool {
-        match self.get_health().await {
-            Ok(_) => true,
-            Err(e) => e.is::<RpcError>(),
-        }
+        self.try_call::<String>("getHealth", &NO_PARAMS).await.is_ok()
     }
 
     pub async fn primary_ready(&self) -> bool {
@@ -386,12 +399,11 @@ impl Api {
         let resp: WithContext<Vec<Option<RpcAccount>>> =
             self.call("getMultipleAccounts", &params).await?;
         if resp.value.len() != pks.len() {
-            return Err(format!(
+            return Err(anyhow!(
                 "getMultipleAccounts: asked for {} accounts, got {}",
                 pks.len(),
                 resp.value.len()
-            )
-            .into());
+            ));
         }
         resp.value
             .into_iter()
@@ -440,8 +452,9 @@ impl Api {
                 "sendTransaction",
                 &json::to_string(&Self::send_params(tx)?)?,
             ));
-            expect
-                .push(*tx.signatures.first().ok_or("a transaction to send carries no signature")?);
+            expect.push(
+                *tx.signatures.first().context("a transaction to send carries no signature")?,
+            );
         }
         if batched {
             body.push(']');
@@ -459,15 +472,12 @@ impl Api {
             1 => json::from_str(&response).map(|one| vec![one]),
             _ => json::from_str(&response),
         }
-        .map_err(|error| {
-            format!("sendTransaction: unexpected response shape: {error} ({response})")
-        })?;
+        .with_context(|| format!("sendTransaction: unexpected response shape ({response})"))?;
         if envelopes.len() != count {
-            return Err(format!(
+            return Err(anyhow!(
                 "sendTransaction: sent {count} requests, got {} responses",
                 envelopes.len()
-            )
-            .into());
+            ));
         }
         let mut answered = vec![false; count];
         let mut rejected = 0;
@@ -476,58 +486,75 @@ impl Api {
                 .id
                 .and_then(|id| usize::try_from(id).ok())
                 .filter(|id| (1..=count).contains(id))
-                .ok_or_else(|| {
+                .with_context(|| {
                     format!(
                         "sendTransaction: response id {:?} outside 1..={count}",
                         envelope.id
                     )
                 })?;
             if mem::replace(&mut answered[id - 1], true) {
-                return Err(format!("sendTransaction: duplicate response id {id}").into());
+                return Err(anyhow!("sendTransaction: duplicate response id {id}"));
             }
             if envelope.error.is_some() {
                 rejected += 1;
                 continue;
             }
-            let signature = envelope.result.as_ref().ok_or_else(|| {
+            let signature = envelope.result.as_ref().with_context(|| {
                 format!("sendTransaction: id {id} carries neither result nor error")
             })?;
             let acknowledged = Signature::from_str(signature)?;
             let expected = body.expect[id - 1];
             if acknowledged != expected {
-                return Err(format!(
+                return Err(anyhow!(
                     "sendTransaction: id {id} acknowledged \
                      {acknowledged}, expected {expected}"
-                )
-                .into());
+                ));
             }
         }
         Ok(rejected)
     }
 
     pub async fn send_transaction(&self, tx: &Transaction) -> Result<Signature> {
-        let sig: String = self.call("sendTransaction", &Self::send_params(tx)?).await?;
-        Ok(Signature::from_str(&sig)?)
+        self.try_send_transaction(tx).await?.map_err(Into::into)
+    }
+
+    pub async fn try_send_transaction(
+        &self,
+        tx: &Transaction,
+    ) -> Result<result::Result<Signature, RpcError>> {
+        match self.try_call::<String>("sendTransaction", &Self::send_params(tx)?).await? {
+            Ok(sig) => Ok(Ok(Signature::from_str(&sig)?)),
+            Err(error) => Ok(Err(error)),
+        }
     }
 
     pub async fn confirm(&self, sig: &Signature, options: ConfirmOptions) -> Result<()> {
+        self.try_confirm(sig, options).await?.map_err(Into::into)
+    }
+
+    /// Keeps on-chain failure typed; timeout or RPC failure is not an execution outcome.
+    pub async fn try_confirm(
+        &self,
+        sig: &Signature,
+        options: ConfirmOptions,
+    ) -> Result<result::Result<(), TxError>> {
         crate::check::poll_until(options.deadline, options.poll, async || {
             if let Some(status) = self.get_signature_status(sig).await? {
                 if let Some(err) = status.err {
-                    return Err(Box::new(TxError { signature: *sig, err }) as DynError);
+                    return Result::Ok(Some(Err(TxError { signature: *sig, err })));
                 }
                 if status.meets(options.commitment) {
-                    return Ok(Some(()));
+                    return Ok(Some(Ok(())));
                 }
             }
             Ok(None)
         })
         .await?
         .ok_or_else(|| {
-            Box::new(ConfirmTimeout {
+            DynError::new(ConfirmTimeout {
                 signature: *sig,
                 deadline: options.deadline,
-            }) as DynError
+            })
         })
     }
 
@@ -624,7 +651,7 @@ impl Api {
     ) -> Result<TransactionInfo> {
         crate::check::poll_until(timeout, TX_POLL, async || self.get_transaction(sig).await)
             .await?
-            .ok_or_else(|| format!("transaction {sig} not found within {timeout:?}").into())
+            .with_context(|| format!("transaction {sig} not found within {timeout:?}"))
     }
 }
 

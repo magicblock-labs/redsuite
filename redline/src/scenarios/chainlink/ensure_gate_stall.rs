@@ -1,9 +1,9 @@
 use std::{rc::Rc, time::Duration};
 
+use anyhow::ensure;
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    check, check_eq,
     profile::ProfileValues,
     programs::REDLINE,
     redline::Accounts,
@@ -232,12 +232,12 @@ impl Scenario<ScenarioReport> for EnsureGateStall {
         let healthy = &cells[0];
         let thrash = &cells[1];
 
-        check_eq!(
+        ensure!(
+            healthy.outcome.failed == 0,
+            "failures={:?}; first error={:?}",
             healthy.outcome.failed,
-            0,
-            "healthy cell requests failed: {:?}",
             healthy.outcome.first_error
-        )?;
+        );
         if healthy.outcome.delivery.median >= 1_000_000 {
             warn!(
                 healthy.outcome.delivery.median,
@@ -257,20 +257,20 @@ impl Scenario<ScenarioReport> for EnsureGateStall {
         // fraction of the working set can evict below capacity; only
         // systematic eviction marks a broken knob.
         let healthy_tolerance = (profile.working_set as f64) * 0.15;
-        check!(
+        ensure!(
             healthy.evictions <= healthy_tolerance,
             "healthy cell (cap ≥ working set) evicted {} accounts",
             healthy.evictions
-        )?;
+        );
 
-        check!(
+        ensure!(
             thrash.outcome.delivered > 0,
             "INVALID: the thrash cell delivered nothing"
-        )?;
-        check!(
+        );
+        ensure!(
             thrash.evictions > 0.0,
             "INVALID: no evictions — the cap knob did not engage"
-        )?;
+        );
 
         let slowdown = if healthy.outcome.delivery.median > 0 {
             thrash.outcome.delivery.median as f64 / healthy.outcome.delivery.median as f64

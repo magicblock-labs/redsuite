@@ -1,5 +1,6 @@
 use std::{future::Future, panic::AssertUnwindSafe, rc::Rc, result, time::Instant};
 
+use anyhow::anyhow;
 use futures_util::FutureExt;
 use tokio::task::LocalSet;
 use tracing::{error, info, instrument, Span};
@@ -129,7 +130,7 @@ impl RunRecord {
         let mut base = topology::base_only(config).await?;
         base.scenario = Some(self.name.clone());
         let base = Rc::new(base);
-        let state = state?;
+        let state = state.map_err(crate::DynError::msg)?;
         let resources = base.resources();
         self.phase = "setup";
         let started = Instant::now();
@@ -144,7 +145,7 @@ impl RunRecord {
             Ok(Err(error)) => (None, Err(error)),
             Err(payload) => {
                 self.phase = "panic";
-                (None, Err(panic_message(payload).into()))
+                (None, Err(crate::DynError::msg(panic_message(payload))))
             }
         };
         self.report = report.map(|report| {
@@ -164,7 +165,7 @@ impl RunRecord {
                     self.phase = "persist";
                     self.outcome = Err(error);
                 } else {
-                    error!(%error, "report not persisted");
+                    error!(error = %format_args!("{error:#}"), "report not persisted");
                 }
             }
         }
@@ -174,7 +175,7 @@ impl RunRecord {
         }
         Span::current().record("stage", self.phase);
         match &self.outcome {
-            Err(error) => error!(%error, "failed"),
+            Err(error) => error!(error = %format_args!("{error:#}"), "failed"),
             Ok(()) => error!("verdict failed"),
         }
         for launch in &self.launches {
@@ -259,12 +260,11 @@ fn preflight(fixtures: &[Fixture]) -> Result<()> {
     };
     for fixture in fixtures {
         if fixture.program_id().is_some() && !loaded.iter().any(|name| name == fixture.so_name()) {
-            return Err(format!(
+            return Err(anyhow!(
                 "{} is staged, but the running base booted without it — \
                  run `cargo xtask stack down`, then run again",
                 fixture.so_name()
-            )
-            .into());
+            ));
         }
     }
     Ok(())

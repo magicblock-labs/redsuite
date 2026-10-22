@@ -3,11 +3,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+use anyhow::{ensure, Context};
 use keypair::Keypair;
 use pubkey::Pubkey;
 
 use redsuite_core::{
-    check, check_eq, prep,
+    check, prep,
     programs::{CellHeader, REDSHIFT},
     topology::{self, ErOptions, PrivateEr, RestartConfig},
     BaseCtx, ChainCtx, DynError, ErCtx, PrivateErScenario, Result,
@@ -78,9 +79,9 @@ async fn seed_history(er: &ErCtx, cell: &Pubkey, sent: &mut Vec<Sent>) -> Result
         "the er records the clone of the delegated cell",
         PROGRAM_CLONE_TIMEOUT,
         || async {
-            check!(er.account(cell).await?.is_some(), "cell {cell} not cloned")?;
+            ensure!(er.account(cell).await?.is_some(), "cell {cell} not cloned");
             let signatures = er.api().get_signatures_for_address(cell, SIGNATURE_WINDOW).await?;
-            check!(!signatures.is_empty(), "cell {cell} has no history")?;
+            ensure!(!signatures.is_empty(), "cell {cell} has no history");
             Ok::<_, DynError>(signatures)
         },
     )
@@ -91,7 +92,7 @@ async fn seed_history(er: &ErCtx, cell: &Pubkey, sent: &mut Vec<Sent>) -> Result
             .api()
             .get_transaction(&signature)
             .await?
-            .ok_or_else(|| format!("listed transaction {signature} is missing on the er"))?;
+            .with_context(|| format!("listed transaction {signature} is missing on the er"))?;
         sent.push(Sent { signature, slot: tx.slot });
     }
     Ok(())
@@ -113,11 +114,11 @@ async fn send_add(er: &ErCtx, payer: &Keypair, count: u8, sent: &mut Vec<Sent>) 
         )
         .await?;
     let tx = er.api().await_transaction(&signature, TX_LEDGER_TIMEOUT).await?;
-    check!(
+    ensure!(
         tx.err.is_none(),
         "add {signature} must succeed on the er, got {:?}",
         tx.err
-    )?;
+    );
     sent.push(Sent { signature, slot: tx.slot });
     Ok(())
 }
@@ -130,12 +131,7 @@ async fn observe(er: &ErCtx, sent: &[Sent]) -> Result<HistoryView> {
     for entry in sent {
         match er.api().get_transaction(&entry.signature).await? {
             Some(tx) => {
-                check_eq!(
-                    tx.slot,
-                    entry.slot,
-                    "retained transaction {} must keep its slot",
-                    entry.signature
-                )?;
+                ensure!(tx.slot == entry.slot);
                 view.retained.push(entry.clone());
             }
             None => view.pruned.push(entry.clone()),
@@ -145,7 +141,7 @@ async fn observe(er: &ErCtx, sent: &[Sent]) -> Result<HistoryView> {
 }
 
 async fn cell_value(er: &ErCtx, cell: &Pubkey) -> Result<u64> {
-    let account = er.account(cell).await?.ok_or("the delegated cell is missing on the er")?;
+    let account = er.account(cell).await?.context("the delegated cell is missing on the er")?;
     Ok(CellHeader::try_decode(&account.data)?.value)
 }
 
@@ -157,64 +153,55 @@ async fn verify(
     cell: &Pubkey,
     expected_count: u64,
 ) -> Result<()> {
-    check!(
+    ensure!(
         view.pruned.len() >= previous_pruned,
         "{label}: pruned history must not come back — {} pruned before, {} \
          now",
         previous_pruned,
         view.pruned.len()
-    )?;
+    );
     if let (Some(max_pruned), Some(min_retained)) =
         (view.max_pruned_slot(), view.min_retained_slot())
     {
-        check!(
+        ensure!(
             max_pruned < min_retained,
             "{label}: retention must remove only the oldest history — a \
              pruned transaction sits in slot {max_pruned} while slot \
              {min_retained} is still retained"
-        )?;
+        );
     }
 
     let tip = er.api().get_slot().await?;
     for entry in &view.pruned {
         let block = er.api().get_block(entry.slot).await?;
-        check!(
+        ensure!(
             block.is_none(),
             "{label}: slot {} holds pruned transaction {} but getBlock still \
              returns it",
             entry.slot,
             entry.signature
-        )?;
+        );
     }
     for entry in &view.retained {
         if entry.slot + BLOCK_SETTLE_SLOTS > tip {
             continue;
         }
         let block = er.api().get_block(entry.slot).await?;
-        check!(
+        ensure!(
             block.is_some(),
             "{label}: slot {} holds retained transaction {} but getBlock \
              returns nothing",
             entry.slot,
             entry.signature
-        )?;
+        );
     }
 
     let listed = er.api().get_signatures_for_address(cell, SIGNATURE_WINDOW).await?;
     let expected: Vec<Signature> =
         view.retained.iter().rev().map(|entry| entry.signature).collect();
-    check_eq!(
-        listed,
-        expected,
-        "{label}: getSignaturesForAddress must list exactly the retained \
-         transactions, newest first"
-    )?;
+    ensure!(listed == expected);
 
-    check_eq!(
-        cell_value(er, cell).await?,
-        expected_count,
-        "{label}: the delegated cell must hold every add"
-    )?;
+    ensure!(cell_value(er, cell).await? == expected_count);
     Ok(())
 }
 
@@ -295,46 +282,42 @@ impl PrivateErScenario for LedgerRetention {
                 if events >= RETENTION_EVENTS && first_pruning_event.is_some() {
                     break;
                 }
-                check!(
+                ensure!(
                     started.elapsed() < RETENTION_TIMEOUT,
                     "retention must purge {RETENTION_EVENTS} superblocks and \
                      reach this scenario's history within \
                      {RETENTION_TIMEOUT:?}; saw {events} events and {} pruned \
                      transactions",
                     previous_pruned
-                )?;
+                );
                 time::sleep(TX_INTERVAL).await;
             }
 
             before = observe(er, &sent).await?;
             verify(er, "before restart", &before, previous_pruned, &cell, total).await?;
-            check!(
+            ensure!(
                 !before.retained.is_empty(),
                 "some of this scenario's history must still be retained \
                  before the restart"
-            )?;
+            );
         }
 
         let timing = private.restart(RestartConfig::default()).await?;
-        check_eq!(
-            timing.exit_code,
-            Some(0),
-            "the er must stop cleanly on SIGTERM before the relaunch"
-        )?;
-        check!(
+        ensure!(timing.exit_code == Some(0));
+        ensure!(
             !timing.needed_sigkill,
             "the graceful stop must not escalate to SIGKILL"
-        )?;
+        );
 
         let er = private.ctx();
         let after = observe(er, &sent).await?;
-        check!(
+        ensure!(
             after.pruned.len() >= before.pruned.len(),
             "a restart must not resurrect pruned history — {} pruned before, \
              {} after",
             before.pruned.len(),
             after.pruned.len()
-        )?;
+        );
         verify(
             er,
             "after restart",
@@ -344,10 +327,10 @@ impl PrivateErScenario for LedgerRetention {
             total,
         )
         .await?;
-        check!(
+        ensure!(
             !after.retained.is_empty(),
             "the restart must preserve the retained history"
-        )?;
+        );
 
         let count = add_count(adds);
         send_add(er, &payer, count, &mut sent).await?;

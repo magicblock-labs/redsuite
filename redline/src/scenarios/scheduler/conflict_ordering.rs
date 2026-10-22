@@ -9,11 +9,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+use anyhow::{anyhow, ensure, Context};
 use futures_util::future::join_all;
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    check, check_eq, prep,
+    check, prep,
     profile::ProfileValues,
     programs::HashState,
     redline::{
@@ -28,8 +29,8 @@ use redsuite_core::{
     sampler::{MeanMax, Sampled, Sampler, Trailing},
     stats::{ObservationsStats, StreamingStats},
     transport::{clock::SendClock, ws::SignatureConfirmations},
-    BaseCtx, ChainCtx, CheckError, ErClient, ErCtx, Metrics, MetricsDelta, Result, Scenario,
-    ScenarioReport, TxSender,
+    BaseCtx, ChainCtx, ErClient, ErCtx, Metrics, MetricsDelta, Result, Scenario, ScenarioReport,
+    TxSender,
 };
 use signature::Signature;
 use signer::Signer;
@@ -195,7 +196,7 @@ fn spawn_load(
                 LoadMode::Open { .. } if concurrency == 0 => Ok(RawRunOutcome::default()),
                 LoadMode::Open { .. } => open_load(lanes, iters, concurrency, &worker).await,
                 LoadMode::Bounded { .. } => {
-                    bounded_load(&er_ws_url, lanes, iters, worker.stop_flag()).await
+                    BoundedLoad::run(&er_ws_url, lanes, iters, worker.stop_flag()).await
                 }
             }
         }
@@ -217,77 +218,77 @@ async fn open_load(
     .await
 }
 
-#[derive(Default)]
-struct LaneTally {
-    delivered: u64,
-    failed: u64,
-    first_error: Option<String>,
-    delivery: StreamingStats,
+struct BoundedLoad {
+    sigs: SignatureConfirmations,
+    tally: RefCell<RawRunOutcome>,
+    next_id: Cell<u64>,
+    stop: Arc<AtomicBool>,
+    iters: u32,
 }
 
-async fn bounded_load(
-    ws_url: &Url,
-    lanes: Vec<(Pubkey, TxSender)>,
-    iters: u32,
-    stop: Arc<AtomicBool>,
-) -> Result<RawRunOutcome> {
-    let sigs =
-        Rc::new(SignatureConfirmations::connect(ws_url, Arc::new(SendClock::new(1, 0))).await?);
-    let tally = Rc::new(RefCell::new(LaneTally::default()));
-    let next_id = Rc::new(Cell::new(0u64));
-    let started = Instant::now();
-    let mut tasks = Vec::with_capacity(lanes.len());
-    for (account, sender) in lanes {
-        let sigs = sigs.clone();
-        let tally = tally.clone();
-        let stop = stop.clone();
-        let next_id = next_id.clone();
-        tasks.push(tokio::task::spawn_local(async move {
-            while !stop.load(Ordering::Relaxed) {
-                let id = next_id.get() + 1;
-                next_id.set(id);
-                let ixs = independent_ixs(id, account, iters);
-                let result: Result<()> = async {
-                    let tx = sender.prepare(&ixs).await?;
-                    sigs.subscribe(id, &tx.signatures[0]).await?;
-                    let sent = Instant::now();
-                    sender.submit_prepared(&tx).await?;
-                    tally.borrow_mut().delivery.push(sent.elapsed().as_micros() as u32);
-                    time::timeout(CONFIRM_TIMEOUT, sigs.await_id(id)).await.map_err(|_| {
-                        format!(
-                            "confirmation for independent tx {id} not \
-                                     within {CONFIRM_TIMEOUT:?}"
-                        )
-                    })??;
-                    Ok(())
-                }
-                .await;
-                let mut tally = tally.borrow_mut();
-                match result {
-                    Ok(()) => tally.delivered += 1,
-                    Err(error) => {
-                        tally.failed += 1;
-                        tally.first_error.get_or_insert(error.to_string());
-                        break;
-                    }
+impl BoundedLoad {
+    async fn run(
+        ws_url: &Url,
+        lanes: Vec<(Pubkey, TxSender)>,
+        iters: u32,
+        stop: Arc<AtomicBool>,
+    ) -> Result<RawRunOutcome> {
+        let load = Rc::new(Self {
+            sigs: SignatureConfirmations::connect(ws_url, Arc::new(SendClock::new(1, 0))).await?,
+            tally: RefCell::new(RawRunOutcome::default()),
+            next_id: Cell::new(0),
+            stop,
+            iters,
+        });
+        let started = Instant::now();
+        let mut tasks = Vec::with_capacity(lanes.len());
+        for (account, sender) in lanes {
+            tasks.push(tokio::task::spawn_local(
+                load.clone().run_lane(account, sender),
+            ));
+        }
+        for task in tasks {
+            task.await.context("independent lane panicked")?;
+        }
+        let confirmations = load.sigs.finalize();
+        let tally = mem::take(&mut *load.tally.borrow_mut());
+        Ok(RawRunOutcome {
+            failed: tally.failed + confirmations.failed as u64,
+            first_error: tally.first_error.or(confirmations.first_failure),
+            origin: SEND_ORIGIN,
+            wall: started.elapsed(),
+            ..tally
+        })
+    }
+
+    async fn run_lane(self: Rc<Self>, account: Pubkey, sender: TxSender) {
+        while !self.stop.load(Ordering::Relaxed) {
+            let result = self.deliver(account, &sender).await;
+            let mut tally = self.tally.borrow_mut();
+            match result {
+                Ok(()) => tally.delivered += 1,
+                Err(error) => {
+                    tally.failed += 1;
+                    tally.first_error.get_or_insert(format!("{error:#}"));
+                    break;
                 }
             }
-        }));
+        }
     }
-    for task in tasks {
-        task.await.map_err(|error| format!("independent lane panicked: {error}"))?;
+
+    async fn deliver(&self, account: Pubkey, sender: &TxSender) -> Result<()> {
+        let id = self.next_id.get() + 1;
+        self.next_id.set(id);
+        let tx = sender.prepare(&independent_ixs(id, account, self.iters)).await?;
+        self.sigs.subscribe(id, &tx.signatures[0]).await?;
+        let sent = Instant::now();
+        sender.submit_prepared(&tx).await?;
+        self.tally.borrow_mut().delivery.push(sent.elapsed().as_micros() as u32);
+        time::timeout(CONFIRM_TIMEOUT, self.sigs.await_id(id)).await.with_context(|| {
+            format!("independent tx {id} unconfirmed after {CONFIRM_TIMEOUT:?}")
+        })??;
+        Ok(())
     }
-    let confirmations = sigs.finalize();
-    let mut tally = tally.borrow_mut();
-    Ok(RawRunOutcome {
-        delivered: tally.delivered,
-        failed: tally.failed + confirmations.failed as u64,
-        first_error: tally.first_error.take().or(confirmations.first_failure),
-        delivery: mem::take(&mut tally.delivery),
-        origin: SEND_ORIGIN,
-        wall: started.elapsed(),
-        ..RawRunOutcome::default()
-    })
 }
 
 async fn join_load(handles: Workers<RawRunOutcome>) -> Result<RunOutcome> {
@@ -346,11 +347,9 @@ fn is_idle(metrics: &Metrics) -> bool {
 async fn drain(er: &ErCtx, target: f64) -> Result<DrainState> {
     let started = Instant::now();
     crate::await_executed(er, target, DRAIN_TIMEOUT).await?;
-    check::poll(
-        "the execution pipeline goes idle (nothing blocked, busy or pending)",
-        SETTLE_TIMEOUT,
-        || async { er.scrape_metrics().await.is_ok_and(|metrics| is_idle(&metrics)) },
-    )
+    check::poll("execution pipeline idle", SETTLE_TIMEOUT, || async {
+        er.scrape_metrics().await.is_ok_and(|metrics| is_idle(&metrics))
+    })
     .await?;
     let (blocked, busy, pending) = idle_values(&er.scrape_metrics().await?);
     Ok(DrainState {
@@ -381,15 +380,14 @@ async fn await_load_reaching_executors(
         if let Some(handles) = handles.take() {
             let load = join_load(handles).await?;
             if let Some(error) = load.first_error {
-                return Err(format!(
+                return Err(anyhow!(
                     "independent load failed before reaching the executors: \
-                     {error}"
-                )
-                .into());
+                     {error:#}"
+                ));
             }
         }
     }
-    reached.map_err(Into::into)
+    reached
 }
 
 struct PhasePlan {
@@ -475,7 +473,7 @@ async fn run_phase(
     time::sleep_until(phase_started + plan.span).await;
     let load = match handles.take() {
         Some(handles) => join_load(handles).await?,
-        None => return Err("independent load driver already joined".into()),
+        None => return Err(anyhow!("independent load driver already joined")),
     };
     let samples = sampler.finish_complete("scheduler").await?;
     chain_result?;
@@ -521,18 +519,10 @@ async fn verify_pairs(er: &ErCtx, pairs: &mut [Pair], batch: usize) -> Result<()
         if let Err(error) =
             pair.chain.verify(er, &format!("batch {batch}: pair {index} on the ER")).await
         {
-            let error = match error.downcast::<CheckError>() {
-                Ok(error) => error
-                    .context(
-                        "first failed step of this batch",
-                        first_failed_step(er, &pair.steps).await.unwrap_or_else(|| {
-                            "none — every step executed successfully".to_owned()
-                        }),
-                    )
-                    .into(),
-                Err(error) => error,
-            };
-            return Err(error);
+            let step = first_failed_step(er, &pair.steps)
+                .await
+                .unwrap_or_else(|| "none — every step executed successfully".to_owned());
+            return Err(error.context(format!("first failed step of this batch: {step}")));
         }
         pair.steps.clear();
     }
@@ -545,14 +535,9 @@ async fn verify_independent(er: &ErCtx, accounts: &[Pubkey], iters: u32) -> Resu
         let account = er
             .account(address)
             .await?
-            .ok_or(format!("independent account {index} is not on the ER"))?;
+            .with_context(|| format!("independent account {index} is not on the ER"))?;
         let hash = &account.data[layout::HASH_OFFSET..layout::HASH_OFFSET + layout::HASH_SIZE];
-        check_eq!(
-            hash,
-            expected,
-            "independent account {index} must hold the {iters}-iteration \
-             hash chain — the high-cu work beside the chains was not executed"
-        )?;
+        ensure!(hash == expected);
     }
     Ok(())
 }
@@ -595,11 +580,11 @@ impl Scenario<ScenarioReport> for ConflictOrdering {
 
         let probe = er.scrape_metrics().await?;
         for name in REQUIRED_METRICS {
-            check!(
+            ensure!(
                 probe.get(name).is_some(),
                 "the ER exposes no {name} metric — this scenario reads the \
                  engine's sequencer and ledger gauges to prove ordering"
-            )?;
+            );
         }
 
         let payers = base
@@ -682,22 +667,22 @@ impl Scenario<ScenarioReport> for ConflictOrdering {
         time::sleep(CALIBRATION).await;
         let calibration = match handles.take() {
             Some(handles) => join_load(handles).await?,
-            None => return Err("calibration load already joined".into()),
+            None => return Err(anyhow!("calibration load already joined")),
         };
         let calibration_samples = sampler.finish_complete("scheduler").await?;
-        check_eq!(
+        ensure!(
+            calibration.failed == 0,
+            "failures={:?}; first error={:?}",
             calibration.failed,
-            0,
-            "calibration deliveries failed: {:?}",
             calibration.first_error
-        )?;
+        );
         let executors = calibration_samples.value.busy.max;
-        check!(
+        ensure!(
             executors >= MIN_EXECUTORS,
             "saturating open-loop high-cu load kept at most {executors:.0} \
              executor busy — this scenario needs at least {MIN_EXECUTORS:.0} \
              (the engine sizes its pool from the host's cpus)"
-        )?;
+        );
         let contention_lanes = (executors as usize * LANES_PER_EXECUTOR)
             .min(profile.independent_accounts)
             .max(1);
@@ -722,12 +707,12 @@ impl Scenario<ScenarioReport> for ConflictOrdering {
         let mut batches: Vec<BatchOutcome> = Vec::with_capacity(profile.batches);
         for batch in 0..profile.batches {
             let before = er.scrape_metrics().await?;
-            check!(
+            ensure!(
                 is_idle(&before),
                 "batch {batch} must start on an idle pipeline, observed \
                  (blocked, busy, pending) = {:?}",
                 idle_values(&before)
-            )?;
+            );
             let txs_before = before.get(TX_COUNT).unwrap_or_default();
 
             let mut phases = Vec::with_capacity(modes.len());
@@ -750,13 +735,12 @@ impl Scenario<ScenarioReport> for ConflictOrdering {
                     plan,
                 )
                 .await?;
-                check_eq!(
+                ensure!(
+                    phase.load.failed == 0,
+                    "failures={:?}; first error={:?}",
                     phase.load.failed,
-                    0,
-                    "batch {batch} {}: independent deliveries failed: {:?}",
-                    phase.label,
                     phase.load.first_error
-                )?;
+                );
                 debug!(
                     batch,
                     phase.label, phase.chain_txs, "contention phase finished",
@@ -788,21 +772,21 @@ impl Scenario<ScenarioReport> for ConflictOrdering {
 
             for phase in &outcome.phases {
                 let samples = &phase.samples.value;
-                check!(
+                ensure!(
                     samples.busy.max >= MIN_EXECUTORS,
                     "batch {batch} {}: at most {:.0} executor was busy at \
                      once — independent work did not spread across executors",
                     phase.label,
                     samples.busy.max
-                )?;
-                check!(
+                );
+                ensure!(
                     samples.busy.mean() > 1.0,
                     "batch {batch} {}: busy executors averaged {:.2} — \
                      independent work ran effectively serially",
                     phase.label,
                     samples.busy.mean()
-                )?;
-                check!(
+                );
+                ensure!(
                     samples.max_stall <= STALL_BOUND,
                     "batch {batch} {}: the engine transaction count stood \
                      still for {:.1} s under load, longer than the {:.0} s \
@@ -810,50 +794,35 @@ impl Scenario<ScenarioReport> for ConflictOrdering {
                     phase.label,
                     samples.max_stall.as_secs_f64(),
                     STALL_BOUND.as_secs_f64()
-                )?;
+                );
             }
-            for (label, value) in [
+            for (_label, value) in [
                 ("blocked", outcome.drained.blocked),
                 ("busy", outcome.drained.busy),
                 ("pending", outcome.drained.pending),
             ] {
-                check_eq!(
-                    value,
-                    0.0,
-                    "batch {batch}: {label} work must return to zero after \
-                     the drain"
-                )?;
+                ensure!(value == 0.0);
             }
-            check!(
+            ensure!(
                 engine_txs >= workload as f64,
                 "batch {batch}: the engine executed {engine_txs:.0} \
                  transactions, fewer than the {workload} the workload \
                  delivered"
-            )?;
+            );
             if let Some(dropped) = outcome.dropped {
-                check_eq!(
-                    dropped,
-                    0.0,
-                    "batch {batch}: the sequencer dropped {dropped:.0} \
-                     transactions before execution"
-                )?;
+                ensure!(dropped == 0.0);
             }
             if let Some(execution_failed) = outcome.execution_failed {
-                check_eq!(
-                    execution_failed,
-                    0.0,
-                    "batch {batch}: {execution_failed:.0} transactions \
-                     reached the SVM and failed there"
-                )?;
+                ensure!(execution_failed == 0.0);
             }
             let contention_chains = outcome.phases[0].chains * profile.pairs as u64;
-            check!(
+            ensure!(
                 dependencies >= contention_chains as f64,
                 "batch {batch}: the engine registered {dependencies:.0} \
                  ordering dependencies, fewer than one per contention-phase \
                  chain ({contention_chains}) — the chain steps never met an \
                  unfinished predecessor, so executor timing was not exercised"
-            )?;
+            );
             verify_pairs(&er, &mut pairs, batch).await?;
             debug!(
                 batch,

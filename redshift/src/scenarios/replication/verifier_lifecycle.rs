@@ -6,9 +6,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+use anyhow::{anyhow, ensure, Context};
 use pubkey::Pubkey;
 use redsuite_core::{
-    check, check_eq,
+    check,
     redline::{
         causal,
         causal::{CausalPair, Step},
@@ -16,7 +17,7 @@ use redsuite_core::{
     },
     topology,
     topology::{ReplicatedOptions, ReplicatedTopology, Verifier, VerifierStop},
-    BaseCtx, ChainCtx, CheckError, PrivateErScenario, Result,
+    BaseCtx, ChainCtx, PrivateErScenario, Result,
 };
 use signer::Signer;
 use tokio::{task::JoinSet, time};
@@ -106,7 +107,7 @@ impl Workload {
         self.progress.stop.set(true);
         time::timeout(DRAIN_TIMEOUT, self.drain(topology))
             .await
-            .map_err(|_| format!("workload did not drain within {DRAIN_TIMEOUT:?}"))?
+            .with_context(|| format!("workload did not drain within {DRAIN_TIMEOUT:?}"))?
     }
 
     async fn drain(self, topology: &ReplicatedTopology) -> Result<(Vec<CausalPair>, u64)> {
@@ -119,11 +120,11 @@ impl Workload {
                     .api()
                     .await_transaction(&signature, DRAIN_TIMEOUT)
                     .await?;
-                check!(
+                ensure!(
                     tx.err.is_none(),
                     "final transaction {signature} failed: {:?}",
                     tx.err
-                )?;
+                );
             }
         }
         await_leader_advance(
@@ -141,7 +142,7 @@ async fn leader_metric(topology: &ReplicatedTopology, name: &str) -> Result<f64>
     let metrics = topology.leader().ctx().scrape_metrics().await?;
     metrics
         .get(name)
-        .ok_or_else(|| format!("the leader exposes no {name} metric").into())
+        .with_context(|| format!("the leader exposes no {name} metric"))
 }
 
 async fn verifier_metric(verifier: &Verifier, name: &str) -> Result<f64> {
@@ -149,7 +150,7 @@ async fn verifier_metric(verifier: &Verifier, name: &str) -> Result<f64> {
         .scrape_metrics()
         .await?
         .get(name)
-        .ok_or_else(|| format!("verifier `{}` exposes no {name} metric", verifier.label()).into())
+        .with_context(|| format!("verifier `{}` exposes no {name} metric", verifier.label()))
 }
 
 async fn leader_count(topology: &ReplicatedTopology, name: &str) -> Result<f64> {
@@ -222,30 +223,22 @@ async fn stop_verifier(verifier: &mut Verifier, hard_kill: bool) -> Result<Verif
     let stop = verifier.stop(hard_kill).await?;
     let label = verifier.label().to_owned();
     if hard_kill {
-        check_eq!(
-            stop.exit_signal,
-            Some(9),
-            "verifier `{label}` must die by SIGKILL when hard-killed"
-        )?;
+        ensure!(stop.exit_signal == Some(9));
     } else {
-        check!(
+        ensure!(
             !stop.needed_sigkill,
             "verifier `{label}` ignored SIGTERM and had to be killed"
-        )?;
-        check_eq!(
-            stop.exit_code,
-            Some(0),
-            "verifier `{label}` must exit cleanly on SIGTERM"
-        )?;
+        );
+        ensure!(stop.exit_code == Some(0));
     }
-    check!(
+    ensure!(
         !verifier.is_running(),
         "verifier `{label}` still counts as running after its stop"
-    )?;
-    check!(
+    );
+    ensure!(
         verifier.scrape_metrics().await.is_err(),
-        "verifier `{label}`'s metrics endpoint still answers after the stop"
-    )?;
+        "{label}: metrics endpoint stopped"
+    );
     Ok(stop)
 }
 
@@ -253,12 +246,12 @@ async fn blocks_advance(verifier: &Verifier) -> Result<f64> {
     let before = verifier_metric(verifier, BLOCKS).await?;
     time::sleep(ADVANCE_WINDOW).await;
     let after = verifier_metric(verifier, BLOCKS).await?;
-    check!(
+    ensure!(
         after > before,
         "verifier `{}` stayed at {before:.0} blocks for {ADVANCE_WINDOW:?} — \
          it stopped following the leader",
         verifier.label()
-    )?;
+    );
     Ok(after - before)
 }
 
@@ -282,16 +275,12 @@ async fn probe_clones(base: &BaseCtx, topology: &ReplicatedTopology) -> Result<(
 async fn verify_connections(topology: &ReplicatedTopology) -> Result<()> {
     for verifier in topology.verifiers() {
         let label = verifier.label();
-        check!(
+        ensure!(
             verifier.stream_connected().await,
             "verifier `{label}` reports no live replication stream"
-        )?;
+        );
     }
-    check_eq!(
-        topology.leader_connections().await?,
-        VERIFIERS as f64,
-        "the leader must serve one replication connection per verifier"
-    )?;
+    ensure!(topology.leader_connections().await? == (VERIFIERS as f64));
     Ok(())
 }
 
@@ -319,7 +308,7 @@ fn executors_in_log(log: &Path) -> Result<u64> {
     let line = text
         .lines()
         .rfind(|line| line.contains("sequencer started"))
-        .ok_or_else(|| format!("{} never logged `sequencer started`", log.display()))?;
+        .with_context(|| format!("{} never logged `sequencer started`", log.display()))?;
     let cleaned = strip_ansi(line);
     let digits: String = cleaned
         .split("executors=")
@@ -328,12 +317,11 @@ fn executors_in_log(log: &Path) -> Result<u64> {
         .chars()
         .take_while(char::is_ascii_digit)
         .collect();
-    digits.parse().map_err(|_| {
+    digits.parse().with_context(|| {
         format!(
             "{} logged an unparseable executor count: {cleaned}",
             log.display()
         )
-        .into()
     })
 }
 
@@ -371,29 +359,22 @@ async fn verify_pairs(topology: &ReplicatedTopology, pairs: &[CausalPair]) -> Re
 
 async fn verify_no_mismatch(topology: &ReplicatedTopology) -> Result<()> {
     for verifier in topology.verifiers() {
-        check!(
+        ensure!(
             verifier.is_running(),
-            "verifier `{}` is no longer running — a replication error ended it",
+            "{}: verifier running",
             verifier.label()
-        )?;
-        check!(
+        );
+        ensure!(
             verifier.stream_connected().await,
             "verifier `{}` lost its replication stream",
             verifier.label()
-        )?;
-        check_eq!(
-            verifier_count(verifier, STATE_MISMATCHES).await?,
-            0.0,
-            "verifier `{}` detected sealed-state checksum mismatches",
-            verifier.label()
-        )?;
+        );
+        ensure!(verifier_count(verifier, STATE_MISMATCHES).await? == 0.0);
         if let Some(line) = log_mentions_mismatch(verifier.log())? {
-            return Err(CheckError::new(format!(
-                "verifier `{}` logged a replication mismatch",
+            return Err(anyhow!(
+                "verifier {}: replication mismatch: {line}",
                 verifier.label()
-            ))
-            .actual(line)
-            .into());
+            ));
         }
     }
     Ok(())
@@ -505,19 +486,14 @@ impl PrivateErScenario for VerifierLifecycle {
             stop_verifier(topology.verifier_mut(0), false).await?;
             topology.verifier_mut(0).start(READY_TIMEOUT).await?;
             let restart_elapsed = restart_started.elapsed();
-            check!(
+            ensure!(
                 restart_elapsed <= RESTART_BUDGET,
                 "verifier 0 restart took {restart_elapsed:?}, exceeding \
                  {RESTART_BUDGET:?}"
-            )?;
+            );
             topology.verifier(0).wait_connected(CONNECT_TIMEOUT).await?;
             let snapshots = verifier_count(topology.verifier(0), CLIENT_SNAPSHOTS).await?;
-            check_eq!(
-                snapshots,
-                0.0,
-                "verifier 0 must resume from its retained cursor, not a \
-                 snapshot"
-            )?;
+            ensure!(snapshots == 0.0);
             let target = leader_metric(&topology, TRANSACTIONS).await?;
             let catch_up = await_catch_up(topology.verifier(0), TRANSACTIONS, target).await?;
             await_leader_connections(&topology, VERIFIERS).await?;
@@ -570,11 +546,11 @@ impl PrivateErScenario for VerifierLifecycle {
                 let slot_before = topology.leader().ctx().api().get_slot().await?;
                 let blocks = blocks_advance(topology.verifier(0)).await?;
                 let slot_after = topology.leader().ctx().api().get_slot().await?;
-                check!(
+                ensure!(
                     slot_after > slot_before,
                     "the leader's slot stood at {slot_before} with \
                          verifier 1 stopped"
-                )?;
+                );
                 let target = leader_metric(&topology, TRANSACTIONS).await?;
                 await_catch_up(topology.verifier(0), TRANSACTIONS, target).await?;
                 Result::Ok(blocks)
@@ -588,18 +564,18 @@ impl PrivateErScenario for VerifierLifecycle {
             topology.verifier_mut(1).start(READY_TIMEOUT).await?;
             topology.verifier(1).wait_connected(CONNECT_TIMEOUT).await?;
             let client_snapshots = verifier_count(topology.verifier(1), CLIENT_SNAPSHOTS).await?;
-            check!(
+            ensure!(
                 client_snapshots >= 1.0,
                 "verifier 1 rejoined after a pruned leader block without \
                  installing a snapshot"
-            )?;
+            );
             let server_snapshots =
                 leader_count(&topology, SERVER_SNAPSHOTS).await? - server_snapshots_before;
-            check!(
+            ensure!(
                 server_snapshots >= 1.0,
                 "the leader served no snapshot to the out-of-retention \
                  verifier"
-            )?;
+            );
             let target = leader_metric(&topology, TRANSACTIONS).await?;
             await_catch_up(topology.verifier(1), TRANSACTIONS, target).await?;
             await_leader_connections(&topology, VERIFIERS).await?;
@@ -629,18 +605,18 @@ impl PrivateErScenario for VerifierLifecycle {
             let slot_before = topology.leader().ctx().api().get_slot().await?;
             let lone_blocks = blocks_advance(topology.verifier(0)).await?;
             let slot_after = topology.leader().ctx().api().get_slot().await?;
-            check!(
+            ensure!(
                 slot_after > slot_before,
                 "the leader's slot stood at {slot_before} with verifier 1 \
                  killed"
-            )?;
+            );
             probe_clones(&base, &topology).await?;
             let target = leader_metric(&topology, TRANSACTIONS).await?;
             await_catch_up(topology.verifier(0), TRANSACTIONS, target).await?;
-            check!(
+            ensure!(
                 !topology.verifier(1).is_running(),
                 "verifier 1 must stay offline while the others are observed"
-            )?;
+            );
             debug!(
                 slots_advanced = slot_after - slot_before,
                 lone_blocks, target, "surviving verifier kept up while peer offline",
@@ -655,16 +631,16 @@ impl PrivateErScenario for VerifierLifecycle {
             topology.verifier_mut(1).start(READY_TIMEOUT).await?;
             topology.verifier(1).wait_connected(CONNECT_TIMEOUT).await?;
             let client_snapshots = verifier_count(topology.verifier(1), CLIENT_SNAPSHOTS).await?;
-            check!(
+            ensure!(
                 client_snapshots >= 1.0,
                 "verifier 1 rejoined from wiped storage without installing a \
                  snapshot"
-            )?;
+            );
             let server_snapshots = leader_count(&topology, SERVER_SNAPSHOTS).await? - served_before;
-            check!(
+            ensure!(
                 server_snapshots >= 1.0,
                 "the leader served no snapshot to the wiped verifier 1"
-            )?;
+            );
             let target = leader_metric(&topology, TRANSACTIONS).await?;
             await_catch_up(topology.verifier(1), TRANSACTIONS, target).await?;
             let blocks = blocks_advance(topology.verifier(1)).await?;
@@ -690,21 +666,11 @@ impl PrivateErScenario for VerifierLifecycle {
             .await?;
             let leader_blocks = leader_metric(&topology, BLOCKS).await?;
             let leader_txs = leader_metric(&topology, TRANSACTIONS).await?;
-            check_eq!(
-                leader_txs,
-                final_txs,
-                "the leader appended transactions after the workload stopped"
-            )?;
+            ensure!(leader_txs == final_txs);
             catch_up_fleet(&topology, &[TRANSACTIONS, SUPERBLOCKS]).await?;
             await_catch_up(topology.verifier(0), BLOCKS, leader_blocks).await?;
             for verifier in topology.verifiers() {
-                check_eq!(
-                    verifier_metric(verifier, TRANSACTIONS).await?,
-                    leader_txs,
-                    "verifier `{}` must hold exactly the leader's \
-                     transactions at the final sealed boundary",
-                    verifier.label()
-                )?;
+                ensure!(verifier_metric(verifier, TRANSACTIONS).await? == leader_txs);
             }
             verify_no_mismatch(&topology).await?;
             verify_pairs(&topology, &pairs).await?;

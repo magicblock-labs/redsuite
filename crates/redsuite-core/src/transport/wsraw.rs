@@ -1,5 +1,6 @@
 use std::{collections::VecDeque, time::Duration};
 
+use anyhow::{anyhow, Context};
 use futures_util::SinkExt;
 use json::{JsonValueTrait, Value};
 use pubkey::Pubkey;
@@ -38,17 +39,17 @@ impl RawWs {
                 conn::request_text(req_id, method, params).into(),
             ))
             .await
-            .map_err(|error| format!("{method} send: {error}"))?;
+            .with_context(|| format!("{method} send"))?;
         let deadline = Instant::now() + REQUEST_TIMEOUT;
         loop {
             let remaining =
                 deadline.checked_duration_since(Instant::now()).unwrap_or(Duration::ZERO);
             let event = time::timeout(remaining, conn::next_event(&mut self.socket))
                 .await
-                .map_err(|_| format!("{method}: no reply within {REQUEST_TIMEOUT:?}"))?;
+                .with_context(|| format!("{method}: no reply within {REQUEST_TIMEOUT:?}"))?;
             match event {
                 Ok(RawEvent::Reply { id, result }) if id == req_id => {
-                    return result.ok_or_else(|| format!("{method}: reply had no result").into());
+                    return result.with_context(|| format!("{method}: reply had no result"));
                 }
                 Ok(RawEvent::Reply { .. }) => {}
                 Ok(RawEvent::Notification {
@@ -58,10 +59,10 @@ impl RawWs {
                 }) => self.queue.push_back((notified, subscription, payload)),
                 Ok(RawEvent::Malformed) => self.malformed += 1,
                 Err(CloseReason::ServerError(error)) => {
-                    return Err(format!("{method}: {error}").into());
+                    return Err(anyhow!("{method}: {error:#}"));
                 }
                 Err(reason) => {
-                    return Err(format!("{method}: {reason}").into());
+                    return Err(anyhow!("{method}: {reason}"));
                 }
             }
         }
@@ -71,14 +72,14 @@ impl RawWs {
         let result = self.request(method, params).await?;
         result
             .as_u64()
-            .ok_or_else(|| format!("non-numeric subscription id: {result:?}").into())
+            .with_context(|| format!("non-numeric subscription id: {result:?}"))
     }
 
     async fn unsubscribe(&mut self, method: &str, subid: u64) -> Result<bool> {
         let result = self.request(method, &format!("[{subid}]")).await?;
         result
             .as_bool()
-            .ok_or_else(|| format!("non-boolean unsubscribe reply: {result:?}").into())
+            .with_context(|| format!("non-boolean unsubscribe reply: {result:?}"))
     }
 
     pub async fn account_subscribe(&mut self, account: &Pubkey) -> Result<u64> {
@@ -144,7 +145,7 @@ impl RawWs {
                 }
                 Ok(Ok(RawEvent::Reply { .. })) => {}
                 Ok(Ok(RawEvent::Malformed)) => self.malformed += 1,
-                Ok(Err(reason)) => return Err(format!("ws: {reason}").into()),
+                Ok(Err(reason)) => return Err(anyhow!("ws: {reason}")),
             }
         }
     }
@@ -154,7 +155,7 @@ impl RawWs {
     }
 
     pub async fn close(mut self) -> Result<()> {
-        self.socket.close(None).await.map_err(|error| format!("ws close: {error}"))?;
+        self.socket.close(None).await.context("ws close")?;
         Ok(())
     }
 }

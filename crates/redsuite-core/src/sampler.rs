@@ -1,7 +1,8 @@
 use std::{thread, thread::JoinHandle, time::Duration};
 
+use anyhow::{ensure, Context};
 use derive_more::Display;
-use futures_util::future::{AbortHandle, Abortable};
+use futures_util::future::{AbortHandle, AbortRegistration, Abortable};
 use tokio::{
     runtime::Builder,
     sync::{oneshot, watch},
@@ -11,7 +12,7 @@ use tracing::{info, warn, Span};
 
 use crate::{
     api::{Metrics, MetricsCollector},
-    check, Result,
+    Result,
 };
 
 #[derive(Default, Display)]
@@ -36,6 +37,72 @@ pub struct Sampler<T> {
     handle: Option<JoinHandle<()>>,
 }
 
+struct Sampling<T, Observe> {
+    collector: MetricsCollector,
+    interval: Duration,
+    trailing: Trailing,
+    observe: Observe,
+    halted: watch::Receiver<bool>,
+    samples: Sampled<T>,
+    consecutive_failures: usize,
+}
+
+impl<T, Observe> Sampling<T, Observe>
+where
+    Observe: FnMut(&Metrics, &mut T) -> Option<()>,
+{
+    fn run(self, registration: AbortRegistration) -> Result<Sampled<T>> {
+        let runtime = Builder::new_current_thread().enable_all().build()?;
+        Ok(runtime.block_on(Abortable::new(self.collect(), registration))?)
+    }
+
+    async fn collect(mut self) -> Sampled<T> {
+        while self.trailing == Trailing::Sample || !*self.halted.borrow() {
+            self.scrape().await;
+            if *self.halted.borrow() {
+                break;
+            }
+            tokio::select! {
+                _ = time::sleep(self.interval) => {}
+                _ = self.halted.changed(), if self.trailing == Trailing::Skip => {}
+            }
+        }
+        if self.samples.failures != 0 {
+            warn!(
+                scrapes = self.samples.scrapes,
+                failures = self.samples.failures,
+                consecutive_failures = self.consecutive_failures,
+                "metrics sampling finished with failures",
+            );
+        }
+        self.samples
+    }
+
+    async fn scrape(&mut self) {
+        self.samples.scrapes += 1;
+        match self.collector.scrape().await {
+            Ok(metrics) => {
+                if self.consecutive_failures != 0 {
+                    info!(
+                        consecutive_failures = self.consecutive_failures,
+                        "metrics scraping recovered"
+                    );
+                    self.consecutive_failures = 0;
+                }
+                self.samples.observations +=
+                    usize::from((self.observe)(&metrics, &mut self.samples.value).is_some());
+            }
+            Err(error) => {
+                self.samples.failures += 1;
+                self.consecutive_failures += 1;
+                if self.consecutive_failures == 1 {
+                    warn!(error = %format_args!("{error:#}"), "metrics scrape failed; repeats suppressed until recovery");
+                }
+            }
+        }
+    }
+}
+
 impl<T> Sampler<T>
 where
     T: Default + Send + 'static,
@@ -44,67 +111,27 @@ where
         collector: MetricsCollector,
         interval: Duration,
         trailing: Trailing,
-        mut observe: Observe,
+        observe: Observe,
     ) -> Self
     where
         Observe: FnMut(&Metrics, &mut T) -> Option<()> + Send + 'static,
     {
-        let (stop, mut halted) = watch::channel(false);
+        let (stop, halted) = watch::channel(false);
         let (abort, registration) = AbortHandle::new_pair();
         let (done, result) = oneshot::channel();
+        let sampling = Sampling {
+            collector,
+            interval,
+            trailing,
+            observe,
+            halted,
+            samples: Sampled::<T>::default(),
+            consecutive_failures: 0,
+        };
         let span = Span::current();
         let handle = thread::spawn(move || {
             let _entered = span.enter();
-            let sampling = async move {
-                let mut samples = Sampled::<T>::default();
-                let mut consecutive_failures = 0usize;
-                while trailing == Trailing::Sample || !*halted.borrow() {
-                    samples.scrapes += 1;
-                    match collector.scrape().await {
-                        Ok(metrics) => {
-                            if consecutive_failures != 0 {
-                                info!(consecutive_failures, "metrics scraping recovered",);
-                                consecutive_failures = 0;
-                            }
-                            samples.observations +=
-                                usize::from(observe(&metrics, &mut samples.value).is_some())
-                        }
-                        Err(error) => {
-                            samples.failures += 1;
-                            consecutive_failures += 1;
-                            if consecutive_failures == 1 {
-                                warn!(
-                                    %error,
-                                    "metrics scrape failed; repeats suppressed until recovery",
-                                );
-                            }
-                        }
-                    }
-                    if *halted.borrow() {
-                        break;
-                    }
-                    tokio::select! {
-                        _ = time::sleep(interval) => {}
-                        _ = halted.changed(), if trailing == Trailing::Skip => {}
-                    }
-                }
-                if samples.failures != 0 {
-                    warn!(
-                        samples.scrapes,
-                        samples.failures,
-                        consecutive_failures,
-                        "metrics sampling finished with failures",
-                    );
-                }
-                samples
-            };
-            let output =
-                Builder::new_current_thread().enable_all().build().map_err(Into::into).and_then(
-                    |runtime| {
-                        runtime.block_on(Abortable::new(sampling, registration)).map_err(Into::into)
-                    },
-                );
-            let _ = done.send(output);
+            let _ = done.send(sampling.run(registration));
         });
         Self {
             stop,
@@ -116,15 +143,15 @@ where
 
     pub async fn finish(mut self) -> Result<Sampled<T>> {
         let _ = self.stop.send(true);
-        (&mut self.result).await.map_err(|_| "metrics sampler worker failed")?
+        (&mut self.result).await.context("metrics sampler worker failed")?
     }
 
     pub async fn finish_complete(self, what: &str) -> Result<Sampled<T>> {
         let sampled = self.finish().await?;
-        check!(
+        ensure!(
             sampled.observations > 0 && sampled.observations == sampled.scrapes,
             "incomplete {what} sampling: {sampled}"
-        )?;
+        );
         Ok(sampled)
     }
 }

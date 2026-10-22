@@ -1,12 +1,13 @@
 use std::time::{Duration, Instant};
 
+use anyhow::{anyhow, Context};
 use instruction::Instruction;
 use pubkey::Pubkey;
 use signature::Signature;
 
 use crate::{
     programs::{layout, CellHeader, HashState, REDLINE},
-    ChainCtx, CheckError, Result, TxSender,
+    ChainCtx, Result, TxSender,
 };
 
 pub const STEPS: u64 = 3;
@@ -70,7 +71,7 @@ impl CausalPair {
         let signature = sender
             .submit_prepared(&tx)
             .await
-            .map_err(|error| format!("step {step:?}, id {id}: {error}"))?;
+            .with_context(|| format!("step {step:?}, id {id}"))?;
         let elapsed = started.elapsed();
         self.last_signature = Some(signature);
         self.model.apply(step, id, iters);
@@ -117,19 +118,16 @@ impl PairModel {
             let account = ctx
                 .account(&address)
                 .await?
-                .ok_or_else(|| format!("{scope}: account {label} {address} is missing"))?;
+                .with_context(|| format!("{scope}: account {label} {address} is missing"))?;
             let id = CellHeader::try_decode(&account.data)?.value;
             let hash = CellHeader::payload(&account.data)?
                 .first_chunk::<{ layout::HASH_SIZE }>()
-                .ok_or_else(|| format!("{scope}: account {label} has no hash"))?;
+                .with_context(|| format!("{scope}: account {label} has no hash"))?;
             if hash != &expected_hash || id != expected_id {
-                return Err(CheckError::new(format!(
-                    "{scope}: account {label} must hold the fold of its \
-                     accepted X/Y/Z history"
-                ))
-                .expected(format!("id {expected_id}, hash {}", hex(&expected_hash)))
-                .actual(format!("id {id}, hash {}", hex(hash)))
-                .into());
+                return Err(anyhow!(
+                    "{scope}: account {label}: expected id {expected_id}, hash {}; got id {id}, hash {}",
+                    hex(&expected_hash), hex(hash)
+                ));
             }
         }
         Ok(())

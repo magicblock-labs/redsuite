@@ -4,12 +4,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+use anyhow::{ensure, Context};
 use keypair::Keypair;
 use pubkey::Pubkey;
 
 use redsuite_core::{
     cells::OwnedCell,
-    check, check_eq,
     programs::REDSHIFT,
     topology::{self, ErOptions, PrivateEr, RestartConfig},
     Api, BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result,
@@ -32,49 +32,60 @@ const CLONE_TIMEOUT: Duration = Duration::from_secs(20);
 
 struct Readers {
     stop: Rc<Cell<bool>>,
-    task: JoinHandle<(u64, Option<String>)>,
+    task: JoinHandle<Result<()>>,
+}
+
+struct AccountReader {
+    api: Api,
+    addresses: Vec<Pubkey>,
+    stop: Rc<Cell<bool>>,
+}
+
+impl AccountReader {
+    async fn run(self) -> Result<()> {
+        let mut reads = 0;
+        while !self.stop.get() {
+            self.read()
+                .await
+                .with_context(|| format!("snapshot account reads; completed={reads}"))?;
+            reads += 1;
+        }
+        Ok(())
+    }
+
+    async fn read(&self) -> Result<()> {
+        let accounts = self.api.get_multiple_accounts(&self.addresses).await?;
+        let missing: Vec<_> = accounts
+            .iter()
+            .enumerate()
+            .filter_map(|(index, account)| account.is_none().then_some(index))
+            .collect();
+        let _: () = ensure!(
+            missing.is_empty(),
+            "missing snapshot account indices: {missing:?}"
+        );
+        Ok(())
+    }
 }
 
 impl Readers {
     fn start(api: Api, addresses: Vec<Pubkey>) -> Self {
         let stop = Rc::new(Cell::new(false));
-        let flag = stop.clone();
-        let task = tokio::task::spawn_local(async move {
-            let mut reads = 0u64;
-            while !flag.get() {
-                match api.get_multiple_accounts(&addresses).await {
-                    Ok(accounts) if accounts.iter().all(Option::is_some) => {
-                        reads += 1;
-                    }
-                    Ok(accounts) => {
-                        let missing = addresses
-                            .iter()
-                            .zip(accounts.iter())
-                            .filter(|(_, a)| a.is_none())
-                            .map(|(pk, _)| pk.to_string())
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        return (reads, Some(format!("missing account(s): {missing}")));
-                    }
-                    Err(error) => return (reads, Some(error.to_string())),
-                }
-            }
-            (reads, None)
-        });
+        let reader = AccountReader {
+            api,
+            addresses,
+            stop: stop.clone(),
+        };
+        let task = tokio::task::spawn_local(reader.run());
         Self { stop, task }
     }
 
     async fn stop(self, phase: &str) -> Result<()> {
         self.stop.set(true);
-        let (reads, failure) =
-            self.task.await.map_err(|error| format!("reader task {phase}: {error}"))?;
-        check!(
-            failure.is_none(),
-            "{phase}: account reads must keep succeeding while the er seals \
-             superblocks; {reads} reads then: {}",
-            failure.unwrap_or_default()
-        )?;
-        Ok(())
+        self.task
+            .await
+            .with_context(|| format!("reader task {phase}"))?
+            .with_context(|| format!("snapshot reads {phase}"))
     }
 }
 
@@ -92,17 +103,10 @@ async fn churn(
         let index = grows % accounts.len();
         let bytes = GROW_BYTES + ((grows / accounts.len()) % GROW_VARIANTS) as u32;
         let space = sizes[index] + bytes;
-        let resize = REDSHIFT.resize(
-            payer.pubkey(),
-            REDSHIFT.primary(accounts[index].authority.pubkey()),
-            space,
-        );
-        let submitted = er.submit_and_confirm(payer, &[resize]).await;
-        check!(
-            submitted.is_ok(),
-            "{phase}: resizing account {index} must succeed after {grows} grows: {}",
-            submitted.err().map(|e| e.to_string()).unwrap_or_default()
-        )?;
+        let resize = REDSHIFT.resize(payer.pubkey(), accounts[index].address, space);
+        er.submit_and_confirm(payer, &[resize]).await.with_context(|| {
+            format!("resizing account {index} {phase}; completed grows={grows}")
+        })?;
         sizes[index] = space;
         grows += 1;
         time::sleep(GROW_INTERVAL).await;
@@ -161,11 +165,7 @@ impl PrivateErScenario for SnapshotReadRace {
         readers.stop("before restart").await?;
 
         let timing = private.restart(RestartConfig::default()).await?;
-        check_eq!(
-            timing.exit_code,
-            Some(0),
-            "the er must stop cleanly on SIGTERM before the relaunch"
-        )?;
+        ensure!(timing.exit_code == Some(0));
 
         let er = private.ctx();
         let readers = Readers::start(er.api().clone(), addresses.clone());
@@ -186,11 +186,7 @@ impl PrivateErScenario for SnapshotReadRace {
             .into_iter()
             .map(|account| account.map_or(0, |a| a.data.len() as u32))
             .collect();
-        check_eq!(
-            observed,
-            sizes,
-            "every account must retain its resized length"
-        )?;
+        ensure!(observed == sizes);
         private.finish().await?;
         Ok(())
     }

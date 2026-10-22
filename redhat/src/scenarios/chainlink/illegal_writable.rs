@@ -1,10 +1,11 @@
 use std::{rc::Rc, time::Duration};
 
+use anyhow::{ensure, Context};
 use instruction::Instruction;
 use pubkey::Pubkey;
 
 use redsuite_core::{
-    check, check_eq, dlp,
+    dlp,
     programs::{SettlementMode, MAGIC, REDHAT, REDSHIFT},
     system, BaseCtx, ChainCtx, ErCtx, Result, Scenario, TxSender,
 };
@@ -100,26 +101,22 @@ impl Scenario for IllegalWritable {
             let error = tx
                 .err
                 .as_ref()
-                .ok_or_else(|| format!("{case} ({signature}): attack unexpectedly succeeded"))?;
+                .with_context(|| format!("{case} ({signature}): attack unexpectedly succeeded"))?;
             let observed = format!("{}\n{error:?}", tx.logs.join("\n"));
             // Every group must match; alternatives within a group are ORed.
             for alternatives in refusals {
-                check!(
+                ensure!(
                     alternatives.iter().any(|needle| observed.contains(needle)),
-                    "{case} ({signature}): the refusal must name one of {alternatives:?}, got: {observed}"
-                )?;
+                    "{case}: expected refusal {alternatives:?}; actual={observed}"
+                );
             }
         }
 
         // The refused attacks must not have scheduled anything: no base commit
         // moved the PDAs off dlp.
         for pda in &pdas {
-            let on_base = base.account(pda).await?.ok_or("the cell pda vanished from base")?;
-            check_eq!(
-                on_base.owner,
-                dlp::dlp_id(),
-                "a refused attack must leave the cell delegated"
-            )?;
+            let on_base = base.account(pda).await?.context("the cell pda vanished from base")?;
+            ensure!(on_base.owner == dlp::dlp_id());
         }
 
         Ok(())
