@@ -1,17 +1,10 @@
-use std::{
-    collections::HashMap,
-    io::{ErrorKind, Read, Write},
+use std::{cell::RefCell, collections::HashMap, rc::Rc, time::Duration};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    rc::Rc,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, RwLock,
-    },
-    thread,
-    thread::JoinHandle,
-    time::Duration,
+    sync::Notify,
+    task::{self, JoinHandle},
 };
-use tokio::sync::Notify;
 
 use anyhow::{ensure, Context};
 use keypair::Keypair;
@@ -50,39 +43,26 @@ const RISK_THRESHOLD: u64 = 5;
 // magicblock-aml deserializes.
 pub struct MockRiskServer {
     base_url: Url,
-    shutdown: Arc<AtomicBool>,
-    worker: Option<JoinHandle<()>>,
-    service: RiskService,
+    worker: JoinHandle<()>,
+    service: Rc<RiskService>,
 }
 
 impl MockRiskServer {
-    pub fn start() -> Result<Self> {
-        let listener = TcpListener::bind("127.0.0.1:0")?;
-        listener.set_nonblocking(true)?;
+    pub async fn start() -> Result<Self> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let worker_shutdown = Arc::clone(&shutdown);
-        let service = RiskService::default();
-        let worker_service = service.clone();
-        let worker = thread::spawn(move || worker_service.run(listener, worker_shutdown));
+        let service = Rc::new(RiskService::default());
+        let worker = task::spawn_local(service.clone().run(listener));
 
         Ok(Self {
             base_url: format!("http://{addr}").parse()?,
-            shutdown,
-            worker: Some(worker),
+            worker,
             service,
         })
     }
 
-    pub fn stop(&mut self) {
-        self.shutdown.store(true, Ordering::SeqCst);
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
-    }
-
     pub fn set_risk(&self, address: Pubkey, risk_score: u64) {
-        self.service.risks.write().unwrap().entry(address).or_default().score = risk_score;
+        self.service.risks.borrow_mut().entry(address).or_default().score = risk_score;
     }
 
     pub fn base_url(&self) -> &Url {
@@ -90,7 +70,7 @@ impl MockRiskServer {
     }
 
     fn query_count(&self, owner: &Pubkey) -> usize {
-        self.service.risks.read().unwrap().get(owner).map_or(0, |risk| risk.queries)
+        self.service.risks.borrow().get(owner).map_or(0, |risk| risk.queries)
     }
 }
 
@@ -100,35 +80,29 @@ struct Risk {
     queries: usize,
 }
 
-#[derive(Clone, Default)]
+#[derive(Default)]
 struct RiskService {
-    risks: Arc<RwLock<HashMap<Pubkey, Risk>>>,
-    changed: Arc<Notify>,
+    risks: RefCell<HashMap<Pubkey, Risk>>,
+    changed: Notify,
 }
 
 impl RiskService {
-    fn run(self, listener: TcpListener, shutdown: Arc<AtomicBool>) {
-        while !shutdown.load(Ordering::SeqCst) {
-            match listener.accept() {
-                Ok((stream, _)) => self.respond(stream),
-                Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(25))
-                }
-                Err(_) => break,
-            }
+    async fn run(self: Rc<Self>, listener: TcpListener) {
+        while let Ok((stream, _)) = listener.accept().await {
+            self.respond(stream).await;
         }
     }
 
-    fn respond(&self, mut stream: TcpStream) {
+    async fn respond(&self, mut stream: TcpStream) {
         let mut buffer = [0u8; 4096];
-        let read = stream.read(&mut buffer).unwrap_or(0);
+        let read = stream.read(&mut buffer).await.unwrap_or(0);
         let request = String::from_utf8_lossy(&buffer[..read]);
         let body = self.body(&request);
         let status = if request.starts_with("GET /risk?") { "200 OK" } else { "404 Not Found" };
         let response = format!(
             "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len(),
         );
-        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.write_all(response.as_bytes()).await;
     }
 
     fn body(&self, request: &str) -> String {
@@ -144,7 +118,7 @@ impl RiskService {
             .unwrap_or("");
         let risk_score = match address.parse::<Pubkey>() {
             Ok(key) => {
-                let mut risks = self.risks.write().unwrap();
+                let mut risks = self.risks.borrow_mut();
                 let risk = risks.entry(key).or_default();
                 risk.queries += 1;
                 self.changed.notify_waiters();
@@ -159,7 +133,7 @@ impl RiskService {
 
 impl Drop for MockRiskServer {
     fn drop(&mut self) {
-        self.stop();
+        self.worker.abort();
     }
 }
 
@@ -171,7 +145,7 @@ pub struct AmlGate {
 
 impl PrivateErScenario for AmlGate {
     async fn setup(base: Rc<BaseCtx>, _: ()) -> Result<Self> {
-        let server = MockRiskServer::start()?;
+        let server = MockRiskServer::start().await?;
         // No api key or threshold: both belong to the risk server now; loopback
         // http is the one plaintext scheme magicblock-aml accepts.
         let private = topology::private_er(

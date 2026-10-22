@@ -1,28 +1,26 @@
 use std::{
     any::Any,
-    cell::Cell,
-    future::{Future, Ready},
-    mem,
-    rc::Rc,
-    thread,
+    future::{pending, Future, Ready},
+    mem, thread,
     thread::JoinHandle,
     time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, ensure, Context};
+use futures_util::{stream::FuturesUnordered, StreamExt};
 use tokio::{
     runtime::Builder,
-    sync::{watch, OwnedSemaphorePermit},
+    sync::watch,
     task,
-    task::{JoinSet, LocalSet},
+    task::{coop::cooperative, LocalSet},
     time,
 };
-use tracing::Span;
+use tracing::{Instrument, Span};
 
 pub use crate::transport::rate::{split_budget, Pacing};
 use crate::{
     stats::{ObservationsStats, StreamingStats},
-    transport::rate::Throttle,
+    transport::rate::{AdmissionStats, Pacer},
     Result,
 };
 
@@ -93,40 +91,31 @@ impl Job {
             sync: None,
             outcome: Ok(()),
         };
-        job.outcome = job.deliver(request, sync).await;
-        job
-    }
-
-    async fn deliver<D, Request, Sync>(
-        &mut self,
-        request: Request,
-        sync: Option<Sync>,
-    ) -> Result<()>
-    where
-        D: Delivery,
-        Request: Future<Output = Result<D>>,
-        Sync: Future<Output = Result<()>>,
-    {
-        let send = request.await?;
-        let started = Instant::now();
-        send.deliver(started).await?;
-        self.delivery = Some(started.elapsed().as_micros() as u32);
-        if let Some(sync) = sync {
-            sync.await.context("sync")?;
-            self.sync = Some(started.elapsed().as_micros() as u32);
+        job.outcome = async {
+            let send = request.await?;
+            let started = Instant::now();
+            send.deliver(started).await?;
+            job.delivery = Some(started.elapsed().as_micros() as u32);
+            if let Some(sync) = sync {
+                sync.await.context("sync")?;
+                job.sync = Some(started.elapsed().as_micros() as u32);
+            }
+            Ok(())
         }
-        Ok(())
+        .await;
+        job
     }
 }
 
 #[derive(Debug, Default)]
 pub struct RunOutcome<S = ObservationsStats> {
     pub delivered: u64,
-    /// Unsuccessful requests; task panics abort the run instead of producing a tally.
+    /// Unsuccessful requests; panics abort the run instead of producing a tally.
     /// Together with `delivered`, this gives the admitted count.
     pub failed: u64,
     pub first_error: Option<String>,
     pub delivery: S,
+    /// Admission to first poll, excluding pacing and capacity waits.
     pub scheduling: S,
     pub origin: &'static str,
     // closed loop only: send-start → all confirmations for the id
@@ -249,32 +238,39 @@ pub fn panic_message(payload: Box<dyn Any + Send>) -> String {
 
 enum Completion {
     Iterations(u64),
-    Stop(Rc<Cell<bool>>),
-    Until { deadline: Instant, stop: watch::Receiver<bool> },
+    Until {
+        deadline: Option<Instant>,
+        stop: watch::Receiver<bool>,
+    },
 }
 
 impl Completion {
-    async fn admit(
-        &mut self,
-        admitted: u64,
-        throttle: &mut Throttle,
-    ) -> Option<OwnedSemaphorePermit> {
+    fn done(&self, admitted: u64) -> bool {
         match self {
-            Completion::Iterations(total) if admitted >= *total => None,
-            Completion::Stop(stop) if stop.get() => None,
-            Completion::Until { deadline, stop } => {
-                if Instant::now() >= *deadline || *stop.borrow() {
-                    return None;
-                }
-                let permit = tokio::select! {
-                    biased;
-                    _ = time::sleep_until((*deadline).into()) => None,
-                    _ = stop.wait_for(|stop| *stop) => None,
-                    permit = throttle.acquire() => Some(permit),
-                };
-                permit.filter(|_| Instant::now() < *deadline && !*stop.borrow())
+            Self::Iterations(total) => admitted >= *total,
+            Self::Until { deadline, stop } => {
+                deadline.is_some_and(|deadline| Instant::now() >= deadline)
+                    || *stop.borrow()
+                    || stop.has_changed().is_err()
             }
-            _ => Some(throttle.acquire().await),
+        }
+    }
+
+    async fn stopped(&self) {
+        match self {
+            Completion::Iterations(_) => pending().await,
+            Completion::Until { deadline, stop } => {
+                let mut stop = stop.clone();
+                tokio::select! {
+                    _ = stop.wait_for(|stop| *stop) => {}
+                    _ = async {
+                        match deadline {
+                            Some(deadline) => time::sleep_until((*deadline).into()).await,
+                            None => pending().await,
+                        }
+                    } => {}
+                }
+            }
         }
     }
 }
@@ -283,7 +279,7 @@ type NoSync = fn(u64) -> Ready<Result<()>>;
 const NO_SYNC: Option<NoSync> = None;
 
 async fn execute_inner<Request, RequestFut, D, Sync, SyncFut>(
-    mut completion: Completion,
+    completion: Completion,
     pacing: Pacing,
     concurrency: usize,
     mut request: Request,
@@ -296,7 +292,12 @@ where
     Sync: FnMut(u64) -> SyncFut,
     SyncFut: Future<Output = Result<()>> + 'static,
 {
-    let mut throttle = Throttle::new(pacing, concurrency)?;
+    ensure!(
+        concurrency != 0,
+        "an admission budget needs a concurrency above zero"
+    );
+    let mut pacer = Pacer::new(pacing)?;
+    let mut stats = AdmissionStats::new();
     let mut tally = RawRunOutcome {
         sync: sync.is_some().then(StreamingStats::new),
         origin: D::ORIGIN,
@@ -304,27 +305,37 @@ where
     };
     let started = Instant::now();
 
-    let mut jobs = JoinSet::new();
+    let mut jobs = FuturesUnordered::new();
     let mut admitted = 0u64;
-    while let Some(permit) = completion.admit(admitted, &mut throttle).await {
-        throttle.record();
+    let stopped = completion.stopped();
+    tokio::pin!(stopped);
+    'admit: while !completion.done(admitted) {
+        let tick = pacer.wait();
+        tokio::pin!(tick);
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut stopped => break 'admit,
+                Some(job) = cooperative(jobs.next()), if !jobs.is_empty() => tally.record(job),
+                _ = &mut tick, if jobs.len() < concurrency => break,
+            }
+        }
+        if completion.done(admitted) {
+            break;
+        }
+        stats.record();
         let admitted_at = Instant::now();
         admitted += 1;
         let request_fut = request(admitted);
         let sync_fut = sync.as_mut().map(|sync| sync(admitted));
-        jobs.spawn_local(async move {
-            let job = Job::run(admitted_at, request_fut, sync_fut).await;
-            drop(permit);
-            job
-        });
-        while let Some(joined) = jobs.try_join_next() {
-            tally.record(joined?);
-        }
+        jobs.push(Job::run(admitted_at, request_fut, sync_fut));
+        // Admission can be immediately ready without touching a Tokio resource.
+        task::consume_budget().await;
     }
     let admission_wall = started.elapsed();
-    let rps = throttle.finish();
-    while let Some(joined) = jobs.join_next().await {
-        tally.record(joined?);
+    let rps = stats.finish();
+    while let Some(job) = cooperative(jobs.next()).await {
+        tally.record(job);
     }
 
     Ok(RawRunOutcome {
@@ -361,12 +372,11 @@ where
     .await
 }
 
-/// Generate open-loop load until `stop` is observed between admissions, then drain.
-/// Unlike [`execute_for_raw`], a stop does not interrupt a pending throttle wait.
+/// Stop admission on notification or channel closure, then drain admitted work.
 pub async fn execute_until_raw<F, Fut, D>(
     pacing: Pacing,
     concurrency: usize,
-    stop: Rc<Cell<bool>>,
+    stop: watch::Receiver<bool>,
     request: F,
 ) -> Result<RawRunOutcome>
 where
@@ -375,7 +385,7 @@ where
     D: Delivery,
 {
     execute_inner(
-        Completion::Stop(stop),
+        Completion::Until { deadline: None, stop },
         pacing,
         concurrency,
         request,
@@ -401,7 +411,7 @@ where
     D: Delivery,
 {
     execute_inner(
-        Completion::Until { deadline, stop },
+        Completion::Until { deadline: Some(deadline), stop },
         pacing,
         concurrency,
         request,
@@ -443,29 +453,24 @@ impl Worker {
     pub fn stop_signal(&self) -> watch::Receiver<bool> {
         self.stop.subscribe()
     }
-
-    pub fn stop_cell(&self) -> Rc<Cell<bool>> {
-        let cell = Rc::new(Cell::new(false));
-        let mut stop = self.stop.subscribe();
-        let bridge = cell.clone();
-        task::spawn_local(async move {
-            if !*stop.borrow_and_update() {
-                let _ = stop.changed().await;
-            }
-            bridge.set(true);
-        });
-        cell
-    }
 }
 
 pub struct Workers<T> {
     stop: watch::Sender<bool>,
-    handles: Vec<JoinHandle<Result<T>>>,
+    handles: Handles<T>,
+}
+
+enum Handles<T> {
+    Local(task::JoinHandle<Result<T>>),
+    Threads(Vec<JoinHandle<Result<T>>>),
 }
 
 impl<T> Drop for Workers<T> {
     fn drop(&mut self) {
         self.stop();
+        if let Handles::Local(handle) = &self.handles {
+            handle.abort();
+        }
     }
 }
 
@@ -473,9 +478,22 @@ pub fn spawn_workers<T, Factory, Fut>(threads: usize, factory: Factory) -> Worke
 where
     T: Send + 'static,
     Factory: Fn(Worker) -> Fut + Clone + Send + 'static,
-    Fut: Future<Output = Result<T>>,
+    Fut: Future<Output = Result<T>> + 'static,
 {
     let (stop, _) = watch::channel(false);
+    if threads == 1 {
+        let worker = Worker {
+            index: 0,
+            threads,
+            stop: stop.clone(),
+        };
+        return Workers {
+            stop,
+            handles: Handles::Local(task::spawn_local(
+                async move { factory(worker).await }.in_current_span(),
+            )),
+        };
+    }
     let mut handles = Vec::with_capacity(threads);
     for index in 0..threads {
         let factory = factory.clone();
@@ -487,16 +505,16 @@ where
         };
         handles.push(thread::spawn(move || {
             let _entered = span.enter();
-            let runtime = Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("driver runtime build is infallible");
+            let runtime = Builder::new_current_thread().enable_all().build()?;
             let local = LocalSet::new();
             // The factory may need the runtime or spawn local tasks immediately.
             runtime.block_on(local.run_until(async move { factory(worker).await }))
         }));
     }
-    Workers { stop, handles }
+    Workers {
+        stop,
+        handles: Handles::Threads(handles),
+    }
 }
 
 impl<T> Workers<T> {
@@ -509,37 +527,29 @@ impl<T> Workers<T>
 where
     T: Send + 'static,
 {
-    pub fn join(mut self) -> Result<Vec<T>> {
+    pub async fn join(mut self) -> Result<Vec<T>> {
         self.stop();
-        let handles = mem::take(&mut self.handles);
-        let mut outcomes = Vec::with_capacity(handles.len());
-        let mut first_panic = None;
-        let mut first_error = None;
-        for handle in handles {
-            match handle.join() {
-                Ok(Ok(outcome)) => outcomes.push(outcome),
-                Ok(Err(error)) => {
-                    first_error.get_or_insert(error);
-                }
-                Err(payload) => {
-                    first_panic.get_or_insert_with(|| panic_message(payload));
-                }
+        match &mut self.handles {
+            Handles::Local(handle) => Ok(vec![handle.await.context("driver worker failed")??]),
+            Handles::Threads(handles) => {
+                let handles = mem::take(handles);
+                task::spawn_blocking(move || {
+                    // Join every worker before returning an error, so none outlive cleanup.
+                    handles
+                        .into_iter()
+                        .map(|handle| {
+                            handle.join().unwrap_or_else(|panic| {
+                                Err(anyhow!("driver worker panicked: {}", panic_message(panic)))
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .collect()
+                })
+                .await
+                .context("driver worker join failed")?
             }
         }
-        if let Some(panic) = first_panic {
-            return Err(anyhow!("driver worker thread panicked: {panic}"));
-        }
-        if let Some(error) = first_error {
-            return Err(error);
-        }
-        Ok(outcomes)
-    }
-
-    pub async fn join_async(self) -> Result<Vec<T>> {
-        self.stop();
-        task::spawn_blocking(move || self.join())
-            .await
-            .context("driver worker join failed")?
     }
 }
 
@@ -595,13 +605,13 @@ impl WorkerBudgets {
     }
 }
 
-pub fn execute_threaded<Factory, Request, Fut, D>(
+pub async fn execute_threaded<Factory, Request, Fut, D>(
     config: ThreadRunConfig,
     factory: Factory,
 ) -> Result<RunOutcome>
 where
     Factory: Fn(usize) -> Request + Clone + Send + 'static,
-    Request: FnMut(u64) -> Fut,
+    Request: FnMut(u64) -> Fut + 'static,
     Fut: Future<Output = Result<D>> + 'static,
     D: Delivery,
 {
@@ -623,7 +633,8 @@ where
             .await
         }
     })
-    .join()?;
+    .join()
+    .await?;
     Ok(merge_outcomes(outcomes))
 }
 

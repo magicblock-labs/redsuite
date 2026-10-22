@@ -95,7 +95,7 @@ impl Scenario<ScenarioReport> for ProtocolBoundarySelftest {
     }
 
     async fn run(self) -> Result<ScenarioReport> {
-        self.warm_up()?;
+        self.warm_up().await?;
         let mut id_offset = self.profile.warmup;
         let mut cells: Vec<CellOutcome> = Vec::new();
         for threads in [1, self.profile.threads] {
@@ -107,7 +107,7 @@ impl Scenario<ScenarioReport> for ProtocolBoundarySelftest {
 }
 
 impl ProtocolBoundarySelftest {
-    fn execute(&self, threads: usize, iterations: u64, offset: u64) -> Result<RunOutcome> {
+    async fn execute(&self, threads: usize, iterations: u64, offset: u64) -> Result<RunOutcome> {
         let pool = self.pool.clone();
         execute_kernel(
             ThreadRunConfig {
@@ -123,11 +123,12 @@ impl ProtocolBoundarySelftest {
             move |id| REDLINE.copy_three(&pool, offset + id).0,
             None,
         )
+        .await
     }
 
     #[instrument(skip_all, err)]
-    fn warm_up(&self) -> Result<()> {
-        let warmup = self.execute(self.profile.threads, self.profile.warmup, 0)?;
+    async fn warm_up(&self) -> Result<()> {
+        let warmup = self.execute(self.profile.threads, self.profile.warmup, 0).await?;
         ensure!(warmup.failed == 0);
 
         Ok(())
@@ -136,7 +137,7 @@ impl ProtocolBoundarySelftest {
     #[instrument(skip_all, err)]
     async fn measure_cell(&self, threads: usize, id_offset: &mut u64) -> Result<CellOutcome> {
         let before = self.er.scrape_metrics().await?;
-        let outcome = self.execute(threads, self.profile.iterations, *id_offset)?;
+        let outcome = self.execute(threads, self.profile.iterations, *id_offset).await?;
         let after = self.er.scrape_metrics().await?;
         let delta = MetricsDelta::new(before, after);
         *id_offset += self.profile.iterations;

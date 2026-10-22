@@ -93,7 +93,8 @@ impl Scenario<ScenarioReport> for RpcIngressCapacity {
             0,
             move |id| REDLINE.write(id, &[self.pool[(id as usize) % self.pool.len()]]),
             None,
-        )?;
+        )
+        .await?;
         if let Some(ledger_txs_before) = before.get(metrics::ENGINE_TRANSACTIONS) {
             self.profile.settle_ledger(&self.er, ledger_txs_before).await;
         }

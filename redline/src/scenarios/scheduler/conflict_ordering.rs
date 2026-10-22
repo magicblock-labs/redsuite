@@ -206,7 +206,7 @@ async fn open_load(
     concurrency: usize,
     worker: &Worker,
 ) -> Result<RawRunOutcome> {
-    execute_until_raw(Pacing::Unlimited, concurrency, worker.stop_cell(), |id| {
+    execute_until_raw(Pacing::Unlimited, concurrency, worker.stop_signal(), |id| {
         let (account, sender) = &lanes[((id - 1) as usize) % lanes.len()];
         let ixs = independent_ixs(id, *account, iters);
         let sender = sender.clone();
@@ -287,7 +287,7 @@ impl BoundedLoad {
 }
 
 async fn join_load(handles: Workers<RawRunOutcome>) -> Result<RunOutcome> {
-    Ok(merge_outcomes(handles.join_async().await?))
+    Ok(merge_outcomes(handles.join().await?))
 }
 
 #[derive(Default)]
