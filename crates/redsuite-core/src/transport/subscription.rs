@@ -76,9 +76,14 @@ pub(super) trait SubscriptionState {
     fn on_close(&mut self, _reason: &CloseReason) {}
 }
 
+enum Request<K> {
+    Subscribe(K),
+    Unsubscribe(Topic),
+}
+
 pub(super) struct Router<S: SubscriptionState> {
     pub(super) state: S,
-    requests: HashMap<u64, S::Key>,
+    requests: HashMap<u64, Request<S::Key>>,
     subscriptions: HashMap<u64, S::Key>,
     subscribed: usize,
     error: Option<String>,
@@ -98,7 +103,7 @@ impl<S: SubscriptionState> Router<S> {
     }
 
     pub(super) fn register(&mut self, request: u64, key: S::Key) {
-        self.requests.insert(request, key);
+        self.requests.insert(request, Request::Subscribe(key));
     }
 
     pub(super) fn dispatch(
@@ -108,11 +113,20 @@ impl<S: SubscriptionState> Router<S> {
     ) -> Result<()> {
         match frame {
             Frame::Reply { id, result } => {
-                if let Some(key) = self.requests.remove(&id) {
-                    let subscription = json::from_str(result.as_raw_str())?;
-                    self.subscriptions.insert(subscription, key);
-                    self.subscribed += 1;
-                    self.state.on_subscribed(self.subscribed);
+                match (self.requests.remove(&id), result) {
+                    (Some(Request::Subscribe(key)), Ok(result)) => {
+                        let subscription = json::from_str(result.as_raw_str())?;
+                        self.subscriptions.insert(subscription, key);
+                        self.subscribed += 1;
+                        self.state.on_subscribed(self.subscribed);
+                    }
+                    // HTTP may observe confirmation before we receive its notification;
+                    // the server has already retired the one-shot signature route.
+                    (Some(Request::Unsubscribe(Topic::Signature)), Err(error))
+                        if error.code == jsonrpc_core::ErrorCode::InvalidParams
+                            && error.message == "Invalid subscription id." => {}
+                    (_, Err(error)) => return Err(CloseReason::ServerError(error).into()),
+                    _ => {}
                 }
             }
             Frame::Notification { params, .. } => {
@@ -244,7 +258,11 @@ impl<S: SubscriptionState + 'static> Connection<S> {
     {
         // A one-shot route can complete before the task awaiting its acknowledgment resumes.
         self.wait("subscription acknowledgment", |router| {
-            Ok((!router.requests.values().any(|pending| *pending == key)).then_some(()))
+            Ok((!router
+                .requests
+                .values()
+                .any(|request| matches!(request, Request::Subscribe(active) if *active == key)))
+            .then_some(()))
         })
         .await
     }
@@ -254,7 +272,9 @@ impl<S: SubscriptionState + 'static> Connection<S> {
         S::Key: PartialEq,
     {
         if let Err(error) = self.await_ack(key).await {
-            self.router.borrow_mut().requests.retain(|_, pending| *pending != key);
+            self.router.borrow_mut().requests.retain(
+                |_, request| !matches!(request, Request::Subscribe(active) if *active == key),
+            );
             return Err(error);
         }
         let subscription = self
@@ -269,6 +289,7 @@ impl<S: SubscriptionState + 'static> Connection<S> {
         self.router.borrow_mut().subscriptions.remove(&subscription);
         let id = self.next_id.replace(self.next_id.get() + 1);
         let mut sink = self.sink.lock().await;
+        self.router.borrow_mut().requests.insert(id, Request::Unsubscribe(topic));
         socket::send(&mut *sink, id, topic.unsubscribe(), &(subscription,)).await
     }
 

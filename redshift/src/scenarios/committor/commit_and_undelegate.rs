@@ -5,14 +5,16 @@ use instruction::Instruction;
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    api::{transaction_logs, transaction_meta},
+    api::{transaction_logs, transaction_meta, TxError},
     check, prep,
     programs::{CellHeader, CellId, SettlementMode, UndelegationOutcome, MAGIC, REDSHIFT},
     receipt::{self, CommitReceipt},
+    rpc_types::response::TransactionError,
     wait, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
 use signature::Signature;
 use signer::Signer;
+use solana_instruction_error::InstructionError;
 use tokio::time;
 use tracing::instrument;
 
@@ -25,7 +27,6 @@ const REDELEGATE_SETTLE: Duration = Duration::from_secs(2);
 const ROLLBACK_SETTLE: Duration = Duration::from_millis(1500);
 const MOD_AFTER_REFUSAL: &str = "instruction modified data of an account it does not own";
 const TWICE_REFUSAL: &str = "is required to be writable and delegated in order to be undelegated";
-const FOREIGN_REJECTION: &str = "MissingAccount";
 
 pub struct CommitAndUndelegate {
     base: Rc<BaseCtx>,
@@ -311,30 +312,31 @@ impl CommitAndUndelegate {
         let payer = self.base.funded_payer(PAYER_LAMPORTS).await?;
         let outsider =
             self.base.delegated_payer(&payer, self.er.identity(), PAYER_LAMPORTS).await?;
+        let sender = self.er.sender(Rc::new(outsider));
+        let outsider = sender.payer().pubkey();
         let validator = Keypair::new().pubkey();
         for (commit_type, what) in
             [(SettlementMode::Commit, "commit"), (SettlementMode::Undelegate, "undelegation")]
         {
             let cells = self.base.cells(REDSHIFT, &payer).create_owned(validator, 1).await?;
             self.er.await_cells(&cells).await?;
-            let attempt = self
-                .er
-                .submit_and_confirm(
-                    &outsider,
-                    &[REDSHIFT
-                        .batch()
-                        .settle(
-                            outsider.pubkey(),
-                            &[cells[0].address, outsider.pubkey()],
-                            commit_type,
-                        )
-                        .build()],
-                )
-                .await;
-
-            let error = check::expect_error(attempt, &format!("foreign {what} rejected"))?;
-            let error = format!("{error:#}");
-            ensure!(error.contains(FOREIGN_REJECTION));
+            let tx = sender
+                .prepare(&[REDSHIFT
+                    .batch()
+                    .settle(outsider, &[cells[0].address, outsider], commit_type)
+                    .build()])
+                .await?;
+            let signature = self.er.api().send_transaction(&tx).await?;
+            let outcome = self.er.api().try_confirm(&signature).await?;
+            ensure!(
+                matches!(
+                    &outcome,
+                    Err(TxError {
+                        err: TransactionError::InstructionError(0, InstructionError::IllegalOwner)
+                    })
+                ),
+                "foreign {what}: {outcome:?}"
+            );
         }
         Ok(())
     }

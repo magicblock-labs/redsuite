@@ -26,7 +26,7 @@ use crate::{
     report::{self, ScenarioReport},
     resources::Resources,
     runner::{Delivery, SendTransaction},
-    topology::{PrivateEr, RestartConfig, RestartTiming},
+    topology::{PrivateEr, RestartConfig, RestartOutcome},
     transport::NETWORK_TIMEOUT,
     wait, Result,
 };
@@ -311,7 +311,7 @@ impl ErCtx {
         self.proxies.as_deref()
     }
 
-    pub async fn restart(&self, config: RestartConfig) -> Result<RestartTiming> {
+    pub async fn restart(&self, config: RestartConfig) -> Result<RestartOutcome> {
         self.owner
             .as_ref()
             .and_then(Weak::upgrade)

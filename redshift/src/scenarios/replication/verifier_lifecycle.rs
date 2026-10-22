@@ -34,14 +34,15 @@ const PROBE_LAMPORTS: u64 = 1_000_000;
 const CHAIN_GAP: Duration = Duration::from_millis(100);
 const HEAVY_ITERS: u32 = 30;
 const STEADY: Duration = Duration::from_secs(8);
-const SUPERBLOCK_SLOTS: u64 = 128;
+const BLOCKTIME: Duration = Duration::from_millis(10);
+// Retention removes one superblock every 512 slots; avoid producing a backlog.
+const SUPERBLOCK_SLOTS: u64 = 512;
 const LEDGER_SIZE_LIMIT_BYTES: u64 = 1;
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(90);
 const CATCH_UP_TIMEOUT: Duration = Duration::from_secs(120);
 const DETACH_TIMEOUT: Duration = Duration::from_secs(30);
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(120);
-const RETENTION_TIMEOUT: Duration = Duration::from_secs(180);
 const SEAL_TIMEOUT: Duration = Duration::from_secs(60);
 const ADVANCE_WINDOW: Duration = Duration::from_secs(2);
 const LAG_SAMPLE: Duration = Duration::from_millis(500);
@@ -180,7 +181,7 @@ async fn await_leader_advance(
     let target = from + by;
     wait::retry(
         &format!("{what} (leader {name} reaching {target:.0})"),
-        SEAL_TIMEOUT.max(RETENTION_TIMEOUT),
+        SEAL_TIMEOUT,
         async || {
             ensure!(leader_count(topology, name).await? >= target);
             Ok(())
@@ -273,6 +274,7 @@ impl PrivateErScenario for VerifierLifecycle {
                 label: LABEL.to_owned(),
                 verifiers: VERIFIERS,
                 settings: Box::new(|params| {
+                    params.engine.blockstore.blocktime = BLOCKTIME;
                     params.engine.blockstore.superblock = SUPERBLOCK_SLOTS;
                     params.engine.ledger.size_limit = LEDGER_SIZE_LIMIT_BYTES;
                 }),

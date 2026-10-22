@@ -59,7 +59,11 @@ impl Action {
     }
 
     fn instruction(&self, keys: &[Pubkey]) -> Instruction {
-        let native = Instruction {
+        self.wrap(self.native(keys), keys)
+    }
+
+    fn native(&self, keys: &[Pubkey]) -> Instruction {
+        Instruction {
             program_id: magic_api::id(),
             accounts: vec![
                 AccountMeta::new(keys[SPONSOR], true),
@@ -67,7 +71,10 @@ impl Action {
                 AccountMeta::new(keys[VAULT], false),
             ],
             data: self.operation.try_to_vec().expect("ephemeral instruction serialization"),
-        };
+        }
+    }
+
+    fn wrap(&self, native: Instruction, keys: &[Pubkey]) -> Instruction {
         if self.caller == magic_api::id() {
             return native;
         }
@@ -271,7 +278,11 @@ impl Workload {
         };
         after[PAYER].lamports =
             after[PAYER].lamports.checked_sub(record.info.fee).context("payer exhausted")?;
-        ensure!(state(&self.er, &self.keys).await? == after);
+        let observed = state(&self.er, &self.keys).await?;
+        ensure!(
+            observed == after,
+            "{label}: state {observed:?}, expected {after:?}"
+        );
         if let Err(error) = record.check(&self.keys, &before, &after, expected_error) {
             self.failures.push(format!("{label}: {error:#}"));
         }
@@ -289,7 +300,7 @@ impl Workload {
         let foreign = topology::redshift_loader_v3_target().0;
 
         let mut action = Action::new(operation);
-        let ix = action.instruction(&keys);
+        let native = action.native(&keys);
         for (case, index, value, reason) in [
             (
                 "unsigned sponsor",
@@ -304,13 +315,18 @@ impl Workload {
                 InstructionError::InvalidAccountData,
             ),
         ] {
-            let mut invalid = ix.clone();
+            let mut invalid = native.clone();
             if let Some(key) = value {
                 invalid.accounts[index].pubkey = key;
             } else {
                 invalid.accounts[index].is_signer = false;
             }
-            self.run(&format!("{label}: {case}"), vec![invalid], Err(reason)).await?;
+            self.run(
+                &format!("{label}: {case}"),
+                vec![action.wrap(invalid, &keys)],
+                Err(reason),
+            )
+            .await?;
         }
         let mut direct = action.clone();
         direct.caller = magic_api::id();
@@ -321,19 +337,19 @@ impl Workload {
         )
         .await?;
         if matches!(action.operation, Create { .. }) {
-            let mut unsigned = ix.clone();
+            let mut unsigned = native.clone();
             unsigned.accounts[1].is_signer = false;
             self.run(
                 "create: unsigned address",
-                vec![unsigned],
+                vec![action.wrap(unsigned, &keys)],
                 Err(InstructionError::MissingRequiredSignature),
             )
             .await?;
-            let mut occupied = ix.clone();
+            let mut occupied = native;
             occupied.accounts[1].pubkey = keys[SUBSTITUTE];
             self.run(
                 "create: funded address",
-                vec![occupied],
+                vec![action.wrap(occupied, &keys)],
                 Err(InstructionError::InvalidAccountData),
             )
             .await?;
@@ -349,7 +365,7 @@ impl Workload {
         }
         self.run(
             &format!("{label}: rollback"),
-            vec![ix, direct.instruction(&keys)],
+            vec![action.instruction(&keys), direct.instruction(&keys)],
             Err(InstructionError::IncorrectProgramId),
         )
         .await?;

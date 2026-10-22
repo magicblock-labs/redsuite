@@ -106,7 +106,7 @@ fn memo_instruction(program_id: Pubkey, attempt: u64) -> Instruction {
 }
 
 fn has_log_msg(logs: &[String]) -> bool {
-    logs.iter().any(|line| line.contains("LogMsg: probe"))
+    logs.iter().any(|line| line.starts_with("Program log: probe "))
 }
 
 fn has_memo(logs: &[String]) -> bool {

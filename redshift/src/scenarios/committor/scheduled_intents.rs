@@ -51,6 +51,7 @@ fn intents(
         };
         return REDSHIFT
             .batch()
+            .require_signer(authorities[1])
             .invoke(MAGIC.intents(
                 authorities[0],
                 dlp::magic_fee_vault_pda(&validator),

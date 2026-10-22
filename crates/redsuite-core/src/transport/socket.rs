@@ -53,8 +53,14 @@ pub(super) struct Notification<'a> {
 }
 
 pub(super) enum Frame<'a> {
-    Reply { id: u64, result: LazyValue<'a> },
-    Notification { method: &'a str, params: Notification<'a> },
+    Reply {
+        id: u64,
+        result: result::Result<LazyValue<'a>, jsonrpc_core::Error>,
+    },
+    Notification {
+        method: &'a str,
+        params: Notification<'a>,
+    },
     Malformed,
 }
 
@@ -63,7 +69,10 @@ pub(super) fn parse(text: &str) -> result::Result<Option<Frame<'_>>, CloseReason
         return Ok(Some(Frame::Malformed));
     };
     if let Some(error) = envelope.error {
-        return Err(error.into());
+        return match envelope.id {
+            Some(id) => Ok(Some(Frame::Reply { id, result: Err(error) })),
+            None => Err(error.into()),
+        };
     }
     let frame = match (
         envelope.method,
@@ -72,7 +81,7 @@ pub(super) fn parse(text: &str) -> result::Result<Option<Frame<'_>>, CloseReason
         envelope.result,
     ) {
         (Some(method), Some(params), _, _) => Frame::Notification { method, params },
-        (None, _, Some(id), Some(result)) => Frame::Reply { id, result },
+        (None, _, Some(id), Some(result)) => Frame::Reply { id, result: Ok(result) },
         _ => return Ok(None),
     };
     Ok(Some(frame))
