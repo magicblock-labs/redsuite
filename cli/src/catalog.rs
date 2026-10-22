@@ -263,6 +263,14 @@ pub mod redhat {
 
     scenario_catalog! {
         family: Redhat,
+        stale_remote_state => chainlink::remote_observations::RemoteObservations::State {
+            er: Fresh,
+            fixtures: [Fixture::RedlineProgram, Fixture::RedshiftProgram],
+        },
+        stale_token_projection => chainlink::remote_observations::RemoteObservations::Tokens {
+            er: Fresh,
+            fixtures: [Fixture::RedlineProgram, Fixture::RedshiftProgram],
+        },
         ephemeral_accounts => magicblock::ephemeral_accounts::EphemeralAccounts {
             er: Exclusive(DEFAULT),
             fixtures: [Fixture::RedshiftProgram],

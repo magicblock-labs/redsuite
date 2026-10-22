@@ -9,4 +9,4 @@ pub mod program_upgrade;
 pub mod projected_token_lifecycle;
 pub mod undelegation_grpc_redundancy;
 
-pub(crate) mod spl;
+pub mod spl;

@@ -199,12 +199,23 @@ pub struct FaultEvent {
 
 enum Decision {
     Release,
+    Replace(String),
     Discard,
     Reject(String),
 }
 
+impl Decision {
+    fn body<T: From<String>>(self, original: T) -> T {
+        match self {
+            Decision::Replace(body) => body.into(),
+            _ => original,
+        }
+    }
+}
+
 struct Pending {
     operation: Operation,
+    body: String,
     held_at: Duration,
     decide: Option<oneshot::Sender<Decision>>,
 }
@@ -256,7 +267,7 @@ enum GateStart {
     Pending(oneshot::Receiver<Decision>, Operation, Holding),
 }
 
-fn gate_start(shared: &Shared, operation: Operation) -> GateStart {
+fn gate_start(shared: &Shared, operation: Operation, body: &str) -> GateStart {
     let mut state = shared.borrow_mut();
     let rule = state
         .rules
@@ -299,6 +310,7 @@ fn gate_start(shared: &Shared, operation: Operation) -> GateStart {
                     let held_at = state.started.elapsed();
                     *trap.fired.borrow_mut() = Some(Pending {
                         operation: operation.clone(),
+                        body: body.to_owned(),
                         held_at,
                         decide: Some(sender),
                     });
@@ -331,7 +343,7 @@ async fn gate_finish(
 ) -> Decision {
     let decision = receiver.await.unwrap_or(Decision::Release);
     let action = match &decision {
-        Decision::Release => Action::Released,
+        Decision::Release | Decision::Replace(_) => Action::Released,
         Decision::Discard => Action::Discarded,
         Decision::Reject(_) => Action::Rejected,
     };
@@ -342,8 +354,9 @@ async fn gate_finish(
 async fn gate(
     shared: &Shared,
     operation: Operation,
+    body: &str,
 ) -> (Decision, Option<Holding>) {
-    match gate_start(shared, operation) {
+    match gate_start(shared, operation, body) {
         GateStart::Decided(decision) => (decision, None),
         GateStart::Pending(receiver, operation, holding) => (
             gate_finish(shared, receiver, operation).await,
@@ -371,17 +384,23 @@ fn deliver(
             Message::Text(rejection(id, &message).into())
         }
         Decision::Release => Message::Text(text),
+        Decision::Replace(body) => Message::Text(body.into()),
     };
     outbound.send(Some((message, holding))).map_err(|_| ())
 }
 
 pub struct Held {
     pub operation: Operation,
+    pub body: String,
     pub held_at: Duration,
     decide: oneshot::Sender<Decision>,
 }
 
 impl Held {
+    pub fn replace(self, body: String) {
+        let _ = self.decide.send(Decision::Replace(body));
+    }
+
     pub fn release(self) {
         let _ = self.decide.send(Decision::Release);
     }
@@ -407,6 +426,7 @@ impl Trap {
                 if let Some(decide) = pending.decide.take() {
                     return Ok(Held {
                         operation: pending.operation.clone(),
+                        body: pending.body.clone(),
                         held_at: pending.held_at,
                         decide,
                     });
@@ -824,7 +844,8 @@ async fn serve_http(
 ) {
     let mut buffer = Vec::new();
     loop {
-        let Some((head, body)) = read_request(&mut socket, &mut buffer).await
+        let Some((head, mut body)) =
+            read_request(&mut socket, &mut buffer).await
         else {
             return;
         };
@@ -850,7 +871,8 @@ async fn serve_http(
                 operation(Transport::Http, Stage::Request, "?", Vec::new()),
             ),
         };
-        let (decision, _request_hold) = gate(&shared, request.clone()).await;
+        let (decision, _request_hold) =
+            gate(&shared, request.clone(), &body).await;
         match decision {
             Decision::Discard => return,
             Decision::Reject(message) => {
@@ -865,6 +887,7 @@ async fn serve_http(
                 continue;
             }
             Decision::Release => {}
+            Decision::Replace(replacement) => body = replacement,
         }
         let (status, text) = match http::post_json(&client, &upstream, body)
             .await
@@ -881,7 +904,7 @@ async fn serve_http(
             .map(|parsed| parsed.strings)
             .unwrap_or_default();
         let response = merged(request, Stage::Response, extra);
-        let (decision, _response_hold) = gate(&shared, response).await;
+        let (decision, _response_hold) = gate(&shared, response, &text).await;
         match decision {
             Decision::Discard => return,
             Decision::Reject(message) => {
@@ -891,7 +914,8 @@ async fn serve_http(
                     return;
                 }
             }
-            Decision::Release => {
+            Decision::Release | Decision::Replace(_) => {
+                let text = decision.body(text);
                 if !write_response(&mut socket, status, &text).await {
                     return;
                 }
@@ -1001,7 +1025,7 @@ async fn serve_ws(socket: TcpStream, upstream: String, shared: Shared) {
                     parsed.method.as_deref().unwrap_or("?"),
                     parsed.strings,
                 );
-                let (decision, _hold) = gate(&shared, request.clone()).await;
+                let (decision, _hold) = gate(&shared, request.clone(), &text).await;
                 match decision {
                     Decision::Discard => break,
                     Decision::Reject(message) => {
@@ -1010,10 +1034,11 @@ async fn serve_ws(socket: TcpStream, upstream: String, shared: Shared) {
                             break;
                         }
                     }
-                    Decision::Release => {
+                    Decision::Release | Decision::Replace(_) => {
                         if let Some(id) = parsed.id.as_ref().and_then(|id| json::to_string(id).ok()) {
                             pending.insert(id, request);
                         }
+                        let text = decision.body(text);
                         if server_sink.send(Message::Text(text)).await.is_err() {
                             break;
                         }
@@ -1041,7 +1066,7 @@ async fn serve_ws(socket: TcpStream, upstream: String, shared: Shared) {
                 let is_notification = parsed.subscription.is_some();
                 let id = parsed.id.clone();
                 let inbound = response_operation(parsed, &mut pending, &mut subscriptions);
-                match gate_start(&shared, inbound) {
+                match gate_start(&shared, inbound, &text) {
                     GateStart::Decided(decision) => {
                         if deliver(&outbound, decision, text, is_notification, &id, None).is_err() {
                             break;

@@ -13,7 +13,7 @@ pub(crate) const MINT_OFFSET: usize = 0;
 pub(crate) const OWNER_OFFSET: usize = 32;
 const TOKEN_AMOUNT_OFFSET: usize = 64;
 
-pub(crate) fn token_program() -> Pubkey {
+pub fn token_program() -> Pubkey {
     sdk::consts::TOKEN_PROGRAM_ID
 }
 
@@ -21,11 +21,11 @@ pub(crate) fn ata_program() -> Pubkey {
     sdk::consts::ASSOCIATED_TOKEN_PROGRAM_ID
 }
 
-pub(crate) fn eata_program() -> Pubkey {
+pub fn eata_program() -> Pubkey {
     sdk::consts::ESPL_TOKEN_PROGRAM_ID
 }
 
-pub(crate) fn derive_eata(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
+pub fn derive_eata(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(
         &[owner.as_ref(), mint.as_ref()],
         &eata_program(),
@@ -33,11 +33,11 @@ pub(crate) fn derive_eata(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
     .0
 }
 
-pub(crate) fn derive_global_vault(mint: &Pubkey) -> Pubkey {
+pub fn derive_global_vault(mint: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(&[mint.as_ref()], &eata_program()).0
 }
 
-pub(crate) fn derive_ata(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
+pub fn derive_ata(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(
         &[owner.as_ref(), token_program().as_ref(), mint.as_ref()],
         &ata_program(),
@@ -80,14 +80,11 @@ pub(crate) fn is_magic_ata(data: &[u8]) -> bool {
         && data.get(133..165) == Some(sdk_ids::sysvar::rent::ID.as_ref())
 }
 
-pub(crate) fn allocate_mint(payer: &Pubkey, mint: &Pubkey) -> Instruction {
+pub fn allocate_mint(payer: &Pubkey, mint: &Pubkey) -> Instruction {
     system::create_account(payer, mint, MINT_RENT, MINT_LEN, &token_program())
 }
 
-pub(crate) fn initialize_mint(
-    mint: &Pubkey,
-    authority: &Pubkey,
-) -> Instruction {
+pub fn initialize_mint(mint: &Pubkey, authority: &Pubkey) -> Instruction {
     let mut data = vec![20u8, 0u8];
     data.extend_from_slice(authority.as_ref());
     data.push(0);
@@ -98,7 +95,7 @@ pub(crate) fn initialize_mint(
     }
 }
 
-pub(crate) fn create_ata_idempotent(
+pub fn create_ata_idempotent(
     funder: &Pubkey,
     owner: &Pubkey,
     mint: &Pubkey,
@@ -117,7 +114,7 @@ pub(crate) fn create_ata_idempotent(
     }
 }
 
-pub(crate) fn mint_to(
+pub fn mint_to(
     mint: &Pubkey,
     destination: &Pubkey,
     authority: &Pubkey,
@@ -136,23 +133,22 @@ pub(crate) fn mint_to(
     }
 }
 
-pub(crate) async fn token_balance(
+pub fn token_amount(data: &[u8]) -> Option<u64> {
+    let bytes = data.get(TOKEN_AMOUNT_OFFSET..TOKEN_AMOUNT_OFFSET + 8)?;
+    Some(u64::from_le_bytes(bytes.try_into().ok()?))
+}
+
+pub async fn token_balance(
     ctx: &impl ChainCtx,
     account: &Pubkey,
 ) -> Result<Option<u64>> {
     let Some(account) = ctx.account(account).await? else {
         return Ok(None);
     };
-    let Some(bytes) = account
-        .data
-        .get(TOKEN_AMOUNT_OFFSET..TOKEN_AMOUNT_OFFSET + 8)
-    else {
-        return Ok(None);
-    };
-    Ok(Some(u64::from_le_bytes(bytes.try_into()?)))
+    Ok(token_amount(&account.data))
 }
 
-pub(crate) fn transfer(
+pub fn transfer(
     source: &Pubkey,
     destination: &Pubkey,
     authority: &Pubkey,
@@ -171,7 +167,7 @@ pub(crate) fn transfer(
     }
 }
 
-pub(crate) fn approve(
+pub fn approve(
     source: &Pubkey,
     delegate: &Pubkey,
     owner: &Pubkey,
@@ -190,10 +186,18 @@ pub(crate) fn approve(
     }
 }
 
-pub(crate) fn initialize_global_vault(
-    payer: &Pubkey,
-    mint: &Pubkey,
-) -> Instruction {
+pub fn revoke(source: &Pubkey, owner: &Pubkey) -> Instruction {
+    Instruction {
+        program_id: token_program(),
+        accounts: vec![
+            AccountMeta::new(*source, false),
+            AccountMeta::new_readonly(*owner, true),
+        ],
+        data: vec![5],
+    }
+}
+
+pub fn initialize_global_vault(payer: &Pubkey, mint: &Pubkey) -> Instruction {
     InitializeGlobalVaultBuilder {
         payer: *payer,
         mint: *mint,
@@ -201,7 +205,7 @@ pub(crate) fn initialize_global_vault(
     .instruction()
 }
 
-pub(crate) fn initialize_eata(
+pub fn initialize_eata(
     payer: &Pubkey,
     user: &Pubkey,
     mint: &Pubkey,
@@ -214,7 +218,7 @@ pub(crate) fn initialize_eata(
     .instruction()
 }
 
-pub(crate) fn deposit_spl_tokens(
+pub fn deposit_spl_tokens(
     user: &Pubkey,
     mint: &Pubkey,
     amount: u64,
@@ -251,7 +255,7 @@ pub(crate) fn withdraw_spl_tokens(
     }
 }
 
-pub(crate) fn delegate_eata(
+pub fn delegate_eata(
     payer: &Pubkey,
     user: &Pubkey,
     mint: &Pubkey,

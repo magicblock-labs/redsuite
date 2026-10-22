@@ -3146,17 +3146,22 @@ dependencies = [
  "async-trait",
  "ephemeral-rollups-sdk",
  "futures-util",
+ "magicblock-delegation-program-api",
  "magicblock-magic-program-api",
  "redhat-interface",
+ "redshift",
  "redshift-interface",
  "redsuite-core",
  "solana-account 4.3.2",
  "solana-instruction 3.4.0",
  "solana-keypair",
  "solana-pubkey 4.2.0",
+ "solana-signature",
  "solana-signer",
  "solana-transaction 4.1.6",
  "sonic-rs",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
