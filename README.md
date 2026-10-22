@@ -153,6 +153,10 @@ Redline defaults to the shorter `lite` workloads. Only `redline run` and
 adversarial checks use fixed workloads. Redline benchmarks run sequentially;
 checks can use `--fresh-concurrency` to bound concurrent fresh scenarios.
 
+`redshift run` and `redhat run` accept `--seed <U64>` to set the run seed,
+for example `redsuite redhat run --seed 12345`. When omitted, a random seed
+is generated. The chosen seed is logged at `info` before stack startup.
+
 `redline load` continuously runs the mixed write/compute/read-write workload.
 The duration covers load generation, not setup or draining. Rate and total
 outstanding-request concurrency default from the selected preset; overrides

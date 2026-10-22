@@ -79,6 +79,9 @@ pub struct Run {
 pub struct CheckRun {
     #[command(flatten)]
     pub run: Run,
+    /// Seed for reproducible case generation; generated randomly if omitted.
+    #[arg(long, value_name = "U64")]
+    pub seed: Option<u64>,
     /// Maximum concurrent fresh scenarios.
     #[arg(long, default_value = "2", value_name = "N")]
     pub fresh_concurrency: NonZeroUsize,

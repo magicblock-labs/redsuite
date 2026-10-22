@@ -1,4 +1,5 @@
 pub mod api;
+pub mod attack;
 pub mod catalog;
 pub mod check;
 pub mod context;

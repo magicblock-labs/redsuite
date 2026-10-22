@@ -45,10 +45,15 @@ async fn checks(family: Family, command: args::Checks) -> Result<()> {
     match command {
         args::Checks::List { selections } => list(family, &selections),
         args::Checks::Run(args) => {
+            let seed = args.seed.unwrap_or_else(rand::random);
+            info!(seed, "run seed");
             suite::Suite::new(
                 family,
                 args.run,
-                ExecutionConfig::default(),
+                ExecutionConfig {
+                    seed,
+                    ..ExecutionConfig::default()
+                },
                 args.serial,
                 args.fresh_concurrency.get(),
             )?
@@ -74,6 +79,7 @@ async fn dispatch(command: args::Command) -> Result<ExitCode> {
                 let config = ExecutionConfig {
                     profile: args.profile,
                     loop_mode: args.loop_mode,
+                    ..ExecutionConfig::default()
                 };
                 suite::Suite::new(Family::Redline, args.run, config, true, 1)?
                     .run()
@@ -98,6 +104,7 @@ async fn load(args: args::Load) -> Result<ExitCode> {
     let config = ExecutionConfig {
         profile: args.profile,
         loop_mode: LoopMode::Open,
+        ..ExecutionConfig::default()
     };
     let scenario = redline::load::Load {
         duration: args.duration,

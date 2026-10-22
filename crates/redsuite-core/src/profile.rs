@@ -36,6 +36,7 @@ impl LoopMode {
 pub struct ExecutionConfig {
     pub profile: Profile,
     pub loop_mode: LoopMode,
+    pub seed: u64,
 }
 
 pub struct ProfileValues<T> {
