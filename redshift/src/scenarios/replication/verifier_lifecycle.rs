@@ -508,6 +508,8 @@ impl VerifierLifecycle {
 
     #[instrument(skip_all, err)]
     async fn check_final_boundary(&self, pairs: &[CausalPair]) -> Result<()> {
+        // Background services can append transactions after the workload drains.
+        // Replicate this fixed cutoff through a sealed boundary, not a moving head.
         let final_txs = leader_metric(&self.topology, TRANSACTIONS).await?;
         await_leader_advance(
             &self.topology,
@@ -516,23 +518,18 @@ impl VerifierLifecycle {
             "the final sealed boundary after the load",
         )
         .await?;
-        let leader_blocks = leader_metric(&self.topology, BLOCKS).await?;
-        let leader_txs = leader_metric(&self.topology, TRANSACTIONS).await?;
-        ensure!(leader_txs == final_txs);
-        self.catch_up_fleet(&[TRANSACTIONS, SUPERBLOCKS]).await?;
-        await_catch_up(self.topology.verifier(0), BLOCKS, leader_blocks).await?;
+        self.catch_up_fleet(&[BLOCKS, SUPERBLOCKS]).await?;
         for verifier in self.topology.verifiers() {
-            ensure!(verifier_metric(verifier, TRANSACTIONS).await? == leader_txs);
+            await_catch_up(verifier, TRANSACTIONS, final_txs).await?;
         }
         self.verify_no_mismatch().await?;
         self.verify_pairs(pairs).await?;
-        leader_metric(&self.topology, SUPERBLOCKS).await?;
         let mut verifier_superblocks = Vec::with_capacity(VERIFIERS);
         for verifier in self.topology.verifiers() {
             verifier_superblocks.push(verifier_metric(verifier, SUPERBLOCKS).await?);
         }
         debug!(
-            leader_txs,
+            final_txs,
             ?verifier_superblocks,
             "final replicated account state verified",
         );

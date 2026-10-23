@@ -142,6 +142,10 @@ impl EventSubscriptions {
         self.connection.state().malformed
     }
 
+    pub(crate) fn diagnostics(&self) -> String {
+        self.connection.diagnostics()
+    }
+
     pub fn finalize(&self) {
         self.connection.stop();
     }

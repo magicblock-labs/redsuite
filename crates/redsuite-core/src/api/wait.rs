@@ -119,12 +119,16 @@ impl Api {
         let deadline = time::Instant::now() + NETWORK_TIMEOUT;
         let subscriptions = stream::iter(addresses)
             .map(async |address| {
-                time::timeout_at(deadline, events.account(address)).await.with_context(|| {
-                    format!(
-                        "accountSubscribe not acknowledged: address={address}, endpoint={}",
-                        self.ws_url
-                    )
-                })?
+                time::timeout_at(deadline, events.account(address))
+                    .await
+                    .with_context(|| events.diagnostics())
+                    .and_then(|result| result)
+                    .with_context(|| {
+                        format!(
+                            "accountSubscribe not acknowledged: address={address}, malformed={}",
+                            events.malformed_frames()
+                        )
+                    })
             })
             .buffered(16)
             .try_collect()

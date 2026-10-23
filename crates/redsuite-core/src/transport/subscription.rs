@@ -86,6 +86,7 @@ pub(super) struct Router<S: SubscriptionState> {
     requests: HashMap<u64, Request<S::Key>>,
     subscriptions: HashMap<u64, S::Key>,
     subscribed: usize,
+    last_reply: Option<u64>,
     error: Option<String>,
     changed: Rc<Notify>,
 }
@@ -97,6 +98,7 @@ impl<S: SubscriptionState> Router<S> {
             requests: HashMap::new(),
             subscriptions: HashMap::new(),
             subscribed: 0,
+            last_reply: None,
             error: None,
             changed: Rc::new(Notify::new()),
         }
@@ -113,6 +115,7 @@ impl<S: SubscriptionState> Router<S> {
     ) -> Result<()> {
         match frame {
             Frame::Reply { id, result } => {
+                self.last_reply = Some(id);
                 match (self.requests.remove(&id), result) {
                     (Some(Request::Subscribe(key)), Ok(result)) => {
                         let subscription = json::from_str(result.as_raw_str())?;
@@ -160,6 +163,7 @@ pub(super) struct Connection<S: SubscriptionState> {
     url: Url,
     sink: Mutex<SplitSink<Socket, Message>>,
     next_id: Cell<u64>,
+    last_sent: Cell<u64>,
     router: Rc<RefCell<Router<S>>>,
     reader: JoinHandle<()>,
 }
@@ -190,6 +194,7 @@ impl<S: SubscriptionState + 'static> Connection<S> {
             url: url.clone(),
             sink: Mutex::new(sink),
             next_id: Cell::new(1),
+            last_sent: Cell::new(0),
             router,
             reader,
         })
@@ -205,7 +210,9 @@ impl<S: SubscriptionState + 'static> Connection<S> {
         // Register before sending: the reader may see an acknowledgment as soon as send yields.
         self.router.borrow_mut().register(id, key);
         let mut sink = self.sink.lock().await;
-        socket::send(&mut *sink, id, topic.subscribe(), params).await
+        socket::send(&mut *sink, id, topic.subscribe(), params).await?;
+        self.last_sent.set(id);
+        Ok(())
     }
 
     pub(super) fn state(&self) -> Ref<'_, S> {
@@ -256,14 +263,17 @@ impl<S: SubscriptionState + 'static> Connection<S> {
             observe()
         })
         .await
-        .with_context(|| {
-            let router = self.router.borrow();
-            let pending: Vec<_> = router.requests.keys().take(16).copied().collect();
-            format!(
-                "websocket wait failed: endpoint={}, pending={}, request_ids={pending:?}, active={}, acknowledged={}",
-                self.url, router.requests.len(), router.subscriptions.len(), router.subscribed
-            )
-        })
+        .with_context(|| self.diagnostics())
+    }
+
+    pub(super) fn diagnostics(&self) -> String {
+        let router = self.router.borrow();
+        let pending: Vec<_> = router.requests.keys().take(16).copied().collect();
+        format!(
+            "websocket state: endpoint={}, last_sent={}, last_reply={:?}, pending={}, request_ids={pending:?}, active={}, acknowledged={}",
+            self.url, self.last_sent.get(), router.last_reply,
+            router.requests.len(), router.subscriptions.len(), router.subscribed
+        )
     }
 
     pub(super) async fn await_ack(&self, key: S::Key) -> Result<()>
@@ -306,7 +316,9 @@ impl<S: SubscriptionState + 'static> Connection<S> {
         let id = self.next_id.replace(self.next_id.get() + 1);
         let mut sink = self.sink.lock().await;
         self.router.borrow_mut().requests.insert(id, Request::Unsubscribe);
-        socket::send(&mut *sink, id, topic.unsubscribe(), &(subscription,)).await
+        socket::send(&mut *sink, id, topic.unsubscribe(), &(subscription,)).await?;
+        self.last_sent.set(id);
+        Ok(())
     }
 
     pub(super) fn stop(&self) {
