@@ -8,7 +8,6 @@ use redline_interface::DELEGATION_PROGRAM_ID;
 use redsuite_core::{dlp, programs::CellHeader, BaseCtx, ChainCtx, Result};
 
 pub const ACCOUNT_SPACE: u32 = 128;
-pub(crate) const LARGE_ACCOUNT_SPACE: u32 = 10 * 1024;
 pub const PAYER_LAMPORTS: u64 = 2_000_000_000;
 
 pub const LOCKOUT_REJECTIONS: [&str; 4] = [

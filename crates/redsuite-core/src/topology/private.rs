@@ -214,11 +214,10 @@ async fn launch(
     let log = dir.join(format!("er-{}.log", options.label));
     let identity_pubkey = er_identity.pubkey();
     let role = if allowed_followers.is_empty() { "private-er" } else { "leader" };
-    let endpoints = options.base_endpoints.unwrap_or_else(|| BaseEndpoints {
-        rpc_url: base.api().url().clone(),
-        ws_url: base.ws_url().clone(),
-        grpc_url: None,
-    });
+    let endpoints = match options.base_endpoints {
+        Some(endpoints) => endpoints,
+        None => BaseEndpoints::from_base(base)?,
+    };
     let plan = ErPlan {
         bin: er_bin,
         config_path: config::config_path(&dir, &options.label),

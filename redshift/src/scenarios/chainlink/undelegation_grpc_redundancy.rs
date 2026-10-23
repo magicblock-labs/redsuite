@@ -1,6 +1,6 @@
 use std::{rc::Rc, time::Duration};
 
-use anyhow::{anyhow, ensure, Context};
+use anyhow::{bail, ensure};
 use redsuite_core::{
     netfault::{BaseProxies, Selector},
     programs::{CellId, SettlementMode, REDLINE},
@@ -27,19 +27,16 @@ pub struct GrpcRedundancy {
 
 impl PrivateErScenario for GrpcRedundancy {
     async fn setup(shared: Rc<BaseCtx>, _: ()) -> Result<Self> {
-        let (grpc_url, _) = shared.grpc().context("base L1 Yellowstone gRPC endpoint missing")?;
         let http = BaseProxies::spawn(&shared).await?;
         let ws = BaseProxies::spawn(&shared).await?;
         let mut endpoints = http.endpoints();
         endpoints.ws_url = ws.endpoints().ws_url;
-        endpoints.grpc_url = Some(grpc_url.clone());
 
         let private = topology::private_er(
             &shared,
             ErOptions {
                 label: LABEL.into(),
                 base_endpoints: Some(endpoints),
-
                 ..ErOptions::default()
             },
         )
@@ -93,9 +90,9 @@ impl PrivateErScenario for GrpcRedundancy {
         .await?;
         self.http.await_held(Selector::default(), TIMEOUT).await?;
 
-        let mut blackout = vec![self.ws.stall(Selector::default().response().notification())];
+        self.ws.stall(Selector::default().response().notification());
         for key in &keys {
-            blackout.push(self.http.stall(Selector::methods(&FETCHES).response().account(key)));
+            self.http.stall(Selector::methods(&FETCHES).response().account(key));
         }
         self.ws.close_connections();
         settlement.remove();
@@ -133,17 +130,14 @@ impl PrivateErScenario for GrpcRedundancy {
         {
             let served: Vec<_> =
                 er.accounts(pending).await?.into_iter().map(crate::account_id).collect();
-            return Err(anyhow!(
+            bail!(
                 "{error:#}; the cloned account did refresh over grpc after \
                  {refresh:.1?}, and a direct client read returns {served:?}"
-            ));
+            );
         }
 
         let ws_held = self.ws.held_count(&Selector::default());
         ensure!(ws_held > 0);
-        for rule in blackout {
-            rule.remove();
-        }
         self.ws.restore();
         self.http.restore();
 

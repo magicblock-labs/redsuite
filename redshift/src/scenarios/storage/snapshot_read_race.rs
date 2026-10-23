@@ -17,9 +17,8 @@ use redsuite_core::{
 use signer::Signer;
 use tokio::{task::JoinHandle, time};
 
-use crate::LARGE_ACCOUNT_SPACE;
-
 const LABEL: &str = "snapshot-read-race";
+const INITIAL_ACCOUNT_SPACE: u32 = 10 * 1024;
 const SUPERBLOCK_SLOTS: u64 = 10;
 const ACCOUNTS: usize = 8;
 const GROW_BYTES: u32 = 32;
@@ -105,16 +104,16 @@ impl PrivateErScenario for SnapshotReadRace {
     }
 
     async fn run(mut self) -> Result<()> {
-        let mut sizes = vec![LARGE_ACCOUNT_SPACE; ACCOUNTS];
+        let mut sizes = vec![INITIAL_ACCOUNT_SPACE; ACCOUNTS];
         let er = self.private.ctx();
         er.await_program_clone(&redshift_interface::id()).await?;
         let accounts = self
             .base
             .cells(REDSHIFT, &self.payer)
-            .create_owned_sized(er.identity(), ACCOUNTS, LARGE_ACCOUNT_SPACE)
+            .create_owned_sized(er.identity(), ACCOUNTS, INITIAL_ACCOUNT_SPACE)
             .await?;
         let addresses: Vec<_> = accounts.iter().map(|account| account.address).collect();
-        er.await_clones(&addresses, LARGE_ACCOUNT_SPACE as usize).await?;
+        er.await_clones(&addresses, INITIAL_ACCOUNT_SPACE as usize).await?;
         let sponsor = self.base.funded_payer(crate::PAYER_LAMPORTS).await?;
         self.base.delegate_payer(&sponsor, &self.payer, er.identity()).await?;
 

@@ -412,7 +412,7 @@ impl BaseProxies {
         let endpoints = BaseEndpoints {
             rpc_url: format!("http://{}", http_listener.local_addr()?).parse()?,
             ws_url: format!("ws://{}", ws_listener.local_addr()?).parse()?,
-            grpc_url: None,
+            ..BaseEndpoints::from_base(base)?
         };
         let upstream_rpc = base.api().url().clone();
         let upstream_ws = base.ws_url().clone();

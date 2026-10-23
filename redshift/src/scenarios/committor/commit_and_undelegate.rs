@@ -18,10 +18,9 @@ use solana_instruction_error::InstructionError;
 use tokio::time;
 use tracing::instrument;
 
-use crate::{
-    program::DELEGATION_PROGRAM_ID, LARGE_ACCOUNT_SPACE, LOCKOUT_REJECTIONS, PAYER_LAMPORTS,
-};
+use crate::{program::DELEGATION_PROGRAM_ID, LOCKOUT_REJECTIONS, PAYER_LAMPORTS};
 
+const LARGE_ACCOUNT_SPACE: u32 = 2 * 1024;
 const ER_WRITE_TIMEOUT: Duration = Duration::from_secs(20);
 const REDELEGATE_SETTLE: Duration = Duration::from_secs(2);
 const ROLLBACK_SETTLE: Duration = Duration::from_millis(1500);

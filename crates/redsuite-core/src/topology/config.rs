@@ -20,7 +20,7 @@ use tracing::warn;
 use url::Url;
 
 use super::{process, state};
-use crate::{catalog::Fixture, Result};
+use crate::{catalog::Fixture, BaseCtx, ChainCtx, Result};
 
 const LEDGER_SIZE_LIMIT_UNREACHABLE: u64 = 1 << 60;
 
@@ -337,12 +337,10 @@ pub(super) fn leader_params(
         remotes: vec![
             Remote::Http(ResolvedUrl(endpoints.rpc_url.clone())),
             Remote::Websocket(ResolvedUrl(endpoints.ws_url.clone()), None),
+            Remote::Grpc(ResolvedUrl(with_api_key(endpoints.grpc_url.clone()))),
         ],
         ..LeaderParams::default()
     };
-    if let Some(grpc_url) = &endpoints.grpc_url {
-        params.remotes.push(Remote::Grpc(ResolvedUrl(with_api_key(grpc_url.clone()))));
-    }
     params.aperture.listen = local(ports.rpc);
     params.metrics.address = local(ports.metrics);
     params.engine.authority = identity.into();
@@ -456,7 +454,6 @@ fn with_api_key(mut grpc_url: Url) -> Url {
 pub struct ErOptions {
     pub label: String,
     pub settings: Settings,
-
     pub base_endpoints: Option<BaseEndpoints>,
 }
 
@@ -465,7 +462,6 @@ impl Default for ErOptions {
         Self {
             label: String::new(),
             settings: Box::new(|_| {}),
-
             base_endpoints: None,
         }
     }
@@ -475,7 +471,18 @@ impl Default for ErOptions {
 pub struct BaseEndpoints {
     pub rpc_url: Url,
     pub ws_url: Url,
-    pub grpc_url: Option<Url>,
+    pub grpc_url: Url,
+}
+
+impl BaseEndpoints {
+    pub(crate) fn from_base(base: &BaseCtx) -> Result<Self> {
+        let (grpc_url, _) = base.grpc().context("base L1 Yellowstone gRPC endpoint missing")?;
+        Ok(Self {
+            rpc_url: base.api().url().clone(),
+            ws_url: base.ws_url().clone(),
+            grpc_url: grpc_url.clone(),
+        })
+    }
 }
 
 pub struct RestartConfig {
