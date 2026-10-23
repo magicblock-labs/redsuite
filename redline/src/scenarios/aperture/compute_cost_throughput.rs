@@ -21,7 +21,6 @@ use crate::{metrics, program::layout, ACCOUNT_SPACE};
 
 const PAYER_LAMPORTS: u64 = 2_000_000_000;
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(300);
-const SETTLE_TIMEOUT: Duration = Duration::from_secs(20);
 const TX_COUNT: &str = metrics::ENGINE_TRANSACTIONS;
 const LIGHT_ITERS: u32 = 1;
 const HEAVY_ITERS: u32 = 20;
@@ -107,12 +106,7 @@ async fn run_cell(
         warmup_request,
     )
     .await?;
-    ensure!(
-        warm.failed == 0,
-        "failures={:?}; first error={:?}",
-        warm.failed,
-        warm.first_error
-    );
+    ensure!(warm.failed == 0);
     if let Some(seen) = count_before_warmup {
         crate::await_executed(er, seen + profile.warmup as f64, DRAIN_TIMEOUT).await?;
     }
@@ -126,7 +120,7 @@ async fn run_cell(
     for pda in pdas {
         updates.account_subscribe(pda).await?;
     }
-    updates.await_subscribed(pdas.len(), Duration::from_secs(5)).await?;
+    updates.await_subscribed(pdas.len()).await?;
 
     let offset = offset + profile.warmup;
     let probe: Rc<RefCell<Option<Signature>>> = Rc::new(RefCell::new(None));
@@ -161,12 +155,7 @@ async fn run_cell(
         request,
     )
     .await?;
-    ensure!(
-        outcome.failed == 0,
-        "failures={:?}; first error={:?}",
-        outcome.failed,
-        outcome.first_error
-    );
+    ensure!(outcome.failed == 0);
     let drain = match before.get(TX_COUNT) {
         Some(seen) => {
             crate::await_executed(er, seen + profile.iterations as f64, DRAIN_TIMEOUT).await?
@@ -174,10 +163,10 @@ async fn run_cell(
         None => Duration::ZERO,
     };
 
-    let probe_sig = probe.borrow().as_ref().cloned().context("no probe signature captured")?;
+    let probe_sig = (*probe.borrow()).context("no probe signature captured")?;
     let probe_cus = crate::probe_cus(er, &probe_sig, label, iters).await?;
 
-    updates.await_settled(SETTLE_TIMEOUT).await?;
+    updates.await_settled().await?;
     let after = er.scrape_metrics().await?;
     let delta = MetricsDelta::new(before, after);
     if let Some(failed) = delta.counter_all(metrics::FAILED_TRANSACTIONS) {
@@ -215,7 +204,7 @@ impl Scenario<ScenarioReport> for ComputeCostThroughput {
         let pdas = Accounts::new(ACCOUNT_SPACE, er.identity())
             .init_delegated(base.as_ref(), &payers[0], profile.accounts)
             .await?;
-        er.await_clones(&pdas, ACCOUNT_SPACE as usize, Duration::from_secs(15)).await?;
+        er.await_clones(&pdas, ACCOUNT_SPACE as usize).await?;
         let senders: Vec<TxSender> =
             payers.into_iter().map(|payer| er.sender(Rc::new(payer))).collect();
 
@@ -291,13 +280,7 @@ impl Scenario<ScenarioReport> for ComputeCostThroughput {
         let light = &cells[0];
         let heavy = &cells[1];
         let cu_ratio = heavy.probe_cus / light.probe_cus;
-        ensure!(
-            cu_ratio >= CU_CONTRAST_FLOOR,
-            "heavy cell consumed {:.0} cus per tx vs light {:.0} — not the \
-             >= {CU_CONTRAST_FLOOR}x compute contrast this scenario is about",
-            heavy.probe_cus,
-            light.probe_cus
-        );
+        ensure!(cu_ratio >= CU_CONTRAST_FLOOR);
         let validator_avg_ratio = match (light.validator_avg_us, heavy.validator_avg_us) {
             (Some(light_avg), Some(heavy_avg)) if light_avg > 0.0 => Some(heavy_avg / light_avg),
             _ => None,

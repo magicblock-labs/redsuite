@@ -67,6 +67,7 @@ const PROFILES: ProfileValues<Profile> = ProfileValues { lite: LITE, full: FULL 
 // (hot-set sizes are powers of two — coprime with the stride)
 fn execute_cell(
     er_rpc_url: Url,
+    er_ws_url: Url,
     config: ThreadRunConfig,
     id_offset: u64,
     hot_set: Arc<Vec<Pubkey>>,
@@ -75,6 +76,7 @@ fn execute_cell(
     execute_kernel(
         config,
         er_rpc_url,
+        er_ws_url,
         payer_bytes,
         id_offset,
         move |id| REDLINE.copy_three(&hot_set, id).0,
@@ -103,7 +105,7 @@ impl Scenario<ScenarioReport> for HotAccountCliff {
         let pdas = Accounts::new(ACCOUNT_SPACE, er.identity())
             .init_delegated(base.as_ref(), &payers[0], pool)
             .await?;
-        er.await_clones(&pdas, ACCOUNT_SPACE as usize, Duration::from_secs(15)).await?;
+        er.await_clones(&pdas, ACCOUNT_SPACE as usize).await?;
         let payer_bytes = prep::payer_bytes(&payers);
 
         Ok(Self {
@@ -132,6 +134,7 @@ impl Scenario<ScenarioReport> for HotAccountCliff {
             let count_before_warmup = er.scrape_metrics().await?.get(TX_COUNT);
             let warm = execute_cell(
                 er_rpc_url.clone(),
+                er.ws_url().clone(),
                 ThreadRunConfig {
                     threads: profile.threads,
                     iterations: profile.warmup,
@@ -142,12 +145,7 @@ impl Scenario<ScenarioReport> for HotAccountCliff {
                 hot_set.clone(),
                 payer_bytes.clone(),
             )?;
-            ensure!(
-                warm.failed == 0,
-                "failures={:?}; first error={:?}",
-                warm.failed,
-                warm.first_error
-            );
+            ensure!(warm.failed == 0);
             offset += profile.warmup;
             if let Some(seen) = count_before_warmup {
                 crate::await_executed(&er, seen + profile.warmup as f64, DRAIN_TIMEOUT).await?;
@@ -156,6 +154,7 @@ impl Scenario<ScenarioReport> for HotAccountCliff {
             let before = er.scrape_metrics().await?;
             let outcome = execute_cell(
                 er_rpc_url.clone(),
+                er.ws_url().clone(),
                 ThreadRunConfig {
                     threads: profile.threads,
                     iterations: profile.iterations,
@@ -167,12 +166,7 @@ impl Scenario<ScenarioReport> for HotAccountCliff {
                 payer_bytes.clone(),
             )?;
             offset += profile.iterations;
-            ensure!(
-                outcome.failed == 0,
-                "failures={:?}; first error={:?}",
-                outcome.failed,
-                outcome.first_error
-            );
+            ensure!(outcome.failed == 0);
             if let Some(seen) = before.get(TX_COUNT) {
                 crate::await_executed(&er, seen + profile.iterations as f64, DRAIN_TIMEOUT).await?;
             }

@@ -5,13 +5,14 @@ use instruction::Instruction;
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
+    api::transaction_meta,
     check,
     dlp::{self, delegate_with_actions, DelegateArgs},
     netfault::{BaseProxies, Selector},
     programs::{SettlementMode, REDLINE},
     receipt, system,
     topology::{self, ErOptions, PrivateEr},
-    BaseCtx, ChainCtx, DynError, ErCtx, PrivateErScenario, Result,
+    BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result,
 };
 use sdk::spl::builders::UndelegateEphemeralAtaBuilder;
 use signature::Signature;
@@ -30,7 +31,6 @@ const SUPPLY: u64 = 415;
 const ACTION_AMOUNT: u64 = 100;
 const FAILING_AMOUNT: u64 = 1_000_000;
 const TIMEOUT: Duration = Duration::from_secs(60);
-const RECEIPT_TIMEOUT: Duration = Duration::from_secs(120);
 
 struct Wallet {
     owner: Keypair,
@@ -109,15 +109,13 @@ impl Balances {
         let claims = active_claims + self.eatas[3].unwrap_or(0) + self.vault[1];
         ensure!(self.vault[0] == claims);
         let physical = self.base_atas.iter().sum::<u64>() + self.vault[0] + extra_base;
-        let _: () = ensure!(physical == supply);
+        ensure!(physical == supply);
         Ok(())
     }
 }
 
 async fn amount(ctx: &impl ChainCtx, address: &Pubkey) -> Result<u64> {
-    spl::token_balance(ctx, address)
-        .await?
-        .with_context(|| format!("token balance missing at {address}"))
+    spl::token_balance(ctx, address).await?.context("token balance missing")
 }
 
 async fn balances(
@@ -139,14 +137,19 @@ async fn balances(
 }
 
 async fn await_projection(er: &ErCtx, wallets: &[Wallet; 4], expected: &[u64; 4]) -> Result<()> {
-    check::poll_for("projected balances converge", TIMEOUT, || async {
-        for (wallet, expected) in wallets.iter().zip(expected) {
-            let actual = amount(er, &wallet.ata).await?;
-            ensure!(actual == *expected);
-        }
-        Ok::<_, DynError>(())
-    })
-    .await
+    er.api()
+        .await_accounts(
+            &wallets.iter().map(|wallet| wallet.ata).collect::<Vec<_>>(),
+            "projected balances converge",
+            async || {
+                for (wallet, expected) in wallets.iter().zip(expected) {
+                    let actual = amount(er, &wallet.ata).await?;
+                    ensure!(actual == *expected);
+                }
+                Ok(())
+            },
+        )
+        .await
 }
 
 async fn check_controls(er: &ErCtx, wallets: &[Wallet; 4], amount: u64) -> Result<()> {
@@ -158,18 +161,14 @@ async fn check_controls(er: &ErCtx, wallets: &[Wallet; 4], amount: u64) -> Resul
             let error =
                 check::expect_error(attempt, &format!("unauthorized transfer {from}->{to}"))?;
             let error = format!("{error:#}");
-            ensure!(
-                [
-                    "InvalidWritableAccount",
-                    "ExternalAccountDataModified",
-                    "ReadonlyDataModified",
-                    "Immutable",
-                ]
-                .iter()
-                .any(|code| error.contains(code)),
-                "{} transfer {from}->{to}: authorization rejection; actual={error:#}",
-                NAMES[control]
-            );
+            ensure!([
+                "InvalidWritableAccount",
+                "ExternalAccountDataModified",
+                "ReadonlyDataModified",
+                "Immutable",
+            ]
+            .iter()
+            .any(|code| error.contains(code)));
             ensure!(er.accounts(&atas).await? == before);
         }
     }
@@ -183,10 +182,10 @@ async fn settled(
     expected: &[Pubkey],
     undelegate: bool,
 ) -> Result<()> {
-    let receipt = receipt::fetch_commit_receipt(er.api(), signature, RECEIPT_TIMEOUT).await?;
+    let receipt = receipt::fetch_commit_receipt(er.api(), signature).await?;
     receipt.check_success("projected-token commit")?;
     receipt.check_accounts(expected, undelegate)?;
-    receipt.confirm(base.api(), TIMEOUT).await
+    receipt.confirm(base.api()).await
 }
 
 pub struct ProjectedTokenLifecycle {
@@ -243,7 +242,7 @@ impl PrivateErScenario for ProjectedTokenLifecycle {
         };
         let owner_is = async |address: &Pubkey, owner| -> Result<()> {
             let actual = base.account(address).await?.map(|a| a.owner);
-            let _: () = ensure!(actual == Some(owner));
+            ensure!(actual == Some(owner));
             Ok(())
         };
         let delegate = async |payer: &Keypair, wallet: &Wallet, validator| -> Result<()> {
@@ -314,12 +313,14 @@ impl PrivateErScenario for ProjectedTokenLifecycle {
             base.submit_and_confirm(&wallets[3].owner, &[wallets[3].deposit(40)]).await?;
             delegate(&payer, &wallets[3], foreign_validator).await?;
             for control in [2, 3] {
-                let first = check::poll_for(
-                    &format!("the er clones the {} ATA", NAMES[control]),
-                    TIMEOUT,
-                    || amount(er, &wallets[control].ata),
-                )
-                .await?;
+                let first = er
+                    .api()
+                    .await_accounts(
+                        &[wallets[control].ata],
+                        &format!("the er clones the {} ATA", NAMES[control]),
+                        || amount(er, &wallets[control].ata),
+                    )
+                    .await?;
                 ensure!(first == expected.projected[control]);
             }
             await_projection(er, &wallets, &expected.projected).await?;
@@ -369,18 +370,20 @@ impl PrivateErScenario for ProjectedTokenLifecycle {
         // undelegation (ownership returns to system on base).
         crate::phase("failing post-delegation action", async {
             let failing = delegate_with_transfer(FAILING_AMOUNT).await?;
-            check::poll(
-                "the failing action returns base ownership to the system \
+            base.api()
+                .await_accounts(
+                    &[failing],
+                    "the failing action returns base ownership to the system \
                  program",
-                TIMEOUT,
-                || async {
-                    matches!(
-                        base.account(&failing).await,
-                        Ok(Some(account)) if account.owner == system::system_id()
-                    )
-                },
-            )
-            .await?;
+                    async || {
+                        ensure!(matches!(
+                            base.account(&failing).await,
+                            Ok(Some(account)) if account.owner == system::system_id()
+                        ));
+                        Ok(())
+                    },
+                )
+                .await?;
             record(&expected, true).await
         })
         .await?;
@@ -404,12 +407,9 @@ impl PrivateErScenario for ProjectedTokenLifecycle {
                 let signature = commit(1).await?;
                 let held = submission.wait(TIMEOUT).await?;
                 let landed = held.operation.signature()?;
-                let tx = base.api().await_transaction(&landed, TIMEOUT).await?;
-                ensure!(
-                    tx.err.is_none(),
-                    "the intercepted commit executed on base: {:?}",
-                    tx.err
-                );
+                let tx = base.api().await_transaction(&landed).await?;
+                let meta = transaction_meta(&tx)?;
+                ensure!(meta.err == None);
                 expected.eatas[..2].copy_from_slice(&[Some(63), Some(237)]);
                 record(&expected, true).await?;
                 wallets[0].transfer(er, &wallets[1], 11).await?;

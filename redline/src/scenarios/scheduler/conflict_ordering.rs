@@ -2,19 +2,18 @@ use std::{
     cell::{Cell, RefCell},
     mem,
     rc::Rc,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
+    sync::Arc,
     time::{Duration, Instant},
 };
+use tokio::sync::watch;
 
 use anyhow::{anyhow, ensure, Context};
 use futures_util::future::join_all;
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    check, prep,
+    api::transaction_meta,
+    prep,
     profile::ProfileValues,
     programs::HashState,
     redline::{
@@ -29,8 +28,8 @@ use redsuite_core::{
     sampler::{MeanMax, Sampled, Sampler, Trailing},
     stats::{ObservationsStats, StreamingStats},
     transport::{clock::SendClock, ws::SignatureConfirmations},
-    BaseCtx, ChainCtx, ErClient, ErCtx, Metrics, MetricsDelta, Result, Scenario, ScenarioReport,
-    TxSender,
+    wait, BaseCtx, ChainCtx, ErClient, ErCtx, Metrics, MetricsDelta, Result, Scenario,
+    ScenarioReport, TxSender,
 };
 use signature::Signature;
 use signer::Signer;
@@ -41,10 +40,8 @@ use url::Url;
 use crate::{metrics, program::layout, ACCOUNT_SPACE};
 
 const PAYER_LAMPORTS: u64 = 200_000_000;
-const CLONE_TIMEOUT: Duration = Duration::from_secs(60);
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(600);
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(60);
-const CONFIRM_TIMEOUT: Duration = Duration::from_secs(60);
 const WARM_IN_TIMEOUT: Duration = Duration::from_secs(15);
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
 const CALIBRATION: Duration = Duration::from_secs(3);
@@ -176,7 +173,7 @@ fn spawn_load(
         let accounts = accounts.clone();
         let payer_bytes = payer_bytes.clone();
         async move {
-            let client = ErClient::new(er_rpc_url);
+            let client = ErClient::new(er_rpc_url, er_ws_url.clone());
             let (lane_limit, concurrency) = match mode {
                 LoadMode::Bounded { lanes } => (lanes, 0),
                 LoadMode::Open { concurrency } => (
@@ -196,7 +193,7 @@ fn spawn_load(
                 LoadMode::Open { .. } if concurrency == 0 => Ok(RawRunOutcome::default()),
                 LoadMode::Open { .. } => open_load(lanes, iters, concurrency, &worker).await,
                 LoadMode::Bounded { .. } => {
-                    BoundedLoad::run(&er_ws_url, lanes, iters, worker.stop_flag()).await
+                    BoundedLoad::run(&er_ws_url, lanes, iters, worker.stop_signal()).await
                 }
             }
         }
@@ -222,7 +219,7 @@ struct BoundedLoad {
     sigs: SignatureConfirmations,
     tally: RefCell<RawRunOutcome>,
     next_id: Cell<u64>,
-    stop: Arc<AtomicBool>,
+    stop: watch::Receiver<bool>,
     iters: u32,
 }
 
@@ -231,7 +228,7 @@ impl BoundedLoad {
         ws_url: &Url,
         lanes: Vec<(Pubkey, TxSender)>,
         iters: u32,
-        stop: Arc<AtomicBool>,
+        stop: watch::Receiver<bool>,
     ) -> Result<RawRunOutcome> {
         let load = Rc::new(Self {
             sigs: SignatureConfirmations::connect(ws_url, Arc::new(SendClock::new(1, 0))).await?,
@@ -262,7 +259,7 @@ impl BoundedLoad {
     }
 
     async fn run_lane(self: Rc<Self>, account: Pubkey, sender: TxSender) {
-        while !self.stop.load(Ordering::Relaxed) {
+        while !*self.stop.borrow() {
             let result = self.deliver(account, &sender).await;
             let mut tally = self.tally.borrow_mut();
             match result {
@@ -284,9 +281,7 @@ impl BoundedLoad {
         let sent = Instant::now();
         sender.submit_prepared(&tx).await?;
         self.tally.borrow_mut().delivery.push(sent.elapsed().as_micros() as u32);
-        time::timeout(CONFIRM_TIMEOUT, self.sigs.await_id(id)).await.with_context(|| {
-            format!("independent tx {id} unconfirmed after {CONFIRM_TIMEOUT:?}")
-        })??;
+        self.sigs.await_id(id).await?;
         Ok(())
     }
 }
@@ -347,11 +342,13 @@ fn is_idle(metrics: &Metrics) -> bool {
 async fn drain(er: &ErCtx, target: f64) -> Result<DrainState> {
     let started = Instant::now();
     crate::await_executed(er, target, DRAIN_TIMEOUT).await?;
-    check::poll("execution pipeline idle", SETTLE_TIMEOUT, || async {
-        er.scrape_metrics().await.is_ok_and(|metrics| is_idle(&metrics))
-    })
-    .await?;
-    let (blocked, busy, pending) = idle_values(&er.scrape_metrics().await?);
+    let (blocked, busy, pending) =
+        wait::retry("execution pipeline idle", SETTLE_TIMEOUT, async || {
+            let metrics = er.scrape_metrics().await?;
+            ensure!(is_idle(&metrics));
+            Ok(idle_values(&metrics))
+        })
+        .await?;
     Ok(DrainState {
         elapsed: started.elapsed(),
         blocked,
@@ -364,15 +361,14 @@ async fn await_load_reaching_executors(
     er: &ErCtx,
     handles: &mut Option<Workers<RawRunOutcome>>,
 ) -> Result<()> {
-    let reached = check::poll(
+    let reached = wait::retry(
         "the independent load reaches the executors",
         WARM_IN_TIMEOUT,
-        || async {
-            er.scrape_metrics()
-                .await
-                .ok()
-                .and_then(|metrics| metrics.get(BUSY_EXECUTORS))
-                .is_some_and(|busy| busy >= 1.0)
+        async || {
+            let metrics = er.scrape_metrics().await?;
+            let busy = metrics.get(BUSY_EXECUTORS).context("busy executors metric missing")?;
+            ensure!(busy >= 1.0);
+            Ok(())
         },
     )
     .await;
@@ -491,21 +487,14 @@ async fn run_phase(
 async fn first_failed_step(er: &ErCtx, steps: &[(u64, Step, Signature)]) -> Option<String> {
     for (id, step, signature) in steps {
         match er.api().get_transaction(signature).await {
-            Ok(None) => {
-                return Some(format!(
-                    "step {} id {id} ({signature}) never reached the ledger",
-                    step.label()
-                ))
-            }
+            Ok(None) => return Some(format!("step {} id {id} not published", step.label())),
             Ok(Some(info)) => {
-                if let Some(err) = info.err {
-                    return Some(format!(
-                        "step {} id {id} ({signature}) failed in slot {}: \
-                         {err}; logs: {:?}",
-                        step.label(),
-                        info.slot,
-                        info.logs
-                    ));
+                let meta = match transaction_meta(&info) {
+                    Ok(meta) => meta,
+                    Err(error) => return Some(format!("{error:#}")),
+                };
+                if let Some(err) = &meta.err {
+                    return Some(format!("step {} id {id} failed: {err}", step.label()));
                 }
             }
             Err(_) => continue,
@@ -580,11 +569,7 @@ impl Scenario<ScenarioReport> for ConflictOrdering {
 
         let probe = er.scrape_metrics().await?;
         for name in REQUIRED_METRICS {
-            ensure!(
-                probe.get(name).is_some(),
-                "the ER exposes no {name} metric — this scenario reads the \
-                 engine's sequencer and ledger gauges to prove ordering"
-            );
+            ensure!(probe.get(name).is_some());
         }
 
         let payers = base
@@ -603,7 +588,7 @@ impl Scenario<ScenarioReport> for ConflictOrdering {
         let pair_accounts = Accounts::new(ACCOUNT_SPACE, er.identity())
             .init_batched(base.as_ref(), &prep_payers, profile.pairs * 2, true)
             .await?;
-        er.await_clones(&pair_accounts, ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
+        er.await_clones(&pair_accounts, ACCOUNT_SPACE as usize).await?;
         let independent = Accounts::new(ACCOUNT_SPACE, er.identity())
             .init_batched(
                 base.as_ref(),
@@ -612,9 +597,9 @@ impl Scenario<ScenarioReport> for ConflictOrdering {
                 true,
             )
             .await?;
-        er.await_clones(&independent, ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
+        er.await_clones(&independent, ACCOUNT_SPACE as usize).await?;
         let payer_keys: Vec<Pubkey> = payers.iter().map(Signer::pubkey).collect();
-        er.await_cloned_payers(&payer_keys, CLONE_TIMEOUT).await?;
+        er.await_cloned_payers(&payer_keys).await?;
 
         let pairs: Vec<Pair> = pair_accounts
             .chunks_exact(2)
@@ -670,19 +655,9 @@ impl Scenario<ScenarioReport> for ConflictOrdering {
             None => return Err(anyhow!("calibration load already joined")),
         };
         let calibration_samples = sampler.finish_complete("scheduler").await?;
-        ensure!(
-            calibration.failed == 0,
-            "failures={:?}; first error={:?}",
-            calibration.failed,
-            calibration.first_error
-        );
+        ensure!(calibration.failed == 0);
         let executors = calibration_samples.value.busy.max;
-        ensure!(
-            executors >= MIN_EXECUTORS,
-            "saturating open-loop high-cu load kept at most {executors:.0} \
-             executor busy — this scenario needs at least {MIN_EXECUTORS:.0} \
-             (the engine sizes its pool from the host's cpus)"
-        );
+        ensure!(executors >= MIN_EXECUTORS);
         let contention_lanes = (executors as usize * LANES_PER_EXECUTOR)
             .min(profile.independent_accounts)
             .max(1);
@@ -707,12 +682,7 @@ impl Scenario<ScenarioReport> for ConflictOrdering {
         let mut batches: Vec<BatchOutcome> = Vec::with_capacity(profile.batches);
         for batch in 0..profile.batches {
             let before = er.scrape_metrics().await?;
-            ensure!(
-                is_idle(&before),
-                "batch {batch} must start on an idle pipeline, observed \
-                 (blocked, busy, pending) = {:?}",
-                idle_values(&before)
-            );
+            ensure!(is_idle(&before));
             let txs_before = before.get(TX_COUNT).unwrap_or_default();
 
             let mut phases = Vec::with_capacity(modes.len());
@@ -735,12 +705,7 @@ impl Scenario<ScenarioReport> for ConflictOrdering {
                     plan,
                 )
                 .await?;
-                ensure!(
-                    phase.load.failed == 0,
-                    "failures={:?}; first error={:?}",
-                    phase.load.failed,
-                    phase.load.first_error
-                );
+                ensure!(phase.load.failed == 0);
                 debug!(
                     batch,
                     phase.label, phase.chain_txs, "contention phase finished",
@@ -772,29 +737,9 @@ impl Scenario<ScenarioReport> for ConflictOrdering {
 
             for phase in &outcome.phases {
                 let samples = &phase.samples.value;
-                ensure!(
-                    samples.busy.max >= MIN_EXECUTORS,
-                    "batch {batch} {}: at most {:.0} executor was busy at \
-                     once — independent work did not spread across executors",
-                    phase.label,
-                    samples.busy.max
-                );
-                ensure!(
-                    samples.busy.mean() > 1.0,
-                    "batch {batch} {}: busy executors averaged {:.2} — \
-                     independent work ran effectively serially",
-                    phase.label,
-                    samples.busy.mean()
-                );
-                ensure!(
-                    samples.max_stall <= STALL_BOUND,
-                    "batch {batch} {}: the engine transaction count stood \
-                     still for {:.1} s under load, longer than the {:.0} s \
-                     progress bound",
-                    phase.label,
-                    samples.max_stall.as_secs_f64(),
-                    STALL_BOUND.as_secs_f64()
-                );
+                ensure!(samples.busy.max >= MIN_EXECUTORS);
+                ensure!(samples.busy.mean() > 1.0);
+                ensure!(samples.max_stall <= STALL_BOUND);
             }
             for (_label, value) in [
                 ("blocked", outcome.drained.blocked),
@@ -803,12 +748,7 @@ impl Scenario<ScenarioReport> for ConflictOrdering {
             ] {
                 ensure!(value == 0.0);
             }
-            ensure!(
-                engine_txs >= workload as f64,
-                "batch {batch}: the engine executed {engine_txs:.0} \
-                 transactions, fewer than the {workload} the workload \
-                 delivered"
-            );
+            ensure!(engine_txs >= workload as f64);
             if let Some(dropped) = outcome.dropped {
                 ensure!(dropped == 0.0);
             }
@@ -816,13 +756,7 @@ impl Scenario<ScenarioReport> for ConflictOrdering {
                 ensure!(execution_failed == 0.0);
             }
             let contention_chains = outcome.phases[0].chains * profile.pairs as u64;
-            ensure!(
-                dependencies >= contention_chains as f64,
-                "batch {batch}: the engine registered {dependencies:.0} \
-                 ordering dependencies, fewer than one per contention-phase \
-                 chain ({contention_chains}) — the chain steps never met an \
-                 unfinished predecessor, so executor timing was not exercised"
-            );
+            ensure!(dependencies >= contention_chains as f64);
             verify_pairs(&er, &mut pairs, batch).await?;
             debug!(
                 batch,

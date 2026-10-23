@@ -1,4 +1,5 @@
 use std::{cell::Cell, fs, rc::Rc, slice, time::Duration};
+use tokio::sync::Notify;
 
 use account::Account;
 use anyhow::{anyhow, ensure, Context};
@@ -6,14 +7,14 @@ use futures_util::future::{try_join, try_join_all};
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    api::{custom_error_code, TransactionInfo},
+    api::{custom_error_code, transaction_logs, transaction_meta},
     catalog::Fixture,
-    check,
     netfault::{BaseProxies, Selector},
     programs::UpgradeProbe,
     redline::Accounts,
     topology::{self, ErOptions, PrivateEr},
-    BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result, TxSender,
+    transaction_types::EncodedConfirmedTransactionWithStatusMeta as TransactionInfo,
+    wait, BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result, TxSender,
 };
 use signer::Signer;
 use solana_loader_v3_interface::{
@@ -84,7 +85,7 @@ impl PrivateErScenario for ProgramUpgrade {
         let size = a.len().max(b.len());
         a.resize(size, 0);
         b.resize(size, 0);
-        ensure!(a != b, "fixture versions differ");
+        ensure!(a != b);
         let funder = base.funded_payer(10_000_000_000).await?;
         let authority = funder.pubkey();
         let (a_buffer, b_buffer) =
@@ -109,7 +110,7 @@ impl PrivateErScenario for ProgramUpgrade {
         let options = |label: &str| ErOptions {
             label: label.into(),
             base_endpoints: Some(proxies.endpoints()),
-            request_timeout: Some(TIMEOUT),
+
             ..ErOptions::default()
         };
         let (hot, cold) = try_join(
@@ -148,10 +149,7 @@ impl PrivateErScenario for ProgramUpgrade {
             .into_iter()
             .collect::<Option<Vec<_>>>()
             .context("state account missing")?;
-        ensure!(
-            local_program(self.cold.ctx(), self.program_id).await?.is_none(),
-            "cold program absent"
-        );
+        ensure!(local_program(self.cold.ctx(), self.program_id).await?.is_none());
         let progress = Progress::default();
         let traffic = Invocations {
             er,
@@ -178,13 +176,14 @@ impl PrivateErScenario for ProgramUpgrade {
 struct Progress {
     phase: Cell<usize>,
     counts: Cell<[usize; 4]>,
+    changed: Notify,
     done: Cell<bool>,
 }
 
 impl Progress {
     async fn await_count(&self, phase: usize, count: usize) -> Result<()> {
-        check::poll("invocations progress", TIMEOUT, || async {
-            self.counts.get()[phase] >= count
+        wait::on_change(&self.changed, TIMEOUT, "invocations progress", || {
+            Ok((self.counts.get()[phase] >= count).then_some(()))
         })
         .await
     }
@@ -233,19 +232,17 @@ impl Invocations<'_> {
         match self.er.api().try_send_transaction(&tx).await? {
             Err(rpc) => {
                 ensure!(
-                    rpc.code == -32003
+                    rpc.error.code.code() == -32003
                         && if injecting {
-                            rpc.message.contains(FETCH_FAILURE)
+                            rpc.error.message.contains(FETCH_FAILURE)
                         } else {
                             matches!(current, 1 | 2)
-                        },
-                    "{}: loading failure: {rpc}",
-                    PHASES[current]
+                        }
                 );
             }
             Ok(_) => {
-                ensure!(!injecting, "injected cold fetch must fail");
-                let outcome = self.er.api().await_transaction(&signature, TIMEOUT).await?;
+                ensure!(!injecting);
+                let outcome = self.er.api().await_transaction(&signature).await?;
                 self.verify(&outcome, id, current)?;
             }
         };
@@ -260,12 +257,13 @@ impl Invocations<'_> {
         let mut counts = self.progress.counts.get();
         counts[current] += 1;
         self.progress.counts.set(counts);
+        self.progress.changed.notify_waiters();
         Ok(())
     }
 
     fn verify(&mut self, outcome: &TransactionInfo, id: u64, current: usize) -> Result<()> {
-        let versions: Vec<_> = outcome
-            .logs
+        let outcome = transaction_meta(outcome)?;
+        let versions: Vec<_> = transaction_logs(outcome)
             .iter()
             .map(String::as_str)
             .filter(|log| log.starts_with("Program log: Upgrade: "))
@@ -274,29 +272,20 @@ impl Invocations<'_> {
             ["Program log: Upgrade: 1"] => 1,
             ["Program log: Upgrade: 2"] => 2,
             [] => {
-                ensure!(
-                    outcome.err.is_some() && matches!(current, 1 | 2),
-                    "{}: missing upgrade version; error={:?}",
-                    PHASES[current],
-                    outcome.err
-                );
+                ensure!(outcome.err.is_some() && matches!(current, 1 | 2));
                 return Ok(());
             }
             _ => return Err(anyhow!("upgrade version markers: {versions:?}")),
         };
-        ensure!(
-            matches!((current, version), (0, 1) | (1 | 2, 1 | 2) | (3, 2)),
-            "{}: unexpected program version {version}",
-            PHASES[current]
-        );
+        ensure!(matches!(
+            (current, version),
+            (0, 1) | (1 | 2, 1 | 2) | (3, 2)
+        ));
         if let Some(error) = &outcome.err {
-            ensure!(
-                id.is_multiple_of(4),
-                "unexpected execution failure: {error:#}"
-            );
-            ensure!(custom_error_code(error) == Some(UpgradeProbe::FAILURE_CODE));
+            ensure!(id.is_multiple_of(4));
+            ensure!(custom_error_code(error.clone()) == Some(UpgradeProbe::FAILURE_CODE));
         } else {
-            ensure!(!id.is_multiple_of(4), "failure probe rejected");
+            ensure!(!id.is_multiple_of(4));
             let value = id * 10 + version;
             for (account, value) in self.expected.iter_mut().zip([value, !value]) {
                 account.data[layout::DATA_OFFSET..].copy_from_slice(&value.to_le_bytes());
@@ -308,12 +297,9 @@ impl Invocations<'_> {
 
 impl ProgramUpgrade {
     async fn materialized(&self, er: &ErCtx, bytes: &[u8]) -> Result<()> {
-        ensure!(
-            local_program(er, self.program_id)
-                .await?
-                .is_some_and(|account| account.executable && account.data == bytes),
-            "materialized program bytes"
-        );
+        ensure!(local_program(er, self.program_id)
+            .await?
+            .is_some_and(|account| account.executable && account.data == bytes));
         Ok(())
     }
 
@@ -349,10 +335,7 @@ impl ProgramUpgrade {
             .context("missing upgraded programdata")?
             .data;
         let offset = UpgradeableLoaderState::size_of_programdata_metadata();
-        ensure!(
-            data.get(offset..) == Some(self.b.as_slice()),
-            "base installed B bytes"
-        );
+        ensure!(data.get(offset..) == Some(self.b.as_slice()));
         self.proxies
             .await_held(
                 Selector::default().notification().account(&self.programdata),
@@ -378,18 +361,18 @@ impl ProgramUpgrade {
             },
         )
         .await?;
-        ensure!(
-            clones.iter().all(|a| {
-                a.as_ref().is_some_and(|a| {
-                    a.executable && a.owner == sdk_ids::loader_v4::ID && a.data == self.b
-                })
-            }),
-            "cold clones contain B"
-        );
-        check::poll_for("fresh B materialization", TIMEOUT, || {
-            self.materialized(er, &self.b)
-        })
-        .await?;
+        ensure!(clones.iter().all(|a| {
+            a.as_ref().is_some_and(|a| {
+                a.executable && a.owner == sdk_ids::loader_v4::ID && a.data == self.b
+            })
+        }));
+        er.api()
+            .await_accounts(
+                &[self.program_id, self.programdata],
+                "fresh B materialization",
+                || self.materialized(er, &self.b),
+            )
+            .await?;
         progress.phase.set(3);
         progress.await_count(3, 12).await?;
         progress.done.set(true);

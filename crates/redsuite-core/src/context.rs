@@ -7,19 +7,19 @@ use std::{
 };
 
 use account::Account;
-use anyhow::Context;
+use anyhow::{ensure, Context};
 use hash::Hash;
 use instruction::Instruction;
 use keypair::Keypair;
 use pubkey::Pubkey;
 use signature::Signature;
 use signer::Signer;
-use tokio::sync::Mutex;
+use tokio::{sync::Mutex, time};
 use transaction::Transaction;
 use url::Url;
 
 use crate::{
-    api::{Api, ConfirmOptions, Metrics, MetricsCollector},
+    api::{Api, Metrics, MetricsCollector},
     cells,
     netfault::BaseProxies,
     profile::ExecutionConfig,
@@ -27,11 +27,10 @@ use crate::{
     resources::Resources,
     runner::{Delivery, SendTransaction},
     topology::{PrivateEr, RestartConfig, RestartTiming},
-    DynError, Result,
+    transport::NETWORK_TIMEOUT,
+    wait, Result,
 };
 
-const AIRDROP_TIMEOUT: Duration = Duration::from_secs(60);
-const AIRDROP_POLL: Duration = Duration::from_millis(200);
 // The ER produces 50ms blocks, so its blockhash window is much shorter than
 // the base chain's.
 const BASE_BLOCKHASH_TTL: Duration = Duration::from_secs(20);
@@ -59,6 +58,13 @@ pub trait ChainCtx: Sized {
         cosigners: &[&Keypair],
         ixs: &[Instruction],
     ) -> impl Future<Output = Result<Signature>>;
+    fn await_account(
+        &self,
+        address: &Pubkey,
+        ready: impl Fn(&Account) -> Result<()>,
+    ) -> impl Future<Output = Result<Account>> {
+        self.api().await_account(address, ready)
+    }
     fn account(&self, pk: &Pubkey) -> impl Future<Output = Result<Option<Account>>> {
         self.api().get_account(pk)
     }
@@ -104,9 +110,7 @@ async fn submit_and_confirm(
     let mut signers = vec![payer];
     signers.extend_from_slice(cosigners);
     let tx = Transaction::new_signed_with_payer(ixs, Some(&payer.pubkey()), &signers, hash);
-    let sig = api.send_transaction(&tx).await?;
-    api.confirm(&sig, ConfirmOptions::default()).await?;
-    Ok(sig)
+    api.send_and_confirm(&tx).await
 }
 
 #[derive(Clone)]
@@ -164,9 +168,8 @@ impl TxSender {
     }
 
     pub async fn submit_and_confirm(&self, ixs: &[Instruction]) -> Result<Signature> {
-        let sig = self.submit(ixs).await?;
-        self.api.confirm(&sig, ConfirmOptions::default()).await?;
-        Ok(sig)
+        let transaction = self.prepare(ixs).await?;
+        self.api.send_and_confirm(&transaction).await
     }
 }
 
@@ -176,9 +179,9 @@ pub struct ErClient {
 }
 
 impl ErClient {
-    pub fn new(rpc_url: Url) -> Self {
+    pub fn new(rpc_url: Url, ws_url: Url) -> Self {
         Self {
-            api: Api::new(rpc_url),
+            api: Api::new(rpc_url, ws_url),
             blockhash: Rc::new(BlockhashCache::new(ER_BLOCKHASH_TTL)),
         }
     }
@@ -199,7 +202,6 @@ impl ErClient {
 pub struct BaseCtx {
     pub(crate) scenario: Option<String>,
     api: Api,
-    ws_url: Url,
     grpc: Option<(Url, String)>,
     blockhash: Rc<BlockhashCache>,
     resources: Rc<Resources>,
@@ -218,8 +220,7 @@ impl BaseCtx {
     ) -> Self {
         Self {
             scenario: None,
-            api: Api::new(rpc_url),
-            ws_url,
+            api: Api::new(rpc_url, ws_url),
             grpc,
             blockhash: Rc::new(BlockhashCache::new(BASE_BLOCKHASH_TTL)),
             resources: Rc::new(Resources::default()),
@@ -251,7 +252,7 @@ impl BaseCtx {
     }
 
     pub fn ws_url(&self) -> &Url {
-        &self.ws_url
+        self.api.ws_url()
     }
 
     pub fn sender(&self, payer: Rc<Keypair>) -> TxSender {
@@ -266,7 +267,6 @@ impl BaseCtx {
 #[derive(Clone)]
 pub struct ErCtx {
     api: Api,
-    ws_url: Url,
     metrics: MetricsCollector,
     identity: Pubkey,
     blockhash: Rc<BlockhashCache>,
@@ -294,16 +294,10 @@ impl ErCtx {
         ws_url: Url,
         metrics_url: Url,
         identity: Pubkey,
-        request_timeout: Option<Duration>,
         pid: u32,
     ) -> Self {
-        let api = match request_timeout {
-            Some(timeout) => Api::with_timeout(rpc_url, timeout),
-            None => Api::new(rpc_url),
-        };
         Self {
-            api,
-            ws_url,
+            api: Api::new(rpc_url, ws_url),
             metrics: MetricsCollector::new(metrics_url),
             identity,
             blockhash: Rc::new(BlockhashCache::new(ER_BLOCKHASH_TTL)),
@@ -333,7 +327,7 @@ impl ErCtx {
     }
 
     pub fn ws_url(&self) -> &Url {
-        &self.ws_url
+        self.api.ws_url()
     }
 
     pub fn sender(&self, payer: Rc<Keypair>) -> TxSender {
@@ -362,21 +356,23 @@ impl ErCtx {
 }
 
 async fn airdrop_and_confirm(api: &Api, pk: &Pubkey, lamports: u64) -> Result<()> {
-    let before = api.get_balance(pk).await.unwrap_or(0);
-    let mut requested = false;
-    crate::check::poll_until(AIRDROP_TIMEOUT, AIRDROP_POLL, async || {
-        if !requested {
-            // The faucet can lag the RPC service right after boot — retry
-            // the request itself, not just the balance poll.
-            requested = api.request_airdrop(pk, lamports).await.is_ok();
-        }
-        Ok::<_, DynError>(
-            (requested && api.get_balance(pk).await.unwrap_or(0) >= before + lamports)
-                .then_some(()),
-        )
+    time::timeout(NETWORK_TIMEOUT, async {
+        let before = api.get_balance(pk).await.unwrap_or(0);
+        let signature = wait::retry("airdrop accepted", NETWORK_TIMEOUT, async || {
+            api.request_airdrop(pk, lamports).await
+        })
+        .await?;
+        let signature = signature.parse()?;
+        api.confirm(&signature).await?;
+        api.await_account(pk, |account| {
+            ensure!(account.lamports >= before + lamports);
+            Ok(())
+        })
+        .await?;
+        Ok(())
     })
-    .await?
-    .with_context(|| format!("airdrop of {lamports} lamports to {pk} not confirmed"))
+    .await
+    .context("airdrop not confirmed")?
 }
 
 impl ChainCtx for BaseCtx {

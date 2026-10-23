@@ -13,6 +13,7 @@ use redsuite_core::{
     runner::{execute, Pacing, RunConfig, RunOutcome},
     topology,
     topology::ErOptions,
+    transport::NETWORK_TIMEOUT,
     BaseCtx, ChainCtx, ErCtx, Metrics, MetricsDelta, Result, Scenario, ScenarioReport,
 };
 use tokio::time;
@@ -20,9 +21,6 @@ use tracing::{debug, warn};
 
 const ACCOUNT_SPACE: u32 = 2048;
 const PREP_PAYER_LAMPORTS: u64 = 4_000_000_000;
-
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-const CLONE_TIMEOUT: Duration = Duration::from_secs(15);
 
 const MONITORED_GAUGE: &str = "engine_keeper_account_cache_entries";
 const EVICTED_COUNTER: &str = "engine_keeper_account_cache_evictions";
@@ -108,7 +106,6 @@ struct Cell {
 
 struct CellOutcome {
     name: String,
-    cap: usize,
     outcome: RunOutcome,
     evictions: f64,
     eviction_rate: f64,
@@ -159,14 +156,14 @@ impl Scenario<ScenarioReport> for CloneLruChurn {
                         params.engine.accountsdb.lru_capacity = cell.cap;
                         params.chainlink.resubscription_delay = RESUBSCRIBE;
                     }),
-                    request_timeout: Some(REQUEST_TIMEOUT),
+
                     ..Default::default()
                 },
             )
             .await?;
             let cell_er = private.ctx();
             if cell.closure {
-                cell_er.prewarm(&pool, ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
+                cell_er.prewarm(&pool, ACCOUNT_SPACE as usize).await?;
             } else {
                 cell_er.touch(&pool).await;
             }
@@ -188,12 +185,7 @@ impl Scenario<ScenarioReport> for CloneLruChurn {
                 request,
             )
             .await?;
-            ensure!(
-                warmup.failed == 0,
-                "failures={:?}; first error={:?}",
-                warmup.failed,
-                warmup.first_error
-            );
+            ensure!(warmup.failed == 0);
 
             let before = cell_er.scrape_metrics().await?;
             let offset = profile.warmup;
@@ -212,7 +204,6 @@ impl Scenario<ScenarioReport> for CloneLruChurn {
             let evictions = delta.counter(EVICTED_COUNTER).unwrap_or(0.0);
             let cell_outcome = CellOutcome {
                 name: cell.name.clone(),
-                cap: cell.cap,
                 evictions,
                 eviction_rate: evictions / outcome.wall.as_secs_f64(),
                 fetches_found: delta.counter_all(FETCHES_FOUND_COUNTER),
@@ -237,7 +228,7 @@ impl Scenario<ScenarioReport> for CloneLruChurn {
                 .setting("measured reads", profile.iterations)
                 .setting("offered rate /s", profile.rate)
                 .setting("concurrency", profile.concurrency)
-                .setting("request timeout s", REQUEST_TIMEOUT.as_secs())
+                .setting("request timeout s", NETWORK_TIMEOUT.as_secs())
                 .observe(
                     "read latency us",
                     Unit::Micros,
@@ -282,24 +273,12 @@ impl Scenario<ScenarioReport> for CloneLruChurn {
         }
 
         let closure = &cells[0];
-        ensure!(
-            closure.outcome.failed == 0,
-            "failures={:?}; first error={:?}",
-            closure.outcome.failed,
-            closure.outcome.first_error
-        );
+        ensure!(closure.outcome.failed == 0);
         // The engine's account cache is a per-bucket sampled LRU (scc
         // HashCache), so a handful of early evictions below capacity are
         // normal; only systematic eviction under the cap marks a broken knob.
         let closure_tolerance = (profile.working_set as f64) * 0.05;
-        ensure!(
-            closure.evictions <= closure_tolerance,
-            "INVALID: closure cell (cap {} ≥ working set {}) evicted {} \
-             accounts — the cap knob or the harness is broken",
-            closure.cap,
-            profile.working_set,
-            closure.evictions
-        );
+        ensure!(closure.evictions <= closure_tolerance);
         if closure.outcome.delivery.median >= 1_000_000 {
             warn!(
                 closure.outcome.delivery.median,
@@ -308,30 +287,12 @@ impl Scenario<ScenarioReport> for CloneLruChurn {
         }
 
         for churn_cell in &cells[1..] {
-            ensure!(
-                churn_cell.outcome.delivered > 0,
-                "INVALID: {} delivered nothing",
-                churn_cell.name
-            );
-            ensure!(
-                churn_cell.evictions > 0.0,
-                "{}: no evictions with cap {} < working set {} — \
-                 churn did not engage",
-                churn_cell.name,
-                churn_cell.cap,
-                profile.working_set
-            );
+            ensure!(churn_cell.outcome.delivered > 0);
+            ensure!(churn_cell.evictions > 0.0);
             if let Some(fetches_found) = churn_cell.fetches_found {
                 let deviation = (fetches_found - churn_cell.evictions).abs();
                 let tolerance = (churn_cell.evictions * 0.15).max(profile.concurrency as f64);
-                ensure!(
-                    deviation <= tolerance,
-                    "{}: {} refetches vs {} evictions — evict/reload left \
-                     lockstep",
-                    churn_cell.name,
-                    fetches_found,
-                    churn_cell.evictions
-                );
+                ensure!(deviation <= tolerance);
             }
         }
 

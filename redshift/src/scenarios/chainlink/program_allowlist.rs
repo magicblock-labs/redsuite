@@ -9,7 +9,6 @@ use redsuite_core::{
 };
 use tokio::time;
 
-const CLONE_TIMEOUT: Duration = Duration::from_secs(20);
 const BLOCKED_SETTLE: Duration = Duration::from_secs(2);
 
 /// An allowlisted program clones while an existing unlisted program stays absent.
@@ -19,12 +18,10 @@ pub struct ProgramAllowlist {
 
 impl PrivateErScenario for ProgramAllowlist {
     async fn setup(base: Rc<BaseCtx>, _: ()) -> Result<Self> {
-        ensure!(
-            base.account(&topology::COMMITTOR_ID)
-                .await?
-                .is_some_and(|program| program.executable),
-            "unlisted program exists on base"
-        );
+        ensure!(base
+            .account(&topology::COMMITTOR_ID)
+            .await?
+            .is_some_and(|program| program.executable));
         let private = topology::private_er(
             &base,
             ErOptions {
@@ -42,16 +39,10 @@ impl PrivateErScenario for ProgramAllowlist {
 
     async fn run(self) -> Result<()> {
         let er = self.private.ctx();
-        er.await_program_clone(&redshift_interface::ID, CLONE_TIMEOUT).await?;
-        ensure!(
-            er.account(&topology::COMMITTOR_ID).await?.is_none(),
-            "unlisted program initially absent on ER"
-        );
+        er.await_program_clone(&redshift_interface::ID).await?;
+        ensure!(er.account(&topology::COMMITTOR_ID).await?.is_none());
         time::sleep(BLOCKED_SETTLE).await;
-        ensure!(
-            er.account(&topology::COMMITTOR_ID).await?.is_none(),
-            "unlisted program remains absent on ER"
-        );
+        ensure!(er.account(&topology::COMMITTOR_ID).await?.is_none());
         self.private.finish().await
     }
 }

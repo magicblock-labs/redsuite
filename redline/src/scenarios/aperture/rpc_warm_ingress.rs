@@ -1,4 +1,4 @@
-use std::{rc::Rc, sync::Arc, time::Duration};
+use std::{rc::Rc, sync::Arc};
 
 use anyhow::{ensure, Context};
 use pubkey::Pubkey;
@@ -8,20 +8,18 @@ use redsuite_core::{
     redline::Accounts,
     report::Unit,
     runner::{execute, execute_and_sync, Pacing, RunConfig},
+    transport::NETWORK_TIMEOUT,
     transport::{
         clock::SendClock,
         ws::{AccountUpdates, SignatureConfirmations},
     },
     BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport, TxSender,
 };
-use tokio::time;
 use tracing::warn;
 
 use crate::{metrics, ACCOUNT_SPACE};
 
 const PAYER_LAMPORTS: u64 = 2_000_000_000;
-
-const CONFIRM_TIMEOUT: Duration = Duration::from_secs(20);
 
 struct Profile {
     name: &'static str,
@@ -70,7 +68,7 @@ impl Scenario<ScenarioReport> for WarmIngress {
         let pdas = Accounts::new(ACCOUNT_SPACE, er.identity())
             .init_delegated(base.as_ref(), &payers[0], profile.accounts)
             .await?;
-        er.await_clones(&pdas, ACCOUNT_SPACE as usize, Duration::from_secs(15)).await?;
+        er.await_clones(&pdas, ACCOUNT_SPACE as usize).await?;
 
         let senders: Vec<TxSender> =
             payers.into_iter().map(|payer| er.sender(Rc::new(payer))).collect();
@@ -93,12 +91,7 @@ impl Scenario<ScenarioReport> for WarmIngress {
             },
         )
         .await?;
-        ensure!(
-            warmup.failed == 0,
-            "failures={:?}; first error={:?}",
-            warmup.failed,
-            warmup.first_error
-        );
+        ensure!(warmup.failed == 0);
 
         let offset = profile.warmup;
         let clock = Arc::new(SendClock::new(offset + 1, profile.iterations as usize));
@@ -108,7 +101,7 @@ impl Scenario<ScenarioReport> for WarmIngress {
         for pda in &pdas {
             updates.account_subscribe(pda).await?;
         }
-        updates.await_subscribed(pdas.len(), Duration::from_secs(5)).await?;
+        updates.await_subscribed(pdas.len()).await?;
         let sigs = Rc::new(SignatureConfirmations::connect(er.ws_url(), clock.clone()).await?);
 
         // warmup discarded and setup complete — open the measured window
@@ -134,14 +127,8 @@ impl Scenario<ScenarioReport> for WarmIngress {
             let sigs = sigs.clone();
             let updates = updates.clone();
             async move {
-                time::timeout(CONFIRM_TIMEOUT, async move {
-                    sigs.await_id(id).await?;
-                    updates.await_id(id).await
-                })
-                .await
-                .with_context(|| {
-                    format!("confirmations for id {id} not within {CONFIRM_TIMEOUT:?}")
-                })?
+                sigs.await_id(id).await?;
+                updates.await_id(id).await
             }
         };
         let cfg = RunConfig {
@@ -158,16 +145,11 @@ impl Scenario<ScenarioReport> for WarmIngress {
         } else {
             execute(cfg, request).await?
         };
-        ensure!(
-            outcome.failed == 0,
-            "failures={:?}; first error={:?}",
-            outcome.failed,
-            outcome.first_error
-        );
+        ensure!(outcome.failed == 0);
 
         // open loop drains here; a closed loop has already settled per id
-        sigs.await_all(CONFIRM_TIMEOUT).await?;
-        updates.await_settled(CONFIRM_TIMEOUT).await?;
+        sigs.await_all().await?;
+        updates.await_settled().await?;
         // window closes only once the fan-out settled — the after scrape
         // must cover everything the measured load caused
         let after = er.scrape_metrics().await?;
@@ -190,12 +172,7 @@ impl Scenario<ScenarioReport> for WarmIngress {
             (update_outcome.observed + update_outcome.superseded) == (profile.iterations as usize)
         );
         let sig_outcome = sigs.finalize();
-        ensure!(
-            sig_outcome.failed == 0,
-            "failures={:?}; first error={:?}",
-            sig_outcome.failed,
-            sig_outcome.first_failure
-        );
+        ensure!(sig_outcome.failed == 0);
         ensure!(sig_outcome.unconfirmed == 0);
         ensure!(sig_outcome.confirmed == (profile.iterations as usize));
 
@@ -214,7 +191,7 @@ impl Scenario<ScenarioReport> for WarmIngress {
             .setting("profile", profile.name)
             .setting("shape", "read-write 3/tx (1 src + 2 dst data-copy)")
             .setting("loop", mode.name())
-            .setting("confirm timeout s", CONFIRM_TIMEOUT.as_secs())
+            .setting("confirm timeout s", NETWORK_TIMEOUT.as_secs())
             .setting("payers", profile.payers)
             .setting("accounts", profile.accounts)
             .setting("warmup iters", profile.warmup)

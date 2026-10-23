@@ -13,10 +13,8 @@ pub mod projected_token_lifecycle;
 pub(crate) mod spl;
 pub mod undelegation_grpc_redundancy;
 
-use std::time::Duration;
-
 use pubkey::Pubkey;
-use redsuite_core::{check, ErCtx, Result};
+use redsuite_core::{ChainCtx, ErCtx, Result};
 
 use crate::ACCOUNT_OWNERS;
 
@@ -25,18 +23,13 @@ const BASE_REWRITE: u64 = 900;
 const BASE_REFRESH: u64 = 901;
 const FETCHES: [&str; 2] = ["getAccountInfo", "getMultipleAccounts"];
 
-async fn await_local_value(
-    er: &ErCtx,
-    what: &str,
-    keys: &[Pubkey],
-    expected: u64,
-    timeout: Duration,
-) -> Result<()> {
-    check::poll_for(what, timeout, || async {
-        for account in er.local_accounts(&ACCOUNT_OWNERS, keys).await? {
-            ensure!(crate::account_id(account) == Some(expected));
-        }
-        Result::Ok(())
-    })
-    .await
+async fn await_local_value(er: &ErCtx, what: &str, keys: &[Pubkey], expected: u64) -> Result<()> {
+    er.api()
+        .await_accounts(keys, what, async || {
+            for account in er.local_accounts(&ACCOUNT_OWNERS, keys).await? {
+                ensure!(crate::account_id(account) == Some(expected));
+            }
+            Result::Ok(())
+        })
+        .await
 }

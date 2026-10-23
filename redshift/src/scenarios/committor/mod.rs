@@ -1,4 +1,6 @@
 use anyhow::{ensure, Context};
+use std::slice;
+
 pub mod commit_and_undelegate;
 pub mod commit_blackout;
 pub mod commit_exactly_once;
@@ -12,7 +14,7 @@ use std::time::{Duration, Instant};
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    check,
+    api::transaction_meta,
     programs::{CellHeader, SettlementMode, REDLINE},
     BaseCtx, ChainCtx, ErCtx, Result,
 };
@@ -20,8 +22,6 @@ use signature::Signature;
 use tokio::time;
 
 pub(super) const PROXIED_GROUP: &str = "this scenario needs the base-chain proxies of its ER group";
-const BASE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(30);
-const BASE_STATE_TIMEOUT: Duration = Duration::from_secs(30);
 
 async fn write_and_commit(
     er: &ErCtx,
@@ -56,17 +56,20 @@ async fn prove_landed(
     account: &Pubkey,
     snapshot: &[u8],
 ) -> Result<()> {
-    let base_tx = base.api().await_transaction(base_signature, BASE_CONFIRM_TIMEOUT).await?;
-    ensure!(
-        base_tx.err.is_none(),
-        "the intercepted base commit {base_signature} must succeed on base, \
-         got {:?}",
-        base_tx.err
-    );
-    check::poll("base snapshot before fault", BASE_STATE_TIMEOUT, || async {
-        matches!(base.account(account).await, Ok(Some(acc)) if acc.data == snapshot)
-    })
-    .await?;
+    let base_tx = base.api().await_transaction(base_signature).await?;
+    let meta = transaction_meta(&base_tx)?;
+    ensure!(meta.err == None);
+    base.api()
+        .await_accounts(
+            slice::from_ref(account),
+            "base snapshot before fault",
+            async || {
+                let account = base.account(account).await?.context("base account missing")?;
+                ensure!(account.data == snapshot);
+                Ok(())
+            },
+        )
+        .await?;
     Ok(())
 }
 

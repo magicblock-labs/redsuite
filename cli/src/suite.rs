@@ -8,6 +8,8 @@ use std::{
     time::Instant,
 };
 
+use anyhow::ensure;
+
 use anyhow::anyhow;
 use futures_util::{future::join_all, StreamExt};
 use redsuite_core::{
@@ -266,8 +268,10 @@ pub fn finish(records: &[RunRecord], cleanup: bool) -> Result<()> {
     let cleanup = if cleanup { topology::down() } else { Ok(()) }
         .inspect_err(|error| error!(error = %format_args!("{error:#}"), "stack cleanup failed"));
     let failed = records.iter().filter(|record| !record.passed()).count();
-    if failed != 0 {
-        return Err(anyhow!("{failed} of {} scenarios failed", records.len()));
-    }
+    ensure!(
+        failed == 0,
+        "{failed} of {} scenarios failed",
+        records.len()
+    );
     cleanup
 }

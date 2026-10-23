@@ -1,10 +1,9 @@
-use std::{rc::Rc, time::Duration};
+use std::{rc::Rc, slice, time::Duration};
 
 use anyhow::{ensure, Context};
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    check,
     netfault::{BaseProxies, Selector},
     programs::{SettlementMode, REDLINE},
     receipt::{self, CommitReceipt},
@@ -17,12 +16,7 @@ use super::{hold_nonces, write_snapshot};
 use crate::{program::DELEGATION_PROGRAM_ID, ACCOUNT_SPACE, PAYER_LAMPORTS};
 
 const LABEL: &str = "commit-settlement-order";
-const CLONE_TIMEOUT: Duration = Duration::from_secs(30);
 const INTERCEPT_TIMEOUT: Duration = Duration::from_secs(60);
-const BASE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(30);
-const BASE_STATE_TIMEOUT: Duration = Duration::from_secs(30);
-const RECEIPT_TIMEOUT: Duration = Duration::from_secs(120);
-const BUFFER_CLEANUP_TIMEOUT: Duration = Duration::from_secs(60);
 const HOLD_WINDOW: Duration = Duration::from_secs(5);
 const HISTORY_LIMIT: usize = 32;
 const SMALL_SPACE: u32 = ACCOUNT_SPACE;
@@ -83,10 +77,13 @@ async fn base_data(base: &BaseCtx, account: &Pubkey) -> Result<Vec<u8>> {
 }
 
 async fn await_base(base: &BaseCtx, account: &Pubkey, snapshot: &[u8], what: &str) -> Result<()> {
-    check::poll(what, BASE_STATE_TIMEOUT, || async {
-        matches!(base.account(account).await, Ok(Some(acc)) if acc.data == snapshot)
-    })
-    .await?;
+    base.api()
+        .await_accounts(slice::from_ref(account), what, async || {
+            let account = base.account(account).await?.context("base account missing")?;
+            ensure!(account.data == snapshot);
+            Ok(())
+        })
+        .await?;
     Ok(())
 }
 
@@ -97,13 +94,12 @@ async fn settled(
     expected: &[Pubkey],
     phase: &str,
 ) -> Result<Bundle> {
-    let receipt =
-        receipt::fetch_commit_receipt(er.api(), commit_signature, RECEIPT_TIMEOUT).await?;
+    let receipt = receipt::fetch_commit_receipt(er.api(), commit_signature).await?;
     receipt.check_success(phase)?;
     receipt.check_included(expected)?;
-    receipt.confirm(base.api(), BASE_CONFIRM_TIMEOUT).await?;
+    receipt.confirm(base.api()).await?;
     let last = receipt.base_signatures[receipt.base_signatures.len() - 1];
-    let slot = base.api().await_transaction(&last, BASE_CONFIRM_TIMEOUT).await?.slot;
+    let slot = base.api().await_transaction(&last).await?.slot;
     Ok(Bundle { receipt, slot })
 }
 
@@ -116,7 +112,7 @@ async fn history_position(
     history
         .iter()
         .position(|entry| entry == signature)
-        .with_context(|| format!("base history of {account} does not list {signature}"))
+        .context("settlement missing from base history")
 }
 
 async fn prepare_accounts(
@@ -137,7 +133,7 @@ async fn prepare_accounts(
             .await?;
         let on_base = base.account(&account).await?.context("pda not on base")?;
         ensure!(on_base.owner == DELEGATION_PROGRAM_ID);
-        er.await_clones(&[account], variant.space as usize, CLONE_TIMEOUT).await?;
+        er.await_clones(&[account], variant.space as usize).await?;
         *key = account;
     }
     Ok(keys)
@@ -190,10 +186,7 @@ async fn run_variant(
     hold_nonces(base, &[a, b], &[nonce_a, nonce_b], HOLD_WINDOW).await?;
     let buffers_during_hold = buffer_accounts(base).await?.saturating_sub(buffers_before);
     if variant.buffered {
-        ensure!(
-            buffers_during_hold > 0,
-            "large accounts use commit buffers while held"
-        );
+        ensure!(buffers_during_hold > 0);
     } else {
         ensure!(buffers_during_hold == 0);
     }
@@ -212,32 +205,19 @@ async fn run_variant(
     ensure!(crate::last_commit_id(base, &b).await? == (nonce_b + 1));
 
     let held_second = second_submission.wait(INTERCEPT_TIMEOUT).await?;
-    ensure!(
-        held_second.held_at > retry_held_at,
-        "conflicting submission {:?} must follow retry {:?}",
-        held_second.held_at,
-        retry_held_at
-    );
+    ensure!(held_second.held_at > retry_held_at);
     held_second.release();
     let second_bundle = settled(base, er, &second, &[b, c], "conflicting bundle").await?;
     await_base(base, &b, &b2, "conflicting bundle: B snapshot").await?;
     ensure!(base_data(base, &c).await? == c1);
     ensure!(crate::last_commit_id(base, &b).await? == (nonce_b + 2));
     ensure!(crate::last_commit_id(base, &c).await? == (nonce_c + 1));
-    ensure!(
-        first_bundle.slot <= second_bundle.slot,
-        "settlement slots: delayed={} conflicting={}",
-        first_bundle.slot,
-        second_bundle.slot
-    );
+    ensure!(first_bundle.slot <= second_bundle.slot);
     let first_position =
         history_position(base, &b, &first_bundle.receipt.base_signatures[0]).await?;
     let second_position =
         history_position(base, &b, &second_bundle.receipt.base_signatures[0]).await?;
-    ensure!(
-        first_position > second_position,
-        "delayed bundle precedes conflict in base history"
-    );
+    ensure!(first_position > second_position);
 
     let mut finals = Vec::with_capacity(4);
     for (offset, account) in accounts.iter().enumerate() {
@@ -248,12 +228,12 @@ async fn run_variant(
     for (account, snapshot) in accounts.iter().zip(&finals) {
         await_base(base, account, snapshot, "follow-up bundle: final snapshot").await?;
     }
-    check::poll(
-        "commit buffers closed after settlement",
-        BUFFER_CLEANUP_TIMEOUT,
-        || async { matches!(buffer_accounts(base).await, Ok(count) if count <= buffers_before) },
-    )
-    .await?;
+    base.api()
+        .await_query("commit buffers closed after settlement", async || {
+            ensure!(buffer_accounts(base).await? <= buffers_before);
+            Ok(())
+        })
+        .await?;
     Ok(())
 }
 

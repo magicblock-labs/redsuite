@@ -28,7 +28,6 @@ const PAYER_LAMPORTS: u64 = 10_000_000_000;
 const GROW_INTERVAL: Duration = Duration::from_millis(40);
 const CHURN_BEFORE_RESTART: Duration = Duration::from_secs(6);
 const CHURN_AFTER_RESTART: Duration = Duration::from_secs(12);
-const CLONE_TIMEOUT: Duration = Duration::from_secs(20);
 
 struct Readers {
     stop: Rc<Cell<bool>>,
@@ -55,15 +54,7 @@ impl AccountReader {
 
     async fn read(&self) -> Result<()> {
         let accounts = self.api.get_multiple_accounts(&self.addresses).await?;
-        let missing: Vec<_> = accounts
-            .iter()
-            .enumerate()
-            .filter_map(|(index, account)| account.is_none().then_some(index))
-            .collect();
-        let _: () = ensure!(
-            missing.is_empty(),
-            "missing snapshot account indices: {missing:?}"
-        );
+        ensure!(accounts.iter().all(Option::is_some));
         Ok(())
     }
 }
@@ -142,13 +133,13 @@ impl PrivateErScenario for SnapshotReadRace {
         let Self { base, mut private, payer } = self;
         let mut sizes = vec![LARGE_ACCOUNT_SPACE; ACCOUNTS];
         let er = private.ctx();
-        er.await_program_clone(&redshift_interface::id(), CLONE_TIMEOUT).await?;
+        er.await_program_clone(&redshift_interface::id()).await?;
         let accounts = base
             .cells(REDSHIFT, &payer)
             .create_owned_sized(er.identity(), ACCOUNTS, LARGE_ACCOUNT_SPACE)
             .await?;
         let addresses: Vec<_> = accounts.iter().map(|account| account.address).collect();
-        er.await_clones(&addresses, LARGE_ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
+        er.await_clones(&addresses, LARGE_ACCOUNT_SPACE as usize).await?;
         let sponsor = base.funded_payer(crate::PAYER_LAMPORTS).await?;
         base.delegate_payer(&sponsor, &payer, er.identity()).await?;
 

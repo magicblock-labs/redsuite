@@ -1,14 +1,15 @@
-use std::{rc::Rc, time::Duration};
+use std::{rc::Rc, slice, time::Duration};
 
 use anyhow::{ensure, Context};
 use instruction::Instruction;
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
+    api::{transaction_logs, transaction_meta},
     check, prep,
     programs::{CellHeader, CellId, SettlementMode, UndelegationOutcome, MAGIC, REDSHIFT},
     receipt::{self, CommitReceipt},
-    BaseCtx, ChainCtx, DynError, ErCtx, Result, Scenario,
+    wait, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
 use signature::Signature;
 use signer::Signer;
@@ -18,9 +19,6 @@ use crate::{
     program::DELEGATION_PROGRAM_ID, LARGE_ACCOUNT_SPACE, LOCKOUT_REJECTIONS, PAYER_LAMPORTS,
 };
 
-const CLONE_TIMEOUT: Duration = Duration::from_secs(15);
-const RECEIPT_TIMEOUT: Duration = Duration::from_secs(30);
-const BASE_STATE_TIMEOUT: Duration = Duration::from_secs(30);
 const ER_WRITE_TIMEOUT: Duration = Duration::from_secs(20);
 const REDELEGATE_SETTLE: Duration = Duration::from_secs(2);
 const ROLLBACK_SETTLE: Duration = Duration::from_millis(1500);
@@ -39,10 +37,7 @@ async fn base_requested_undelegation(base: &BaseCtx, er: &ErCtx) -> Result<()> {
     er.await_cells(&cells).await?;
     let cell = &cells[0];
     let request = sdk::pda::undelegation_request_pda_from_delegated_account(&cell.address);
-    ensure!(
-        base.account(&request).await?.is_none(),
-        "request {request} starts absent"
-    );
+    ensure!(base.account(&request).await?.is_none());
     er.submit_and_confirm(&payer, &[REDSHIFT.batch().add(&[cell.address], 1).build()])
         .await?;
     let snapshot = er.account(&cell.address).await?.context("missing ER cell")?;
@@ -50,32 +45,25 @@ async fn base_requested_undelegation(base: &BaseCtx, er: &ErCtx) -> Result<()> {
     ensure!(
         decoded_count(&base.account(&cell.address).await?.context("missing base cell")?.data)? == 0
     );
-    let signature = base
-        .submit_and_confirm(
-            &payer,
-            &[REDSHIFT
-                .request_undelegation(payer.pubkey(), CellId::new(cell.authority.pubkey(), 0))],
-        )
-        .await?;
-    check::poll_for(
-        &format!(
-            "base request {signature} settles {} and removes {request}",
-            cell.address
-        ),
-        BASE_STATE_TIMEOUT,
-        || async {
-            let account = base.account(&cell.address).await?.context("missing cell")?;
-            ensure!(account.owner == redshift_interface::ID);
-            ensure!(account.data == snapshot.data);
-            ensure!(account.lamports == snapshot.lamports);
-            ensure!(
-                base.account(&request).await?.is_none(),
-                "completed request {request} is removed"
-            );
-            Ok::<_, DynError>(())
-        },
+    base.submit_and_confirm(
+        &payer,
+        &[REDSHIFT.request_undelegation(payer.pubkey(), CellId::new(cell.authority.pubkey(), 0))],
     )
     .await?;
+    base.api()
+        .await_accounts(
+            &[cell.address, request],
+            "base undelegation and request cleanup",
+            async || {
+                let account = base.account(&cell.address).await?.context("missing cell")?;
+                ensure!(account.owner == redshift_interface::ID);
+                ensure!(account.data == snapshot.data);
+                ensure!(account.lamports == snapshot.lamports);
+                ensure!(base.account(&request).await?.is_none());
+                Ok(())
+            },
+        )
+        .await?;
     Ok(())
 }
 
@@ -111,18 +99,14 @@ async fn settled(
         ensure!(commit_receipt.base_signatures.len() == 1);
     }
     for pda in pdas {
-        check::poll_for(
-            &format!("{pda} settles on base after the commit"),
-            BASE_STATE_TIMEOUT,
-            || async {
+        base.api()
+            .await_accounts(slice::from_ref(pda), "base settlement", async || {
                 let account = base.account(pda).await?.context("settled cell absent from base")?;
                 ensure!(account.owner == owner);
                 ensure!(decoded_count(&account.data)? == count);
-                Ok::<_, DynError>(())
-            },
-        )
-        .await
-        .with_context(|| format!("owner {owner} count {count}"))?;
+                Ok(())
+            })
+            .await?;
         let on_er =
             er.account(pda).await?.context("the er clone is not present after the commit")?;
         ensure!(decoded_count(&on_er.data)? == count);
@@ -202,19 +186,15 @@ async fn commit_undelegate_lifecycle(
     }
 
     for cell in &cells {
-        check::poll(
-            &format!(
-                "the er accepts writes to {} after the redelegation",
-                cell.address
-            ),
+        wait::retry(
+            "ER writes after redelegation",
             ER_WRITE_TIMEOUT,
-            || async {
+            async || {
                 er.submit_and_confirm(
                     er_fee_payer,
                     &[REDSHIFT.batch().add(&[cell.address], 1).build()],
                 )
                 .await
-                .is_ok()
             },
         )
         .await?;
@@ -239,7 +219,7 @@ async fn large_account_cell(base: &BaseCtx, er: &ErCtx, commit_type: SettlementM
     let pda = cell.address;
     let on_base = base.account(&pda).await?.context("large account missing after delegation")?;
     ensure!(on_base.data.len() == (LARGE_ACCOUNT_SPACE as usize));
-    er.await_clones(&[pda], LARGE_ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
+    er.await_clones(&[pda], LARGE_ACCOUNT_SPACE as usize).await?;
 
     let seed = u64::from(undelegates) + 1;
     let mut expected = on_base.data;
@@ -258,20 +238,20 @@ async fn large_account_cell(base: &BaseCtx, er: &ErCtx, commit_type: SettlementM
         .await?;
     er.check_commit(base, &signature, &[pda], undelegates).await?;
     let on_er = er.account(&pda).await?.context("large account missing after commit")?;
-    ensure!(
-        on_er.data == expected,
-        "ER must retain the entire large-account payload after commit"
-    );
+    ensure!(on_er.data == expected);
     let expected_owner = if undelegates { redshift_interface::id() } else { DELEGATION_PROGRAM_ID };
-    check::poll(
-        "large-account data and ownership settle on base",
-        BASE_STATE_TIMEOUT,
-        || async {
-            matches!(base.account(&pda).await, Ok(Some(account))
-                if account.owner == expected_owner && account.data == expected)
-        },
-    )
-    .await
+    base.api()
+        .await_accounts(
+            &[pda],
+            "large-account data and ownership settle on base",
+            async || {
+                let account = base.account(&pda).await?.context("base account missing")?;
+                ensure!(account.owner == expected_owner);
+                ensure!(account.data == expected);
+                Ok(())
+            },
+        )
+        .await
 }
 
 async fn rejected_intent_cell(
@@ -282,21 +262,17 @@ async fn rejected_intent_cell(
 ) -> Result<()> {
     let sender = er.sender(payer.clone());
     let signature = sender.submit(&[instruction]).await?;
-    let tx = er.api().await_transaction(&signature, RECEIPT_TIMEOUT).await?;
-    let error = tx.err.as_ref().with_context(|| format!("{signature}: expected ER rejection"))?;
-    let observed = format!("{}\n{error:?}", tx.logs.join("\n"));
-    ensure!(
-        observed.contains(refusal),
-        "the refusal must name '{refusal}', got: {observed}"
-    );
+    let tx = er.api().await_transaction(&signature).await?;
+    let meta = transaction_meta(&tx)?;
+    let logs = transaction_logs(meta);
+    let error = meta.err.as_ref().context("expected ER rejection")?;
+    let observed = format!("{}\n{error:?}", logs.join("\n"));
+    ensure!(observed.contains(refusal));
 
-    let sent_signature = receipt::receipt_signature_in_logs(&tx.logs)
+    let sent_signature = receipt::receipt_signature_in_logs(logs)
         .context("the failed tx logs carry no ScheduledCommitSent signature")?;
     time::sleep(ROLLBACK_SETTLE).await;
-    ensure!(
-        er.api().get_transaction(&sent_signature).await?.is_none(),
-        "a failed transaction must not schedule a commit"
-    );
+    ensure!(er.api().get_transaction(&sent_signature).await?.is_none());
     Ok(())
 }
 
@@ -333,12 +309,7 @@ async fn test_foreign_ownership(base: &BaseCtx, er: &ErCtx) -> Result<()> {
 
         let error = check::expect_error(attempt, &format!("foreign {what} rejected"))?;
         let error = format!("{error:#}");
-        ensure!(
-            error.contains(FOREIGN_REJECTION),
-            "the foreign {what} for {} must be rejected with \
-             {FOREIGN_REJECTION}, got {error:#}",
-            cells[0].address
-        );
+        ensure!(error.contains(FOREIGN_REJECTION));
     }
     Ok(())
 }
@@ -418,19 +389,17 @@ async fn test_failed_undelegation_lockout(base: &BaseCtx, er: &ErCtx) -> Result<
         .await?;
     er.check_commit(base, &signature, &[pda], true).await?;
 
-    check::poll(
-        "the rejection policy settles on base",
-        BASE_STATE_TIMEOUT,
-        || async {
-            matches!(
+    base.api()
+        .await_accounts(&[pda], "the rejection policy settles on base", async || {
+            ensure!(matches!(
                 base.account(&pda).await,
                 Ok(Some(acc))
                     if CellHeader::try_decode(&acc.data).ok().map(|cell| cell.undelegation)
                         == Some(UndelegationOutcome::Reject)
-            )
-        },
-    )
-    .await?;
+            ));
+            Ok(())
+        })
+        .await?;
     let on_base = base
         .account(&pda)
         .await?

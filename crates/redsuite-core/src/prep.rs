@@ -1,17 +1,18 @@
-use std::{future::Future, rc::Rc, sync::Arc, time::Duration};
+use std::{future::Future, rc::Rc, sync::Arc};
 
-use account::Account;
-use anyhow::{anyhow, ensure, Context};
+use anyhow::{ensure, Context};
 use futures_util::future::join_all;
 use keypair::Keypair;
 use pubkey::Pubkey;
 use signer::Signer;
+use solana_rpc_client_types::request::RpcRequest;
 use url::Url;
 
 use crate::{
-    check,
     context::{BaseCtx, ChainCtx, ErCtx},
-    dlp, system, DynError, ErClient, Result, TxSender,
+    dlp, system,
+    transport::NETWORK_TIMEOUT,
+    wait, ErClient, Result, TxSender,
 };
 
 pub const COMMIT_FREQUENCY_MS: u32 = 1_000_000_000;
@@ -41,11 +42,12 @@ pub fn payer_from_bytes(bytes: &[u8]) -> Keypair {
 // Each worker owns its client/cache and the same round-robin payer partition.
 pub fn worker_senders(
     rpc_url: &Url,
+    ws_url: &Url,
     payers: &[[u8; 64]],
     worker: usize,
     threads: usize,
 ) -> Vec<TxSender> {
-    let client = ErClient::new(rpc_url.clone());
+    let client = ErClient::new(rpc_url.clone(), ws_url.clone());
     payers
         .iter()
         .skip(worker)
@@ -96,62 +98,35 @@ impl BaseCtx {
             .account(&delegatee_pubkey)
             .await?
             .context("delegated payer account missing after delegation")?;
-        if on_chain.owner != dlp::dlp_id() {
-            return Err(anyhow!(
-                "delegated payer {delegatee_pubkey} owned by {}, expected the \
-             delegation program",
-                on_chain.owner
-            ));
-        }
+        ensure!(on_chain.owner == dlp::dlp_id());
         Ok(())
     }
 }
 
 impl ErCtx {
-    pub async fn await_account(
-        &self,
-        address: &Pubkey,
-        timeout: Duration,
-        ready: impl Fn(&Account) -> Result<()>,
-    ) -> Result<Account> {
-        check::poll_for("ER account readiness", timeout, || async {
-            let account = self.account(address).await?.context("ER account missing")?;
-            ready(&account)?;
-            Ok::<_, DynError>(account)
-        })
-        .await
-    }
-
-    pub async fn await_delegated(
-        &self,
-        account: &Pubkey,
-        timeout: Duration,
-        what: &str,
-    ) -> Result<()> {
+    pub async fn await_delegated(&self, account: &Pubkey, what: &str) -> Result<()> {
         #[derive(serde::Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct Status {
             is_delegated: bool,
         }
-        check::poll_for(what, timeout, || async {
-            let status: Status =
-                self.api().call("getDelegationStatus", &(account.to_string(),)).await?;
-            ensure!(status.is_delegated, "delegation status");
-            Ok::<_, DynError>(())
+        wait::retry(what, NETWORK_TIMEOUT, async || {
+            let status: Status = self
+                .api()
+                .call(
+                    RpcRequest::Custom { method: "getDelegationStatus" },
+                    &(account.to_string(),),
+                )
+                .await?;
+            ensure!(status.is_delegated);
+            Ok(())
         })
         .await
-        .with_context(|| "delegated")?;
-        Ok(())
     }
 
-    pub async fn await_clones(
-        &self,
-        pdas: &[Pubkey],
-        space: usize,
-        timeout: Duration,
-    ) -> Result<()> {
+    pub async fn await_clones(&self, pdas: &[Pubkey], space: usize) -> Result<()> {
         for pda in pdas {
-            self.await_account(pda, timeout, |account| {
+            self.await_account(pda, |account| {
                 ensure!(account.data.len() == space);
                 Ok(())
             })
@@ -166,22 +141,17 @@ impl ErCtx {
         }
     }
 
-    pub async fn prewarm(
-        &self,
-        accounts: &[Pubkey],
-        space: usize,
-        timeout: Duration,
-    ) -> Result<()> {
+    pub async fn prewarm(&self, accounts: &[Pubkey], space: usize) -> Result<()> {
         self.touch(accounts).await;
-        self.await_clones(accounts, space, timeout).await
+        self.await_clones(accounts, space).await
     }
 
-    pub async fn await_cloned_payers(&self, payers: &[Pubkey], timeout: Duration) -> Result<()> {
+    pub async fn await_cloned_payers(&self, payers: &[Pubkey]) -> Result<()> {
         bounded(payers.len(), "cloned payer", |index| {
             let payer = payers[index];
             async move {
-                self.await_account(&payer, timeout, |account| {
-                    ensure!(account.lamports > 0, "clone funding");
+                self.await_account(&payer, |account| {
+                    ensure!(account.lamports > 0);
                     Ok(())
                 })
                 .await?;
@@ -192,9 +162,9 @@ impl ErCtx {
         Ok(())
     }
 
-    pub async fn await_program_clone(&self, program: &Pubkey, timeout: Duration) -> Result<()> {
-        self.await_account(program, timeout, |account| {
-            ensure!(account.executable, "executable clone");
+    pub async fn await_program_clone(&self, program: &Pubkey) -> Result<()> {
+        self.await_account(program, |account| {
+            ensure!(account.executable);
             Ok(())
         })
         .await?;

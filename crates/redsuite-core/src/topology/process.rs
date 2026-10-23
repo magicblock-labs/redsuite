@@ -11,7 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{anyhow, Context};
+use anyhow::{anyhow, ensure, Context};
 use rand::Rng;
 use tokio::{net::TcpStream, time};
 use tracing::warn;
@@ -73,11 +73,10 @@ pub(super) async fn terminate(
             escalated = true;
             needed_sigkill = true;
         }
-        if Instant::now() >= hard_deadline {
-            return Err(anyhow!(
-                "process {pid} did not exit within {KILL_GRACE:?} of SIGKILL"
-            ));
-        }
+        ensure!(
+            Instant::now() < hard_deadline,
+            "process {pid} did not exit within {KILL_GRACE:?} of SIGKILL"
+        );
         time::sleep(RESTART_POLL).await;
     }
 }
@@ -260,11 +259,12 @@ pub(super) fn rpc_listening(port: u16) -> bool {
 // consumers dial is accepting, and the chain has ticked past genesis.
 pub(super) async fn await_base_serving(
     rpc_url: &Url,
+    ws_url: &Url,
     log: &Path,
     pid: u32,
     listeners: &[(&str, u16)],
 ) -> Result<()> {
-    let api = Api::new(rpc_url.clone());
+    let api = Api::new(rpc_url.clone(), ws_url.clone());
     wait_until(
         config::BASE_READY_TIMEOUT,
         "base RPC healthy",
@@ -327,19 +327,17 @@ where
             || now.duration_since(liveness_checked) >= LIVENESS_INTERVAL
         {
             liveness_checked = now;
-            if !proc_running(pid) {
-                return Err(anyhow!(
-                    "process exited while waiting for {what}; log tail:\n{}",
-                    tail(log, 30)
-                ));
-            }
-        }
-        if time::Instant::now() >= deadline {
-            return Err(anyhow!(
-                "timed out after {timeout:?} waiting for {what}; log tail:\n{}",
+            ensure!(
+                proc_running(pid),
+                "process exited while waiting for {what}; log tail:\n{}",
                 tail(log, 30)
-            ));
+            );
         }
+        ensure!(
+            time::Instant::now() < deadline,
+            "timed out after {timeout:?} waiting for {what}; log tail:\n{}",
+            tail(log, 30)
+        );
         time::sleep(interval).await;
     }
 }

@@ -8,7 +8,11 @@ use anyhow::{anyhow, ensure, Context};
 use instruction::Instruction;
 use keypair::Keypair;
 use pubkey::Pubkey;
-use redsuite_core::{programs::Redshift, topology, BaseCtx, ChainCtx, ErCtx, Result, Scenario};
+use redsuite_core::{
+    api::{transaction_logs, transaction_meta},
+    programs::Redshift,
+    topology, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
+};
 use signature::Signature;
 use tokio::time;
 
@@ -21,8 +25,6 @@ const PAYER_DELEGATION: u64 = 1_000_000_000;
 const INVOKE_TIMEOUT: Duration = Duration::from_secs(30);
 // The engine reports a confirmed status one blocktime before the ledger
 // serves the transaction, so a lookup right after confirm must re-poll.
-const LEDGER_VISIBILITY_TIMEOUT: Duration = Duration::from_millis(250);
-const LEDGER_VISIBILITY_POLL: Duration = Duration::from_millis(10);
 const LOADER_V3_PROGRAMDATA_METADATA: usize = 45;
 
 pub struct LoaderMatrix {
@@ -56,13 +58,7 @@ impl Scenario for LoaderMatrix {
         .await?;
         let (v1_owner, v1_data) = cloned_program(&er, &memo_v1).await?;
         ensure!(v1_owner == sdk_ids::bpf_loader_deprecated::ID);
-        ensure!(
-            v1_data == base_memo_v1.data,
-            "the memo v1 clone must byte-equal the base program account \
-             (er {} bytes, base {} bytes)",
-            v1_data.len(),
-            base_memo_v1.data.len()
-        );
+        ensure!(v1_data == base_memo_v1.data);
 
         let base_memo_v2 =
             base.account(&memo_v2).await?.context("memo v2 is not on the base chain")?;
@@ -75,13 +71,7 @@ impl Scenario for LoaderMatrix {
         .await?;
         let (v2_owner, v2_data) = cloned_program(&er, &memo_v2).await?;
         ensure!(v2_owner == sdk_ids::loader_v4::ID);
-        ensure!(
-            v2_data == base_memo_v2.data,
-            "the memo v2 clone must byte-equal the base program account \
-             (er {} bytes, base {} bytes)",
-            v2_data.len(),
-            base_memo_v2.data.len()
-        );
+        ensure!(v2_data == base_memo_v2.data);
 
         let (v3_id, _) = topology::redshift_loader_v3_target();
         let v3_logs = invoke_until(
@@ -101,17 +91,8 @@ impl Scenario for LoaderMatrix {
         let base_v3_elf = base_v3_programdata.split_off(LOADER_V3_PROGRAMDATA_METADATA);
         let (v3_owner, v3_data) = cloned_program(&er, &v3_id).await?;
         ensure!(v3_owner == sdk_ids::loader_v4::ID);
-        ensure!(
-            v3_data == base_v3_elf,
-            "the v3 clone must byte-equal the base programdata ELF \
-             (er {} bytes, base {} bytes)",
-            v3_data.len(),
-            base_v3_elf.len()
-        );
-        ensure!(
-            v3_logs.iter().any(|line| line.contains("LogMsg:")),
-            "the v3 program invocation must emit its LogMsg line"
-        );
+        ensure!(v3_data == base_v3_elf);
+        ensure!(v3_logs.iter().any(|line| line.contains("LogMsg:")));
 
         Ok(())
     }
@@ -147,14 +128,14 @@ async fn cloned_program(er: &ErCtx, program: &Pubkey) -> Result<(Pubkey, Vec<u8>
 }
 
 async fn confirmed_logs(er: &ErCtx, signature: &Signature) -> Result<Vec<String>> {
-    Ok(redsuite_core::check::poll_until(
-        LEDGER_VISIBILITY_TIMEOUT,
-        LEDGER_VISIBILITY_POLL,
-        async || er.api().get_transaction(signature).await,
-    )
-    .await?
-    .map(|info| info.logs)
-    .unwrap_or_default())
+    let info = match er.api().await_transaction(signature).await {
+        Ok(info) => info,
+        Err(error) if error.downcast_ref::<time::error::Elapsed>().is_some() => {
+            return Ok(Vec::new())
+        }
+        Err(error) => return Err(error),
+    };
+    Ok(transaction_logs(transaction_meta(&info)?).to_vec())
 }
 
 async fn invoke_until<Build, Accept>(
@@ -169,30 +150,23 @@ where
 {
     let deadline = Instant::now() + INVOKE_TIMEOUT;
     let mut attempt = 0u64;
-    let mut last_logs = Vec::new();
     loop {
         attempt += 1;
         let ix = build(attempt);
-        let program = ix.program_id;
         match er.submit_and_confirm(payer, slice::from_ref(&ix)).await {
             Ok(signature) => {
                 let logs = confirmed_logs(er, &signature).await?;
                 if accept(&logs) {
                     return Ok(logs);
                 }
-                last_logs = logs;
             }
             Err(err) => {
                 if Instant::now() >= deadline {
-                    return Err(err.context(format!("invoke of {program} never succeeded")));
+                    return Err(err.context("program invocation never succeeded"));
                 }
             }
         }
-        if Instant::now() >= deadline {
-            return Err(anyhow!(
-                "invoke of {program}: log condition unmet: {last_logs:?}"
-            ));
-        }
+        ensure!(Instant::now() < deadline);
         time::sleep(Duration::from_millis(500)).await;
     }
 }

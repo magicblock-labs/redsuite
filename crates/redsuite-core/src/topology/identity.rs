@@ -6,12 +6,12 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{anyhow, Context};
+use anyhow::{ensure, Context};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use keypair::Keypair;
 use pubkey::Pubkey;
 use signer::Signer;
-use tokio::{time, time::Instant};
+use tokio::time;
 
 use super::{config::DLP_ID, state};
 use crate::{context::BaseCtx, ChainCtx, Result};
@@ -24,7 +24,6 @@ const VAULT_SPACE: usize = 8;
 const VAULT_LAMPORTS: u64 = 10_000_000;
 
 const IDENTITY_FUNDING_LAMPORTS: u64 = 20 * 1_000_000_000;
-const FUNDING_POLL: Duration = Duration::from_millis(250);
 
 pub fn identity_keypair(identity: &Pubkey) -> Result<Keypair> {
     let state =
@@ -34,7 +33,7 @@ pub fn identity_keypair(identity: &Pubkey) -> Result<Keypair> {
         .iter()
         .filter_map(|bytes| Keypair::try_from(&bytes[..]).ok())
         .find(|keypair| keypair.pubkey() == *identity)
-        .with_context(|| format!("{identity} is not one of this stack's ER identities"))
+        .context("identity not reserved by this stack")
 }
 
 fn vault_dump_json(vault: &Pubkey) -> String {
@@ -59,12 +58,11 @@ pub(super) fn reset_pool(dir: &Path) {
 pub fn identity_for_label(label: &str) -> Result<Keypair> {
     let state =
         state::read_state().context("no shared stack state — boot the shared stack first")?;
-    if state.er_identity_pool.is_empty() {
-        return Err(anyhow!(
-            "this stack predates per-ER identities — run \
+    ensure!(
+        !state.er_identity_pool.is_empty(),
+        "this stack predates per-ER identities — run \
                     `redsuite stack down` and boot it again"
-        ));
-    }
+    );
     let dir = state::stack_dir();
     let _guard = PoolLock::acquire(&dir)?;
     let map_path = dir.join(POOL_MAP_FILE);
@@ -77,13 +75,12 @@ pub fn identity_for_label(label: &str) -> Result<Keypair> {
         Some(slot) => *slot,
         None => {
             let slot = assignments.len();
-            if slot >= state.er_identity_pool.len() {
-                return Err(anyhow!(
-                    "the stack reserved {} private-ER identities and all are \
+            ensure!(
+                slot < state.er_identity_pool.len(),
+                "the stack reserved {} private-ER identities and all are \
                      bound; raise IDENTITY_POOL_SIZE and boot a fresh stack",
-                    state.er_identity_pool.len()
-                ));
-            }
+                state.er_identity_pool.len()
+            );
             assignments.insert(label.to_owned(), slot);
             fs::write(&map_path, json::to_string(&assignments)?)?;
             slot
@@ -107,30 +104,21 @@ impl PoolLock {
     }
 }
 
-// The identity SPENDS concurrently (vault init, mdp sync), so the confirm
-// polls the ABSOLUTE funding target — an exact-increment poll can never
-// land while the balance moves under it.
+// Identity initialization spends concurrently; wait for an absolute balance,
+// and retry dropped faucet requests without requiring an exact increment.
 pub(super) async fn ensure_identity_funded(base: &BaseCtx, identity: &Pubkey) -> Result<()> {
-    let funded = || async {
-        base.api().get_balance(identity).await.unwrap_or(0) >= IDENTITY_FUNDING_LAMPORTS
-    };
-    let deadline = Instant::now() + Duration::from_secs(90);
-    let mut ticks = 0u32;
-    loop {
-        if funded().await {
-            return Ok(());
+    let timeout = Duration::from_secs(90);
+    time::timeout(timeout, async {
+        let events = base.api().events().await?;
+        let mut account = events.account(identity).await?;
+        let mut balance = base.api().get_balance(identity).await.unwrap_or(0);
+        let mut requests = time::interval(Duration::from_secs(5));
+        loop {
+            if balance >= IDENTITY_FUNDING_LAMPORTS { return Ok(()); }
+            tokio::select! {
+                update = account.next() => { balance = update?.value.lamports; }
+                _ = requests.tick() => { let _ = base.api().request_airdrop(identity, IDENTITY_FUNDING_LAMPORTS).await; }
+            }
         }
-        // Re-request on a cadence — a busy freshly-booted base can drop the
-        // faucet transaction, so one request is not enough.
-        if ticks.is_multiple_of(20) {
-            let _ = base.api().request_airdrop(identity, IDENTITY_FUNDING_LAMPORTS).await;
-        }
-        ticks += 1;
-        if Instant::now() >= deadline {
-            return Err(anyhow!(
-                "the identity {identity} did not reach the funding target"
-            ));
-        }
-        time::sleep(FUNDING_POLL).await;
-    }
+    }).await.context("identity funding target not reached")?
 }

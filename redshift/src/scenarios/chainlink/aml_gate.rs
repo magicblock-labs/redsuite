@@ -11,14 +11,16 @@ use std::{
     thread::JoinHandle,
     time::Duration,
 };
+use tokio::sync::Notify;
 
 use anyhow::{ensure, Context};
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    check, dlp, topology,
+    api::transaction_meta,
+    dlp, topology,
     topology::{ErOptions, PrivateEr},
-    BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result,
+    wait, BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result,
 };
 use sdk::spl::{
     builders::{
@@ -37,7 +39,6 @@ const SHUTTLE_AMOUNT: u64 = 200;
 const SHUTTLE_ID: u32 = 0;
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
 const QUERY_TIMEOUT: Duration = Duration::from_secs(15);
-const UNDELEGATION_TIMEOUT: Duration = Duration::from_secs(20);
 const MERGE_TIMEOUT: Duration = Duration::from_secs(30);
 
 // The risk server owns the threshold: the validator only ever sees the
@@ -102,6 +103,7 @@ struct Risk {
 #[derive(Clone, Default)]
 struct RiskService {
     risks: Arc<RwLock<HashMap<Pubkey, Risk>>>,
+    changed: Arc<Notify>,
 }
 
 impl RiskService {
@@ -145,6 +147,7 @@ impl RiskService {
                 let mut risks = self.risks.write().unwrap();
                 let risk = risks.entry(key).or_default();
                 risk.queries += 1;
+                self.changed.notify_waiters();
                 risk.score
             }
             Err(_) => 0,
@@ -256,10 +259,7 @@ async fn run_risk_case(
     base.submit_and_confirm(&fee_payer, &[vault_ix]).await?;
 
     let fees_vault = dlp::validator_fees_vault_pda(&er_identity);
-    ensure!(
-        base.account(&fees_vault).await?.is_some(),
-        "validator fees vault exists on base"
-    );
+    ensure!(base.account(&fees_vault).await?.is_some());
 
     let _ = er_ctx.account(&source_ata).await;
     let _ = er_ctx.account(&destination_ata).await;
@@ -279,59 +279,47 @@ async fn run_risk_case(
     base.submit_and_confirm_with(&fee_payer, &[&owner], &[shuttle_ix]).await?;
 
     // Verify shuttle ATA delegation record exists on base chain
-    ensure!(
-        delegation_record_exists(base, &shuttle_ata).await?,
-        "shuttle delegation record exists"
-    );
+    ensure!(delegation_record_exists(base, &shuttle_ata).await?);
 
     // 5. Wait for the risk server query
-    check::poll(
-        "risk server queried shuttle owner",
+    wait::on_change(
+        &server.service.changed,
         QUERY_TIMEOUT,
-        || async { server.query_count(&owner_pk) > 0 },
+        "risk server queried shuttle owner",
+        || Ok((server.query_count(&owner_pk) > 0).then_some(())),
     )
     .await?;
 
     // The gate controls attempts. An allowed action can still fail in the
     // deployed token program; only a successful action must move the tokens.
     if expect_allowed {
-        check::poll("low-risk merge attempted", MERGE_TIMEOUT, || async {
-            matches!(
-                merge_attempt(er_ctx, &shuttle_ata, &destination_ata).await,
-                Ok(Some(_))
-            )
+        let attempt = wait::retry("low-risk merge attempted", MERGE_TIMEOUT, async || {
+            merge_attempt(er_ctx, &shuttle_ata, &destination_ata)
+                .await?
+                .context("merge attempt missing")
         })
         .await?;
-        let attempt = merge_attempt(er_ctx, &shuttle_ata, &destination_ata)
-            .await?
-            .context("merge attempt missing after poll")?;
         if attempt.is_none() {
-            check::poll("low-risk merge settles", MERGE_TIMEOUT, || async {
-                matches!(
-                    er_token_amount(er_ctx, &destination_ata).await,
-                    Ok(amount) if amount == SHUTTLE_AMOUNT
-                )
-            })
-            .await?;
+            er_ctx
+                .api()
+                .await_accounts(&[destination_ata], "low-risk merge settles", async || {
+                    ensure!(er_token_amount(er_ctx, &destination_ata).await? == SHUTTLE_AMOUNT);
+                    Ok(())
+                })
+                .await?;
             ensure!(er_token_amount(er_ctx, &destination_ata).await? == SHUTTLE_AMOUNT);
         } else {
             ensure!(er_token_amount(er_ctx, &destination_ata).await? == 0);
         }
     } else {
-        check::poll(
-            "high-risk shuttle undelegates",
-            UNDELEGATION_TIMEOUT,
-            || async { !delegation_record_exists(base, &shuttle_ata).await.unwrap_or(true) },
-        )
-        .await?;
-        ensure!(
-            !delegation_record_exists(base, &shuttle_ata).await?,
-            "high-risk shuttle undelegated"
-        );
-        ensure!(
-            merge_attempt(er_ctx, &shuttle_ata, &destination_ata).await?.is_none(),
-            "high-risk merge blocked"
-        );
+        base.api()
+            .await_query("high-risk shuttle undelegates", async || {
+                ensure!(!delegation_record_exists(base, &shuttle_ata).await?);
+                Ok(())
+            })
+            .await?;
+        ensure!(!delegation_record_exists(base, &shuttle_ata).await?);
+        ensure!(merge_attempt(er_ctx, &shuttle_ata, &destination_ata).await?.is_none());
         ensure!(er_token_amount(er_ctx, &destination_ata).await? == 0);
     }
     Ok(())
@@ -353,8 +341,10 @@ async fn merge_attempt(
     else {
         return Ok(None);
     };
-    let tx = er.api().await_transaction(shared, Duration::from_secs(5)).await?;
-    Ok(Some(tx.err.map(|err| format!("{err:?}"))))
+    let tx = er.api().await_transaction(shared).await?;
+    Ok(Some(
+        transaction_meta(&tx)?.err.as_ref().map(|err| format!("{err:?}")),
+    ))
 }
 
 async fn er_token_amount(er: &ErCtx, ata: &Pubkey) -> Result<u64> {

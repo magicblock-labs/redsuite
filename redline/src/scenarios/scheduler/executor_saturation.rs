@@ -5,13 +5,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{anyhow, ensure, Context};
+use anyhow::{ensure, Context};
 use instruction::Instruction;
 use pubkey::Pubkey;
 use redsuite_core::{
     host, prep,
     profile::ProfileValues,
-    programs::{HashState, Redline},
+    programs::{HashState, REDLINE},
     redline::{causal, Accounts},
     report::Unit::{Count, Micros, Ratio, Seconds, Tps},
     runner::{
@@ -30,13 +30,11 @@ use crate::{metrics, program::layout, ACCOUNT_SPACE};
 
 const PAYER_LAMPORTS: u64 = 200_000_000;
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(900);
-const CLONE_TIMEOUT: Duration = Duration::from_secs(60);
 const BUSY_SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
 const TX_COUNT: &str = metrics::ENGINE_TRANSACTIONS;
 const BUSY_EXECUTORS: &str = "engine_processor_busy_executors";
 const ORDERING_DEPENDENCIES: &str = "engine_processor_ordering_dependencies";
 const BLOCKED_TRANSACTIONS: &str = "engine_processor_blocked_transactions";
-const PROGRAM: Pubkey = crate::program::ID;
 const LIGHT_ITERS: u32 = 1;
 const CU_CONTRAST_FLOOR: f64 = 10.0;
 const BUSY_THREAD_CORES: f64 = 0.5;
@@ -144,7 +142,7 @@ fn build_ixs(
     raise_budget: bool,
 ) -> Vec<Instruction> {
     let pda = accounts[slot_of(global_id, accounts.len())];
-    let compute = Redline::at(PROGRAM).hash(global_id, causal::HASH_INIT.to_bytes(), iters, &[pda]);
+    let compute = REDLINE.hash(global_id, causal::HASH_INIT.to_bytes(), iters, &[pda]);
     if raise_budget {
         vec![causal::compute_unit_limit(causal::CU_LIMIT), compute]
     } else {
@@ -155,6 +153,7 @@ fn build_ixs(
 #[allow(clippy::too_many_arguments)]
 async fn execute_cell_burst(
     er_rpc_url: Url,
+    er_ws_url: Url,
     config: BurstConfig,
     id_offset: u64,
     accounts: Arc<Vec<Pubkey>>,
@@ -176,11 +175,12 @@ async fn execute_cell_burst(
         let concurrency = budgets.concurrency[worker.index];
         let thread_first_id = id_offset + first_id;
         let er_rpc_url = er_rpc_url.clone();
+        let er_ws_url = er_ws_url.clone();
         let accounts = accounts.clone();
         let payer_bytes = payer_bytes.clone();
         let probe = probe.clone();
         async move {
-            let client = ErClient::new(er_rpc_url);
+            let client = ErClient::new(er_rpc_url, er_ws_url);
             let senders: Vec<TxSender> = payer_bytes
                 .iter()
                 .map(|bytes| {
@@ -227,9 +227,7 @@ async fn execute_cell_burst(
                         let api = api.clone();
                         future::ready(Ok(SendTransaction(move |_: Instant| async move {
                             let rejected = api.send_prepared(&body).await?;
-                            if rejected != 0 {
-                                return Err(anyhow!("{rejected} entries rejected"));
-                            }
+                            ensure!(rejected == 0);
                             Ok(())
                         })))
                     },
@@ -313,14 +311,10 @@ impl Scenario<ScenarioReport> for ExecutorSaturation {
         let profile = PROFILES.select(base.config().profile);
 
         let payers = base.funded_payers(profile.accounts, PAYER_LAMPORTS).await?;
-        let accounts = Accounts {
-            program_id: PROGRAM,
-            space: ACCOUNT_SPACE,
-            authority: er.identity(),
-        }
-        .init_batched(base.as_ref(), &payers, profile.accounts, true)
-        .await?;
-        er.await_clones(&accounts, ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
+        let accounts = Accounts::new(ACCOUNT_SPACE, er.identity())
+            .init_batched(base.as_ref(), &payers, profile.accounts, true)
+            .await?;
+        er.await_clones(&accounts, ACCOUNT_SPACE as usize).await?;
         let accounts = Arc::new(accounts);
         let payer_bytes = prep::payer_bytes(&payers);
 
@@ -346,6 +340,7 @@ impl Scenario<ScenarioReport> for ExecutorSaturation {
         let count_before_warmup = er.scrape_metrics().await?.get(TX_COUNT);
         let warm = execute_cell_burst(
             er_rpc_url.clone(),
+            er.ws_url().clone(),
             BurstConfig {
                 threads: profile.threads,
                 iterations: profile.warmup,
@@ -361,12 +356,7 @@ impl Scenario<ScenarioReport> for ExecutorSaturation {
             Arc::new(OnceLock::new()),
         )
         .await?;
-        ensure!(
-            warm.outcome.failed == 0,
-            "failures={:?}; first error={:?}",
-            warm.outcome.failed,
-            warm.outcome.first_error
-        );
+        ensure!(warm.outcome.failed == 0);
         if let Some(seen) = count_before_warmup {
             crate::await_executed(&er, seen + profile.warmup as f64, DRAIN_TIMEOUT).await?;
         }
@@ -391,6 +381,7 @@ impl Scenario<ScenarioReport> for ExecutorSaturation {
             );
             let burst = execute_cell_burst(
                 er_rpc_url.clone(),
+                er.ws_url().clone(),
                 BurstConfig {
                     threads: profile.threads,
                     iterations: cell_iterations,
@@ -408,12 +399,7 @@ impl Scenario<ScenarioReport> for ExecutorSaturation {
             .await?;
             let outcome = burst.outcome;
             offset += cell_iterations;
-            ensure!(
-                outcome.failed == 0,
-                "failures={:?}; first error={:?}",
-                outcome.failed,
-                outcome.first_error
-            );
+            ensure!(outcome.failed == 0);
             let drain = match before.get(TX_COUNT) {
                 Some(seen) => {
                     crate::await_executed(&er, seen + cell_iterations as f64, DRAIN_TIMEOUT).await?
@@ -529,13 +515,7 @@ impl Scenario<ScenarioReport> for ExecutorSaturation {
         let light = &cells[0];
         let heavy = &cells[1];
         let cu_ratio = heavy.probe_cus / light.probe_cus;
-        ensure!(
-            cu_ratio >= CU_CONTRAST_FLOOR,
-            "heavy cell consumed {:.0} cus per tx vs light {:.0} — not the \
-             >= {CU_CONTRAST_FLOOR}x compute contrast this scenario is about",
-            heavy.probe_cus,
-            light.probe_cus
-        );
+        ensure!(cu_ratio >= CU_CONTRAST_FLOOR);
 
         let mut summary = ScenarioReport::ok()
             .setting("profile", profile.name)

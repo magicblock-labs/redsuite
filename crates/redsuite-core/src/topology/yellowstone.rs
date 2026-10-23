@@ -5,7 +5,7 @@ use std::{
     process::Command,
 };
 
-use anyhow::{anyhow, Context};
+use anyhow::{anyhow, ensure, Context};
 use sha2::{Digest, Sha256};
 use tracing::info;
 use url::Url;
@@ -52,12 +52,11 @@ impl Plugin {
 pub async fn ensure(base_bin: &Path) -> Result<Plugin> {
     if let Some(path) = env::var_os(PLUGIN_ENV) {
         let libpath = PathBuf::from(path);
-        if !libpath.is_file() {
-            return Err(anyhow!(
-                "{PLUGIN_ENV} points at {}, which is not a file",
-                libpath.display()
-            ));
-        }
+        ensure!(
+            libpath.is_file(),
+            "{PLUGIN_ENV} points at {}, which is not a file",
+            libpath.display()
+        );
         return Ok(Plugin {
             tag: format!("{} (from {PLUGIN_ENV})", libpath.display()),
             libpath,
@@ -65,12 +64,11 @@ pub async fn ensure(base_bin: &Path) -> Result<Plugin> {
     }
     let tag = release_for(&base_version(base_bin)?)?;
 
-    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-        return Err(anyhow!(
-            "upstream publishes the Yellowstone geyser plugin only for \
+    ensure!(
+        cfg!(all(target_os = "linux", target_arch = "x86_64")),
+        "upstream publishes the Yellowstone geyser plugin only for \
              x86_64 linux; build one for this host and point {PLUGIN_ENV} at it"
-        ));
-    }
+    );
 
     Ok(Plugin {
         libpath: cached(tag).await?,
@@ -138,12 +136,7 @@ async fn cached(tag: &str) -> Result<PathBuf> {
     info!(tag, ?dir, "downloading Yellowstone geyser plugin");
     let bytes = fetch(&asset_url(tag, LIB)).await?;
     let actual = sha256(&bytes);
-    if actual != expected {
-        return Err(anyhow!(
-            "{LIB} from {tag} hashes to {actual}, but the release checksums \
-             list {expected}"
-        ));
-    }
+    ensure!(actual == expected);
 
     let staged = dir.join(format!("{LIB}.partial"));
     fs::write(&staged, &bytes)?;
@@ -174,9 +167,11 @@ fn asset_url(tag: &str, asset: &str) -> Url {
 
 async fn fetch(url: &Url) -> Result<Vec<u8>> {
     let response = reqwest::get(url.clone()).await.with_context(|| format!("fetching {url}"))?;
-    if !response.status().is_success() {
-        return Err(anyhow!("fetching {url}: HTTP {}", response.status()));
-    }
+    ensure!(
+        response.status().is_success(),
+        "fetching {url}: HTTP {}",
+        response.status()
+    );
     Ok(response.bytes().await.with_context(|| format!("reading {url}"))?.to_vec())
 }
 

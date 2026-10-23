@@ -1,6 +1,7 @@
 use std::{path::PathBuf, result};
 
-use anyhow::anyhow;
+use anyhow::ensure;
+
 use clap::ValueEnum;
 use futures_util::future::LocalBoxFuture;
 use magicblock_config::LeaderParams;
@@ -86,12 +87,11 @@ pub enum Fixture {
 impl Fixture {
     pub fn resolve(self) -> Result<PathBuf> {
         let path = crate::topology::workspace_root().join("target/deploy").join(self.so_name());
-        if !path.is_file() {
-            return Err(anyhow!(
-                "fixture {} is missing; run `cargo xtask programs`",
-                path.display()
-            ));
-        }
+        ensure!(
+            path.is_file(),
+            "fixture {} is missing; run `cargo xtask programs`",
+            path.display()
+        );
         Ok(path)
     }
 

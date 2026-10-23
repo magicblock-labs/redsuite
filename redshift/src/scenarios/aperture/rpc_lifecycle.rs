@@ -2,37 +2,39 @@ use std::{
     collections::BTreeMap,
     rc::Rc,
     sync::Arc,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{anyhow, ensure, Context};
+use anyhow::{ensure, Context};
 use futures_util::future::join_all;
 use hash::Hash;
-use json::{JsonContainerTrait, JsonValueTrait, Value};
 use pubkey::Pubkey;
 use redsuite_core::{
-    check,
+    api::{encode, transaction_meta},
     programs::{CellHeader, REDLINE},
     redline::Accounts,
-    rpc_client::{
-        nonblocking::rpc_client::RpcClient, rpc_client::GetConfirmedSignaturesForAddress2Config,
-    },
-    rpc_client_api::config::{
-        RpcBlockConfig, RpcSendTransactionConfig, RpcSimulateTransactionConfig,
-        RpcTransactionConfig,
+    rpc_types::{
+        config::{RpcBlockConfig, RpcSignaturesForAddressConfig, RpcTransactionConfig},
+        request::RpcRequest,
+        response::{
+            Response, RpcBlockhash, RpcConfirmedTransactionStatusWithSignature, RpcKeyedAccount,
+            RpcLogsResponse, SlotInfo,
+        },
     },
     system,
     transport::{
         clock::SendClock, events::EventSubscriptions, ws::SignatureConfirmations, wsraw::RawWs,
     },
-    BaseCtx, ChainCtx, DynError, ErCtx, Result, Scenario, TxSender,
+    Api, BaseCtx, ChainCtx, ErCtx, Result, Scenario, TxSender,
 };
 use serde::Deserialize;
 use signature::Signature;
 use signer::Signer;
+use solana_account_decoder_client_types::UiAccount;
 use solana_commitment_config::CommitmentConfig;
 use solana_transaction_status_client_types::{
-    TransactionConfirmationStatus, TransactionDetails, UiTransactionEncoding,
+    EncodedConfirmedTransactionWithStatusMeta, TransactionDetails, UiConfirmedBlock,
+    UiTransactionEncoding,
 };
 use transaction::Transaction;
 
@@ -44,21 +46,13 @@ const PAYER_LAMPORTS: u64 = 2_000_000_000;
 const FIRST_ID: u64 = 1_000;
 const ACCOUNTS_PER_CALL: usize = 100;
 const HISTORY_LIMIT: usize = 16;
-const CLONE_TIMEOUT: Duration = Duration::from_secs(30);
 const BURST_DEADLINE: Duration = Duration::from_secs(20);
-const CONFIRM_DEADLINE: Duration = Duration::from_secs(30);
-const PUBLICATION_TIMEOUT: Duration = Duration::from_secs(15);
-const POLL: Duration = Duration::from_millis(50);
 const LEDGER_SETTLE_SLOTS: u64 = 10;
-const LEDGER_SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
 
 const ACCOUNT_LAMPORTS: u64 = 1_000_000_000;
 const TRANSFER_LAMPORTS: u64 = 10_000;
 const SEQUENTIAL_TRANSFERS: u64 = 10;
 const LOGS_TRANSFERS: usize = 5;
-const TRANSFER_TIMEOUT: Duration = Duration::from_secs(5);
-const EVENT_TIMEOUT: Duration = Duration::from_secs(10);
-const EVENT_POLL: Duration = Duration::from_millis(20);
 const RAW_FIRST_TIMEOUT: Duration = Duration::from_secs(3);
 const RAW_DRAIN_TIMEOUT: Duration = Duration::from_millis(300);
 const RAW_SILENCE_TIMEOUT: Duration = Duration::from_millis(700);
@@ -68,16 +62,6 @@ struct Write {
     id: u64,
     transaction: Transaction,
     signature: Signature,
-}
-
-#[derive(Deserialize)]
-struct WithContext<T> {
-    value: T,
-}
-
-#[derive(Deserialize)]
-struct RawBlockhash {
-    blockhash: String,
 }
 
 #[derive(Deserialize)]
@@ -108,89 +92,54 @@ fn block_config() -> RpcBlockConfig {
     }
 }
 
-fn is_confirmed(status: &Option<TransactionConfirmationStatus>) -> bool {
-    matches!(
-        status,
-        Some(TransactionConfirmationStatus::Confirmed)
-            | Some(TransactionConfirmationStatus::Finalized)
-    )
-}
-
-async fn await_clones(client: &RpcClient, pdas: &[Pubkey]) -> Result<()> {
-    let deadline = Instant::now() + CLONE_TIMEOUT;
-    loop {
-        let mut all_present = true;
-        for chunk in pdas.chunks(ACCOUNTS_PER_CALL) {
-            let accounts =
-                client.get_multiple_accounts_with_commitment(chunk, confirmed()).await?.value;
-            all_present &= accounts.iter().all(|account| {
-                account
+async fn await_clones(client: &Api, pdas: &[Pubkey]) -> Result<()> {
+    client
+        .await_accounts(pdas, "delegated account clones", async || {
+            for chunk in pdas.chunks(ACCOUNTS_PER_CALL) {
+                let accounts = client.get_multiple_accounts(chunk).await?;
+                ensure!(accounts.iter().all(|account| account
                     .as_ref()
-                    .is_some_and(|account| account.data.len() == ACCOUNT_SPACE as usize)
-            });
-        }
-        if all_present {
-            return Ok(());
-        }
-        ensure!(
-            Instant::now() < deadline,
-            "the ER did not clone all {} delegated accounts within \
-             {CLONE_TIMEOUT:?}",
-            pdas.len()
-        );
-        tokio::time::sleep(POLL).await;
-    }
-}
-
-async fn await_statuses(client: &RpcClient, signatures: &[Signature]) -> Result<Vec<u64>> {
-    let deadline = Instant::now() + CONFIRM_DEADLINE;
-    loop {
-        let statuses = client.get_signature_statuses(signatures).await?.value;
-        ensure!(statuses.len() == signatures.len());
-        let mut slots = Vec::with_capacity(signatures.len());
-        for (signature, status) in signatures.iter().zip(&statuses) {
-            let Some(status) = status else {
-                break;
-            };
-            ensure!(
-                status.err.is_none(),
-                "write {signature} failed on the ER: {:?}",
-                status.err
-            );
-            if !is_confirmed(&status.confirmation_status) {
-                break;
+                    .is_some_and(|account| account.data.len() == ACCOUNT_SPACE as usize)));
             }
-            slots.push(status.slot);
-        }
-        if slots.len() == signatures.len() {
-            return Ok(slots);
-        }
-        ensure!(
-            Instant::now() < deadline,
-            "only {} of {} writes reached confirmed status within \
-             {CONFIRM_DEADLINE:?}",
-            slots.len(),
-            signatures.len()
-        );
-        tokio::time::sleep(POLL).await;
-    }
+            Ok(())
+        })
+        .await
 }
 
-async fn await_publication(client: &RpcClient, slot: u64) -> Result<()> {
-    let deadline = Instant::now() + PUBLICATION_TIMEOUT;
-    loop {
-        if client.get_block_with_config(slot, block_config()).await.is_ok() {
-            return Ok(());
-        }
-        ensure!(
-            Instant::now() < deadline,
-            "getBlock({slot}) was not published within {PUBLICATION_TIMEOUT:?}"
-        );
-        tokio::time::sleep(POLL).await;
-    }
+async fn await_statuses(client: &Api, signatures: &[Signature]) -> Result<Vec<u64>> {
+    futures_util::future::try_join_all(
+        signatures.iter().map(|signature| client.confirm(signature)),
+    )
+    .await?;
+    client
+        .await_query("confirmed signature statuses", async || {
+            let statuses = client.get_signature_statuses(signatures).await?;
+            statuses
+                .into_iter()
+                .map(|status| {
+                    let status =
+                        status.context("confirmed signature missing from getSignatureStatuses")?;
+                    ensure!(status.err == None);
+                    ensure!(status.satisfies_commitment(confirmed()));
+                    Ok(status.slot)
+                })
+                .collect()
+        })
+        .await
 }
 
-async fn burst(base: &BaseCtx, er: &ErCtx, client: &RpcClient) -> Result<()> {
+async fn await_publication(client: &Api, slot: u64) -> Result<()> {
+    client
+        .await_query("block publication", async || {
+            client
+                .call::<UiConfirmedBlock>(RpcRequest::GetBlock, &(slot, block_config()))
+                .await?;
+            Ok(())
+        })
+        .await
+}
+
+async fn burst(base: &BaseCtx, er: &ErCtx, client: &Api) -> Result<()> {
     let payers = base.funded_payers(PAYERS, PAYER_LAMPORTS).await?;
     let pdas = Accounts::new(ACCOUNT_SPACE, er.identity())
         .init_batched(base, &payers, WRITES, true)
@@ -198,20 +147,19 @@ async fn burst(base: &BaseCtx, er: &ErCtx, client: &RpcClient) -> Result<()> {
     let per_payer = WRITES.div_ceil(PAYERS);
     await_clones(client, &pdas).await?;
     let blockhash = client.get_latest_blockhash().await?;
-    ensure!(
-        client.is_blockhash_valid(&blockhash, confirmed()).await?,
-        "getLatestBlockhash returned {blockhash} but isBlockhashValid \
-         rejects it"
-    );
+    ensure!(client.is_blockhash_valid(&blockhash).await?);
     let pda_strings: Vec<String> = pdas.iter().map(ToString::to_string).collect();
-    let for_accounts: WithContext<RawBlockhash> =
-        er.api().call("getBlockhashForAccounts", &(pda_strings,)).await?;
+    let for_accounts: Response<RpcBlockhash> = er
+        .api()
+        .call(
+            RpcRequest::Custom {
+                method: "getBlockhashForAccounts",
+            },
+            &(pda_strings,),
+        )
+        .await?;
     let for_accounts: Hash = for_accounts.value.blockhash.parse()?;
-    ensure!(
-        client.is_blockhash_valid(&for_accounts, confirmed()).await?,
-        "getBlockhashForAccounts returned {for_accounts} but \
-         isBlockhashValid rejects it"
-    );
+    ensure!(client.is_blockhash_valid(&for_accounts).await?);
 
     let writes: Vec<Write> = pdas
         .iter()
@@ -236,67 +184,26 @@ async fn burst(base: &BaseCtx, er: &ErCtx, client: &RpcClient) -> Result<()> {
         .collect();
     let signatures: Vec<Signature> = writes.iter().map(|write| write.signature).collect();
     let probe = &writes[0];
-    client.get_fee_for_message(&probe.transaction.message).await?;
-    let simulation = client
-        .simulate_transaction_with_config(
-            &probe.transaction,
-            RpcSimulateTransactionConfig {
-                sig_verify: true,
-                commitment: Some(confirmed()),
-                ..RpcSimulateTransactionConfig::default()
-            },
-        )
-        .await?
-        .value;
-    ensure!(
-        simulation.err.is_none(),
-        "simulateTransaction rejected a valid write: {:?}",
-        simulation.err
-    );
+    let message = encode(&probe.transaction.message)?;
+    let _fee: Option<u64> =
+        client.call_value(RpcRequest::GetFeeForMessage, &(message, confirmed())).await?;
+    let simulation = client.simulate_transaction(&probe.transaction).await?;
+    ensure!(simulation.err == None);
     let after_simulation = client
-        .get_account_with_commitment(&probe.address, confirmed())
+        .get_account(&probe.address)
         .await?
-        .value
         .context("the probe account vanished after simulation")?;
     ensure!(CellHeader::written_id(&after_simulation.data) == Some(0));
-    let after_simulation = client.get_signature_statuses(&[probe.signature]).await?.value;
-    ensure!(
-        after_simulation.first().is_some_and(Option::is_none),
-        "simulateTransaction must not record a signature status"
-    );
+    let after_simulation = client.get_signature_status(&probe.signature).await?;
+    ensure!(after_simulation.is_none());
 
-    let send_config = RpcSendTransactionConfig {
-        skip_preflight: true,
-        preflight_commitment: Some(confirmed().commitment),
-        ..RpcSendTransactionConfig::default()
-    };
-    let sends = join_all(
-        writes
-            .iter()
-            .map(|write| client.send_transaction_with_config(&write.transaction, send_config)),
-    );
+    let sends = join_all(writes.iter().map(|write| client.send_transaction(&write.transaction)));
     let sends = tokio::time::timeout(BURST_DEADLINE, sends)
         .await
         .with_context(|| format!("the burst of {WRITES} sends exceeded {BURST_DEADLINE:?}"))?;
-    let mut failures = 0u64;
-    let mut first_failure = None;
-    for (write, sent) in writes.iter().zip(sends) {
-        match sent {
-            Ok(signature) => ensure!(signature == write.signature),
-            Err(error) => {
-                failures += 1;
-                first_failure.get_or_insert_with(|| {
-                    format!("send of {} failed: {error:#}", write.signature)
-                });
-            }
-        }
+    for sent in sends {
+        sent?;
     }
-    ensure!(
-        failures == 0,
-        "failures={:?}; first error={:?}",
-        failures,
-        first_failure
-    );
 
     let slots = await_statuses(client, &signatures).await?;
     let min_slot = *slots.iter().min().context("no slots recorded")?;
@@ -310,78 +217,63 @@ async fn burst(base: &BaseCtx, er: &ErCtx, client: &RpcClient) -> Result<()> {
 
     let mut block_times = Vec::with_capacity(writes.len());
     for (write, slot) in writes.iter().zip(&slots) {
-        let transaction = client
-            .get_transaction_with_config(&write.signature, transaction_config())
+        let transaction: EncodedConfirmedTransactionWithStatusMeta = client
+            .call(
+                RpcRequest::GetTransaction,
+                &(write.signature.to_string(), transaction_config()),
+            )
             .await?;
         ensure!(transaction.slot == *slot);
         let meta = transaction.transaction.meta.context("getTransaction returned no meta")?;
-        ensure!(
-            meta.err.is_none(),
-            "getTransaction reports a failed write {}: {:?}",
-            write.signature,
-            meta.err
-        );
+        ensure!(meta.err == None);
         block_times.push(transaction.block_time.context("getTransaction returned no blockTime")?);
     }
 
     for (slot, indices) in &by_slot {
-        let block = client.get_block_with_config(*slot, block_config()).await?;
-        let block_time = client.get_block_time(*slot).await?;
+        let block: UiConfirmedBlock =
+            client.call(RpcRequest::GetBlock, &(*slot, block_config())).await?;
+        let block_time = client.call::<i64>(RpcRequest::GetBlockTime, &(*slot,)).await?;
         ensure!(block.block_time == Some(block_time));
         let listed = block.signatures.context("getBlock returned no signatures")?;
         for &index in indices {
             let signature = writes[index].signature.to_string();
-            ensure!(
-                listed.contains(&signature),
-                "getBlock({slot}) must list {signature}"
-            );
+            ensure!(listed.contains(&signature));
             ensure!(block_times[index] == block_time);
         }
     }
-    let blocks = client.get_blocks_with_commitment(min_slot, Some(max_slot), confirmed()).await?;
-    ensure!(
-        blocks.windows(2).all(|pair| pair[0] < pair[1]),
-        "getBlocks must return strictly ascending slots"
-    );
+    let blocks: Vec<u64> = client
+        .call(
+            RpcRequest::GetBlocks,
+            &(min_slot, Some(max_slot), confirmed()),
+        )
+        .await?;
+    ensure!(blocks.windows(2).all(|pair| pair[0] < pair[1]));
     for slot in by_slot.keys() {
-        ensure!(
-            blocks.contains(slot),
-            "getBlocks({min_slot}, {max_slot}) must include slot {slot}"
-        );
+        ensure!(blocks.contains(slot));
     }
-    let limited = client
-        .get_blocks_with_limit_and_commitment(
-            min_slot,
-            (max_slot - min_slot + 1) as usize,
-            confirmed(),
+    let limited: Vec<u64> = client
+        .call(
+            RpcRequest::GetBlocksWithLimit,
+            &(min_slot, (max_slot - min_slot + 1) as usize, confirmed()),
         )
         .await?;
     ensure!(limited == blocks);
-    let slot_before = client.get_slot_with_commitment(confirmed()).await?;
-    let height = client.get_block_height_with_commitment(confirmed()).await?;
-    let slot_after = client.get_slot_with_commitment(confirmed()).await?;
-    ensure!(
-        slot_before <= height && height <= slot_after,
-        "getBlockHeight ({height}) must sit between consecutive getSlot \
-         reads ({slot_before}, {slot_after})"
-    );
-    ensure!(
-        slot_before >= max_slot,
-        "getSlot ({slot_before}) must not precede the last write slot \
-         {max_slot}"
-    );
+    let slot_before = client.get_slot().await?;
+    let height: u64 = client.call(RpcRequest::GetBlockHeight, &(confirmed(),)).await?;
+    let slot_after = client.get_slot().await?;
+    ensure!(slot_before <= height && height <= slot_after);
+    ensure!(slot_before >= max_slot);
 
     for (chunk_index, chunk) in pdas.chunks(ACCOUNTS_PER_CALL).enumerate() {
-        let batched = client.get_multiple_accounts_with_commitment(chunk, confirmed()).await?.value;
+        let batched = client.get_multiple_accounts(chunk).await?;
         for (offset, (pda, batched)) in chunk.iter().zip(batched).enumerate() {
             let write = &writes[chunk_index * ACCOUNTS_PER_CALL + offset];
             let batched = batched.context("getMultipleAccounts dropped a written account")?;
             let single = client
-                .get_account_with_commitment(pda, confirmed())
+                .get_account(pda)
                 .await?
-                .value
                 .context("getAccountInfo dropped a written account")?;
-            let balance = client.get_balance_with_commitment(pda, confirmed()).await?.value;
+            let balance = client.get_balance(pda).await?;
             ensure!(CellHeader::written_id(&single.data) == Some(write.id));
             ensure!(batched.data == single.data);
             ensure!(batched.lamports == single.lamports);
@@ -390,14 +282,15 @@ async fn burst(base: &BaseCtx, er: &ErCtx, client: &RpcClient) -> Result<()> {
     }
 
     for (write, slot) in writes.iter().zip(&slots) {
-        let history = client
-            .get_signatures_for_address_with_config(
-                &write.address,
-                GetConfirmedSignaturesForAddress2Config {
-                    limit: Some(HISTORY_LIMIT),
-                    commitment: Some(confirmed()),
-                    ..GetConfirmedSignaturesForAddress2Config::default()
-                },
+        let config = RpcSignaturesForAddressConfig {
+            limit: Some(HISTORY_LIMIT),
+            commitment: Some(confirmed()),
+            ..RpcSignaturesForAddressConfig::default()
+        };
+        let history: Vec<RpcConfirmedTransactionStatusWithSignature> = client
+            .call(
+                RpcRequest::GetSignaturesForAddress,
+                &(write.address.to_string(), config),
             )
             .await?;
         let entry = history
@@ -410,24 +303,24 @@ async fn burst(base: &BaseCtx, er: &ErCtx, client: &RpcClient) -> Result<()> {
                 )
             })?;
         ensure!(entry.slot == *slot);
-        ensure!(
-            entry.err.is_none(),
-            "getSignaturesForAddress reports a failed write {}",
-            write.signature
-        );
+        ensure!(entry.err == None);
     }
-    let delegated: RawDelegationStatus =
-        er.api().call("getDelegationStatus", &(probe.address.to_string(),)).await?;
-    ensure!(
-        delegated.is_delegated,
-        "getDelegationStatus must report the written pda as delegated"
-    );
-    let undelegated: RawDelegationStatus =
-        er.api().call("getDelegationStatus", &(payers[0].pubkey().to_string(),)).await?;
-    ensure!(
-        !undelegated.is_delegated,
-        "getDelegationStatus must report a plain payer as not delegated"
-    );
+    let delegated: RawDelegationStatus = er
+        .api()
+        .call(
+            RpcRequest::Custom { method: "getDelegationStatus" },
+            &(probe.address.to_string(),),
+        )
+        .await?;
+    ensure!(delegated.is_delegated);
+    let undelegated: RawDelegationStatus = er
+        .api()
+        .call(
+            RpcRequest::Custom { method: "getDelegationStatus" },
+            &(payers[0].pubkey().to_string(),),
+        )
+        .await?;
+    ensure!(!undelegated.is_delegated);
     Ok(())
 }
 
@@ -441,12 +334,9 @@ async fn transfer(
         let signature = sender
             .submit_fresh(&[system::transfer(&sender.payer().pubkey(), to, lamports)])
             .await?;
-        let confirmed = er.api().await_transaction(&signature, TRANSFER_TIMEOUT).await?;
-        ensure!(
-            confirmed.err.is_none(),
-            "transfer {signature} failed: {:?}",
-            confirmed.err
-        );
+        let confirmed = er.api().await_transaction(&signature).await?;
+        let meta = transaction_meta(&confirmed)?;
+        ensure!(meta.err == None);
         Ok((signature, confirmed.slot))
     })
     .await
@@ -454,68 +344,29 @@ async fn transfer(
 
 async fn timestamps(er: &ErCtx, executions: Vec<(Signature, u64)>) -> Result<()> {
     let last_slot = executions.last().map_or(0, |(_, slot)| *slot);
-    let settled = check::poll_until(LEDGER_SETTLE_TIMEOUT, POLL, async || {
-        Ok::<_, DynError>(
-            (er.api().get_slot().await? >= last_slot + LEDGER_SETTLE_SLOTS).then_some(()),
-        )
-    })
-    .await?;
-    ensure!(
-        settled.is_some(),
-        "the slot never reached {} within {LEDGER_SETTLE_TIMEOUT:?}",
-        last_slot + LEDGER_SETTLE_SLOTS
-    );
+    er.api().await_slot(last_slot + LEDGER_SETTLE_SLOTS).await?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
     for (signature, slot) in &executions {
-        let time = er
-            .api()
-            .get_block_time(*slot)
-            .await?
-            .ok_or_else(|| anyhow!("getBlockTime({slot}) returned null for {signature}"))?;
-        let block = er
-            .api()
-            .get_block(*slot)
-            .await?
-            .ok_or_else(|| anyhow!("getBlock({slot}) returned null for {signature}"))?;
+        let time = er.api().get_block_time(*slot).await?.context("settled block time missing")?;
+        let block = er.api().get_block(*slot).await?.context("settled block missing")?;
         let transaction = er
             .api()
             .get_transaction(signature)
             .await?
-            .with_context(|| format!("settled {signature} vanished"))?;
+            .context("settled transaction missing")?;
         ensure!((block.block_time, transaction.block_time) == (Some(time), Some(time)));
-        ensure!(
-            time > 0 && time <= now,
-            "timestamp {time} of {signature} is positive and not in the \
-             future (now {now})"
-        );
+        ensure!(time > 0 && time <= now);
     }
     Ok(())
 }
 
-async fn await_event_where(
+async fn await_event_where<T: serde::de::DeserializeOwned>(
     events: &EventSubscriptions,
     key: u64,
     what: &str,
-    matches: impl Fn(&Value) -> bool,
-) -> Result<Value> {
-    check::poll_until(EVENT_TIMEOUT, EVENT_POLL, async || {
-        Result::Ok(events.events(key).into_iter().find(|event| matches(event)))
-    })
-    .await?
-    .ok_or_else(|| {
-        anyhow!(
-            "{what} after {EVENT_TIMEOUT:?}: events={:?}",
-            events.events(key)
-        )
-    })
-}
-
-fn event_lamports(event: &Value) -> Option<u64> {
-    event.get("value").get("lamports").as_u64()
-}
-
-fn event_signature(event: &Value) -> Option<String> {
-    event.get("value").get("signature").as_str().map(str::to_owned)
+    matches: impl Fn(&T) -> bool,
+) -> Result<T> {
+    events.await_event(key, matches).await.with_context(|| what.to_owned())
 }
 
 async fn wallet_stream(base: &BaseCtx, er: &ErCtx, events: &EventSubscriptions) -> Result<()> {
@@ -527,7 +378,7 @@ async fn wallet_stream(base: &BaseCtx, er: &ErCtx, events: &EventSubscriptions) 
     let sender = er.sender(Rc::new(account1));
     let account1_key = events.account_subscribe(&account1_pubkey).await?;
     let account2_key = events.account_subscribe(&account2).await?;
-    events.await_subscribed(3, Duration::from_secs(5)).await?;
+    events.await_subscribed(3).await?;
     let mut sent = 0u64;
 
     let executions = crate::phase("ws account stream", async {
@@ -540,33 +391,33 @@ async fn wallet_stream(base: &BaseCtx, er: &ErCtx, events: &EventSubscriptions) 
                 events,
                 account1_key,
                 "sequential account 1 update",
-                |event| event_lamports(event) == Some(expected),
+                |event: &Response<UiAccount>| event.value.lamports == expected,
             )
             .await?;
             if sent == 1 {
-                await_event_where(events, account2_key, "account 2 credit", |event| {
-                    event_lamports(event) == Some(ACCOUNT_LAMPORTS + TRANSFER_LAMPORTS)
-                })
+                await_event_where(
+                    events,
+                    account2_key,
+                    "account 2 credit",
+                    |event: &Response<UiAccount>| {
+                        event.value.lamports == ACCOUNT_LAMPORTS + TRANSFER_LAMPORTS
+                    },
+                )
                 .await?;
-                for event in events.events(account2_key) {
-                    let lamports = event_lamports(&event);
+                for event in events.events::<Response<UiAccount>>(account2_key)? {
+                    let lamports = event.value.lamports;
                     ensure!(
-                        lamports == Some(ACCOUNT_LAMPORTS)
-                            || lamports == Some(ACCOUNT_LAMPORTS + TRANSFER_LAMPORTS),
-                        "unexpected account 2 lamports in {event:?}"
+                        lamports == ACCOUNT_LAMPORTS
+                            || lamports == ACCOUNT_LAMPORTS + TRANSFER_LAMPORTS
                     );
                 }
             }
         }
         let mut previous = ACCOUNT_LAMPORTS;
-        for event in events.events(account1_key) {
-            let lamports = event_lamports(&event)
-                .ok_or_else(|| anyhow!("account 1 notification without lamports: {event:?}"))?;
+        for event in events.events::<Response<UiAccount>>(account1_key)? {
+            let lamports = event.value.lamports;
             ensure!(
-                lamports == previous || previous.checked_sub(TRANSFER_LAMPORTS) == Some(lamports),
-                "out-of-order account 1 notification {lamports}: neither the \
-                 previous {previous} nor one step down (a replaying validator \
-                 that resent a stale balance would fail here)"
+                lamports == previous || previous.checked_sub(TRANSFER_LAMPORTS) == Some(lamports)
             );
             previous = lamports;
         }
@@ -580,7 +431,7 @@ async fn wallet_stream(base: &BaseCtx, er: &ErCtx, events: &EventSubscriptions) 
             let mentions1_key = events.logs_subscribe_mentions(&account1_pubkey).await?;
             let mentions2_key = events.logs_subscribe_mentions(&account2).await?;
             let program_key = events.program_subscribe(&system_program).await?;
-            events.await_subscribed(6, Duration::from_secs(5)).await?;
+            events.await_subscribed(6).await?;
             let mut logs_signatures = Vec::with_capacity(LOGS_TRANSFERS);
             for _ in 0..LOGS_TRANSFERS {
                 let (signature, _) = transfer(er, &sender, &account2, TRANSFER_LAMPORTS).await?;
@@ -592,17 +443,18 @@ async fn wallet_stream(base: &BaseCtx, er: &ErCtx, events: &EventSubscriptions) 
                     (mentions1_key, "logs mentions(account1) entry"),
                     (mentions2_key, "logs mentions(account2) entry"),
                 ] {
-                    let event = await_event_where(events, key, what, |event| {
-                        event_signature(event).as_deref() == Some(logs_signature.as_str())
-                    })
+                    let event = await_event_where(
+                        events,
+                        key,
+                        what,
+                        |event: &Response<RpcLogsResponse>| {
+                            event.value.signature == *logs_signature
+                        },
+                    )
                     .await?;
-                    ensure!(
-                        event.get("value").get("err").is_null(),
-                        "{what} carries an error: {event:?}"
-                    );
-                    let log_count =
-                        event.get("value").get("logs").as_array().map_or(0, |logs| logs.len());
-                    ensure!(log_count > 0, "{what}: missing logs; event={event:?}");
+                    ensure!(event.value.err == None);
+                    let log_count = event.value.logs.len();
+                    ensure!(log_count > 0);
                 }
             }
             let expected1 = ACCOUNT_LAMPORTS - sent * TRANSFER_LAMPORTS;
@@ -611,11 +463,15 @@ async fn wallet_stream(base: &BaseCtx, er: &ErCtx, events: &EventSubscriptions) 
                 ("program update 1", account1_pubkey, expected1),
                 ("program update 2", account2, expected2),
             ] {
-                await_event_where(events, program_key, what, |event| {
-                    event.get("value").get("pubkey").as_str() == Some(account.to_string().as_str())
-                        && event.get("value").get("account").get("lamports").as_u64()
-                            == Some(expected)
-                })
+                await_event_where(
+                    events,
+                    program_key,
+                    what,
+                    |event: &Response<RpcKeyedAccount>| {
+                        event.value.pubkey == account.to_string()
+                            && event.value.account.lamports == expected
+                    },
+                )
                 .await?;
             }
             Ok(())
@@ -630,28 +486,16 @@ async fn wallet_stream(base: &BaseCtx, er: &ErCtx, events: &EventSubscriptions) 
                 sender.prepare(&[system::transfer(&account1_pubkey, &account2, 7_777)]).await?;
             confirmations.subscribe(1, &immediate_tx.signatures[0]).await?;
             crate::phase("http transfer", sender.submit_prepared(&immediate_tx)).await?;
-            tokio::time::timeout(EVENT_TIMEOUT, confirmations.await_id(1))
-                .await
-                .map_err(|_| anyhow!("signature notification never fired"))??;
+            confirmations.await_id(1).await.context("signature notification never fired")?;
             let (delayed_signature, _) = transfer(er, &sender, &account2, 8_888).await?;
             tokio::time::sleep(Duration::from_millis(50)).await;
             confirmations.subscribe(2, &delayed_signature).await?;
-            tokio::time::timeout(EVENT_TIMEOUT, confirmations.await_id(2)).await.map_err(
-                |_| {
-                    anyhow!(
-                        "{}",
-                        "delayed signature subscription never fired for \
-                         an already-confirmed signature"
-                    )
-                },
-            )??;
+            confirmations.await_id(2).await.context(
+                "delayed signature subscription never fired for an already-confirmed signature",
+            )?;
             let outcome = confirmations.finalize();
             ensure!(outcome.confirmed == 2);
-            ensure!(
-                outcome.failed == 0,
-                "signature notification failed: {:?}",
-                outcome.first_failure
-            );
+            ensure!(outcome.failed == 0);
             Ok(())
         })
         .await?;
@@ -665,46 +509,28 @@ async fn wallet_stream(base: &BaseCtx, er: &ErCtx, events: &EventSubscriptions) 
                     _ => raw.program_subscribe(&system_program).await?,
                 };
                 transfer(er, &sender, &account2, TRANSFER_LAMPORTS).await?;
-                ensure!(
-                    raw.next_notification(RAW_FIRST_TIMEOUT).await?.is_some(),
-                    "no {case} notification before unsubscribe"
-                );
+                ensure!(raw.next_notification(RAW_FIRST_TIMEOUT).await?.is_some());
                 let removed = match case {
                     "account" => raw.account_unsubscribe(subscription).await?,
                     "logs" => raw.logs_unsubscribe(subscription).await?,
                     _ => raw.program_unsubscribe(subscription).await?,
                 };
-                ensure!(removed, "the {case} unsubscribe must return true");
+                ensure!(removed);
                 while raw.next_notification(RAW_DRAIN_TIMEOUT).await?.is_some() {}
-                let (signature, _) = transfer(er, &sender, &account2, TRANSFER_LAMPORTS).await?;
-                ensure!(
-                    raw.next_notification(RAW_SILENCE_TIMEOUT).await?.is_none(),
-                    "{case} notifications continued after unsubscribe \
-                     ({signature})"
-                );
+                transfer(er, &sender, &account2, TRANSFER_LAMPORTS).await?;
+                ensure!(raw.next_notification(RAW_SILENCE_TIMEOUT).await?.is_none());
             }
             let slot_sub = raw.slot_subscribe().await?;
-            ensure!(
-                raw.next_notification(RAW_FIRST_TIMEOUT).await?.is_some(),
-                "no slot notification before unsubscribe"
-            );
-            ensure!(
-                raw.slot_unsubscribe(slot_sub).await?,
-                "the slot unsubscribe must return true"
-            );
+            ensure!(raw.next_notification(RAW_FIRST_TIMEOUT).await?.is_some());
+            ensure!(raw.slot_unsubscribe(slot_sub).await?);
             while raw.next_notification(RAW_DRAIN_TIMEOUT).await?.is_some() {}
-            ensure!(
-                raw.next_notification(RAW_SILENCE_TIMEOUT).await?.is_none(),
-                "slot notifications continued after unsubscribe"
-            );
+            ensure!(raw.next_notification(RAW_SILENCE_TIMEOUT).await?.is_none());
             let refusal = match raw.logs_subscribe_all().await {
                 Err(error) => format!("{error:#}"),
-                Ok(subid) => format!("accepted as subscription {subid}"),
+                Ok(_) => "subscription accepted".to_owned(),
             };
             ensure!(
-                refusal.contains("-32602") && refusal.contains("'all' filter is not supported"),
-                "logsSubscribe(all) must be refused with invalid params \
-                 naming the filter, got: {refusal}"
+                refusal.contains("-32602") && refusal.contains("'all' filter is not supported")
             );
             let unsent =
                 sender.prepare(&[system::transfer(&account1_pubkey, &account2, 9_999)]).await?;
@@ -723,18 +549,11 @@ async fn wallet_stream(base: &BaseCtx, er: &ErCtx, events: &EventSubscriptions) 
 }
 
 async fn slot_stream(events: &EventSubscriptions, slot_key: u64) -> Result<()> {
-    events.await_events(slot_key, 10, EVENT_TIMEOUT).await?;
+    events.await_events(slot_key, 10).await?;
     let mut last_slot = 0u64;
-    for event in events.events(slot_key) {
-        let slot = event
-            .get("slot")
-            .as_u64()
-            .ok_or_else(|| anyhow!("slot event without a slot field: {event:?}"))?;
-        ensure!(
-            slot > last_slot,
-            "slot sequence not strictly increasing: {slot} after \
-             {last_slot}"
-        );
+    for event in events.events::<SlotInfo>(slot_key)? {
+        let slot = event.slot;
+        ensure!(slot > last_slot);
         last_slot = slot;
     }
     Ok(())
@@ -743,14 +562,14 @@ async fn slot_stream(events: &EventSubscriptions, slot_key: u64) -> Result<()> {
 pub struct RpcLifecycle {
     base: Rc<BaseCtx>,
     er: ErCtx,
-    client: RpcClient,
+    client: Api,
     events: EventSubscriptions,
     slot_key: u64,
 }
 
 impl Scenario for RpcLifecycle {
     async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
-        let client = RpcClient::new_with_commitment(er.api().url().to_string(), confirmed());
+        let client = er.api().clone();
         let events = EventSubscriptions::connect(er.ws_url()).await?;
         let slot_key = events.slot_subscribe().await?;
         Ok(Self {

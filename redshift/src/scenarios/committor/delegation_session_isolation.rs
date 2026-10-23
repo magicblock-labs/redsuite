@@ -9,13 +9,14 @@ use keypair::Keypair;
 use pubkey::Pubkey;
 
 use redsuite_core::{
-    check, dlp,
+    api::transaction_meta,
+    dlp,
     netfault::{BaseProxies, Selector},
     prep,
     programs::{CellHeader, CellId, SettlementMode, REDSHIFT},
     receipt,
     topology::{self, ErOptions, PrivateEr, RestartConfig},
-    BaseCtx, ChainCtx, DynError, ErCtx, Result, Scenario,
+    BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
 use signature::Signature;
 use signer::Signer;
@@ -24,11 +25,7 @@ use tokio::time;
 use crate::PAYER_LAMPORTS;
 
 const LABEL_A: &str = "session-isolation-a";
-const CLONE_TIMEOUT: Duration = Duration::from_secs(30);
 const INTERCEPT_TIMEOUT: Duration = Duration::from_secs(60);
-const RECEIPT_TIMEOUT: Duration = Duration::from_secs(120);
-const BASE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(30);
-const COMPLETION_TIMEOUT: Duration = Duration::from_secs(60);
 const STALE_WINDOW: Duration = Duration::from_secs(5);
 const RECOVERY_WINDOW: Duration = Duration::from_secs(10);
 const POLL: Duration = Duration::from_millis(250);
@@ -42,17 +39,13 @@ fn count(data: &[u8]) -> Result<u64> {
 }
 
 async fn await_clone_count(er: &ErCtx, account: &Pubkey, id: u64) -> Result<()> {
-    check::poll_for(
-        &format!("the er {} clones the cell with count {id}", er.identity()),
-        CLONE_TIMEOUT,
-        || async {
+    er.api()
+        .await_accounts(slice::from_ref(account), "cloned cell state", async || {
             let account = er.account(account).await?.context("ER cell absent")?;
             ensure!(count(&account.data)? == id);
-            Ok::<_, DynError>(())
-        },
-    )
-    .await
-    .with_context(|| format!("count {id}"))?;
+            Ok(())
+        })
+        .await?;
     Ok(())
 }
 
@@ -76,12 +69,12 @@ async fn await_base(
     id: u64,
     what: &str,
 ) -> Result<()> {
-    check::poll_for(what, COMPLETION_TIMEOUT, || async {
-        ensure!(base_state(base, account).await? == (owner, Some(id)));
-        Ok::<_, DynError>(())
-    })
-    .await
-    .with_context(|| format!("owner {owner} count {id}"))?;
+    base.api()
+        .await_accounts(slice::from_ref(account), what, async || {
+            ensure!(base_state(base, account).await? == (owner, Some(id)));
+            Ok(())
+        })
+        .await?;
     Ok(())
 }
 
@@ -136,8 +129,8 @@ async fn recover_session_a_commit_after_lost_response(
     let signature = schedule_commit(er, payer, account, SettlementMode::Commit).await?;
     let held = submission.wait(INTERCEPT_TIMEOUT).await?;
     let base_signature = held.operation.signature()?;
-    let base_tx = base.api().await_transaction(&base_signature, BASE_CONFIRM_TIMEOUT).await?;
-    ensure!(base_tx.err == None);
+    let base_tx = base.api().await_transaction(&base_signature).await?;
+    ensure!(transaction_meta(&base_tx)?.err == None);
     await_base(
         base,
         account,
@@ -148,13 +141,8 @@ async fn recover_session_a_commit_after_lost_response(
     .await?;
     held.discard();
 
-    let receipt = receipt::fetch_commit_receipt(er.api(), &signature, RECEIPT_TIMEOUT).await?;
-    ensure!(
-        receipt.succeeded() || receipt.failure_is_duplicate_rejection(),
-        "the session-a commit intent must converge after a lost base response, \
-         got {:?}",
-        receipt.error_message
-    );
+    let receipt = receipt::fetch_commit_receipt(er.api(), &signature).await?;
+    ensure!(receipt.succeeded() || receipt.failure_is_duplicate_rejection());
     Ok(())
 }
 
@@ -191,13 +179,8 @@ async fn isolate(
     let delayed = proxies.intercept(Selector::methods(&[]).ws().notification().account(&account));
     let undelegate =
         schedule_commit(er_a.ctx(), payer, &account, SettlementMode::Undelegate).await?;
-    let undelegated =
-        receipt::fetch_commit_receipt(er_a.ctx().api(), &undelegate, RECEIPT_TIMEOUT).await?;
-    ensure!(
-        undelegated.succeeded() || undelegated.failure_is_duplicate_rejection(),
-        "the session-a undelegation must complete, got {:?}",
-        undelegated.error_message
-    );
+    let undelegated = receipt::fetch_commit_receipt(er_a.ctx().api(), &undelegate).await?;
+    ensure!(undelegated.succeeded() || undelegated.failure_is_duplicate_rejection());
     await_base(
         base,
         &account,
@@ -232,11 +215,7 @@ async fn isolate(
     .await?;
     await_clone_count(session_b, &account, base_value).await?;
     session_b
-        .await_delegated(
-            &account,
-            CLONE_TIMEOUT,
-            "session-b er activates the cell as delegated",
-        )
+        .await_delegated(&account, "session-b er activates the cell as delegated")
         .await?;
     let er_value = value(case, 3);
     write(session_b, payer, &account, er_value).await?;
@@ -280,17 +259,11 @@ async fn isolate(
                 &[REDSHIFT.batch().set(&[account], value(case, 4)).build()],
             )
             .await;
-        ensure!(
-            stale_write.is_err(),
-            "the old validator must reject writes to the reassigned \
-                 account, got {stale_write:?}"
-        );
+        ensure!(stale_write.is_err());
         let stale_commit =
             schedule_commit(er_a.ctx(), payer, &account, SettlementMode::Commit).await;
         if let Ok(signature) = stale_commit {
-            let receipt =
-                receipt::fetch_commit_receipt(er_a.ctx().api(), &signature, RECEIPT_TIMEOUT)
-                    .await?;
+            let receipt = receipt::fetch_commit_receipt(er_a.ctx().api(), &signature).await?;
             receipt
                 .error_message
                 .context("the old validator must not commit the reassigned account")?;
@@ -299,13 +272,8 @@ async fn isolate(
     }
 
     let fresh = schedule_commit(session_b, payer, &account, SettlementMode::Commit).await?;
-    let fresh_receipt =
-        receipt::fetch_commit_receipt(session_b.api(), &fresh, RECEIPT_TIMEOUT).await?;
-    ensure!(
-        fresh_receipt.succeeded() || fresh_receipt.failure_is_duplicate_rejection(),
-        "a fresh session-b commit must complete, got {:?}",
-        fresh_receipt.error_message
-    );
+    let fresh_receipt = receipt::fetch_commit_receipt(session_b.api(), &fresh).await?;
+    ensure!(fresh_receipt.succeeded() || fresh_receipt.failure_is_duplicate_rejection());
     await_base(
         base,
         &account,

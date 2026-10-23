@@ -4,7 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{anyhow, ensure};
+use anyhow::ensure;
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
@@ -23,7 +23,6 @@ const ACCOUNT_SPACE: u32 = 2048;
 const PREP_PAYER_LAMPORTS: u64 = 4_000_000_000;
 const PAYER_LAMPORTS: u64 = 2_000_000_000;
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const SLOW_THRESHOLD: Duration = Duration::from_millis(100);
 const MIN_COLD_WARM_RATIO: f64 = 10.0;
 
@@ -66,11 +65,7 @@ async fn touch_pass(er: &ErCtx, pool: &[Pubkey]) -> Result<ObservationsStats> {
         let fetched = er.account(account).await?;
         latencies.push(started.elapsed().as_micros() as u32);
         let data_len = fetched.map(|account| account.data.len()).unwrap_or(0);
-        if data_len != ACCOUNT_SPACE as usize {
-            return Err(anyhow!(
-                "hydration broken: {account} read back {data_len} bytes"
-            ));
-        }
+        ensure!(data_len == ACCOUNT_SPACE as usize);
     }
     Ok(latencies.finalize(false))
 }
@@ -95,7 +90,7 @@ async fn burst_cell(
         base,
         ErOptions {
             label: label.to_owned(),
-            request_timeout: Some(REQUEST_TIMEOUT),
+
             ..Default::default()
         },
     )
@@ -181,7 +176,7 @@ impl Scenario<ScenarioReport> for ColdHydrationTail {
             &base,
             ErOptions {
                 label: "s7-touch".to_owned(),
-                request_timeout: Some(REQUEST_TIMEOUT),
+
                 ..Default::default()
             },
         )
@@ -254,12 +249,7 @@ impl Scenario<ScenarioReport> for ColdHydrationTail {
                 cell_name,
                 outcome.outcome.failed, outcome.slow, "dependency hydration cell finished",
             );
-            ensure!(
-                outcome.outcome.failed == 0,
-                "failures={:?}; first error={:?}",
-                outcome.outcome.failed,
-                outcome.outcome.first_error
-            );
+            ensure!(outcome.outcome.failed == 0);
         }
         if warm_deps.slow > cold_deps.slow {
             warn!(

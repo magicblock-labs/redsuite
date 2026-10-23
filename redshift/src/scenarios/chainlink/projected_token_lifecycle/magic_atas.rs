@@ -4,7 +4,7 @@ use account::Account;
 use anyhow::{ensure, Context};
 use keypair::Keypair;
 use pubkey::Pubkey;
-use redsuite_core::{check, dlp, system, BaseCtx, ChainCtx, DynError, ErCtx, Result};
+use redsuite_core::{check, dlp, system, BaseCtx, ChainCtx, ErCtx, Result};
 use sdk::spl::{
     builders::{InitializeRentPdaBuilder, WithdrawThroughDelegatedShuttleWithMergeBuilder},
     find_rent_pda,
@@ -12,7 +12,7 @@ use sdk::spl::{
 use signer::Signer;
 use tokio::time;
 
-use super::{amount, balances, spl, Wallet, SUPPLY, TIMEOUT};
+use super::{amount, balances, spl, Wallet, SUPPLY};
 
 const RECEIVE: u64 = 60;
 const DEPOSIT: u64 = 45;
@@ -117,16 +117,10 @@ impl MagicAtas<'_> {
             .submit_and_confirm(self.funder, &[empty.ensure(self.funder.pubkey())])
             .await?;
         let account = self.er.account(&empty.ata).await?.context("empty Magic ATA missing")?;
-        ensure!(
-            spl::is_magic_ata(&account.data),
-            "empty creation retains the Magic ATA marker"
-        );
+        ensure!(spl::is_magic_ata(&account.data));
         ensure!(amount(self.er, &empty.ata).await? == 0);
         self.close(&empty).await?;
-        ensure!(
-            self.er.account(&empty.ata).await?.is_none(),
-            "explicit close removes the empty ATA"
-        );
+        ensure!(self.er.account(&empty.ata).await?.is_none());
         Ok(())
     }
 
@@ -215,7 +209,7 @@ impl MagicAtas<'_> {
         ensure!(amount(self.er, &destination.ata).await? == RECEIVE);
         ensure!(amount(self.er, &source.ata).await? == (self.source_balance - RECEIVE));
         let account = self.er.account(&destination.ata).await?.context("Magic ATA missing")?;
-        ensure!(spl::is_magic_ata(&account.data), "received ATA is marked");
+        ensure!(spl::is_magic_ata(&account.data));
         ensure!(spl::token_balance(self.base, &destination.ata).await? == expected_base);
         Ok(())
     }
@@ -253,10 +247,7 @@ impl MagicAtas<'_> {
         loop {
             let account =
                 self.er.account(&destination.ata).await?.context("empty overlay disappeared")?;
-            ensure!(
-                spl::is_magic_ata(&account.data),
-                "projection cannot replace an existing Magic ATA"
-            );
+            ensure!(spl::is_magic_ata(&account.data));
             ensure!(amount(self.er, &destination.ata).await? == 0);
             if Instant::now() >= until {
                 break;
@@ -274,38 +265,39 @@ impl MagicAtas<'_> {
     }
 
     async fn await_restored(&self, destination: &Wallet, original: Option<Account>) -> Result<()> {
-        check::poll_for(
-            "close restores the base ATA or permits eATA projection",
-            TIMEOUT,
-            || async {
-                ensure!(self.er.account(&destination.ata).await? == original);
-                Ok::<_, DynError>(())
-            },
-        )
-        .await?;
+        self.er
+            .api()
+            .await_accounts(
+                &[destination.ata],
+                "close restores the base ATA or permits eATA projection",
+                async || {
+                    ensure!(self.er.account(&destination.ata).await? == original);
+                    Ok(())
+                },
+            )
+            .await?;
         Ok(())
     }
 
     async fn await_projection(&self, destination: &Wallet) -> Result<()> {
         let base_ata = self.base.account(&destination.ata).await?.context("base ATA missing")?;
-        check::poll_for(
-            "close restores the base ATA or permits eATA projection",
-            TIMEOUT,
-            || async {
-                let account =
-                    self.er.account(&destination.ata).await?.context("projection missing")?;
-                ensure!(
-                    !spl::is_magic_ata(&account.data),
-                    "projected ATA has no Magic marker"
-                );
-                ensure!(account.owner == spl::token_program());
-                ensure!(account.data.len() == spl::TOKEN_ACCOUNT_LEN);
-                ensure!(account.lamports == base_ata.lamports);
-                ensure!(amount(self.er, &destination.ata).await? == DEPOSIT);
-                Ok::<_, DynError>(())
-            },
-        )
-        .await?;
+        self.er
+            .api()
+            .await_accounts(
+                &[destination.ata],
+                "close restores the base ATA or permits eATA projection",
+                async || {
+                    let account =
+                        self.er.account(&destination.ata).await?.context("projection missing")?;
+                    ensure!(!spl::is_magic_ata(&account.data));
+                    ensure!(account.owner == spl::token_program());
+                    ensure!(account.data.len() == spl::TOKEN_ACCOUNT_LEN);
+                    ensure!(account.lamports == base_ata.lamports);
+                    ensure!(amount(self.er, &destination.ata).await? == DEPOSIT);
+                    Ok(())
+                },
+            )
+            .await?;
         Ok(())
     }
 
@@ -330,31 +322,22 @@ impl MagicAtas<'_> {
             ]);
         }
         instructions.push(shuttle);
-        let signature = self
-            .base
+        self.base
             .submit_and_confirm_with(self.funder, &[&destination.owner], &instructions)
             .await?;
-        check::poll_for(
-            &format!("shuttle {signature} settles and cleans up"),
-            TIMEOUT,
-            || async {
+        self.base
+            .api()
+            .await_query("shuttle settlement and cleanup", async || {
                 ensure!(amount(self.base, &destination.ata).await? == RECEIVE);
                 if let Some(local) = self.er.account(&destination.ata).await? {
-                    ensure!(
-                        !spl::is_magic_ata(&local.data),
-                        "withdrawal clears the Magic ATA marker"
-                    );
+                    ensure!(!spl::is_magic_ata(&local.data));
                 }
                 for address in &shuttle_accounts {
-                    ensure!(
-                        self.base.account(address).await?.is_none(),
-                        "shuttle account {address} is removed"
-                    );
+                    ensure!(self.base.account(address).await?.is_none());
                 }
-                Ok::<_, DynError>(())
-            },
-        )
-        .await?;
+                Ok(())
+            })
+            .await?;
         if case == Case::TransparentShuttle {
             ensure!(
                 self.base.account(&destination.eata).await?.map(|a| a.owner) == Some(dlp::dlp_id())

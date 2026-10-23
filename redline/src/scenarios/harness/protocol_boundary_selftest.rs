@@ -1,4 +1,4 @@
-use std::{rc::Rc, sync::Arc, time::Duration};
+use std::{rc::Rc, sync::Arc};
 
 use anyhow::ensure;
 use pubkey::Pubkey;
@@ -17,7 +17,6 @@ use url::Url;
 use crate::ACCOUNT_SPACE;
 
 const PREP_PAYER_LAMPORTS: u64 = 4_000_000_000;
-const CLONE_TIMEOUT: Duration = Duration::from_secs(15);
 const ARTIFACT_P50_RATIO: f64 = 5.0;
 const VALIDATOR_AGREEMENT_RATIO: f64 = 3.0;
 
@@ -63,6 +62,7 @@ const PROFILES: ProfileValues<Profile> = ProfileValues { lite: LITE, full: FULL 
 
 fn run_cell(
     er_rpc_url: Url,
+    er_ws_url: Url,
     config: ThreadRunConfig,
     id_offset: u64,
     pool: Arc<Vec<Pubkey>>,
@@ -71,6 +71,7 @@ fn run_cell(
     execute_kernel(
         config,
         er_rpc_url,
+        er_ws_url,
         payer_bytes,
         0,
         move |id| REDLINE.copy_three(&pool, id_offset + id).0,
@@ -101,7 +102,7 @@ impl Scenario<ScenarioReport> for ProtocolBoundarySelftest {
                 .init_batched(base.as_ref(), &prep_payers, profile.accounts, true)
                 .await?,
         );
-        er.await_clones(&pool, ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
+        er.await_clones(&pool, ACCOUNT_SPACE as usize).await?;
         let payer_bytes = prep::payer_bytes(&prep_payers);
 
         Ok(Self {
@@ -124,6 +125,7 @@ impl Scenario<ScenarioReport> for ProtocolBoundarySelftest {
         let er_rpc_url = er.api().url().clone();
         let warmup = run_cell(
             er_rpc_url.clone(),
+            er.ws_url().clone(),
             ThreadRunConfig {
                 threads: profile.threads,
                 iterations: profile.warmup,
@@ -134,12 +136,7 @@ impl Scenario<ScenarioReport> for ProtocolBoundarySelftest {
             pool.clone(),
             payer_bytes.clone(),
         )?;
-        ensure!(
-            warmup.failed == 0,
-            "failures={:?}; first error={:?}",
-            warmup.failed,
-            warmup.first_error
-        );
+        ensure!(warmup.failed == 0);
 
         let mut id_offset = profile.warmup;
         let mut cells: Vec<CellOutcome> = Vec::new();
@@ -147,6 +144,7 @@ impl Scenario<ScenarioReport> for ProtocolBoundarySelftest {
             let before = er.scrape_metrics().await?;
             let outcome = run_cell(
                 er_rpc_url.clone(),
+                er.ws_url().clone(),
                 ThreadRunConfig {
                     threads,
                     iterations: profile.iterations,
@@ -174,12 +172,7 @@ impl Scenario<ScenarioReport> for ProtocolBoundarySelftest {
                 cell.tx_processing_avg_us,
                 "protocol boundary cell finished",
             );
-            ensure!(
-                cell.outcome.failed == 0,
-                "failures={:?}; first error={:?}",
-                cell.outcome.failed,
-                cell.outcome.first_error
-            );
+            ensure!(cell.outcome.failed == 0);
 
             let cell_report = ScenarioReport::ok()
                 .setting("profile", profile.name)

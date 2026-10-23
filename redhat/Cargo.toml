@@ -20,3 +20,4 @@ instruction = { workspace = true }
 pubkey = { workspace = true }
 keypair = { workspace = true }
 signer = { workspace = true }
+solana-instruction-error = { workspace = true }

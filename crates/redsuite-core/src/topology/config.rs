@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{anyhow, Context};
+use anyhow::{ensure, Context};
 use keypair::Keypair;
 use magicblock_config::{
     config::EngineConfig,
@@ -117,9 +117,7 @@ pub(super) fn find_base_bin() -> Result<PathBuf> {
 fn explicit_bin(name: &str) -> Result<Option<PathBuf>> {
     let path = env::var_os(name).map(PathBuf::from);
     if let Some(path) = &path {
-        if !path.exists() {
-            return Err(anyhow!("{name}={} does not exist", path.display()));
-        }
+        ensure!(path.exists(), "{name}={} does not exist", path.display());
     }
     Ok(path)
 }
@@ -458,7 +456,7 @@ fn with_api_key(mut grpc_url: Url) -> Url {
 pub struct ErOptions {
     pub label: String,
     pub settings: Settings,
-    pub request_timeout: Option<Duration>,
+
     pub base_endpoints: Option<BaseEndpoints>,
 }
 
@@ -467,7 +465,7 @@ impl Default for ErOptions {
         Self {
             label: String::new(),
             settings: Box::new(|_| {}),
-            request_timeout: None,
+
             base_endpoints: None,
         }
     }

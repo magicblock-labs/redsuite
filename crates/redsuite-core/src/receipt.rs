@@ -1,13 +1,15 @@
-use std::{collections::HashSet, time::Duration};
+use std::{collections::HashSet, mem};
 
 use anyhow::{anyhow, ensure, Context};
 use pubkey::Pubkey;
 use signature::Signature;
-use tokio::{time, time::Instant};
+use solana_transaction_status_client_types::UiTransactionStatusMeta;
+use tokio::time;
 use tracing::warn;
 
 use crate::{
-    api::{custom_error_code, Api, TransactionInfo},
+    api::{custom_error_code, transaction_logs, transaction_meta, Api},
+    transport::NETWORK_TIMEOUT,
     BaseCtx, ChainCtx, ErCtx, Result,
 };
 
@@ -23,14 +25,7 @@ const LOG_MARKER: &str = "ScheduledCommitSent ";
 
 const SCHEDULE_MARKER: &str = "Scheduled commit with ID: ";
 
-const RECEIPT_TIMEOUT: Duration = Duration::from_secs(30);
-const BASE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(20);
-
-const SCHEDULE_FETCH_TIMEOUT: Duration = Duration::from_secs(20);
-
 const RECEIPT_HISTORY_LIMIT: usize = 64;
-
-const RECEIPT_POLL: Duration = Duration::from_millis(500);
 
 #[derive(Debug)]
 pub struct CommitReceipt {
@@ -56,7 +51,7 @@ impl ErCtx {
         expected: &[Pubkey],
         expect_undelegation: bool,
     ) -> Result<CommitReceipt> {
-        let receipt = fetch_commit_receipt(self.api(), signature, RECEIPT_TIMEOUT).await?;
+        let receipt = fetch_commit_receipt(self.api(), signature).await?;
         if let Some(message) = &receipt.error_message {
             if receipt.failure_is_duplicate_rejection() {
                 warn_duplicate_rejection(message);
@@ -65,7 +60,7 @@ impl ErCtx {
             return Err(anyhow!("commit intent failed: {message}"));
         }
         receipt.check_accounts(expected, expect_undelegation)?;
-        receipt.confirm(base.api(), BASE_CONFIRM_TIMEOUT).await?;
+        receipt.confirm(base.api()).await?;
         Ok(receipt)
     }
 }
@@ -101,15 +96,13 @@ impl CommitReceipt {
         Ok(())
     }
 
-    pub async fn confirm(&self, base: &Api, timeout: Duration) -> Result<()> {
+    pub async fn confirm(&self, base: &Api) -> Result<()> {
         for chain_signature in &self.base_signatures {
             let base_tx = base
-                .await_transaction(chain_signature, timeout)
+                .await_transaction(chain_signature)
                 .await
                 .context("base settlement confirmation")?;
-            if let Some(err) = &base_tx.err {
-                return Err(anyhow!("base settlement failed: {err:?}"));
-            }
+            ensure!(transaction_meta(&base_tx)?.err == None);
         }
         Ok(())
     }
@@ -162,7 +155,7 @@ fn pubkey_list(list: &str) -> Vec<Pubkey> {
         .collect()
 }
 
-pub fn parse_receipt(signature: Signature, receipt_tx: &TransactionInfo) -> CommitReceipt {
+pub fn parse_receipt(signature: Signature, receipt_tx: &UiTransactionStatusMeta) -> CommitReceipt {
     let mut receipt = CommitReceipt {
         signature,
         commit_id: None,
@@ -172,9 +165,9 @@ pub fn parse_receipt(signature: Signature, receipt_tx: &TransactionInfo) -> Comm
         base_signatures: Vec::new(),
         requested_undelegation: false,
         error_message: None,
-        receipt_err_code: receipt_tx.err.as_ref().and_then(custom_error_code),
+        receipt_err_code: receipt_tx.err.clone().and_then(custom_error_code),
     };
-    for line in &receipt_tx.logs {
+    for line in transaction_logs(receipt_tx) {
         let Some(rest) = strip_program_prefix(line).strip_prefix(LOG_MARKER) else {
             continue;
         };
@@ -206,65 +199,69 @@ pub async fn scheduled_receipt_signature(
     er: &Api,
     commit_signature: &Signature,
 ) -> Result<Signature> {
-    let commit_tx = er.await_transaction(commit_signature, SCHEDULE_FETCH_TIMEOUT).await?;
-    if let Some(err) = &commit_tx.err {
-        return Err(anyhow!("commit scheduling failed: {err:?}"));
-    }
-    receipt_signature_in_logs(&commit_tx.logs)
+    let commit_tx = er.await_transaction(commit_signature).await?;
+    let meta = transaction_meta(&commit_tx)?;
+    ensure!(meta.err == None);
+    receipt_signature_in_logs(transaction_logs(meta))
         .ok_or_else(|| anyhow!("missing ScheduledCommitSent signature"))
 }
 
-pub async fn fetch_commit_receipt(
-    er: &Api,
-    commit_signature: &Signature,
-    timeout: Duration,
-) -> Result<CommitReceipt> {
+pub async fn fetch_commit_receipt(er: &Api, commit_signature: &Signature) -> Result<CommitReceipt> {
     let receipt_signature = scheduled_receipt_signature(er, commit_signature).await?;
-    let receipt_tx = er.await_transaction(&receipt_signature, timeout).await?;
-    Ok(parse_receipt(receipt_signature, &receipt_tx))
+    let receipt_tx = er.await_transaction(&receipt_signature).await?;
+    Ok(parse_receipt(
+        receipt_signature,
+        transaction_meta(&receipt_tx)?,
+    ))
 }
 
 pub async fn scheduled_intent_id(er: &Api, commit_signature: &Signature) -> Result<u64> {
-    let commit_tx = er.await_transaction(commit_signature, SCHEDULE_FETCH_TIMEOUT).await?;
-    intent_id_in_logs(&commit_tx.logs).ok_or_else(|| anyhow!("missing scheduled intent ID"))
+    let commit_tx = er.await_transaction(commit_signature).await?;
+    intent_id_in_logs(transaction_logs(transaction_meta(&commit_tx)?))
+        .ok_or_else(|| anyhow!("missing scheduled intent ID"))
 }
 
 pub async fn fetch_commit_receipt_by_intent(
     er: &Api,
     validator: &Pubkey,
     intent_id: u64,
-    timeout: Duration,
 ) -> Result<CommitReceipt> {
-    let deadline = Instant::now() + timeout;
-    let mut seen = HashSet::new();
     let mut last_fetch_error = None;
-    loop {
-        let history = er.get_signatures_for_address(validator, RECEIPT_HISTORY_LIMIT).await?;
-        for signature in history {
-            if !seen.insert(signature) {
-                continue;
-            }
-            let tx = match er.get_transaction(&signature).await {
-                Ok(Some(tx)) => tx,
-                Ok(None) => continue,
-                Err(error) => {
-                    last_fetch_error = Some(format!("{error:#}"));
-                    continue;
+    let result = time::timeout(NETWORK_TIMEOUT, async {
+        let events = er.events().await?;
+        let mut logs = events.logs(validator).await?;
+        let mut slots = events.slots().await?;
+        let mut pending = er.get_signatures_for_address(validator, RECEIPT_HISTORY_LIMIT).await?;
+        let mut seen: HashSet<_> = pending.iter().copied().collect();
+        loop {
+            for signature in mem::take(&mut pending) {
+                match er.get_transaction(&signature).await {
+                    Ok(Some(transaction)) => {
+                        let receipt = parse_receipt(signature, transaction_meta(&transaction)?);
+                        if receipt.commit_id == Some(intent_id) {
+                            return Ok(receipt);
+                        }
+                    }
+                    Ok(None) => pending.push(signature),
+                    Err(error) => {
+                        last_fetch_error = Some(error);
+                        pending.push(signature);
+                    }
                 }
-            };
-            let receipt = parse_receipt(signature, &tx);
-            if receipt.commit_id == Some(intent_id) {
-                return Ok(receipt);
+            }
+            tokio::select! {
+                update = logs.next() => {
+                    let signature = update?.value.signature.parse()?;
+                    if seen.insert(signature) { pending.push(signature); }
+                }
+                update = slots.next() => { update?; }
             }
         }
-        if Instant::now() >= deadline {
-            let mut message =
-                format!("no commit receipt for intent {intent_id} within {timeout:?}");
-            if let Some(error) = &last_fetch_error {
-                message.push_str(&format!("; last fetch error: {error:#}"));
-            }
-            return Err(crate::DynError::msg(message));
-        }
-        time::sleep(RECEIPT_POLL).await;
+    })
+    .await;
+    match result {
+        Ok(result) => result,
+        Err(timeout_error) => Err(last_fetch_error.unwrap_or_else(|| timeout_error.into()))
+            .context("commit receipt not published"),
     }
 }

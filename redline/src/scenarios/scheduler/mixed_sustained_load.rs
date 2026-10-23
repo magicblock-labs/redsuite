@@ -8,7 +8,7 @@ use anyhow::{ensure, Context};
 use instruction::Instruction;
 use pubkey::Pubkey;
 use redsuite_core::{
-    check, host, prep,
+    host, prep,
     profile::ProfileValues,
     programs::{CellHeader, HashState, REDLINE},
     redline::{causal, Accounts},
@@ -17,7 +17,7 @@ use redsuite_core::{
         execute_for_raw, execute_raw, merge_outcomes, spawn_workers, split_budget,
         split_iterations, Delivery, Pacing, RawRunOutcome, RunConfig, RunOutcome, SendTransaction,
     },
-    BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
+    wait, BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
 };
 use tokio::sync::{watch, Mutex};
 use tracing::{debug, info};
@@ -26,7 +26,6 @@ use url::Url;
 use crate::{load::Options, metrics, program::layout, ACCOUNT_SPACE};
 
 const PAYER_LAMPORTS: u64 = 4_000_000_000;
-const CLONE_TIMEOUT: Duration = Duration::from_secs(60);
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(1_800);
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -200,6 +199,7 @@ struct ExecuteConfig {
 
 async fn execute(
     er_rpc_url: Url,
+    er_ws_url: Url,
     config: ExecuteConfig,
     pool: Arc<Vec<Pubkey>>,
     payer_bytes: Arc<Vec<[u8; 64]>>,
@@ -226,10 +226,12 @@ async fn execute(
         let concurrency = concurrency[index] as usize;
         let limit = limit.clone();
         let er_rpc_url = er_rpc_url.clone();
+        let er_ws_url = er_ws_url.clone();
         let pool = pool.clone();
         let payer_bytes = payer_bytes.clone();
         async move {
-            let senders = prep::worker_senders(&er_rpc_url, &payer_bytes, index, threads);
+            let senders =
+                prep::worker_senders(&er_rpc_url, &er_ws_url, &payer_bytes, index, threads);
             let locks: Rc<Vec<Arc<Mutex<()>>>> =
                 Rc::new((0..span.len).map(|_| Arc::new(Mutex::new(()))).collect());
             let request = |iteration| {
@@ -308,16 +310,14 @@ struct DrainState {
 async fn drain(er: &ErCtx, target: f64) -> Result<DrainState> {
     let started = Instant::now();
     crate::await_executed(er, target, DRAIN_TIMEOUT).await?;
-    check::poll("execution pipeline idle", SETTLE_TIMEOUT, || async {
-        let Ok(metrics) = er.scrape_metrics().await else {
-            return false;
-        };
-        [BLOCKED_TRANSACTIONS, BUSY_EXECUTORS, PENDING_TRANSACTIONS]
+    let metrics = wait::retry("execution pipeline idle", SETTLE_TIMEOUT, async || {
+        let metrics = er.scrape_metrics().await?;
+        ensure!([BLOCKED_TRANSACTIONS, BUSY_EXECUTORS, PENDING_TRANSACTIONS]
             .iter()
-            .all(|name| metrics.value_sum(name).unwrap_or_default() == 0.0)
+            .all(|name| metrics.value_sum(name).unwrap_or_default() == 0.0));
+        Ok(metrics)
     })
     .await?;
-    let metrics = er.scrape_metrics().await?;
     Ok(DrainState {
         elapsed: started.elapsed(),
         blocked: metrics.value_sum(BLOCKED_TRANSACTIONS).unwrap_or_default(),
@@ -348,11 +348,7 @@ async fn verify_final_state(
                 let filled = data[layout::DATA_OFFSET..]
                     .chunks_exact(layout::ID_SIZE)
                     .all(|chunk| chunk == last_id.to_le_bytes());
-                ensure!(
-                    filled,
-                    "lane {index} must be filled with the repeated id \
-                     {last_id} — the last pattern write did not land"
-                );
+                ensure!(filled);
             }
             Mode::HashCompute => {
                 let hash = &data[layout::HASH_OFFSET..layout::HASH_OFFSET + layout::HASH_SIZE];
@@ -398,34 +394,15 @@ impl Workload {
         let profile = PROFILES.select(base.config().profile);
 
         ensure!(gcd(profile.lanes, MIX_PERIOD) == 1);
-        ensure!(
-            profile.lanes >= profile.threads as u64,
-            "profile {}: lanes ({}) must cover every one of the {} driver threads",
-            profile.name,
-            profile.lanes,
-            profile.threads
-        );
-        ensure!(
-            profile.payers >= profile.threads,
-            "profile {}: payers ({}) must cover every one of the {} driver \
-             threads — a thread with no payer cannot send",
-            profile.name,
-            profile.payers,
-            profile.threads
-        );
-        ensure!(
-            (profile.read_span as u64) < profile.lanes,
-            "profile {}: read span ({}) must stay below the lane count ({})",
-            profile.name,
-            profile.read_span,
-            profile.lanes
-        );
+        ensure!(profile.lanes >= profile.threads as u64);
+        ensure!(profile.payers >= profile.threads);
+        ensure!((profile.read_span as u64) < profile.lanes);
 
         let payers = base.funded_payers(profile.payers, PAYER_LAMPORTS).await?;
         let pool = Accounts::new(ACCOUNT_SPACE, er.identity())
             .init_batched(base, &payers, profile.lanes as usize, true)
             .await?;
-        er.await_clones(&pool, ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
+        er.await_clones(&pool, ACCOUNT_SPACE as usize).await?;
 
         let pool = Arc::new(pool);
         let payer_bytes = prep::payer_bytes(&payers);
@@ -461,7 +438,7 @@ impl Workload {
         let setup = started.elapsed();
         let limit = match load {
             Some(load) => {
-                ensure!(!load.duration.is_zero(), "load duration must be positive");
+                ensure!(!load.duration.is_zero());
                 let deadline = Instant::now()
                     .checked_add(load.duration)
                     .context("load duration exceeds monotonic clock range")?;
@@ -475,6 +452,7 @@ impl Workload {
         };
         let executed = execute(
             er.api().url().clone(),
+            er.ws_url().clone(),
             ExecuteConfig {
                 lanes: profile.lanes,
                 limit,
@@ -547,12 +525,7 @@ impl Workload {
                 }
             }
             ensure!(counts.iter().sum::<u64>() == total);
-            ensure!(
-                outcome.failed == 0,
-                "failures={:?}; first error={:?}",
-                outcome.failed,
-                outcome.first_error
-            );
+            ensure!(outcome.failed == 0);
             ensure!(outcome.delivered == total);
 
             let drained = drain(er, engine_txs_before + total as f64).await?;
@@ -598,11 +571,7 @@ impl Workload {
                     delta.counter(ORDERING_DEPENDENCIES),
                 );
             report.measurements.extend(observations.measurements);
-            ensure!(
-                engine_txs >= total as f64,
-                "the engine executed {engine_txs:.0} transactions, fewer than the \
-             {total} delivered by the workload"
-            );
+            ensure!(engine_txs >= total as f64);
 
             if let Some(rpc_handled) = rpc_handled {
                 ensure!(rpc_handled == (total as f64));

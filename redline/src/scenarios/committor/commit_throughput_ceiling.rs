@@ -4,17 +4,16 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{anyhow, ensure};
+use anyhow::{ensure, Context};
 use pubkey::Pubkey;
 use redsuite_core::{
-    check,
     monitor::{self, MonitorSpec},
     profile::ProfileValues,
     programs::{SettlementMode, REDLINE},
     redline::Accounts,
     report::Unit,
     runner::{execute, Pacing, RunConfig, RunOutcome, SendTransaction},
-    BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport, TxSender,
+    wait, BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport, TxSender,
 };
 use signature::Signature;
 use signer::Signer;
@@ -26,10 +25,7 @@ const ACCOUNT_SPACE: u32 = 40;
 const PAYER_LAMPORTS: u64 = 2_000_000_000;
 const PREP_PAYER_LAMPORTS: u64 = 2_000_000_000;
 const INTENT_GATE: Duration = Duration::from_secs(90);
-const RECEIPT_TIMEOUT: Duration = Duration::from_secs(20);
-const BASE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(20);
 const DRAIN_POLL: Duration = Duration::from_secs(2);
-const CLONE_TIMEOUT: Duration = Duration::from_secs(15);
 const QUIESCE_TIMEOUT: Duration = Duration::from_secs(120);
 
 const INTENTS_COUNTER: &str = "mbv_committor_intents_count";
@@ -77,8 +73,8 @@ async fn deliver_commits(
     first_id: u64,
     rate: u32,
     concurrency: usize,
-) -> Result<(Vec<(u64, Signature)>, RunOutcome)> {
-    let delivered: Rc<RefCell<Vec<(u64, Signature)>>> =
+) -> Result<(Vec<Signature>, RunOutcome)> {
+    let delivered: Rc<RefCell<Vec<Signature>>> =
         Rc::new(RefCell::new(Vec::with_capacity(sets.len())));
     let request = |iteration: u64| {
         let id = first_id + iteration;
@@ -94,7 +90,7 @@ async fn deliver_commits(
             let tx = sender.prepare(&[ix]).await?;
             Ok(SendTransaction(move |_: Instant| async move {
                 let commit_signature = sender.submit_prepared(&tx).await?;
-                delivered.borrow_mut().push((id, commit_signature));
+                delivered.borrow_mut().push(commit_signature);
                 Ok(())
             }))
         }
@@ -108,12 +104,7 @@ async fn deliver_commits(
         request,
     )
     .await?;
-    if outcome.failed > 0 {
-        return Err(anyhow!(
-            "commit deliveries failed: {:?}",
-            outcome.first_error
-        ));
-    }
+    ensure!(outcome.failed == 0);
     let delivered = Rc::try_unwrap(delivered)
         .unwrap_or_else(|_| panic!("delivery tasks still hold the list"))
         .into_inner();
@@ -121,20 +112,15 @@ async fn deliver_commits(
 }
 
 async fn quiesce_committor(er: &ErCtx) -> Result<()> {
-    check::poll(
-        "the committor drains its backlog before the measured window",
-        QUIESCE_TIMEOUT,
-        || async {
-            er.scrape_metrics().await.is_ok_and(|metrics| {
-                let backlog = metrics.value_sum(BACKLOG_GAUGE).unwrap_or(0.0);
-                let intents = metrics.value_sum(INTENTS_COUNTER).unwrap_or(0.0);
-                let executed = metrics.value_sum(EXECUTED_COUNTER).unwrap_or(0.0);
-                backlog == 0.0 && intents <= executed
-            })
-        },
-    )
-    .await?;
-    Ok(())
+    wait::retry("committor backlog drained", QUIESCE_TIMEOUT, async || {
+        let metrics = er.scrape_metrics().await?;
+        let backlog = metrics.value_sum(BACKLOG_GAUGE).unwrap_or(0.0);
+        let intents = metrics.value_sum(INTENTS_COUNTER).unwrap_or(0.0);
+        let executed = metrics.value_sum(EXECUTED_COUNTER).unwrap_or(0.0);
+        ensure!(backlog == 0.0 && intents <= executed);
+        Ok(())
+    })
+    .await
 }
 
 struct DrainResult {
@@ -188,7 +174,7 @@ impl Scenario<ScenarioReport> for CommitThroughputCeiling {
             .init_batched(base.as_ref(), &prep_payers, pool_size, true)
             .await?;
 
-        er.prewarm(&pool, ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
+        er.prewarm(&pool, ACCOUNT_SPACE as usize).await?;
 
         let payer = base.funded_payer(PAYER_LAMPORTS).await?;
         let sender = er.sender(Rc::new(payer));
@@ -231,16 +217,13 @@ impl Scenario<ScenarioReport> for CommitThroughputCeiling {
 
         if before.get(INTENTS_COUNTER).is_some() {
             let target = intents_before + profile.fresh_commits as f64;
-            check::poll(
-                &format!("the intents counter reaches {target}"),
-                INTENT_GATE,
-                || async {
-                    matches!(
-                        er.scrape_metrics().await.ok().and_then(|metrics| metrics.value_sum(INTENTS_COUNTER)),
-                        Some(count) if count >= target
-                    )
-                },
-            )
+            wait::retry("intents accepted", INTENT_GATE, async || {
+                let metrics = er.scrape_metrics().await?;
+                let count =
+                    metrics.value_sum(INTENTS_COUNTER).context("intents counter missing")?;
+                ensure!(count >= target);
+                Ok(())
+            })
             .await?;
         }
 
@@ -258,12 +241,7 @@ impl Scenario<ScenarioReport> for CommitThroughputCeiling {
         let after = er.scrape_metrics().await?;
         let delta = MetricsDelta::new(before, after);
 
-        ensure!(
-            drain.drained > 0.0,
-            "INVALID: no intent drained within {:?} — the commit pipeline \
-             executed nothing",
-            profile.drain_cap
-        );
+        ensure!(drain.drained > 0.0);
         let failed_intents = delta.counter_all("mbv_committor_failed_intents_count").unwrap_or(0.0);
         ensure!(failed_intents == 0.0);
         let drain_rate = drain.drained / span_wall.as_secs_f64();
@@ -277,15 +255,9 @@ impl Scenario<ScenarioReport> for CommitThroughputCeiling {
         // receipt exists, succeeded, and its base txs confirm on chain
         let mut receipt_base_txs = 0usize;
         if drain.fully_drained {
-            for (id, commit_signature) in &delivered {
-                let commit_receipt = super::settled_receipt(
-                    er.api(),
-                    commit_signature,
-                    RECEIPT_TIMEOUT,
-                    format!("fresh commit {id} intent"),
-                )
-                .await?;
-                commit_receipt.confirm(base.api(), BASE_CONFIRM_TIMEOUT).await?;
+            for commit_signature in &delivered {
+                let commit_receipt = super::settled_receipt(er.api(), commit_signature).await?;
+                commit_receipt.confirm(base.api()).await?;
                 receipt_base_txs += commit_receipt.base_signatures.len();
             }
         } else {

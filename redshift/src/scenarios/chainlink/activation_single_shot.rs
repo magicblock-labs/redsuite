@@ -10,14 +10,13 @@ use keypair::Keypair;
 use pubkey::Pubkey;
 
 use redsuite_core::{
-    check,
     dlp::{self, delegate_with_actions, DelegateArgs},
     netfault::{BaseProxies, Selector},
     prep,
     programs::{CellHeader, REDSHIFT},
     system,
     topology::{self, ErOptions, PrivateEr, RestartConfig},
-    BaseCtx, ChainCtx, DynError, ErCtx, PrivateErScenario, Result,
+    BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result,
 };
 use signature::Signature;
 use signer::Signer;
@@ -34,11 +33,8 @@ const DEPENDENCY_LAMPORTS: u64 = 1_000_000;
 const ACTION_COUNT: u8 = 7;
 const CONCURRENT_READS: usize = 16;
 const CONCURRENT_SUBMISSIONS: usize = 8;
-const CLONE_TIMEOUT: Duration = Duration::from_secs(30);
 const INTERCEPT_TIMEOUT: Duration = Duration::from_secs(30);
 const HOLD_WINDOW: Duration = Duration::from_millis(2_500);
-const ACTIVATION_TIMEOUT: Duration = Duration::from_secs(30);
-const RESCUE_TIMEOUT: Duration = Duration::from_secs(45);
 const STEADY_WINDOW: Duration = Duration::from_secs(4);
 const RECOVERY_WINDOW: Duration = Duration::from_secs(6);
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(20);
@@ -76,12 +72,14 @@ impl Activation<'_> {
         })
     }
 
-    async fn await_cell(&self, expected: CellState, what: &str, timeout: Duration) -> Result<()> {
-        check::poll_for(what, timeout, || async {
-            ensure!(self.state().await? == expected);
-            Ok::<_, DynError>(())
-        })
-        .await
+    async fn await_cell(&self, expected: CellState, what: &str) -> Result<()> {
+        self.er
+            .api()
+            .await_accounts(&[self.cell], what, async || {
+                ensure!(self.state().await? == expected);
+                Ok(())
+            })
+            .await
     }
     async fn hold_steady(&self, expected: CellState, window: Duration) -> Result<()> {
         let started = Instant::now();
@@ -165,16 +163,18 @@ impl Activation<'_> {
         stall.remove();
         discovery.settle().await;
         if fail {
-            check::poll_for(
-                "the failed activation completes the rescue undelegation on base",
-                RESCUE_TIMEOUT,
-                || async {
-                    let owner = base.account(&trigger.pubkey()).await?.map(|account| account.owner);
-                    ensure!(owner == Some(system::system_id()));
-                    Ok::<_, DynError>(())
-                },
-            )
-            .await?;
+            base.api()
+                .await_accounts(
+                    &[trigger.pubkey()],
+                    "the failed activation completes the rescue undelegation on base",
+                    async || {
+                        let owner =
+                            base.account(&trigger.pubkey()).await?.map(|account| account.owner);
+                        ensure!(owner == Some(system::system_id()));
+                        Ok(())
+                    },
+                )
+                .await?;
             ensure!(self.state().await? == before);
         } else {
             let expected = CellState {
@@ -184,14 +184,9 @@ impl Activation<'_> {
             self.await_cell(
                 expected,
                 "the released activation applies the cell action exactly once",
-                ACTIVATION_TIMEOUT,
             )
             .await?;
-            ensure!(
-                er.account(&trigger.pubkey()).await?.is_some(),
-                "activated trigger {} is present on the er",
-                trigger.pubkey()
-            );
+            ensure!(er.account(&trigger.pubkey()).await?.is_some());
         }
         Ok(trigger.pubkey())
     }
@@ -249,9 +244,7 @@ impl PrivateErScenario for ActivationSingleShot {
             cell,
         };
         let zero = CellState { value: 0, revision: 0 };
-        activation
-            .await_cell(zero, "the er clones the delegated cell", CLONE_TIMEOUT)
-            .await?;
+        activation.await_cell(zero, "the er clones the delegated cell").await?;
 
         let trigger = activation.run(false).await?;
         let applied = CellState {
@@ -282,7 +275,6 @@ impl PrivateErScenario for ActivationSingleShot {
             .await_cell(
                 applied,
                 "the restarted er serves the cell with the action applied",
-                CLONE_TIMEOUT,
             )
             .await?;
         base.submit_and_confirm(&funder, &[system::transfer(&funder.pubkey(), &trigger, 1)])
