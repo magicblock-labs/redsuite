@@ -17,8 +17,7 @@ use redsuite_core::{
     },
     BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
 };
-use tracing::{debug, warn};
-use url::Url;
+use tracing::{debug, instrument, warn};
 
 use crate::{metrics, ACCOUNT_SPACE};
 
@@ -68,37 +67,6 @@ const FULL: Profile = Profile {
 
 const PROFILES: ProfileValues<Profile> = ProfileValues { lite: LITE, full: FULL };
 
-fn cell_expected_writes(pool: &[Pubkey], first_id: u64, iterations: u64) -> ExpectedWrites {
-    let mut expected: ExpectedWrites = HashMap::new();
-    for id in first_id + 1..=first_id + iterations {
-        let (_, dests) = REDLINE.copy_three(pool, id);
-        for dest in dests {
-            expected.entry(dest).or_default().push(id);
-        }
-    }
-    expected
-}
-
-fn execute_cell(
-    er_rpc_url: Url,
-    er_ws_url: Url,
-    config: ThreadRunConfig,
-    id_offset: u64,
-    pool: Arc<Vec<Pubkey>>,
-    payer_bytes: Arc<Vec<[u8; 64]>>,
-    clock: Option<Arc<SendClock>>,
-) -> Result<RunOutcome> {
-    execute_kernel(
-        config,
-        er_rpc_url,
-        er_ws_url,
-        payer_bytes,
-        id_offset,
-        move |id| REDLINE.copy_three(&pool, id).0,
-        clock,
-    )
-}
-
 struct CellOutcome {
     connections: usize,
     outcome: RunOutcome,
@@ -140,161 +108,188 @@ impl Scenario<ScenarioReport> for WsFanoutThreshold {
     }
 
     async fn run(self) -> Result<ScenarioReport> {
-        let Self {
-            base,
-            er,
-            profile,
-            payer_bytes,
-            pool,
-        } = self;
-        let er_rpc_url = er.api().url().clone();
-        let warmup = execute_cell(
-            er_rpc_url.clone(),
-            er.ws_url().clone(),
-            ThreadRunConfig {
-                threads: profile.threads,
-                iterations: profile.warmup,
-                rate: Pacing::PerSecond(profile.rate),
-                concurrency: profile.concurrency,
-            },
-            0,
-            pool.clone(),
-            payer_bytes.clone(),
-            None,
-        )?;
-        ensure!(warmup.failed == 0);
-
-        let mut id_cursor = profile.warmup;
+        self.warm_up()?;
+        let mut id_cursor = self.profile.warmup;
         let mut cells: Vec<CellOutcome> = Vec::new();
-        for &connections in profile.ladder {
-            let clock = Arc::new(SendClock::new(id_cursor + 1, profile.iterations as usize));
-            let expected = Arc::new(cell_expected_writes(&pool, id_cursor, profile.iterations));
-            let subscribers = SubscriberPool::start(
-                er.ws_url(),
-                &pool,
-                connections,
-                profile.subscriber_threads,
-                clock.clone(),
-                expected.clone(),
-                Arc::new(CellHeader::written_id),
-                LAG_THRESHOLD,
-            );
-            subscribers.await_subscribed(pool.len()).await?;
-
-            let before = er.scrape_metrics().await?;
-            let outcome = execute_cell(
-                er_rpc_url.clone(),
-                er.ws_url().clone(),
-                ThreadRunConfig {
-                    threads: profile.threads,
-                    iterations: profile.iterations,
-                    rate: Pacing::PerSecond(profile.rate),
-                    concurrency: profile.concurrency,
-                },
-                id_cursor,
-                pool.clone(),
-                payer_bytes.clone(),
-                Some(clock.clone()),
-            )?;
-            ensure!(outcome.failed == 0);
-
-            let missing_final = subscribers.await_final(&expected).await;
-            let incomplete = subscribers.incomplete(&expected);
-            let after = er.scrape_metrics().await?;
-            let delta = MetricsDelta::new(before, after);
-            if let Some(error) = subscribers.first_error() {
-                return Err(anyhow!(
-                    "ws{connections}: subscriber pool failed: {error:#}"
-                ));
-            }
-            let conn_reports: Vec<ConnReport> = subscribers.finalize();
-
-            let received_min = conn_reports.iter().map(|conn| conn.received).min().unwrap_or(0);
-            let received_max = conn_reports.iter().map(|conn| conn.received).max().unwrap_or(0);
-            let received_total: u64 = conn_reports.iter().map(|conn| conn.received).sum();
-            let over_threshold: u64 = conn_reports.iter().map(|conn| conn.over_threshold).sum();
-            let mut lag_stats = StreamingStats::new();
-            for conn_report in conn_reports {
-                lag_stats.merge(conn_report.lag);
-            }
-            let lag = lag_stats.finalize(false);
-
-            let cell_outcome = CellOutcome {
-                connections,
-                outcome,
-                missing_final,
-                incomplete,
-                received_min,
-                received_max,
-                lag,
-                over_threshold,
-                received_total,
-            };
-            debug!(
-                connections,
-                missing_final, incomplete, "fan-out cell finished",
-            );
-
-            let cell_report = ScenarioReport::ok()
-                .setting("profile", profile.name)
-                .setting("ws connections", connections)
-                .setting("subscriber threads", profile.subscriber_threads)
-                .setting("driver threads", profile.threads)
-                .setting("shape", "read-write 3/tx (1 src + 2 dst data-copy)")
-                .setting("payers", profile.payers)
-                .setting("accounts", profile.accounts)
-                .setting("measured iters", profile.iterations)
-                .setting("offered tps", profile.rate)
-                .setting("concurrency", profile.concurrency)
-                .setting("drain timeout s", NETWORK_TIMEOUT.as_secs())
-                .observe("delivery us", Unit::Micros, cell_outcome.outcome.delivery)
-                .client_side(&cell_outcome.outcome)
-                .observe("fanout lag us", Unit::Micros, cell_outcome.lag)
-                .metric(
-                    "achieved tps",
-                    Unit::Tps,
-                    cell_outcome.outcome.achieved_rps(),
-                )
-                .metric(
-                    "writes produced",
-                    Unit::Count,
-                    (profile.iterations * 2) as f64,
-                )
-                .metric("received total", Unit::Count, received_total as f64)
-                .metric("received per-conn min", Unit::Count, received_min as f64)
-                .metric("received per-conn max", Unit::Count, received_max as f64)
-                .metric(
-                    "received per-conn spread",
-                    Unit::Count,
-                    (received_max - received_min) as f64,
-                )
-                .metric("missing final states", Unit::Count, missing_final as f64)
-                .metric(
-                    "incomplete conn-account pairs",
-                    Unit::Count,
-                    incomplete as f64,
-                )
-                .metric("notifications over 1s", Unit::Count, over_threshold as f64)
-                .metric_if(
-                    "validator txs in window",
-                    Unit::Count,
-                    delta.counter(metrics::ENGINE_TRANSACTIONS),
-                )
-                .metric_if(
-                    "validator tx processing avg us",
-                    Unit::Micros,
-                    delta
-                        .histogram_avg("mbv_transaction_processing_time")
-                        .map(|seconds| seconds * 1e6),
-                );
-            base.report_cell(&format!("ws{connections}"), &cell_report)?;
-            if let Some(failed_txs) = delta.counter_all(metrics::FAILED_TRANSACTIONS) {
-                ensure!(failed_txs == 0.0);
-            }
-            cells.push(cell_outcome);
-            id_cursor += profile.iterations;
+        for &connections in self.profile.ladder {
+            cells.push(self.measure_cell(connections, &mut id_cursor).await?);
         }
 
+        self.summarize(&cells)
+    }
+}
+
+impl WsFanoutThreshold {
+    fn execute(
+        &self,
+        iterations: u64,
+        offset: u64,
+        clock: Option<Arc<SendClock>>,
+    ) -> Result<RunOutcome> {
+        let pool = self.pool.clone();
+        execute_kernel(
+            ThreadRunConfig {
+                threads: self.profile.threads,
+                iterations,
+                rate: Pacing::PerSecond(self.profile.rate),
+                concurrency: self.profile.concurrency,
+            },
+            self.er.api().url().clone(),
+            self.er.ws_url().clone(),
+            self.payer_bytes.clone(),
+            offset,
+            move |id| REDLINE.copy_three(&pool, id).0,
+            clock,
+        )
+    }
+
+    #[instrument(skip_all, err)]
+    fn warm_up(&self) -> Result<()> {
+        let warmup = self.execute(self.profile.warmup, 0, None)?;
+        ensure!(warmup.failed == 0);
+
+        Ok(())
+    }
+
+    #[instrument(skip_all, err)]
+    async fn measure_cell(&self, connections: usize, id_cursor: &mut u64) -> Result<CellOutcome> {
+        let clock = Arc::new(SendClock::new(
+            *id_cursor + 1,
+            self.profile.iterations as usize,
+        ));
+        let expected = Arc::new(self.cell_expected_writes(*id_cursor));
+        let subscribers = SubscriberPool::start(
+            self.er.ws_url(),
+            &self.pool,
+            connections,
+            self.profile.subscriber_threads,
+            clock.clone(),
+            expected.clone(),
+            Arc::new(CellHeader::written_id),
+            LAG_THRESHOLD,
+        );
+        subscribers.await_subscribed(self.pool.len()).await?;
+
+        let before = self.er.scrape_metrics().await?;
+        let outcome = self.execute(self.profile.iterations, *id_cursor, Some(clock))?;
+        ensure!(outcome.failed == 0);
+
+        let missing_final = subscribers.await_final(&expected).await;
+        let incomplete = subscribers.incomplete(&expected);
+        let after = self.er.scrape_metrics().await?;
+        let delta = MetricsDelta::new(before, after);
+        if let Some(error) = subscribers.first_error() {
+            return Err(anyhow!(
+                "ws{connections}: subscriber pool failed: {error:#}"
+            ));
+        }
+        let conn_reports: Vec<ConnReport> = subscribers.finalize();
+
+        let received_min = conn_reports.iter().map(|conn| conn.received).min().unwrap_or(0);
+        let received_max = conn_reports.iter().map(|conn| conn.received).max().unwrap_or(0);
+        let received_total: u64 = conn_reports.iter().map(|conn| conn.received).sum();
+        let over_threshold: u64 = conn_reports.iter().map(|conn| conn.over_threshold).sum();
+        let mut lag_stats = StreamingStats::new();
+        for conn_report in conn_reports {
+            lag_stats.merge(conn_report.lag);
+        }
+        let lag = lag_stats.finalize(false);
+
+        let cell_outcome = CellOutcome {
+            connections,
+            outcome,
+            missing_final,
+            incomplete,
+            received_min,
+            received_max,
+            lag,
+            over_threshold,
+            received_total,
+        };
+        debug!(
+            connections,
+            missing_final, incomplete, "fan-out cell finished",
+        );
+
+        self.report_cell(&cell_outcome, &delta)?;
+        if let Some(failed_txs) = delta.counter_all(metrics::FAILED_TRANSACTIONS) {
+            ensure!(failed_txs == 0.0);
+        }
+
+        *id_cursor += self.profile.iterations;
+
+        Ok(cell_outcome)
+    }
+
+    fn report_cell(&self, cell: &CellOutcome, delta: &MetricsDelta) -> Result<()> {
+        let cell_report = ScenarioReport::ok()
+            .setting("profile", self.profile.name)
+            .setting("ws connections", cell.connections)
+            .setting("subscriber threads", self.profile.subscriber_threads)
+            .setting("driver threads", self.profile.threads)
+            .setting("shape", "read-write 3/tx (1 src + 2 dst data-copy)")
+            .setting("payers", self.profile.payers)
+            .setting("accounts", self.profile.accounts)
+            .setting("measured iters", self.profile.iterations)
+            .setting("offered tps", self.profile.rate)
+            .setting("concurrency", self.profile.concurrency)
+            .setting("drain timeout s", NETWORK_TIMEOUT.as_secs())
+            .observe("delivery us", Unit::Micros, cell.outcome.delivery)
+            .client_side(&cell.outcome)
+            .observe("fanout lag us", Unit::Micros, cell.lag)
+            .metric("achieved tps", Unit::Tps, cell.outcome.achieved_rps())
+            .metric(
+                "writes produced",
+                Unit::Count,
+                (self.profile.iterations * 2) as f64,
+            )
+            .metric("received total", Unit::Count, cell.received_total as f64)
+            .metric(
+                "received per-conn min",
+                Unit::Count,
+                cell.received_min as f64,
+            )
+            .metric(
+                "received per-conn max",
+                Unit::Count,
+                cell.received_max as f64,
+            )
+            .metric(
+                "received per-conn spread",
+                Unit::Count,
+                (cell.received_max - cell.received_min) as f64,
+            )
+            .metric(
+                "missing final states",
+                Unit::Count,
+                cell.missing_final as f64,
+            )
+            .metric(
+                "incomplete conn-account pairs",
+                Unit::Count,
+                cell.incomplete as f64,
+            )
+            .metric(
+                "notifications over 1s",
+                Unit::Count,
+                cell.over_threshold as f64,
+            )
+            .metric_if(
+                "validator txs in window",
+                Unit::Count,
+                delta.counter(metrics::ENGINE_TRANSACTIONS),
+            )
+            .metric_if(
+                "validator tx processing avg us",
+                Unit::Micros,
+                delta
+                    .histogram_avg("mbv_transaction_processing_time")
+                    .map(|seconds| seconds * 1e6),
+            );
+        self.base.report_cell(&format!("ws{}", cell.connections), &cell_report)
+    }
+
+    fn summarize(&self, cells: &[CellOutcome]) -> Result<ScenarioReport> {
         let baseline = &cells[0];
         if baseline.lag.quantile95 >= CLIFF_P95_US {
             warn!(
@@ -317,7 +312,7 @@ impl Scenario<ScenarioReport> for WsFanoutThreshold {
             );
         }
 
-        for cell in &cells {
+        for cell in cells {
             ensure!(cell.outcome.delivered > 0);
         }
 
@@ -332,24 +327,24 @@ impl Scenario<ScenarioReport> for WsFanoutThreshold {
             .unwrap_or(0);
 
         let mut summary = ScenarioReport::ok()
-            .setting("profile", profile.name)
+            .setting("profile", self.profile.name)
             .setting("shape", "read-write 3/tx (1 src + 2 dst data-copy)")
             .setting(
                 "ws ladder",
-                profile
+                self.profile
                     .ladder
                     .iter()
                     .map(|connections| connections.to_string())
                     .collect::<Vec<_>>()
                     .join("/"),
             )
-            .setting("subscriber threads", profile.subscriber_threads)
-            .setting("driver threads", profile.threads)
-            .setting("payers", profile.payers)
-            .setting("accounts", profile.accounts)
-            .setting("measured iters per cell", profile.iterations)
-            .setting("offered tps", profile.rate)
-            .setting("concurrency", profile.concurrency)
+            .setting("subscriber threads", self.profile.subscriber_threads)
+            .setting("driver threads", self.profile.threads)
+            .setting("payers", self.profile.payers)
+            .setting("accounts", self.profile.accounts)
+            .setting("measured iters per cell", self.profile.iterations)
+            .setting("offered tps", self.profile.rate)
+            .setting("concurrency", self.profile.concurrency)
             .metric("cliff at ws conns (0 = none)", Unit::Count, cliff as f64)
             .metric(
                 "baseline missing finals",
@@ -361,7 +356,7 @@ impl Scenario<ScenarioReport> for WsFanoutThreshold {
                 Unit::Count,
                 (baseline.received_max - baseline.received_min) as f64,
             );
-        for cell in &cells {
+        for cell in cells {
             let cell_name = format!("ws{}", cell.connections);
             summary = summary
                 .with_flags(&cell.outcome)
@@ -417,5 +412,16 @@ impl Scenario<ScenarioReport> for WsFanoutThreshold {
                 );
         }
         Ok(summary)
+    }
+
+    fn cell_expected_writes(&self, first_id: u64) -> ExpectedWrites {
+        let mut expected: ExpectedWrites = HashMap::new();
+        for id in first_id + 1..=first_id + self.profile.iterations {
+            let (_, dests) = REDLINE.copy_three(&self.pool, id);
+            for dest in dests {
+                expected.entry(dest).or_default().push(id);
+            }
+        }
+        expected
     }
 }

@@ -310,19 +310,19 @@ impl Scenario for DelegationSessionIsolation {
         Ok(Self { base, er, proxies, er_a, payer })
     }
 
-    async fn run(self) -> Result<()> {
-        let Self {
-            base,
-            er,
-            proxies,
-            mut er_a,
-            payer,
-        } = self;
-        isolate(&base, &proxies, &mut er_a, None, &payer).await?;
-        isolate(&base, &proxies, &mut er_a, Some(&er), &payer).await?;
+    async fn run(mut self) -> Result<()> {
+        isolate(&self.base, &self.proxies, &mut self.er_a, None, &self.payer).await?;
+        isolate(
+            &self.base,
+            &self.proxies,
+            &mut self.er_a,
+            Some(&self.er),
+            &self.payer,
+        )
+        .await?;
 
-        proxies.finish()?;
-        er_a.finish().await?;
+        self.proxies.finish()?;
+        self.er_a.finish().await?;
         Ok(())
     }
 }

@@ -17,7 +17,7 @@ use redsuite_core::{
     BaseCtx, ChainCtx, ErCtx, Metrics, MetricsDelta, Result, Scenario, ScenarioReport,
 };
 use tokio::time;
-use tracing::{debug, warn};
+use tracing::{debug, instrument, warn};
 
 const ACCOUNT_SPACE: u32 = 2048;
 const PREP_PAYER_LAMPORTS: u64 = 4_000_000_000;
@@ -132,13 +132,12 @@ impl Scenario<ScenarioReport> for CloneLruChurn {
     }
 
     async fn run(self) -> Result<ScenarioReport> {
-        let Self { base, profile, pool } = self;
         let mut cells_spec = vec![Cell {
             name: "closure".to_owned(),
-            cap: profile.closure_cap,
+            cap: self.profile.closure_cap,
             closure: true,
         }];
-        for &cap in profile.ladder {
+        for &cap in self.profile.ladder {
             cells_spec.push(Cell {
                 name: format!("cap{cap}"),
                 cap,
@@ -148,136 +147,153 @@ impl Scenario<ScenarioReport> for CloneLruChurn {
 
         let mut cells: Vec<CellOutcome> = Vec::new();
         for cell in cells_spec {
-            let private = topology::private_er(
-                &base,
-                ErOptions {
-                    label: format!("s5-{}", cell.name),
-                    settings: Box::new(move |params| {
-                        params.engine.accountsdb.lru_capacity = cell.cap;
-                        params.chainlink.resubscription_delay = RESUBSCRIBE;
-                    }),
-
-                    ..Default::default()
-                },
-            )
-            .await?;
-            let cell_er = private.ctx();
-            if cell.closure {
-                cell_er.prewarm(&pool, ACCOUNT_SPACE as usize).await?;
-            } else {
-                cell_er.touch(&pool).await;
-            }
-
-            let request = |id: u64| {
-                let account = pick_account(&pool, id);
-                let api = cell_er.api().clone();
-                future::ready(Ok(move |_: Instant| async move {
-                    api.get_account(&account).await.map(|_| ())
-                }))
-            };
-
-            let warmup = execute(
-                RunConfig {
-                    iterations: profile.warmup,
-                    rate: Pacing::PerSecond(profile.rate),
-                    concurrency: profile.concurrency,
-                },
-                request,
-            )
-            .await?;
-            ensure!(warmup.failed == 0);
-
-            let before = cell_er.scrape_metrics().await?;
-            let offset = profile.warmup;
-            let outcome = execute(
-                RunConfig {
-                    iterations: profile.iterations,
-                    rate: Pacing::PerSecond(profile.rate),
-                    concurrency: profile.concurrency,
-                },
-                |iteration| request(offset + iteration),
-            )
-            .await?;
-            let after = settled_scrape(cell_er).await?;
-            let delta = MetricsDelta::new(before, after);
-
-            let evictions = delta.counter(EVICTED_COUNTER).unwrap_or(0.0);
-            let cell_outcome = CellOutcome {
-                name: cell.name.clone(),
-                evictions,
-                eviction_rate: evictions / outcome.wall.as_secs_f64(),
-                fetches_found: delta.counter_all(FETCHES_FOUND_COUNTER),
-                ensure_avg_s: delta.histogram_avg(ENSURE_HISTOGRAM),
-                monitored_end: delta.gauge(MONITORED_GAUGE).unwrap_or(0.0),
-                outcome,
-            };
-            debug!(
-                %cell_outcome.name,
-                cell_outcome.outcome.failed,
-                cell_outcome.evictions,
-                "cache churn cell finished",
-            );
-
-            let cell_report = ScenarioReport::ok()
-                .setting("profile", profile.name)
-                .setting("cap", cell.cap)
-                .setting("working set", profile.working_set)
-                .setting("account space", ACCOUNT_SPACE)
-                .setting("closure", cell.closure)
-                .setting("warmup reads", profile.warmup)
-                .setting("measured reads", profile.iterations)
-                .setting("offered rate /s", profile.rate)
-                .setting("concurrency", profile.concurrency)
-                .setting("request timeout s", NETWORK_TIMEOUT.as_secs())
-                .observe(
-                    "read latency us",
-                    Unit::Micros,
-                    cell_outcome.outcome.delivery,
-                )
-                .client_side(&cell_outcome.outcome)
-                .metric(
-                    "achieved reads /s",
-                    Unit::PerSecond,
-                    cell_outcome.outcome.achieved_rps(),
-                )
-                .metric(
-                    "delivered",
-                    Unit::Count,
-                    cell_outcome.outcome.delivered as f64,
-                )
-                .metric("failed", Unit::Count, cell_outcome.outcome.failed as f64)
-                .metric("evictions in window", Unit::Count, cell_outcome.evictions)
-                .metric(
-                    "eviction rate /s",
-                    Unit::PerSecond,
-                    cell_outcome.eviction_rate,
-                )
-                .metric_if(
-                    "fetches found in window",
-                    Unit::Count,
-                    cell_outcome.fetches_found,
-                )
-                .metric_if(
-                    "validator ensure avg s",
-                    Unit::Seconds,
-                    cell_outcome.ensure_avg_s,
-                )
-                .metric(
-                    "monitored accounts (end)",
-                    Unit::Count,
-                    cell_outcome.monitored_end,
-                );
-            base.report_cell(&cell.name, &cell_report)?;
-            cells.push(cell_outcome);
-            drop(private);
+            cells.push(self.measure_cell(cell).await?);
         }
 
+        self.check_cells(&cells)?;
+        Ok(self.summarize(&cells))
+    }
+}
+
+impl CloneLruChurn {
+    #[instrument(skip_all, err, fields(cell = %cell.name))]
+    async fn measure_cell(&self, cell: Cell) -> Result<CellOutcome> {
+        let private = topology::private_er(
+            &self.base,
+            ErOptions {
+                label: format!("s5-{}", cell.name),
+                settings: Box::new(move |params| {
+                    params.engine.accountsdb.lru_capacity = cell.cap;
+                    params.chainlink.resubscription_delay = RESUBSCRIBE;
+                }),
+
+                ..Default::default()
+            },
+        )
+        .await?;
+        let cell_er = private.ctx();
+        if cell.closure {
+            cell_er.prewarm(&self.pool, ACCOUNT_SPACE as usize).await?;
+        } else {
+            cell_er.touch(&self.pool).await;
+        }
+
+        let request = |id: u64| {
+            let account = pick_account(&self.pool, id);
+            let api = cell_er.api().clone();
+            future::ready(Ok(move |_: Instant| async move {
+                api.get_account(&account).await.map(|_| ())
+            }))
+        };
+
+        let warmup = execute(
+            RunConfig {
+                iterations: self.profile.warmup,
+                rate: Pacing::PerSecond(self.profile.rate),
+                concurrency: self.profile.concurrency,
+            },
+            request,
+        )
+        .await?;
+        ensure!(warmup.failed == 0);
+
+        let before = cell_er.scrape_metrics().await?;
+        let offset = self.profile.warmup;
+        let outcome = execute(
+            RunConfig {
+                iterations: self.profile.iterations,
+                rate: Pacing::PerSecond(self.profile.rate),
+                concurrency: self.profile.concurrency,
+            },
+            |iteration| request(offset + iteration),
+        )
+        .await?;
+        let after = settled_scrape(cell_er).await?;
+        let delta = MetricsDelta::new(before, after);
+
+        let evictions = delta.counter(EVICTED_COUNTER).unwrap_or(0.0);
+        let cell_outcome = CellOutcome {
+            name: cell.name.clone(),
+            evictions,
+            eviction_rate: evictions / outcome.wall.as_secs_f64(),
+            fetches_found: delta.counter_all(FETCHES_FOUND_COUNTER),
+            ensure_avg_s: delta.histogram_avg(ENSURE_HISTOGRAM),
+            monitored_end: delta.gauge(MONITORED_GAUGE).unwrap_or(0.0),
+            outcome,
+        };
+        debug!(
+            %cell_outcome.name,
+            cell_outcome.outcome.failed,
+            cell_outcome.evictions,
+            "cache churn cell finished",
+        );
+
+        self.report_cell(&cell, &cell_outcome)?;
+        drop(private);
+        Ok(cell_outcome)
+    }
+
+    fn report_cell(&self, cell: &Cell, cell_outcome: &CellOutcome) -> Result<()> {
+        let cell_report = ScenarioReport::ok()
+            .setting("profile", self.profile.name)
+            .setting("cap", cell.cap)
+            .setting("working set", self.profile.working_set)
+            .setting("account space", ACCOUNT_SPACE)
+            .setting("closure", cell.closure)
+            .setting("warmup reads", self.profile.warmup)
+            .setting("measured reads", self.profile.iterations)
+            .setting("offered rate /s", self.profile.rate)
+            .setting("concurrency", self.profile.concurrency)
+            .setting("request timeout s", NETWORK_TIMEOUT.as_secs())
+            .observe(
+                "read latency us",
+                Unit::Micros,
+                cell_outcome.outcome.delivery,
+            )
+            .client_side(&cell_outcome.outcome)
+            .metric(
+                "achieved reads /s",
+                Unit::PerSecond,
+                cell_outcome.outcome.achieved_rps(),
+            )
+            .metric(
+                "delivered",
+                Unit::Count,
+                cell_outcome.outcome.delivered as f64,
+            )
+            .metric("failed", Unit::Count, cell_outcome.outcome.failed as f64)
+            .metric("evictions in window", Unit::Count, cell_outcome.evictions)
+            .metric(
+                "eviction rate /s",
+                Unit::PerSecond,
+                cell_outcome.eviction_rate,
+            )
+            .metric_if(
+                "fetches found in window",
+                Unit::Count,
+                cell_outcome.fetches_found,
+            )
+            .metric_if(
+                "validator ensure avg s",
+                Unit::Seconds,
+                cell_outcome.ensure_avg_s,
+            )
+            .metric(
+                "monitored accounts (end)",
+                Unit::Count,
+                cell_outcome.monitored_end,
+            );
+        self.base.report_cell(&cell.name, &cell_report)
+    }
+
+    #[instrument(skip_all, err)]
+    fn check_cells(&self, cells: &[CellOutcome]) -> Result<()> {
         let closure = &cells[0];
         ensure!(closure.outcome.failed == 0);
         // The engine's account cache is a per-bucket sampled LRU (scc
         // HashCache), so a handful of early evictions below capacity are
         // normal; only systematic eviction under the cap marks a broken knob.
-        let closure_tolerance = (profile.working_set as f64) * 0.05;
+        let closure_tolerance = (self.profile.working_set as f64) * 0.05;
         ensure!(closure.evictions <= closure_tolerance);
         if closure.outcome.delivery.median >= 1_000_000 {
             warn!(
@@ -291,23 +307,32 @@ impl Scenario<ScenarioReport> for CloneLruChurn {
             ensure!(churn_cell.evictions > 0.0);
             if let Some(fetches_found) = churn_cell.fetches_found {
                 let deviation = (fetches_found - churn_cell.evictions).abs();
-                let tolerance = (churn_cell.evictions * 0.15).max(profile.concurrency as f64);
+                let tolerance = (churn_cell.evictions * 0.15).max(self.profile.concurrency as f64);
                 ensure!(deviation <= tolerance);
             }
         }
 
+        Ok(())
+    }
+
+    fn summarize(&self, cells: &[CellOutcome]) -> ScenarioReport {
         let mut summary = ScenarioReport::ok()
-            .setting("profile", profile.name)
-            .setting("working set", profile.working_set)
+            .setting("profile", self.profile.name)
+            .setting("working set", self.profile.working_set)
             .setting("account space", ACCOUNT_SPACE)
-            .setting("closure cap", profile.closure_cap)
+            .setting("closure cap", self.profile.closure_cap)
             .setting(
                 "cap ladder",
-                profile.ladder.iter().map(|cap| cap.to_string()).collect::<Vec<_>>().join("/"),
+                self.profile
+                    .ladder
+                    .iter()
+                    .map(|cap| cap.to_string())
+                    .collect::<Vec<_>>()
+                    .join("/"),
             )
-            .setting("offered rate /s", profile.rate)
-            .setting("concurrency", profile.concurrency);
-        for cell in &cells {
+            .setting("offered rate /s", self.profile.rate)
+            .setting("concurrency", self.profile.concurrency);
+        for cell in cells {
             summary = summary
                 .metric(
                     format!("{} eviction rate /s", cell.name),
@@ -351,6 +376,6 @@ impl Scenario<ScenarioReport> for CloneLruChurn {
                     cell.ensure_avg_s,
                 );
         }
-        Ok(summary)
+        summary
     }
 }

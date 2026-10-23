@@ -77,28 +77,27 @@ impl Scenario<ScenarioReport> for RpcIngressCapacity {
     }
 
     async fn run(self) -> Result<ScenarioReport> {
-        let Self { er, profile, prep_payers, pool } = self;
-        let threads = profile.threads;
+        let threads = self.profile.threads;
 
-        let before = er.scrape_metrics().await?;
+        let before = self.er.scrape_metrics().await?;
         let outcome = execute_kernel(
             ThreadRunConfig {
                 threads,
-                iterations: profile.requests,
-                rate: Pacing::PerSecond(profile.offered),
-                concurrency: profile.concurrency,
+                iterations: self.profile.requests,
+                rate: Pacing::PerSecond(self.profile.offered),
+                concurrency: self.profile.concurrency,
             },
-            er.api().url().clone(),
-            er.ws_url().clone(),
-            prep::payer_bytes(&prep_payers),
+            self.er.api().url().clone(),
+            self.er.ws_url().clone(),
+            prep::payer_bytes(&self.prep_payers),
             0,
-            move |id| REDLINE.write(id, &[pool[(id as usize) % pool.len()]]),
+            move |id| REDLINE.write(id, &[self.pool[(id as usize) % self.pool.len()]]),
             None,
         )?;
         if let Some(ledger_txs_before) = before.get(metrics::ENGINE_TRANSACTIONS) {
-            settle_ledger(&er, ledger_txs_before, profile.requests as f64).await;
+            self.profile.settle_ledger(&self.er, ledger_txs_before).await;
         }
-        let after = er.scrape_metrics().await?;
+        let after = self.er.scrape_metrics().await?;
         let delta = MetricsDelta::new(before, after);
 
         let delivered_rps = outcome.achieved_rps();
@@ -109,21 +108,21 @@ impl Scenario<ScenarioReport> for RpcIngressCapacity {
             warn!(delivered_rps, "RPC throughput below minimum",);
         }
         if let Some(processed) = delta.counter(metrics::ENGINE_TRANSACTIONS) {
-            ensure!(processed >= profile.requests as f64);
+            ensure!(processed >= self.profile.requests as f64);
         }
         if let Some(failed_txs) = delta.counter_all(metrics::FAILED_TRANSACTIONS) {
             ensure!(failed_txs == 0.0);
         }
 
         Ok(ScenarioReport::ok()
-            .setting("profile", profile.name)
+            .setting("profile", self.profile.name)
             .setting("shape", "write 1/tx pattern write over hot pool")
             .setting("threads", threads)
-            .setting("payers", profile.payers)
-            .setting("accounts", profile.accounts)
-            .setting("requests", profile.requests)
-            .setting("offered rps", profile.offered)
-            .setting("concurrency", profile.concurrency)
+            .setting("payers", self.profile.payers)
+            .setting("accounts", self.profile.accounts)
+            .setting("requests", self.profile.requests)
+            .setting("offered rps", self.profile.offered)
+            .setting("concurrency", self.profile.concurrency)
             .observe("delivery us", Unit::Micros, outcome.delivery)
             .client_side(&outcome)
             .observe("achieved rps", Unit::Rps, outcome.rps)
@@ -143,19 +142,21 @@ impl Scenario<ScenarioReport> for RpcIngressCapacity {
     }
 }
 
-async fn settle_ledger(er: &ErCtx, baseline: f64, expected: f64) {
-    let deadline = Instant::now() + LEDGER_SETTLE_TIMEOUT;
-    loop {
-        let committed = time::timeout_at(deadline, er.scrape_metrics())
-            .await
-            .ok()
-            .and_then(|scraped| scraped.ok())
-            .and_then(|metrics| metrics.get(metrics::ENGINE_TRANSACTIONS))
-            .map(|total| total - baseline)
-            .unwrap_or(0.0);
-        if committed >= expected || Instant::now() >= deadline {
-            return;
+impl Profile {
+    async fn settle_ledger(&self, er: &ErCtx, baseline: f64) {
+        let deadline = Instant::now() + LEDGER_SETTLE_TIMEOUT;
+        loop {
+            let committed = time::timeout_at(deadline, er.scrape_metrics())
+                .await
+                .ok()
+                .and_then(|scraped| scraped.ok())
+                .and_then(|metrics| metrics.get(metrics::ENGINE_TRANSACTIONS))
+                .map(|total| total - baseline)
+                .unwrap_or(0.0);
+            if committed >= self.requests as f64 || Instant::now() >= deadline {
+                return;
+            }
+            time::sleep(LEDGER_SETTLE_POLL).await;
         }
-        time::sleep(LEDGER_SETTLE_POLL).await;
     }
 }

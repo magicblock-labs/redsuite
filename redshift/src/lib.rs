@@ -5,7 +5,6 @@ use account::Account;
 use pubkey::Pubkey;
 pub use redline_interface as program;
 use redline_interface::DELEGATION_PROGRAM_ID;
-pub use redsuite_core::phase;
 use redsuite_core::{dlp, programs::CellHeader, BaseCtx, ChainCtx, Result};
 
 pub const ACCOUNT_SPACE: u32 = 128;

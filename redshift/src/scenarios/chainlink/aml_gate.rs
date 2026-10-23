@@ -20,7 +20,7 @@ use redsuite_core::{
     api::transaction_meta,
     dlp, topology,
     topology::{ErOptions, PrivateEr},
-    wait, BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result,
+    wait, BaseCtx, ChainCtx, PrivateErScenario, Result,
 };
 use sdk::spl::{
     builders::{
@@ -195,163 +195,165 @@ impl PrivateErScenario for AmlGate {
     }
 
     async fn run(self) -> Result<()> {
-        let Self { base, server, private } = self;
         // High-risk owner (score 9): the merge is blocked, no tokens move,
         // and the shuttle ATA is undelegated on base.
-        run_risk_case(&base, private.ctx(), &server, 9, false).await?;
+        self.run_risk_case(9, false).await?;
 
         // Low-risk owner (score 1): the gate allows a merge attempt.
-        run_risk_case(&base, private.ctx(), &server, 1, true).await?;
+        self.run_risk_case(1, true).await?;
 
-        private.finish().await?;
+        self.private.finish().await?;
         Ok(())
     }
-}
-
-async fn run_risk_case(
-    base: &BaseCtx,
-    er_ctx: &ErCtx,
-    server: &MockRiskServer,
-    owner_risk: u64,
-    expect_allowed: bool,
-) -> Result<()> {
-    let er_identity = er_ctx.identity();
-    let owner = Keypair::new();
-    let owner_pk = owner.pubkey();
-    server.set_risk(owner_pk, owner_risk);
-
-    let fee_payer = base.funded_payer(AIRDROP).await?;
-    base.airdrop(&owner_pk, AIRDROP).await?;
-    let recipient = Keypair::new();
-    let mint = Keypair::new();
-
-    let source_ata = spl::derive_ata(&owner_pk, &mint.pubkey());
-    let destination_ata = spl::derive_ata(&recipient.pubkey(), &mint.pubkey());
-
-    let (shuttle_ephemeral_ata, _) =
-        find_shuttle_ephemeral_ata(&owner_pk, &mint.pubkey(), SHUTTLE_ID);
-    let (shuttle_ata, _) = find_shuttle_ata(&shuttle_ephemeral_ata, &mint.pubkey());
-
-    // 1. Create mint, source ATA, destination ATA, and mint tokens
-    let setup_ixs = vec![
-        spl::allocate_mint(&fee_payer.pubkey(), &mint.pubkey()),
-        spl::initialize_mint(&mint.pubkey(), &owner_pk),
-        spl::create_ata_idempotent(&fee_payer.pubkey(), &owner_pk, &mint.pubkey()),
-        spl::create_ata_idempotent(&fee_payer.pubkey(), &recipient.pubkey(), &mint.pubkey()),
-        spl::mint_to(&mint.pubkey(), &source_ata, &owner_pk, SHUTTLE_AMOUNT),
-    ];
-    base.submit_and_confirm_with(&fee_payer, &[&mint, &owner], &setup_ixs).await?;
-
-    // 2. Initialize rent PDA if it doesn't exist yet, and top it up
-    let (rent_pda, _) = find_rent_pda();
-    if base.account(&rent_pda).await?.is_none() {
-        let rent_pda_ix = InitializeRentPdaBuilder { payer: fee_payer.pubkey() }.instruction();
-        base.submit_and_confirm(&fee_payer, &[rent_pda_ix]).await?;
-    }
-    base.airdrop(&rent_pda, 1_000_000_000).await?;
-
-    // 3. Initialize Global Vault and Validator Fees Vault
-    let vault_ix = InitializeGlobalVaultBuilder {
-        payer: fee_payer.pubkey(),
-        mint: mint.pubkey(),
-    }
-    .instruction();
-    base.submit_and_confirm(&fee_payer, &[vault_ix]).await?;
-
-    let fees_vault = dlp::validator_fees_vault_pda(&er_identity);
-    ensure!(base.account(&fees_vault).await?.is_some());
-
-    let _ = er_ctx.account(&source_ata).await;
-    let _ = er_ctx.account(&destination_ata).await;
-
-    // 4. Delegate shuttle ATA with post-delegation merge instruction
-    let shuttle_ix = SetupAndDelegateShuttleEphemeralAtaWithMergeBuilder {
-        payer: fee_payer.pubkey(),
-        owner: owner_pk,
-        mint: mint.pubkey(),
-        source_ata,
-        destination_ata,
-        shuttle_id: SHUTTLE_ID,
-        amount: SHUTTLE_AMOUNT,
-        validator: Some(er_identity),
-    }
-    .instruction();
-    base.submit_and_confirm_with(&fee_payer, &[&owner], &[shuttle_ix]).await?;
-
-    // Verify shuttle ATA delegation record exists on base chain
-    ensure!(delegation_record_exists(base, &shuttle_ata).await?);
-
-    // 5. Wait for the risk server query
-    wait::on_change(
-        &server.service.changed,
-        QUERY_TIMEOUT,
-        "risk server queried shuttle owner",
-        || Ok((server.query_count(&owner_pk) > 0).then_some(())),
-    )
-    .await?;
-
-    // The gate controls attempts. An allowed action can still fail in the
-    // deployed token program; only a successful action must move the tokens.
-    if expect_allowed {
-        let attempt = wait::retry("low-risk merge attempted", MERGE_TIMEOUT, async || {
-            merge_attempt(er_ctx, &shuttle_ata, &destination_ata)
-                .await?
-                .context("merge attempt missing")
-        })
-        .await?;
-        if attempt.is_none() {
-            er_ctx
-                .api()
-                .await_accounts(&[destination_ata], "low-risk merge settles", async || {
-                    ensure!(er_token_amount(er_ctx, &destination_ata).await? == SHUTTLE_AMOUNT);
-                    Ok(())
-                })
-                .await?;
-            ensure!(er_token_amount(er_ctx, &destination_ata).await? == SHUTTLE_AMOUNT);
-        } else {
-            ensure!(er_token_amount(er_ctx, &destination_ata).await? == 0);
-        }
-    } else {
-        base.api()
-            .await_query("high-risk shuttle undelegates", async || {
-                ensure!(!delegation_record_exists(base, &shuttle_ata).await?);
-                Ok(())
-            })
-            .await?;
-        ensure!(!delegation_record_exists(base, &shuttle_ata).await?);
-        ensure!(merge_attempt(er_ctx, &shuttle_ata, &destination_ata).await?.is_none());
-        ensure!(er_token_amount(er_ctx, &destination_ata).await? == 0);
-    }
-    Ok(())
 }
 
 // The merge attempt is the er transaction that references both the shuttle
 // ATA and the destination. Outer None = no attempt; Some(None) = the attempt
 // succeeded; Some(Some(text)) = the attempt failed with that error.
-async fn merge_attempt(
-    er: &ErCtx,
-    shuttle_ata: &Pubkey,
-    destination_ata: &Pubkey,
-) -> Result<Option<Option<String>>> {
-    let shuttle_signatures = er.api().get_signatures_for_address(shuttle_ata, 10).await?;
-    let destination_signatures = er.api().get_signatures_for_address(destination_ata, 10).await?;
-    let Some(shared) = shuttle_signatures
-        .iter()
-        .find(|signature| destination_signatures.contains(signature))
-    else {
-        return Ok(None);
-    };
-    let tx = er.api().await_transaction(shared).await?;
-    Ok(Some(
-        transaction_meta(&tx)?.err.as_ref().map(|err| format!("{err:?}")),
-    ))
-}
 
-async fn er_token_amount(er: &ErCtx, ata: &Pubkey) -> Result<u64> {
-    Ok(spl::token_balance(er, ata).await?.unwrap_or(0))
-}
+impl AmlGate {
+    async fn run_risk_case(&self, owner_risk: u64, expect_allowed: bool) -> Result<()> {
+        let er_identity = self.private.ctx().identity();
+        let owner = Keypair::new();
+        let owner_pk = owner.pubkey();
+        self.server.set_risk(owner_pk, owner_risk);
 
-async fn delegation_record_exists(base: &BaseCtx, delegated_account: &Pubkey) -> Result<bool> {
-    let record_pda = dlp::delegation_record_pda(delegated_account);
-    Ok(base.account(&record_pda).await?.is_some())
+        let fee_payer = self.base.funded_payer(AIRDROP).await?;
+        self.base.airdrop(&owner_pk, AIRDROP).await?;
+        let recipient = Keypair::new();
+        let mint = Keypair::new();
+
+        let source_ata = spl::derive_ata(&owner_pk, &mint.pubkey());
+        let destination_ata = spl::derive_ata(&recipient.pubkey(), &mint.pubkey());
+
+        let (shuttle_ephemeral_ata, _) =
+            find_shuttle_ephemeral_ata(&owner_pk, &mint.pubkey(), SHUTTLE_ID);
+        let (shuttle_ata, _) = find_shuttle_ata(&shuttle_ephemeral_ata, &mint.pubkey());
+
+        // 1. Create mint, source ATA, destination ATA, and mint tokens
+        let setup_ixs = vec![
+            spl::allocate_mint(&fee_payer.pubkey(), &mint.pubkey()),
+            spl::initialize_mint(&mint.pubkey(), &owner_pk),
+            spl::create_ata_idempotent(&fee_payer.pubkey(), &owner_pk, &mint.pubkey()),
+            spl::create_ata_idempotent(&fee_payer.pubkey(), &recipient.pubkey(), &mint.pubkey()),
+            spl::mint_to(&mint.pubkey(), &source_ata, &owner_pk, SHUTTLE_AMOUNT),
+        ];
+        self.base
+            .submit_and_confirm_with(&fee_payer, &[&mint, &owner], &setup_ixs)
+            .await?;
+
+        // 2. Initialize rent PDA if it doesn't exist yet, and top it up
+        let (rent_pda, _) = find_rent_pda();
+        if self.base.account(&rent_pda).await?.is_none() {
+            let rent_pda_ix = InitializeRentPdaBuilder { payer: fee_payer.pubkey() }.instruction();
+            self.base.submit_and_confirm(&fee_payer, &[rent_pda_ix]).await?;
+        }
+        self.base.airdrop(&rent_pda, 1_000_000_000).await?;
+
+        // 3. Initialize Global Vault and Validator Fees Vault
+        let vault_ix = InitializeGlobalVaultBuilder {
+            payer: fee_payer.pubkey(),
+            mint: mint.pubkey(),
+        }
+        .instruction();
+        self.base.submit_and_confirm(&fee_payer, &[vault_ix]).await?;
+
+        let fees_vault = dlp::validator_fees_vault_pda(&er_identity);
+        ensure!(self.base.account(&fees_vault).await?.is_some());
+
+        let _ = self.private.ctx().account(&source_ata).await;
+        let _ = self.private.ctx().account(&destination_ata).await;
+
+        // 4. Delegate shuttle ATA with post-delegation merge instruction
+        let shuttle_ix = SetupAndDelegateShuttleEphemeralAtaWithMergeBuilder {
+            payer: fee_payer.pubkey(),
+            owner: owner_pk,
+            mint: mint.pubkey(),
+            source_ata,
+            destination_ata,
+            shuttle_id: SHUTTLE_ID,
+            amount: SHUTTLE_AMOUNT,
+            validator: Some(er_identity),
+        }
+        .instruction();
+        self.base.submit_and_confirm_with(&fee_payer, &[&owner], &[shuttle_ix]).await?;
+
+        // Verify shuttle ATA delegation record exists on base chain
+        ensure!(self.delegation_record_exists(&shuttle_ata).await?);
+
+        // 5. Wait for the risk server query
+        wait::on_change(
+            &self.server.service.changed,
+            QUERY_TIMEOUT,
+            "risk server queried shuttle owner",
+            || Ok((self.server.query_count(&owner_pk) > 0).then_some(())),
+        )
+        .await?;
+
+        // The gate controls attempts. An allowed action can still fail in the
+        // deployed token program; only a successful action must move the tokens.
+        if expect_allowed {
+            let attempt = wait::retry("low-risk merge attempted", MERGE_TIMEOUT, async || {
+                self.merge_attempt(&shuttle_ata, &destination_ata)
+                    .await?
+                    .context("merge attempt missing")
+            })
+            .await?;
+            if attempt.is_none() {
+                self.private
+                    .ctx()
+                    .api()
+                    .await_accounts(&[destination_ata], "low-risk merge settles", async || {
+                        ensure!(self.er_token_amount(&destination_ata).await? == SHUTTLE_AMOUNT);
+                        Ok(())
+                    })
+                    .await?;
+                ensure!(self.er_token_amount(&destination_ata).await? == SHUTTLE_AMOUNT);
+            } else {
+                ensure!(self.er_token_amount(&destination_ata).await? == 0);
+            }
+        } else {
+            self.base
+                .api()
+                .await_query("high-risk shuttle undelegates", async || {
+                    ensure!(!self.delegation_record_exists(&shuttle_ata).await?);
+                    Ok(())
+                })
+                .await?;
+            ensure!(!self.delegation_record_exists(&shuttle_ata).await?);
+            ensure!(self.merge_attempt(&shuttle_ata, &destination_ata).await?.is_none());
+            ensure!(self.er_token_amount(&destination_ata).await? == 0);
+        }
+        Ok(())
+    }
+
+    async fn merge_attempt(
+        &self,
+        shuttle_ata: &Pubkey,
+        destination_ata: &Pubkey,
+    ) -> Result<Option<Option<String>>> {
+        let shuttle_signatures =
+            self.private.ctx().api().get_signatures_for_address(shuttle_ata, 10).await?;
+        let destination_signatures =
+            self.private.ctx().api().get_signatures_for_address(destination_ata, 10).await?;
+        let Some(shared) = shuttle_signatures
+            .iter()
+            .find(|signature| destination_signatures.contains(signature))
+        else {
+            return Ok(None);
+        };
+        let tx = self.private.ctx().api().await_transaction(shared).await?;
+        Ok(Some(
+            transaction_meta(&tx)?.err.as_ref().map(|err| format!("{err:?}")),
+        ))
+    }
+
+    async fn er_token_amount(&self, ata: &Pubkey) -> Result<u64> {
+        Ok(spl::token_balance(self.private.ctx(), ata).await?.unwrap_or(0))
+    }
+
+    async fn delegation_record_exists(&self, delegated_account: &Pubkey) -> Result<bool> {
+        let record_pda = dlp::delegation_record_pda(delegated_account);
+        Ok(self.base.account(&record_pda).await?.is_some())
+    }
 }

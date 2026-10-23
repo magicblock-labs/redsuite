@@ -17,10 +17,10 @@ use redsuite_core::{
         execute_for_raw, execute_raw, merge_outcomes, spawn_workers, split_budget,
         split_iterations, Delivery, Pacing, RawRunOutcome, RunConfig, RunOutcome, SendTransaction,
     },
-    wait, BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
+    wait, BaseCtx, ChainCtx, ErCtx, Metrics, MetricsDelta, Result, Scenario, ScenarioReport,
 };
 use tokio::sync::{watch, Mutex};
-use tracing::{debug, info};
+use tracing::{debug, info, instrument};
 use url::Url;
 
 use crate::{load::Options, metrics, program::layout, ACCOUNT_SPACE};
@@ -416,24 +416,27 @@ impl Workload {
         load: Option<&Options>,
         started: Instant,
     ) -> Result<(ScenarioReport, Result<()>)> {
-        let Self { profile, pool, payer_bytes } = self;
         let er_pid = er.pid();
-        let rate = load.and_then(|load| load.rate).map_or(profile.rate, |rate| rate.get());
+        let rate = load.and_then(|load| load.rate).map_or(self.profile.rate, |rate| rate.get());
         let concurrency = load.and_then(|load| load.concurrency).map_or(
-            profile.concurrency_per_thread() * profile.threads,
+            self.profile.concurrency_per_thread() * self.profile.threads,
             |concurrency| concurrency.get(),
         );
-        let threads = profile.threads.min(rate as usize).min(concurrency);
+        let threads = self.profile.threads.min(rate as usize).min(concurrency);
 
-        let before = er.scrape_metrics().await?;
-        let engine_txs_before = before.get(metrics::ENGINE_TRANSACTIONS).with_context(|| {
+        let metrics = er.scrape_metrics().await?;
+        let engine_txs = metrics.get(metrics::ENGINE_TRANSACTIONS).with_context(|| {
             format!(
                 "the ER exposes no {} metric to drain against",
                 metrics::ENGINE_TRANSACTIONS
             )
         })?;
-        let cpu_before = host::cpu_sample(er_pid)?;
-        let rss_before = host::rss_kb(er_pid)?;
+        let baseline = Baseline {
+            metrics,
+            cpu: host::cpu_sample(er_pid)?,
+            rss: host::rss_kb(er_pid)?,
+            engine_txs,
+        };
 
         let setup = started.elapsed();
         let limit = match load {
@@ -448,27 +451,26 @@ impl Workload {
                     stop: load.stop.clone(),
                 }
             }
-            None => Limit::Iterations(profile.iterations),
+            None => Limit::Iterations(self.profile.iterations),
         };
         let executed = execute(
             er.api().url().clone(),
             er.ws_url().clone(),
             ExecuteConfig {
-                lanes: profile.lanes,
+                lanes: self.profile.lanes,
                 limit,
-                read_span: profile.read_span,
-                hash_iters: profile.hash_iters,
+                read_span: self.profile.read_span,
+                hash_iters: self.profile.hash_iters,
                 rate,
                 threads,
                 concurrency,
             },
-            pool.clone(),
-            payer_bytes,
+            self.pool.clone(),
+            self.payer_bytes,
         )
         .await?;
 
-        let Executed { outcome, last_ids, counts } = executed;
-        let total = outcome.delivered + outcome.failed;
+        let outcome = &executed.outcome;
         if load.is_some() {
             info!(
                 outcome.delivered,
@@ -477,13 +479,38 @@ impl Workload {
                 "load requests drained"
             );
         }
+        let mut report = executed.report(self.profile, load, setup, (rate, concurrency, threads));
+        let validation = executed
+            .check(
+                er,
+                self.profile,
+                &self.pool,
+                baseline,
+                load.is_none(),
+                &mut report,
+            )
+            .await;
+        Ok((report, validation))
+    }
+}
+
+impl Executed {
+    fn report(
+        &self,
+        profile: &Profile,
+        load: Option<&Options>,
+        setup: Duration,
+        settings: (u32, usize, usize),
+    ) -> ScenarioReport {
+        let outcome = &self.outcome;
+        let (rate, concurrency, threads) = settings;
         let mut report = ScenarioReport::ok()
             .setting("profile", profile.name)
             .setting(
                 "mix",
                 "10% hash compute / 45% pattern write / 45% account size sum, no commits",
             )
-            .setting("workload txs", total)
+            .setting("workload txs", outcome.delivered + outcome.failed)
             .setting("target tps", rate)
             .setting("lanes", profile.lanes)
             .setting("read span", profile.read_span)
@@ -492,7 +519,7 @@ impl Workload {
             .setting("total concurrency", concurrency)
             .setting("hash-chain iterations", profile.hash_iters)
             .observe("delivery us", Unit::Micros, outcome.delivery)
-            .client_side(&outcome)
+            .client_side(outcome)
             .metric("target tps", Unit::Tps, f64::from(rate))
             .metric("delivered tps", Unit::Tps, outcome.achieved_rps())
             .metric("delivered txs", Unit::Count, outcome.delivered as f64)
@@ -514,84 +541,113 @@ impl Workload {
         } else {
             report = report.setting("concurrency per thread", profile.concurrency_per_thread());
         }
-        for (mode, count) in Mode::ALL.into_iter().zip(counts) {
+        for (mode, count) in Mode::ALL.into_iter().zip(self.counts) {
             report = report.metric(format!("{} txs", mode.label()), Unit::Count, count as f64);
         }
-        let validation = async {
-            if load.is_none() {
-                ensure!(total == profile.iterations);
-                for mode in Mode::ALL {
-                    ensure!(counts[mode as usize] == mode_count(mode, total));
-                }
-            }
-            ensure!(counts.iter().sum::<u64>() == total);
-            ensure!(outcome.failed == 0);
-            ensure!(outcome.delivered == total);
 
-            let drained = drain(er, engine_txs_before + total as f64).await?;
-            let cpu_after = host::cpu_sample(er_pid)?;
-            let rss_after = host::rss_kb(er_pid)?;
-            let after = er.scrape_metrics().await?;
-            let delta = MetricsDelta::new(before, after);
-
-            let engine_txs = delta.counter(metrics::ENGINE_TRANSACTIONS).unwrap_or_default();
-            let excess = engine_txs - total as f64;
-            let rpc_handled = delta.counter(metrics::RPC_HANDLED_TRANSACTIONS);
-            let rpc_accepted = delta.counter(metrics::RPC_ACCEPTED_TRANSACTIONS);
-            let wall = outcome.wall + drained.elapsed;
-            let executed_tps = total as f64 / wall.as_secs_f64();
-            let thread_cores = cpu_after.thread_cores_since(&cpu_before);
-            let observations = ScenarioReport::ok()
-                .metric("executed tps", Unit::Tps, executed_tps)
-                .metric("engine txs", Unit::Count, engine_txs)
-                .metric("engine txs beyond workload", Unit::Count, excess)
-                .metric_if("rpc handled txs", Unit::Count, rpc_handled)
-                .metric_if("rpc accepted txs", Unit::Count, rpc_accepted)
-                .metric("drain s", Unit::Seconds, drained.elapsed.as_secs_f64())
-                .metric("blocked at drain", Unit::Count, drained.blocked)
-                .metric("busy at drain", Unit::Count, drained.busy)
-                .metric("pending at drain", Unit::Count, drained.pending)
-                .metric(
-                    "validator cores",
-                    Unit::Count,
-                    cpu_after.cores_since(&cpu_before),
-                )
-                .metric(
-                    "top thread cores",
-                    Unit::Count,
-                    thread_cores.first().copied().unwrap_or(0.0),
-                )
-                .metric("rss growth mib", Unit::Count, {
-                    let growth = rss_after.saturating_sub(rss_before);
-                    growth as f64 / 1024.0
-                })
-                .metric_if(
-                    "ordering dependencies",
-                    Unit::Count,
-                    delta.counter(ORDERING_DEPENDENCIES),
-                );
-            report.measurements.extend(observations.measurements);
-            ensure!(engine_txs >= total as f64);
-
-            if let Some(rpc_handled) = rpc_handled {
-                ensure!(rpc_handled == (total as f64));
-            }
-            if let Some(rpc_accepted) = rpc_accepted {
-                ensure!(rpc_accepted == (total as f64));
-            }
-
-            verify_final_state(er, &pool, &last_ids, profile.hash_iters, profile.read_span).await?;
-
-            debug!(
-                total,
-                delivered_tps = outcome.achieved_rps(),
-                executed_tps,
-                "sustained workload finished",
-            );
-
-            Ok(())
-        }
-        .await;
-        Ok((report, validation))
+        report
     }
+
+    #[instrument(skip_all, err)]
+    async fn check(
+        &self,
+        er: &ErCtx,
+        profile: &Profile,
+        pool: &[Pubkey],
+        baseline: Baseline,
+        check_counts: bool,
+        report: &mut ScenarioReport,
+    ) -> Result<()> {
+        let outcome = &self.outcome;
+        let counts = self.counts;
+        let total = outcome.delivered + outcome.failed;
+        let er_pid = er.pid();
+
+        if check_counts {
+            ensure!(total == profile.iterations);
+            for mode in Mode::ALL {
+                ensure!(counts[mode as usize] == mode_count(mode, total));
+            }
+        }
+        ensure!(counts.iter().sum::<u64>() == total);
+        ensure!(outcome.failed == 0);
+        ensure!(outcome.delivered == total);
+
+        let drained = drain(er, baseline.engine_txs + total as f64).await?;
+        let cpu_after = host::cpu_sample(er_pid)?;
+        let rss_after = host::rss_kb(er_pid)?;
+        let after = er.scrape_metrics().await?;
+        let delta = MetricsDelta::new(baseline.metrics, after);
+
+        let engine_txs = delta.counter(metrics::ENGINE_TRANSACTIONS).unwrap_or_default();
+        let excess = engine_txs - total as f64;
+        let rpc_handled = delta.counter(metrics::RPC_HANDLED_TRANSACTIONS);
+        let rpc_accepted = delta.counter(metrics::RPC_ACCEPTED_TRANSACTIONS);
+        let wall = outcome.wall + drained.elapsed;
+        let executed_tps = total as f64 / wall.as_secs_f64();
+        let thread_cores = cpu_after.thread_cores_since(&baseline.cpu);
+        let observations = ScenarioReport::ok()
+            .metric("executed tps", Unit::Tps, executed_tps)
+            .metric("engine txs", Unit::Count, engine_txs)
+            .metric("engine txs beyond workload", Unit::Count, excess)
+            .metric_if("rpc handled txs", Unit::Count, rpc_handled)
+            .metric_if("rpc accepted txs", Unit::Count, rpc_accepted)
+            .metric("drain s", Unit::Seconds, drained.elapsed.as_secs_f64())
+            .metric("blocked at drain", Unit::Count, drained.blocked)
+            .metric("busy at drain", Unit::Count, drained.busy)
+            .metric("pending at drain", Unit::Count, drained.pending)
+            .metric(
+                "validator cores",
+                Unit::Count,
+                cpu_after.cores_since(&baseline.cpu),
+            )
+            .metric(
+                "top thread cores",
+                Unit::Count,
+                thread_cores.first().copied().unwrap_or(0.0),
+            )
+            .metric("rss growth mib", Unit::Count, {
+                let growth = rss_after.saturating_sub(baseline.rss);
+                growth as f64 / 1024.0
+            })
+            .metric_if(
+                "ordering dependencies",
+                Unit::Count,
+                delta.counter(ORDERING_DEPENDENCIES),
+            );
+        report.measurements.extend(observations.measurements);
+        ensure!(engine_txs >= total as f64);
+
+        if let Some(rpc_handled) = rpc_handled {
+            ensure!(rpc_handled == (total as f64));
+        }
+        if let Some(rpc_accepted) = rpc_accepted {
+            ensure!(rpc_accepted == (total as f64));
+        }
+
+        verify_final_state(
+            er,
+            pool,
+            &self.last_ids,
+            profile.hash_iters,
+            profile.read_span,
+        )
+        .await?;
+
+        debug!(
+            total,
+            delivered_tps = outcome.achieved_rps(),
+            executed_tps,
+            "sustained workload finished",
+        );
+
+        Ok(())
+    }
+}
+
+struct Baseline {
+    metrics: Metrics,
+    cpu: host::CpuSample,
+    rss: u64,
+    engine_txs: f64,
 }

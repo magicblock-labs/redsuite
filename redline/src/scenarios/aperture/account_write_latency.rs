@@ -50,20 +50,20 @@ impl Scenario<ScenarioReport> for AccountWriteLatency {
     }
 
     async fn run(self) -> Result<ScenarioReport> {
-        let Self { base, er, payer, pdas } = self;
         let clock = Arc::new(SendClock::new(1, ITERATIONS as usize));
         let updates = Rc::new(
-            AccountUpdates::connect(er.ws_url(), CellHeader::written_id, clock.clone()).await?,
+            AccountUpdates::connect(self.er.ws_url(), CellHeader::written_id, clock.clone())
+                .await?,
         );
-        for pda in &pdas {
+        for pda in &self.pdas {
             updates.account_subscribe(pda).await?;
         }
-        updates.await_subscribed(pdas.len()).await?;
-        let sigs = Rc::new(SignatureConfirmations::connect(er.ws_url(), clock.clone()).await?);
-        let sender = er.sender(Rc::new(payer));
+        updates.await_subscribed(self.pdas.len()).await?;
+        let sigs = Rc::new(SignatureConfirmations::connect(self.er.ws_url(), clock.clone()).await?);
+        let sender = self.er.sender(Rc::new(self.payer));
 
         let request = |id: u64| {
-            let target = pdas[((id - 1) % pdas.len() as u64) as usize];
+            let target = self.pdas[((id - 1) % self.pdas.len() as u64) as usize];
             let ix = REDLINE.write(id, &[target]);
             updates.track(id, target);
             let (sender, sigs, clock) = (sender.clone(), sigs.clone(), clock.clone());
@@ -94,12 +94,12 @@ impl Scenario<ScenarioReport> for AccountWriteLatency {
         let confirmations = sigs.finalize();
         ensure!(confirmations.failed == 0);
 
-        for (i, pda) in pdas.iter().enumerate() {
+        for (i, pda) in self.pdas.iter().enumerate() {
             let last_id = ITERATIONS - ACCOUNTS as u64 + 1 + i as u64;
-            let on_er = er.account(pda).await?.context("pda not on er")?;
+            let on_er = self.er.account(pda).await?.context("pda not on er")?;
             ensure!(CellHeader::written_id(&on_er.data) == Some(last_id));
 
-            let on_base = base.account(pda).await?.context("pda gone on base")?;
+            let on_base = self.base.account(pda).await?.context("pda gone on base")?;
             ensure!(on_base.data[layout::DATA_OFFSET..].iter().all(|&b| b == 0));
         }
 

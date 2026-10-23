@@ -53,24 +53,19 @@ impl PrivateErScenario for CloneWithoutAltWrites {
     }
 
     async fn run(self) -> Result<()> {
-        let Self {
-            base,
-            identity,
-            baseline,
-            private,
-        } = self;
         let alt_program = sdk_ids::address_lookup_table::ID.to_string();
         let alt_transactions = async || -> Result<usize> {
-            let signatures = base
+            let signatures = self
+                .base
                 .api()
-                .get_signatures_for_address(&identity.pubkey(), SIGNATURE_WINDOW)
+                .get_signatures_for_address(&self.identity.pubkey(), SIGNATURE_WINDOW)
                 .await?;
             let mut count = 0;
             for signature in signatures {
-                if baseline.contains(&signature) {
+                if self.baseline.contains(&signature) {
                     continue;
                 }
-                let Some(tx) = base.api().get_transaction(&signature).await? else {
+                let Some(tx) = self.base.api().get_transaction(&signature).await? else {
                     continue;
                 };
                 if transaction_logs(transaction_meta(&tx)?)
@@ -84,17 +79,18 @@ impl PrivateErScenario for CloneWithoutAltWrites {
         };
 
         ensure!(alt_transactions().await? == 0);
-        let er = private.ctx();
+        let er = self.private.ctx();
         er.await_program_clone(&redshift_interface::ID).await?;
         er.await_program_clone(&topology::COMMITTOR_ID).await?;
 
-        let payer_chain = base.funded_payer(PAYER_LAMPORTS).await?;
-        let payer_ephem = base.funded_payer(PAYER_LAMPORTS).await?;
-        let cell = base
+        let payer_chain = self.base.funded_payer(PAYER_LAMPORTS).await?;
+        let payer_ephem = self.base.funded_payer(PAYER_LAMPORTS).await?;
+        let cell = self
+            .base
             .cells(REDSHIFT, &payer_ephem)
             .create_primary(er.identity(), prep::COMMIT_FREQUENCY_MS)
             .await?;
-        base.delegate_payer(&payer_chain, &payer_ephem, er.identity()).await?;
+        self.base.delegate_payer(&payer_chain, &payer_ephem, er.identity()).await?;
         er.submit_and_confirm(
             &payer_ephem,
             &[REDSHIFT
@@ -110,11 +106,12 @@ impl PrivateErScenario for CloneWithoutAltWrites {
         time::sleep(ALT_SETTLE).await;
         ensure!(alt_transactions().await? == 0);
         // Keep the detector's positive control out of the ER observation window.
-        private.finish().await?;
+        self.private.finish().await?;
 
-        let recent_slot = base.api().get_slot().await?;
-        let (create, _) = create_lookup_table(identity.pubkey(), identity.pubkey(), recent_slot);
-        base.submit_and_confirm(&identity, &[create]).await?;
+        let recent_slot = self.base.api().get_slot().await?;
+        let (create, _) =
+            create_lookup_table(self.identity.pubkey(), self.identity.pubkey(), recent_slot);
+        self.base.submit_and_confirm(&self.identity, &[create]).await?;
         ensure!(alt_transactions().await? == 1);
         Ok(())
     }

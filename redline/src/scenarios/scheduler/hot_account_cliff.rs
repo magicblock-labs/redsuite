@@ -11,8 +11,7 @@ use redsuite_core::{
     runner::{Pacing, RunOutcome, ThreadRunConfig},
     BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
 };
-use tracing::{debug, warn};
-use url::Url;
+use tracing::{debug, instrument, warn};
 
 use crate::{metrics, ACCOUNT_SPACE};
 
@@ -63,27 +62,6 @@ const FULL: Profile = Profile {
 
 const PROFILES: ProfileValues<Profile> = ProfileValues { lite: LITE, full: FULL };
 
-// same read-write 3/tx shape as S1, confined to the hot set
-// (hot-set sizes are powers of two — coprime with the stride)
-fn execute_cell(
-    er_rpc_url: Url,
-    er_ws_url: Url,
-    config: ThreadRunConfig,
-    id_offset: u64,
-    hot_set: Arc<Vec<Pubkey>>,
-    payer_bytes: Arc<Vec<[u8; 64]>>,
-) -> Result<RunOutcome> {
-    execute_kernel(
-        config,
-        er_rpc_url,
-        er_ws_url,
-        payer_bytes,
-        id_offset,
-        move |id| REDLINE.copy_three(&hot_set, id).0,
-        None,
-    )
-}
-
 struct CellResult {
     hot: u8,
     outcome: RunOutcome,
@@ -118,103 +96,111 @@ impl Scenario<ScenarioReport> for HotAccountCliff {
     }
 
     async fn run(self) -> Result<ScenarioReport> {
-        let Self {
-            base,
-            er,
-            profile,
-            payer_bytes,
-            pdas,
-        } = self;
-        let er_rpc_url = er.api().url().clone();
         let mut offset = 0u64;
         let mut cells: Vec<CellResult> = Vec::new();
-        for &hot in profile.cells {
-            let hot_set: Arc<Vec<Pubkey>> = Arc::new(pdas[..hot as usize].to_vec());
-
-            let count_before_warmup = er.scrape_metrics().await?.get(TX_COUNT);
-            let warm = execute_cell(
-                er_rpc_url.clone(),
-                er.ws_url().clone(),
-                ThreadRunConfig {
-                    threads: profile.threads,
-                    iterations: profile.warmup,
-                    rate: Pacing::PerSecond(profile.rate),
-                    concurrency: profile.concurrency,
-                },
-                offset,
-                hot_set.clone(),
-                payer_bytes.clone(),
-            )?;
-            ensure!(warm.failed == 0);
-            offset += profile.warmup;
-            if let Some(seen) = count_before_warmup {
-                crate::await_executed(&er, seen + profile.warmup as f64, DRAIN_TIMEOUT).await?;
-            }
-
-            let before = er.scrape_metrics().await?;
-            let outcome = execute_cell(
-                er_rpc_url.clone(),
-                er.ws_url().clone(),
-                ThreadRunConfig {
-                    threads: profile.threads,
-                    iterations: profile.iterations,
-                    rate: Pacing::PerSecond(profile.rate),
-                    concurrency: profile.concurrency,
-                },
-                offset,
-                hot_set.clone(),
-                payer_bytes.clone(),
-            )?;
-            offset += profile.iterations;
-            ensure!(outcome.failed == 0);
-            if let Some(seen) = before.get(TX_COUNT) {
-                crate::await_executed(&er, seen + profile.iterations as f64, DRAIN_TIMEOUT).await?;
-            }
-            let after = er.scrape_metrics().await?;
-            let delta = MetricsDelta::new(before, after);
-            if let Some(failed) = delta.counter_all(metrics::FAILED_TRANSACTIONS) {
-                ensure!(failed == 0.0);
-            }
-
-            let cell = CellResult { hot, outcome };
-            debug!(
-                hot,
-                delivered_tps = cell.outcome.achieved_rps(),
-                "hot account cell finished",
-            );
-
-            let cell_report = ScenarioReport::ok()
-                .setting("profile", profile.name)
-                .setting("hot accounts", hot)
-                .setting("shape", "read-write 3/tx (1 src + 2 dst data-copy)")
-                .setting("driver threads", profile.threads)
-                .setting("measured iters", profile.iterations)
-                .setting("offered tps", profile.rate)
-                .setting("concurrency", profile.concurrency)
-                .observe("delivery us", Unit::Micros, cell.outcome.delivery)
-                .client_side(&cell.outcome)
-                .metric("achieved tps", Unit::Tps, cell.outcome.achieved_rps())
-                .metric_if(
-                    "validator tx processing avg us",
-                    Unit::Micros,
-                    delta
-                        .histogram_avg("mbv_transaction_processing_time")
-                        .map(|seconds| seconds * 1e6),
-                )
-                .metric_if(
-                    "max lock contention queue",
-                    Unit::Count,
-                    delta.gauge("mbv_max_lock_contention_queue_size"),
-                )
-                .metric_if(
-                    "validator txs in window",
-                    Unit::Count,
-                    delta.counter(metrics::ENGINE_TRANSACTIONS),
-                );
-            base.report_cell(&format!("hot{hot}"), &cell_report)?;
-            cells.push(cell);
+        for &hot in self.profile.cells {
+            cells.push(self.measure_cell(hot, &mut offset).await?);
         }
 
+        Ok(self.summarize(&cells))
+    }
+}
+
+impl HotAccountCliff {
+    fn execute(
+        &self,
+        hot_set: Arc<Vec<Pubkey>>,
+        iterations: u64,
+        offset: u64,
+    ) -> Result<RunOutcome> {
+        execute_kernel(
+            ThreadRunConfig {
+                threads: self.profile.threads,
+                iterations,
+                rate: Pacing::PerSecond(self.profile.rate),
+                concurrency: self.profile.concurrency,
+            },
+            self.er.api().url().clone(),
+            self.er.ws_url().clone(),
+            self.payer_bytes.clone(),
+            offset,
+            // Hot-set sizes are powers of two, coprime with the copy stride.
+            move |id| REDLINE.copy_three(&hot_set, id).0,
+            None,
+        )
+    }
+
+    #[instrument(skip_all, err, fields(hot = hot))]
+    async fn measure_cell(&self, hot: u8, offset: &mut u64) -> Result<CellResult> {
+        let hot_set: Arc<Vec<Pubkey>> = Arc::new(self.pdas[..hot as usize].to_vec());
+
+        let count_before_warmup = self.er.scrape_metrics().await?.get(TX_COUNT);
+        let warm = self.execute(hot_set.clone(), self.profile.warmup, *offset)?;
+        ensure!(warm.failed == 0);
+        *offset += self.profile.warmup;
+        if let Some(seen) = count_before_warmup {
+            crate::await_executed(&self.er, seen + self.profile.warmup as f64, DRAIN_TIMEOUT)
+                .await?;
+        }
+
+        let before = self.er.scrape_metrics().await?;
+        let outcome = self.execute(hot_set, self.profile.iterations, *offset)?;
+        *offset += self.profile.iterations;
+        ensure!(outcome.failed == 0);
+        if let Some(seen) = before.get(TX_COUNT) {
+            crate::await_executed(
+                &self.er,
+                seen + self.profile.iterations as f64,
+                DRAIN_TIMEOUT,
+            )
+            .await?;
+        }
+        let after = self.er.scrape_metrics().await?;
+        let delta = MetricsDelta::new(before, after);
+        if let Some(failed) = delta.counter_all(metrics::FAILED_TRANSACTIONS) {
+            ensure!(failed == 0.0);
+        }
+
+        let cell = CellResult { hot, outcome };
+        debug!(
+            hot,
+            delivered_tps = cell.outcome.achieved_rps(),
+            "hot account cell finished",
+        );
+
+        let cell_report = ScenarioReport::ok()
+            .setting("profile", self.profile.name)
+            .setting("hot accounts", hot)
+            .setting("shape", "read-write 3/tx (1 src + 2 dst data-copy)")
+            .setting("driver threads", self.profile.threads)
+            .setting("measured iters", self.profile.iterations)
+            .setting("offered tps", self.profile.rate)
+            .setting("concurrency", self.profile.concurrency)
+            .observe("delivery us", Unit::Micros, cell.outcome.delivery)
+            .client_side(&cell.outcome)
+            .metric("achieved tps", Unit::Tps, cell.outcome.achieved_rps())
+            .metric_if(
+                "validator tx processing avg us",
+                Unit::Micros,
+                delta
+                    .histogram_avg("mbv_transaction_processing_time")
+                    .map(|seconds| seconds * 1e6),
+            )
+            .metric_if(
+                "max lock contention queue",
+                Unit::Count,
+                delta.gauge("mbv_max_lock_contention_queue_size"),
+            )
+            .metric_if(
+                "validator txs in window",
+                Unit::Count,
+                delta.counter(metrics::ENGINE_TRANSACTIONS),
+            );
+        self.base.report_cell(&format!("hot{hot}"), &cell_report)?;
+        Ok(cell)
+    }
+
+    fn summarize(&self, cells: &[CellResult]) -> ScenarioReport {
         // High baseline latency confounds comparisons of contention effects.
         // Validator processing latency helps separate execution from client delay.
         let p50 = |cell: &CellResult| cell.outcome.delivery.median as f64;
@@ -223,7 +209,7 @@ impl Scenario<ScenarioReport> for HotAccountCliff {
             warn!(
                 hot = cells[0].hot,
                 baseline_p50_us,
-                profile.rate,
+                self.profile.rate,
                 "baseline median exceeds latency bound; sweep may be load-limited",
             );
         }
@@ -247,22 +233,23 @@ impl Scenario<ScenarioReport> for HotAccountCliff {
             .find(|cell| p50(cell) > baseline_p50_us * CLIFF_FACTOR)
             .map(|cell| cell.hot);
 
-        let cell_names: Vec<String> = profile.cells.iter().map(|hot| hot.to_string()).collect();
+        let cell_names: Vec<String> =
+            self.profile.cells.iter().map(|hot| hot.to_string()).collect();
         let mut summary = ScenarioReport::ok()
-            .setting("profile", profile.name)
+            .setting("profile", self.profile.name)
             .setting("cells", cell_names.join("/"))
             .setting("shape", "read-write 3/tx (1 src + 2 dst data-copy)")
-            .setting("driver threads", profile.threads)
-            .setting("measured iters per cell", profile.iterations)
-            .setting("offered tps", profile.rate)
-            .setting("concurrency", profile.concurrency)
+            .setting("driver threads", self.profile.threads)
+            .setting("measured iters per cell", self.profile.iterations)
+            .setting("offered tps", self.profile.rate)
+            .setting("concurrency", self.profile.concurrency)
             .setting(
                 "cliff",
                 cliff
                     .map(|hot| format!("hot-set {hot}"))
-                    .unwrap_or_else(|| format!("none at {} tps", profile.rate)),
+                    .unwrap_or_else(|| format!("none at {} tps", self.profile.rate)),
             );
-        for cell in &cells {
+        for cell in cells {
             summary = summary
                 .with_flags(&cell.outcome)
                 .metric(
@@ -281,6 +268,6 @@ impl Scenario<ScenarioReport> for HotAccountCliff {
                     cell.outcome.achieved_rps(),
                 );
         }
-        Ok(summary)
+        summary
     }
 }

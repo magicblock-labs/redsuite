@@ -23,39 +23,6 @@ const SUBMISSION_WRITE: u64 = 41;
 const CONFIRMATION_WRITE: u64 = 42;
 const RECONNECT_WRITE: u64 = 43;
 
-async fn await_convergence(
-    base: &BaseCtx,
-    er: &ErCtx,
-    account: &Pubkey,
-    snapshot: &[u8],
-    signature: &Signature,
-) -> Result<()> {
-    let receipt = receipt::fetch_commit_receipt(er.api(), signature).await?;
-    match &receipt.error_message {
-        Some(message) if receipt.failure_is_duplicate_rejection() => {
-            receipt::warn_duplicate_rejection(message);
-        }
-        Some(message) => {
-            return Err(anyhow!(
-                "the commit intent converges after the fault is lifted: {message}"
-            ));
-        }
-        None => {}
-    }
-    base.api()
-        .await_accounts(
-            slice::from_ref(account),
-            "the base copy still matches the er snapshot after convergence",
-            async || {
-                let account = base.account(account).await?.context("base account missing")?;
-                ensure!(account.data == snapshot);
-                Ok(())
-            },
-        )
-        .await?;
-    Ok(())
-}
-
 pub struct CommitBlackout {
     base: Rc<BaseCtx>,
     er: ErCtx,
@@ -79,24 +46,25 @@ impl Scenario for CommitBlackout {
     }
 
     async fn run(self) -> Result<()> {
-        let Self { base, er, payer, account } = self;
-        let proxies = er.proxies().context(PROXIED_GROUP)?;
-        let submission_trap = proxies
-            .intercept(Selector::method("sendTransaction").http().response().account(&account));
+        let proxies = self.er.proxies().context(PROXIED_GROUP)?;
+        let submission_trap = proxies.intercept(
+            Selector::method("sendTransaction").http().response().account(&self.account),
+        );
         let (snapshot, commit_signature) =
-            write_and_commit(&er, &payer, 1, SUBMISSION_WRITE, &account).await?;
+            write_and_commit(&self.er, &self.payer, 1, SUBMISSION_WRITE, &self.account).await?;
         let held = submission_trap.wait(INTERCEPT_TIMEOUT).await?;
         let base_signature = held.operation.signature()?;
-        prove_landed(&base, &base_signature, &account, &snapshot).await?;
+        prove_landed(&self.base, &base_signature, &self.account, &snapshot).await?;
         held.discard();
-        await_convergence(&base, &er, &account, &snapshot, &commit_signature).await?;
+        self.await_convergence(&snapshot, &commit_signature).await?;
 
-        let submission_probe = proxies
-            .intercept(Selector::method("sendTransaction").http().response().account(&account));
+        let submission_probe = proxies.intercept(
+            Selector::method("sendTransaction").http().response().account(&self.account),
+        );
         let (snapshot, commit_signature) =
-            write_and_commit(&er, &payer, 2, CONFIRMATION_WRITE, &account).await?;
+            write_and_commit(&self.er, &self.payer, 2, CONFIRMATION_WRITE, &self.account).await?;
         let receipt_signature =
-            receipt::scheduled_receipt_signature(er.api(), &commit_signature).await?;
+            receipt::scheduled_receipt_signature(self.er.api(), &commit_signature).await?;
         let probe = submission_probe.wait(INTERCEPT_TIMEOUT).await?;
         let base_signature = probe.operation.signature()?;
         let status_blackout = proxies.stall(
@@ -112,11 +80,11 @@ impl Scenario for CommitBlackout {
                 .signature(&base_signature),
         );
         probe.release();
-        prove_landed(&base, &base_signature, &account, &snapshot).await?;
+        prove_landed(&self.base, &base_signature, &self.account, &snapshot).await?;
         let held = notification_trap.wait(INTERCEPT_TIMEOUT).await?;
         let blackout_end = Instant::now() + BLACKOUT_WINDOW;
         loop {
-            ensure!(er.api().get_transaction(&receipt_signature).await?.is_none());
+            ensure!(self.er.api().get_transaction(&receipt_signature).await?.is_none());
             if Instant::now() >= blackout_end {
                 break;
             }
@@ -124,31 +92,67 @@ impl Scenario for CommitBlackout {
         }
         held.release();
         status_blackout.remove();
-        await_convergence(&base, &er, &account, &snapshot, &commit_signature).await?;
+        self.await_convergence(&snapshot, &commit_signature).await?;
 
         proxies.close_connections();
-        let fresh = base
-            .cells(REDLINE, &payer)
-            .create_delegated(ACCOUNT_SPACE, er.identity(), 1)
+        let fresh = self
+            .base
+            .cells(REDLINE, &self.payer)
+            .create_delegated(ACCOUNT_SPACE, self.er.identity(), 1)
             .await?;
-        er.await_clones(&[fresh], ACCOUNT_SPACE as usize).await?;
+        self.er.await_clones(&[fresh], ACCOUNT_SPACE as usize).await?;
         let (snapshot, commit_signature) =
-            write_and_commit(&er, &payer, 3, RECONNECT_WRITE, &fresh).await?;
-        let plain = receipt::fetch_commit_receipt(er.api(), &commit_signature).await?;
+            write_and_commit(&self.er, &self.payer, 3, RECONNECT_WRITE, &fresh).await?;
+        let plain = receipt::fetch_commit_receipt(self.er.api(), &commit_signature).await?;
         ensure!(plain.succeeded());
-        plain.confirm(base.api()).await?;
-        base.api()
+        plain.confirm(self.base.api()).await?;
+        self.base
+            .api()
             .await_accounts(
                 &[fresh],
                 "the fresh account commits to base through restored traffic",
                 async || {
-                    let account = base.account(&fresh).await?.context("base account missing")?;
+                    let account =
+                        self.base.account(&fresh).await?.context("base account missing")?;
                     ensure!(account.data == snapshot);
                     Ok(())
                 },
             )
             .await?;
 
+        Ok(())
+    }
+}
+
+impl CommitBlackout {
+    async fn await_convergence(&self, snapshot: &[u8], signature: &Signature) -> Result<()> {
+        let account = &self.account;
+
+        let receipt = receipt::fetch_commit_receipt(self.er.api(), signature).await?;
+        match &receipt.error_message {
+            Some(message) if receipt.failure_is_duplicate_rejection() => {
+                receipt::warn_duplicate_rejection(message);
+            }
+            Some(message) => {
+                return Err(anyhow!(
+                    "the commit intent converges after the fault is lifted: {message}"
+                ));
+            }
+            None => {}
+        }
+        self.base
+            .api()
+            .await_accounts(
+                slice::from_ref(account),
+                "the base copy still matches the er snapshot after convergence",
+                async || {
+                    let account =
+                        self.base.account(account).await?.context("base account missing")?;
+                    ensure!(account.data == snapshot);
+                    Ok(())
+                },
+            )
+            .await?;
         Ok(())
     }
 }

@@ -6,8 +6,7 @@ use keypair::Keypair;
 use magic_api::args::{CommitTypeArgs, MagicIntentBundleArgs};
 use pubkey::Pubkey;
 use redsuite_core::{
-    api::custom_error_code,
-    api::transaction_meta,
+    api::{custom_error_code, transaction_meta},
     dlp, prep,
     programs::{
         Action, CellHeader, CellId, Commit, IntentBundle, Refund, ResultCallback, SettlementMode,
@@ -18,6 +17,7 @@ use redsuite_core::{
 use sdk::dlp_api::consts::COMMIT_FEE_LAMPORTS;
 use signature::Signature;
 use signer::Signer;
+use tracing::instrument;
 
 use crate::PAYER_LAMPORTS;
 
@@ -26,6 +26,7 @@ const ACTION_FEE: u64 = 5_000;
 const CALLBACK_FEE: u64 = 5_000;
 const TRANSFER_LAMPORTS: u64 = 1_000_000;
 const ACTION_COMPUTE_UNITS: u32 = 100_000;
+const ACTORS: usize = 3;
 
 #[derive(Clone, Copy)]
 enum Mode {
@@ -122,49 +123,8 @@ fn transfer_with_refund(
         .build()
 }
 
-async fn redelegate(base: &BaseCtx, er: &ErCtx, payer: &Keypair, phase: &str) -> Result<()> {
-    base.submit_and_confirm(
-        payer,
-        &[
-            REDSHIFT.delegate(
-                payer.pubkey(),
-                CellId::new(payer.pubkey(), 0),
-                Some(er.identity()),
-                prep::COMMIT_FREQUENCY_MS,
-            ),
-            REDSHIFT.log(phase),
-        ],
-    )
-    .await?;
-    Ok(())
-}
-
 pub(super) async fn run(base: &BaseCtx, er: &ErCtx) -> Result<()> {
-    let delegated = async |key: &Pubkey| er.await_delegated(key, "local delegation").await;
-    let settled = async |signature: &Signature, accounts: &[Pubkey], undelegates| {
-        let receipt = er.check_commit(base, signature, accounts, undelegates).await?;
-        receipt.check_success("scheduled intent")
-    };
-    let funder = base.funded_payer(PAYER_LAMPORTS).await?;
-    let payers = base.funded_payers(3, PAYER_LAMPORTS).await?;
-    let keys: Vec<_> = payers.iter().map(Signer::pubkey).collect();
-    let mut cells = Vec::new();
-    let mut expected = Vec::new();
-    for payer in &payers {
-        let (cell, [create, delegate]) = base
-            .cells(REDSHIFT, payer)
-            .prepare_delegated(er.identity(), prep::COMMIT_FREQUENCY_MS);
-        base.submit_and_confirm(
-            payer,
-            &[create, delegate, dlp::top_up_ephemeral_balance(&payer.pubkey(), 500_000_000, 1)],
-        )
-        .await?;
-        expected.push(CellHeader::try_decode(
-            &base.account(&cell).await?.context("cell missing")?.data,
-        )?);
-        cells.push(cell);
-    }
-    let mut is_delegated = [true; 3];
+    let mut suite = ScheduledIntents::prepare(base, er).await?;
     use Mode::{Commit, Finalize, Undelegate};
     for (label, modes, additions, actions) in [
         ("single commit action", &[Commit][..], &[101][..], true),
@@ -196,224 +156,339 @@ pub(super) async fn run(base: &BaseCtx, er: &ErCtx) -> Result<()> {
             false,
         ),
     ] {
-        crate::phase(label, async {
-            let n = modes.len();
-            let destination = Keypair::new().pubkey();
-            for i in 0..n {
-                if !is_delegated[i] {
-                    redelegate(base, er, &payers[i], label).await?;
-                    is_delegated[i] = true;
-                }
-                delegated(&cells[i]).await?;
-                er.api()
-                    .await_accounts(
-                        &[cells[i]],
-                        &format!("{} restored for {label}", cells[i]),
-                        async || {
-                            let account =
-                                er.account(&cells[i]).await?.context("ER cell missing")?;
-                            ensure!(account.owner == redshift_interface::ID);
-                            ensure!(CellHeader::try_decode(&account.data)? == expected[i]);
-                            Ok(())
-                        },
-                    )
-                    .await?;
-                if additions[i] != 0 {
-                    er.submit_and_confirm(
-                        &payers[i],
+        suite.check_bundle(label, modes, additions, actions).await?;
+    }
+
+    suite.check_sponsored_quota().await?;
+    base.delegate_payer(&suite.funder, &suite.actors[0].payer, er.identity())
+        .await?;
+    suite.await_delegated(&suite.actors[0].payer.pubkey()).await?;
+    suite.await_delegated(&suite.actors[0].cell).await?;
+    suite.check_paid_threshold().await?;
+
+    base.delegate_payer(&suite.funder, &suite.actors[1].payer, er.identity())
+        .await?;
+    suite.await_delegated(&suite.actors[1].payer.pubkey()).await?;
+    for fail in [false, true] {
+        suite.check_callback(fail).await?;
+    }
+    Ok(())
+}
+
+struct ScheduledIntents<'a> {
+    base: &'a BaseCtx,
+    er: &'a ErCtx,
+    funder: Keypair,
+    actors: Vec<Actor>,
+}
+
+struct Actor {
+    payer: Keypair,
+    cell: Pubkey,
+    expected: CellHeader,
+    delegated: bool,
+}
+
+impl<'a> ScheduledIntents<'a> {
+    async fn await_delegated(&self, key: &Pubkey) -> Result<()> {
+        self.er.await_delegated(key, "local delegation").await
+    }
+
+    async fn check_settled(
+        &self,
+        signature: &Signature,
+        accounts: &[Pubkey],
+        undelegates: bool,
+    ) -> Result<()> {
+        let receipt = self.er.check_commit(self.base, signature, accounts, undelegates).await?;
+        receipt.check_success("scheduled intent")
+    }
+    #[instrument(skip_all, err, fields(case = label))]
+    async fn check_bundle(
+        &mut self,
+        label: &str,
+        modes: &[Mode],
+        additions: &[i32],
+        actions: bool,
+    ) -> Result<()> {
+        use Mode::Undelegate;
+
+        let n = modes.len();
+        let destination = Keypair::new().pubkey();
+        for (i, &addition) in additions[..n].iter().enumerate() {
+            if !self.actors[i].delegated {
+                self.redelegate(&self.actors[i].payer, label).await?;
+                self.actors[i].delegated = true;
+            }
+            self.await_delegated(&self.actors[i].cell).await?;
+            let actor = &mut self.actors[i];
+            let key = actor.payer.pubkey();
+            self.er
+                .api()
+                .await_accounts(
+                    &[actor.cell],
+                    &format!("{} restored for {label}", actor.cell),
+                    async || {
+                        let account =
+                            self.er.account(&actor.cell).await?.context("ER cell missing")?;
+                        ensure!(account.owner == redshift_interface::ID);
+                        ensure!(CellHeader::try_decode(&account.data)? == actor.expected);
+                        Ok(())
+                    },
+                )
+                .await?;
+            if addition != 0 {
+                self.er
+                    .submit_and_confirm(
+                        &actor.payer,
                         &[REDSHIFT
                             .batch()
-                            .add(&[REDSHIFT.primary(keys[i])], i64::from(additions[i]))
-                            .require_signer(keys[i])
+                            .add(&[actor.cell], i64::from(addition))
+                            .require_signer(key)
                             .build()],
                     )
                     .await?;
-                    expected[i].value += additions[i] as u64;
-                    expected[i].revision += 1;
-                }
+                actor.expected.value += addition as u64;
+                actor.expected.revision += 1;
             }
-            let signature = er
-                .submit_and_confirm_with(
-                    &payers[0],
-                    &payers[1..n].iter().collect::<Vec<_>>(),
-                    &[intents(&keys[..n], er.identity(), destination, modes, actions)],
-                )
-                .await?;
-            let undelegates = modes.iter().any(|mode| matches!(mode, Undelegate(_)));
-            settled(&signature, &cells[..n], undelegates).await?;
-            let mut transfers = 0;
-            for (i, mode) in modes.iter().enumerate() {
-                transfers += usize::from(actions);
-                if let Undelegate(change) = mode {
-                    expected[i].value = expected[i]
-                        .value
-                        .checked_add_signed(*change)
-                        .context("cell model underflow")?;
-                    expected[i].revision += 1;
-                    is_delegated[i] = false;
-                    transfers += 1;
-                }
-                let account = base.account(&cells[i]).await?.context("committed cell missing")?;
-                ensure!(CellHeader::try_decode(&account.data)? == expected[i]);
-                ensure!(
-                    account.owner
-                        == if is_delegated[i] { dlp::dlp_id() } else { redshift_interface::ID }
-                );
+        }
+        let actors = &self.actors[..n];
+        let keys: [_; ACTORS] = std::array::from_fn(|i| self.actors[i].payer.pubkey());
+        let cells: [_; ACTORS] = std::array::from_fn(|i| self.actors[i].cell);
+        let signature = self
+            .er
+            .submit_and_confirm_with(
+                &actors[0].payer,
+                &actors[1..].iter().map(|actor| &actor.payer).collect::<Vec<_>>(),
+                &[intents(&keys[..n], self.er.identity(), destination, modes, actions)],
+            )
+            .await?;
+        let undelegates = modes.iter().any(|mode| matches!(mode, Undelegate(_)));
+        self.check_settled(&signature, &cells[..n], undelegates).await?;
+        let mut transfers = 0;
+        for (actor, mode) in self.actors.iter_mut().zip(modes) {
+            transfers += usize::from(actions);
+            if let Undelegate(change) = mode {
+                actor.expected.value = actor
+                    .expected
+                    .value
+                    .checked_add_signed(*change)
+                    .context("cell model underflow")?;
+                actor.expected.revision += 1;
+                actor.delegated = false;
+                transfers += 1;
             }
+            let account =
+                self.base.account(&actor.cell).await?.context("committed cell missing")?;
+            ensure!(CellHeader::try_decode(&account.data)? == actor.expected);
             ensure!(
-                base.api().get_balance(&destination).await?
-                    == (transfers as u64 * TRANSFER_LAMPORTS)
+                account.owner
+                    == if actor.delegated { dlp::dlp_id() } else { redshift_interface::ID }
             );
-            Ok(())
-        })
-        .await?;
+        }
+        ensure!(
+            self.base.api().get_balance(&destination).await?
+                == (transfers as u64 * TRANSFER_LAMPORTS)
+        );
+        Ok(())
     }
 
-    crate::phase("sponsored quota and undelegation", async {
-        let payer = &payers[0];
-        let initial_nonce = crate::last_commit_id(base, &cells[0]).await?;
+    #[instrument(skip_all, err)]
+    async fn check_sponsored_quota(&self) -> Result<()> {
+        use Mode::{Commit, Undelegate};
+        let actor = &self.actors[0];
+        let key = actor.payer.pubkey();
+        let payer = &actor.payer;
+        let destination = self.actors[1].payer.pubkey();
+        let initial_nonce = crate::last_commit_id(self.base, &actor.cell).await?;
         ensure!(initial_nonce < receipt::SPONSORED_COMMIT_LIMIT);
         for nonce in initial_nonce..receipt::SPONSORED_COMMIT_LIMIT {
-            let signature = er
-                .submit_and_confirm(
-                    payer,
-                    &[
-                        REDSHIFT
-                            .batch()
-                            .add(&[REDSHIFT.primary(keys[0])], i64::from(nonce as u8 + 1))
-                            .require_signer(keys[0])
-                            .build(),
-                        intents(&keys[..1], er.identity(), keys[1], &[Commit], false),
-                    ],
-                )
-                .await?;
-            settled(&signature, &cells[..1], false).await?;
-            ensure!(crate::last_commit_id(base, &cells[0]).await? == (nonce + 1));
+            let signature = self.increment_and_commit(nonce, destination, false).await?;
+            self.check_settled(&signature, &[actor.cell], false).await?;
+            ensure!(crate::last_commit_id(self.base, &actor.cell).await? == (nonce + 1));
         }
-        let before = er.account(&cells[0]).await?;
-        let signature = er
+        let before = self.er.account(&actor.cell).await?;
+        let signature = self
+            .er
             .sender(Rc::new(prep::payer_from_bytes(&payer.to_bytes())))
             .submit(&[
-                REDSHIFT.batch().add(&[cells[0]], 99).require_signer(keys[0]).build(),
-                intents(&keys[..1], er.identity(), keys[1], &[Commit], false),
+                REDSHIFT.batch().add(&[actor.cell], 99).require_signer(key).build(),
+                intents(&[key], self.er.identity(), destination, &[Commit], false),
             ])
             .await?;
-        let tx = er.api().await_transaction(&signature).await?;
+        let tx = self.er.api().await_transaction(&signature).await?;
         ensure!(
             transaction_meta(&tx)?.err.clone().and_then(custom_error_code)
                 == Some(receipt::COMMIT_LIMIT_ERR)
         );
-        ensure!(er.account(&cells[0]).await? == before);
-        let signature = er
+        ensure!(self.er.account(&actor.cell).await? == before);
+        let signature = self
+            .er
             .submit_and_confirm(
                 payer,
-                &[intents(&keys[..1], er.identity(), keys[1], &[Undelegate(0)], false)],
+                &[intents(
+                    &[key],
+                    self.er.identity(),
+                    destination,
+                    &[Undelegate(0)],
+                    false,
+                )],
             )
             .await?;
-        settled(&signature, &cells[..1], true).await?;
-        let account = base.account(&cells[0]).await?.context("undelegated cell missing")?;
+        self.check_settled(&signature, &[actor.cell], true).await?;
+        let account = self.base.account(&actor.cell).await?.context("undelegated cell missing")?;
         ensure!(account.owner == redshift_interface::ID);
         ensure!(account.data == before.context("ER cell missing")?.data);
-        redelegate(base, er, payer, "after sponsored quota").await?;
+        self.redelegate(payer, "after sponsored quota").await?;
         Ok(())
-    })
-    .await?;
+    }
 
-    base.delegate_payer(&funder, &payers[0], er.identity()).await?;
-    delegated(&keys[0]).await?;
-    delegated(&cells[0]).await?;
-    let vault = dlp::magic_fee_vault_pda(&er.identity());
-    crate::phase("paid commit threshold and combined action charge", async {
-        let initial_nonce = crate::last_commit_id(base, &cells[0]).await?;
+    #[instrument(skip_all, err)]
+    async fn check_paid_threshold(&self) -> Result<()> {
+        let actor = &self.actors[0];
+        let key = actor.payer.pubkey();
+        let vault = dlp::magic_fee_vault_pda(&self.er.identity());
+        let initial_nonce = crate::last_commit_id(self.base, &actor.cell).await?;
         ensure!(initial_nonce < PAID_COMMIT_LIMIT);
         for nonce in initial_nonce..=PAID_COMMIT_LIMIT + 1 {
             let actions = nonce == PAID_COMMIT_LIMIT + 1;
             let destination = Keypair::new().pubkey();
-            let payer_before = er.api().get_balance(&keys[0]).await?;
-            let vault_before = er.api().get_balance(&vault).await?;
-            let signature = er
-                .submit_and_confirm(
-                    &payers[0],
-                    &[
-                        REDSHIFT
-                            .batch()
-                            .add(&[REDSHIFT.primary(keys[0])], i64::from(nonce as u8 + 1))
-                            .require_signer(keys[0])
-                            .build(),
-                        intents(&keys[..1], er.identity(), destination, &[Commit], actions),
-                    ],
-                )
-                .await?;
-            settled(&signature, &cells[..1], false).await?;
+            let payer_before = self.er.api().get_balance(&key).await?;
+            let vault_before = self.er.api().get_balance(&vault).await?;
+            let signature = self.increment_and_commit(nonce, destination, actions).await?;
+            self.check_settled(&signature, &[actor.cell], false).await?;
             let fee = if nonce >= PAID_COMMIT_LIMIT { COMMIT_FEE_LAMPORTS } else { 0 }
                 + if actions { ACTION_FEE } else { 0 };
-            ensure!(er.api().get_balance(&keys[0]).await? == (payer_before - fee));
-            ensure!(er.api().get_balance(&vault).await? == (vault_before + fee));
-            ensure!(crate::last_commit_id(base, &cells[0]).await? == (nonce + 1));
+            ensure!(self.er.api().get_balance(&key).await? == (payer_before - fee));
+            ensure!(self.er.api().get_balance(&vault).await? == (vault_before + fee));
+            ensure!(crate::last_commit_id(self.base, &actor.cell).await? == (nonce + 1));
             ensure!(
-                base.api().get_balance(&destination).await?
+                self.base.api().get_balance(&destination).await?
                     == if actions { TRANSFER_LAMPORTS } else { 0 }
             );
         }
         Ok(())
-    })
-    .await?;
-
-    base.delegate_payer(&funder, &payers[1], er.identity()).await?;
-    delegated(&keys[1]).await?;
-    for fail in [false, true] {
-        crate::phase(
-            if fail { "transfer callback refund" } else { "transfer callback success" },
-            async {
-                const AMOUNT: u64 = 890_880;
-                let destination = Keypair::new().pubkey();
-                let before = er.account(&cells[1]).await?.context("transfer cell missing")?;
-                let state = CellHeader::try_decode(&before.data)?;
-                let payer_before = er.api().get_balance(&keys[1]).await?;
-                let vault_before = er.api().get_balance(&vault).await?;
-                let signature = er
-                    .submit_and_confirm(
-                        &payers[1],
-                        &[transfer_with_refund(keys[1], er.identity(), destination, AMOUNT, fail)],
-                    )
-                    .await?;
-                settled(&signature, &cells[1..2], false).await?;
-                er.api()
-                    .await_accounts(
-                        &[cells[1], keys[1]],
-                        "callback completes exactly once",
-                        async || {
-                            let account =
-                                er.account(&cells[1]).await?.context("callback cell missing")?;
-                            let actual = CellHeader::try_decode(&account.data)?;
-                            ensure!(actual.revision == (state.revision + 1));
-                            ensure!(actual.value == (state.value + u64::from(fail)));
-                            ensure!(
-                                account.lamports
-                                    == (before.lamports + if fail { 0 } else { AMOUNT })
-                            );
-                            ensure!(
-                                er.api().get_balance(&keys[1]).await?
-                                    == (payer_before
-                                        - ACTION_FEE
-                                        - CALLBACK_FEE
-                                        - if fail { 0 } else { AMOUNT })
-                            );
-                            Ok(())
-                        },
-                    )
-                    .await?;
-                ensure!(
-                    base.api().get_balance(&destination).await? == if fail { 0 } else { AMOUNT }
-                );
-                ensure!(
-                    er.api().get_balance(&vault).await?
-                        == (vault_before + ACTION_FEE + CALLBACK_FEE)
-                );
-                Ok(())
-            },
-        )
-        .await?;
     }
-    Ok(())
+
+    async fn increment_and_commit(
+        &self,
+        nonce: u64,
+        destination: Pubkey,
+        actions: bool,
+    ) -> Result<Signature> {
+        let actor = &self.actors[0];
+        let key = actor.payer.pubkey();
+        self.er
+            .submit_and_confirm(
+                &actor.payer,
+                &[
+                    REDSHIFT
+                        .batch()
+                        .add(&[actor.cell], i64::from(nonce as u8 + 1))
+                        .require_signer(key)
+                        .build(),
+                    intents(
+                        &[key],
+                        self.er.identity(),
+                        destination,
+                        &[Mode::Commit],
+                        actions,
+                    ),
+                ],
+            )
+            .await
+    }
+
+    #[instrument(skip_all, err, fields(fail = fail))]
+    async fn check_callback(&self, fail: bool) -> Result<()> {
+        let actor = &self.actors[1];
+        let key = actor.payer.pubkey();
+        let vault = dlp::magic_fee_vault_pda(&self.er.identity());
+
+        const AMOUNT: u64 = 890_880;
+        let destination = Keypair::new().pubkey();
+        let before = self.er.account(&actor.cell).await?.context("transfer cell missing")?;
+        let state = CellHeader::try_decode(&before.data)?;
+        let payer_before = self.er.api().get_balance(&key).await?;
+        let vault_before = self.er.api().get_balance(&vault).await?;
+        let signature = self
+            .er
+            .submit_and_confirm(
+                &actor.payer,
+                &[transfer_with_refund(key, self.er.identity(), destination, AMOUNT, fail)],
+            )
+            .await?;
+        self.check_settled(&signature, &[actor.cell], false).await?;
+        self.er
+            .api()
+            .await_accounts(
+                &[actor.cell, key],
+                "callback completes exactly once",
+                async || {
+                    let account =
+                        self.er.account(&actor.cell).await?.context("callback cell missing")?;
+                    let actual = CellHeader::try_decode(&account.data)?;
+                    ensure!(actual.revision == (state.revision + 1));
+                    ensure!(actual.value == (state.value + u64::from(fail)));
+                    ensure!(account.lamports == (before.lamports + if fail { 0 } else { AMOUNT }));
+                    ensure!(
+                        self.er.api().get_balance(&key).await?
+                            == (payer_before
+                                - ACTION_FEE
+                                - CALLBACK_FEE
+                                - if fail { 0 } else { AMOUNT })
+                    );
+                    Ok(())
+                },
+            )
+            .await?;
+        ensure!(self.base.api().get_balance(&destination).await? == if fail { 0 } else { AMOUNT });
+        ensure!(
+            self.er.api().get_balance(&vault).await? == (vault_before + ACTION_FEE + CALLBACK_FEE)
+        );
+        Ok(())
+    }
+
+    async fn prepare(base: &'a BaseCtx, er: &'a ErCtx) -> Result<Self> {
+        let funder = base.funded_payer(PAYER_LAMPORTS).await?;
+        let payers = base.funded_payers(ACTORS, PAYER_LAMPORTS).await?;
+        let mut actors = Vec::with_capacity(payers.len());
+        for payer in payers {
+            let (cell, [create, delegate]) = base
+                .cells(REDSHIFT, &payer)
+                .prepare_delegated(er.identity(), prep::COMMIT_FREQUENCY_MS);
+            base.submit_and_confirm(
+                &payer,
+                &[create, delegate, dlp::top_up_ephemeral_balance(&payer.pubkey(), 500_000_000, 1)],
+            )
+            .await?;
+            let expected =
+                CellHeader::try_decode(&base.account(&cell).await?.context("cell missing")?.data)?;
+            actors.push(Actor {
+                payer,
+                cell,
+                expected,
+                delegated: true,
+            });
+        }
+        Ok(Self { base, er, funder, actors })
+    }
+
+    async fn redelegate(&self, payer: &Keypair, phase: &str) -> Result<()> {
+        self.base
+            .submit_and_confirm(
+                payer,
+                &[
+                    REDSHIFT.delegate(
+                        payer.pubkey(),
+                        CellId::new(payer.pubkey(), 0),
+                        Some(self.er.identity()),
+                        prep::COMMIT_FREQUENCY_MS,
+                    ),
+                    REDSHIFT.log(phase),
+                ],
+            )
+            .await?;
+        Ok(())
+    }
 }

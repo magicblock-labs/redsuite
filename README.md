@@ -187,8 +187,8 @@ harness also reclaims private rollups left behind by failed scenarios.
 ## 📊 Results and diagnostics
 
 Redshift and Redhat return verdicts in the console without persisting benchmark
-reports. Failed scenarios include diagnostic details; set `RUST_LOG=debug`
-to include phase and workload progress. Logging defaults
+reports. Stage errors are logged with method context; set `RUST_LOG=debug`
+to include workload progress. Logging defaults
 to `info`; `RUST_LOG` also applies to launched validators. A failed run
 returns a nonzero exit status.
 

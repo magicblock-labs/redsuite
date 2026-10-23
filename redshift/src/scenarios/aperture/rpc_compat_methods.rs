@@ -97,168 +97,6 @@ fn confirmed() -> CommitmentConfig {
     CommitmentConfig::confirmed()
 }
 
-async fn run_method(client: &Api, fixture: &Fixture, method: Method) -> Result<Option<u64>> {
-    let mut observed_slot = None;
-    match method {
-        Method::BlockCommitment => {
-            let commitment: RpcBlockCommitment<[u64; 32]> =
-                client.call(RpcRequest::GetBlockCommitment, &(fixture.slot_floor,)).await?;
-            ensure!(commitment.commitment == Some([0u64; 32]));
-            ensure!(commitment.total_stake == 0);
-        }
-        Method::ClusterNodes => {
-            let nodes: Vec<RpcContactInfo> =
-                client.call(RpcRequest::GetClusterNodes, &NO_PARAMS).await?;
-            ensure!(nodes.len() == 1);
-            let node = &nodes[0];
-            ensure!(node.pubkey == fixture.identity.to_string());
-            ensure!(
-                node.gossip.is_none()
-                    && node.tpu.is_none()
-                    && node.rpc.is_none()
-                    && node.pubsub.is_none()
-                    && node.version.is_none()
-                    && node.feature_set.is_none()
-                    && node.shred_version.is_none()
-            );
-        }
-        Method::EpochInfo => {
-            let info: EpochInfo = client.call(RpcRequest::GetEpochInfo, &(confirmed(),)).await?;
-            ensure!(info.slots_in_epoch == SUPERBLOCK_SLOTS);
-            ensure!(info.epoch == (info.absolute_slot / SUPERBLOCK_SLOTS));
-            ensure!(info.slot_index == (info.absolute_slot % SUPERBLOCK_SLOTS));
-            ensure!(info.block_height == info.absolute_slot);
-            ensure!(info.transaction_count == Some(0));
-            observed_slot = Some(info.absolute_slot);
-        }
-        Method::EpochSchedule => {
-            let schedule: EpochSchedule =
-                client.call(RpcRequest::GetEpochSchedule, &NO_PARAMS).await?;
-            ensure!(schedule.slots_per_epoch == SUPERBLOCK_SLOTS);
-            ensure!(schedule.leader_schedule_slot_offset == SUPERBLOCK_SLOTS);
-            ensure!(!schedule.warmup);
-            ensure!(schedule.first_normal_epoch == 0);
-            ensure!(schedule.first_normal_slot == 0);
-        }
-        Method::FirstAvailableBlock => {
-            ensure!(client.call::<u64>(RpcRequest::GetFirstAvailableBlock, &NO_PARAMS).await? == 0);
-        }
-        Method::GenesisHash => {
-            ensure!(
-                client.call::<String>(RpcRequest::GetGenesisHash, &NO_PARAMS).await?
-                    == Hash::default().to_string()
-            );
-        }
-        Method::Health => {
-            client.get_health().await?;
-        }
-        Method::HighestSnapshotSlot => {
-            let snapshot: RpcSnapshotSlotInfo =
-                client.call(RpcRequest::GetHighestSnapshotSlot, &NO_PARAMS).await?;
-            ensure!(snapshot.full == 0);
-            ensure!(snapshot.incremental == None);
-        }
-        Method::Identity => {
-            ensure!(
-                client.call::<RpcIdentity>(RpcRequest::GetIdentity, &NO_PARAMS).await?.identity
-                    == fixture.identity.to_string()
-            );
-        }
-        Method::LargestAccounts => {
-            let config = RpcLargestAccountsConfig {
-                commitment: Some(confirmed()),
-                ..RpcLargestAccountsConfig::default()
-            };
-            let largest: Response<Vec<RpcAccountBalance>> =
-                client.call(RpcRequest::GetLargestAccounts, &(config,)).await?;
-            ensure!(largest.value.is_empty());
-            observed_slot = Some(largest.context.slot);
-        }
-        Method::RecentPerformanceSamples => {
-            let samples: Vec<RpcPerfSample> = client
-                .call(
-                    RpcRequest::GetRecentPerformanceSamples,
-                    &(PERFORMANCE_SAMPLE_LIMIT,),
-                )
-                .await?;
-            ensure!(!samples.is_empty() && samples.len() <= PERFORMANCE_SAMPLE_LIMIT);
-            for sample in &samples {
-                ensure!(sample.sample_period_secs == PERFORMANCE_SAMPLE_PERIOD_SECS);
-                ensure!(sample.num_slots >= 1);
-            }
-        }
-        Method::SlotLeader => {
-            ensure!(
-                client.call::<String>(RpcRequest::GetSlotLeader, &(confirmed(),)).await?
-                    == fixture.identity.to_string()
-            );
-        }
-        Method::SlotLeaders => {
-            let leaders: Vec<String> = client
-                .call(
-                    RpcRequest::GetSlotLeaders,
-                    &(fixture.slot_floor, SLOT_LEADER_LIMIT),
-                )
-                .await?;
-            ensure!(!leaders.is_empty() && leaders.len() as u64 <= SLOT_LEADER_LIMIT);
-            let identity = fixture.identity.to_string();
-            ensure!(leaders.iter().all(|leader| *leader == identity));
-        }
-        Method::Supply => {
-            let supply: Response<RpcSupply> =
-                client.call(RpcRequest::GetSupply, &(confirmed(),)).await?;
-            ensure!(supply.value.total == u64::MAX);
-            ensure!(supply.value.circulating == (u64::MAX / 2));
-            ensure!(supply.value.non_circulating == (u64::MAX / 2));
-            ensure!(supply.value.non_circulating_accounts.is_empty());
-            observed_slot = Some(supply.context.slot);
-        }
-        Method::TokenLargestAccounts => {
-            let largest: Response<Vec<RpcTokenAccountBalance>> = client
-                .call(
-                    RpcRequest::GetTokenLargestAccounts,
-                    &(fixture.mint.to_string(), confirmed()),
-                )
-                .await?;
-            ensure!(largest.value.is_empty());
-            observed_slot = Some(largest.context.slot);
-        }
-        Method::TokenSupply => {
-            let supply: Response<UiTokenAmount> = client
-                .call(
-                    RpcRequest::GetTokenSupply,
-                    &(fixture.mint.to_string(), confirmed()),
-                )
-                .await?;
-            ensure!(supply.value.amount == "0");
-            ensure!(supply.value.decimals == 0);
-            ensure!(supply.value.ui_amount == Some(0.0));
-            ensure!(supply.value.ui_amount_string == "0.0");
-            observed_slot = Some(supply.context.slot);
-        }
-        Method::TransactionCount => {
-            ensure!(
-                client.call::<u64>(RpcRequest::GetTransactionCount, &(confirmed(),)).await? == 0
-            );
-        }
-        Method::Version => {
-            let version: RpcVersionInfo = client.call(RpcRequest::GetVersion, &NO_PARAMS).await?;
-            let parts: Vec<&str> = version.solana_core.split('.').collect();
-            ensure!(parts.len() == 3 && parts.iter().all(|part| part.parse::<u32>().is_ok()));
-            ensure!(version.feature_set.is_some_and(|set| set != 0));
-        }
-        Method::VoteAccounts => {
-            let accounts: RpcVoteAccountStatus =
-                client.call(RpcRequest::GetVoteAccounts, &(confirmed(),)).await?;
-            ensure!(accounts.current.is_empty() && accounts.delinquent.is_empty());
-        }
-        Method::MinimumLedgerSlot => {
-            ensure!(client.call::<u64>(RpcRequest::MinimumLedgerSlot, &NO_PARAMS).await? == 0);
-        }
-    }
-    Ok(observed_slot)
-}
-
 async fn bounded<T>(label: &str, call: impl Future<Output = T>) -> Result<T> {
     time::timeout(NEGATIVE_DEADLINE, call)
         .await
@@ -297,19 +135,17 @@ impl PrivateErScenario for RpcCompatMethods {
     }
 
     async fn run(self) -> Result<()> {
-        let Self { private, client, fixture } = self;
-        let er = private.ctx();
-        let requests = join_all(
-            (0..REQUESTS).map(|index| run_method(&client, &fixture, CYCLE[index % CYCLE.len()])),
-        );
+        let er = self.private.ctx();
+        let requests =
+            join_all((0..REQUESTS).map(|index| self.run_method(CYCLE[index % CYCLE.len()])));
         let outcomes = time::timeout(BURST_DEADLINE, requests).await.with_context(|| {
             format!("the burst of {REQUESTS} requests exceeded {BURST_DEADLINE:?}")
         })?;
-        let slot_ceiling = client.get_slot().await?;
+        let slot_ceiling = self.client.get_slot().await?;
 
         for outcome in outcomes {
             if let Some(slot) = outcome? {
-                ensure!(slot >= fixture.slot_floor);
+                ensure!(slot >= self.fixture.slot_floor);
                 ensure!(slot <= slot_ceiling);
             }
         }
@@ -318,7 +154,7 @@ impl PrivateErScenario for RpcCompatMethods {
             "requestAirdrop",
             er.api().try_call::<Value>(
                 RpcRequest::RequestAirdrop,
-                &(fixture.identity.to_string(), AIRDROP_LAMPORTS),
+                &(self.fixture.identity.to_string(), AIRDROP_LAMPORTS),
             ),
         )
         .await??;
@@ -350,7 +186,190 @@ impl PrivateErScenario for RpcCompatMethods {
             }
         }
 
-        private.finish().await?;
+        self.private.finish().await?;
         Ok(())
+    }
+}
+
+impl RpcCompatMethods {
+    async fn run_method(&self, method: Method) -> Result<Option<u64>> {
+        let mut observed_slot = None;
+        match method {
+            Method::BlockCommitment => {
+                let commitment: RpcBlockCommitment<[u64; 32]> = self
+                    .client
+                    .call(RpcRequest::GetBlockCommitment, &(self.fixture.slot_floor,))
+                    .await?;
+                ensure!(commitment.commitment == Some([0u64; 32]));
+                ensure!(commitment.total_stake == 0);
+            }
+            Method::ClusterNodes => {
+                let nodes: Vec<RpcContactInfo> =
+                    self.client.call(RpcRequest::GetClusterNodes, &NO_PARAMS).await?;
+                ensure!(nodes.len() == 1);
+                let node = &nodes[0];
+                ensure!(node.pubkey == self.fixture.identity.to_string());
+                ensure!(
+                    node.gossip.is_none()
+                        && node.tpu.is_none()
+                        && node.rpc.is_none()
+                        && node.pubsub.is_none()
+                        && node.version.is_none()
+                        && node.feature_set.is_none()
+                        && node.shred_version.is_none()
+                );
+            }
+            Method::EpochInfo => {
+                let info: EpochInfo =
+                    self.client.call(RpcRequest::GetEpochInfo, &(confirmed(),)).await?;
+                ensure!(info.slots_in_epoch == SUPERBLOCK_SLOTS);
+                ensure!(info.epoch == (info.absolute_slot / SUPERBLOCK_SLOTS));
+                ensure!(info.slot_index == (info.absolute_slot % SUPERBLOCK_SLOTS));
+                ensure!(info.block_height == info.absolute_slot);
+                ensure!(info.transaction_count == Some(0));
+                observed_slot = Some(info.absolute_slot);
+            }
+            Method::EpochSchedule => {
+                let schedule: EpochSchedule =
+                    self.client.call(RpcRequest::GetEpochSchedule, &NO_PARAMS).await?;
+                ensure!(schedule.slots_per_epoch == SUPERBLOCK_SLOTS);
+                ensure!(schedule.leader_schedule_slot_offset == SUPERBLOCK_SLOTS);
+                ensure!(!schedule.warmup);
+                ensure!(schedule.first_normal_epoch == 0);
+                ensure!(schedule.first_normal_slot == 0);
+            }
+            Method::FirstAvailableBlock => {
+                ensure!(
+                    self.client.call::<u64>(RpcRequest::GetFirstAvailableBlock, &NO_PARAMS).await?
+                        == 0
+                );
+            }
+            Method::GenesisHash => {
+                ensure!(
+                    self.client.call::<String>(RpcRequest::GetGenesisHash, &NO_PARAMS).await?
+                        == Hash::default().to_string()
+                );
+            }
+            Method::Health => {
+                self.client.get_health().await?;
+            }
+            Method::HighestSnapshotSlot => {
+                let snapshot: RpcSnapshotSlotInfo =
+                    self.client.call(RpcRequest::GetHighestSnapshotSlot, &NO_PARAMS).await?;
+                ensure!(snapshot.full == 0);
+                ensure!(snapshot.incremental == None);
+            }
+            Method::Identity => {
+                ensure!(
+                    self.client
+                        .call::<RpcIdentity>(RpcRequest::GetIdentity, &NO_PARAMS)
+                        .await?
+                        .identity
+                        == self.fixture.identity.to_string()
+                );
+            }
+            Method::LargestAccounts => {
+                let config = RpcLargestAccountsConfig {
+                    commitment: Some(confirmed()),
+                    ..RpcLargestAccountsConfig::default()
+                };
+                let largest: Response<Vec<RpcAccountBalance>> =
+                    self.client.call(RpcRequest::GetLargestAccounts, &(config,)).await?;
+                ensure!(largest.value.is_empty());
+                observed_slot = Some(largest.context.slot);
+            }
+            Method::RecentPerformanceSamples => {
+                let samples: Vec<RpcPerfSample> = self
+                    .client
+                    .call(
+                        RpcRequest::GetRecentPerformanceSamples,
+                        &(PERFORMANCE_SAMPLE_LIMIT,),
+                    )
+                    .await?;
+                ensure!(!samples.is_empty() && samples.len() <= PERFORMANCE_SAMPLE_LIMIT);
+                for sample in &samples {
+                    ensure!(sample.sample_period_secs == PERFORMANCE_SAMPLE_PERIOD_SECS);
+                    ensure!(sample.num_slots >= 1);
+                }
+            }
+            Method::SlotLeader => {
+                ensure!(
+                    self.client.call::<String>(RpcRequest::GetSlotLeader, &(confirmed(),)).await?
+                        == self.fixture.identity.to_string()
+                );
+            }
+            Method::SlotLeaders => {
+                let leaders: Vec<String> = self
+                    .client
+                    .call(
+                        RpcRequest::GetSlotLeaders,
+                        &(self.fixture.slot_floor, SLOT_LEADER_LIMIT),
+                    )
+                    .await?;
+                ensure!(!leaders.is_empty() && leaders.len() as u64 <= SLOT_LEADER_LIMIT);
+                let identity = self.fixture.identity.to_string();
+                ensure!(leaders.iter().all(|leader| *leader == identity));
+            }
+            Method::Supply => {
+                let supply: Response<RpcSupply> =
+                    self.client.call(RpcRequest::GetSupply, &(confirmed(),)).await?;
+                ensure!(supply.value.total == u64::MAX);
+                ensure!(supply.value.circulating == (u64::MAX / 2));
+                ensure!(supply.value.non_circulating == (u64::MAX / 2));
+                ensure!(supply.value.non_circulating_accounts.is_empty());
+                observed_slot = Some(supply.context.slot);
+            }
+            Method::TokenLargestAccounts => {
+                let largest: Response<Vec<RpcTokenAccountBalance>> = self
+                    .client
+                    .call(
+                        RpcRequest::GetTokenLargestAccounts,
+                        &(self.fixture.mint.to_string(), confirmed()),
+                    )
+                    .await?;
+                ensure!(largest.value.is_empty());
+                observed_slot = Some(largest.context.slot);
+            }
+            Method::TokenSupply => {
+                let supply: Response<UiTokenAmount> = self
+                    .client
+                    .call(
+                        RpcRequest::GetTokenSupply,
+                        &(self.fixture.mint.to_string(), confirmed()),
+                    )
+                    .await?;
+                ensure!(supply.value.amount == "0");
+                ensure!(supply.value.decimals == 0);
+                ensure!(supply.value.ui_amount == Some(0.0));
+                ensure!(supply.value.ui_amount_string == "0.0");
+                observed_slot = Some(supply.context.slot);
+            }
+            Method::TransactionCount => {
+                ensure!(
+                    self.client
+                        .call::<u64>(RpcRequest::GetTransactionCount, &(confirmed(),))
+                        .await?
+                        == 0
+                );
+            }
+            Method::Version => {
+                let version: RpcVersionInfo =
+                    self.client.call(RpcRequest::GetVersion, &NO_PARAMS).await?;
+                let parts: Vec<&str> = version.solana_core.split('.').collect();
+                ensure!(parts.len() == 3 && parts.iter().all(|part| part.parse::<u32>().is_ok()));
+                ensure!(version.feature_set.is_some_and(|set| set != 0));
+            }
+            Method::VoteAccounts => {
+                let accounts: RpcVoteAccountStatus =
+                    self.client.call(RpcRequest::GetVoteAccounts, &(confirmed(),)).await?;
+                ensure!(accounts.current.is_empty() && accounts.delinquent.is_empty());
+            }
+            Method::MinimumLedgerSlot => {
+                ensure!(
+                    self.client.call::<u64>(RpcRequest::MinimumLedgerSlot, &NO_PARAMS).await? == 0
+                );
+            }
+        }
+        Ok(observed_slot)
     }
 }

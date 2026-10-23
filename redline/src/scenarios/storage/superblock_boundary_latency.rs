@@ -6,20 +6,20 @@ use std::{
 
 use anyhow::ensure;
 use json::JsonValueTrait;
-use keypair::Keypair;
+use pubkey::Pubkey;
 use redsuite_core::{
     host,
     profile::ProfileValues,
     programs::REDLINE,
     redline::Accounts,
     report::Unit,
-    runner::{execute, Pacing, RunConfig},
-    sampler::{Sampler, Trailing},
+    runner::{execute, Pacing, RunConfig, RunOutcome},
+    sampler::{Sampled, Sampler, Trailing},
     topology::{self, ErOptions, PrivateEr},
     transport::wsraw::RawWs,
     BaseCtx, MetricsDelta, PrivateErScenario, Result, ScenarioReport, TxSender,
 };
-use tracing::debug;
+use tracing::{debug, instrument};
 use url::Url;
 
 use crate::{metrics, ACCOUNT_SPACE};
@@ -169,9 +169,9 @@ async fn observe_slots(
 }
 
 pub struct SuperblockBoundaryLatency {
-    base: Rc<BaseCtx>,
     profile: &'static Profile,
-    prep_payers: Vec<Keypair>,
+    pool: Vec<Pubkey>,
+    senders: Vec<TxSender>,
     private: PrivateEr,
 }
 
@@ -192,21 +192,6 @@ impl PrivateErScenario<ScenarioReport> for SuperblockBoundaryLatency {
             },
         )
         .await?;
-        Ok(Self {
-            base,
-            profile,
-            prep_payers,
-            private,
-        })
-    }
-
-    async fn run(self) -> Result<ScenarioReport> {
-        let Self {
-            base,
-            profile,
-            prep_payers,
-            private,
-        } = self;
         let cell_er = private.ctx();
 
         let pool = Accounts::new(ACCOUNT_SPACE, cell_er.identity())
@@ -214,43 +199,78 @@ impl PrivateErScenario<ScenarioReport> for SuperblockBoundaryLatency {
             .await?;
         cell_er.await_clones(&pool, ACCOUNT_SPACE as usize).await?;
 
-        let payers: Vec<Rc<Keypair>> = prep_payers.into_iter().map(Rc::new).collect();
         let senders: Vec<TxSender> =
-            payers.iter().map(|payer| cell_er.sender(payer.clone())).collect();
+            prep_payers.into_iter().map(|payer| cell_er.sender(Rc::new(payer))).collect();
 
-        let ledger_txs_at_boot =
-            cell_er.scrape_metrics().await?.get(LEDGER_TRANSACTIONS).unwrap_or(0.0);
+        Ok(Self { profile, pool, senders, private })
+    }
+
+    async fn run(self) -> Result<ScenarioReport> {
+        self.fill().await?;
+        let measurement = self.measure().await?;
+        ensure!(measurement.outcome.failed == 0);
+        ensure!(measurement.boundary.count >= self.profile.min_boundaries);
+        ensure!(measurement.normal.count > 0);
+
+        Ok(self.report(&measurement))
+    }
+}
+
+struct Measurement {
+    outcome: RunOutcome,
+    boundary: Timings,
+    normal: Timings,
+    health: Sampled<Health>,
+    delta: MetricsDelta,
+    storage_growth: u64,
+}
+
+impl SuperblockBoundaryLatency {
+    #[instrument(skip_all, err)]
+    async fn fill(&self) -> Result<()> {
+        let ledger_txs_at_boot = self
+            .private
+            .ctx()
+            .scrape_metrics()
+            .await?
+            .get(LEDGER_TRANSACTIONS)
+            .unwrap_or(0.0);
         let fill = execute(
             RunConfig {
-                iterations: profile.fill,
-                rate: Pacing::PerSecond(profile.rate),
-                concurrency: profile.concurrency,
+                iterations: self.profile.fill,
+                rate: Pacing::PerSecond(self.profile.rate),
+                concurrency: self.profile.concurrency,
             },
             |id| {
-                let sender = senders[(id as usize) % senders.len()].clone();
-                let (ix, _) = REDLINE.copy_three(&pool, id);
+                let sender = self.senders[(id as usize) % self.senders.len()].clone();
+                let (ix, _) = REDLINE.copy_three(&self.pool, id);
                 sender.staged([ix])
             },
         )
         .await?;
         ensure!(fill.failed == 0);
         crate::await_executed(
-            cell_er,
-            ledger_txs_at_boot + profile.fill as f64,
+            self.private.ctx(),
+            ledger_txs_at_boot + self.profile.fill as f64,
             LEDGER_FILL_TIMEOUT,
         )
         .await?;
 
-        let storage_before = host::dir_size_bytes(private.storage_dir())?;
-        let before = cell_er.scrape_metrics().await?;
+        Ok(())
+    }
+
+    #[instrument(skip_all, err)]
+    async fn measure(&self) -> Result<Measurement> {
+        let storage_before = host::dir_size_bytes(self.private.storage_dir())?;
+        let before = self.private.ctx().scrape_metrics().await?;
         let stop = Rc::new(Cell::new(false));
         let observer = observe_slots(
-            cell_er.ws_url().clone(),
-            profile.superblock_slots,
+            self.private.ctx().ws_url().clone(),
+            self.profile.superblock_slots,
             stop.clone(),
         );
         let health = Sampler::spawn(
-            cell_er.metrics().clone(),
+            self.private.ctx().metrics().clone(),
             HEALTH_SAMPLE_INTERVAL,
             Trailing::Skip,
             |metrics, health: &mut Health| {
@@ -266,13 +286,13 @@ impl PrivateErScenario<ScenarioReport> for SuperblockBoundaryLatency {
         let load = async {
             let outcome: Result<_> = execute(
                 RunConfig {
-                    iterations: profile.iterations,
-                    rate: Pacing::PerSecond(profile.rate),
-                    concurrency: profile.concurrency,
+                    iterations: self.profile.iterations,
+                    rate: Pacing::PerSecond(self.profile.rate),
+                    concurrency: self.profile.concurrency,
                 },
                 |id| {
-                    let sender = senders[(id as usize) % senders.len()].clone();
-                    let (ix, _) = REDLINE.copy_three(&pool, profile.fill + id);
+                    let sender = self.senders[(id as usize) % self.senders.len()].clone();
+                    let (ix, _) = REDLINE.copy_three(&self.pool, self.profile.fill + id);
                     sender.staged([ix])
                 },
             )
@@ -284,36 +304,38 @@ impl PrivateErScenario<ScenarioReport> for SuperblockBoundaryLatency {
         let outcome = outcome?;
         let intervals = intervals?;
         let health = health?;
-        let after = cell_er.scrape_metrics().await?;
+        let after = self.private.ctx().scrape_metrics().await?;
         let delta = MetricsDelta::new(before, after);
-        let storage_after = host::dir_size_bytes(private.storage_dir())?;
-
-        ensure!(outcome.failed == 0);
-
-        let boundary = timings(
-            intervals
-                .iter()
-                .filter(|interval| interval.kind == Kind::Boundary)
-                .map(|interval| interval.micros)
-                .collect(),
-        );
-        let normal = timings(
-            intervals
-                .iter()
-                .filter(|interval| interval.kind == Kind::Normal)
-                .map(|interval| interval.micros)
-                .collect(),
-        );
-        ensure!(boundary.count >= profile.min_boundaries);
-        ensure!(normal.count > 0);
-
-        let sealed = delta.counter(SUPERBLOCKS).unwrap_or_default();
-        let finalize_us = delta.histogram_avg(FINALIZE_SUPERBLOCK);
-        let finalize_count = delta.counter(FINALIZE_SUPERBLOCK_COUNT);
-        let snapshot_us = delta.histogram_avg(SNAPSHOT);
-        let checksum_us = delta.histogram_avg(CHECKSUM);
-        let snapshot_bytes = delta.gauge(SNAPSHOT_SIZE).unwrap_or_default();
+        let storage_after = host::dir_size_bytes(self.private.storage_dir())?;
         let storage_growth = storage_after.saturating_sub(storage_before);
+        let mut boundary = Vec::new();
+        let mut normal = Vec::new();
+        for interval in intervals {
+            match interval.kind {
+                Kind::Boundary => boundary.push(interval.micros),
+                Kind::Normal => normal.push(interval.micros),
+            }
+        }
+
+        Ok(Measurement {
+            outcome,
+            boundary: timings(boundary),
+            normal: timings(normal),
+            health,
+            delta,
+            storage_growth,
+        })
+    }
+
+    fn report(&self, measurement: &Measurement) -> ScenarioReport {
+        let boundary = &measurement.boundary;
+        let normal = &measurement.normal;
+        let sealed = measurement.delta.counter(SUPERBLOCKS).unwrap_or_default();
+        let finalize_us = measurement.delta.histogram_avg(FINALIZE_SUPERBLOCK);
+        let finalize_count = measurement.delta.counter(FINALIZE_SUPERBLOCK_COUNT);
+        let snapshot_us = measurement.delta.histogram_avg(SNAPSHOT);
+        let checksum_us = measurement.delta.histogram_avg(CHECKSUM);
+        let snapshot_bytes = measurement.delta.gauge(SNAPSHOT_SIZE).unwrap_or_default();
         let stall_ratio =
             if normal.p50 > 0 { boundary.p50 as f64 / normal.p50 as f64 } else { 0.0 };
 
@@ -322,19 +344,19 @@ impl PrivateErScenario<ScenarioReport> for SuperblockBoundaryLatency {
             stall_ratio, "superblock boundary workload finished",
         );
 
-        Ok(ScenarioReport::ok()
-            .setting("profile", profile.name)
+        ScenarioReport::ok()
+            .setting("profile", self.profile.name)
             .setting("shape", "account data copy, 1 source into 2 dests")
             .setting("blocktime ms", BLOCKTIME_MS)
-            .setting("superblock slots", profile.superblock_slots)
-            .setting("fill txs", profile.fill)
-            .setting("measured txs", profile.iterations)
-            .setting("offered tps", profile.rate)
-            .setting("accounts", profile.accounts)
-            .setting("payers", profile.payers)
-            .setting("concurrency", profile.concurrency)
-            .observe("delivery us", Unit::Micros, outcome.delivery)
-            .client_side(&outcome)
+            .setting("superblock slots", self.profile.superblock_slots)
+            .setting("fill txs", self.profile.fill)
+            .setting("measured txs", self.profile.iterations)
+            .setting("offered tps", self.profile.rate)
+            .setting("accounts", self.profile.accounts)
+            .setting("payers", self.profile.payers)
+            .setting("concurrency", self.profile.concurrency)
+            .observe("delivery us", Unit::Micros, measurement.outcome.delivery)
+            .client_side(&measurement.outcome)
             .metric("boundary count", Unit::Count, boundary.count as f64)
             .metric("boundary p50 us", Unit::Micros, boundary.p50 as f64)
             .metric("boundary p95 us", Unit::Micros, boundary.p95 as f64)
@@ -354,28 +376,56 @@ impl PrivateErScenario<ScenarioReport> for SuperblockBoundaryLatency {
             .metric_if("checksum mean us", Unit::Micros, checksum_us)
             .metric("snapshot size bytes", Unit::Count, snapshot_bytes)
             .metric("superblocks sealed", Unit::Count, sealed)
-            .metric("storage growth bytes", Unit::Count, storage_growth as f64)
-            .metric("achieved tps", Unit::Tps, outcome.achieved_rps())
-            .metric("delivered txs", Unit::Count, outcome.delivered as f64)
-            .metric("tx gap max us", Unit::Micros, outcome.delivery.max as f64)
+            .metric(
+                "storage growth bytes",
+                Unit::Count,
+                measurement.storage_growth as f64,
+            )
+            .metric(
+                "achieved tps",
+                Unit::Tps,
+                measurement.outcome.achieved_rps(),
+            )
+            .metric(
+                "delivered txs",
+                Unit::Count,
+                measurement.outcome.delivered as f64,
+            )
+            .metric(
+                "tx gap max us",
+                Unit::Micros,
+                measurement.outcome.delivery.max as f64,
+            )
             .metric(
                 "tx gap p95 us",
                 Unit::Micros,
-                outcome.delivery.quantile95 as f64,
+                measurement.outcome.delivery.quantile95 as f64,
             )
-            .metric("blocked peak", Unit::Count, health.value.blocked_peak)
-            .metric("busy peak", Unit::Count, health.value.busy_peak)
-            .metric("pending peak", Unit::Count, health.value.pending_peak)
-            .metric("health samples", Unit::Count, health.observations as f64)
+            .metric(
+                "blocked peak",
+                Unit::Count,
+                measurement.health.value.blocked_peak,
+            )
+            .metric("busy peak", Unit::Count, measurement.health.value.busy_peak)
+            .metric(
+                "pending peak",
+                Unit::Count,
+                measurement.health.value.pending_peak,
+            )
+            .metric(
+                "health samples",
+                Unit::Count,
+                measurement.health.observations as f64,
+            )
             .metric_if(
                 "ordering dependencies",
                 Unit::Count,
-                delta.counter(ORDERING_DEPENDENCIES),
+                measurement.delta.counter(ORDERING_DEPENDENCIES),
             )
             .metric_if(
                 "failed transactions",
                 Unit::Count,
-                delta.counter_all(metrics::FAILED_TRANSACTIONS),
-            ))
+                measurement.delta.counter_all(metrics::FAILED_TRANSACTIONS),
+            )
     }
 }

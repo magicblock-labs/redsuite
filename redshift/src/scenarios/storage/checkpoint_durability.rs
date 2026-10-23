@@ -1,4 +1,4 @@
-use std::{path::Path, rc::Rc, time::Duration};
+use std::{rc::Rc, time::Duration};
 
 use anyhow::{ensure, Context};
 use keypair::Keypair;
@@ -42,6 +42,17 @@ impl State {
         }
         Ok(())
     }
+
+    async fn read(er: &ErCtx, keys: &[Pubkey; 2]) -> Result<State> {
+        let accounts = er.accounts(keys).await?;
+        let payer = accounts[0].as_ref().context("fee payer missing")?;
+        let cell = accounts[1].as_ref().context("cell missing")?;
+        Ok(State {
+            payer_lamports: payer.lamports,
+            cell_lamports: cell.lamports,
+            cell: CellHeader::try_decode(&cell.data)?,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -72,17 +83,6 @@ impl Record {
     }
 }
 
-async fn state(er: &ErCtx, keys: &[Pubkey; 2]) -> Result<State> {
-    let accounts = er.accounts(keys).await?;
-    let payer = accounts[0].as_ref().context("fee payer missing")?;
-    let cell = accounts[1].as_ref().context("cell missing")?;
-    Ok(State {
-        payer_lamports: payer.lamports,
-        cell_lamports: cell.lamports,
-        cell: CellHeader::try_decode(&cell.data)?,
-    })
-}
-
 struct Workload {
     payer: Keypair,
     owner: Pubkey,
@@ -93,7 +93,7 @@ struct Workload {
 
 impl Workload {
     async fn check(&self, er: &ErCtx) -> Result<()> {
-        ensure!(state(er, &self.keys).await? == self.expected);
+        ensure!(State::read(er, &self.keys).await? == self.expected);
         Ok(())
     }
 
@@ -129,38 +129,6 @@ impl Workload {
     }
 }
 
-async fn head(er: &ErCtx) -> Result<u64> {
-    Ok(er
-        .scrape_metrics()
-        .await?
-        .get("engine_ledger_superblocks")
-        .context("missing ledger head metric")? as u64)
-}
-
-async fn checkpoint(er: &ErCtx, storage: &Path) -> Result<u64> {
-    let sealed = head(er).await?;
-    let archive = storage.join(format!("superblock-{:09}", sealed + 1)).join("accountsdb.tar.zst");
-    wait::retry(
-        &format!("checkpoint {sealed} archived at {}", archive.display()),
-        CHECKPOINT_TIMEOUT,
-        async || {
-            ensure!(head(er).await? > sealed);
-            let metadata = archive.metadata()?;
-            ensure!(metadata.is_file() && metadata.len() > 0);
-            Ok(())
-        },
-    )
-    .await?;
-    Ok(sealed)
-}
-
-async fn verify(er: &ErCtx, protected: &[Record]) -> Result<()> {
-    for record in protected {
-        ensure!(er.api().get_transaction(&record.signature).await? == record.evidence);
-    }
-    Ok(())
-}
-
 pub struct CheckpointDurability {
     private: PrivateEr,
     workload: Workload,
@@ -189,7 +157,9 @@ impl PrivateErScenario for CheckpointDurability {
         let expected = private
             .ctx()
             .api()
-            .await_accounts(&keys, "accounts cloned", || state(private.ctx(), &keys))
+            .await_accounts(&keys, "accounts cloned", || {
+                State::read(private.ctx(), &keys)
+            })
             .await?;
         ensure!((expected.cell.value, expected.cell.revision) == (0, 0));
         let workload = Workload {
@@ -202,28 +172,28 @@ impl PrivateErScenario for CheckpointDurability {
         Ok(Self { private, workload })
     }
 
-    async fn run(self) -> Result<()> {
-        let Self { mut private, mut workload } = self;
+    async fn run(mut self) -> Result<()> {
         let mut protected = Vec::new();
         let mut previous_boundary = 0;
 
         for _ in 0..ROUNDS {
-            let er = private.ctx();
+            let er = self.private.ctx();
             for _ in 0..8 {
-                protected.push(workload.submit(er, true).await?);
+                protected.push(self.workload.submit(er, true).await?);
             }
-            let boundary = checkpoint(er, private.storage_dir()).await?;
+            let boundary = self.checkpoint().await?;
             ensure!(boundary > previous_boundary);
             previous_boundary = boundary;
-            verify(er, &protected).await?;
-            workload.check(er).await?;
-            let baseline = workload.expected.clone();
+            self.verify(&protected).await?;
+            self.workload.check(er).await?;
+            let baseline = self.workload.expected.clone();
 
             let mut tail = Vec::new();
             for index in 0..16 {
-                tail.push(workload.submit(er, index < 4).await?);
+                tail.push(self.workload.submit(er, index < 4).await?);
             }
-            let timing = private
+            let timing = self
+                .private
                 .restart(RestartConfig {
                     hard_kill: true,
                     reset: false,
@@ -231,24 +201,67 @@ impl PrivateErScenario for CheckpointDurability {
                 })
                 .await?;
             ensure!(timing.exit_signal == Some(9));
-            let er = private.ctx();
-            verify(er, &protected).await?;
-            workload.expected = baseline;
+            let er = self.private.ctx();
+            self.verify(&protected).await?;
+            self.workload.expected = baseline;
             for mut record in tail {
                 let found = er.api().get_transaction(&record.signature).await?;
                 if let Some(evidence) = found {
                     record.check(&evidence)?;
-                    workload.expected.apply(&record, &evidence)?;
+                    self.workload.expected.apply(&record, &evidence)?;
                     record.evidence = Some(evidence);
                     protected.push(record);
                 }
             }
-            workload.check(er).await?;
+            self.workload.check(er).await?;
             for _ in 0..2 {
-                protected.push(workload.submit(er, true).await?);
+                protected.push(self.workload.submit(er, true).await?);
             }
         }
-        private.finish().await?;
+        self.private.finish().await?;
+        Ok(())
+    }
+}
+
+impl CheckpointDurability {
+    async fn head(&self) -> Result<u64> {
+        Ok(self
+            .private
+            .ctx()
+            .scrape_metrics()
+            .await?
+            .get("engine_ledger_superblocks")
+            .context("missing ledger head metric")? as u64)
+    }
+
+    async fn checkpoint(&self) -> Result<u64> {
+        let sealed = self.head().await?;
+        let archive = self
+            .private
+            .storage_dir()
+            .join(format!("superblock-{:09}", sealed + 1))
+            .join("accountsdb.tar.zst");
+        wait::retry(
+            &format!("checkpoint {sealed} archived at {}", archive.display()),
+            CHECKPOINT_TIMEOUT,
+            async || {
+                ensure!(self.head().await? > sealed);
+                let metadata = archive.metadata()?;
+                ensure!(metadata.is_file() && metadata.len() > 0);
+                Ok(())
+            },
+        )
+        .await?;
+        Ok(sealed)
+    }
+
+    async fn verify(&self, protected: &[Record]) -> Result<()> {
+        for record in protected {
+            ensure!(
+                self.private.ctx().api().get_transaction(&record.signature).await?
+                    == record.evidence
+            );
+        }
         Ok(())
     }
 }

@@ -8,7 +8,7 @@ use redsuite_core::{
     api::transaction_meta,
     check,
     dlp::{self, delegate_with_actions, DelegateArgs},
-    netfault::{BaseProxies, Selector},
+    netfault::{BaseProxies, Held, RuleHandle, Selector},
     programs::{SettlementMode, REDLINE},
     receipt, system,
     topology::{self, ErOptions, PrivateEr},
@@ -19,6 +19,7 @@ use signature::Signature;
 use signer::Signer;
 
 mod magic_atas;
+use tracing::instrument;
 
 use super::spl;
 use crate::PAYER_LAMPORTS;
@@ -118,382 +119,445 @@ async fn amount(ctx: &impl ChainCtx, address: &Pubkey) -> Result<u64> {
     spl::token_balance(ctx, address).await?.context("token balance missing")
 }
 
-async fn balances(
-    base: &BaseCtx,
-    er: &ErCtx,
-    wallets: &[Wallet; 4],
-    vault: &[Pubkey; 2],
-) -> Result<Balances> {
-    let mut state = Balances::default();
-    for (i, wallet) in wallets.iter().enumerate() {
-        state.base_atas[i] = amount(base, &wallet.ata).await?;
-        state.eatas[i] = spl::token_balance(base, &wallet.eata).await?;
-        state.projected[i] = amount(er, &wallet.ata).await?;
-    }
-    for (i, address) in vault.iter().enumerate() {
-        state.vault[i] = amount(base, address).await?;
-    }
-    Ok(state)
-}
-
-async fn await_projection(er: &ErCtx, wallets: &[Wallet; 4], expected: &[u64; 4]) -> Result<()> {
-    er.api()
-        .await_accounts(
-            &wallets.iter().map(|wallet| wallet.ata).collect::<Vec<_>>(),
-            "projected balances converge",
-            async || {
-                for (wallet, expected) in wallets.iter().zip(expected) {
-                    let actual = amount(er, &wallet.ata).await?;
-                    ensure!(actual == *expected);
-                }
-                Ok(())
-            },
-        )
-        .await
-}
-
-async fn check_controls(er: &ErCtx, wallets: &[Wallet; 4], amount: u64) -> Result<()> {
-    let atas = wallets.each_ref().map(|wallet| wallet.ata);
-    let before = er.accounts(&atas).await?;
-    for control in [2, 3] {
-        for (from, to) in [(control, 0), (0, control)] {
-            let attempt = wallets[from].transfer(er, &wallets[to], amount).await;
-            let error =
-                check::expect_error(attempt, &format!("unauthorized transfer {from}->{to}"))?;
-            let error = format!("{error:#}");
-            ensure!([
-                "InvalidWritableAccount",
-                "ExternalAccountDataModified",
-                "ReadonlyDataModified",
-                "Immutable",
-            ]
-            .iter()
-            .any(|code| error.contains(code)));
-            ensure!(er.accounts(&atas).await? == before);
-        }
-    }
-    Ok(())
-}
-
-async fn settled(
-    base: &BaseCtx,
-    er: &ErCtx,
-    signature: &Signature,
-    expected: &[Pubkey],
-    undelegate: bool,
-) -> Result<()> {
-    let receipt = receipt::fetch_commit_receipt(er.api(), signature).await?;
-    receipt.check_success("projected-token commit")?;
-    receipt.check_accounts(expected, undelegate)?;
-    receipt.confirm(base.api()).await
-}
-
 pub struct ProjectedTokenLifecycle {
     base: Rc<BaseCtx>,
     proxies: BaseProxies,
     private: PrivateEr,
+    validator: Keypair,
+    payer: Keypair,
+    mint: Keypair,
+    wallets: [Wallet; 4],
+    vault: [Pubkey; 2],
 }
 
 impl PrivateErScenario for ProjectedTokenLifecycle {
     async fn setup(base: Rc<BaseCtx>, _: ()) -> Result<Self> {
         let proxies = BaseProxies::spawn(&base).await?;
-        let private = crate::phase(
-            "boot",
-            topology::private_er(
-                &base,
-                ErOptions {
-                    label: LABEL.to_owned(),
-                    base_endpoints: Some(proxies.endpoints()),
-                    ..Default::default()
-                },
-            ),
+        let private = topology::private_er(
+            &base,
+            ErOptions {
+                label: LABEL.to_owned(),
+                base_endpoints: Some(proxies.endpoints()),
+                ..Default::default()
+            },
         )
         .await?;
-        Ok(Self { base, proxies, private })
-    }
-
-    async fn run(self) -> Result<()> {
-        let Self { base, proxies, private } = self;
-        let er = private.ctx();
         let validator = topology::identity_for_label(LABEL)?;
-        let identity = validator.pubkey();
         let payer = base.funded_payer(PAYER_LAMPORTS).await?;
-        let funder = payer.pubkey();
         let mint = Keypair::new();
         let mint_key = mint.pubkey();
-        let wallets: [Wallet; 4] = std::array::from_fn(|_| Wallet::new(&mint_key));
+        let wallets = std::array::from_fn(|_| Wallet::new(&mint_key));
         let global_vault = spl::derive_global_vault(&mint_key);
         let vault = [
             spl::derive_ata(&global_vault, &mint_key),
             spl::derive_eata(&global_vault, &mint_key),
         ];
-        let atas = [wallets[0].ata, wallets[1].ata];
-        let eatas = [wallets[0].eata, wallets[1].eata];
-        let commit = async |id| {
-            er.submit_and_confirm(
-                &validator,
-                &[REDLINE
-                    .batch()
-                    .nonce(id)
-                    .settle(identity, &atas, SettlementMode::Commit)
-                    .build()],
-            )
-            .await
-        };
-        let owner_is = async |address: &Pubkey, owner| -> Result<()> {
-            let actual = base.account(address).await?.map(|a| a.owner);
-            ensure!(actual == Some(owner));
-            Ok(())
-        };
-        let delegate = async |payer: &Keypair, wallet: &Wallet, validator| -> Result<()> {
-            let ix = wallet.delegate(payer.pubkey(), validator);
-            base.submit_and_confirm(payer, &[ix]).await?;
-            owner_is(&wallet.eata, dlp::dlp_id()).await
-        };
-        let delegate_with_transfer = async |amount: u64| -> Result<Pubkey> {
-            let account = base.funded_payer(PAYER_LAMPORTS).await?;
-            let action = wallets[0].transfer_to(&wallets[1], amount);
-            // Publish the owner change with its record so discovery sees both.
-            base.submit_and_confirm_with(
-                &payer,
-                &[&account, &wallets[0].owner],
-                &[
-                    system::assign(&account.pubkey(), &dlp::dlp_id()),
-                    delegate_with_actions(
-                        &funder,
-                        &account.pubkey(),
-                        None,
-                        DelegateArgs {
-                            commit_frequency_ms: u32::MAX,
-                            seeds: vec![],
-                            validator: Some(identity),
-                        },
-                        &[action],
-                    ),
-                ],
-            )
-            .await?;
-            Ok(account.pubkey())
-        };
-        let record = async |expected: &Balances, delegated: bool| -> Result<()> {
-            let observed = balances(&base, er, &wallets, &vault).await?;
-            ensure!(&observed == expected);
-            observed.conserved(delegated)?;
-            Ok(())
-        };
+        Ok(Self {
+            base,
+            proxies,
+            private,
+            validator,
+            payer,
+            mint,
+            wallets,
+            vault,
+        })
+    }
+
+    async fn run(self) -> Result<()> {
+        let er = self.private.ctx();
         let mut expected = Balances {
             base_atas: [200, 100, 70, 5],
             eatas: [Some(0), Some(0), None, Some(40)],
             projected: [200, 100, 70, 5],
             vault: [40, 0],
         };
-        let foreign_validator = Keypair::new().pubkey();
+        self.create_tokens(&expected).await?;
+        self.check_balances(&expected, false).await?;
 
-        crate::phase("token setup", async {
-            base.submit_and_confirm_with(
-                &payer,
-                &[&mint],
+        self.deposit().await?;
+        expected.base_atas = [0, 0, 70, 5];
+        expected.eatas = [Some(200), Some(100), None, Some(40)];
+        expected.projected = expected.base_atas;
+        expected.vault[0] = 340;
+        self.await_projection(&expected.projected).await?;
+        self.check_balances(&expected, false).await?;
+
+        self.delegate_wallets().await?;
+        expected.projected = [200, 100, 70, 5];
+        self.await_projection(&expected.projected).await?;
+        self.check_controls(1).await?;
+        self.check_balances(&expected, true).await?;
+
+        let delegated = self.delegate_with_transfer(ACTION_AMOUNT).await?;
+        expected.projected = [100, 200, 70, 5];
+        self.await_projection(&expected.projected).await?;
+        self.check_owner(&delegated, dlp::dlp_id()).await?;
+        self.check_balances(&expected, true).await?;
+
+        self.check_failing_action().await?;
+        self.check_balances(&expected, true).await?;
+
+        self.wallets[0].transfer(er, &self.wallets[1], 37).await?;
+        expected.projected = [63, 237, 70, 5];
+        self.check_balances(&expected, true).await?;
+
+        let (signature, held, confirmations) = self.commit_withheld().await?;
+        expected.eatas[..2].copy_from_slice(&[Some(63), Some(237)]);
+        self.check_balances(&expected, true).await?;
+        self.wallets[0].transfer(er, &self.wallets[1], 11).await?;
+        expected.projected = [52, 248, 70, 5];
+        self.check_balances(&expected, true).await?;
+
+        self.recover_confirmation(signature, held, confirmations).await?;
+        self.check_controls(2).await?;
+        self.check_balances(&expected, true).await?;
+        let eatas = [self.wallets[0].eata, self.wallets[1].eata];
+        self.settled(&self.commit(2).await?, &eatas, false).await?;
+        expected.eatas[..2].copy_from_slice(&[Some(52), Some(248)]);
+        self.check_balances(&expected, true).await?;
+
+        self.undelegate_wallets().await?;
+        expected.projected = expected.base_atas;
+        self.await_projection(&expected.projected).await?;
+        self.check_balances(&expected, false).await?;
+
+        self.withdraw().await?;
+        expected.base_atas[0] = 20;
+        expected.eatas[0] = Some(32);
+        expected.projected[0] = 20;
+        expected.vault[0] = 320;
+        self.await_projection(&expected.projected).await?;
+        self.check_balances(&expected, false).await?;
+
+        self.redelegate().await?;
+        expected.projected = [32, 248, 70, 5];
+        self.await_projection(&expected.projected).await?;
+        self.check_controls(3).await?;
+        self.check_balances(&expected, true).await?;
+        self.wallets[0].transfer(er, &self.wallets[1], 7).await?;
+        expected.projected = [25, 255, 70, 5];
+        self.check_balances(&expected, true).await?;
+        let signature = self.commit(3).await?;
+        self.settled(&signature, &eatas, false).await?;
+        expected.eatas[..2].copy_from_slice(&[Some(25), Some(255)]);
+        self.check_balances(&expected, true).await?;
+
+        MagicAtas::run(&self).await?;
+        self.finish().await
+    }
+}
+
+impl ProjectedTokenLifecycle {
+    #[instrument(skip_all, err)]
+    async fn create_tokens(&self, expected: &Balances) -> Result<()> {
+        let er = self.private.ctx();
+        let foreign_validator = Keypair::new().pubkey();
+        self.base
+            .submit_and_confirm_with(
+                &self.payer,
+                &[&self.mint],
                 &[
-                    spl::allocate_mint(&funder, &mint_key),
-                    spl::initialize_mint(&mint_key, &funder),
-                    spl::initialize_global_vault(&funder, &mint_key),
+                    spl::allocate_mint(&self.payer.pubkey(), &self.mint.pubkey()),
+                    spl::initialize_mint(&self.mint.pubkey(), &self.payer.pubkey()),
+                    spl::initialize_global_vault(&self.payer.pubkey(), &self.mint.pubkey()),
                 ],
             )
             .await?;
-            for (i, wallet) in wallets.iter().enumerate() {
-                let owner = wallet.owner.pubkey();
-                base.airdrop(&owner, PAYER_LAMPORTS).await?;
-                let mut instructions =
-                    vec![wallet.create(funder), wallet.mint_to(funder, INITIAL[i])];
-                if i != 2 {
-                    instructions.push(wallet.initialize(funder));
-                }
-                base.submit_and_confirm(&payer, &instructions).await?;
+        for (i, wallet) in self.wallets.iter().enumerate() {
+            let owner = wallet.owner.pubkey();
+            self.base.airdrop(&owner, PAYER_LAMPORTS).await?;
+            let mut instructions = vec![
+                wallet.create(self.payer.pubkey()),
+                wallet.mint_to(self.payer.pubkey(), INITIAL[i]),
+            ];
+            if i != 2 {
+                instructions.push(wallet.initialize(self.payer.pubkey()));
             }
-            base.submit_and_confirm(&wallets[3].owner, &[wallets[3].deposit(40)]).await?;
-            delegate(&payer, &wallets[3], foreign_validator).await?;
-            for control in [2, 3] {
-                let first = er
-                    .api()
-                    .await_accounts(
-                        &[wallets[control].ata],
-                        &format!("the er clones the {} ATA", NAMES[control]),
-                        || amount(er, &wallets[control].ata),
-                    )
-                    .await?;
-                ensure!(first == expected.projected[control]);
-            }
-            await_projection(er, &wallets, &expected.projected).await?;
-            record(&expected, false).await
-        })
-        .await?;
-
-        crate::phase("deposit", async {
-            for (wallet, initial) in wallets[..2].iter().zip(INITIAL) {
-                base.submit_and_confirm(
-                    &wallet.owner,
-                    &[spl::deposit_spl_tokens(&wallet.owner.pubkey(), &mint_key, initial)],
-                )
-                .await?;
-            }
-            expected.base_atas = [0, 0, 70, 5];
-            expected.eatas = [Some(200), Some(100), None, Some(40)];
-            expected.projected = expected.base_atas;
-            expected.vault[0] = 340;
-            await_projection(er, &wallets, &expected.projected).await?;
-            record(&expected, false).await
-        })
-        .await?;
-
-        crate::phase("delegation", async {
-            for wallet in &wallets[..2] {
-                delegate(&payer, wallet, identity).await?;
-            }
-            expected.projected = [200, 100, 70, 5];
-            await_projection(er, &wallets, &expected.projected).await?;
-            check_controls(er, &wallets, 1).await?;
-            record(&expected, true).await
-        })
-        .await?;
-
-        crate::phase("post-delegation action", async {
-            let delegated = delegate_with_transfer(ACTION_AMOUNT).await?;
-            expected.projected = [100, 200, 70, 5];
-            await_projection(er, &wallets, &expected.projected).await?;
-            owner_is(&delegated, dlp::dlp_id()).await?;
-            record(&expected, true).await
-        })
-        .await?;
-
-        // failing post-delegation action — an action that cannot execute
-        // must route the freshly delegated account into scheduled
-        // undelegation (ownership returns to system on base).
-        crate::phase("failing post-delegation action", async {
-            let failing = delegate_with_transfer(FAILING_AMOUNT).await?;
-            base.api()
-                .await_accounts(
-                    &[failing],
-                    "the failing action returns base ownership to the system \
-                 program",
-                    async || {
-                        ensure!(matches!(
-                            base.account(&failing).await,
-                            Ok(Some(account)) if account.owner == system::system_id()
-                        ));
-                        Ok(())
-                    },
-                )
-                .await?;
-            record(&expected, true).await
-        })
-        .await?;
-
-        crate::phase("er transfer", async {
-            wallets[0].transfer(er, &wallets[1], 37).await?;
-            expected.projected = [63, 237, 70, 5];
-            record(&expected, true).await
-        })
-        .await?;
-
-        let (signature, held, confirmations) =
-            crate::phase("commit with withheld confirmation", async {
-                let confirmations = [
-                    proxies.stall(Selector::method("getSignatureStatuses").http().response()),
-                    proxies.stall(Selector::method("signatureNotification").ws().notification()),
-                ];
-                let submission = proxies.intercept(
-                    Selector::method("sendTransaction").http().response().account(&eatas[0]),
-                );
-                let signature = commit(1).await?;
-                let held = submission.wait(TIMEOUT).await?;
-                let landed = held.operation.signature()?;
-                let tx = base.api().await_transaction(&landed).await?;
-                let meta = transaction_meta(&tx)?;
-                ensure!(meta.err == None);
-                expected.eatas[..2].copy_from_slice(&[Some(63), Some(237)]);
-                record(&expected, true).await?;
-                wallets[0].transfer(er, &wallets[1], 11).await?;
-                expected.projected = [52, 248, 70, 5];
-                record(&expected, true).await?;
-                Ok((signature, held, confirmations))
-            })
+            self.base.submit_and_confirm(&self.payer, &instructions).await?;
+        }
+        self.base
+            .submit_and_confirm(&self.wallets[3].owner, &[self.wallets[3].deposit(40)])
             .await?;
+        self.delegate(&self.payer, &self.wallets[3], foreign_validator).await?;
+        for control in [2, 3] {
+            let first = er
+                .api()
+                .await_accounts(
+                    &[self.wallets[control].ata],
+                    &format!("the er clones the {} ATA", NAMES[control]),
+                    || amount(er, &self.wallets[control].ata),
+                )
+                .await?;
+            ensure!(first == expected.projected[control]);
+        }
+        self.await_projection(&expected.projected).await?;
+        Ok(())
+    }
 
-        crate::phase("confirmation recovery", async {
-            held.discard();
-            proxies.close_connections();
-            for rule in confirmations {
-                rule.remove();
-            }
-            settled(&base, er, &signature, &eatas, false).await?;
-            check_controls(er, &wallets, 2).await?;
-            record(&expected, true).await?;
-            settled(&base, er, &commit(2).await?, &eatas, false).await?;
-            expected.eatas[..2].copy_from_slice(&[Some(52), Some(248)]);
-            record(&expected, true).await
-        })
-        .await?;
+    #[instrument(skip_all, err)]
+    async fn deposit(&self) -> Result<()> {
+        for (wallet, initial) in self.wallets[..2].iter().zip(INITIAL) {
+            self.base.submit_and_confirm(&wallet.owner, &[wallet.deposit(initial)]).await?;
+        }
+        Ok(())
+    }
 
-        crate::phase("undelegation", async {
-            for wallet in &wallets[..2] {
-                let signature = er
-                    .submit_and_confirm(
-                        &wallet.owner,
-                        &[UndelegateEphemeralAtaBuilder {
-                            payer: wallet.owner.pubkey(),
-                            user: wallet.owner.pubkey(),
-                            mint: mint_key,
-                        }
-                        .instruction()],
-                    )
-                    .await?;
-                settled(&base, er, &signature, &[wallet.eata], true).await?;
-                owner_is(&wallet.eata, spl::eata_program()).await?;
-            }
-            expected.projected = expected.base_atas;
-            await_projection(er, &wallets, &expected.projected).await?;
-            record(&expected, false).await
-        })
-        .await?;
+    #[instrument(skip_all, err)]
+    async fn delegate_wallets(&self) -> Result<()> {
+        for wallet in &self.wallets[..2] {
+            self.delegate(&self.payer, wallet, self.validator.pubkey()).await?;
+        }
 
-        crate::phase("withdrawal", async {
-            base.submit_and_confirm(
-                &wallets[0].owner,
-                &[spl::withdraw_spl_tokens(&wallets[0].owner.pubkey(), &mint_key, 20)],
+        Ok(())
+    }
+
+    #[instrument(skip_all, err)]
+    async fn check_failing_action(&self) -> Result<()> {
+        // A failing post-delegation action schedules undelegation, returning
+        // base ownership to the system program.
+        let failing = self.delegate_with_transfer(FAILING_AMOUNT).await?;
+        self.base
+            .api()
+            .await_accounts(
+                &[failing],
+                "the failing action returns base ownership to the system \
+                 program",
+                async || {
+                    ensure!(matches!(
+                        self.base.account(&failing).await,
+                        Ok(Some(account)) if account.owner == system::system_id()
+                    ));
+                    Ok(())
+                },
             )
             .await?;
-            expected.base_atas[0] = 20;
-            expected.eatas[0] = Some(32);
-            expected.projected[0] = 20;
-            expected.vault[0] = 320;
-            await_projection(er, &wallets, &expected.projected).await?;
-            record(&expected, false).await
-        })
-        .await?;
+        Ok(())
+    }
 
-        crate::phase("redelegation", async {
-            for wallet in &wallets[..2] {
-                delegate(&wallet.owner, wallet, identity).await?;
-            }
-            expected.projected = [32, 248, 70, 5];
-            await_projection(er, &wallets, &expected.projected).await?;
-            check_controls(er, &wallets, 3).await?;
-            record(&expected, true).await?;
-            wallets[0].transfer(er, &wallets[1], 7).await?;
-            expected.projected = [25, 255, 70, 5];
-            record(&expected, true).await?;
-            settled(&base, er, &commit(3).await?, &eatas, false).await?;
-            expected.eatas[..2].copy_from_slice(&[Some(25), Some(255)]);
-            record(&expected, true).await
-        })
-        .await?;
+    #[instrument(skip_all, err)]
+    async fn commit_withheld(&self) -> Result<(Signature, Held, [RuleHandle; 2])> {
+        let confirmations = [
+            self.proxies.stall(Selector::method("getSignatureStatuses").http().response()),
+            self.proxies
+                .stall(Selector::method("signatureNotification").ws().notification()),
+        ];
+        let submission = self.proxies.intercept(
+            Selector::method("sendTransaction")
+                .http()
+                .response()
+                .account(&self.wallets[0].eata),
+        );
+        let signature = self.commit(1).await?;
+        let held = submission.wait(TIMEOUT).await?;
+        let landed = held.operation.signature()?;
+        let tx = self.base.api().await_transaction(&landed).await?;
+        let meta = transaction_meta(&tx)?;
+        ensure!(meta.err == None);
+        Ok((signature, held, confirmations))
+    }
 
-        MagicAtas::run(&base, er, &payer, mint_key, &wallets, &vault).await?;
-
-        crate::phase("teardown", async {
-            proxies.finish()?;
-            private.finish().await
-        })
+    #[instrument(skip_all, err)]
+    async fn recover_confirmation(
+        &self,
+        signature: Signature,
+        held: Held,
+        confirmations: [RuleHandle; 2],
+    ) -> Result<()> {
+        held.discard();
+        self.proxies.close_connections();
+        for rule in confirmations {
+            rule.remove();
+        }
+        self.settled(
+            &signature,
+            &[self.wallets[0].eata, self.wallets[1].eata],
+            false,
+        )
         .await
+    }
+
+    #[instrument(skip_all, err)]
+    async fn undelegate_wallets(&self) -> Result<()> {
+        for wallet in &self.wallets[..2] {
+            let signature = self
+                .private
+                .ctx()
+                .submit_and_confirm(
+                    &wallet.owner,
+                    &[UndelegateEphemeralAtaBuilder {
+                        payer: wallet.owner.pubkey(),
+                        user: wallet.owner.pubkey(),
+                        mint: self.mint.pubkey(),
+                    }
+                    .instruction()],
+                )
+                .await?;
+            self.settled(&signature, &[wallet.eata], true).await?;
+            self.check_owner(&wallet.eata, spl::eata_program()).await?;
+        }
+        Ok(())
+    }
+
+    #[instrument(skip_all, err)]
+    async fn withdraw(&self) -> Result<()> {
+        self.base
+            .submit_and_confirm(
+                &self.wallets[0].owner,
+                &[spl::withdraw_spl_tokens(
+                    &self.wallets[0].owner.pubkey(),
+                    &self.mint.pubkey(),
+                    20,
+                )],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn commit(&self, id: u64) -> Result<Signature> {
+        self.private
+            .ctx()
+            .submit_and_confirm(
+                &self.validator,
+                &[REDLINE
+                    .batch()
+                    .nonce(id)
+                    .settle(
+                        self.validator.pubkey(),
+                        &[self.wallets[0].ata, self.wallets[1].ata],
+                        SettlementMode::Commit,
+                    )
+                    .build()],
+            )
+            .await
+    }
+
+    async fn check_owner(&self, address: &Pubkey, owner: Pubkey) -> Result<()> {
+        let actual = self.base.account(address).await?.map(|a| a.owner);
+        ensure!(actual == Some(owner));
+        Ok(())
+    }
+
+    async fn delegate(&self, payer: &Keypair, wallet: &Wallet, validator: Pubkey) -> Result<()> {
+        let ix = wallet.delegate(payer.pubkey(), validator);
+        self.base.submit_and_confirm(payer, &[ix]).await?;
+        self.check_owner(&wallet.eata, dlp::dlp_id()).await
+    }
+
+    #[instrument(skip_all, err)]
+    async fn delegate_with_transfer(&self, amount: u64) -> Result<Pubkey> {
+        let account = self.base.funded_payer(PAYER_LAMPORTS).await?;
+        let action = self.wallets[0].transfer_to(&self.wallets[1], amount);
+        // Publish the owner change with its record so discovery sees both.
+        self.base
+            .submit_and_confirm_with(
+                &self.payer,
+                &[&account, &self.wallets[0].owner],
+                &[
+                    system::assign(&account.pubkey(), &dlp::dlp_id()),
+                    delegate_with_actions(
+                        &self.payer.pubkey(),
+                        &account.pubkey(),
+                        None,
+                        DelegateArgs {
+                            commit_frequency_ms: u32::MAX,
+                            seeds: vec![],
+                            validator: Some(self.validator.pubkey()),
+                        },
+                        &[action],
+                    ),
+                ],
+            )
+            .await?;
+        Ok(account.pubkey())
+    }
+
+    #[instrument(skip_all, err)]
+    async fn check_balances(&self, expected: &Balances, delegated: bool) -> Result<()> {
+        let observed = self.balances().await?;
+        ensure!(&observed == expected);
+        observed.conserved(delegated)?;
+        Ok(())
+    }
+
+    #[instrument(skip_all, err)]
+    async fn finish(self) -> Result<()> {
+        self.proxies.finish()?;
+        self.private.finish().await
+    }
+
+    async fn redelegate(&self) -> Result<()> {
+        for wallet in &self.wallets[..2] {
+            self.delegate(&wallet.owner, wallet, self.validator.pubkey()).await?;
+        }
+        Ok(())
+    }
+
+    async fn balances(&self) -> Result<Balances> {
+        let mut state = Balances::default();
+        for (i, wallet) in self.wallets.iter().enumerate() {
+            state.base_atas[i] = amount(self.base.as_ref(), &wallet.ata).await?;
+            state.eatas[i] = spl::token_balance(self.base.as_ref(), &wallet.eata).await?;
+            state.projected[i] = amount(self.private.ctx(), &wallet.ata).await?;
+        }
+        for (i, address) in self.vault.iter().enumerate() {
+            state.vault[i] = amount(self.base.as_ref(), address).await?;
+        }
+        Ok(state)
+    }
+
+    async fn await_projection(&self, expected: &[u64; 4]) -> Result<()> {
+        self.private
+            .ctx()
+            .api()
+            .await_accounts(
+                &self.wallets.iter().map(|wallet| wallet.ata).collect::<Vec<_>>(),
+                "projected balances converge",
+                async || {
+                    for (wallet, expected) in self.wallets.iter().zip(expected) {
+                        let actual = amount(self.private.ctx(), &wallet.ata).await?;
+                        ensure!(actual == *expected);
+                    }
+                    Ok(())
+                },
+            )
+            .await
+    }
+
+    async fn check_controls(&self, amount: u64) -> Result<()> {
+        let atas = self.wallets.each_ref().map(|wallet| wallet.ata);
+        let before = self.private.ctx().accounts(&atas).await?;
+        for control in [2, 3] {
+            for (from, to) in [(control, 0), (0, control)] {
+                let attempt = self.wallets[from]
+                    .transfer(self.private.ctx(), &self.wallets[to], amount)
+                    .await;
+                let error =
+                    check::expect_error(attempt, &format!("unauthorized transfer {from}->{to}"))?;
+                let error = format!("{error:#}");
+                ensure!([
+                    "InvalidWritableAccount",
+                    "ExternalAccountDataModified",
+                    "ReadonlyDataModified",
+                    "Immutable",
+                ]
+                .iter()
+                .any(|code| error.contains(code)));
+                ensure!(self.private.ctx().accounts(&atas).await? == before);
+            }
+        }
+        Ok(())
+    }
+
+    async fn settled(
+        &self,
+        signature: &Signature,
+        expected: &[Pubkey],
+        undelegate: bool,
+    ) -> Result<()> {
+        let receipt = receipt::fetch_commit_receipt(self.private.ctx().api(), signature).await?;
+        receipt.check_success("projected-token commit")?;
+        receipt.check_accounts(expected, undelegate)?;
+        receipt.confirm(self.base.api()).await
     }
 }

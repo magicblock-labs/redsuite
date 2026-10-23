@@ -15,7 +15,7 @@ use redsuite_core::{
     BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport, TxSender,
 };
 use signature::Signature;
-use tracing::debug;
+use tracing::{debug, instrument};
 
 use crate::{metrics, program::layout, ACCOUNT_SPACE};
 
@@ -75,120 +75,6 @@ impl Cell {
     }
 }
 
-async fn run_cell(
-    er: &ErCtx,
-    senders: &[TxSender],
-    pdas: &[Pubkey],
-    profile: &Profile,
-    label: &'static str,
-    iters: u32,
-    offset: u64,
-) -> Result<Cell> {
-    let warmup_request = |iteration: u64| {
-        let global_id = offset + iteration;
-        let pda_index = ((global_id - 1) % pdas.len() as u64) as usize;
-        let ix = REDLINE.hash(
-            global_id,
-            causal::HASH_INIT.to_bytes(),
-            iters,
-            &[pdas[pda_index]],
-        );
-        let sender = senders[(global_id as usize) % senders.len()].clone();
-        sender.staged([ix])
-    };
-    let count_before_warmup = er.scrape_metrics().await?.get(TX_COUNT);
-    let warm = execute(
-        RunConfig {
-            iterations: profile.warmup,
-            rate: Pacing::PerSecond(profile.rate),
-            concurrency: profile.concurrency,
-        },
-        warmup_request,
-    )
-    .await?;
-    ensure!(warm.failed == 0);
-    if let Some(seen) = count_before_warmup {
-        crate::await_executed(er, seen + profile.warmup as f64, DRAIN_TIMEOUT).await?;
-    }
-
-    let clock = Arc::new(SendClock::new(
-        offset + profile.warmup + 1,
-        profile.iterations as usize,
-    ));
-    let updates =
-        Rc::new(AccountUpdates::connect(er.ws_url(), CellHeader::written_id, clock.clone()).await?);
-    for pda in pdas {
-        updates.account_subscribe(pda).await?;
-    }
-    updates.await_subscribed(pdas.len()).await?;
-
-    let offset = offset + profile.warmup;
-    let probe: Rc<RefCell<Option<Signature>>> = Rc::new(RefCell::new(None));
-    let request = |iteration: u64| {
-        let global_id = offset + iteration;
-        let pda_index = ((global_id - 1) % pdas.len() as u64) as usize;
-        let ix = REDLINE.hash(
-            global_id,
-            causal::HASH_INIT.to_bytes(),
-            iters,
-            &[pdas[pda_index]],
-        );
-        updates.track(global_id, pdas[pda_index]);
-        let sender = senders[(global_id as usize) % senders.len()].clone();
-        let probe = probe.clone();
-        let clock = clock.clone();
-        async move {
-            let tx = sender.prepare(&[ix]).await?;
-            if probe.borrow().is_none() {
-                *probe.borrow_mut() = Some(tx.signatures[0]);
-            }
-            Ok(clock.stamped(global_id, sender.deliver(tx)))
-        }
-    };
-    let before = er.scrape_metrics().await?;
-    let outcome = execute(
-        RunConfig {
-            iterations: profile.iterations,
-            rate: Pacing::PerSecond(profile.rate),
-            concurrency: profile.concurrency,
-        },
-        request,
-    )
-    .await?;
-    ensure!(outcome.failed == 0);
-    let drain = match before.get(TX_COUNT) {
-        Some(seen) => {
-            crate::await_executed(er, seen + profile.iterations as f64, DRAIN_TIMEOUT).await?
-        }
-        None => Duration::ZERO,
-    };
-
-    let probe_sig = (*probe.borrow()).context("no probe signature captured")?;
-    let probe_cus = crate::probe_cus(er, &probe_sig, label, iters).await?;
-
-    updates.await_settled().await?;
-    let after = er.scrape_metrics().await?;
-    let delta = MetricsDelta::new(before, after);
-    if let Some(failed) = delta.counter_all(metrics::FAILED_TRANSACTIONS) {
-        ensure!(failed == 0.0);
-    }
-    let update_outcome = updates.finalize();
-    ensure!((update_outcome.observed + update_outcome.superseded) == (profile.iterations as usize));
-
-    Ok(Cell {
-        label,
-        iters,
-        outcome,
-        updates: update_outcome,
-        drain,
-        probe_cus,
-        validator_avg_us: delta
-            .histogram_avg("mbv_transaction_processing_time")
-            .map(|seconds| seconds * 1e6),
-        validator_txs: delta.counter(TX_COUNT),
-    })
-}
-
 pub struct ComputeCostThroughput {
     base: Rc<BaseCtx>,
     er: ErCtx,
@@ -212,55 +98,66 @@ impl Scenario<ScenarioReport> for ComputeCostThroughput {
     }
 
     async fn run(self) -> Result<ScenarioReport> {
-        let Self { base, er, profile, senders, pdas } = self;
         let mut offset = 0u64;
         let mut cells: Vec<Cell> = Vec::new();
         for (label, iters) in [("light", LIGHT_ITERS), ("heavy", HEAVY_ITERS)] {
-            let cell = run_cell(&er, &senders, &pdas, profile, label, iters, offset).await?;
-            offset += profile.warmup + profile.iterations;
+            let cell = self.run_cell(label, iters, offset).await?;
+            offset += self.profile.warmup + self.profile.iterations;
             debug!(
                 label,
-                executed_tps = cell.executed_tps(profile.iterations),
+                executed_tps = cell.executed_tps(self.profile.iterations),
                 "compute cell finished",
             );
 
-            let cell_report = ScenarioReport::ok()
-                .setting("profile", profile.name)
-                .setting("sha256 iters", cell.iters)
-                .setting("shape", "width-1 sha256 hash-chain compute")
-                .setting("payers", profile.payers)
-                .setting("accounts", profile.accounts)
-                .setting("measured iters", profile.iterations)
-                .setting("offered tps", profile.rate)
-                .setting("concurrency", profile.concurrency)
-                .observe("delivery us", Unit::Micros, cell.outcome.delivery)
-                .client_side(&cell.outcome)
-                .observe("account-update lag us", Unit::Micros, cell.updates.lag)
-                .metric("achieved tps", Unit::Tps, cell.outcome.achieved_rps())
-                .metric(
-                    "executed tps",
-                    Unit::Tps,
-                    cell.executed_tps(profile.iterations),
-                )
-                .metric("drain s", Unit::Seconds, cell.drain.as_secs_f64())
-                .metric("superseded", Unit::Count, cell.updates.superseded as f64)
-                .metric("probe consumed cus", Unit::Count, cell.probe_cus)
-                .metric_if(
-                    "validator tx processing avg us",
-                    Unit::Micros,
-                    cell.validator_avg_us,
-                )
-                .metric_if("validator txs in window", Unit::Count, cell.validator_txs);
-            base.report_cell(label, &cell_report)?;
+            self.report_cell(&cell)?;
             cells.push(cell);
         }
 
-        let heavy_start = offset - profile.iterations + 1;
+        self.check_final_state(offset).await?;
+        self.summarize(&cells)
+    }
+}
+
+impl ComputeCostThroughput {
+    fn report_cell(&self, cell: &Cell) -> Result<()> {
+        let cell_report = ScenarioReport::ok()
+            .setting("profile", self.profile.name)
+            .setting("sha256 iters", cell.iters)
+            .setting("shape", "width-1 sha256 hash-chain compute")
+            .setting("payers", self.profile.payers)
+            .setting("accounts", self.profile.accounts)
+            .setting("measured iters", self.profile.iterations)
+            .setting("offered tps", self.profile.rate)
+            .setting("concurrency", self.profile.concurrency)
+            .observe("delivery us", Unit::Micros, cell.outcome.delivery)
+            .client_side(&cell.outcome)
+            .observe("account-update lag us", Unit::Micros, cell.updates.lag)
+            .metric("achieved tps", Unit::Tps, cell.outcome.achieved_rps())
+            .metric(
+                "executed tps",
+                Unit::Tps,
+                cell.executed_tps(self.profile.iterations),
+            )
+            .metric("drain s", Unit::Seconds, cell.drain.as_secs_f64())
+            .metric("superseded", Unit::Count, cell.updates.superseded as f64)
+            .metric("probe consumed cus", Unit::Count, cell.probe_cus)
+            .metric_if(
+                "validator tx processing avg us",
+                Unit::Micros,
+                cell.validator_avg_us,
+            )
+            .metric_if("validator txs in window", Unit::Count, cell.validator_txs);
+        self.base.report_cell(cell.label, &cell_report)
+    }
+
+    #[instrument(skip_all, err)]
+    async fn check_final_state(&self, offset: u64) -> Result<()> {
+        let heavy_start = offset - self.profile.iterations + 1;
         let heavy_end = offset;
         let expected_hash = HashState::chain(causal::HASH_INIT.to_bytes(), HEAVY_ITERS);
-        let pool = pdas.len() as u64;
+        let pool = self.pdas.len() as u64;
         let end_index = (heavy_end - 1) % pool;
-        for (index, pda) in pdas.iter().enumerate() {
+        for (index, pda) in self.pdas.iter().enumerate() {
             let index = index as u64;
             let last_id = if end_index >= index {
                 heavy_end - (end_index - index)
@@ -270,13 +167,17 @@ impl Scenario<ScenarioReport> for ComputeCostThroughput {
             if last_id < heavy_start {
                 continue;
             }
-            let on_er = er.account(pda).await?.context("pda not on er")?;
+            let on_er = self.er.account(pda).await?.context("pda not on er")?;
             ensure!(CellHeader::written_id(&on_er.data) == Some(last_id));
             let hash_bytes =
                 &on_er.data[layout::HASH_OFFSET..layout::HASH_OFFSET + layout::HASH_SIZE];
             ensure!(hash_bytes == expected_hash);
         }
 
+        Ok(())
+    }
+
+    fn summarize(&self, cells: &[Cell]) -> Result<ScenarioReport> {
         let light = &cells[0];
         let heavy = &cells[1];
         let cu_ratio = heavy.probe_cus / light.probe_cus;
@@ -287,17 +188,17 @@ impl Scenario<ScenarioReport> for ComputeCostThroughput {
         };
 
         let mut summary = ScenarioReport::ok()
-            .setting("profile", profile.name)
+            .setting("profile", self.profile.name)
             .setting("shape", "width-1 sha256 hash-chain compute")
             .setting("light iters", LIGHT_ITERS)
             .setting("heavy iters", HEAVY_ITERS)
-            .setting("payers", profile.payers)
-            .setting("accounts", profile.accounts)
-            .setting("warmup iters per cell", profile.warmup)
-            .setting("measured iters per cell", profile.iterations)
-            .setting("offered tps", profile.rate)
-            .setting("concurrency", profile.concurrency);
-        for cell in &cells {
+            .setting("payers", self.profile.payers)
+            .setting("accounts", self.profile.accounts)
+            .setting("warmup iters per cell", self.profile.warmup)
+            .setting("measured iters per cell", self.profile.iterations)
+            .setting("offered tps", self.profile.rate)
+            .setting("concurrency", self.profile.concurrency);
+        for cell in cells {
             summary = summary
                 .with_flags(&cell.outcome)
                 .metric(
@@ -323,7 +224,7 @@ impl Scenario<ScenarioReport> for ComputeCostThroughput {
                 .metric(
                     format!("{} executed tps", cell.label),
                     Unit::Tps,
-                    cell.executed_tps(profile.iterations),
+                    cell.executed_tps(self.profile.iterations),
                 )
                 .metric(
                     format!("{} drain s", cell.label),
@@ -346,5 +247,122 @@ impl Scenario<ScenarioReport> for ComputeCostThroughput {
             summary = summary.metric("heavy/light validator avg ratio", Unit::Ratio, ratio);
         }
         Ok(summary)
+    }
+
+    async fn run_cell(&self, label: &'static str, iters: u32, offset: u64) -> Result<Cell> {
+        let warmup_request = |iteration: u64| {
+            let global_id = offset + iteration;
+            let pda_index = ((global_id - 1) % self.pdas.len() as u64) as usize;
+            let ix = REDLINE.hash(
+                global_id,
+                causal::HASH_INIT.to_bytes(),
+                iters,
+                &[self.pdas[pda_index]],
+            );
+            let sender = self.senders[(global_id as usize) % self.senders.len()].clone();
+            sender.staged([ix])
+        };
+        let count_before_warmup = self.er.scrape_metrics().await?.get(TX_COUNT);
+        let warm = execute(
+            RunConfig {
+                iterations: self.profile.warmup,
+                rate: Pacing::PerSecond(self.profile.rate),
+                concurrency: self.profile.concurrency,
+            },
+            warmup_request,
+        )
+        .await?;
+        ensure!(warm.failed == 0);
+        if let Some(seen) = count_before_warmup {
+            crate::await_executed(&self.er, seen + self.profile.warmup as f64, DRAIN_TIMEOUT)
+                .await?;
+        }
+
+        let clock = Arc::new(SendClock::new(
+            offset + self.profile.warmup + 1,
+            self.profile.iterations as usize,
+        ));
+        let updates = Rc::new(
+            AccountUpdates::connect(self.er.ws_url(), CellHeader::written_id, clock.clone())
+                .await?,
+        );
+        for pda in &self.pdas {
+            updates.account_subscribe(pda).await?;
+        }
+        updates.await_subscribed(self.pdas.len()).await?;
+
+        let offset = offset + self.profile.warmup;
+        let probe: Rc<RefCell<Option<Signature>>> = Rc::new(RefCell::new(None));
+        let request = |iteration: u64| {
+            let global_id = offset + iteration;
+            let pda_index = ((global_id - 1) % self.pdas.len() as u64) as usize;
+            let ix = REDLINE.hash(
+                global_id,
+                causal::HASH_INIT.to_bytes(),
+                iters,
+                &[self.pdas[pda_index]],
+            );
+            updates.track(global_id, self.pdas[pda_index]);
+            let sender = self.senders[(global_id as usize) % self.senders.len()].clone();
+            let probe = probe.clone();
+            let clock = clock.clone();
+            async move {
+                let tx = sender.prepare(&[ix]).await?;
+                if probe.borrow().is_none() {
+                    *probe.borrow_mut() = Some(tx.signatures[0]);
+                }
+                Ok(clock.stamped(global_id, sender.deliver(tx)))
+            }
+        };
+        let before = self.er.scrape_metrics().await?;
+        let outcome = execute(
+            RunConfig {
+                iterations: self.profile.iterations,
+                rate: Pacing::PerSecond(self.profile.rate),
+                concurrency: self.profile.concurrency,
+            },
+            request,
+        )
+        .await?;
+        ensure!(outcome.failed == 0);
+        let drain = match before.get(TX_COUNT) {
+            Some(seen) => {
+                crate::await_executed(
+                    &self.er,
+                    seen + self.profile.iterations as f64,
+                    DRAIN_TIMEOUT,
+                )
+                .await?
+            }
+            None => Duration::ZERO,
+        };
+
+        let probe_sig = (*probe.borrow()).context("no probe signature captured")?;
+        let probe_cus = crate::probe_cus(&self.er, &probe_sig, label, iters).await?;
+
+        updates.await_settled().await?;
+        let after = self.er.scrape_metrics().await?;
+        let delta = MetricsDelta::new(before, after);
+        if let Some(failed) = delta.counter_all(metrics::FAILED_TRANSACTIONS) {
+            ensure!(failed == 0.0);
+        }
+        let update_outcome = updates.finalize();
+        ensure!(
+            (update_outcome.observed + update_outcome.superseded)
+                == (self.profile.iterations as usize)
+        );
+
+        Ok(Cell {
+            label,
+            iters,
+            outcome,
+            updates: update_outcome,
+            drain,
+            probe_cus,
+            validator_avg_us: delta
+                .histogram_avg("mbv_transaction_processing_time")
+                .map(|seconds| seconds * 1e6),
+            validator_txs: delta.counter(TX_COUNT),
+        })
     }
 }

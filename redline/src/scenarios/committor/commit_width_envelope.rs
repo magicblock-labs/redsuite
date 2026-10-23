@@ -25,7 +25,7 @@ use redsuite_core::{
 use signature::Signature;
 use signer::Signer;
 use tokio::time;
-use tracing::debug;
+use tracing::{debug, instrument};
 
 use crate::program::DELEGATION_PROGRAM_ID;
 
@@ -83,25 +83,9 @@ struct CellSummary {
     base_txs_per_commit: f64,
 }
 
-fn commit_set(pdas: &[Pubkey], width: usize, id: u64) -> Vec<Pubkey> {
-    let pool_len = pdas.len();
-    let start_index = ((id as usize - 1) * width) % pool_len;
-    (0..width).map(|position| pdas[(start_index + position) % pool_len]).collect()
-}
-
 enum SchedulingOutcome {
     Confirmed,
     Rejected(Option<u32>),
-}
-
-async fn scheduling_outcome(
-    er_api: &Api,
-    commit_signature: &Signature,
-) -> Result<SchedulingOutcome> {
-    match er_api.try_confirm(commit_signature).await? {
-        Ok(()) => Ok(SchedulingOutcome::Confirmed),
-        Err(error) => Ok(SchedulingOutcome::Rejected(custom_error_code(error.err))),
-    }
 }
 
 const SIGNATURE_SCAN_LIMIT: usize = 1000;
@@ -119,44 +103,6 @@ impl BaseFlowSnapshot {
     fn new_alt_since(&self, earlier: &BaseFlowSnapshot) -> usize {
         self.alt.difference(&earlier.alt).count()
     }
-}
-
-async fn snapshot_base_flow(base_api: &Api) -> Result<BaseFlowSnapshot> {
-    let committor_program: Pubkey = topology::COMMITTOR_ID;
-    let alt_program: Pubkey = sdk_ids::address_lookup_table::ID;
-    let mut flow = HashSet::new();
-    flow.extend(
-        base_api
-            .get_signatures_for_address(&DELEGATION_PROGRAM_ID, SIGNATURE_SCAN_LIMIT)
-            .await?,
-    );
-    flow.extend(
-        base_api
-            .get_signatures_for_address(&committor_program, SIGNATURE_SCAN_LIMIT)
-            .await?,
-    );
-    let alt = base_api
-        .get_signatures_for_address(&alt_program, SIGNATURE_SCAN_LIMIT)
-        .await?
-        .into_iter()
-        .collect();
-    Ok(BaseFlowSnapshot { flow, alt })
-}
-
-async fn own_lookup_table_txs(base_api: &Api, signatures: &[Signature]) -> Result<usize> {
-    let mut with_lookups = 0;
-    for chain_signature in signatures {
-        let tx = base_api.await_transaction(chain_signature).await?;
-        let decoded = tx.transaction.transaction.decode().context("invalid encoded transaction")?;
-        if decoded
-            .message
-            .address_table_lookups()
-            .is_some_and(|lookups| !lookups.is_empty())
-        {
-            with_lookups += 1;
-        }
-    }
-    Ok(with_lookups)
 }
 
 pub struct CommitWidthEnvelope {
@@ -273,7 +219,7 @@ impl CommitRequest {
 }
 impl CommitWidthEnvelope {
     fn request(&self, width: usize, id: u64, tally: Rc<RefCell<CellTally>>) -> CommitRequest {
-        let accounts = commit_set(&self.pdas, width, id);
+        let accounts = self.commit_set(width, id);
         let instruction = REDLINE
             .batch()
             .nonce(id)
@@ -292,14 +238,14 @@ impl CommitWidthEnvelope {
             tally,
         }
     }
+    #[instrument(skip_all, err)]
     async fn measure_width(&self, width: usize, offset: &mut u64) -> Result<CellSummary> {
-        let Self { base, er, profile, .. } = self;
         let warmup_tally = Rc::new(RefCell::new(CellTally::default()));
         let warmup = execute(
             RunConfig {
                 iterations: WARMUP_COMMITS,
-                rate: Pacing::PerSecond(profile.rate),
-                concurrency: profile.concurrency,
+                rate: Pacing::PerSecond(self.profile.rate),
+                concurrency: self.profile.concurrency,
             },
             |iteration| self.request(width, *offset + iteration, warmup_tally.clone()).prepare(),
         )
@@ -311,27 +257,27 @@ impl CommitWidthEnvelope {
         // stragglers land before the base-flow snapshot
         time::sleep(Duration::from_secs(1)).await;
 
-        let flow_before = snapshot_base_flow(base.api()).await?;
-        let before = er.scrape_metrics().await?;
+        let flow_before = self.snapshot_base_flow().await?;
+        let before = self.er.scrape_metrics().await?;
         let tally = Rc::new(RefCell::new(CellTally::default()));
         let outcome = execute(
             RunConfig {
-                iterations: profile.commits,
-                rate: Pacing::PerSecond(profile.rate),
-                concurrency: profile.concurrency,
+                iterations: self.profile.commits,
+                rate: Pacing::PerSecond(self.profile.rate),
+                concurrency: self.profile.concurrency,
             },
             |iteration| self.request(width, *offset + iteration, tally.clone()).prepare(),
         )
         .await?;
-        *offset += profile.commits;
+        *offset += self.profile.commits;
         ensure!(outcome.failed == 0);
         time::sleep(Duration::from_secs(1)).await;
-        let after = er.scrape_metrics().await?;
-        let flow_after = snapshot_base_flow(base.api()).await?;
+        let after = self.er.scrape_metrics().await?;
+        let flow_after = self.snapshot_base_flow().await?;
         let delta = MetricsDelta::new(before, after);
 
         if let Some(intents) = delta.counter("mbv_committor_intents_count") {
-            ensure!(intents >= profile.commits as f64);
+            ensure!(intents >= self.profile.commits as f64);
         }
         let failed_intents = delta.counter_all("mbv_committor_failed_intents_count").unwrap_or(0.0);
         ensure!(failed_intents == 0.0);
@@ -344,31 +290,31 @@ impl CommitWidthEnvelope {
             .unwrap_or_else(|_| panic!("commit tasks still hold the tally"))
             .into_inner();
         ensure!(tally.included_mismatch == 0);
-        let own_alt_txs = own_lookup_table_txs(base.api(), &tally.base_txs).await?;
+        let own_alt_txs = self.own_lookup_table_txs(&tally.base_txs).await?;
         ensure!(own_alt_txs == 0);
         let round_trip = tally.round_trip.finalize(false);
         let er_delivery = tally.er_delivery.finalize(false);
-        ensure!(round_trip.count == (profile.commits as usize));
+        ensure!(round_trip.count == (self.profile.commits as usize));
 
-        let receipt_txs_per_commit = tally.base_txs.len() as f64 / profile.commits as f64;
+        let receipt_txs_per_commit = tally.base_txs.len() as f64 / self.profile.commits as f64;
         ensure!(receipt_txs_per_commit >= 1.0);
         let flow_txs_per_commit =
-            flow_after.new_flow_since(&flow_before) as f64 / profile.commits as f64;
+            flow_after.new_flow_since(&flow_before) as f64 / self.profile.commits as f64;
 
         debug!(
             width,
-            commits_per_sec = profile.commits as f64 / outcome.wall.as_secs_f64(),
+            commits_per_sec = self.profile.commits as f64 / outcome.wall.as_secs_f64(),
             "commit width cell finished"
         );
 
         let cell_report = ScenarioReport::ok()
-            .setting("profile", profile.name)
+            .setting("profile", self.profile.name)
             .setting("width", width)
             .setting("account space", ACCOUNT_SPACE)
-            .setting("commits", profile.commits)
-            .setting("offered rate /s", profile.rate)
-            .setting("concurrency", profile.concurrency)
-            .setting("pool", profile.pool)
+            .setting("commits", self.profile.commits)
+            .setting("offered rate /s", self.profile.rate)
+            .setting("concurrency", self.profile.concurrency)
+            .setting("pool", self.profile.pool)
             .setting("receipt timeout s", NETWORK_TIMEOUT.as_secs())
             .observe("er delivery us", Unit::Micros, er_delivery)
             .observe("commit round-trip us", Unit::Micros, round_trip)
@@ -384,7 +330,7 @@ impl CommitWidthEnvelope {
             .metric(
                 "achieved commits /s",
                 Unit::PerSecond,
-                profile.commits as f64 / outcome.wall.as_secs_f64(),
+                self.profile.commits as f64 / outcome.wall.as_secs_f64(),
             )
             .metric_if(
                 "validator intent exec avg s",
@@ -396,7 +342,7 @@ impl CommitWidthEnvelope {
                 Unit::Count,
                 delta.counter("mbv_committor_intents_count"),
             );
-        base.report_cell(&format!("w{width}"), &cell_report)?;
+        self.base.report_cell(&format!("w{width}"), &cell_report)?;
 
         Ok(CellSummary {
             width,
@@ -406,40 +352,39 @@ impl CommitWidthEnvelope {
             base_txs_per_commit: flow_txs_per_commit,
         })
     }
+    #[instrument(skip_all, err)]
     async fn probe_alt(
         &self,
         offset: &mut u64,
         mut report: ScenarioReport,
     ) -> Result<ScenarioReport> {
-        let Self { base, er, pdas, sender, .. } = self;
-        let payer_pubkey = sender.payer().pubkey();
-        let accounts: Vec<Pubkey> = pdas.iter().copied().take(15).collect();
+        let payer_pubkey = self.sender.payer().pubkey();
+        let accounts: Vec<Pubkey> = self.pdas.iter().copied().take(15).collect();
         *offset += 1;
         let ix = REDLINE
             .batch()
             .nonce(*offset)
             .settle(payer_pubkey, &accounts, SettlementMode::Commit)
             .build();
-        let flow_before = snapshot_base_flow(base.api()).await?;
-        let before = er.scrape_metrics().await?;
-        let tx = sender.prepare(&[ix]).await?;
+        let flow_before = self.snapshot_base_flow().await?;
+        let before = self.er.scrape_metrics().await?;
+        let tx = self.sender.prepare(&[ix]).await?;
         let started = Instant::now();
-        let commit_signature = sender.submit_prepared(&tx).await?;
-        match scheduling_outcome(er.api(), &commit_signature).await? {
+        let commit_signature = self.sender.submit_prepared(&tx).await?;
+        match self.scheduling_outcome(&commit_signature).await? {
             SchedulingOutcome::Rejected(code) => {
                 ensure!(code == Some(receipt::INTENT_TOO_LARGE_ERR));
                 debug!("probe refused by scheduling intent-size gate");
                 report = report.setting("probe w15", "refused at scheduling (intent size gate)");
             }
             SchedulingOutcome::Confirmed => {
-                let alt_receipt = super::settled_receipt(er.api(), &commit_signature).await?;
-                alt_receipt.confirm(base.api()).await?;
+                let alt_receipt = super::settled_receipt(self.er.api(), &commit_signature).await?;
+                alt_receipt.confirm(self.base.api()).await?;
                 let wall = started.elapsed();
-                let delta = MetricsDelta::new(before, er.scrape_metrics().await?);
-                let flow_after = snapshot_base_flow(base.api()).await?;
+                let delta = MetricsDelta::new(before, self.er.scrape_metrics().await?);
+                let flow_after = self.snapshot_base_flow().await?;
                 let alt_base_txs = flow_after.new_alt_since(&flow_before);
-                let own_alt_txs =
-                    own_lookup_table_txs(base.api(), &alt_receipt.base_signatures).await?;
+                let own_alt_txs = self.own_lookup_table_txs(&alt_receipt.base_signatures).await?;
                 ensure!(own_alt_txs >= 1);
                 debug!(alt_base_txs, "ALT commit probe finished");
                 report = report.setting("probe w15", "delivered via ALTs");
@@ -461,31 +406,31 @@ impl CommitWidthEnvelope {
 
         Ok(report)
     }
+    #[instrument(skip_all, err)]
     async fn probe_oversized(
         &self,
         offset: &mut u64,
         mut report: ScenarioReport,
     ) -> Result<ScenarioReport> {
-        let Self { er, pdas, sender, .. } = self;
-        let payer_pubkey = sender.payer().pubkey();
-        let accounts: Vec<Pubkey> = pdas.iter().copied().take(30).collect();
+        let payer_pubkey = self.sender.payer().pubkey();
+        let accounts: Vec<Pubkey> = self.pdas.iter().copied().take(30).collect();
         *offset += 1;
         let ix = REDLINE
             .batch()
             .nonce(*offset)
             .settle(payer_pubkey, &accounts, SettlementMode::Commit)
             .build();
-        let before = er.scrape_metrics().await?;
-        let commit_signature = sender.submit(&[ix]).await?;
-        let outcome_note = match scheduling_outcome(er.api(), &commit_signature).await? {
+        let before = self.er.scrape_metrics().await?;
+        let commit_signature = self.sender.submit(&[ix]).await?;
+        let outcome_note = match self.scheduling_outcome(&commit_signature).await? {
             SchedulingOutcome::Rejected(code) => {
                 ensure!(code == Some(receipt::INTENT_TOO_LARGE_ERR));
                 "refused at scheduling (intent size gate)".to_owned()
             }
             SchedulingOutcome::Confirmed => {
                 let receipt_outcome =
-                    receipt::fetch_commit_receipt(er.api(), &commit_signature).await;
-                let delta = MetricsDelta::new(before, er.scrape_metrics().await?);
+                    receipt::fetch_commit_receipt(self.er.api(), &commit_signature).await;
+                let delta = MetricsDelta::new(before, self.er.scrape_metrics().await?);
                 let failed_intents =
                     delta.counter_all("mbv_committor_failed_intents_count").unwrap_or(0.0);
                 report = report.metric("probe w30 failed intents", Unit::Count, failed_intents);
@@ -516,20 +461,20 @@ impl CommitWidthEnvelope {
 
         Ok(report)
     }
+    #[instrument(skip_all, err)]
     async fn probe_allowance(
         &self,
         offset: &mut u64,
         mut report: ScenarioReport,
     ) -> Result<ScenarioReport> {
-        let Self { base, er, .. } = self;
-        let probe_payer = base.funded_payer(PAYER_LAMPORTS).await?;
+        let probe_payer = self.base.funded_payer(PAYER_LAMPORTS).await?;
         let probe_payer_pubkey = probe_payer.pubkey();
-        let probe_pdas = Accounts::new(ACCOUNT_SPACE, er.identity())
-            .init_delegated(base.as_ref(), &probe_payer, 1)
+        let probe_pdas = Accounts::new(ACCOUNT_SPACE, self.er.identity())
+            .init_delegated(self.base.as_ref(), &probe_payer, 1)
             .await?;
         let probe_account = probe_pdas[0];
-        er.await_clones(&[probe_account], ACCOUNT_SPACE as usize).await?;
-        let probe_sender = er.sender(Rc::new(probe_payer));
+        self.er.await_clones(&[probe_account], ACCOUNT_SPACE as usize).await?;
+        let probe_sender = self.er.sender(Rc::new(probe_payer));
         for _ in 0..receipt::SPONSORED_COMMIT_LIMIT {
             *offset += 1;
             let ix = REDLINE
@@ -538,7 +483,7 @@ impl CommitWidthEnvelope {
                 .settle(probe_payer_pubkey, &[probe_account], SettlementMode::Commit)
                 .build();
             let commit_signature = probe_sender.submit(&[ix]).await?;
-            super::settled_receipt(er.api(), &commit_signature).await?;
+            super::settled_receipt(self.er.api(), &commit_signature).await?;
         }
         *offset += 1;
         let ix = REDLINE
@@ -547,7 +492,7 @@ impl CommitWidthEnvelope {
             .settle(probe_payer_pubkey, &[probe_account], SettlementMode::Commit)
             .build();
         let rejected_signature = probe_sender.submit(&[ix]).await?;
-        let rejection_code = match scheduling_outcome(er.api(), &rejected_signature).await? {
+        let rejection_code = match self.scheduling_outcome(&rejected_signature).await? {
             SchedulingOutcome::Rejected(code) => code,
             SchedulingOutcome::Confirmed => {
                 return Err(anyhow!(
@@ -567,5 +512,63 @@ impl CommitWidthEnvelope {
         report = report.setting("probe commit limit", outcome_note);
 
         Ok(report)
+    }
+
+    fn commit_set(&self, width: usize, id: u64) -> Vec<Pubkey> {
+        let pool_len = self.pdas.len();
+        let start_index = ((id as usize - 1) * width) % pool_len;
+        (0..width)
+            .map(|position| self.pdas[(start_index + position) % pool_len])
+            .collect()
+    }
+
+    async fn scheduling_outcome(&self, commit_signature: &Signature) -> Result<SchedulingOutcome> {
+        match self.er.api().try_confirm(commit_signature).await? {
+            Ok(()) => Ok(SchedulingOutcome::Confirmed),
+            Err(error) => Ok(SchedulingOutcome::Rejected(custom_error_code(error.err))),
+        }
+    }
+
+    async fn snapshot_base_flow(&self) -> Result<BaseFlowSnapshot> {
+        let committor_program: Pubkey = topology::COMMITTOR_ID;
+        let alt_program: Pubkey = sdk_ids::address_lookup_table::ID;
+        let mut flow = HashSet::new();
+        flow.extend(
+            self.base
+                .api()
+                .get_signatures_for_address(&DELEGATION_PROGRAM_ID, SIGNATURE_SCAN_LIMIT)
+                .await?,
+        );
+        flow.extend(
+            self.base
+                .api()
+                .get_signatures_for_address(&committor_program, SIGNATURE_SCAN_LIMIT)
+                .await?,
+        );
+        let alt = self
+            .base
+            .api()
+            .get_signatures_for_address(&alt_program, SIGNATURE_SCAN_LIMIT)
+            .await?
+            .into_iter()
+            .collect();
+        Ok(BaseFlowSnapshot { flow, alt })
+    }
+
+    async fn own_lookup_table_txs(&self, signatures: &[Signature]) -> Result<usize> {
+        let mut with_lookups = 0;
+        for chain_signature in signatures {
+            let tx = self.base.api().await_transaction(chain_signature).await?;
+            let decoded =
+                tx.transaction.transaction.decode().context("invalid encoded transaction")?;
+            if decoded
+                .message
+                .address_table_lookups()
+                .is_some_and(|lookups| !lookups.is_empty())
+            {
+                with_lookups += 1;
+            }
+        }
+        Ok(with_lookups)
     }
 }

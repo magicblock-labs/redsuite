@@ -48,14 +48,14 @@ impl PrivateErScenario for GrpcRedundancy {
     }
 
     async fn run(self) -> Result<()> {
-        let Self { shared, http, ws, private } = self;
-        let er = private.ctx();
+        let er = self.private.ctx();
         let validator = er.identity();
-        let funder = shared.funded_payer(PAYER_LAMPORTS).await?;
+        let funder = self.shared.funded_payer(PAYER_LAMPORTS).await?;
         let owner = funder.pubkey();
-        let payer = shared.delegated_payer(&funder, validator, PAYER_LAMPORTS).await?;
+        let payer = self.shared.delegated_payer(&funder, validator, PAYER_LAMPORTS).await?;
 
-        let keys = shared
+        let keys = self
+            .shared
             .cells(REDLINE, &funder)
             .create_many(ACCOUNT_SPACE, validator, CLONED_COUNT + PENDING_COUNT)
             .await?;
@@ -70,7 +70,7 @@ impl PrivateErScenario for GrpcRedundancy {
                 )
             })
             .collect();
-        shared.submit_and_confirm(&funder, &delegates).await?;
+        self.shared.submit_and_confirm(&funder, &delegates).await?;
         er.accounts(&keys).await?;
         er.cells(REDLINE, &payer).write(ER_WRITE, pending).await?;
         ensure!(er
@@ -79,8 +79,9 @@ impl PrivateErScenario for GrpcRedundancy {
             .into_iter()
             .all(|account| crate::account_id(account) == Some(ER_WRITE)));
 
-        let settlement =
-            http.stall(Selector::method("sendTransaction").request().account(&pending[0]));
+        let settlement = self
+            .http
+            .stall(Selector::method("sendTransaction").request().account(&pending[0]));
         er.submit_and_confirm(
             &funder,
             &[REDLINE
@@ -90,27 +91,27 @@ impl PrivateErScenario for GrpcRedundancy {
                 .build()],
         )
         .await?;
-        http.await_held(Selector::default(), TIMEOUT).await?;
+        self.http.await_held(Selector::default(), TIMEOUT).await?;
 
-        let mut blackout = vec![ws.stall(Selector::default().response().notification())];
+        let mut blackout = vec![self.ws.stall(Selector::default().response().notification())];
         for key in &keys {
-            blackout.push(http.stall(Selector::methods(&FETCHES).response().account(key)));
+            blackout.push(self.http.stall(Selector::methods(&FETCHES).response().account(key)));
         }
-        ws.close_connections();
+        self.ws.close_connections();
         settlement.remove();
 
-        shared
+        self.shared
             .api()
             .await_accounts(pending, "base completes the undelegation", async || {
-                let settled = shared.accounts(pending).await?.into_iter().all(
+                let settled = self.shared.accounts(pending).await?.into_iter().all(
                     |account| matches!(account, Some(account) if account.owner == program::id()),
                 );
                 ensure!(settled);
                 Result::Ok(())
             })
             .await?;
-        shared.cells(REDLINE, &funder).write(BASE_REWRITE, pending).await?;
-        shared.cells(REDLINE, &funder).write(BASE_REFRESH, cloned).await?;
+        self.shared.cells(REDLINE, &funder).write(BASE_REWRITE, pending).await?;
+        self.shared.cells(REDLINE, &funder).write(BASE_REFRESH, cloned).await?;
 
         let refresh_started = Instant::now();
         await_local_value(
@@ -138,17 +139,17 @@ impl PrivateErScenario for GrpcRedundancy {
             ));
         }
 
-        let ws_held = ws.held_count(&Selector::default());
+        let ws_held = self.ws.held_count(&Selector::default());
         ensure!(ws_held > 0);
         for rule in blackout {
             rule.remove();
         }
-        ws.restore();
-        http.restore();
+        self.ws.restore();
+        self.http.restore();
 
-        private.finish().await?;
-        http.finish()?;
-        ws.finish()?;
+        self.private.finish().await?;
+        self.http.finish()?;
+        self.ws.finish()?;
         Ok(())
     }
 }

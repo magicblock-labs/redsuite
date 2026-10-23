@@ -1,8 +1,5 @@
-use std::future::Future;
-
-use anyhow::{bail, Context};
+use anyhow::bail;
 use hash::Hash;
-use tracing::{debug, instrument};
 
 use crate::{DynError, Result};
 
@@ -17,11 +14,4 @@ pub fn expect_error<T>(result: Result<T>, check: &str) -> Result<DynError> {
         Err(error) => Ok(error),
         Ok(_) => bail!("{check}: unexpectedly succeeded"),
     }
-}
-
-/// Attach phase context to both tracing and returned errors.
-#[instrument(skip_all, level = "error", fields(phase = name))]
-pub async fn phase<T>(name: &str, work: impl Future<Output = Result<T>>) -> Result<T> {
-    debug!("started");
-    work.await.with_context(|| name.to_owned())
 }

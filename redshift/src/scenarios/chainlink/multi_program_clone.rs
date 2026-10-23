@@ -43,22 +43,22 @@ impl Scenario for MultiProgramClone {
     }
 
     async fn run(self) -> Result<()> {
-        let Self { er, payer, accounts } = self;
         let writes: [Instruction; 2] = std::array::from_fn(|index| {
-            let (program, account) = accounts[index];
+            let (program, account) = self.accounts[index];
             Redline::at(program).write(WRITES[index], &[account])
         });
-        er.submit_and_confirm(&payer, &writes).await?;
+        self.er.submit_and_confirm(&self.payer, &writes).await?;
 
-        for ((program, _), label) in accounts.iter().zip(["first", "second"]) {
-            let clone = er
+        for ((program, _), label) in self.accounts.iter().zip(["first", "second"]) {
+            let clone = self
+                .er
                 .account(program)
                 .await?
                 .ok_or_else(|| anyhow!("{label} program not cloned after the transaction"))?;
             ensure!(clone.executable);
         }
-        for ((_, key), expected) in accounts.iter().zip(WRITES) {
-            let clone = er.account(key).await?.context("cloned account missing")?;
+        for ((_, key), expected) in self.accounts.iter().zip(WRITES) {
+            let clone = self.er.account(key).await?.context("cloned account missing")?;
             ensure!(CellHeader::written_id(&clone.data) == Some(expected));
         }
 
