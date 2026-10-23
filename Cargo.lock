@@ -1482,6 +1482,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "059c31d7d36c43fe39d89e55711858b4da8be7eb6dabac23c7289b1a19489406"
 
 [[package]]
+name = "fixture"
+version = "2.0.0"
+dependencies = [
+ "bincode",
+ "ephemeral-rollups-sdk",
+ "magicblock-magic-program-api",
+ "sha2 0.10.9",
+ "solana-instruction 3.4.0",
+ "solana-program 3.0.0",
+ "solana-pubkey 4.2.0",
+ "solana-sdk-ids 3.1.0",
+ "solana-system-interface 3.2.0",
+ "wincode",
+]
+
+[[package]]
 name = "flate2"
 version = "1.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3168,10 +3184,7 @@ dependencies = [
 name = "redhat-interface"
 version = "2.0.0"
 dependencies = [
- "borsh 1.7.0",
- "ephemeral-rollups-sdk",
- "redshift-interface",
- "solana-instruction 3.4.0",
+ "fixture",
  "solana-pubkey 4.2.0",
 ]
 
@@ -3179,9 +3192,8 @@ dependencies = [
 name = "redhat-program"
 version = "2.0.0"
 dependencies = [
- "borsh 1.7.0",
+ "fixture",
  "redhat-interface",
- "redshift-interface",
  "solana-program 3.0.0",
 ]
 
@@ -3208,25 +3220,18 @@ dependencies = [
 name = "redline-interface"
 version = "2.0.0"
 dependencies = [
- "bincode",
  "ephemeral-rollups-sdk",
- "serde",
- "sha2 0.10.9",
- "solana-instruction 3.4.0",
+ "fixture",
  "solana-pubkey 4.2.0",
- "solana-sdk-ids 3.1.0",
 ]
 
 [[package]]
 name = "redline-program"
 version = "2.0.0"
 dependencies = [
- "bincode",
- "borsh 1.7.0",
- "ephemeral-rollups-sdk",
+ "fixture",
  "redline-interface",
  "solana-program 3.0.0",
- "solana-pubkey 4.2.0",
 ]
 
 [[package]]
@@ -3244,10 +3249,10 @@ version = "2.0.0"
 dependencies = [
  "base64 0.22.1",
  "bincode",
- "borsh 1.7.0",
  "ephemeral-rollups-sdk",
  "futures-util",
  "magicblock-config",
+ "magicblock-magic-program-api",
  "rand 0.8.6",
  "redline-interface",
  "redshift-interface",
@@ -3271,7 +3276,6 @@ dependencies = [
  "sonic-rs",
  "tokio",
  "tracing",
- "upgrade-probe",
  "url",
 ]
 
@@ -3279,26 +3283,17 @@ dependencies = [
 name = "redshift-interface"
 version = "2.0.0"
 dependencies = [
- "borsh 1.7.0",
- "ephemeral-rollups-sdk",
- "solana-instruction 3.4.0",
- "solana-program-error 3.0.1",
+ "fixture",
  "solana-pubkey 4.2.0",
- "solana-sdk-ids 3.1.0",
 ]
 
 [[package]]
 name = "redshift-program"
 version = "2.0.0"
 dependencies = [
- "bincode",
- "borsh 1.7.0",
- "ephemeral-rollups-sdk",
- "magicblock-magic-program-api",
+ "fixture",
  "redshift-interface",
  "solana-program 3.0.0",
- "solana-sdk-ids 3.1.0",
- "solana-system-interface 3.2.0",
 ]
 
 [[package]]
@@ -3326,6 +3321,7 @@ dependencies = [
  "clap",
  "const-str",
  "derive_more",
+ "fixture",
  "futures-util",
  "libproc",
  "magicblock-config",
@@ -3357,6 +3353,7 @@ dependencies = [
  "tracing",
  "tracing-error",
  "tracing-subscriber",
+ "upgrade-probe",
  "url",
  "wincode",
 ]
@@ -4710,6 +4707,7 @@ dependencies = [
  "solana-define-syscall 5.1.0",
  "solana-instruction-error",
  "solana-pubkey 4.2.0",
+ "wincode",
 ]
 
 [[package]]
@@ -7122,6 +7120,7 @@ version = "2.0.0"
 dependencies = [
  "redline-interface",
  "solana-program 3.0.0",
+ "wincode",
 ]
 
 [[package]]

@@ -2,7 +2,6 @@ use std::{cell::Cell, fs, rc::Rc, slice, time::Duration};
 
 use account::Account;
 use futures_util::future::{try_join, try_join_all};
-use instruction::{AccountMeta, Instruction};
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
@@ -10,9 +9,9 @@ use redsuite_core::{
     catalog::Fixture,
     check, check_eq,
     netfault::{Action, BaseProxies, Selector, Stage},
+    programs::UpgradeProbe,
     redline::Accounts,
-    topology,
-    topology::{ErOptions, PrivateEr},
+    topology::{self, ErOptions, PrivateEr},
     BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result,
 };
 use signer::Signer;
@@ -208,20 +207,13 @@ impl PrivateErScenario for ProgramUpgrade {
                 ),
             );
             let mut converged = false;
-            let mut accounts: Vec<_> =
-                keys.iter().map(|key| AccountMeta::new(*key, false)).collect();
-            accounts.push(AccountMeta::new_readonly(crate::program::id(), false));
-            let mut probe = Instruction {
-                program_id,
-                accounts,
-                data: Vec::new(),
-            };
+            let probe = UpgradeProbe::at(program_id);
             let mut id = 0u64;
             while !done.get() {
                 id += 1;
                 let fail = id.is_multiple_of(4);
-                probe.data = upgrade_probe::instruction_data(id, fail).to_vec();
-                let tx = sender.prepare(slice::from_ref(&probe)).await?;
+                let instruction = probe.write(id, fail, &[keys[0], keys[1]]);
+                let tx = sender.prepare(slice::from_ref(&instruction)).await?;
                 let signature = tx.signatures[0];
                 let current = phase.get();
                 let mut tally = counts.get();
@@ -269,7 +261,7 @@ impl PrivateErScenario for ProgramUpgrade {
                                 check!(fail, "execution failure for {signature}: {error}")?;
                                 check_eq!(
                                     custom_error_code(error),
-                                    Some(upgrade_probe::FAILURE_CODE),
+                                    Some(UpgradeProbe::FAILURE_CODE),
                                     "failure after writes for {signature}"
                                 )?;
                                 tally[current][2] += 1;

@@ -4,6 +4,7 @@ use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
     check, check_eq,
+    programs::{CellHeader, REDLINE},
     redline::Accounts,
     report::Unit,
     runner::{execute_and_sync, Pacing, RunConfig},
@@ -27,14 +28,14 @@ const CONCURRENCY: usize = 1;
 const CONFIRM_TIMEOUT: Duration = Duration::from_secs(20);
 const PAYER_LAMPORTS: u64 = 2_000_000_000;
 
-pub struct SimpleLoad {
+pub struct AccountWriteLatency {
     base: Rc<BaseCtx>,
     er: ErCtx,
     payer: Keypair,
     pdas: Vec<Pubkey>,
 }
 
-impl Scenario<ScenarioReport> for SimpleLoad {
+impl Scenario<ScenarioReport> for AccountWriteLatency {
     async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
         let payer = base.funded_payer(PAYER_LAMPORTS).await?;
         let pdas = Accounts::new(ACCOUNT_SPACE, er.identity())
@@ -58,7 +59,7 @@ impl Scenario<ScenarioReport> for SimpleLoad {
         let Self { base, er, payer, pdas } = self;
         let clock = Arc::new(SendClock::new(1, ITERATIONS as usize));
         let updates = Rc::new(
-            AccountUpdates::connect(er.ws_url(), crate::account_update_id, clock.clone()).await?,
+            AccountUpdates::connect(er.ws_url(), CellHeader::written_id, clock.clone()).await?,
         );
         for pda in &pdas {
             updates.account_subscribe(pda).await?;
@@ -69,7 +70,7 @@ impl Scenario<ScenarioReport> for SimpleLoad {
 
         let request = |id: u64| {
             let target = pdas[((id - 1) % pdas.len() as u64) as usize];
-            let ix = crate::program::instruction::build::simple_byte_set(id, &[target]);
+            let ix = REDLINE.write(id, &[target]);
             updates.track(id, target);
             let (sender, sigs, clock) = (sender.clone(), sigs.clone(), clock.clone());
             async move {
@@ -117,7 +118,7 @@ impl Scenario<ScenarioReport> for SimpleLoad {
             let last_id = ITERATIONS - ACCOUNTS as u64 + 1 + i as u64;
             let on_er = er.account(pda).await?.ok_or("pda not on er")?;
             check_eq!(
-                crate::account_update_id(&on_er.data),
+                CellHeader::written_id(&on_er.data),
                 Some(last_id),
                 "er copy must hold the last id written to pda {i}"
             )?;

@@ -6,6 +6,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+fixture.workspace = true
 clap = { workspace = true }
 tracing = { workspace = true }
 tracing-error = { workspace = true }
@@ -20,6 +21,7 @@ url = { workspace = true }
 redline-interface = { workspace = true }
 redshift-interface = { workspace = true }
 redhat-interface = { workspace = true }
+upgrade-probe = { workspace = true, features = ["no-entrypoint"] }
 
 serde = { workspace = true }
 serde_with = { workspace = true }

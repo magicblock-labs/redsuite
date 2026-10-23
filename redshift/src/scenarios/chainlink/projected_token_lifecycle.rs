@@ -9,8 +9,9 @@ use redsuite_core::{
     check, check_eq,
     dlp::{self, delegate_with_actions, DelegateArgs},
     netfault::{BaseProxies, Selector},
-    receipt, system, topology,
-    topology::{ErOptions, PrivateEr},
+    programs::{SettlementMode, REDLINE},
+    receipt, system,
+    topology::{self, ErOptions, PrivateEr},
     BaseCtx, ChainCtx, DynError, ErCtx, PrivateErScenario, Result,
 };
 use sdk::spl::{
@@ -25,7 +26,7 @@ use signer::Signer;
 use tokio::time;
 
 use super::spl;
-use crate::{program::instruction::build, PAYER_LAMPORTS};
+use crate::PAYER_LAMPORTS;
 
 const LABEL: &str = "projected-token-lifecycle";
 const NAMES: [&str; 4] = ["source", "destination", "unbacked", "foreign"];
@@ -125,8 +126,9 @@ async fn check_controls(er: &ErCtx, wallets: &[Wallet; 4], amount: u64) -> Resul
     for control in [2, 3] {
         for (from, to) in [(control, 0), (0, control)] {
             let attempt = wallets[from].transfer(er, &wallets[to], amount).await;
-            check!(attempt.is_err(), "unauthorized transfer {from}->{to}")?;
-            let error = attempt.unwrap_err().to_string();
+            let error =
+                check::expect_error(attempt, &format!("unauthorized transfer {from}->{to}"))?;
+            let error = error.to_string();
             check!(
                 ["InvalidWritableAccount", "ExternalAccountDataModified", "ReadonlyDataModified", "Immutable"]
                     .iter().any(|code| error.contains(code)),
@@ -286,10 +288,8 @@ async fn magic_atas(
                         ],
                     )
                     .await;
-                check!(
-                    attempt.is_err(),
-                    "readonly base balance cannot be spent before overlay"
-                )?;
+                let error =
+                    check::expect_error(attempt, "readonly balance unspendable before overlay")?;
                 crate::rejection_code(
                     "readonly spend before overlay",
                     &[
@@ -298,7 +298,7 @@ async fn magic_atas(
                         "ReadonlyDataModified",
                         "Immutable",
                     ],
-                    &attempt.unwrap_err().to_string(),
+                    &error.to_string(),
                 )?;
                 check_eq!(
                     er.account(&destination.ata).await?,
@@ -563,8 +563,15 @@ impl PrivateErScenario for ProjectedTokenLifecycle {
         let atas = [wallets[0].ata, wallets[1].ata];
         let eatas = [wallets[0].eata, wallets[1].eata];
         let commit = async |id| {
-            er.submit_and_confirm(&validator, &[build::commit_accounts(id, identity, &atas)])
-                .await
+            er.submit_and_confirm(
+                &validator,
+                &[REDLINE
+                    .batch()
+                    .nonce(id)
+                    .settle(identity, &atas, SettlementMode::Commit)
+                    .build()],
+            )
+            .await
         };
         let owner_is = async |address: &Pubkey, owner| -> Result<()> {
             let actual = base.account(address).await?.map(|a| a.owner);

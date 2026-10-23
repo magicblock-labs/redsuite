@@ -4,11 +4,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use instruction::{AccountMeta, Instruction};
+use instruction::Instruction;
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    check, check_eq, topology, BaseCtx, ChainCtx, CheckError, ErCtx, Result, Scenario,
+    check, check_eq, programs::Redshift, topology, BaseCtx, ChainCtx, CheckError, ErCtx, Result,
+    Scenario,
 };
 use signature::Signature;
 use tokio::time;
@@ -48,9 +49,12 @@ impl Scenario for LoaderMatrix {
 
         let base_memo_v1 =
             base.account(&memo_v1).await?.ok_or("memo v1 is not on the base chain")?;
-        invoke_until(&er, payer, memo_v1, &memo_data, vec![], |logs| {
-            program_succeeded(logs, &memo_v1)
-        })
+        invoke_until(
+            &er,
+            payer,
+            |attempt| memo_instruction(memo_v1, attempt),
+            |logs| program_succeeded(logs, &memo_v1),
+        )
         .await?;
         let (v1_owner, v1_data) = cloned_program(&er, &memo_v1).await?;
         check_eq!(
@@ -68,7 +72,13 @@ impl Scenario for LoaderMatrix {
 
         let base_memo_v2 =
             base.account(&memo_v2).await?.ok_or("memo v2 is not on the base chain")?;
-        invoke_until(&er, payer, memo_v2, &memo_data, vec![], has_memo).await?;
+        invoke_until(
+            &er,
+            payer,
+            |attempt| memo_instruction(memo_v2, attempt),
+            has_memo,
+        )
+        .await?;
         let (v2_owner, v2_data) = cloned_program(&er, &memo_v2).await?;
         check_eq!(
             v2_owner,
@@ -84,7 +94,13 @@ impl Scenario for LoaderMatrix {
         )?;
 
         let (v3_id, _) = topology::redshift_loader_v3_target();
-        let v3_logs = invoke_until(&er, payer, v3_id, &log_data, vec![], has_log_msg).await?;
+        let v3_logs = invoke_until(
+            &er,
+            payer,
+            |attempt| Redshift::at(v3_id).log(&format!("probe {attempt}")),
+            has_log_msg,
+        )
+        .await?;
         let v3_programdata =
             Pubkey::find_program_address(&[v3_id.as_ref()], &sdk_ids::bpf_loader_upgradeable::ID).0;
         let mut base_v3_programdata = base
@@ -115,12 +131,12 @@ impl Scenario for LoaderMatrix {
     }
 }
 
-fn memo_data(attempt: u64) -> Vec<u8> {
-    format!("redsuite memo {attempt}").into_bytes()
-}
-
-fn log_data(attempt: u64) -> Vec<u8> {
-    redshift_interface::log_msg_data(&format!("probe {attempt}"))
+fn memo_instruction(program_id: Pubkey, attempt: u64) -> Instruction {
+    Instruction::new_with_bytes(
+        program_id,
+        format!("redsuite memo {attempt}").as_bytes(),
+        vec![],
+    )
 }
 
 fn has_log_msg(logs: &[String]) -> bool {
@@ -155,16 +171,14 @@ async fn confirmed_logs(er: &ErCtx, signature: &Signature) -> Result<Vec<String>
     .unwrap_or_default())
 }
 
-async fn invoke_until<Data, Accept>(
+async fn invoke_until<Build, Accept>(
     er: &ErCtx,
     payer: &Keypair,
-    program: Pubkey,
-    data_for: Data,
-    accounts: Vec<AccountMeta>,
+    build: Build,
     accept: Accept,
 ) -> Result<Vec<String>>
 where
-    Data: Fn(u64) -> Vec<u8>,
+    Build: Fn(u64) -> Instruction,
     Accept: Fn(&[String]) -> bool,
 {
     let deadline = Instant::now() + INVOKE_TIMEOUT;
@@ -172,11 +186,8 @@ where
     let mut last_logs = Vec::new();
     loop {
         attempt += 1;
-        let ix = Instruction {
-            program_id: program,
-            accounts: accounts.clone(),
-            data: data_for(attempt),
-        };
+        let ix = build(attempt);
+        let program = ix.program_id;
         match er.submit_and_confirm(payer, slice::from_ref(&ix)).await {
             Ok(signature) => {
                 let logs = confirmed_logs(er, &signature).await?;

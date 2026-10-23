@@ -8,17 +8,15 @@ use pubkey::Pubkey;
 use redsuite_core::{
     check, check_eq,
     netfault::{BaseProxies, Selector},
+    programs::{CellHeader, CellId, SettlementMode, REDLINE},
     topology::RestartConfig,
-    BaseCtx, ChainCtx, ErCtx, Result, Scenario,
+    BaseCtx, ChainCtx, DynError, ErCtx, Result, Scenario,
 };
 use signer::Signer;
 use tokio::time;
 
-use super::PROXIED_GROUP;
-use crate::{
-    program::{instruction::build, DELEGATION_PROGRAM_ID},
-    ACCOUNT_SPACE, LOCKOUT_REJECTIONS, PAYER_LAMPORTS,
-};
+use super::{write_snapshot, PROXIED_GROUP};
+use crate::{program::DELEGATION_PROGRAM_ID, ACCOUNT_SPACE, LOCKOUT_REJECTIONS, PAYER_LAMPORTS};
 
 const CLONE_TIMEOUT: Duration = Duration::from_secs(30);
 const INTERCEPT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -53,17 +51,6 @@ fn value(case: u64, step: u64) -> u64 {
     100 * case + step
 }
 
-async fn write(er: &ErCtx, payer: &Keypair, id: u64, account: &Pubkey) -> Result<Vec<u8>> {
-    er.redline(payer).write(id, &[*account]).await?;
-    let data = er.account(account).await?.ok_or("er copy vanished after the write")?.data;
-    check_eq!(
-        crate::written_id(&data),
-        Some(id),
-        "the er write must land before undelegation is requested"
-    )?;
-    Ok(data)
-}
-
 async fn rejected_write(
     er: &ErCtx,
     payer: &Keypair,
@@ -72,13 +59,9 @@ async fn rejected_write(
     snapshot: &[u8],
     when: &str,
 ) -> Result<()> {
-    let attempt = er.redline(payer).write(id, &[*account]).await;
-    check!(
-        attempt.is_err(),
-        "an er write {when} must be rejected while undelegation is pending, \
-         got {attempt:?}"
-    )?;
-    let error = format!("{:?}", attempt.unwrap_err());
+    let attempt = er.cells(REDLINE, payer).write(id, &[*account]).await;
+    let error = check::expect_error(attempt, &format!("ER write rejected {when}"))?;
+    let error = format!("{error:?}");
     crate::rejection_code(&format!("the er write {when}"), &LOCKOUT_REJECTIONS, &error)?;
     let on_er = er.account(account).await?.ok_or("er copy vanished during the lockout")?;
     check_eq!(
@@ -127,16 +110,13 @@ async fn await_ownership_return(
 
 async fn await_er_value(er: &ErCtx, account: &Pubkey, id: u64, what: &str) -> Result<()> {
     check::poll_for(what, DISCOVERY_TIMEOUT, || async {
-        match er.account(account).await {
-            Ok(Some(acc)) if crate::written_id(&acc.data) == Some(id) => Ok(()),
-            Ok(Some(acc)) => Err(format!(
-                "owner {} written id {:?}",
-                acc.owner,
-                crate::written_id(&acc.data)
-            )),
-            Ok(None) => Err("absent".to_owned()),
-            Err(error) => Err(format!("read failed: {error}")),
-        }
+        let account = er.account(account).await?.ok_or("ER cell absent")?;
+        check_eq!(
+            CellHeader::try_decode(&account.data)?.value,
+            id,
+            "ER cell value"
+        )?;
+        Ok::<_, DynError>(())
     })
     .await
     .map_err(|error| error.expected(format!("written id {id}")))?;
@@ -153,12 +133,11 @@ async fn redelegate_and_write(
 ) -> Result<()> {
     base.submit_and_confirm(
         payer,
-        &[build::delegate(
+        &[REDLINE.delegate(
             payer.pubkey(),
-            *account,
-            payer.pubkey(),
-            seed,
-            er.identity(),
+            CellId::new(payer.pubkey(), u64::from(seed)),
+            Some(er.identity()),
+            u32::MAX,
         )],
     )
     .await?;
@@ -174,7 +153,7 @@ async fn redelegate_and_write(
     check::poll(
         "the er accepts writes again once the account is redelegated",
         REDELEGATE_TIMEOUT,
-        || async { er.redline(payer).write(id, &[*account]).await.is_ok() },
+        || async { er.cells(REDLINE, payer).write(id, &[*account]).await.is_ok() },
     )
     .await?;
     let on_er = er
@@ -182,7 +161,7 @@ async fn redelegate_and_write(
         .await?
         .ok_or("er copy vanished after the redelegated write")?;
     check_eq!(
-        crate::written_id(&on_er.data),
+        CellHeader::written_id(&on_er.data),
         Some(id),
         "the er must hold the write made after redelegation"
     )?;
@@ -199,13 +178,18 @@ async fn recover(
 ) -> Result<()> {
     let case = u64::from(seed);
     let identity = er.identity();
-    let account = base.redline(payer).init_delegated(ACCOUNT_SPACE, identity, seed).await?;
+    let account = base
+        .cells(REDLINE, payer)
+        .create_delegated(ACCOUNT_SPACE, identity, seed)
+        .await?;
     er.await_clones(&[account], ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
-    let snapshot = write(er, payer, value(case, 1), &account).await?;
+    let snapshot = write_snapshot(er, payer, value(case, 1), &account).await?;
 
     let submission =
         proxies.intercept(Selector::method("sendTransaction").http().request().account(&account));
-    er.redline(payer).commit_and_undelegate(case, &[account]).await?;
+    er.cells(REDLINE, payer)
+        .settle(case, &[account], SettlementMode::Undelegate)
+        .await?;
     let held = submission.wait(INTERCEPT_TIMEOUT).await?;
     rejected_write(
         er,
@@ -265,7 +249,7 @@ async fn recover(
     }
 
     let base_write = value(case, 5);
-    base.redline(payer).write(base_write, &[account]).await?;
+    base.cells(REDLINE, payer).write(base_write, &[account]).await?;
     await_er_value(
         er,
         &account,

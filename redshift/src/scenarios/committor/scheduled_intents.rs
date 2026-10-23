@@ -2,14 +2,16 @@ use std::{rc::Rc, time::Duration};
 
 use instruction::Instruction;
 use keypair::Keypair;
+use magic_api::args::{CommitTypeArgs, MagicIntentBundleArgs};
 use pubkey::Pubkey;
-use redshift_interface::{
-    schedulecommit,
-    schedulecommit::{build as counter, IntentMode, MainAccount},
-};
 use redsuite_core::{
-    api::custom_error_code, check, check_eq, dlp, prep, receipt, BaseCtx, ChainCtx, DynError,
-    ErCtx, Result,
+    api::custom_error_code,
+    check, check_eq, dlp, prep,
+    programs::{
+        Action, CellHeader, CellId, Commit, IntentBundle, Refund, ResultCallback, SettlementMode,
+        MAGIC, REDSHIFT,
+    },
+    receipt, BaseCtx, ChainCtx, DynError, ErCtx, Result,
 };
 use sdk::dlp_api::consts::COMMIT_FEE_LAMPORTS;
 use signature::Signature;
@@ -21,22 +23,115 @@ const TIMEOUT: Duration = Duration::from_secs(60);
 const PAID_COMMIT_LIMIT: u64 = 25;
 const ACTION_FEE: u64 = 5_000;
 const CALLBACK_FEE: u64 = 5_000;
+const TRANSFER_LAMPORTS: u64 = 1_000_000;
+const ACTION_COMPUTE_UNITS: u32 = 100_000;
+
+#[derive(Clone, Copy)]
+enum Mode {
+    Commit,
+    Undelegate(i64),
+    Finalize,
+}
+
+fn intents(
+    authorities: &[Pubkey],
+    validator: Pubkey,
+    destination: Pubkey,
+    modes: &[Mode],
+    actions: bool,
+) -> Instruction {
+    let cells = REDSHIFT.primaries(authorities);
+    if matches!(modes, [Mode::Commit, Mode::Finalize]) {
+        let args = MagicIntentBundleArgs {
+            commit: Some(CommitTypeArgs::Standalone(vec![3])),
+            commit_finalize: Some(CommitTypeArgs::Standalone(vec![4])),
+            ..Default::default()
+        };
+        return REDSHIFT
+            .batch()
+            .invoke(MAGIC.intents(
+                authorities[0],
+                dlp::magic_fee_vault_pda(&validator),
+                &cells,
+                args,
+            ))
+            .build();
+    }
+    let mut bundle = IntentBundle::new(authorities[0]);
+    bundle.validator = Some(validator);
+    for ((&authority, &cell), &mode) in authorities.iter().zip(&cells).zip(modes) {
+        let settlement = match mode {
+            Mode::Undelegate(_) => SettlementMode::Undelegate,
+            _ => SettlementMode::Commit,
+        };
+        let mut commit = Commit::new(settlement, &[cell]);
+        if actions {
+            let transfer = REDSHIFT
+                .batch()
+                .transfer_from_escrow(destination, TRANSFER_LAMPORTS)
+                .action(cell, dlp::dlp_id());
+            commit.after_commit.push(Action::new(authority, transfer, ACTION_COMPUTE_UNITS));
+            if let Mode::Undelegate(change) = mode {
+                let transfer = REDSHIFT
+                    .batch()
+                    .add(&[cell], change)
+                    .transfer_from_escrow(destination, TRANSFER_LAMPORTS)
+                    .action(cell, REDSHIFT.id());
+                commit.after_undelegate.push(Action::new(
+                    authority,
+                    transfer,
+                    ACTION_COMPUTE_UNITS,
+                ));
+            }
+        }
+        bundle.commits.push(commit);
+    }
+    REDSHIFT.batch().intents(bundle).build()
+}
+
+fn transfer_with_refund(
+    authority: Pubkey,
+    validator: Pubkey,
+    destination: Pubkey,
+    amount: u64,
+    fail: bool,
+) -> Instruction {
+    let cell = REDSHIFT.primary(authority);
+    let mut action = REDSHIFT.batch();
+    if fail {
+        action = action.fail(0xFA11);
+    }
+    let transfer = action.transfer_from_escrow(destination, amount).action(cell, dlp::dlp_id());
+    let callback = ResultCallback {
+        cell,
+        refund: Some(Refund { recipient: authority, amount }),
+        compute_units: 20_000,
+    };
+    let mut commit = Commit::new(SettlementMode::Commit, &[cell]);
+    commit
+        .after_commit
+        .push(Action::new(authority, transfer, ACTION_COMPUTE_UNITS).then(callback));
+    let mut bundle = IntentBundle::new(authority);
+    bundle.validator = Some(validator);
+    bundle.commits.push(commit);
+    REDSHIFT
+        .batch()
+        .invoke(redsuite_core::system::transfer(&authority, &cell, amount))
+        .intents(bundle)
+        .build()
+}
 
 async fn redelegate(base: &BaseCtx, er: &ErCtx, payer: &Keypair, phase: &str) -> Result<()> {
     base.submit_and_confirm(
         payer,
         &[
-            counter::delegate_cpi(
+            REDSHIFT.delegate(
                 payer.pubkey(),
-                payer.pubkey(),
-                prep::COMMIT_FREQUENCY_MS,
+                CellId::new(payer.pubkey(), 0),
                 Some(er.identity()),
+                prep::COMMIT_FREQUENCY_MS,
             ),
-            Instruction {
-                program_id: redshift_interface::ID,
-                accounts: vec![],
-                data: redshift_interface::log_msg_data(phase),
-            },
+            REDSHIFT.log(phase),
         ],
     )
     .await?;
@@ -54,64 +149,51 @@ pub(super) async fn run(base: &BaseCtx, er: &ErCtx) -> Result<()> {
     let funder = base.funded_payer(PAYER_LAMPORTS).await?;
     let payers = base.funded_payers(3, PAYER_LAMPORTS).await?;
     let keys: Vec<_> = payers.iter().map(Signer::pubkey).collect();
-    let mut counters = Vec::new();
+    let mut cells = Vec::new();
     let mut expected = Vec::new();
     for payer in &payers {
-        let (counter, setup) = base
-            .schedulecommit(payer)
-            .prepare_counter(er.identity(), prep::COMMIT_FREQUENCY_MS);
+        let (cell, [create, delegate]) = base
+            .cells(REDSHIFT, payer)
+            .prepare_delegated(er.identity(), prep::COMMIT_FREQUENCY_MS);
         base.submit_and_confirm(
             payer,
-            &[
-                setup[0].clone(),
-                setup[1].clone(),
-                dlp::top_up_ephemeral_balance(
-                    &payer.pubkey(),
-                    500_000_000,
-                    schedulecommit::ACTOR_ESCROW_INDEX,
-                ),
-            ],
+            &[create, delegate, dlp::top_up_ephemeral_balance(&payer.pubkey(), 500_000_000, 1)],
         )
         .await?;
-        expected.push(MainAccount::try_decode(
-            &base.account(&counter).await?.ok_or("counter missing")?.data,
+        expected.push(CellHeader::try_decode(
+            &base.account(&cell).await?.ok_or("cell missing")?.data,
         )?);
-        counters.push(counter);
+        cells.push(cell);
     }
     let mut is_delegated = [true; 3];
-    use IntentMode::{Commit, Finalize, Undelegate};
+    use Mode::{Commit, Finalize, Undelegate};
     for (label, modes, additions, actions) in [
-        ("single commit action", vec![Commit], vec![101], true),
-        ("repeated commit action", vec![Commit], vec![2], true),
-        ("undelegate action", vec![Undelegate(-100)], vec![0], true),
-        (
-            "action after redelegation",
-            vec![Undelegate(102)],
-            vec![0],
-            true,
-        ),
+        ("single commit action", &[Commit][..], &[101][..], true),
+        ("repeated commit action", &[Commit], &[2], true),
+        ("undelegate action", &[Undelegate(-100)], &[0], true),
+        ("action after redelegation", &[Undelegate(102)], &[0], true),
         (
             "two-payer commit actions",
-            vec![Commit, Commit],
-            vec![0, 200],
+            &[Commit, Commit],
+            &[0, 200],
             true,
         ),
         (
             "two-payer undelegate actions",
-            vec![Undelegate(-50), Undelegate(25)],
-            vec![0, 0],
+            &[Undelegate(-50), Undelegate(25)],
+            &[0, 0],
             true,
         ),
         (
             "mixed commit/undelegate bundle",
-            vec![Commit, Commit, Undelegate(-25)],
-            vec![0, 0, 200],
+            &[Commit, Commit, Undelegate(-25)],
+            &[0, 0, 200],
             true,
         ),
         (
             "mixed commit/finalize bundle",
-            vec![Commit, Finalize],
-            vec![0, 0],
+            &[Commit, Finalize],
+            &[0, 0],
             false,
         ),
     ] {
@@ -123,80 +205,75 @@ pub(super) async fn run(base: &BaseCtx, er: &ErCtx) -> Result<()> {
                     redelegate(base, er, &payers[i], label).await?;
                     is_delegated[i] = true;
                 }
-                delegated(&counters[i]).await?;
+                delegated(&cells[i]).await?;
                 check::poll_for(
-                    &format!("{} restored for {label}", counters[i]),
+                    &format!("{} restored for {label}", cells[i]),
                     TIMEOUT,
                     || async {
-                        let account =
-                            er.account(&counters[i]).await?.ok_or("ER counter missing")?;
+                        let account = er.account(&cells[i]).await?.ok_or("ER cell missing")?;
+                        check_eq!(account.owner, redshift_interface::ID, "ER cell ownership")?;
                         check_eq!(
-                            account.owner,
-                            redshift_interface::ID,
-                            "ER counter ownership"
-                        )?;
-                        check_eq!(
-                            MainAccount::try_decode(&account.data)?,
+                            CellHeader::try_decode(&account.data)?,
                             expected[i],
-                            "ER sees the latest counter before another intent"
+                            "ER sees the latest cell before another intent"
                         )?;
                         Ok::<_, DynError>(())
                     },
                 )
                 .await?;
                 if additions[i] != 0 {
-                    er.submit_and_confirm(&payers[i], &[counter::add(keys[i], additions[i])])
-                        .await?;
-                    expected[i].count += additions[i] as u64;
-                    expected[i].updates += 1;
+                    er.submit_and_confirm(
+                        &payers[i],
+                        &[REDSHIFT
+                            .batch()
+                            .add(&[REDSHIFT.primary(keys[i])], i64::from(additions[i]))
+                            .require_signer(keys[i])
+                            .build()],
+                    )
+                    .await?;
+                    expected[i].value += additions[i] as u64;
+                    expected[i].revision += 1;
                 }
             }
             let signature = er
                 .submit_and_confirm_with(
                     &payers[0],
                     &payers[1..n].iter().collect::<Vec<_>>(),
-                    &[counter::schedule_intents(
-                        &keys[..n],
-                        er.identity(),
-                        destination,
-                        modes.clone(),
-                        actions,
-                    )],
+                    &[intents(&keys[..n], er.identity(), destination, modes, actions)],
                 )
                 .await?;
             let undelegates = modes.iter().any(|mode| matches!(mode, Undelegate(_)));
-            settled(&signature, &counters[..n], undelegates).await?;
-            let mut prizes = 0;
+            settled(&signature, &cells[..n], undelegates).await?;
+            let mut transfers = 0;
             for (i, mode) in modes.iter().enumerate() {
-                prizes += usize::from(actions);
+                transfers += usize::from(actions);
                 if let Undelegate(change) = mode {
-                    expected[i].count = expected[i]
-                        .count
+                    expected[i].value = expected[i]
+                        .value
                         .checked_add_signed(*change)
-                        .ok_or("counter model underflow")?;
-                    expected[i].updates += 1;
+                        .ok_or("cell model underflow")?;
+                    expected[i].revision += 1;
                     is_delegated[i] = false;
-                    prizes += 1;
+                    transfers += 1;
                 }
-                let account =
-                    base.account(&counters[i]).await?.ok_or("committed counter missing")?;
+                let account = base.account(&cells[i]).await?.ok_or("committed cell missing")?;
                 check_eq!(
-                    MainAccount::try_decode(&account.data)?,
+                    CellHeader::try_decode(&account.data)?,
                     expected[i],
-                    "{label} {signature}: exact counter {}",
-                    counters[i]
+                    "{label} {signature}: exact cell {}",
+                    cells[i]
                 )?;
                 check_eq!(
                     account.owner,
                     if is_delegated[i] { dlp::dlp_id() } else { redshift_interface::ID },
                     "{label}: base ownership of {}",
-                    counters[i]
+                    cells[i]
                 )?;
             }
             check_eq!(
                 base.api().get_balance(&destination).await?,
-                prizes as u64 * schedulecommit::ACTION_PRIZE,
-                "{label} {signature}: exactly one prize per routed action"
+                transfers as u64 * TRANSFER_LAMPORTS,
+                "{label} {signature}: exactly one transfer per routed action"
             )?;
             Ok(())
         })
@@ -205,7 +282,7 @@ pub(super) async fn run(base: &BaseCtx, er: &ErCtx) -> Result<()> {
 
     crate::phase("sponsored quota and undelegation", async {
         let payer = &payers[0];
-        let initial_nonce = crate::last_commit_id(base, &counters[0]).await?;
+        let initial_nonce = crate::last_commit_id(base, &cells[0]).await?;
         check!(
             initial_nonce < receipt::SPONSORED_COMMIT_LIMIT,
             "quota preparation starts below the sponsored limit"
@@ -215,30 +292,28 @@ pub(super) async fn run(base: &BaseCtx, er: &ErCtx) -> Result<()> {
                 .submit_and_confirm(
                     payer,
                     &[
-                        counter::add(keys[0], nonce as u8 + 1),
-                        counter::schedule_intents(
-                            &keys[..1],
-                            er.identity(),
-                            keys[1],
-                            vec![Commit],
-                            false,
-                        ),
+                        REDSHIFT
+                            .batch()
+                            .add(&[REDSHIFT.primary(keys[0])], i64::from(nonce as u8 + 1))
+                            .require_signer(keys[0])
+                            .build(),
+                        intents(&keys[..1], er.identity(), keys[1], &[Commit], false),
                     ],
                 )
                 .await?;
-            settled(&signature, &counters[..1], false).await?;
+            settled(&signature, &cells[..1], false).await?;
             check_eq!(
-                crate::last_commit_id(base, &counters[0]).await?,
+                crate::last_commit_id(base, &cells[0]).await?,
                 nonce + 1,
                 "sponsored commit advances exactly one nonce"
             )?;
         }
-        let before = er.account(&counters[0]).await?;
+        let before = er.account(&cells[0]).await?;
         let signature = er
             .sender(Rc::new(prep::payer_from_bytes(&payer.to_bytes())))
             .submit(&[
-                counter::add(keys[0], 99),
-                counter::schedule_intents(&keys[..1], er.identity(), keys[1], vec![Commit], false),
+                REDSHIFT.batch().add(&[cells[0]], 99).require_signer(keys[0]).build(),
+                intents(&keys[..1], er.identity(), keys[1], &[Commit], false),
             ])
             .await?;
         let tx = er.api().await_transaction(&signature, TIMEOUT).await?;
@@ -248,24 +323,18 @@ pub(super) async fn run(base: &BaseCtx, er: &ErCtx) -> Result<()> {
             "{signature}: precise sponsored-limit refusal"
         )?;
         check_eq!(
-            er.account(&counters[0]).await?,
+            er.account(&cells[0]).await?,
             before,
             "quota refusal rolls back the preceding write"
         )?;
         let signature = er
             .submit_and_confirm(
                 payer,
-                &[counter::schedule_intents(
-                    &keys[..1],
-                    er.identity(),
-                    keys[1],
-                    vec![Undelegate(0)],
-                    false,
-                )],
+                &[intents(&keys[..1], er.identity(), keys[1], &[Undelegate(0)], false)],
             )
             .await?;
-        settled(&signature, &counters[..1], true).await?;
-        let account = base.account(&counters[0]).await?.ok_or("undelegated counter missing")?;
+        settled(&signature, &cells[..1], true).await?;
+        let account = base.account(&cells[0]).await?.ok_or("undelegated cell missing")?;
         check_eq!(
             account.owner,
             redshift_interface::ID,
@@ -273,7 +342,7 @@ pub(super) async fn run(base: &BaseCtx, er: &ErCtx) -> Result<()> {
         )?;
         check_eq!(
             account.data,
-            before.ok_or("ER counter missing")?.data,
+            before.ok_or("ER cell missing")?.data,
             "quota undelegation settles unchanged bytes"
         )?;
         redelegate(base, er, payer, "after sponsored quota").await?;
@@ -283,10 +352,10 @@ pub(super) async fn run(base: &BaseCtx, er: &ErCtx) -> Result<()> {
 
     base.delegate_payer(&funder, &payers[0], er.identity()).await?;
     delegated(&keys[0]).await?;
-    delegated(&counters[0]).await?;
+    delegated(&cells[0]).await?;
     let vault = dlp::magic_fee_vault_pda(&er.identity());
     crate::phase("paid commit threshold and combined action charge", async {
-        let initial_nonce = crate::last_commit_id(base, &counters[0]).await?;
+        let initial_nonce = crate::last_commit_id(base, &cells[0]).await?;
         check!(
             initial_nonce < PAID_COMMIT_LIMIT,
             "paid threshold starts above sponsored coverage"
@@ -300,18 +369,16 @@ pub(super) async fn run(base: &BaseCtx, er: &ErCtx) -> Result<()> {
                 .submit_and_confirm(
                     &payers[0],
                     &[
-                        counter::add(keys[0], nonce as u8 + 1),
-                        counter::schedule_intents(
-                            &keys[..1],
-                            er.identity(),
-                            destination,
-                            vec![Commit],
-                            actions,
-                        ),
+                        REDSHIFT
+                            .batch()
+                            .add(&[REDSHIFT.primary(keys[0])], i64::from(nonce as u8 + 1))
+                            .require_signer(keys[0])
+                            .build(),
+                        intents(&keys[..1], er.identity(), destination, &[Commit], actions),
                     ],
                 )
                 .await?;
-            settled(&signature, &counters[..1], false).await?;
+            settled(&signature, &cells[..1], false).await?;
             let fee = if nonce >= PAID_COMMIT_LIMIT { COMMIT_FEE_LAMPORTS } else { 0 }
                 + if actions { ACTION_FEE } else { 0 };
             check_eq!(
@@ -325,13 +392,13 @@ pub(super) async fn run(base: &BaseCtx, er: &ErCtx) -> Result<()> {
                 "{signature}: exact vault credit at nonce {nonce}"
             )?;
             check_eq!(
-                crate::last_commit_id(base, &counters[0]).await?,
+                crate::last_commit_id(base, &cells[0]).await?,
                 nonce + 1,
                 "paid commit nonce"
             )?;
             check_eq!(
                 base.api().get_balance(&destination).await?,
-                if actions { schedulecommit::ACTION_PRIZE } else { 0 },
+                if actions { TRANSFER_LAMPORTS } else { 0 },
                 "combined charge retains action execution"
             )?;
         }
@@ -347,34 +414,32 @@ pub(super) async fn run(base: &BaseCtx, er: &ErCtx) -> Result<()> {
             async {
                 const AMOUNT: u64 = 890_880;
                 let destination = Keypair::new().pubkey();
-                let before = er.account(&counters[1]).await?.ok_or("transfer counter missing")?;
-                let state = MainAccount::try_decode(&before.data)?;
+                let before = er.account(&cells[1]).await?.ok_or("transfer cell missing")?;
+                let state = CellHeader::try_decode(&before.data)?;
                 let payer_before = er.api().get_balance(&keys[1]).await?;
                 let vault_before = er.api().get_balance(&vault).await?;
                 let signature = er
                     .submit_and_confirm(
                         &payers[1],
-                        &[counter::transfer_intent(
-                            keys[1],
-                            er.identity(),
-                            destination,
-                            AMOUNT,
-                            fail,
-                        )],
+                        &[transfer_with_refund(keys[1], er.identity(), destination, AMOUNT, fail)],
                     )
                     .await?;
-                settled(&signature, &counters[1..2], false).await?;
+                settled(&signature, &cells[1..2], false).await?;
                 check::poll_for(
                     &format!("{signature}: callback completes exactly once"),
                     TIMEOUT,
                     || async {
                         let account =
-                            er.account(&counters[1]).await?.ok_or("callback counter missing")?;
-                        let actual = MainAccount::try_decode(&account.data)?;
-                        check_eq!(actual.updates, state.updates + 1, "callback delivery count")?;
+                            er.account(&cells[1]).await?.ok_or("callback cell missing")?;
+                        let actual = CellHeader::try_decode(&account.data)?;
                         check_eq!(
-                            actual.count,
-                            state.count + u64::from(fail),
+                            actual.revision,
+                            state.revision + 1,
+                            "callback delivery count"
+                        )?;
+                        check_eq!(
+                            actual.value,
+                            state.value + u64::from(fail),
                             "callback success/failure result"
                         )?;
                         check_eq!(

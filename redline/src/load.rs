@@ -9,8 +9,7 @@ use std::{
 };
 
 use redsuite_core::{
-    topology,
-    topology::{ErOptions, PrivateEr},
+    topology::{self, ErOptions, PrivateEr},
     BaseCtx, PrivateErScenario, Result, ScenarioReport,
 };
 use tokio::sync::watch;

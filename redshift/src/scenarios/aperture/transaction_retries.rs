@@ -6,14 +6,13 @@ use hash::Hash;
 use instruction::{AccountMeta, Instruction};
 use keypair::Keypair;
 use pubkey::Pubkey;
-use redline_interface::instruction::build as load;
-use redshift_interface::schedulecommit::{build, MainAccount};
+
 use redsuite_core::{
     api::RpcError,
     check, check_eq,
     netfault::Selector,
-    topology,
-    topology::{ErOptions, PrivateEr, RestartConfig},
+    programs::{CellHeader, REDLINE, REDSHIFT},
+    topology::{self, ErOptions, PrivateEr, RestartConfig},
     transport::wsraw::RawWs,
     BaseCtx, ChainCtx, CheckError, DynError, ErCtx, PrivateErScenario, Result, Scenario,
 };
@@ -58,12 +57,14 @@ impl Signed {
         fail: bool,
         cold: Option<Pubkey>,
     ) -> Result<Self> {
-        let mut instructions = vec![build::add_unsigned(owner, count)];
+        let mut instructions =
+            vec![REDSHIFT.batch().add(&[REDSHIFT.primary(owner)], i64::from(count)).build()];
         if let Some(cold) = cold {
             instructions[0].accounts.push(AccountMeta::new_readonly(cold, false));
         }
         if fail {
-            instructions.push(build::fail(owner));
+            instructions
+                .push(REDSHIFT.batch().writable(&[REDSHIFT.primary(owner)]).fail(0).build());
         }
         let blockhash = er.api().get_latest_blockhash().await?;
         let tx = Transaction::new_signed_with_payer(
@@ -152,11 +153,11 @@ impl Signed {
     }
 }
 
-async fn state(er: &ErCtx, keys: &[Pubkey; 2]) -> Result<(u64, MainAccount)> {
+async fn state(er: &ErCtx, keys: &[Pubkey; 2]) -> Result<(u64, CellHeader)> {
     let accounts = er.accounts(keys).await?;
     let payer = accounts[0].as_ref().ok_or_else(|| format!("payer {} missing", keys[0]))?;
-    let counter = accounts[1].as_ref().ok_or_else(|| format!("counter {} missing", keys[1]))?;
-    Ok((payer.lamports, MainAccount::try_decode(&counter.data)?))
+    let cell = accounts[1].as_ref().ok_or_else(|| format!("cell {} missing", keys[1]))?;
+    Ok((payer.lamports, CellHeader::try_decode(&cell.data)?))
 }
 
 async fn subscribe(er: &ErCtx, tx: &Signed) -> Result<(RawWs, u64)> {
@@ -168,7 +169,7 @@ async fn subscribe(er: &ErCtx, tx: &Signed) -> Result<(RawWs, u64)> {
 async fn queue_readers(
     er: &ErCtx,
     payer: &Keypair,
-    counter: Pubkey,
+    cell: Pubkey,
     round: u8,
 ) -> Result<Vec<Signature>> {
     let blockhash = er.api().get_latest_blockhash().await?;
@@ -184,8 +185,8 @@ async fn queue_readers(
             Transaction::new_signed_with_payer(
                 &[
                     budget.clone(),
-                    load::read_accounts_data(id, &[counter]),
-                    load::expensive_hash_compute(u64::from(round) * 256 + id, counter, 180, &[]),
+                    REDLINE.inspect(&[cell]),
+                    REDLINE.hash(u64::from(round) * 256 + id, cell.to_bytes(), 180, &[]),
                 ],
                 Some(&payer.pubkey()),
                 &[payer],
@@ -210,8 +211,8 @@ async fn execute(
         listeners.push(subscribe(er, tx).await?);
     }
     let mut readers = Vec::new();
-    if let Some((payer, counter, round)) = queued {
-        readers = queue_readers(er, payer, counter, round).await?;
+    if let Some((payer, cell, round)) = queued {
+        readers = queue_readers(er, payer, cell, round).await?;
     }
     let (sent, racing) = tokio::join!(
         tx.copies(er, copies),
@@ -343,7 +344,7 @@ impl Mode {
             &["case"]
         };
         for &phase in phases {
-            // Each outcome owns fresh payer/counter state and its ledger window.
+            // Each outcome owns fresh payer/cell state and its ledger window.
             crate::phase(
                 phase,
                 self.run_case(base, er, phase, private.as_deref_mut()),
@@ -361,7 +362,7 @@ impl Mode {
         private: Option<&mut PrivateEr>,
     ) -> Result<()> {
         let owner = base.funded_payer(PAYER_LAMPORTS).await?;
-        let (counter, setup) = base.schedulecommit(&owner).prepare_counter(er.identity(), u32::MAX);
+        let (cell, setup) = base.cells(REDSHIFT, &owner).prepare_delegated(er.identity(), u32::MAX);
         base.submit_and_confirm(&owner, &setup).await?;
         let payer = base.delegated_payer(&owner, er.identity(), PAYER_LAMPORTS).await?;
         let load_payer = if matches!(self, Self::Subscriptions) {
@@ -370,12 +371,12 @@ impl Mode {
             None
         };
         let owner = owner.pubkey();
-        let keys = [payer.pubkey(), counter];
+        let keys = [payer.pubkey(), cell];
         let mut expected = check::poll_for("accounts cloned", TIMEOUT, || state(er, &keys)).await?;
         check_eq!(
-            (expected.1.count, expected.1.updates),
+            (expected.1.value, expected.1.revision),
             (0, 0),
-            "{phase}: fresh counter {}",
+            "{phase}: fresh cell {}",
             keys[1]
         )?;
         let mut start = er.api().get_slot().await?;
@@ -421,8 +422,8 @@ impl Mode {
                 tx.outcome(er).await?;
                 audit(er, start, &[(&tx, 1)]).await?;
                 expected.0 -= tx.fee;
-                expected.1.count += 7;
-                expected.1.updates += 1;
+                expected.1.value += 7;
+                expected.1.revision += 1;
             }
             Self::Concurrent | Self::Subscriptions => {
                 let mut pending_results = [false; 2];
@@ -438,19 +439,19 @@ impl Mode {
                         load_payer
                             .as_ref()
                             .filter(|_| !pending_results[usize::from(fail)])
-                            .map(|payer| (payer, counter, round)),
+                            .map(|payer| (payer, cell, round)),
                     )
                     .await;
                     start = audit(er, start, &[(&tx, 1)]).await?;
                     expected.0 -= tx.fee;
                     if !fail {
-                        expected.1.count += u64::from(round);
-                        expected.1.updates += 1;
+                        expected.1.value += u64::from(round);
+                        expected.1.revision += 1;
                     }
                     check_eq!(
                         state(er, &keys).await?,
                         expected,
-                        "{phase} round {round}: {} counter {} exact effect and fee",
+                        "{phase} round {round}: {} cell {} exact effect and fee",
                         tx.signature,
                         keys[1]
                     )?;
@@ -481,8 +482,8 @@ impl Mode {
                             let slot = tx.outcome(er).await?;
                             expected.0 -= tx.fee;
                             if i == 0 {
-                                expected.1.count += u64::from(count);
-                                expected.1.updates += 1;
+                                expected.1.value += u64::from(count);
+                                expected.1.revision += 1;
                             }
                             Some(slot)
                         } else {

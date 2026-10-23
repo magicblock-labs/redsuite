@@ -2,10 +2,11 @@ use std::{path::Path, rc::Rc, time::Duration};
 
 use keypair::Keypair;
 use pubkey::Pubkey;
-use redshift_interface::schedulecommit::{build, MainAccount};
+
 use redsuite_core::{
     api::TransactionInfo,
     check, check_eq,
+    programs::{CellHeader, REDSHIFT},
     topology::{self, ErOptions, PrivateEr, RestartConfig},
     BaseCtx, ChainCtx, DynError, ErCtx, PrivateErScenario, Result,
 };
@@ -24,8 +25,8 @@ const CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(120);
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct State {
     payer_lamports: u64,
-    counter_lamports: u64,
-    counter: MainAccount,
+    cell_lamports: u64,
+    cell: CellHeader,
 }
 
 impl State {
@@ -33,8 +34,8 @@ impl State {
         self.payer_lamports =
             self.payer_lamports.checked_sub(evidence.fee).ok_or("fee payer exhausted")?;
         if !Record::fails(record.id) {
-            self.counter.count += u64::from(record.id);
-            self.counter.updates += 1;
+            self.cell.value += u64::from(record.id);
+            self.cell.revision += 1;
         }
         Ok(())
     }
@@ -80,11 +81,11 @@ impl Record {
 async fn state(er: &ErCtx, keys: &[Pubkey; 2]) -> Result<State> {
     let accounts = er.accounts(keys).await?;
     let payer = accounts[0].as_ref().ok_or("fee payer missing")?;
-    let counter = accounts[1].as_ref().ok_or("counter missing")?;
+    let cell = accounts[1].as_ref().ok_or("cell missing")?;
     Ok(State {
         payer_lamports: payer.lamports,
-        counter_lamports: counter.lamports,
-        counter: MainAccount::try_decode(&counter.data)?,
+        cell_lamports: cell.lamports,
+        cell: CellHeader::try_decode(&cell.data)?,
     })
 }
 
@@ -101,7 +102,7 @@ impl Workload {
         check_eq!(
             state(er, &self.keys).await?,
             self.expected,
-            "counter, rollback and fees must match transaction evidence"
+            "cell, rollback and fees must match transaction evidence"
         )?;
         Ok(())
     }
@@ -109,9 +110,11 @@ impl Workload {
     async fn submit(&mut self, er: &ErCtx, confirm: bool) -> Result<Record> {
         self.next_id = self.next_id.checked_add(1).ok_or("transaction ids exhausted")?;
         let id = self.next_id;
-        let mut instructions = vec![build::add_unsigned(self.owner, id)];
+        let mut instructions =
+            vec![REDSHIFT.batch().add(&[REDSHIFT.primary(self.owner)], i64::from(id)).build()];
         if Record::fails(id) {
-            instructions.push(build::fail(self.owner));
+            instructions
+                .push(REDSHIFT.batch().writable(&[REDSHIFT.primary(self.owner)]).fail(0).build());
         }
         let tx = Transaction::new_signed_with_payer(
             &instructions,
@@ -196,17 +199,17 @@ impl PrivateErScenario for CheckpointDurability {
         )
         .await?;
         let owner = base.funded_payer(PAYER_LAMPORTS).await?;
-        let (counter, setup) =
-            base.schedulecommit(&owner).prepare_counter(private.identity(), u32::MAX);
+        let (cell, setup) =
+            base.cells(REDSHIFT, &owner).prepare_delegated(private.identity(), u32::MAX);
         base.submit_and_confirm(&owner, &setup).await?;
         let payer = base.delegated_payer(&owner, private.identity(), PAYER_LAMPORTS).await?;
-        let keys = [payer.pubkey(), counter];
+        let keys = [payer.pubkey(), cell];
         let expected =
             check::poll_for("accounts cloned", TIMEOUT, || state(private.ctx(), &keys)).await?;
         check_eq!(
-            (expected.counter.count, expected.counter.updates),
+            (expected.cell.value, expected.cell.revision),
             (0, 0),
-            "fresh counter"
+            "fresh cell"
         )?;
         let workload = Workload {
             payer,

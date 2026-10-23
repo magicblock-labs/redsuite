@@ -65,6 +65,19 @@ impl CheckError {
     }
 }
 
+/// Requires a failed operation and returns its original error for inspection.
+pub fn expect_error<T: Debug>(
+    result: crate::Result<T>,
+    check: &str,
+) -> Result<DynError, CheckError> {
+    match result {
+        Err(error) => Ok(error),
+        Ok(value) => Err(CheckError::new(check)
+            .expected("operation rejected")
+            .actual(format!("{value:?}"))),
+    }
+}
+
 #[macro_export]
 macro_rules! check {
     ($condition:expr, $($message:tt)+) => {

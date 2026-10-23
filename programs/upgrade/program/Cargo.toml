@@ -15,3 +15,4 @@ upgraded = []
 [dependencies]
 redline-interface = { workspace = true }
 solana-program = { workspace = true }
+wincode = { workspace = true }

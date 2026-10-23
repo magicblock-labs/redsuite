@@ -10,6 +10,7 @@ use pubkey::Pubkey;
 use redsuite_core::{
     check, check_eq, host, prep,
     profile::ProfileValues,
+    programs::{HashState, Redline},
     redline::{causal, Accounts},
     report::Unit::{Count, Micros, Ratio, Seconds, Tps},
     runner::{
@@ -24,11 +25,7 @@ use signature::Signature;
 use tracing::debug;
 use url::Url;
 
-use crate::{
-    metrics,
-    program::{instruction::build, layout, utils::hash_chain},
-    ACCOUNT_SPACE,
-};
+use crate::{metrics, program::layout, ACCOUNT_SPACE};
 
 const PAYER_LAMPORTS: u64 = 200_000_000;
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(900);
@@ -146,8 +143,7 @@ fn build_ixs(
     raise_budget: bool,
 ) -> Vec<Instruction> {
     let pda = accounts[slot_of(global_id, accounts.len())];
-    let compute =
-        build::expensive_hash_compute_at(PROGRAM, global_id, causal::HASH_INIT, iters, &[pda]);
+    let compute = Redline::at(PROGRAM).hash(global_id, causal::HASH_INIT.to_bytes(), iters, &[pda]);
     if raise_budget {
         vec![causal::compute_unit_limit(causal::CU_LIMIT), compute]
     } else {
@@ -536,7 +532,7 @@ impl Scenario<ScenarioReport> for ExecutorSaturation {
             cells.push(cell);
         }
 
-        let expected_hash = hash_chain(causal::HASH_INIT.to_bytes(), profile.heavy_iters);
+        let expected_hash = HashState::chain(causal::HASH_INIT.to_bytes(), profile.heavy_iters);
         for (index, pda) in accounts.iter().enumerate() {
             let on_er = er.account(pda).await?.ok_or("pda not on er")?;
             let hash_bytes =

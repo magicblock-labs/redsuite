@@ -6,7 +6,6 @@ use signature::Signature;
 pub mod load;
 pub mod scenarios;
 pub use redline_interface as program;
-pub use redsuite_core::redline::written_id as account_update_id;
 
 pub const ACCOUNT_SPACE: u32 = 256;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);

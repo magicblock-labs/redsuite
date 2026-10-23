@@ -6,9 +6,5 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-borsh = { workspace = true }
-pubkey = { workspace = true }
-instruction = { workspace = true }
-sdk-ids = { workspace = true }
-solana-program-error = { workspace = true }
-sdk = { workspace = true, features = ["instruction"] }
+fixture.workspace = true
+pubkey.workspace = true

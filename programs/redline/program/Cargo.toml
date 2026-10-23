@@ -9,9 +9,6 @@ authors.workspace = true
 crate-type = ["cdylib", "lib"]
 
 [dependencies]
-borsh = { workspace = true }
-redline-interface = { workspace = true }
-solana-program = { workspace = true }
-pubkey = { workspace = true }
-bincode = { workspace = true }
-sdk = { workspace = true }
+fixture.workspace = true
+redline-interface.workspace = true
+solana-program.workspace = true

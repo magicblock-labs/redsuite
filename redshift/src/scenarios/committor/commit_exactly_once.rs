@@ -5,13 +5,10 @@ use std::{
 
 use keypair::Keypair;
 use pubkey::Pubkey;
-use redshift_interface::{
-    schedulecommit,
-    schedulecommit::{build as counter, MainAccount},
-};
 use redsuite_core::{
     check, check_eq, dlp,
     netfault::{BaseProxies, RuleHandle, Selector},
+    programs::{Action, CellHeader, CellId, IntentBundle, REDLINE, REDSHIFT},
     receipt::{self, CommitReceipt},
     topology::RestartConfig,
     BaseCtx, ChainCtx, ErCtx, Result, Scenario,
@@ -48,25 +45,25 @@ struct FaultedCommit<'a> {
     restart: bool,
 }
 
-async fn base_count(base: &BaseCtx, counter: &Pubkey) -> Result<u64> {
-    let account = base.account(counter).await?.ok_or("the base counter is missing")?;
-    Ok(MainAccount::try_decode(&account.data)?.count)
+async fn base_count(base: &BaseCtx, cell: &Pubkey) -> Result<u64> {
+    let account = base.account(cell).await?.ok_or("the base cell is missing")?;
+    Ok(CellHeader::try_decode(&account.data)?.value)
 }
 
 async fn hold_count(
     base: &BaseCtx,
-    counter: &Pubkey,
+    cell: &Pubkey,
     expected: u64,
     window: Duration,
     phase: &str,
 ) -> Result<()> {
     let deadline = Instant::now() + window;
     loop {
-        let count = base_count(base, counter).await?;
+        let count = base_count(base, cell).await?;
         check_eq!(
             count,
             expected,
-            "{phase}: the base counter must not move once the action has \
+            "{phase}: the base cell must not move once the action has \
              executed"
         )?;
         if Instant::now() >= deadline {
@@ -205,36 +202,31 @@ async fn follow_up_commit(
 
 async fn action_blackout(proxies: &BaseProxies, base: &BaseCtx, er: &ErCtx) -> Result<()> {
     let payer = base.funded_payer(PAYER_LAMPORTS).await?;
-    let (init, counter) = counter::init_account(payer.pubkey(), payer.pubkey());
+    let (init, cell) = REDSHIFT.create(
+        payer.pubkey(),
+        CellId::new(payer.pubkey(), 0),
+        CellHeader::SIZE as u32,
+    );
     base.submit_and_confirm(
         &payer,
-        &[
-            init,
-            dlp::top_up_ephemeral_balance(
-                &payer.pubkey(),
-                ACTION_ESCROW_LAMPORTS,
-                schedulecommit::ACTOR_ESCROW_INDEX,
-            ),
-        ],
+        &[init, dlp::top_up_ephemeral_balance(&payer.pubkey(), ACTION_ESCROW_LAMPORTS, 1)],
     )
     .await?;
     check_eq!(
-        base_count(base, &counter).await?,
+        base_count(base, &cell).await?,
         0,
-        "the base counter starts at zero"
+        "the base cell starts at zero"
     )?;
     let submission =
-        proxies.intercept(Selector::method("sendTransaction").http().response().account(&counter));
+        proxies.intercept(Selector::method("sendTransaction").http().response().account(&cell));
+    let action = REDSHIFT
+        .batch()
+        .add(&[cell], i64::from(ACTION_COUNT))
+        .action(cell, REDSHIFT.id());
+    let mut bundle = IntentBundle::new(payer.pubkey());
+    bundle.actions.push(Action::new(payer.pubkey(), action, ACTION_COMPUTE_UNITS));
     let intent_signature = er
-        .submit_and_confirm(
-            &payer,
-            &[counter::create_action_intent(
-                payer.pubkey(),
-                counter,
-                ACTION_COUNT,
-                ACTION_COMPUTE_UNITS,
-            )],
-        )
+        .submit_and_confirm(&payer, &[REDSHIFT.batch().intents(bundle).build()])
         .await?;
     let held = submission.wait(INTERCEPT_TIMEOUT).await?;
     let landed = held.operation.signature()?;
@@ -245,14 +237,14 @@ async fn action_blackout(proxies: &BaseProxies, base: &BaseCtx, er: &ErCtx) -> R
         base_tx.err
     )?;
     check::poll(
-        "the base counter shows the action once before the fault is applied",
+        "the base cell shows the action once before the fault is applied",
         BASE_STATE_TIMEOUT,
-        || async { matches!(base_count(base, &counter).await, Ok(1)) },
+        || async { matches!(base_count(base, &cell).await, Ok(1)) },
     )
     .await?;
     let confirmations = withhold_confirmations(proxies, &landed);
     held.discard();
-    hold_count(base, &counter, 1, BLACKOUT_WINDOW, "action blackout").await?;
+    hold_count(base, &cell, 1, BLACKOUT_WINDOW, "action blackout").await?;
     for rule in confirmations {
         rule.remove();
     }
@@ -266,7 +258,7 @@ async fn action_blackout(proxies: &BaseProxies, base: &BaseCtx, er: &ErCtx) -> R
         )?;
         receipt.confirm(base.api(), BASE_CONFIRM_TIMEOUT).await?;
     }
-    hold_count(base, &counter, 1, SETTLE_WINDOW, "action settle").await?;
+    hold_count(base, &cell, 1, SETTLE_WINDOW, "action settle").await?;
     Ok(())
 }
 
@@ -282,7 +274,8 @@ impl Scenario for CommitExactlyOnce {
         er.proxies().ok_or(PROXIED_GROUP)?;
         let identity = er.identity();
         let payer = base.funded_payer(PAYER_LAMPORTS).await?;
-        let account = base.redline(&payer).init_delegated(ACCOUNT_SPACE, identity, 0).await?;
+        let account =
+            base.cells(REDLINE, &payer).create_delegated(ACCOUNT_SPACE, identity, 0).await?;
         let on_base = base.account(&account).await?.ok_or("pda not on base")?;
         check_eq!(
             on_base.owner,

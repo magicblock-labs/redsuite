@@ -4,6 +4,7 @@ use pubkey::Pubkey;
 use redsuite_core::{
     check, check_eq,
     profile::ProfileValues,
+    programs::{CellHeader, HashState, REDLINE},
     redline::{causal, Accounts},
     report::Unit,
     runner::{execute, Pacing, RunConfig, RunOutcome},
@@ -16,11 +17,7 @@ use redsuite_core::{
 use signature::Signature;
 use tracing::debug;
 
-use crate::{
-    metrics,
-    program::{instruction::build, layout, utils::hash_chain},
-    ACCOUNT_SPACE,
-};
+use crate::{metrics, program::layout, ACCOUNT_SPACE};
 
 const PAYER_LAMPORTS: u64 = 2_000_000_000;
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(300);
@@ -91,8 +88,12 @@ async fn run_cell(
     let warmup_request = |iteration: u64| {
         let global_id = offset + iteration;
         let pda_index = ((global_id - 1) % pdas.len() as u64) as usize;
-        let ix =
-            build::expensive_hash_compute(global_id, causal::HASH_INIT, iters, &[pdas[pda_index]]);
+        let ix = REDLINE.hash(
+            global_id,
+            causal::HASH_INIT.to_bytes(),
+            iters,
+            &[pdas[pda_index]],
+        );
         let sender = senders[(global_id as usize) % senders.len()].clone();
         sender.staged([ix])
     };
@@ -120,9 +121,8 @@ async fn run_cell(
         offset + profile.warmup + 1,
         profile.iterations as usize,
     ));
-    let updates = Rc::new(
-        AccountUpdates::connect(er.ws_url(), crate::account_update_id, clock.clone()).await?,
-    );
+    let updates =
+        Rc::new(AccountUpdates::connect(er.ws_url(), CellHeader::written_id, clock.clone()).await?);
     for pda in pdas {
         updates.account_subscribe(pda).await?;
     }
@@ -133,8 +133,12 @@ async fn run_cell(
     let request = |iteration: u64| {
         let global_id = offset + iteration;
         let pda_index = ((global_id - 1) % pdas.len() as u64) as usize;
-        let ix =
-            build::expensive_hash_compute(global_id, causal::HASH_INIT, iters, &[pdas[pda_index]]);
+        let ix = REDLINE.hash(
+            global_id,
+            causal::HASH_INIT.to_bytes(),
+            iters,
+            &[pdas[pda_index]],
+        );
         updates.track(global_id, pdas[pda_index]);
         let sender = senders[(global_id as usize) % senders.len()].clone();
         let probe = probe.clone();
@@ -201,7 +205,7 @@ async fn run_cell(
     })
 }
 
-pub struct HighCu {
+pub struct ComputeCostThroughput {
     base: Rc<BaseCtx>,
     er: ErCtx,
     profile: &'static Profile,
@@ -209,7 +213,7 @@ pub struct HighCu {
     pdas: Vec<Pubkey>,
 }
 
-impl Scenario<ScenarioReport> for HighCu {
+impl Scenario<ScenarioReport> for ComputeCostThroughput {
     async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
         let profile = PROFILES.select(base.config().profile);
         let payers = base.funded_payers(profile.payers, PAYER_LAMPORTS).await?;
@@ -269,7 +273,7 @@ impl Scenario<ScenarioReport> for HighCu {
 
         let heavy_start = offset - profile.iterations + 1;
         let heavy_end = offset;
-        let expected_hash = hash_chain(causal::HASH_INIT.to_bytes(), HEAVY_ITERS);
+        let expected_hash = HashState::chain(causal::HASH_INIT.to_bytes(), HEAVY_ITERS);
         let pool = pdas.len() as u64;
         let end_index = (heavy_end - 1) % pool;
         for (index, pda) in pdas.iter().enumerate() {
@@ -284,7 +288,7 @@ impl Scenario<ScenarioReport> for HighCu {
             }
             let on_er = er.account(pda).await?.ok_or("pda not on er")?;
             check_eq!(
-                crate::account_update_id(&on_er.data),
+                CellHeader::written_id(&on_er.data),
                 Some(last_id),
                 "er copy must hold the last id written to pda {index}"
             )?;

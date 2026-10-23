@@ -4,9 +4,12 @@ use account::Account;
 use instruction::Instruction;
 use keypair::Keypair;
 use pubkey::Pubkey;
-use redshift_interface::schedulecommit::build as counter;
+
 use redsuite_core::{
-    api::TxError, check, check_eq, prep, topology, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
+    api::TxError,
+    check, check_eq, prep,
+    programs::{CellId, Task, MAGIC, REDSHIFT},
+    topology, BaseCtx, ChainCtx, DynError, ErCtx, Result, Scenario,
 };
 use signer::Signer;
 
@@ -18,25 +21,38 @@ const SCHEDULER_PROGRAM: Pubkey = topology::HYDRA_EPHEMERAL_ID;
 
 struct Actor {
     payer: Keypair,
-    counter: Pubkey,
+    cell: Pubkey,
+}
+
+impl Actor {
+    fn schedule(&self, task: Task, instruction: Instruction) -> Instruction {
+        let authority = self.payer.pubkey();
+        REDSHIFT
+            .batch()
+            .invoke_signed(
+                MAGIC.schedule(authority, self.cell, task, vec![instruction]),
+                &[CellId::new(authority, 0)],
+            )
+            .build()
+    }
 }
 
 async fn scheduled_actor(base: &BaseCtx, er: &ErCtx, funder: &Keypair) -> Result<Actor> {
     let payer = base.funded_payer(PAYER_LAMPORTS).await?;
-    let counter = base
-        .schedulecommit(&payer)
-        .init_counter(er.identity(), prep::COMMIT_FREQUENCY_MS)
+    let cell = base
+        .cells(REDSHIFT, &payer)
+        .create_primary(er.identity(), prep::COMMIT_FREQUENCY_MS)
         .await?;
     base.delegate_payer(funder, &payer, er.identity()).await?;
-    check::poll("the ER clones the counter", TIMEOUT, || async {
-        matches!(er.account(&counter).await, Ok(Some(account)) if !account.data.is_empty())
+    check::poll("the ER clones the cell", TIMEOUT, || async {
+        matches!(er.account(&cell).await, Ok(Some(account)) if !account.data.is_empty())
     })
     .await?;
-    Ok(Actor { payer, counter })
+    Ok(Actor { payer, cell })
 }
 
 async fn er_count(er: &ErCtx, actor: &Actor) -> Result<u64> {
-    Ok(er.schedulecommit(&actor.payer).counter(&actor.counter).await?.count)
+    Ok(er.cells(REDSHIFT, &actor.payer).read(&actor.cell).await?.value)
 }
 
 async fn tasks(er: &ErCtx) -> Result<Vec<(Pubkey, Account)>> {
@@ -48,11 +64,9 @@ async fn await_tasks(er: &ErCtx, expected: usize) -> Result<Vec<(Pubkey, Account
         &format!("the validator holds {expected} scheduled task account(s)"),
         TIMEOUT,
         || async {
-            match tasks(er).await {
-                Ok(found) if found.len() == expected => Ok(found),
-                Ok(found) => Err(format!("{} task account(s)", found.len())),
-                Err(error) => Err(error.to_string()),
-            }
+            let found = tasks(er).await?;
+            check_eq!(found.len(), expected, "scheduled task count")?;
+            Ok::<_, DynError>(found)
         },
     )
     .await?;
@@ -79,12 +93,13 @@ async fn schedule(
 ) -> Result<()> {
     er.submit_and_confirm(
         &actor.payer,
-        &[counter::schedule_counter_task(
-            actor.payer.pubkey(),
-            task_id,
-            interval_ms,
-            iterations,
-            false,
+        &[actor.schedule(
+            Task {
+                id: task_id,
+                interval_ms,
+                iterations,
+            },
+            REDSHIFT.batch().add(&[actor.cell], 1).build(),
         )],
     )
     .await?;
@@ -94,23 +109,18 @@ async fn schedule(
 async fn cancel(er: &ErCtx, actor: &Actor, task_id: i64) -> Result<()> {
     er.submit_and_confirm(
         &actor.payer,
-        &[
-            counter::cancel_counter_task(actor.payer.pubkey(), task_id),
-            Instruction {
-                program_id: redshift_interface::ID,
-                accounts: vec![],
-                data: redshift_interface::log_msg_data(&rand::random::<u64>().to_string()),
-            },
-        ],
+        &[REDSHIFT
+            .batch()
+            .nonce(rand::random())
+            .invoke(MAGIC.cancel(actor.payer.pubkey(), task_id))
+            .build()],
     )
     .await?;
     Ok(())
 }
 
 fn tx_failure(attempt: Result<()>, context: &str) -> Result<Box<TxError>> {
-    let error = attempt
-        .err()
-        .ok_or_else(|| format!("{context}: transaction unexpectedly succeeded"))?;
+    let error = check::expect_error(attempt, context)?;
     error
         .downcast::<TxError>()
         .map_err(|error| format!("{context}: expected an on-chain rejection, got {error}").into())
@@ -154,12 +164,17 @@ async fn test_signed_refusal(er: &ErCtx, actor: &Actor) -> Result<()> {
     let error = tx_failure(
         er.submit_and_confirm(
             &actor.payer,
-            &[counter::schedule_counter_task(
-                actor.payer.pubkey(),
-                103,
-                TASK_INTERVAL_MS,
-                3,
-                true,
+            &[actor.schedule(
+                Task {
+                    id: 103,
+                    interval_ms: TASK_INTERVAL_MS,
+                    iterations: 3,
+                },
+                REDSHIFT
+                    .batch()
+                    .add(&[actor.cell], 1)
+                    .require_signer(actor.payer.pubkey())
+                    .build(),
             )],
         )
         .await
@@ -224,7 +239,7 @@ async fn sponsor_balance(er: &ErCtx) -> Result<u64> {
 async fn test_sponsor_refund(er: &ErCtx, actor: &Actor) -> Result<()> {
     er.submit_and_confirm(
         &actor.payer,
-        &[counter::add_unsigned(actor.payer.pubkey(), 0)],
+        &[REDSHIFT.batch().add(&[actor.cell], 0).build()],
     )
     .await?;
     let before = sponsor_balance(er).await?;

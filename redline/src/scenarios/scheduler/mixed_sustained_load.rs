@@ -9,6 +9,7 @@ use pubkey::Pubkey;
 use redsuite_core::{
     check, check_eq, host, prep,
     profile::ProfileValues,
+    programs::{CellHeader, HashState, REDLINE},
     redline::{causal, Accounts},
     report::Unit,
     runner::{
@@ -21,12 +22,7 @@ use tokio::sync::{watch, Mutex};
 use tracing::{debug, info};
 use url::Url;
 
-use crate::{
-    load::Options,
-    metrics,
-    program::{instruction::build, layout, utils::hash_chain},
-    ACCOUNT_SPACE,
-};
+use crate::{load::Options, metrics, program::layout, ACCOUNT_SPACE};
 
 const PAYER_LAMPORTS: u64 = 4_000_000_000;
 const CLONE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -39,45 +35,45 @@ const PENDING_TRANSACTIONS: &str = "engine_ledger_pending_transactions";
 const ORDERING_DEPENDENCIES: &str = "engine_processor_ordering_dependencies";
 
 const MIX_PERIOD: u64 = 20;
-const HIGH_CU_SLOTS: u64 = 2;
-const SIMPLE_SLOTS: u64 = 9;
-const READ_WRITE_SLOTS: u64 = MIX_PERIOD - HIGH_CU_SLOTS - SIMPLE_SLOTS;
+const HASH_COMPUTE_SLOTS: u64 = 2;
+const PATTERN_WRITE_SLOTS: u64 = 9;
+const SIZE_SUM_SLOTS: u64 = MIX_PERIOD - HASH_COMPUTE_SLOTS - PATTERN_WRITE_SLOTS;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum Mode {
-    HighCu,
-    SimpleWrite,
-    ReadWrite,
+    HashCompute,
+    PatternWrite,
+    AccountSizeSum,
 }
 
 impl Mode {
-    const ALL: [Mode; 3] = [Mode::HighCu, Mode::SimpleWrite, Mode::ReadWrite];
+    const ALL: [Mode; 3] = [Mode::HashCompute, Mode::PatternWrite, Mode::AccountSizeSum];
 
     fn label(self) -> &'static str {
         match self {
-            Mode::HighCu => "high cu",
-            Mode::SimpleWrite => "simple write",
-            Mode::ReadWrite => "read write",
+            Mode::HashCompute => "hash compute",
+            Mode::PatternWrite => "pattern write",
+            Mode::AccountSizeSum => "account size sum",
         }
     }
 }
 
 fn mode_for(id: u64) -> Mode {
     let slot = (id - 1) % MIX_PERIOD;
-    if slot < HIGH_CU_SLOTS {
-        Mode::HighCu
-    } else if slot < HIGH_CU_SLOTS + SIMPLE_SLOTS {
-        Mode::SimpleWrite
+    if slot < HASH_COMPUTE_SLOTS {
+        Mode::HashCompute
+    } else if slot < HASH_COMPUTE_SLOTS + PATTERN_WRITE_SLOTS {
+        Mode::PatternWrite
     } else {
-        Mode::ReadWrite
+        Mode::AccountSizeSum
     }
 }
 
 fn mode_count(mode: Mode, total: u64) -> u64 {
     let (offset, width) = match mode {
-        Mode::HighCu => (0, HIGH_CU_SLOTS),
-        Mode::SimpleWrite => (HIGH_CU_SLOTS, SIMPLE_SLOTS),
-        Mode::ReadWrite => (HIGH_CU_SLOTS + SIMPLE_SLOTS, READ_WRITE_SLOTS),
+        Mode::HashCompute => (0, HASH_COMPUTE_SLOTS),
+        Mode::PatternWrite => (HASH_COMPUTE_SLOTS, PATTERN_WRITE_SLOTS),
+        Mode::AccountSizeSum => (HASH_COMPUTE_SLOTS + PATTERN_WRITE_SLOTS, SIZE_SUM_SLOTS),
     };
     let periods = total / MIX_PERIOD;
     let tail = (total % MIX_PERIOD).saturating_sub(offset).min(width);
@@ -127,7 +123,7 @@ struct Profile {
     iterations: u64,
     rate: u32,
     threads: usize,
-    high_cu_iters: u32,
+    hash_iters: u32,
 }
 
 impl Profile {
@@ -144,7 +140,7 @@ const LITE: Profile = Profile {
     iterations: 63_000,
     rate: 600,
     threads: 1,
-    high_cu_iters: 180,
+    hash_iters: 180,
 };
 
 const FULL: Profile = Profile {
@@ -155,26 +151,26 @@ const FULL: Profile = Profile {
     iterations: 1_022_000,
     rate: 4_000,
     threads: 4,
-    high_cu_iters: 180,
+    hash_iters: 180,
 };
 
 const PROFILES: ProfileValues<Profile> = ProfileValues { lite: LITE, full: FULL };
 
-fn build_ixs(id: u64, pool: &[Pubkey], read_span: usize, high_cu_iters: u32) -> Vec<Instruction> {
+fn build_ixs(id: u64, pool: &[Pubkey], read_span: usize, hash_iters: u32) -> Vec<Instruction> {
     let lanes = pool.len() as u64;
     let lane = lane_of(id, lanes);
     let target = pool[lane as usize];
     match mode_for(id) {
-        Mode::SimpleWrite => vec![build::simple_byte_set(id, &[target])],
-        Mode::HighCu => vec![
+        Mode::PatternWrite => vec![REDLINE.write(id, &[target])],
+        Mode::HashCompute => vec![
             causal::compute_unit_limit(causal::CU_LIMIT),
-            build::expensive_hash_compute(id, causal::HASH_INIT, high_cu_iters, &[target]),
+            REDLINE.hash(id, causal::HASH_INIT.to_bytes(), hash_iters, &[target]),
         ],
-        Mode::ReadWrite => {
+        Mode::AccountSizeSum => {
             let sources: Vec<Pubkey> = (1..=read_span as u64)
                 .map(|step| pool[((lane + step) % lanes) as usize])
                 .collect();
-            vec![build::multi_account_read(id, target, &sources)]
+            vec![REDLINE.sum_sizes(id, target, &sources)]
         }
     }
 }
@@ -195,7 +191,7 @@ struct ExecuteConfig {
     lanes: u64,
     limit: Limit,
     read_span: usize,
-    high_cu_iters: u32,
+    hash_iters: u32,
     rate: u32,
     threads: usize,
     concurrency: usize,
@@ -221,7 +217,7 @@ async fn execute(
     let limit = config.limit;
     let concurrency = split_budget(config.concurrency as u64, spans.len());
     let read_span = config.read_span;
-    let high_cu_iters = config.high_cu_iters;
+    let hash_iters = config.hash_iters;
     let outcomes = spawn_workers(spans.len(), move |worker| {
         let index = worker.index;
         let span = spans[index];
@@ -238,7 +234,7 @@ async fn execute(
             let request = |iteration| {
                 let id = span.job_id(iteration - 1, lanes);
                 let lane_index = (lane_of(id, lanes) - span.lo) as usize;
-                let ixs = build_ixs(id, &pool, read_span, high_cu_iters);
+                let ixs = build_ixs(id, &pool, read_span, hash_iters);
                 let sender = senders[(id as usize) % senders.len()].clone();
                 let locks = locks.clone();
                 async move {
@@ -337,10 +333,10 @@ async fn verify_final_state(
     er: &ErCtx,
     pool: &[Pubkey],
     last_ids: &[Option<u64>],
-    high_cu_iters: u32,
+    hash_iters: u32,
     read_span: usize,
 ) -> Result<()> {
-    let expected_hash = hash_chain(causal::HASH_INIT.to_bytes(), high_cu_iters);
+    let expected_hash = HashState::chain(causal::HASH_INIT.to_bytes(), hash_iters);
     let expected_sum = (read_span as u64) * u64::from(ACCOUNT_SPACE);
     for (index, pda) in pool.iter().enumerate() {
         let Some(last_id) = last_ids[index] else {
@@ -350,33 +346,33 @@ async fn verify_final_state(
         let data = &account.data;
         let mode = mode_for(last_id);
         check_eq!(
-            crate::account_update_id(data),
+            CellHeader::written_id(data),
             Some(last_id),
             "lane {index} must hold id {last_id}, the last {} write",
             mode.label()
         )?;
         match mode {
-            Mode::SimpleWrite => {
+            Mode::PatternWrite => {
                 let filled = data[layout::DATA_OFFSET..]
                     .chunks_exact(layout::ID_SIZE)
                     .all(|chunk| chunk == last_id.to_le_bytes());
                 check!(
                     filled,
                     "lane {index} must be filled with the repeated id \
-                     {last_id} — the last simple write did not land"
+                     {last_id} — the last pattern write did not land"
                 )?;
             }
-            Mode::HighCu => {
+            Mode::HashCompute => {
                 let hash = &data[layout::HASH_OFFSET..layout::HASH_OFFSET + layout::HASH_SIZE];
                 check_eq!(
                     hash,
                     expected_hash,
-                    "lane {index} must hold the {high_cu_iters}-iteration \
+                    "lane {index} must hold the {hash_iters}-iteration \
                      hash chain from id {last_id}"
                 )?;
             }
-            Mode::ReadWrite => {
-                let offset = layout::ID_OFFSET + layout::ID_SIZE;
+            Mode::AccountSizeSum => {
+                let offset = layout::DATA_OFFSET;
                 let sum = &data[offset..offset + 8];
                 check_eq!(
                     sum,
@@ -505,7 +501,7 @@ impl Workload {
                 lanes: profile.lanes,
                 limit,
                 read_span: profile.read_span,
-                high_cu_iters: profile.high_cu_iters,
+                hash_iters: profile.hash_iters,
                 rate,
                 threads,
                 concurrency,
@@ -529,7 +525,7 @@ impl Workload {
             .setting("profile", profile.name)
             .setting(
                 "mix",
-                "10% high cu / 45% simple write / 45% read write, no commits",
+                "10% hash compute / 45% pattern write / 45% account size sum, no commits",
             )
             .setting("workload txs", total)
             .setting("target tps", rate)
@@ -538,7 +534,7 @@ impl Workload {
             .setting("payers", profile.payers)
             .setting("driver threads", threads)
             .setting("total concurrency", concurrency)
-            .setting("high cu sha256 iters", profile.high_cu_iters)
+            .setting("hash-chain iterations", profile.hash_iters)
             .observe("delivery us", Unit::Micros, outcome.delivery)
             .client_side(&outcome)
             .metric("target tps", Unit::Tps, f64::from(rate))
@@ -664,14 +660,7 @@ impl Workload {
                 )?;
             }
 
-            verify_final_state(
-                er,
-                &pool,
-                &last_ids,
-                profile.high_cu_iters,
-                profile.read_span,
-            )
-            .await?;
+            verify_final_state(er, &pool, &last_ids, profile.hash_iters, profile.read_span).await?;
 
             debug!(
                 total,

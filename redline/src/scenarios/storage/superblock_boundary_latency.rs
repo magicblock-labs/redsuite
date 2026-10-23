@@ -9,12 +9,12 @@ use keypair::Keypair;
 use redsuite_core::{
     check, check_eq, host,
     profile::ProfileValues,
-    redline::{copy_three, Accounts},
+    programs::REDLINE,
+    redline::Accounts,
     report::Unit,
     runner::{execute, Pacing, RunConfig},
     sampler::{Sampler, Trailing},
-    topology,
-    topology::{ErOptions, PrivateEr},
+    topology::{self, ErOptions, PrivateEr},
     transport::wsraw::RawWs,
     BaseCtx, MetricsDelta, PrivateErScenario, Result, ScenarioReport, TxSender,
 };
@@ -228,7 +228,7 @@ impl PrivateErScenario<ScenarioReport> for SuperblockBoundaryLatency {
             },
             |id| {
                 let sender = senders[(id as usize) % senders.len()].clone();
-                let (ix, _) = copy_three(&pool, id);
+                let (ix, _) = REDLINE.copy_three(&pool, id);
                 sender.staged([ix])
             },
         )
@@ -277,7 +277,7 @@ impl PrivateErScenario<ScenarioReport> for SuperblockBoundaryLatency {
                 },
                 |id| {
                     let sender = senders[(id as usize) % senders.len()].clone();
-                    let (ix, _) = copy_three(&pool, profile.fill + id);
+                    let (ix, _) = REDLINE.copy_three(&pool, profile.fill + id);
                     sender.staged([ix])
                 },
             )

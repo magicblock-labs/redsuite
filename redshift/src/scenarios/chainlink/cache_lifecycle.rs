@@ -7,16 +7,17 @@ use pubkey::Pubkey;
 use redsuite_core::{
     check, check_eq,
     netfault::{Action, BaseProxies, Selector},
-    system, topology,
-    topology::{ErOptions, PrivateEr},
+    programs::{CellHeader, CellId, HashState, SettlementMode, REDLINE},
+    system,
+    topology::{self, ErOptions, PrivateEr},
     BaseCtx, ChainCtx, PrivateErScenario, Result,
 };
 use signer::Signer;
-use tokio::{time, time::Instant};
+use tokio::time::{self, Instant};
 
 use super::{await_local_value, BASE_REFRESH, BASE_REWRITE, ER_WRITE, FETCHES};
 use crate::{
-    program::{self, instruction::build, layout, utils::fold_hash, DELEGATION_PROGRAM_ID},
+    program::{self, layout, DELEGATION_PROGRAM_ID},
     ACCOUNT_OWNERS, ACCOUNT_SPACE, PAYER_LAMPORTS,
 };
 
@@ -100,8 +101,8 @@ impl PrivateErScenario<(), Mode> for CacheLifecycle {
         let owner = funder.pubkey();
         let payer = base.delegated_payer(&funder, validator, PAYER_LAMPORTS).await?;
         let keys = base
-            .redline(&funder)
-            .init_many(
+            .cells(REDLINE, &funder)
+            .create_many(
                 ACCOUNT_SPACE,
                 validator,
                 READONLY_COUNT + DELEGATED_COUNT + PENDING_COUNT,
@@ -115,20 +116,29 @@ impl PrivateErScenario<(), Mode> for CacheLifecycle {
         } else {
             protected_keys.iter().map(|key| observe("programNotification", key)).collect()
         };
-        let delegates: Vec<_> = protected_keys
-            .iter()
-            .zip(READONLY_COUNT as u8..)
-            .map(|(&key, seed)| build::delegate(owner, key, owner, seed, validator))
+        let delegates: Vec<_> = (READONLY_COUNT..keys.len())
+            .map(|index| {
+                REDLINE.delegate(
+                    owner,
+                    CellId::new(owner, index as u64),
+                    Some(validator),
+                    u32::MAX,
+                )
+            })
             .collect();
         base.submit_and_confirm(&funder, &delegates).await?;
         let stale = try_join_all(stale.iter().map(|trap| trap.wait(TIMEOUT))).await?;
         er.accounts(protected_keys).await?;
-        er.redline(&payer).write(ER_WRITE, er_written_keys).await?;
+        er.cells(REDLINE, &payer).write(ER_WRITE, er_written_keys).await?;
         let settlement =
             http.stall(Selector::method("sendTransaction").request().account(&pending[0]));
         er.submit_and_confirm(
             &funder,
-            &[build::commit_and_undelegate_accounts(1, owner, pending)],
+            &[REDLINE
+                .batch()
+                .nonce(1)
+                .settle(owner, pending, SettlementMode::Undelegate)
+                .build()],
         )
         .await?;
         check::poll("undelegation submission held", TIMEOUT, || async {
@@ -168,7 +178,7 @@ impl PrivateErScenario<(), Mode> for CacheLifecycle {
             let mut id = 0;
             while !done.get() {
                 id += 1;
-                let ixs = [build::hash_fold(id, 0, traffic_keys)];
+                let ixs = [REDLINE.fold_hashes(id, 0, traffic_keys)];
                 let signature = check::poll_for("warmed submission recovers", TIMEOUT, || {
                     sender.submit(&ixs)
                 })
@@ -181,9 +191,12 @@ impl PrivateErScenario<(), Mode> for CacheLifecycle {
                         "only transient program eviction may fail traffic"
                     )?;
                 } else {
-                    hash = fold_hash(id, &[hash], 0);
+                    hash = HashState::fold(id, &[hash], 0);
                     let data = &mut expected[0].as_mut().unwrap().data;
-                    data[layout::ID_OFFSET..layout::HASH_OFFSET].copy_from_slice(&id.to_le_bytes());
+                    let mut header = CellHeader::try_decode(data)?;
+                    header.value = id;
+                    header.revision += 2;
+                    header.write(data)?;
                     data[layout::HASH_OFFSET..layout::HASH_OFFSET + layout::HASH_SIZE]
                         .copy_from_slice(&hash);
                 }
@@ -235,7 +248,7 @@ impl PrivateErScenario<(), Mode> for CacheLifecycle {
                     registered.wait(TIMEOUT).await?.release();
                     let old = old.wait(TIMEOUT).await?;
                     let notification = observe("accountNotification", &target);
-                    base.redline(&funder).write(latest, &[target]).await?;
+                    base.cells(REDLINE, &funder).write(latest, &[target]).await?;
                     notification.wait(TIMEOUT).await?.release();
                     await_local_value(
                         er,
@@ -285,7 +298,7 @@ impl PrivateErScenario<(), Mode> for CacheLifecycle {
             })
             .await?;
             let released_at = Instant::now();
-            base.redline(&funder).write(BASE_REWRITE, pending).await?;
+            base.cells(REDLINE, &funder).write(BASE_REWRITE, pending).await?;
             let recovery = if reconnect_before_settlement {
                 // Observe late recovery for diagnostics, but retain the
                 // TIMEOUT deadline checked after teardown below.
@@ -324,7 +337,7 @@ impl PrivateErScenario<(), Mode> for CacheLifecycle {
                 .await?;
                 None
             };
-            base.redline(&funder).write(BASE_REFRESH, readonly).await?;
+            base.cells(REDLINE, &funder).write(BASE_REFRESH, readonly).await?;
             // Base confirmation does not wait for ER subscription delivery.
             check::poll_for("final readonly mirrors synchronized", TIMEOUT, || async {
                 let fetched = er.accounts(readonly).await?;
@@ -343,7 +356,7 @@ impl PrivateErScenario<(), Mode> for CacheLifecycle {
                 // Readonly entries may be evicted after the fetch.
                 if let Some(local) = local {
                     check_eq!(
-                        crate::written_id(&local.data),
+                        CellHeader::written_id(&local.data),
                         Some(BASE_REFRESH),
                         "retained local value of {key}"
                     )?;

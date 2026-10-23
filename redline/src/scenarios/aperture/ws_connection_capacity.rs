@@ -84,13 +84,13 @@ struct RungOutcome {
     unsubscribe_failures: usize,
 }
 
-pub struct WsConnCapacity {
+pub struct WsConnectionCapacity {
     profile: &'static Profile,
     shared_account: Pubkey,
     private: PrivateEr,
 }
 
-impl Scenario<ScenarioReport> for WsConnCapacity {
+impl Scenario<ScenarioReport> for WsConnectionCapacity {
     async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
         let profile = PROFILES.select(base.config().profile);
         let shared_account: Pubkey = er.identity();

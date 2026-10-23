@@ -19,13 +19,12 @@ use url::Url;
 
 use crate::{
     api::{Api, ConfirmOptions, Metrics, MetricsCollector},
+    cells,
     netfault::BaseProxies,
     profile::ExecutionConfig,
-    redline,
     report::{self, ScenarioReport},
     resources::Resources,
     runner::{Delivery, SendTransaction},
-    schedulecommit,
     topology::{PrivateEr, RestartConfig, RestartTiming},
     DynError, Result,
 };
@@ -39,15 +38,12 @@ const ER_BLOCKHASH_TTL: Duration = Duration::from_secs(2);
 
 pub trait ChainCtx: Sized {
     fn api(&self) -> &Api;
-    fn schedulecommit<'a>(&'a self, payer: &'a Keypair) -> schedulecommit::Program<'a, Self> {
-        schedulecommit::Program { chain: self, payer }
-    }
-    fn redline<'a>(&'a self, payer: &'a Keypair) -> redline::Program<'a, Self> {
-        redline::Program {
-            chain: self,
-            payer,
-            id: redline_interface::ID,
-        }
+    fn cells<'a>(
+        &'a self,
+        program: fixture::Program,
+        payer: &'a Keypair,
+    ) -> cells::Program<'a, Self> {
+        cells::Program { chain: self, payer, program }
     }
     fn submit_and_confirm(
         &self,

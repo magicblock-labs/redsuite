@@ -1,10 +1,11 @@
 use std::{rc::Rc, time::Duration};
 
 use keypair::Keypair;
-use redshift_interface::schedulecommit::{build, MainAccount};
+
 use redsuite_core::{
-    check_eq, prep, topology,
-    topology::{ErOptions, PrivateEr},
+    check_eq, prep,
+    programs::{CellHeader, REDSHIFT},
+    topology::{self, ErOptions, PrivateEr},
     BaseCtx, ChainCtx, PrivateErScenario, Result,
 };
 use signature::Signature;
@@ -89,19 +90,23 @@ impl PrivateErScenario for CloneWithoutAltWrites {
 
         let payer_chain = base.funded_payer(PAYER_LAMPORTS).await?;
         let payer_ephem = base.funded_payer(PAYER_LAMPORTS).await?;
-        let counter = base
-            .schedulecommit(&payer_ephem)
-            .init_counter(er.identity(), prep::COMMIT_FREQUENCY_MS)
+        let cell = base
+            .cells(REDSHIFT, &payer_ephem)
+            .create_primary(er.identity(), prep::COMMIT_FREQUENCY_MS)
             .await?;
         base.delegate_payer(&payer_chain, &payer_ephem, er.identity()).await?;
-        er.submit_and_confirm(&payer_ephem, &[build::add(payer_ephem.pubkey(), 1)])
-            .await?;
-        let clone = er
-            .account(&counter)
-            .await?
-            .ok_or("the counter clone is missing after the add")?;
+        er.submit_and_confirm(
+            &payer_ephem,
+            &[REDSHIFT
+                .batch()
+                .add(&[REDSHIFT.primary(payer_ephem.pubkey())], 1)
+                .require_signer(payer_ephem.pubkey())
+                .build()],
+        )
+        .await?;
+        let clone = er.account(&cell).await?.ok_or("the cell clone is missing after the add")?;
         check_eq!(
-            MainAccount::try_decode(&clone.data)?.count,
+            CellHeader::try_decode(&clone.data)?.value,
             1,
             "the ER clone must show the add"
         )?;

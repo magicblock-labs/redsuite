@@ -10,6 +10,7 @@ use redsuite_core::{
     api::custom_error_code,
     check, check_eq,
     profile::ProfileValues,
+    programs::{SettlementMode, REDLINE},
     receipt,
     redline::Accounts,
     report::Unit,
@@ -23,7 +24,7 @@ use signer::Signer;
 use tokio::time;
 use tracing::debug;
 
-use crate::program::{instruction::build, DELEGATION_PROGRAM_ID};
+use crate::program::DELEGATION_PROGRAM_ID;
 
 const PAYER_LAMPORTS: u64 = 5_000_000_000;
 
@@ -202,7 +203,11 @@ impl Scenario<ScenarioReport> for CommitWidthEnvelope {
         // ScheduledCommitSent receipt, confirm its base-layer signatures
         let request = |width: usize, id: u64, tally: Rc<RefCell<CellTally>>| {
             let accounts = commit_set(&pdas, width, id);
-            let ix = build::commit_accounts(id, payer_pubkey, &accounts);
+            let ix = REDLINE
+                .batch()
+                .nonce(id)
+                .settle(payer_pubkey, &accounts, SettlementMode::Commit)
+                .build();
             let sender = sender.clone();
             let er_api = er.api().clone();
             let base_api = base.api().clone();
@@ -401,7 +406,11 @@ impl Scenario<ScenarioReport> for CommitWidthEnvelope {
             {
                 let accounts: Vec<Pubkey> = pdas.iter().copied().take(15).collect();
                 offset += 1;
-                let ix = build::commit_accounts(offset, payer_pubkey, &accounts);
+                let ix = REDLINE
+                    .batch()
+                    .nonce(offset)
+                    .settle(payer_pubkey, &accounts, SettlementMode::Commit)
+                    .build();
                 let flow_before = snapshot_base_flow(base.api()).await?;
                 let before = er.scrape_metrics().await?;
                 let tx = sender.prepare(&[ix]).await?;
@@ -480,7 +489,11 @@ impl Scenario<ScenarioReport> for CommitWidthEnvelope {
             {
                 let accounts: Vec<Pubkey> = pdas.iter().copied().take(30).collect();
                 offset += 1;
-                let ix = build::commit_accounts(offset, payer_pubkey, &accounts);
+                let ix = REDLINE
+                    .batch()
+                    .nonce(offset)
+                    .settle(payer_pubkey, &accounts, SettlementMode::Commit)
+                    .build();
                 let before = er.scrape_metrics().await?;
                 let commit_signature = sender.submit(&[ix]).await?;
                 let outcome_note =
@@ -569,7 +582,11 @@ impl Scenario<ScenarioReport> for CommitWidthEnvelope {
                 let probe_sender = er.sender(Rc::new(probe_payer));
                 for commit_round in 1..=receipt::SPONSORED_COMMIT_LIMIT {
                     offset += 1;
-                    let ix = build::commit_accounts(offset, probe_payer_pubkey, &[probe_account]);
+                    let ix = REDLINE
+                        .batch()
+                        .nonce(offset)
+                        .settle(probe_payer_pubkey, &[probe_account], SettlementMode::Commit)
+                        .build();
                     let commit_signature = probe_sender.submit(&[ix]).await?;
                     super::settled_receipt(
                         er.api(),
@@ -583,7 +600,11 @@ impl Scenario<ScenarioReport> for CommitWidthEnvelope {
                     .await?;
                 }
                 offset += 1;
-                let ix = build::commit_accounts(offset, probe_payer_pubkey, &[probe_account]);
+                let ix = REDLINE
+                    .batch()
+                    .nonce(offset)
+                    .settle(probe_payer_pubkey, &[probe_account], SettlementMode::Commit)
+                    .build();
                 let rejected_signature = probe_sender.submit(&[ix]).await?;
                 let rejection_code =
                     match scheduling_outcome(er.api(), &rejected_signature, REJECTION_TIMEOUT)

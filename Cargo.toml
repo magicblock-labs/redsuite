@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "programs/fixture",
     "crates/redsuite-core",
     "redline",
     "redshift",
@@ -23,6 +24,7 @@ license = "MIT"
 authors = ["Magicblock Labs <dev@magicblock.gg>"]
 
 [workspace.dependencies]
+fixture = { path = "programs/fixture" }
 clap = { version = "4", features = ["derive", "env"] }
 humantime = "2"
 redsuite-core = { path = "crates/redsuite-core" }
@@ -59,20 +61,19 @@ rand = "0.8"
 base64 = "0.22"
 bytes = "1"
 bincode = "1.3"
-wincode = "0.5"
-borsh = "1.5"
+wincode = { version = "0.5", features = ["derive"] }
 sha2 = "0.10"
 # Same dep shape as the validator's test-integration workspace (the proven pair
 # against the vendored base-programs/dlp.so — see MANIFEST.toml).
 sdk = { package = "ephemeral-rollups-sdk", version = "0.16.2", default-features = false, features = ["modular-sdk"] }
 
-pubkey = { package = "solana-pubkey", version = "4.2", features = ["serde"] }
+pubkey = { package = "solana-pubkey", version = "4.2", features = ["serde", "wincode"] }
 hash = { package = "solana-hash", version = "4.3", features = ["serde", "std", "decode", "copy", "atomic", "sanitize"] }
 transaction = { package = "solana-transaction", version = "4.1", features = ["serde", "wincode"] }
 message = { package = "solana-message", version = "4.1", features = ["serde"] }
 keypair = { package = "solana-keypair", version = "3.1" }
 signature = { package = "solana-signature", version = "3.4" }
-instruction = { package = "solana-instruction", version = "3.4", features = ["serde"] }
+instruction = { package = "solana-instruction", version = "3.4", features = ["serde", "wincode"] }
 account = { package = "solana-account", version = "4.3" }
 signer = { package = "solana-signer", version = "3" }
 sdk-ids = { package = "solana-sdk-ids", version = "3" }
