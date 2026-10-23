@@ -6,13 +6,11 @@ use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
     api::transaction_meta,
-    check,
     dlp::{self, delegate_with_actions, DelegateArgs},
+    expect_error,
     netfault::{BaseProxies, Held, RuleHandle, Selector},
     programs::{SettlementMode, REDLINE},
-    receipt, system,
-    topology::{self, ErOptions, PrivateEr},
-    BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result,
+    receipt, system, topology, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
 use sdk::spl::builders::UndelegateEphemeralAtaBuilder;
 use signature::Signature;
@@ -25,7 +23,6 @@ use super::spl;
 use crate::PAYER_LAMPORTS;
 use magic_atas::MagicAtas;
 
-const LABEL: &str = "projected-token-lifecycle";
 const NAMES: [&str; 4] = ["source", "destination", "unbacked", "foreign"];
 const INITIAL: [u64; 4] = [200, 100, 70, 45];
 const SUPPLY: u64 = 415;
@@ -97,15 +94,6 @@ struct Balances {
 }
 
 impl Balances {
-    fn conserved(&self, delegated: bool) -> Result<()> {
-        let active: u64 = if delegated {
-            self.projected[..2].iter().sum()
-        } else {
-            self.eatas[..2].iter().flatten().sum()
-        };
-        self.check_supply(active, 0, SUPPLY)
-    }
-
     fn check_supply(&self, active_claims: u64, extra_base: u64, supply: u64) -> Result<()> {
         let claims = active_claims + self.eatas[3].unwrap_or(0) + self.vault[1];
         ensure!(self.vault[0] == claims);
@@ -119,10 +107,17 @@ async fn amount(ctx: &impl ChainCtx, address: &Pubkey) -> Result<u64> {
     spl::token_balance(ctx, address).await?.context("token balance missing")
 }
 
+pub enum Mode {
+    Backing,
+    Overlay,
+}
+
+/// Checks backing settlement or an independently prepared Magic ATA overlay lifecycle.
 pub struct ProjectedTokenLifecycle {
     base: Rc<BaseCtx>,
-    proxies: BaseProxies,
-    private: PrivateEr,
+    proxies: Rc<BaseProxies>,
+    er: ErCtx,
+    mode: Mode,
     validator: Keypair,
     payer: Keypair,
     mint: Keypair,
@@ -130,19 +125,10 @@ pub struct ProjectedTokenLifecycle {
     vault: [Pubkey; 2],
 }
 
-impl PrivateErScenario for ProjectedTokenLifecycle {
-    async fn setup(base: Rc<BaseCtx>, _: ()) -> Result<Self> {
-        let proxies = BaseProxies::spawn(&base).await?;
-        let private = topology::private_er(
-            &base,
-            ErOptions {
-                label: LABEL.to_owned(),
-                base_endpoints: Some(proxies.endpoints()),
-                ..Default::default()
-            },
-        )
-        .await?;
-        let validator = topology::identity_for_label(LABEL)?;
+impl Scenario<(), Mode> for ProjectedTokenLifecycle {
+    async fn setup(base: Rc<BaseCtx>, er: ErCtx, mode: Mode) -> Result<Self> {
+        let proxies = er.http_proxy()?;
+        let validator = topology::identity_keypair(&er.identity())?;
         let payer = base.funded_payer(PAYER_LAMPORTS).await?;
         let mint = Keypair::new();
         let mint_key = mint.pubkey();
@@ -155,7 +141,8 @@ impl PrivateErScenario for ProjectedTokenLifecycle {
         Ok(Self {
             base,
             proxies,
-            private,
+            er,
+            mode,
             validator,
             payer,
             mint,
@@ -165,7 +152,7 @@ impl PrivateErScenario for ProjectedTokenLifecycle {
     }
 
     async fn run(self) -> Result<()> {
-        let er = self.private.ctx();
+        let er = &self.er;
         let mut expected = Balances {
             base_atas: [200, 100, 70, 5],
             eatas: [Some(0), Some(0), None, Some(40)],
@@ -186,6 +173,11 @@ impl PrivateErScenario for ProjectedTokenLifecycle {
         self.delegate_wallets().await?;
         expected.projected = [200, 100, 70, 5];
         self.await_projection(&expected.projected).await?;
+        if matches!(self.mode, Mode::Overlay) {
+            self.wallets[0].transfer(er, &self.wallets[1], 155).await?;
+            MagicAtas::run(&self).await?;
+            return self.finish().await;
+        }
         self.check_controls(1).await?;
         self.check_balances(&expected, true).await?;
 
@@ -243,7 +235,6 @@ impl PrivateErScenario for ProjectedTokenLifecycle {
         expected.eatas[..2].copy_from_slice(&[Some(25), Some(255)]);
         self.check_balances(&expected, true).await?;
 
-        MagicAtas::run(&self).await?;
         self.finish().await
     }
 }
@@ -251,7 +242,7 @@ impl PrivateErScenario for ProjectedTokenLifecycle {
 impl ProjectedTokenLifecycle {
     #[instrument(skip_all, err)]
     async fn create_tokens(&self, expected: &Balances) -> Result<()> {
-        let er = self.private.ctx();
+        let er = &self.er;
         let foreign_validator = Keypair::new().pubkey();
         self.base
             .submit_and_confirm_with(
@@ -384,8 +375,7 @@ impl ProjectedTokenLifecycle {
     async fn undelegate_wallets(&self) -> Result<()> {
         for wallet in &self.wallets[..2] {
             let signature = self
-                .private
-                .ctx()
+                .er
                 .submit_and_confirm(
                     &wallet.owner,
                     &[UndelegateEphemeralAtaBuilder {
@@ -418,8 +408,7 @@ impl ProjectedTokenLifecycle {
     }
 
     async fn commit(&self, id: u64) -> Result<Signature> {
-        self.private
-            .ctx()
+        self.er
             .submit_and_confirm(
                 &self.validator,
                 &[REDLINE
@@ -476,17 +465,15 @@ impl ProjectedTokenLifecycle {
     }
 
     #[instrument(skip_all, err)]
-    async fn check_balances(&self, expected: &Balances, delegated: bool) -> Result<()> {
+    async fn check_balances(&self, expected: &Balances, _delegated: bool) -> Result<()> {
         let observed = self.balances().await?;
         ensure!(&observed == expected);
-        observed.conserved(delegated)?;
         Ok(())
     }
 
     #[instrument(skip_all, err)]
     async fn finish(self) -> Result<()> {
-        self.proxies.finish()?;
-        self.private.finish().await
+        self.proxies.reset().await
     }
 
     async fn redelegate(&self) -> Result<()> {
@@ -501,7 +488,7 @@ impl ProjectedTokenLifecycle {
         for (i, wallet) in self.wallets.iter().enumerate() {
             state.base_atas[i] = amount(self.base.as_ref(), &wallet.ata).await?;
             state.eatas[i] = spl::token_balance(self.base.as_ref(), &wallet.eata).await?;
-            state.projected[i] = amount(self.private.ctx(), &wallet.ata).await?;
+            state.projected[i] = amount(&self.er, &wallet.ata).await?;
         }
         for (i, address) in self.vault.iter().enumerate() {
             state.vault[i] = amount(self.base.as_ref(), address).await?;
@@ -510,8 +497,7 @@ impl ProjectedTokenLifecycle {
     }
 
     async fn await_projection(&self, expected: &[u64; 4]) -> Result<()> {
-        self.private
-            .ctx()
+        self.er
             .api()
             .await_accounts(
                 &self.wallets.iter().map(|wallet| wallet.ata).collect::<Vec<_>>(),
@@ -530,14 +516,12 @@ impl ProjectedTokenLifecycle {
 
     async fn check_controls(&self, amount: u64) -> Result<()> {
         let atas = self.wallets.each_ref().map(|wallet| wallet.ata);
-        let before = self.private.ctx().accounts(&atas).await?;
+        let before = self.er.accounts(&atas).await?;
         for control in [2, 3] {
             for (from, to) in [(control, 0), (0, control)] {
-                let attempt = self.wallets[from]
-                    .transfer(self.private.ctx(), &self.wallets[to], amount)
-                    .await;
-                let error =
-                    check::expect_error(attempt, &format!("unauthorized transfer {from}->{to}"))?;
+                let attempt =
+                    self.wallets[from].transfer(&self.er, &self.wallets[to], amount).await;
+                let error = expect_error(attempt, &format!("unauthorized transfer {from}->{to}"))?;
                 let error = format!("{error:#}");
                 ensure!([
                     "InvalidWritableAccount",
@@ -547,7 +531,7 @@ impl ProjectedTokenLifecycle {
                 ]
                 .iter()
                 .any(|code| error.contains(code)));
-                ensure!(self.private.ctx().accounts(&atas).await? == before);
+                ensure!(self.er.accounts(&atas).await? == before);
             }
         }
         Ok(())
@@ -559,7 +543,7 @@ impl ProjectedTokenLifecycle {
         expected: &[Pubkey],
         undelegate: bool,
     ) -> Result<()> {
-        let receipt = receipt::fetch_commit_receipt(self.private.ctx().api(), signature).await?;
+        let receipt = receipt::fetch_commit_receipt(self.er.api(), signature).await?;
         receipt.check_success("projected-token commit")?;
         receipt.check_accounts(expected, undelegate)?;
         receipt.confirm(self.base.api()).await

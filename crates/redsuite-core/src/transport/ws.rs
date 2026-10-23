@@ -34,7 +34,7 @@ pub struct UpdateOutcome {
 #[derive(Default)]
 struct AccountState {
     // Both indexes contain the same pending writes.
-    pending: HashMap<u64, Pubkey>,
+    pending: HashMap<u64, BTreeSet<Pubkey>>,
     by_account: HashMap<Pubkey, BTreeSet<u64>>,
     waiters: HashMap<u64, oneshot::Sender<()>>,
     lag: StreamingStats,
@@ -52,28 +52,32 @@ impl SubscriptionState for AccountState {
 }
 
 impl AccountState {
-    fn settle(&mut self, id: u64) {
-        let account = self.pending.remove(&id).unwrap();
+    fn settle(&mut self, id: u64, account: Pubkey) {
+        let targets = self.pending.get_mut(&id).unwrap();
+        targets.remove(&account);
         self.by_account.get_mut(&account).unwrap().remove(&id);
-        if let Some(tx) = self.waiters.remove(&id) {
-            let _ = tx.send(());
+        if targets.is_empty() {
+            self.pending.remove(&id);
+            if let Some(tx) = self.waiters.remove(&id) {
+                let _ = tx.send(());
+            }
         }
     }
 
     fn observe(&mut self, account: Pubkey, id: u64, clock: &SendClock) {
-        if self.pending.contains_key(&id) {
+        if self.pending.get(&id).is_some_and(|targets| targets.contains(&account)) {
             if let Some(lag) = clock.elapsed_micros(id) {
                 self.lag.push(lag);
             }
             self.observed += 1;
-            self.settle(id);
+            self.settle(id, account);
         }
         while let Some(&pending_id) = self.by_account.get(&account).and_then(BTreeSet::first) {
             if pending_id >= id {
                 break;
             }
             self.superseded += 1;
-            self.settle(pending_id);
+            self.settle(pending_id, account);
         }
     }
 }
@@ -123,9 +127,7 @@ impl AccountUpdates {
 
     pub fn track(&self, id: u64, account: Pubkey) {
         let mut state = self.connection.state_mut();
-        if let Some(previous) = state.pending.insert(id, account) {
-            state.by_account.get_mut(&previous).unwrap().remove(&id);
-        }
+        state.pending.entry(id).or_default().insert(account);
         state.by_account.entry(account).or_default().insert(id);
     }
 
@@ -162,11 +164,16 @@ impl AccountUpdates {
 
     pub fn finalize(&self) -> UpdateOutcome {
         self.connection.stop();
+        self.take_outcome()
+    }
+
+    /// Takes one settled observation window without reconnecting the subscriber.
+    pub fn take_outcome(&self) -> UpdateOutcome {
         let mut state = self.connection.state_mut();
         UpdateOutcome {
             lag: mem::take(&mut state.lag).finalize(false),
-            observed: state.observed,
-            superseded: state.superseded,
+            observed: mem::take(&mut state.observed),
+            superseded: mem::take(&mut state.superseded),
         }
     }
 }

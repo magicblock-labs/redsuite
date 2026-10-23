@@ -14,7 +14,7 @@ pub use config::{
     ER_READY_TIMEOUT, HYDRA_EPHEMERAL_ID, VERIFIER_BIN_ENV,
 };
 pub use identity::{identity_for_label, identity_keypair};
-pub use private::{private_er, PrivateEr, RestartOutcome};
+pub use private::{leader_er, private_er, PrivateEr, RestartOutcome};
 pub(crate) use process::kill_pid;
 pub use replicated::{
     replicated, ReplicatedOptions, ReplicatedTopology, Verifier, VerifierStop, VerifierTiming,

@@ -28,7 +28,9 @@ pub fn persist(parent: Option<&str>, run: ScenarioRun) -> Result<PathBuf> {
     let mut campaign = CAMPAIGN
         .get_or_init(|| {
             Mutex::new(Campaign {
-                meta: super::campaign_meta(),
+                meta: super::campaign_meta(
+                    run.config.iter().any(|(key, value)| key == "target" && value == "attached"),
+                ),
                 scenarios: BTreeMap::new(),
             })
         })

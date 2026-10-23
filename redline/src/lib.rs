@@ -1,11 +1,11 @@
-use std::time::{Duration, Instant};
-
 use anyhow::{anyhow, ensure, Context};
 use redsuite_core::api::{transaction_logs, transaction_meta};
+use redsuite_core::config::ExecutionConfig;
 use redsuite_core::{wait, ChainCtx, ErCtx, Result};
 use signature::Signature;
+use std::time::{Duration, Instant};
+use tokio::sync::watch;
 
-pub mod load;
 pub mod scenarios;
 pub use redline_interface as program;
 
@@ -30,6 +30,13 @@ pub async fn probe_cus(er: &ErCtx, signature: &Signature, label: &str, _iters: u
     consumed_cus(logs).ok_or_else(|| anyhow!("{label}: missing compute-unit consumption: {logs:?}"))
 }
 
+pub mod metrics {
+    pub const ENGINE_TRANSACTIONS: &str = "engine_ledger_transactions";
+    pub const RPC_HANDLED_TRANSACTIONS: &str = "mbv_transaction_processing_time_count";
+    pub const RPC_ACCEPTED_TRANSACTIONS: &str = "mbv_transaction_skip_preflight_count";
+    pub const FAILED_TRANSACTIONS: &str = "engine_processor_failed_transactions";
+}
+
 pub async fn await_executed(er: &ErCtx, target: f64, timeout: Duration) -> Result<Duration> {
     let started = Instant::now();
     wait::retry("validator transaction count", timeout, async || {
@@ -44,9 +51,33 @@ pub async fn await_executed(er: &ErCtx, target: f64, timeout: Duration) -> Resul
     Ok(started.elapsed())
 }
 
-pub mod metrics {
-    pub const ENGINE_TRANSACTIONS: &str = "engine_ledger_transactions";
-    pub const RPC_HANDLED_TRANSACTIONS: &str = "mbv_transaction_processing_time_count";
-    pub const RPC_ACCEPTED_TRANSACTIONS: &str = "mbv_transaction_skip_preflight_count";
-    pub const FAILED_TRANSACTIONS: &str = "engine_processor_failed_transactions";
+pub(crate) struct RunControl {
+    pub duration: Duration,
+    pub stop: watch::Receiver<bool>,
+}
+impl RunControl {
+    pub(crate) fn from_config(config: &ExecutionConfig) -> Result<Self> {
+        Ok(Self {
+            duration: config.duration.context("Redline requires --duration")?,
+            stop: config.stop.clone().context("missing benchmark stop signal")?,
+        })
+    }
+    pub(crate) fn deadline(&self) -> Result<Instant> {
+        Instant::now()
+            .checked_add(self.duration)
+            .context("duration exceeds monotonic clock range")
+    }
+    pub(crate) fn stopped(&self, deadline: Instant) -> bool {
+        Instant::now() >= deadline || *self.stop.borrow()
+    }
+
+    pub(crate) fn completion(&self, result: &Result<()>) -> &'static str {
+        if *self.stop.borrow() {
+            "interrupted"
+        } else if result.is_ok() {
+            "completed"
+        } else {
+            "failed"
+        }
+    }
 }

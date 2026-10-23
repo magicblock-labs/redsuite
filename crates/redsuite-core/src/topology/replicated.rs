@@ -6,21 +6,13 @@ use std::{
 
 use anyhow::{ensure, Context};
 use keypair::Keypair;
-use signer::Signer;
 use tokio::time;
 use tracing::debug;
 
-use super::{
-    config,
-    config::{ErOptions, Settings, VerifierPlan},
-    private::{leader_er, PrivateEr},
-    process,
-    process::PortLease,
-    state,
-};
+use super::{config, config::VerifierPlan, process, process::PortLease, state};
 use crate::{
     api::{Metrics, MetricsCollector},
-    context::BaseCtx,
+    context::{BaseCtx, ErCtx},
     report,
     resources::LaunchRecord,
     Result,
@@ -32,20 +24,10 @@ pub const SERVER_CONNECTIONS: &str = "engine_replicator_server_connections";
 const VERIFIER_READY_TIMEOUT: Duration = Duration::from_secs(60);
 const CONNECT_POLL: Duration = Duration::from_millis(100);
 
+#[derive(Default)]
 pub struct ReplicatedOptions {
     pub label: String,
     pub verifiers: usize,
-    pub settings: Settings,
-}
-
-impl Default for ReplicatedOptions {
-    fn default() -> Self {
-        Self {
-            label: String::new(),
-            verifiers: 0,
-            settings: Box::new(|_| {}),
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -203,11 +185,11 @@ impl Verifier {
 
 pub struct ReplicatedTopology {
     verifiers: Vec<Verifier>,
-    leader: PrivateEr,
+    leader: ErCtx,
 }
 
 impl ReplicatedTopology {
-    pub fn leader(&self) -> &PrivateEr {
+    pub fn leader(&self) -> &ErCtx {
         &self.leader
     }
 
@@ -228,7 +210,7 @@ impl ReplicatedTopology {
     }
 
     pub async fn leader_connections(&self) -> Result<f64> {
-        let metrics = self.leader.ctx().scrape_metrics().await?;
+        let metrics = self.leader.scrape_metrics().await?;
         metrics
             .get(SERVER_CONNECTIONS)
             .with_context(|| format!("the leader exposes no {SERVER_CONNECTIONS} metric"))
@@ -256,7 +238,7 @@ impl ReplicatedTopology {
     }
 
     pub async fn finish(self) -> Result<()> {
-        let Self { mut verifiers, leader } = self;
+        let Self { mut verifiers, .. } = self;
         let mut first_error = None;
         for verifier in verifiers.iter_mut() {
             if let Err(error) = verifier.finish().await {
@@ -264,9 +246,6 @@ impl ReplicatedTopology {
             }
         }
         drop(verifiers);
-        if let Err(error) = leader.finish().await {
-            first_error.get_or_insert(error);
-        }
         match first_error {
             Some(error) => Err(error),
             None => Ok(()),
@@ -274,24 +253,25 @@ impl ReplicatedTopology {
     }
 }
 
-pub async fn replicated(base: &BaseCtx, options: ReplicatedOptions) -> Result<ReplicatedTopology> {
+pub async fn replicated(
+    base: &BaseCtx,
+    leader: ErCtx,
+    options: ReplicatedOptions,
+) -> Result<ReplicatedTopology> {
     ensure!(
         options.verifiers != 0,
         "a replicated topology needs at least one verifier"
     );
     let verifier_bin = config::find_verifier_bin()?;
-    let identities: Vec<Keypair> = (0..options.verifiers).map(|_| Keypair::new()).collect();
-    let leader = leader_er(
-        base,
-        ErOptions {
-            label: options.label.clone(),
-            settings: options.settings,
-
-            ..ErOptions::default()
-        },
-        identities.iter().map(|identity| identity.pubkey()).collect(),
-    )
-    .await?;
+    let identities: Vec<Keypair> = (0..options.verifiers)
+        .map(|index| super::identity_for_label(&format!("{}-verifier{index}", options.label)))
+        .collect::<Result<_>>()?;
+    let owner = leader
+        .owner
+        .as_ref()
+        .and_then(std::rc::Weak::upgrade)
+        .context("replication requires a group-owned leader")?;
+    let leader_params = owner.lock().await.params().clone();
 
     let dir = state::stack_dir();
     let (bin_version, bin_fingerprint) = report::binary_provenance(&verifier_bin);
@@ -306,7 +286,7 @@ pub async fn replicated(base: &BaseCtx, options: ReplicatedOptions) -> Result<Re
         let plan = VerifierPlan {
             bin: verifier_bin.clone(),
             config_path: config::config_path(&dir, &label),
-            params: config::verifier_params(leader.params(), identity, metrics_port, storage_dir),
+            params: config::verifier_params(&leader_params, identity, metrics_port, storage_dir),
         };
         let log = dir.join(format!("er-{label}.log"));
         debug!(%label, "starting verifier");

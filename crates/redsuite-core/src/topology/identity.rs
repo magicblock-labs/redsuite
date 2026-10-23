@@ -107,6 +107,14 @@ impl PoolLock {
 // Identity initialization spends concurrently; wait for an absolute balance,
 // and retry dropped faucet requests without requiring an exact increment.
 pub(super) async fn ensure_identity_funded(base: &BaseCtx, identity: &Pubkey) -> Result<()> {
+    if base.config().environment.is_some() {
+        let balance = base.api().get_balance(identity).await?;
+        let missing = IDENTITY_FUNDING_LAMPORTS.saturating_sub(balance);
+        if missing > 0 {
+            base.airdrop(identity, missing).await?;
+        }
+        return Ok(());
+    }
     let timeout = Duration::from_secs(90);
     time::timeout(timeout, async {
         let events = base.api().events().await?;

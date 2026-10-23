@@ -10,7 +10,7 @@ use crate::runner::Delivery;
 
 pub struct SendClock {
     epoch: Instant,
-    first_id: u64,
+    first_id: AtomicU64,
     sent_micros: Vec<AtomicU64>,
 }
 
@@ -20,14 +20,23 @@ impl SendClock {
         sent_micros.resize_with(capacity, || AtomicU64::new(0));
         Self {
             epoch: Instant::now(),
-            first_id,
+            first_id: AtomicU64::new(first_id),
             sent_micros,
         }
     }
 
     fn slot_of(&self, id: u64) -> Option<&AtomicU64> {
-        let index = id.checked_sub(self.first_id)?;
+        let index = id.checked_sub(self.first_id.load(Ordering::Acquire))?;
         self.sent_micros.get(index as usize)
+    }
+
+    /// Starts another bounded window after all previously tracked work has settled.
+    pub fn reset(&self, first_id: u64) {
+        self.first_id.store(u64::MAX, Ordering::Release);
+        for stamp in &self.sent_micros {
+            stamp.store(0, Ordering::Release);
+        }
+        self.first_id.store(first_id, Ordering::Release);
     }
 
     pub fn stamp(&self, id: u64, at: Instant) {

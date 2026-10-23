@@ -9,7 +9,6 @@ pub mod http;
 pub mod rate;
 pub(crate) mod rpc;
 mod socket;
-pub mod subpool;
 mod subscription;
 pub mod ws;
 pub mod wsraw;

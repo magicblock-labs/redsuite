@@ -1,12 +1,10 @@
 use anyhow::{ensure, Context};
 use std::slice;
 
-pub mod commit_and_undelegate;
-pub mod commit_blackout;
-pub mod commit_exactly_once;
-pub mod commit_settlement_order;
-pub mod delegation_session_isolation;
-mod scheduled_intents;
+pub mod commit_snapshot_ordering;
+pub mod intent_execution_and_accounting;
+pub mod settlement_lifecycle;
+pub mod stale_delegation_session_isolation;
 pub mod undelegation_recovery;
 
 use std::time::{Duration, Instant};
@@ -91,3 +89,5 @@ async fn hold_nonces(
         time::sleep(Duration::from_millis(250)).await;
     }
 }
+
+pub mod commit_recovery;

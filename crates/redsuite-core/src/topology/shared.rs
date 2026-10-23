@@ -11,8 +11,8 @@ use super::{
 };
 use crate::{
     api::Api,
+    config::ExecutionConfig,
     context::{BaseCtx, ChainCtx},
-    profile::ExecutionConfig,
     Result,
 };
 
@@ -22,9 +22,17 @@ pub fn running_base_programs() -> Option<Vec<String>> {
 }
 
 pub async fn base_only(config: ExecutionConfig) -> Result<BaseCtx> {
+    if let Some(environment) = &config.environment {
+        return Ok(BaseCtx::new(
+            environment.base_rpc.clone(),
+            environment.base_ws.clone(),
+            None,
+            config,
+        ));
+    }
     let _lock = state::acquire_lock().await?;
 
-    let state = ensure_base(config).await?;
+    let state = ensure_base(config.clone()).await?;
     base_ctx(&state, config)
 }
 

@@ -1,1 +1,1 @@
-pub mod ephemeral_accounts;
+pub mod ephemeral_account_security;
