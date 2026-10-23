@@ -229,7 +229,8 @@ impl SettlementLifecycle {
                         .await
                 },
             )
-            .await?;
+            .await
+            .with_context(|| format!("writing redelegated cell {}", cell.address))?;
             let on_er = self
                 .er
                 .account(&cell.address)

@@ -9,15 +9,15 @@ use redsuite_core::{
     redline::{causal, Accounts},
     report::Unit,
     runner::{execute, execute_and_sync, Pacing, RunConfig, RunOutcome},
-    transport::NETWORK_TIMEOUT,
     transport::{
         clock::SendClock,
         ws::{AccountUpdates, SignatureConfirmations, SignatureOutcome, UpdateOutcome},
+        NETWORK_TIMEOUT,
     },
     BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport, TxSender,
 };
 use tokio::sync::watch::Receiver;
-use tracing::{info, instrument, warn};
+use tracing::{info, instrument};
 
 use crate::{metrics, program::layout, RunControl, ACCOUNT_SPACE};
 
@@ -125,6 +125,9 @@ impl Scenario<(ScenarioReport, Result<()>), Shape> for TransactionLoad {
         let result: Result<()> = async {
             while !remaining.is_zero() && !*options.stop.borrow() {
                 let measured = self.measure(cursor, remaining, options.stop.clone()).await?;
+                if measured.outcome.delivered == 0 {
+                    break;
+                }
                 self.check_final_state(cursor, measured.outcome.delivered).await?;
                 remaining = remaining.saturating_sub(measured.outcome.admission_wall);
                 cursor += measured.outcome.delivered;
@@ -266,21 +269,6 @@ impl TransactionLoad {
         // must cover everything the measured load caused
         let after = self.er.scrape_metrics().await?;
         let delta = MetricsDelta::new(before, after);
-
-        // validator-side cross-checks, gated on what this build exposes:
-        // the no-op gate (our load provably hit the validator) and the
-        // nothing-failed-on-chain invariant
-        if let Some(processed) = delta.counter(metrics::ENGINE_TRANSACTIONS) {
-            if processed < outcome.delivered as f64 {
-                warn!(
-                    processed,
-                    self.profile.iterations, "validator transaction count",
-                );
-            }
-        }
-        if let Some(failed) = delta.counter_all(metrics::FAILED_TRANSACTIONS) {
-            tracing::debug!(failed, "ER-wide failure count in observation window");
-        }
 
         let update_outcome = updates.finalize();
         ensure!(

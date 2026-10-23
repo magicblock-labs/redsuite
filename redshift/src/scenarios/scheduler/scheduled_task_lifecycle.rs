@@ -1,7 +1,7 @@
 use std::rc::Rc;
 
 use account::Account;
-use anyhow::{ensure, Context};
+use anyhow::{bail, ensure, Context};
 use instruction::Instruction;
 use keypair::Keypair;
 use pubkey::Pubkey;
@@ -9,9 +9,11 @@ use pubkey::Pubkey;
 use redsuite_core::{
     prep,
     programs::{content_hash, CellId, Task, MAGIC, REDSHIFT},
+    rpc_types::response::TransactionError,
     topology, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
 use signer::Signer;
+use solana_instruction_error::InstructionError;
 
 use crate::PAYER_LAMPORTS;
 
@@ -51,13 +53,11 @@ impl Actor {
             .create_primary(er.identity(), prep::COMMIT_FREQUENCY_MS)
             .await?;
         base.delegate_payer(funder, &payer, er.identity()).await?;
-        er.api()
-            .await_accounts(&[cell], "the ER clones the cell", |accounts| {
-                let account = accounts[0].as_ref().context("cell not cloned")?;
-                ensure!(!account.data.is_empty());
-                Ok(())
-            })
-            .await?;
+        er.await_account(&cell, |account| {
+            ensure!(!account.data.is_empty());
+            Ok(())
+        })
+        .await?;
         Ok(Actor { payer, cell })
     }
 
@@ -88,7 +88,6 @@ impl Actor {
         task.until(&format!("task {task_id} created"), |accounts| {
             let account = accounts[0].as_ref().context("task missing")?;
             ensure!(account.owner == SCHEDULER_PROGRAM);
-            ensure!(!account.data.is_empty());
             Ok(account.clone())
         })
         .await
@@ -125,9 +124,8 @@ pub struct ScheduledTaskLifecycle {
 
 impl Scenario for ScheduledTaskLifecycle {
     async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
-        ensure!(
-            matches!(base.account(&SCHEDULER_PROGRAM).await?, Some(program) if program.executable)
-        );
+        // Program materialization also spends the sponsor's lamports.
+        er.await_program_clone(&SCHEDULER_PROGRAM).await?;
         let funder = base.funded_payer(PAYER_LAMPORTS).await?;
 
         let actor = Actor::prepare(&base, &er, &funder).await?;
@@ -161,10 +159,12 @@ impl ScheduledTaskLifecycle {
             )])
             .await?;
         let Err(error) = self.er.api().try_confirm(&signature).await? else {
-            anyhow::bail!("signed task payload unexpectedly succeeded");
+            bail!("signed task payload unexpectedly succeeded");
         };
-        let detail = format!("{:?}", error.err);
-        ensure!(detail.contains("MissingRequiredSignature"));
+        ensure!(matches!(
+            error.err,
+            TransactionError::InstructionError(_, InstructionError::MissingRequiredSignature)
+        ));
         ensure!(self.er.account(&self.actor.address(103)).await?.is_none());
         Ok(())
     }

@@ -1,4 +1,3 @@
-use redsuite_core::ErCtx;
 use std::{
     cell::Cell,
     fs,
@@ -18,7 +17,7 @@ use redsuite_core::{
     },
     topology,
     topology::{ReplicatedOptions, ReplicatedTopology, Verifier},
-    wait, BaseCtx, ChainCtx, Result, Scenario,
+    wait, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
 use signer::Signer;
 use tokio::{task::JoinSet, time};
@@ -177,13 +176,13 @@ async fn await_leader_advance(
     by: f64,
     what: &str,
 ) -> Result<()> {
-    let from = leader_count(topology, name).await?;
+    let from = leader_metric(topology, name).await?;
     let target = from + by;
     wait::retry(
         &format!("{what} (leader {name} reaching {target:.0})"),
         SEAL_TIMEOUT,
         async || {
-            ensure!(leader_count(topology, name).await? >= target);
+            ensure!(leader_metric(topology, name).await? >= target);
             Ok(())
         },
     )
@@ -261,8 +260,8 @@ impl Scenario for ReplicationRecovery {
     async fn run(mut self) -> Result<()> {
         self.check_ready().await?;
 
-        self.verify_connections().await?;
-        self.catch_up_fleet(&[TRANSACTIONS, BLOCKS]).await?;
+        // Snapshot bootstrap preserves transaction/seal cursors, not the local block count.
+        self.catch_up_fleet(&[TRANSACTIONS, SUPERBLOCKS]).await?;
 
         let pairs = self.prepare_pairs(PAIRS).await?;
         let workload = Workload::start(pairs);
@@ -301,6 +300,10 @@ impl ReplicationRecovery {
     #[instrument(skip_all, err)]
     async fn check_ready(&self) -> Result<()> {
         self.topology.wait_verifiers_connected(CONNECT_TIMEOUT).await?;
+        for verifier in self.topology.verifiers() {
+            ensure!(verifier.stream_connected().await);
+        }
+        ensure!(self.topology.leader_connections().await? == (VERIFIERS as f64));
         Ok(())
     }
 
@@ -331,8 +334,6 @@ impl ReplicationRecovery {
                 })
                 .await?;
             await_catch_up(self.topology.verifier(0), SUPERBLOCKS, sealed).await?;
-            let blocks = leader_metric(&self.topology, BLOCKS).await?;
-            await_catch_up(self.topology.verifier(0), BLOCKS, blocks).await?;
             let slot = self.topology.leader().api().get_slot().await?;
             let headroom = BLOCKTIME * (SUPERBLOCK_SLOTS - slot % SUPERBLOCK_SLOTS) as u32;
             if headroom > RESTART_BUDGET + Duration::from_millis(500) {
@@ -478,7 +479,7 @@ impl ReplicationRecovery {
             "the final sealed boundary after the load",
         )
         .await?;
-        self.catch_up_fleet(&[BLOCKS, SUPERBLOCKS]).await?;
+        self.catch_up_fleet(&[SUPERBLOCKS]).await?;
         for verifier in self.topology.verifiers() {
             await_catch_up(verifier, TRANSACTIONS, final_txs).await?;
         }
@@ -517,15 +518,6 @@ impl ReplicationRecovery {
             },
         )
         .await
-    }
-
-    #[instrument(skip_all, err)]
-    async fn verify_connections(&self) -> Result<()> {
-        for verifier in self.topology.verifiers() {
-            ensure!(verifier.stream_connected().await);
-        }
-        ensure!(self.topology.leader_connections().await? == (VERIFIERS as f64));
-        Ok(())
     }
 
     async fn sample_lag(&self, window: Duration) -> Result<Vec<f64>> {

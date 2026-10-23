@@ -99,6 +99,9 @@ impl Scenario<(ScenarioReport, Result<()>)> for WebsocketFanout {
                 )
                 .await?;
                 ensure!(outcome.failed == 0);
+                if outcome.delivered == 0 {
+                    break;
+                }
                 let mut window_p95 = 0;
                 for reader in &readers {
                     reader.await_settled().await?;

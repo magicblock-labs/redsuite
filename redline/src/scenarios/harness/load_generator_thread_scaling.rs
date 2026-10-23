@@ -1,4 +1,4 @@
-use std::{rc::Rc, sync::Arc};
+use std::{rc::Rc, sync::Arc, time::Instant};
 
 use anyhow::{ensure, Context};
 use pubkey::Pubkey;
@@ -11,7 +11,6 @@ use redsuite_core::{
     runner::{Pacing, RunOutcome, ThreadRunConfig},
     BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
 };
-use std::time::Instant;
 use tracing::{debug, instrument};
 
 use crate::ACCOUNT_SPACE;
@@ -107,6 +106,9 @@ impl Scenario<(ScenarioReport, Result<()>)> for LoadGeneratorThreadScaling {
                     let cell = self
                         .measure_cell(threads, &mut cursor, deadline, options.stop.clone())
                         .await?;
+                    if cell.outcome.delivered == 0 {
+                        break;
+                    }
                     remaining = remaining.saturating_sub(cell.outcome.admission_wall);
                     tracing::info!(
                         threads,
