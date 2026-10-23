@@ -19,7 +19,6 @@ use tokio::{
     sync::{mpsc, oneshot, Notify},
     task,
     task::JoinHandle,
-    time,
 };
 use tokio_tungstenite::{
     tungstenite::{Message, Utf8Bytes},
@@ -187,6 +186,7 @@ struct Rule {
 }
 
 struct State {
+    observed: [usize; 3],
     started: Instant,
     changed: Rc<Notify>,
     traps: Vec<Rc<TrapState>>,
@@ -220,6 +220,12 @@ enum GateStart {
 
 fn gate_start(shared: &Shared, operation: Operation) -> GateStart {
     let mut state = shared.borrow_mut();
+    let stage = match operation.stage {
+        Stage::Request => 0,
+        Stage::Response => 1,
+        Stage::Notification => 2,
+    };
+    state.observed[stage] += 1;
     let rule = state
         .rules
         .iter()
@@ -341,34 +347,30 @@ impl Held {
 
 pub struct Trap {
     state: Rc<TrapState>,
+    shared: Shared,
 }
 
 impl Trap {
     pub async fn wait(&self, timeout: Duration) -> Result<Held> {
-        let deadline = time::Instant::now() + timeout;
-        loop {
-            if let Some(pending) = self.state.fired.borrow_mut().as_mut() {
-                if let Some(decide) = pending.decide.take() {
-                    return Ok(Held {
-                        operation: pending.operation.clone(),
-                        held_at: pending.held_at,
-                        decide,
-                    });
-                }
-                return Err(anyhow!(
-                    "the interception `{:?}` was already taken",
-                    self.state.selector
-                ));
-            }
-            let remaining =
-                deadline.checked_duration_since(time::Instant::now()).with_context(|| {
-                    format!(
-                        "the interception `{:?}` did not occur within {timeout:?}",
-                        self.state.selector
-                    )
-                })?;
-            let _ = time::timeout(remaining, self.state.notify.notified()).await;
-        }
+        wait::on_change(&self.state.notify, timeout, "interception", || {
+            let mut fired = self.state.fired.borrow_mut();
+            let Some(pending) = fired.as_mut() else { return Ok(None) };
+            let decide = pending.decide.take().context("interception was already taken")?;
+            Ok(Some(Held {
+                operation: pending.operation.clone(),
+                held_at: pending.held_at,
+                decide,
+            }))
+        })
+        .await
+        .with_context(|| {
+            let shared = self.shared.borrow();
+            let connections = shared.connections.iter().filter(|handle| !handle.is_finished()).count();
+            format!(
+                "interception {:?}: connections={connections}, held={}, observed [request, response, notification]={:?}",
+                self.state.selector, shared.holding, shared.observed
+            )
+        })
     }
 }
 
@@ -396,6 +398,7 @@ pub struct BaseProxies {
 impl BaseProxies {
     pub async fn spawn(base: &BaseCtx) -> Result<Self> {
         let shared: Shared = Rc::new(RefCell::new(State {
+            observed: [0; 3],
             started: Instant::now(),
             changed: Rc::default(),
             traps: Vec::new(),
@@ -440,7 +443,10 @@ impl BaseProxies {
             notify: Notify::new(),
         });
         self.shared.borrow_mut().traps.push(state.clone());
-        Trap { state }
+        Trap {
+            state,
+            shared: self.shared.clone(),
+        }
     }
 
     pub fn reject(&self, selector: Selector, message: &str) -> RuleHandle {

@@ -7,7 +7,7 @@ use std::{
 };
 
 use account::Account;
-use anyhow::{ensure, Context};
+use anyhow::Context;
 use hash::Hash;
 use instruction::Instruction;
 use keypair::Keypair;
@@ -356,23 +356,27 @@ impl ErCtx {
 }
 
 async fn airdrop_and_confirm(api: &Api, pk: &Pubkey, lamports: u64) -> Result<()> {
-    time::timeout(NETWORK_TIMEOUT, async {
-        let before = api.get_balance(pk).await.unwrap_or(0);
-        let signature = wait::retry("airdrop accepted", NETWORK_TIMEOUT, async || {
+    let deadline = time::Instant::now() + NETWORK_TIMEOUT;
+    let signature: Signature = time::timeout_at(
+        deadline,
+        wait::retry("airdrop accepted", NETWORK_TIMEOUT, async || {
             api.request_airdrop(pk, lamports).await
-        })
-        .await?;
-        let signature = signature.parse()?;
-        api.confirm(&signature).await?;
-        api.await_account(pk, |account| {
-            ensure!(account.lamports >= before + lamports);
-            Ok(())
-        })
-        .await?;
-        Ok(())
-    })
+        }),
+    )
     .await
-    .context("airdrop not confirmed")?
+    .unwrap_or_else(|error| Err(error.into()))
+    .with_context(|| format!("airdrop request failed: address={pk}, lamports={lamports}"))?
+    .parse()?;
+
+    // A shared recipient may spend the credit before its balance is observed.
+    time::timeout_at(deadline, api.confirm(&signature))
+        .await
+        .unwrap_or_else(|error| Err(error.into()))
+        .with_context(|| {
+            format!(
+                "airdrop not confirmed: address={pk}, lamports={lamports}, signature={signature}"
+            )
+        })
 }
 
 impl ChainCtx for BaseCtx {

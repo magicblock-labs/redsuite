@@ -10,7 +10,7 @@ use tokio::net::TcpStream;
 use tokio::time;
 use tokio_tungstenite::{
     connect_async,
-    tungstenite::{Error as WsError, Message, Utf8Bytes},
+    tungstenite::{protocol::CloseFrame, Error as WsError, Message, Utf8Bytes},
     MaybeTlsStream, WebSocketStream,
 };
 use url::Url;
@@ -22,8 +22,8 @@ pub(super) type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 #[derive(Debug, Error)]
 pub(super) enum CloseReason {
-    #[error("connection closed by server")]
-    ServerClose,
+    #[error("connection closed by server: {0:?}")]
+    ServerClose(Option<CloseFrame>),
     #[error("stream ended")]
     StreamEnded,
     #[error("transport error: {0}")]
@@ -118,7 +118,7 @@ where
     loop {
         match stream.next().await {
             Some(Ok(Message::Text(text))) => return Ok(text),
-            Some(Ok(Message::Close(_))) => return Err(CloseReason::ServerClose),
+            Some(Ok(Message::Close(frame))) => return Err(CloseReason::ServerClose(frame)),
             Some(Ok(_)) => {}
             Some(Err(error)) => return Err(error.into()),
             None => return Err(CloseReason::StreamEnded),

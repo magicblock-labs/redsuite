@@ -117,15 +117,18 @@ impl Api {
     pub async fn watch_accounts(&self, addresses: &[Pubkey]) -> Result<AccountWatch> {
         let events = self.events().await?;
         let deadline = time::Instant::now() + NETWORK_TIMEOUT;
-        let subscriptions = time::timeout_at(
-            deadline,
-            stream::iter(addresses)
-                .map(|address| events.account(address))
-                .buffered(16)
-                .try_collect(),
-        )
-        .await
-        .context("account subscriptions not acknowledged")??;
+        let subscriptions = stream::iter(addresses)
+            .map(async |address| {
+                time::timeout_at(deadline, events.account(address)).await.with_context(|| {
+                    format!(
+                        "accountSubscribe not acknowledged: address={address}, endpoint={}",
+                        self.ws_url
+                    )
+                })?
+            })
+            .buffered(16)
+            .try_collect()
+            .await?;
         Ok(AccountWatch {
             addresses: addresses.to_vec(),
             subscriptions,

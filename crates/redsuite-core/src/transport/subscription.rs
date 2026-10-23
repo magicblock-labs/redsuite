@@ -5,7 +5,7 @@ use std::{
     rc::Rc,
 };
 
-use anyhow::{anyhow, ensure};
+use anyhow::{anyhow, ensure, Context};
 use futures_util::{stream::SplitSink, StreamExt};
 use json::LazyValue;
 use pubkey::Pubkey;
@@ -157,6 +157,7 @@ impl<S: SubscriptionState> Router<S> {
 }
 
 pub(super) struct Connection<S: SubscriptionState> {
+    url: Url,
     sink: Mutex<SplitSink<Socket, Message>>,
     next_id: Cell<u64>,
     router: Rc<RefCell<Router<S>>>,
@@ -173,14 +174,20 @@ impl<S: SubscriptionState + 'static> Connection<S> {
         let (sink, mut stream) = socket::connect(url).await?.split();
         let router = Rc::new(RefCell::new(Router::new(state)));
         let reader_state = router.clone();
+        let endpoint = url.clone();
         let reader = task::spawn_local(async move {
             let reason = socket::drive(&mut stream, |frame| {
                 reader_state.borrow_mut().dispatch(frame, &mut on_notification)
             })
             .await;
-            reader_state.borrow_mut().close(&reason);
+            let mut router = reader_state.borrow_mut();
+            if !router.requests.is_empty() {
+                tracing::warn!(%endpoint, %reason, pending = router.requests.len(), "websocket closed with pending requests");
+            }
+            router.close(&reason);
         });
         Ok(Self {
+            url: url.clone(),
             sink: Mutex::new(sink),
             next_id: Cell::new(1),
             router,
@@ -249,6 +256,14 @@ impl<S: SubscriptionState + 'static> Connection<S> {
             observe()
         })
         .await
+        .with_context(|| {
+            let router = self.router.borrow();
+            let pending: Vec<_> = router.requests.keys().take(16).copied().collect();
+            format!(
+                "websocket wait failed: endpoint={}, pending={}, request_ids={pending:?}, active={}, acknowledged={}",
+                self.url, router.requests.len(), router.subscriptions.len(), router.subscribed
+            )
+        })
     }
 
     pub(super) async fn await_ack(&self, key: S::Key) -> Result<()>
