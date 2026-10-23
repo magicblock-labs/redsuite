@@ -1,11 +1,9 @@
-pub mod claim_fees;
 pub mod commit_and_undelegate;
 pub mod commit_blackout;
 pub mod commit_exactly_once;
 pub mod commit_settlement_order;
 pub mod delegation_session_isolation;
 mod scheduled_intents;
-pub mod table_mania;
 pub mod undelegation_recovery;
 
 use std::time::{Duration, Instant};
@@ -14,41 +12,11 @@ use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{check, check_eq, BaseCtx, ChainCtx, ErCtx, Result};
 use signature::Signature;
-use signer::Signer;
-
-use crate::program::instruction::build;
+use tokio::time;
 
 pub(super) const PROXIED_GROUP: &str = "this scenario needs the base-chain proxies of its ER group";
 const BASE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(30);
 const BASE_STATE_TIMEOUT: Duration = Duration::from_secs(30);
-
-async fn await_delegated(
-    er: &ErCtx,
-    account: &Pubkey,
-    timeout: Duration,
-    what: &str,
-) -> Result<()> {
-    #[derive(serde::Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct Status {
-        is_delegated: bool,
-    }
-    check::poll_for(what, timeout, || async {
-        let status: Status = er
-            .api()
-            .call("getDelegationStatus", &(account.to_string(),))
-            .await
-            .map_err(|error| format!("read failed: {error}"))?;
-        if status.is_delegated {
-            Ok(())
-        } else {
-            Err("not delegated".to_owned())
-        }
-    })
-    .await
-    .map_err(|error| error.expected("delegated"))?;
-    Ok(())
-}
 
 async fn write_and_commit(
     er: &ErCtx,
@@ -57,20 +25,14 @@ async fn write_and_commit(
     write: u64,
     account: &Pubkey,
 ) -> Result<(Vec<u8>, Signature)> {
-    er.submit_and_confirm(payer, &[build::simple_byte_set(write, &[*account])])
-        .await?;
+    er.redline(payer).write(write, &[*account]).await?;
     let snapshot = er.account(account).await?.ok_or("er copy vanished after the write")?.data;
     check_eq!(
         crate::written_id(&snapshot),
         Some(write),
         "the er write must land before the commit"
     )?;
-    let commit_signature = er
-        .submit_and_confirm(
-            payer,
-            &[build::commit_accounts(commit_id, payer.pubkey(), &[*account])],
-        )
-        .await?;
+    let commit_signature = er.redline(payer).commit(commit_id, &[*account]).await?;
     Ok((snapshot, commit_signature))
 }
 
@@ -116,23 +78,6 @@ async fn hold_nonces(
         if Instant::now() >= deadline {
             return Ok(());
         }
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        time::sleep(Duration::from_millis(250)).await;
     }
-}
-
-// Duplicate rejection is not settlement evidence for exactly-once, ordering,
-// or projected-token checks. Confirmation and target checks stay at the caller.
-pub(super) fn require_settled(
-    receipt: &redsuite_core::receipt::CommitReceipt,
-    phase: &str,
-) -> Result<()> {
-    check!(
-        receipt.succeeded(),
-        "{phase}: settlement failed: {receipt:?}"
-    )?;
-    check!(
-        !receipt.base_signatures.is_empty(),
-        "{phase}: a settled receipt names its base transactions"
-    )?;
-    Ok(())
 }

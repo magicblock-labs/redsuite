@@ -1,21 +1,26 @@
 use std::{
     any::Any,
     cell::Cell,
-    future::Future,
+    future::{Future, Ready},
+    mem,
     rc::Rc,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
+    thread,
     thread::JoinHandle,
     time::{Duration, Instant},
 };
 
 use tokio::{
+    runtime::Builder,
     sync::{watch, OwnedSemaphorePermit},
-    task::JoinSet,
+    task,
+    task::{JoinSet, LocalSet},
+    time,
 };
-use tracing::{Instrument, Span};
+use tracing::Span;
 
 pub use crate::transport::rate::{split_budget, Pacing};
 use crate::{
@@ -80,11 +85,12 @@ struct Job {
 }
 
 impl Job {
-    async fn run<D: Delivery>(
-        admitted: Instant,
-        request: impl Future<Output = Result<D>>,
-        sync: Option<impl Future<Output = Result<()>>>,
-    ) -> Self {
+    async fn run<D, Request, Sync>(admitted: Instant, request: Request, sync: Option<Sync>) -> Self
+    where
+        D: Delivery,
+        Request: Future<Output = Result<D>>,
+        Sync: Future<Output = Result<()>>,
+    {
         let mut job = Self {
             scheduling: admitted.elapsed().as_micros() as u32,
             delivery: None,
@@ -95,11 +101,16 @@ impl Job {
         job
     }
 
-    async fn deliver<D: Delivery>(
+    async fn deliver<D, Request, Sync>(
         &mut self,
-        request: impl Future<Output = Result<D>>,
-        sync: Option<impl Future<Output = Result<()>>>,
-    ) -> Result<()> {
+        request: Request,
+        sync: Option<Sync>,
+    ) -> Result<()>
+    where
+        D: Delivery,
+        Request: Future<Output = Result<D>>,
+        Sync: Future<Output = Result<()>>,
+    {
         let send = request.await?;
         let started = Instant::now();
         send.deliver(started).await?;
@@ -127,7 +138,7 @@ pub struct RunOutcome<S = ObservationsStats> {
     pub offered: Pacing,
     pub rps: ObservationsStats,
     /// Driver time through completion of all admitted requests, including drain.
-    pub wall: std::time::Duration,
+    pub wall: Duration,
     /// Driver time before admission stops, excluding in-flight request drain.
     pub admission_wall: Duration,
 }
@@ -261,7 +272,7 @@ impl Completion {
                 }
                 let permit = tokio::select! {
                     biased;
-                    _ = tokio::time::sleep_until((*deadline).into()) => None,
+                    _ = time::sleep_until((*deadline).into()) => None,
                     _ = stop.wait_for(|stop| *stop) => None,
                     permit = throttle.acquire() => Some(permit),
                 };
@@ -272,7 +283,7 @@ impl Completion {
     }
 }
 
-type NoSync = fn(u64) -> std::future::Ready<Result<()>>;
+type NoSync = fn(u64) -> Ready<Result<()>>;
 const NO_SYNC: Option<NoSync> = None;
 
 async fn execute_inner<Request, RequestFut, D, Sync, SyncFut>(
@@ -441,9 +452,9 @@ impl Worker {
         let cell = Rc::new(Cell::new(false));
         let stop = self.stop.clone();
         let bridge = cell.clone();
-        tokio::task::spawn_local(async move {
+        task::spawn_local(async move {
             while !stop.load(Ordering::Relaxed) {
-                tokio::time::sleep(STOP_POLL).await;
+                time::sleep(STOP_POLL).await;
             }
             bridge.set(true);
         });
@@ -478,14 +489,15 @@ where
             threads,
             stop: stop.clone(),
         };
-        handles.push(std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
+        handles.push(thread::spawn(move || {
+            let _entered = span.enter();
+            let runtime = Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .expect("driver runtime build is infallible");
-            let local = tokio::task::LocalSet::new();
-            // Run future construction in the span too: the factory can log.
-            runtime.block_on(local.run_until(async move { factory(worker).await }.instrument(span)))
+            let local = LocalSet::new();
+            // The factory may need the runtime or spawn local tasks immediately.
+            runtime.block_on(local.run_until(async move { factory(worker).await }))
         }));
     }
     Workers { stop, handles }
@@ -497,10 +509,13 @@ impl<T> Workers<T> {
     }
 }
 
-impl<T: Send + 'static> Workers<T> {
+impl<T> Workers<T>
+where
+    T: Send + 'static,
+{
     pub fn join(mut self) -> Result<Vec<T>> {
         self.stop();
-        let handles = std::mem::take(&mut self.handles);
+        let handles = mem::take(&mut self.handles);
         let mut outcomes = Vec::with_capacity(handles.len());
         let mut first_panic = None;
         let mut first_error = None;
@@ -526,7 +541,7 @@ impl<T: Send + 'static> Workers<T> {
 
     pub async fn join_async(self) -> Result<Vec<T>> {
         self.stop();
-        tokio::task::spawn_blocking(move || self.join())
+        task::spawn_blocking(move || self.join())
             .await
             .map_err(|error| format!("driver worker join failed: {error}"))?
     }

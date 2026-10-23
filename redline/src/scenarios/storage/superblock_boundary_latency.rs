@@ -4,20 +4,24 @@ use std::{
     time::{Duration, Instant},
 };
 
-use async_trait::async_trait;
 use json::JsonValueTrait;
+use keypair::Keypair;
 use redsuite_core::{
-    check, check_eq, host, prep,
+    check, check_eq, host,
     profile::ProfileValues,
     redline::{copy_three, Accounts},
     report::Unit,
     runner::{execute, Pacing, RunConfig},
     sampler::{Sampler, Trailing},
     topology,
+    topology::{ErOptions, PrivateEr},
     transport::wsraw::RawWs,
     BaseCtx, MetricsDelta, PrivateErScenario, Result, ScenarioReport, TxSender,
 };
 use tracing::debug;
+use url::Url;
+
+use crate::{metrics, ACCOUNT_SPACE};
 
 const PREP_PAYER_LAMPORTS: u64 = 4_000_000_000;
 const CLONE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -129,7 +133,7 @@ struct Health {
 }
 
 async fn observe_slots(
-    ws_url: String,
+    ws_url: Url,
     superblock_slots: u64,
     stop: Rc<Cell<bool>>,
 ) -> Result<Vec<Interval>> {
@@ -164,21 +168,21 @@ async fn observe_slots(
     Ok(intervals)
 }
 
-pub struct SuperblockBoundaryLatency;
+pub struct SuperblockBoundaryLatency {
+    base: Rc<BaseCtx>,
+    profile: &'static Profile,
+    prep_payers: Vec<Keypair>,
+    private: PrivateEr,
+}
 
-#[async_trait(?Send)]
 impl PrivateErScenario<ScenarioReport> for SuperblockBoundaryLatency {
-    fn name(&self) -> &str {
-        "redline/superblock_boundary_latency"
-    }
-
-    async fn run(&self, base: &BaseCtx) -> Result<ScenarioReport> {
+    async fn setup(base: Rc<BaseCtx>, _: ()) -> Result<Self> {
         let profile = PROFILES.select(base.config().profile);
 
-        let prep_payers = prep::funded_payers(base, profile.payers, PREP_PAYER_LAMPORTS).await?;
+        let prep_payers = base.funded_payers(profile.payers, PREP_PAYER_LAMPORTS).await?;
         let private = topology::private_er(
-            base,
-            topology::ErOptions {
+            &base,
+            ErOptions {
                 label: "superblock-boundary".to_owned(),
                 settings: Box::new(move |params| {
                     params.engine.blockstore.blocktime = BLOCKTIME;
@@ -188,14 +192,29 @@ impl PrivateErScenario<ScenarioReport> for SuperblockBoundaryLatency {
             },
         )
         .await?;
+        Ok(Self {
+            base,
+            profile,
+            prep_payers,
+            private,
+        })
+    }
+
+    async fn run(self) -> Result<ScenarioReport> {
+        let Self {
+            base,
+            profile,
+            prep_payers,
+            private,
+        } = self;
         let cell_er = private.ctx();
 
-        let pool = Accounts::new(crate::ACCOUNT_SPACE, cell_er.identity())
-            .init_batched(base, &prep_payers, profile.accounts, true)
+        let pool = Accounts::new(ACCOUNT_SPACE, cell_er.identity())
+            .init_batched(base.as_ref(), &prep_payers, profile.accounts, true)
             .await?;
-        prep::await_clones(cell_er, &pool, crate::ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
+        cell_er.await_clones(&pool, ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
 
-        let payers: Vec<Rc<keypair::Keypair>> = prep_payers.into_iter().map(Rc::new).collect();
+        let payers: Vec<Rc<Keypair>> = prep_payers.into_iter().map(Rc::new).collect();
         let senders: Vec<TxSender> =
             payers.iter().map(|payer| cell_er.sender(payer.clone())).collect();
 
@@ -210,7 +229,7 @@ impl PrivateErScenario<ScenarioReport> for SuperblockBoundaryLatency {
             |id| {
                 let sender = senders[(id as usize) % senders.len()].clone();
                 let (ix, _) = copy_three(&pool, id);
-                sender.staged(&[ix])
+                sender.staged([ix])
             },
         )
         .await?;
@@ -231,7 +250,7 @@ impl PrivateErScenario<ScenarioReport> for SuperblockBoundaryLatency {
         let before = cell_er.scrape_metrics().await?;
         let stop = Rc::new(Cell::new(false));
         let observer = observe_slots(
-            cell_er.ws_url().to_owned(),
+            cell_er.ws_url().clone(),
             profile.superblock_slots,
             stop.clone(),
         );
@@ -259,7 +278,7 @@ impl PrivateErScenario<ScenarioReport> for SuperblockBoundaryLatency {
                 |id| {
                     let sender = senders[(id as usize) % senders.len()].clone();
                     let (ix, _) = copy_three(&pool, profile.fill + id);
-                    sender.staged(&[ix])
+                    sender.staged([ix])
                 },
             )
             .await;
@@ -322,7 +341,7 @@ impl PrivateErScenario<ScenarioReport> for SuperblockBoundaryLatency {
             stall_ratio, "superblock boundary workload finished",
         );
 
-        Ok(ScenarioReport::ok(self.name())
+        Ok(ScenarioReport::ok()
             .setting("profile", profile.name)
             .setting("shape", "account data copy, 1 source into 2 dests")
             .setting("blocktime ms", BLOCKTIME_MS)
@@ -375,7 +394,7 @@ impl PrivateErScenario<ScenarioReport> for SuperblockBoundaryLatency {
             .metric_if(
                 "failed transactions",
                 Unit::Count,
-                delta.counter_all(crate::metrics::FAILED_TRANSACTIONS),
+                delta.counter_all(metrics::FAILED_TRANSACTIONS),
             ))
     }
 }

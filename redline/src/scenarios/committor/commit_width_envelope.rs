@@ -5,22 +5,22 @@ use std::{
     time::{Duration, Instant},
 };
 
-use async_trait::async_trait;
 use pubkey::Pubkey;
 use redsuite_core::{
     api::custom_error_code,
-    check, check_eq, prep,
+    check, check_eq,
     profile::ProfileValues,
     receipt,
     redline::Accounts,
-    report,
     report::Unit,
     runner::{execute, Pacing, RunConfig, RunOutcome, SendTransaction},
     stats::StreamingStats,
     topology, Api, BaseCtx, ChainCtx, CheckError, ErCtx, MetricsDelta, Result, Scenario,
-    ScenarioReport,
+    ScenarioReport, TxSender,
 };
+use signature::Signature;
 use signer::Signer;
+use tokio::time;
 use tracing::debug;
 
 use crate::program::{instruction::build, DELEGATION_PROGRAM_ID};
@@ -75,7 +75,7 @@ struct CellTally {
     er_delivery: StreamingStats,
     round_trip: StreamingStats,
     base_signatures: usize,
-    base_txs: Vec<signature::Signature>,
+    base_txs: Vec<Signature>,
     included_mismatch: usize,
 }
 
@@ -100,10 +100,10 @@ enum SchedulingOutcome {
 
 async fn scheduling_outcome(
     er_api: &Api,
-    commit_signature: &signature::Signature,
+    commit_signature: &Signature,
     timeout: Duration,
-) -> redsuite_core::Result<SchedulingOutcome> {
-    let deadline = tokio::time::Instant::now() + timeout;
+) -> Result<SchedulingOutcome> {
+    let deadline = time::Instant::now() + timeout;
     loop {
         if let Some(status) = er_api.get_signature_status(commit_signature).await? {
             if let Some(err) = &status.err {
@@ -113,22 +113,22 @@ async fn scheduling_outcome(
                 return Ok(SchedulingOutcome::Confirmed);
             }
         }
-        if tokio::time::Instant::now() >= deadline {
+        if time::Instant::now() >= deadline {
             return Err(CheckError::new(format!(
                 "no status for the probe commit {commit_signature} within \
                  {timeout:?}"
             ))
             .into());
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        time::sleep(Duration::from_millis(100)).await;
     }
 }
 
 const SIGNATURE_SCAN_LIMIT: usize = 1000;
 
 struct BaseFlowSnapshot {
-    flow: HashSet<String>,
-    alt: HashSet<String>,
+    flow: HashSet<Signature>,
+    alt: HashSet<Signature>,
 }
 
 impl BaseFlowSnapshot {
@@ -142,8 +142,7 @@ impl BaseFlowSnapshot {
 }
 
 async fn snapshot_base_flow(base_api: &Api) -> Result<BaseFlowSnapshot> {
-    let committor_program: Pubkey =
-        topology::COMMITTOR_ID.parse().expect("pinned committor program id parses");
+    let committor_program: Pubkey = topology::COMMITTOR_ID;
     let alt_program: Pubkey = sdk_ids::address_lookup_table::ID;
     let mut flow = HashSet::new();
     flow.extend(
@@ -164,10 +163,7 @@ async fn snapshot_base_flow(base_api: &Api) -> Result<BaseFlowSnapshot> {
     Ok(BaseFlowSnapshot { flow, alt })
 }
 
-async fn own_lookup_table_txs(
-    base_api: &Api,
-    signatures: &[signature::Signature],
-) -> Result<usize> {
+async fn own_lookup_table_txs(base_api: &Api, signatures: &[Signature]) -> Result<usize> {
     let mut with_lookups = 0;
     for chain_signature in signatures {
         let tx = base_api.await_transaction(chain_signature, BASE_CONFIRM_TIMEOUT).await?;
@@ -178,24 +174,30 @@ async fn own_lookup_table_txs(
     Ok(with_lookups)
 }
 
-pub struct CommitWidthEnvelope;
+pub struct CommitWidthEnvelope {
+    base: Rc<BaseCtx>,
+    er: ErCtx,
+    profile: &'static Profile,
+    pdas: Vec<Pubkey>,
+    sender: TxSender,
+}
 
-#[async_trait(?Send)]
 impl Scenario<ScenarioReport> for CommitWidthEnvelope {
-    fn name(&self) -> &str {
-        "redline/commit_width_envelope"
-    }
-
-    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
+    async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
         let profile = PROFILES.select(base.config().profile);
-        let payer = prep::funded_payer(base, PAYER_LAMPORTS).await?;
-        let payer_pubkey = payer.pubkey();
+        let payer = base.funded_payer(PAYER_LAMPORTS).await?;
         let pdas = Accounts::new(ACCOUNT_SPACE, er.identity())
-            .init_delegated(base, &payer, profile.pool)
+            .init_delegated(base.as_ref(), &payer, profile.pool)
             .await?;
-        prep::await_clones(er, &pdas, ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
+        er.await_clones(&pdas, ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
         let sender = er.sender(Rc::new(payer));
 
+        Ok(Self { base, er, profile, pdas, sender })
+    }
+
+    async fn run(self) -> Result<ScenarioReport> {
+        let Self { base, er, profile, pdas, sender } = self;
+        let payer_pubkey = sender.payer().pubkey();
         // the whole pipeline per request: deliver on the ER, await the
         // ScheduledCommitSent receipt, confirm its base-layer signatures
         let request = |width: usize, id: u64, tally: Rc<RefCell<CellTally>>| {
@@ -217,12 +219,7 @@ impl Scenario<ScenarioReport> for CommitWidthEnvelope {
                     )
                     .await?;
                     let round_trip_us = started.elapsed().as_micros() as u32;
-                    receipt::confirm_base_signatures(
-                        &base_api,
-                        &commit_receipt,
-                        BASE_CONFIRM_TIMEOUT,
-                    )
-                    .await?;
+                    commit_receipt.confirm(&base_api, BASE_CONFIRM_TIMEOUT).await?;
                     let mut tally = tally.borrow_mut();
                     tally.round_trip.push(round_trip_us);
                     tally.base_signatures += commit_receipt.base_signatures.len();
@@ -262,7 +259,7 @@ impl Scenario<ScenarioReport> for CommitWidthEnvelope {
             )?;
             // post-apply buffer closes can trail the receipt — let warmup
             // stragglers land before the base-flow snapshot
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            time::sleep(Duration::from_secs(1)).await;
 
             let flow_before = snapshot_base_flow(base.api()).await?;
             let before = er.scrape_metrics().await?;
@@ -283,7 +280,7 @@ impl Scenario<ScenarioReport> for CommitWidthEnvelope {
                 "w{width} commits failed: {:?}",
                 outcome.first_error
             )?;
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            time::sleep(Duration::from_secs(1)).await;
             let after = er.scrape_metrics().await?;
             let flow_after = snapshot_base_flow(base.api()).await?;
             let delta = MetricsDelta::new(before, after);
@@ -349,7 +346,7 @@ impl Scenario<ScenarioReport> for CommitWidthEnvelope {
                 "commit width cell finished"
             );
 
-            let cell_report = ScenarioReport::ok(&format!("{}/w{width}", self.name()))
+            let cell_report = ScenarioReport::ok()
                 .setting("profile", profile.name)
                 .setting("width", width)
                 .setting("account space", ACCOUNT_SPACE)
@@ -384,7 +381,7 @@ impl Scenario<ScenarioReport> for CommitWidthEnvelope {
                     Unit::Count,
                     delta.counter("mbv_committor_intents_count"),
                 );
-            report::persist_cell(self.name(), &cell_report);
+            base.report_cell(&format!("w{width}"), &cell_report)?;
 
             cells.push(CellSummary {
                 width,
@@ -432,12 +429,7 @@ impl Scenario<ScenarioReport> for CommitWidthEnvelope {
                             "the width-15 probe intent",
                         )
                         .await?;
-                        receipt::confirm_base_signatures(
-                            base.api(),
-                            &alt_receipt,
-                            BASE_CONFIRM_TIMEOUT,
-                        )
-                        .await?;
+                        alt_receipt.confirm(base.api(), BASE_CONFIRM_TIMEOUT).await?;
                         let wall = started.elapsed();
                         let delta = MetricsDelta::new(before, er.scrape_metrics().await?);
                         let flow_after = snapshot_base_flow(base.api()).await?;
@@ -560,10 +552,10 @@ impl Scenario<ScenarioReport> for CommitWidthEnvelope {
 
             // the 11th sponsored commit on one account is rejected on-chain
             {
-                let probe_payer = prep::funded_payer(base, PAYER_LAMPORTS).await?;
+                let probe_payer = base.funded_payer(PAYER_LAMPORTS).await?;
                 let probe_payer_pubkey = probe_payer.pubkey();
                 let probe_pdas = Accounts::new(ACCOUNT_SPACE, er.identity())
-                    .init_delegated(base, &probe_payer, 1)
+                    .init_delegated(base.as_ref(), &probe_payer, 1)
                     .await?;
                 let probe_account = probe_pdas[0];
                 check::poll(
@@ -624,7 +616,7 @@ impl Scenario<ScenarioReport> for CommitWidthEnvelope {
 
         let widths_label: Vec<String> =
             profile.widths.iter().map(|width| width.to_string()).collect();
-        let mut summary = ScenarioReport::ok(self.name())
+        let mut summary = ScenarioReport::ok()
             .setting("profile", profile.name)
             .setting("widths", widths_label.join("/"))
             .setting("account space", ACCOUNT_SPACE)

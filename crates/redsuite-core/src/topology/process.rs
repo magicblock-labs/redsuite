@@ -1,15 +1,25 @@
 use std::{
+    env,
+    fmt::Display,
     fs,
-    path::Path,
+    fs::{File, OpenOptions, TryLockError},
+    future::Future,
+    net::{TcpListener, UdpSocket},
+    ops::Range,
+    path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     rc::Rc,
-    time::Duration,
+    thread,
+    time::{Duration, Instant},
 };
 
 use rand::Rng;
+use tokio::{net::TcpStream, time};
 use tracing::warn;
+use url::Url;
 
-use crate::{host::proc_running, resources::ResourceRecord, Result};
+use super::config;
+use crate::{api::Api, host::proc_running, resources::ResourceRecord, DynError, Result};
 
 pub(super) const KILL_GRACE: Duration = Duration::from_secs(5);
 pub(super) const POLL: Duration = Duration::from_millis(250);
@@ -24,7 +34,7 @@ pub(super) fn spawn_child(mut cmd: Command, log: &Path) -> Result<Child> {
     if log.exists() {
         let _ = fs::rename(log, log.with_extension("log.prev"));
     }
-    let logfile = fs::File::create(log)?;
+    let logfile = File::create(log)?;
     cmd.stdout(logfile.try_clone()?)
         .stderr(logfile)
         .stdin(Stdio::null())
@@ -55,7 +65,7 @@ pub(super) async fn terminate(
     hard_kill: bool,
 ) -> Result<(ExitStatus, bool)> {
     send_signal(pid, if hard_kill { "-KILL" } else { "-TERM" });
-    let grace_deadline = std::time::Instant::now() + KILL_GRACE;
+    let grace_deadline = Instant::now() + KILL_GRACE;
     let hard_deadline = if hard_kill { grace_deadline } else { grace_deadline + KILL_GRACE };
     let mut escalated = hard_kill;
     let mut needed_sigkill = false;
@@ -63,18 +73,18 @@ pub(super) async fn terminate(
         if let Some(status) = child.try_wait()? {
             return Ok((status, needed_sigkill));
         }
-        if !escalated && std::time::Instant::now() >= grace_deadline {
+        if !escalated && Instant::now() >= grace_deadline {
             warn!(pid, "graceful shutdown timed out; sending SIGKILL");
             send_signal(pid, "-KILL");
             escalated = true;
             needed_sigkill = true;
         }
-        if std::time::Instant::now() >= hard_deadline {
+        if Instant::now() >= hard_deadline {
             return Err(
                 format!("process {pid} did not exit within {KILL_GRACE:?} of SIGKILL").into(),
             );
         }
-        tokio::time::sleep(RESTART_POLL).await;
+        time::sleep(RESTART_POLL).await;
     }
 }
 
@@ -92,9 +102,9 @@ pub(crate) fn kill_pid(pid: u32) {
         return;
     }
     let _ = Command::new("kill").arg(pid.to_string()).status();
-    let deadline = std::time::Instant::now() + KILL_GRACE;
-    while std::time::Instant::now() < deadline && proc_running(pid) {
-        std::thread::sleep(Duration::from_millis(100));
+    let deadline = Instant::now() + KILL_GRACE;
+    while Instant::now() < deadline && proc_running(pid) {
+        thread::sleep(Duration::from_millis(100));
     }
     if proc_running(pid) {
         warn!(pid, "process still alive after SIGTERM; sending SIGKILL");
@@ -110,11 +120,11 @@ pub(super) fn kill_matching(procs: &[(u32, &str)]) {
             send_signal(*pid, "-TERM");
         }
     }
-    let deadline = std::time::Instant::now() + KILL_GRACE;
-    while std::time::Instant::now() < deadline
+    let deadline = Instant::now() + KILL_GRACE;
+    while Instant::now() < deadline
         && procs.iter().any(|(pid, bin)| *pid != 0 && proc_matches(*pid, bin))
     {
-        std::thread::sleep(Duration::from_millis(100));
+        thread::sleep(Duration::from_millis(100));
     }
     for (pid, bin) in procs {
         if *pid != 0 && proc_matches(*pid, bin) {
@@ -255,14 +265,14 @@ pub(super) fn rpc_listening(port: u16) -> bool {
 // Both bases are usable at the same point: RPC answers, everything their
 // consumers dial is accepting, and the chain has ticked past genesis.
 pub(super) async fn await_base_serving(
-    rpc_url: &str,
+    rpc_url: &Url,
     log: &Path,
     pid: u32,
     listeners: &[(&str, u16)],
 ) -> Result<()> {
-    let api = crate::api::Api::new(rpc_url.to_owned());
+    let api = Api::new(rpc_url.clone());
     wait_until(
-        super::config::BASE_READY_TIMEOUT,
+        config::BASE_READY_TIMEOUT,
         "base RPC healthy",
         log,
         pid,
@@ -271,7 +281,7 @@ pub(super) async fn await_base_serving(
     .await?;
     for (what, port) in listeners {
         wait_until(Duration::from_secs(20), what, log, pid, || async {
-            tokio::net::TcpStream::connect(("127.0.0.1", *port)).await.is_ok()
+            TcpStream::connect(("127.0.0.1", *port)).await.is_ok()
         })
         .await?;
     }
@@ -295,7 +305,7 @@ pub(super) async fn wait_until<F, Fut>(
 ) -> Result<()>
 where
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = bool>,
+    Fut: Future<Output = bool>,
 {
     wait_until_every(POLL, timeout, what, log, pid, condition).await
 }
@@ -310,15 +320,15 @@ pub(super) async fn wait_until_every<F, Fut>(
 ) -> Result<()>
 where
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = bool>,
+    Fut: Future<Output = bool>,
 {
-    let deadline = tokio::time::Instant::now() + timeout;
-    let mut liveness_checked = tokio::time::Instant::now();
+    let deadline = time::Instant::now() + timeout;
+    let mut liveness_checked = time::Instant::now();
     loop {
         if condition().await {
             return Ok(());
         }
-        let now = tokio::time::Instant::now();
+        let now = time::Instant::now();
         if interval >= LIVENESS_INTERVAL
             || now.duration_since(liveness_checked) >= LIVENESS_INTERVAL
         {
@@ -331,14 +341,14 @@ where
                 .into());
             }
         }
-        if tokio::time::Instant::now() >= deadline {
+        if time::Instant::now() >= deadline {
             return Err(format!(
                 "timed out after {timeout:?} waiting for {what}; log tail:\n{}",
                 tail(log, 30)
             )
             .into());
         }
-        tokio::time::sleep(interval).await;
+        time::sleep(interval).await;
     }
 }
 
@@ -437,24 +447,24 @@ impl Drop for Owned {
 
 #[derive(Default)]
 pub(super) struct PortLease {
-    holders: Vec<(std::net::TcpListener, std::net::UdpSocket)>,
-    claims: Vec<(u16, fs::File)>,
+    holders: Vec<(TcpListener, UdpSocket)>,
+    claims: Vec<(u16, File)>,
 }
 
-const PORT_BAND: std::ops::Range<u16> = 20_000..30_000;
+const PORT_BAND: Range<u16> = 20_000..30_000;
 const BAND_ATTEMPTS: usize = 512;
 
-fn registry_dir() -> std::path::PathBuf {
-    if let Some(dir) = std::env::var_os("REDSUITE_PORT_REGISTRY") {
-        return std::path::PathBuf::from(dir);
+fn registry_dir() -> PathBuf {
+    if let Some(dir) = env::var_os("REDSUITE_PORT_REGISTRY") {
+        return PathBuf::from(dir);
     }
-    let who = std::env::var("HOME")
-        .or_else(|_| std::env::var("USER"))
+    let who = env::var("HOME")
+        .or_else(|_| env::var("USER"))
         .unwrap_or_else(|_| "shared".to_owned());
     let tag = who.bytes().fold(0xcbf2_9ce4_8422_2325u64, |acc, byte| {
         (acc ^ byte as u64).wrapping_mul(0x100_0000_01b3)
     });
-    std::env::temp_dir().join(format!("redsuite-ports-{tag:x}"))
+    env::temp_dir().join(format!("redsuite-ports-{tag:x}"))
 }
 
 impl PortLease {
@@ -469,20 +479,20 @@ impl PortLease {
             let mut claims = Vec::new();
             let mut holders = Vec::new();
             for port in first..first + want {
-                let lock = fs::OpenOptions::new()
+                let lock = OpenOptions::new()
                     .create(true)
                     .truncate(false)
                     .write(true)
                     .open(dir.join(format!("{port}.lock")))?;
                 match lock.try_lock() {
                     Ok(()) => {}
-                    Err(fs::TryLockError::WouldBlock) => break,
+                    Err(TryLockError::WouldBlock) => break,
                     Err(error) => return Err(error.into()),
                 }
-                let Ok(tcp) = std::net::TcpListener::bind(("127.0.0.1", port)) else {
+                let Ok(tcp) = TcpListener::bind(("127.0.0.1", port)) else {
                     break;
                 };
-                let Ok(udp) = std::net::UdpSocket::bind(("127.0.0.1", port)) else {
+                let Ok(udp) = UdpSocket::bind(("127.0.0.1", port)) else {
                     break;
                 };
                 claims.push((port, lock));
@@ -516,7 +526,7 @@ impl PortLease {
         self.holders.clear();
     }
 
-    pub(super) fn failure(&self, error: impl std::fmt::Display) -> crate::DynError {
+    pub(super) fn failure(&self, error: impl Display) -> DynError {
         let ports: Vec<_> = self.claims.iter().map(|(port, _)| *port).collect();
         format!("{error}\nreserved ports: {ports:?}").into()
     }

@@ -2,12 +2,14 @@ use std::{collections::HashSet, time::Duration};
 
 use pubkey::Pubkey;
 use signature::Signature;
+use tokio::{time, time::Instant};
 use tracing::warn;
 
 use crate::{
     api::{custom_error_code, Api, TransactionInfo},
+    check,
     check::CheckError,
-    Result,
+    check_eq, BaseCtx, ChainCtx, ErCtx, Result,
 };
 
 pub const INTENT_FAILED_CODE: u32 = 0x7461_636F;
@@ -21,6 +23,9 @@ pub const SPONSORED_COMMIT_LIMIT: u64 = 10;
 const LOG_MARKER: &str = "ScheduledCommitSent ";
 
 const SCHEDULE_MARKER: &str = "Scheduled commit with ID: ";
+
+const RECEIPT_TIMEOUT: Duration = Duration::from_secs(30);
+const BASE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(20);
 
 const SCHEDULE_FETCH_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -42,7 +47,76 @@ pub struct CommitReceipt {
     pub receipt_err_code: Option<u32>,
 }
 
+impl ErCtx {
+    /// Checks the standard commit receipt and confirms settlement. Duplicate rejection
+    /// is returned unchanged; callers must corroborate it against base state.
+    pub async fn check_commit(
+        &self,
+        base: &BaseCtx,
+        signature: &Signature,
+        expected: &[Pubkey],
+        expect_undelegation: bool,
+    ) -> Result<CommitReceipt> {
+        let receipt = fetch_commit_receipt(self.api(), signature, RECEIPT_TIMEOUT).await?;
+        if let Some(message) = &receipt.error_message {
+            if receipt.failure_is_duplicate_rejection() {
+                warn_duplicate_rejection(message);
+                return Ok(receipt);
+            }
+            return Err(CheckError::new("the commit intent succeeds").actual(message).into());
+        }
+        let mut included = receipt.included.clone();
+        included.sort();
+        let mut expected = expected.to_vec();
+        expected.sort();
+        check_eq!(
+            included,
+            expected,
+            "the receipt must list exactly the committed accounts"
+        )?;
+        check!(
+            receipt.excluded.is_empty(),
+            "the receipt must exclude no accounts"
+        )?;
+        check_eq!(
+            receipt.requested_undelegation,
+            expect_undelegation,
+            "the receipt undelegation flag must match the commit type"
+        )?;
+        receipt.confirm(base.api(), BASE_CONFIRM_TIMEOUT).await?;
+        Ok(receipt)
+    }
+}
+
 impl CommitReceipt {
+    /// Requires success and base signatures, without confirming those transactions.
+    pub fn check_success(&self, phase: &str) -> Result<()> {
+        check!(self.succeeded(), "{phase}: settlement failed: {self:?}")?;
+        check!(
+            !self.base_signatures.is_empty(),
+            "{phase}: a settled receipt names its base transactions"
+        )?;
+        Ok(())
+    }
+
+    pub async fn confirm(&self, base: &Api, timeout: Duration) -> Result<()> {
+        for chain_signature in &self.base_signatures {
+            let base_tx =
+                base.await_transaction(chain_signature, timeout).await.map_err(|error| {
+                    CheckError::new(format!("base commit tx {chain_signature} lands on base"))
+                        .caused_by(error)
+                })?;
+            if let Some(err) = &base_tx.err {
+                return Err(CheckError::new(format!(
+                    "base commit tx {chain_signature} succeeds on base"
+                ))
+                .actual(format!("failed on-chain: {err:?}"))
+                .into());
+            }
+        }
+        Ok(())
+    }
+
     pub fn succeeded(&self) -> bool {
         self.error_message.is_none() && self.receipt_err_code.is_none()
     }
@@ -58,12 +132,8 @@ impl CommitReceipt {
     }
 }
 
-pub fn warn_duplicate_rejection(scenario: &str, error: &str) {
-    warn!(
-        scenario,
-        %error,
-        "intent rejected as duplicate; verifying base state"
-    );
+pub fn warn_duplicate_rejection(error: &str) {
+    warn!(%error, "intent rejected as duplicate; verifying base state");
 }
 
 // Builtin ic_msg lines arrive bare; tolerate a BPF-style prefix anyway.
@@ -183,18 +253,15 @@ pub async fn fetch_commit_receipt_by_intent(
     intent_id: u64,
     timeout: Duration,
 ) -> Result<CommitReceipt> {
-    let deadline = tokio::time::Instant::now() + timeout;
+    let deadline = Instant::now() + timeout;
     let mut seen = HashSet::new();
     let mut last_fetch_error = None;
     loop {
         let history = er.get_signatures_for_address(validator, RECEIPT_HISTORY_LIMIT).await?;
-        for text in history {
-            if !seen.insert(text.clone()) {
+        for signature in history {
+            if !seen.insert(signature) {
                 continue;
             }
-            let Ok(signature) = text.parse::<Signature>() else {
-                continue;
-            };
             let tx = match er.get_transaction(&signature).await {
                 Ok(Some(tx)) => tx,
                 Ok(None) => continue,
@@ -208,7 +275,7 @@ pub async fn fetch_commit_receipt_by_intent(
                 return Ok(receipt);
             }
         }
-        if tokio::time::Instant::now() >= deadline {
+        if Instant::now() >= deadline {
             let mut message =
                 format!("no commit receipt for intent {intent_id} within {timeout:?}");
             if let Some(error) = &last_fetch_error {
@@ -219,27 +286,6 @@ pub async fn fetch_commit_receipt_by_intent(
             }
             return Err(message.into());
         }
-        tokio::time::sleep(RECEIPT_POLL).await;
+        time::sleep(RECEIPT_POLL).await;
     }
-}
-
-pub async fn confirm_base_signatures(
-    base: &Api,
-    receipt: &CommitReceipt,
-    timeout: Duration,
-) -> Result<()> {
-    for chain_signature in &receipt.base_signatures {
-        let base_tx = base.await_transaction(chain_signature, timeout).await.map_err(|error| {
-            CheckError::new(format!("base commit tx {chain_signature} lands on base"))
-                .caused_by(error)
-        })?;
-        if let Some(err) = &base_tx.err {
-            return Err(CheckError::new(format!(
-                "base commit tx {chain_signature} succeeds on base"
-            ))
-            .actual(format!("failed on-chain: {err:?}"))
-            .into());
-        }
-    }
-    Ok(())
 }

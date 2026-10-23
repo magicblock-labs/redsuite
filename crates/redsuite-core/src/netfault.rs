@@ -1,21 +1,27 @@
 use std::{
     cell::RefCell,
     collections::HashMap,
+    mem,
     rc::Rc,
+    result,
     time::{Duration, Instant},
 };
 
 use futures_util::{SinkExt, StreamExt};
-use json::{JsonContainerTrait, JsonValueTrait};
+use json::{JsonContainerTrait, JsonValueTrait, Value};
 use pubkey::Pubkey;
+use reqwest::{Client, StatusCode};
 use signature::Signature;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::{mpsc, oneshot, Notify},
+    task,
     task::JoinHandle,
+    time,
 };
 use tokio_tungstenite::tungstenite::{Message, Utf8Bytes};
+use url::Url;
 
 use crate::{
     api::decode_transaction,
@@ -294,9 +300,9 @@ fn deliver(
     decision: Decision,
     text: Utf8Bytes,
     is_notification: bool,
-    id: &Option<json::Value>,
+    id: &Option<Value>,
     holding: Option<Holding>,
-) -> std::result::Result<(), ()> {
+) -> result::Result<(), ()> {
     let message = match decision {
         Decision::Discard => return Ok(()),
         Decision::Reject(message) => {
@@ -336,7 +342,7 @@ pub struct Trap {
 
 impl Trap {
     pub async fn wait(&self, timeout: Duration) -> Result<Held> {
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = time::Instant::now() + timeout;
         loop {
             if let Some(pending) = self.state.fired.borrow_mut().as_mut() {
                 if let Some(decide) = pending.decide.take() {
@@ -353,14 +359,14 @@ impl Trap {
                 .into());
             }
             let remaining =
-                deadline.checked_duration_since(tokio::time::Instant::now()).ok_or_else(|| {
+                deadline.checked_duration_since(time::Instant::now()).ok_or_else(|| {
                     format!(
                         "the interception `{:?}` did not occur within \
                          {timeout:?}",
                         self.state.selector
                     )
                 })?;
-            let _ = tokio::time::timeout(remaining, self.state.notify.notified()).await;
+            let _ = time::timeout(remaining, self.state.notify.notified()).await;
         }
     }
 }
@@ -405,21 +411,21 @@ impl BaseProxies {
         let http_listener = TcpListener::bind("127.0.0.1:0").await?;
         let ws_listener = TcpListener::bind("127.0.0.1:0").await?;
         let endpoints = BaseEndpoints {
-            rpc_url: format!("http://{}", http_listener.local_addr()?),
-            ws_url: format!("ws://{}", ws_listener.local_addr()?),
+            rpc_url: format!("http://{}", http_listener.local_addr()?).parse()?,
+            ws_url: format!("ws://{}", ws_listener.local_addr()?).parse()?,
             grpc_url: None,
         };
-        let upstream_rpc = base.api().url().to_owned();
-        let upstream_ws = base.ws_url().to_owned();
+        let upstream_rpc = base.api().url().clone();
+        let upstream_ws = base.ws_url().clone();
         let client = http::client_with_timeout(UPSTREAM_TIMEOUT);
         let listeners = vec![
-            tokio::task::spawn_local(accept_http(
+            task::spawn_local(accept_http(
                 http_listener,
                 upstream_rpc,
                 client,
                 shared.clone(),
             )),
-            tokio::task::spawn_local(accept_ws(ws_listener, upstream_ws, shared.clone())),
+            task::spawn_local(accept_ws(ws_listener, upstream_ws, shared.clone())),
         ];
         Ok(Self { shared, endpoints, listeners })
     }
@@ -505,7 +511,7 @@ impl BaseProxies {
     }
 
     fn unfired(&self) -> Result<()> {
-        let unfired = std::mem::take(&mut self.shared.borrow_mut().unfired);
+        let unfired = mem::take(&mut self.shared.borrow_mut().unfired);
         if unfired.is_empty() {
             return Ok(());
         }
@@ -534,7 +540,7 @@ impl Drop for BaseProxies {
     }
 }
 
-fn collect_strings(value: &json::Value, into: &mut Vec<String>) {
+fn collect_strings(value: &Value, into: &mut Vec<String>) {
     if let Some(text) = value.as_str() {
         into.push(text.to_owned());
     } else if let Some(items) = value.as_array() {
@@ -565,7 +571,7 @@ fn classify(strings: Vec<String>) -> (Vec<String>, Vec<String>) {
 }
 
 struct Parsed {
-    id: Option<json::Value>,
+    id: Option<Value>,
     method: Option<String>,
     subscription: Option<u64>,
     result: Option<u64>,
@@ -573,7 +579,7 @@ struct Parsed {
 }
 
 fn parse(text: &str) -> Option<Parsed> {
-    let value: json::Value = json::from_str(text).ok()?;
+    let value: Value = json::from_str(text).ok()?;
     let method = value.get("method").and_then(|m| m.as_str()).map(str::to_owned);
     let mut strings = Vec::new();
     if let Some(params) = value.get("params") {
@@ -622,7 +628,7 @@ fn merged(mut base: Operation, stage: Stage, extra: Vec<String>) -> Operation {
     base
 }
 
-fn rejection(id: &Option<json::Value>, message: &str) -> String {
+fn rejection(id: &Option<Value>, message: &str) -> String {
     let id = id
         .as_ref()
         .and_then(|id| json::to_string(id).ok())
@@ -634,17 +640,12 @@ fn rejection(id: &Option<json::Value>, message: &str) -> String {
     )
 }
 
-async fn accept_http(
-    listener: TcpListener,
-    upstream: String,
-    client: reqwest::Client,
-    shared: Shared,
-) {
+async fn accept_http(listener: TcpListener, upstream: Url, client: Client, shared: Shared) {
     loop {
         let Ok((socket, _)) = listener.accept().await else {
             return;
         };
-        let handle = tokio::task::spawn_local(serve_http(
+        let handle = task::spawn_local(serve_http(
             socket,
             upstream.clone(),
             client.clone(),
@@ -697,10 +698,11 @@ async fn read_request(socket: &mut TcpStream, buffer: &mut Vec<u8>) -> Option<(S
     }
 }
 
-async fn write_response(socket: &mut TcpStream, status: u16, body: &str) -> bool {
-    let reason = if status == 200 { "OK" } else { "Error" };
+async fn write_response(socket: &mut TcpStream, status: StatusCode, body: &str) -> bool {
+    let reason = if status == StatusCode::OK { "OK" } else { "Error" };
+    let code = status.as_str();
     let head = format!(
-        "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\n\
+        "HTTP/1.1 {code} {reason}\r\ncontent-type: application/json\r\n\
          content-length: {}\r\n\r\n",
         body.len()
     );
@@ -709,12 +711,7 @@ async fn write_response(socket: &mut TcpStream, status: u16, body: &str) -> bool
         && socket.flush().await.is_ok()
 }
 
-async fn serve_http(
-    mut socket: TcpStream,
-    upstream: String,
-    client: reqwest::Client,
-    shared: Shared,
-) {
+async fn serve_http(mut socket: TcpStream, upstream: Url, client: Client, shared: Shared) {
     let mut buffer = Vec::new();
     loop {
         let Some((head, body)) = read_request(&mut socket, &mut buffer).await else {
@@ -746,7 +743,7 @@ async fn serve_http(
         match decision {
             Decision::Discard => return,
             Decision::Reject(message) => {
-                if !write_response(&mut socket, 200, &rejection(&id, &message)).await {
+                if !write_response(&mut socket, StatusCode::OK, &rejection(&id, &message)).await {
                     return;
                 }
                 if !keep_alive {
@@ -757,8 +754,11 @@ async fn serve_http(
             Decision::Release => {}
         }
         let (status, text) = match http::post_json(&client, &upstream, body).await {
-            Ok(text) => (200, text),
-            Err(error) => (error.status.unwrap_or(502), error.detail),
+            Ok(text) => (StatusCode::OK, text),
+            Err(error) => (
+                error.status.unwrap_or(StatusCode::BAD_GATEWAY),
+                error.detail,
+            ),
         };
         let extra = parse(&text).map(|parsed| parsed.strings).unwrap_or_default();
         let response = merged(request, Stage::Response, extra);
@@ -766,7 +766,7 @@ async fn serve_http(
         match decision {
             Decision::Discard => return,
             Decision::Reject(message) => {
-                if !write_response(&mut socket, 200, &rejection(&id, &message)).await {
+                if !write_response(&mut socket, StatusCode::OK, &rejection(&id, &message)).await {
                     return;
                 }
             }
@@ -782,12 +782,12 @@ async fn serve_http(
     }
 }
 
-async fn accept_ws(listener: TcpListener, upstream: String, shared: Shared) {
+async fn accept_ws(listener: TcpListener, upstream: Url, shared: Shared) {
     loop {
         let Ok((socket, _)) = listener.accept().await else {
             return;
         };
-        let handle = tokio::task::spawn_local(serve_ws(socket, upstream.clone(), shared.clone()));
+        let handle = task::spawn_local(serve_ws(socket, upstream.clone(), shared.clone()));
         shared.borrow_mut().track(handle);
     }
 }
@@ -824,17 +824,17 @@ fn response_operation(
     merged(request, Stage::Response, parsed.strings)
 }
 
-async fn serve_ws(socket: TcpStream, upstream: String, shared: Shared) {
+async fn serve_ws(socket: TcpStream, upstream: Url, shared: Shared) {
     let Ok(client) = tokio_tungstenite::accept_async(socket).await else {
         return;
     };
-    let Ok((server, _)) = tokio_tungstenite::connect_async(&upstream).await else {
+    let Ok((server, _)) = tokio_tungstenite::connect_async(upstream.as_str()).await else {
         return;
     };
     let (mut client_sink, mut client_stream) = client.split();
     let (mut server_sink, mut server_stream) = server.split();
     let (outbound, mut outbound_rx) = mpsc::unbounded_channel();
-    tokio::task::spawn_local(async move {
+    task::spawn_local(async move {
         while let Some(Some((message, _hold))) = outbound_rx.recv().await {
             if client_sink.send(message).await.is_err() {
                 break;
@@ -919,7 +919,7 @@ async fn serve_ws(socket: TcpStream, upstream: String, shared: Shared) {
                     GateStart::Pending(receiver, operation, holding) => {
                         let shared = shared.clone();
                         let outbound = outbound.clone();
-                        tokio::task::spawn_local(async move {
+                        task::spawn_local(async move {
                             let decision = gate_finish(&shared, receiver, operation).await;
                             let _ = deliver(&outbound, decision, text, is_notification, &id, Some(holding));
                         });

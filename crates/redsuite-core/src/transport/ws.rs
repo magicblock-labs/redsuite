@@ -1,16 +1,18 @@
 use std::{
     cell::RefCell,
     collections::{BTreeSet, HashMap, HashSet},
+    mem,
     rc::Rc,
     sync::Arc,
     time::Duration,
 };
 
-use base64::Engine;
-use json::{Deserialize, LazyValue};
+use base64::{engine::general_purpose::STANDARD, Engine};
+use json::{Deserialize, LazyValue, Value};
 use pubkey::Pubkey;
 use signature::Signature;
 use tokio::sync::oneshot;
+use url::Url;
 
 use super::{
     clock::SendClock,
@@ -33,7 +35,7 @@ struct AccountValue {
 
 pub(super) fn account_update_data(payload: &LazyValue<'_>) -> Option<Vec<u8>> {
     let payload = json::from_str::<AccountPayload>(payload.as_raw_str()).ok()?;
-    base64::engine::general_purpose::STANDARD.decode(&payload.value.data.0).ok()
+    STANDARD.decode(&payload.value.data.0).ok()
 }
 
 #[derive(Debug)]
@@ -81,7 +83,10 @@ struct AccountHandler<E> {
     clock: Arc<SendClock>,
 }
 
-impl<E: Fn(&[u8]) -> Option<u64>> FrameHandler for AccountHandler<E> {
+impl<E> FrameHandler for AccountHandler<E>
+where
+    E: Fn(&[u8]) -> Option<u64>,
+{
     fn on_reply(&mut self, id: u64, result: Option<&LazyValue<'_>>) {
         let mut shared = self.shared.borrow_mut();
         if let (Some(account), Some(subid)) =
@@ -137,11 +142,14 @@ pub struct AccountUpdates {
 }
 
 impl AccountUpdates {
-    pub async fn connect(
-        url: &str,
-        extractor: impl Fn(&[u8]) -> Option<u64> + 'static,
+    pub async fn connect<Extract>(
+        url: &Url,
+        extractor: Extract,
         clock: Arc<SendClock>,
-    ) -> Result<Self> {
+    ) -> Result<Self>
+    where
+        Extract: Fn(&[u8]) -> Option<u64> + 'static,
+    {
         let (requester, stream) = conn::split(conn::connect(url).await?);
         let shared = Rc::new(RefCell::new(Shared::default()));
         let reader = Reader::spawn(
@@ -216,7 +224,7 @@ impl AccountUpdates {
         self.reader.stop();
         let mut shared = self.shared.borrow_mut();
         UpdateOutcome {
-            lag: std::mem::take(&mut shared.lag).finalize(false),
+            lag: mem::take(&mut shared.lag).finalize(false),
             observed: shared.observed,
             superseded: shared.superseded,
         }
@@ -246,7 +254,7 @@ struct SigPayload {
 
 #[derive(Deserialize)]
 struct SigValue {
-    err: Option<json::Value>,
+    err: Option<Value>,
 }
 
 #[derive(Debug)]
@@ -346,7 +354,7 @@ pub struct SignatureConfirmations {
 }
 
 impl SignatureConfirmations {
-    pub async fn connect(url: &str, clock: Arc<SendClock>) -> Result<Self> {
+    pub async fn connect(url: &Url, clock: Arc<SendClock>) -> Result<Self> {
         let (requester, stream) = conn::split(conn::connect(url).await?);
         let shared = Rc::new(RefCell::new(SigShared::default()));
         let reader = Reader::spawn(stream, SigHandler { shared: shared.clone(), clock });
@@ -365,7 +373,7 @@ impl SignatureConfirmations {
             .send(
                 req,
                 "signatureSubscribe",
-                &conn::signature_params(&signature.to_string()),
+                &conn::signature_params(signature),
             )
             .await
     }
@@ -397,7 +405,7 @@ impl SignatureConfirmations {
         self.reader.stop();
         let mut shared = self.shared.borrow_mut();
         SignatureOutcome {
-            latency: std::mem::take(&mut shared.latency).finalize(false),
+            latency: mem::take(&mut shared.latency).finalize(false),
             confirmed: shared.confirmed,
             failed: shared.failed,
             first_failure: shared.first_failure.take(),

@@ -5,12 +5,12 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use async_trait::async_trait;
 use futures_util::future::join_all;
-use json::{JsonContainerTrait, JsonValueTrait};
+use hash::Hash;
+use json::{JsonContainerTrait, JsonValueTrait, Value};
 use pubkey::Pubkey;
 use redsuite_core::{
-    check, check_eq, prep,
+    check, check_eq,
     redline::Accounts,
     rpc_client::{
         nonblocking::rpc_client::RpcClient, rpc_client::GetConfirmedSignaturesForAddress2Config,
@@ -23,7 +23,7 @@ use redsuite_core::{
     transport::{
         clock::SendClock, events::EventSubscriptions, ws::SignatureConfirmations, wsraw::RawWs,
     },
-    BaseCtx, ChainCtx, CheckError, ErCtx, Result, Scenario, TxSender,
+    BaseCtx, ChainCtx, CheckError, DynError, ErCtx, Result, Scenario, TxSender,
 };
 use serde::Deserialize;
 use signature::Signature;
@@ -34,7 +34,7 @@ use solana_transaction_status_client_types::{
 };
 use transaction::Transaction;
 
-use crate::program::instruction::build;
+use crate::{program::instruction::build, ACCOUNT_SPACE};
 
 const WRITES: usize = 256;
 const PAYERS: usize = 32;
@@ -60,8 +60,6 @@ const EVENT_POLL: Duration = Duration::from_millis(20);
 const RAW_FIRST_TIMEOUT: Duration = Duration::from_secs(3);
 const RAW_DRAIN_TIMEOUT: Duration = Duration::from_millis(300);
 const RAW_SILENCE_TIMEOUT: Duration = Duration::from_millis(700);
-
-pub struct RpcLifecycle;
 
 struct Write {
     pda: Pubkey,
@@ -126,7 +124,7 @@ async fn await_clones(client: &RpcClient, pdas: &[Pubkey]) -> Result<()> {
             all_present &= accounts.iter().all(|account| {
                 account
                     .as_ref()
-                    .is_some_and(|account| account.data.len() == crate::ACCOUNT_SPACE as usize)
+                    .is_some_and(|account| account.data.len() == ACCOUNT_SPACE as usize)
             });
         }
         if all_present {
@@ -194,9 +192,9 @@ async fn await_publication(client: &RpcClient, slot: u64) -> Result<()> {
     }
 }
 
-async fn burst(scenario: &str, base: &BaseCtx, er: &ErCtx, client: &RpcClient) -> Result<()> {
-    let payers = prep::funded_payers(base, PAYERS, PAYER_LAMPORTS).await?;
-    let pdas = Accounts::new(crate::ACCOUNT_SPACE, er.identity())
+async fn burst(base: &BaseCtx, er: &ErCtx, client: &RpcClient) -> Result<()> {
+    let payers = base.funded_payers(PAYERS, PAYER_LAMPORTS).await?;
+    let pdas = Accounts::new(ACCOUNT_SPACE, er.identity())
         .init_batched(base, &payers, WRITES, true)
         .await?;
     let per_payer = WRITES.div_ceil(PAYERS);
@@ -210,7 +208,7 @@ async fn burst(scenario: &str, base: &BaseCtx, er: &ErCtx, client: &RpcClient) -
     let pda_strings: Vec<String> = pdas.iter().map(ToString::to_string).collect();
     let for_accounts: WithContext<RawBlockhash> =
         er.api().call("getBlockhashForAccounts", &(pda_strings,)).await?;
-    let for_accounts: hash::Hash = for_accounts.value.blockhash.parse()?;
+    let for_accounts: Hash = for_accounts.value.blockhash.parse()?;
     check!(
         client.is_blockhash_valid(&for_accounts, confirmed()).await?,
         "getBlockhashForAccounts returned {for_accounts} but \
@@ -305,7 +303,7 @@ async fn burst(scenario: &str, base: &BaseCtx, er: &ErCtx, client: &RpcClient) -
     check_eq!(
         failures,
         0,
-        "{scenario}: every write must be accepted by sendTransaction; first failure: {first_failure:?}"
+        "every write must be accepted by sendTransaction; first failure: {first_failure:?}"
     )?;
 
     let slots = await_statuses(client, &signatures).await?;
@@ -505,7 +503,7 @@ async fn transfer(
 async fn timestamps(er: &ErCtx, executions: Vec<(Signature, u64)>) -> Result<()> {
     let last_slot = executions.last().map_or(0, |(_, slot)| *slot);
     let settled = check::poll_until(LEDGER_SETTLE_TIMEOUT, POLL, async || {
-        Ok::<_, redsuite_core::DynError>(
+        Ok::<_, DynError>(
             (er.api().get_slot().await? >= last_slot + LEDGER_SETTLE_SLOTS).then_some(()),
         )
     })
@@ -548,8 +546,8 @@ async fn await_event_where(
     events: &EventSubscriptions,
     key: u64,
     what: &str,
-    matches: impl Fn(&json::Value) -> bool,
-) -> Result<json::Value> {
+    matches: impl Fn(&Value) -> bool,
+) -> Result<Value> {
     check::poll_until(EVENT_TIMEOUT, EVENT_POLL, async || {
         Ok::<_, CheckError>(events.events(key).into_iter().find(|event| matches(event)))
     })
@@ -562,21 +560,19 @@ async fn await_event_where(
     })
 }
 
-fn event_lamports(event: &json::Value) -> Option<u64> {
+fn event_lamports(event: &Value) -> Option<u64> {
     event.get("value").get("lamports").as_u64()
 }
 
-fn event_signature(event: &json::Value) -> Option<String> {
+fn event_signature(event: &Value) -> Option<String> {
     event.get("value").get("signature").as_str().map(str::to_owned)
 }
 
 async fn wallet_stream(base: &BaseCtx, er: &ErCtx, events: &EventSubscriptions) -> Result<()> {
     let system_program = system::system_id();
-    let funder = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
-    let account1 = prep::delegated_payer(base, &funder, er.identity(), ACCOUNT_LAMPORTS).await?;
-    let account2 = prep::delegated_payer(base, &funder, er.identity(), ACCOUNT_LAMPORTS)
-        .await?
-        .pubkey();
+    let funder = base.funded_payer(crate::PAYER_LAMPORTS).await?;
+    let account1 = base.delegated_payer(&funder, er.identity(), ACCOUNT_LAMPORTS).await?;
+    let account2 = base.delegated_payer(&funder, er.identity(), ACCOUNT_LAMPORTS).await?.pubkey();
     let account1_pubkey = account1.pubkey();
     let sender = er.sender(Rc::new(account1));
     let account1_key = events.account_subscribe(&account1_pubkey).await?;
@@ -772,7 +768,7 @@ async fn wallet_stream(base: &BaseCtx, er: &ErCtx, events: &EventSubscriptions) 
             )?;
             let unsent =
                 sender.prepare(&[system::transfer(&account1_pubkey, &account2, 9_999)]).await?;
-            let signature_sub = raw.signature_subscribe(&unsent.signatures[0].to_string()).await?;
+            let signature_sub = raw.signature_subscribe(&unsent.signatures[0]).await?;
             raw.signature_unsubscribe(signature_sub).await?;
             check_eq!(
                 raw.malformed_frames(),
@@ -808,19 +804,39 @@ async fn slot_stream(events: &EventSubscriptions, slot_key: u64) -> Result<()> {
     Ok(())
 }
 
-#[async_trait(?Send)]
-impl Scenario for RpcLifecycle {
-    fn name(&self) -> &str {
-        "redshift/rpc_lifecycle"
-    }
+pub struct RpcLifecycle {
+    base: Rc<BaseCtx>,
+    er: ErCtx,
+    client: RpcClient,
+    events: EventSubscriptions,
+    slot_key: u64,
+}
 
-    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<()> {
-        let client = RpcClient::new_with_commitment(er.api().url().to_owned(), confirmed());
+impl Scenario for RpcLifecycle {
+    async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
+        let client = RpcClient::new_with_commitment(er.api().url().to_string(), confirmed());
         let events = EventSubscriptions::connect(er.ws_url()).await?;
         let slot_key = events.slot_subscribe().await?;
+        Ok(Self {
+            base,
+            er,
+            client,
+            events,
+            slot_key,
+        })
+    }
+
+    async fn run(self) -> Result<()> {
+        let Self {
+            base,
+            er,
+            client,
+            events,
+            slot_key,
+        } = self;
         tokio::try_join!(
-            crate::phase("http burst", burst(self.name(), base, er, &client)),
-            wallet_stream(base, er, &events),
+            crate::phase("http burst", burst(&base, &er, &client)),
+            wallet_stream(&base, &er, &events),
             crate::phase("ws slot stream", slot_stream(&events, slot_key)),
         )?;
         check_eq!(

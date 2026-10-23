@@ -1,26 +1,31 @@
-use std::time::Duration;
+use std::{rc::Rc, time::Duration};
 
-use async_trait::async_trait;
 use keypair::Keypair;
-use redsuite_core::{check, prep, system, BaseCtx, ChainCtx, CheckError, ErCtx, Result, Scenario};
+use pubkey::Pubkey;
+use redsuite_core::{check, system, BaseCtx, ChainCtx, CheckError, ErCtx, Result, Scenario};
 use signer::Signer;
 
 const TRANSFERS: u64 = 10;
 const LAMPORTS_PER_TRANSFER: u64 = 1_000_000;
 const PAYER_LAMPORTS: u64 = 1_000_000_000;
 
-pub struct Example;
+pub struct Example {
+    base: Rc<BaseCtx>,
+    er: ErCtx,
+    payer: Keypair,
+    recipient: Pubkey,
+}
 
-#[async_trait(?Send)]
 impl Scenario for Example {
-    fn name(&self) -> &str {
-        "redshift/example"
-    }
-
-    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<()> {
-        let payer = prep::funded_payer(base, PAYER_LAMPORTS).await?;
+    async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
+        let payer = base.funded_payer(PAYER_LAMPORTS).await?;
         let recipient = Keypair::new().pubkey();
 
+        Ok(Self { base, er, payer, recipient })
+    }
+
+    async fn run(self) -> Result<()> {
+        let Self { base, er, payer, recipient } = self;
         let mut expected = 0;
         // identical transactions share a signature and get deduplicated —
         // every transaction must differ somewhere (here: the amount)

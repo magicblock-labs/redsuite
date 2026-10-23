@@ -1,4 +1,4 @@
-use std::{collections::HashMap, time::Instant};
+use std::{collections::HashMap, fs, fs::ReadDir, path::Path, time::Instant};
 
 #[cfg(target_os = "macos")]
 use tracing::warn;
@@ -14,7 +14,7 @@ const SZOMB: u32 = 5;
 
 #[cfg(target_os = "linux")]
 pub fn proc_running(pid: u32) -> bool {
-    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+    let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
         return false;
     };
     // `pid (comm) S …` — comm may contain anything, so find the last ')'.
@@ -49,7 +49,7 @@ pub struct CpuSample {
 
 #[cfg(target_os = "linux")]
 fn stat_cpu_secs(path: &str) -> Result<f64> {
-    let stat = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+    let stat = fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
     let after_comm = stat.rsplit_once(')').ok_or_else(|| format!("{path}: no comm field"))?.1;
     let fields: Vec<&str> = after_comm.split_whitespace().collect();
     let utime: u64 = fields
@@ -69,8 +69,8 @@ fn stat_cpu_secs(path: &str) -> Result<f64> {
 pub fn cpu_sample(pid: u32) -> Result<CpuSample> {
     let process_secs = stat_cpu_secs(&format!("/proc/{pid}/stat"))?;
     let mut thread_secs = HashMap::new();
-    let tasks = std::fs::read_dir(format!("/proc/{pid}/task"))
-        .map_err(|e| format!("/proc/{pid}/task: {e}"))?;
+    let tasks =
+        fs::read_dir(format!("/proc/{pid}/task")).map_err(|e| format!("/proc/{pid}/task: {e}"))?;
     for task in tasks {
         let task = task?;
         let Ok(tid) = task.file_name().to_string_lossy().parse::<u64>() else {
@@ -141,7 +141,7 @@ impl CpuSample {
 #[cfg(target_os = "linux")]
 pub fn fd_count(pid: u32) -> Result<usize> {
     let entries =
-        std::fs::read_dir(format!("/proc/{pid}/fd")).map_err(|e| format!("/proc/{pid}/fd: {e}"))?;
+        fs::read_dir(format!("/proc/{pid}/fd")).map_err(|e| format!("/proc/{pid}/fd: {e}"))?;
     Ok(entries.count())
 }
 
@@ -160,12 +160,12 @@ pub fn fd_count(pid: u32) -> Result<usize> {
     Ok(open.len())
 }
 
-pub fn dir_size_bytes(dir: &std::path::Path) -> Result<u64> {
-    let entries = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+pub fn dir_size_bytes(dir: &Path) -> Result<u64> {
+    let entries = fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     walk_size(entries)
 }
 
-fn walk_size(entries: std::fs::ReadDir) -> Result<u64> {
+fn walk_size(entries: ReadDir) -> Result<u64> {
     use std::io::ErrorKind::NotFound;
     let mut total = 0;
     for entry in entries {
@@ -180,7 +180,7 @@ fn walk_size(entries: std::fs::ReadDir) -> Result<u64> {
             Err(error) => return Err(error.into()),
         };
         if metadata.is_dir() {
-            total += match std::fs::read_dir(entry.path()) {
+            total += match fs::read_dir(entry.path()) {
                 Ok(inner) => walk_size(inner)?,
                 Err(error) if error.kind() == NotFound => 0,
                 Err(error) => return Err(error.into()),
@@ -194,7 +194,7 @@ fn walk_size(entries: std::fs::ReadDir) -> Result<u64> {
 
 #[cfg(target_os = "linux")]
 pub fn rss_kb(pid: u32) -> Result<u64> {
-    let status = std::fs::read_to_string(format!("/proc/{pid}/status"))
+    let status = fs::read_to_string(format!("/proc/{pid}/status"))
         .map_err(|e| format!("/proc/{pid}/status: {e}"))?;
     for line in status.lines() {
         if let Some(rest) = line.strip_prefix("VmRSS:") {

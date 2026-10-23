@@ -6,7 +6,6 @@ pub mod dlp;
 pub mod frontend;
 pub mod host;
 pub mod logging;
-pub mod mdp;
 pub mod monitor;
 pub mod netfault;
 pub mod prep;
@@ -19,10 +18,13 @@ mod resources;
 pub mod runner;
 pub mod sampler;
 pub mod scenario;
+pub mod schedulecommit;
 pub mod stats;
 pub mod system;
 pub mod topology;
 pub mod transport;
+
+use std::{error::Error, result};
 
 pub use api::{Api, Metrics, MetricsDelta, SendBody};
 pub use check::{phase, CheckError};
@@ -35,5 +37,8 @@ pub use scenario::{
 pub use solana_rpc_client as rpc_client;
 pub use solana_rpc_client_api as rpc_client_api;
 
-pub type DynError = Box<dyn std::error::Error + Send + Sync>;
-pub type Result<T> = std::result::Result<T, DynError>;
+#[doc(hidden)]
+pub use const_str as __const_str;
+
+pub type DynError = Box<dyn Error + Send + Sync>;
+pub type Result<T> = result::Result<T, DynError>;

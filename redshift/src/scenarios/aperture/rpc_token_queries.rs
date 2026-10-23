@@ -1,14 +1,14 @@
-use std::{collections::BTreeSet, time::Duration};
+use std::{collections::BTreeSet, fmt::Debug, future::Future, rc::Rc, result, time::Duration};
 
-use async_trait::async_trait;
-use base64::Engine;
+use base64::{engine::general_purpose::STANDARD, Engine};
 use futures_util::future::join_all;
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    check, check_eq, prep,
+    check, check_eq,
     rpc_client::nonblocking::rpc_client::RpcClient,
     rpc_client_api::{
+        client_error::Error,
         config::{RpcAccountInfoConfig, RpcProgramAccountsConfig},
         filter::{Memcmp, RpcFilterType},
         request::TokenAccountsFilter,
@@ -16,9 +16,11 @@ use redsuite_core::{
     },
     BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
+use serde_json::Value;
 use signer::Signer;
 use solana_account_decoder_client_types::{UiAccount, UiAccountData, UiAccountEncoding};
 use solana_commitment_config::CommitmentConfig;
+use tokio::time;
 
 use crate::scenarios::chainlink::spl;
 
@@ -34,8 +36,6 @@ const DELEGATED_AMOUNT_OFFSET: usize = 121;
 const MATERIALIZATION_TIMEOUT: Duration = Duration::from_secs(30);
 const BURST_DEADLINE: Duration = Duration::from_secs(20);
 const NEGATIVE_DEADLINE: Duration = Duration::from_secs(5);
-
-pub struct RpcTokenQueries;
 
 struct Fixture {
     mint: Pubkey,
@@ -107,9 +107,7 @@ fn read_delegate(data: &[u8]) -> Option<Pubkey> {
 
 fn raw_data(account: &UiAccount) -> Result<Vec<u8>> {
     match &account.data {
-        UiAccountData::Binary(encoded, UiAccountEncoding::Base64) => {
-            Ok(base64::engine::general_purpose::STANDARD.decode(encoded)?)
-        }
+        UiAccountData::Binary(encoded, UiAccountEncoding::Base64) => Ok(STANDARD.decode(encoded)?),
         other => Err(format!("expected base64 account data, got {other:?}").into()),
     }
 }
@@ -123,7 +121,7 @@ struct TokenView {
     delegated_amount: Option<u64>,
 }
 
-fn parsed_str(info: &serde_json::Value, path: &[&str]) -> Option<String> {
+fn parsed_str(info: &Value, path: &[&str]) -> Option<String> {
     let mut value = info;
     for key in path {
         value = value.get(key)?;
@@ -395,14 +393,12 @@ async fn run_query(client: &RpcClient, fixture: &Fixture, query: Query) -> Resul
     Ok(())
 }
 
-async fn expect_rejection<T: std::fmt::Debug>(
-    label: &str,
-    needles: &[&str],
-    call: impl std::future::Future<
-        Output = std::result::Result<T, redsuite_core::rpc_client_api::client_error::Error>,
-    >,
-) -> Result<()> {
-    let outcome = tokio::time::timeout(NEGATIVE_DEADLINE, call)
+async fn expect_rejection<T, Call>(label: &str, needles: &[&str], call: Call) -> Result<()>
+where
+    T: Debug,
+    Call: Future<Output = result::Result<T, Error>>,
+{
+    let outcome = time::timeout(NEGATIVE_DEADLINE, call)
         .await
         .map_err(|_| format!("{label} did not answer within {NEGATIVE_DEADLINE:?}"))?;
     match outcome {
@@ -419,15 +415,15 @@ async fn expect_rejection<T: std::fmt::Debug>(
     }
 }
 
-#[async_trait(?Send)]
-impl Scenario for RpcTokenQueries {
-    fn name(&self) -> &str {
-        "redshift/rpc_token_queries"
-    }
+pub struct RpcTokenQueries {
+    client: RpcClient,
+    fixture: Fixture,
+}
 
-    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<()> {
-        let client = RpcClient::new_with_commitment(er.api().url().to_owned(), confirmed());
-        let fee_payer = prep::funded_payer(base, AIRDROP).await?;
+impl Scenario for RpcTokenQueries {
+    async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
+        let client = RpcClient::new_with_commitment(er.api().url().to_string(), confirmed());
+        let fee_payer = base.funded_payer(AIRDROP).await?;
         let owner_a = Keypair::new();
         let owner_b = Keypair::new();
         let unrelated_owner = Keypair::new();
@@ -525,11 +521,11 @@ impl Scenario for RpcTokenQueries {
             || async {
                 matches!(er.account(&fixture.mint).await, Ok(Some(_)))
                     && matches!(er.account(&fixture.other_mint).await, Ok(Some(_)))
-                    && spl::token_balance(er, &fixture.ata_a).await.ok().flatten()
+                    && spl::token_balance(&er, &fixture.ata_a).await.ok().flatten()
                         == Some(OWNER_A_BALANCE)
-                    && spl::token_balance(er, &fixture.ata_b).await.ok().flatten()
+                    && spl::token_balance(&er, &fixture.ata_b).await.ok().flatten()
                         == Some(OWNER_B_BALANCE)
-                    && spl::token_balance(er, &fixture.ata_a_other).await.ok().flatten()
+                    && spl::token_balance(&er, &fixture.ata_a_other).await.ok().flatten()
                         == Some(OTHER_MINT_BALANCE)
             },
         )
@@ -561,10 +557,15 @@ impl Scenario for RpcTokenQueries {
         )
         .await?;
 
+        Ok(Self { client, fixture })
+    }
+
+    async fn run(self) -> Result<()> {
+        let Self { client, fixture } = self;
         let reads = join_all(
             (0..READS).map(|index| run_query(&client, &fixture, CYCLE[index % CYCLE.len()])),
         );
-        let outcomes = tokio::time::timeout(BURST_DEADLINE, reads)
+        let outcomes = time::timeout(BURST_DEADLINE, reads)
             .await
             .map_err(|_| format!("the burst of {READS} reads exceeded {BURST_DEADLINE:?}"))?;
         let mut failures = 0u64;

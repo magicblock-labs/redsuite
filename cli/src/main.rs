@@ -4,14 +4,17 @@ mod suite;
 
 use std::process::ExitCode;
 
-use args::Cli;
+use args::{Benchmarks, Checks, Cli, Command};
 use clap::Parser;
+use redline::load::Options;
 use redsuite_core::{
     catalog::Family,
     logging,
     profile::{ExecutionConfig, LoopMode},
-    Result,
+    PrivateErScenario, Result,
 };
+use suite::Suite;
+use tokio::task::LocalSet;
 use tracing::{error, info};
 
 #[tokio::main]
@@ -21,7 +24,7 @@ async fn main() -> ExitCode {
         eprintln!("cannot initialize logging: {error}");
         return ExitCode::FAILURE;
     }
-    let outcome = tokio::task::LocalSet::new().run_until(dispatch(cli.command)).await;
+    let outcome = LocalSet::new().run_until(dispatch(cli.command)).await;
 
     match outcome {
         Ok(code) => code,
@@ -34,18 +37,18 @@ async fn main() -> ExitCode {
 
 fn list(family: Family, selections: &[String]) -> Result<()> {
     for entry in catalog::select(family, selections)? {
-        println!("{}", entry.name());
+        println!("{}", entry.name(family));
     }
     Ok(())
 }
 
-async fn checks(family: Family, command: args::Checks) -> Result<()> {
+async fn checks(family: Family, command: Checks) -> Result<()> {
     match command {
-        args::Checks::List { selections } => list(family, &selections),
-        args::Checks::Run(args) => {
+        Checks::List { selections } => list(family, &selections),
+        Checks::Run(args) => {
             let seed = args.seed.unwrap_or_else(rand::random);
             info!(seed, "run seed");
-            suite::Suite::new(
+            Suite::new(
                 family,
                 args.run,
                 ExecutionConfig {
@@ -61,29 +64,29 @@ async fn checks(family: Family, command: args::Checks) -> Result<()> {
     }
 }
 
-async fn dispatch(command: args::Command) -> Result<ExitCode> {
+async fn dispatch(command: Command) -> Result<ExitCode> {
     match command {
-        args::Command::Redshift(command) => checks(Family::Redshift, command).await?,
-        args::Command::Redhat(command) => checks(Family::Redhat, command).await?,
-        args::Command::Redline(command) => match command {
-            args::Benchmarks::List { selections } => list(Family::Redline, &selections)?,
-            args::Benchmarks::Run(args) => {
+        Command::Redshift(command) => checks(Family::Redshift, command).await?,
+        Command::Redhat(command) => checks(Family::Redhat, command).await?,
+        Command::Redline(command) => match command {
+            Benchmarks::List { selections } => list(Family::Redline, &selections)?,
+            Benchmarks::Run(args) => {
                 let config = ExecutionConfig {
                     profile: args.profile,
                     loop_mode: args.loop_mode,
                     ..ExecutionConfig::default()
                 };
-                suite::Suite::new(Family::Redline, args.run, config, true, 1)?.run().await?;
+                Suite::new(Family::Redline, args.run, config, true, 1)?.run().await?;
             }
-            args::Benchmarks::Load(args) => return load(args).await,
+            Benchmarks::Load(args) => return load(args).await,
         },
-        args::Command::Shared(command) => command.run()?,
+        Command::Shared(command) => command.run()?,
     }
     Ok(ExitCode::SUCCESS)
 }
 
 async fn load(args: args::Load) -> Result<ExitCode> {
-    use redsuite_core::{catalog::Fixture, run_private_er_scenario};
+    use redsuite_core::catalog::Fixture;
     use tokio::{
         signal::unix::{signal, SignalKind},
         sync::watch,
@@ -96,13 +99,17 @@ async fn load(args: args::Load) -> Result<ExitCode> {
         loop_mode: LoopMode::Open,
         ..ExecutionConfig::default()
     };
-    let scenario = redline::load::Load {
+    let options = Options {
         duration: args.duration,
         rate: args.rate,
         concurrency: args.concurrency,
         stop: receiver,
     };
-    let work = run_private_er_scenario(scenario, &[Fixture::RedlineProgram], config);
+    let work = redsuite_core::scenario!(
+        redline::load::Load,
+        fresh(&[Fixture::RedlineProgram], options)
+    )
+    .run(Family::Redline, config, None);
     tokio::pin!(work);
     let record = tokio::select! {
         record = &mut work => record,

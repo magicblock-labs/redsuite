@@ -1,30 +1,33 @@
 use std::{
     cell::RefCell,
+    collections::HashMap,
     future::Future,
     rc::{Rc, Weak},
     time::{Duration, Instant},
 };
 
-use tokio::sync::Mutex;
-
 use account::Account;
-use async_trait::async_trait;
 use hash::Hash;
 use instruction::Instruction;
 use keypair::Keypair;
 use pubkey::Pubkey;
 use signature::Signature;
 use signer::Signer;
+use tokio::sync::Mutex;
 use transaction::Transaction;
+use url::Url;
 
 use crate::{
-    api::{self, Api, ConfirmOptions, Metrics},
+    api::{Api, ConfirmOptions, Metrics, MetricsCollector},
     netfault::BaseProxies,
     profile::ExecutionConfig,
+    redline,
+    report::{self, ScenarioReport},
     resources::Resources,
     runner::{Delivery, SendTransaction},
+    schedulecommit,
     topology::{PrivateEr, RestartConfig, RestartTiming},
-    Result,
+    DynError, Result,
 };
 
 const AIRDROP_TIMEOUT: Duration = Duration::from_secs(60);
@@ -34,25 +37,37 @@ const AIRDROP_POLL: Duration = Duration::from_millis(200);
 const BASE_BLOCKHASH_TTL: Duration = Duration::from_secs(20);
 const ER_BLOCKHASH_TTL: Duration = Duration::from_secs(2);
 
-#[async_trait(?Send)]
-pub trait ChainCtx {
+pub trait ChainCtx: Sized {
     fn api(&self) -> &Api;
-    async fn submit_and_confirm(&self, payer: &Keypair, ixs: &[Instruction]) -> Result<Signature> {
-        self.submit_and_confirm_with(payer, &[], ixs).await
+    fn schedulecommit<'a>(&'a self, payer: &'a Keypair) -> schedulecommit::Program<'a, Self> {
+        schedulecommit::Program { chain: self, payer }
     }
-    async fn submit_and_confirm_with(
+    fn redline<'a>(&'a self, payer: &'a Keypair) -> redline::Program<'a, Self> {
+        redline::Program {
+            chain: self,
+            payer,
+            id: redline_interface::ID,
+        }
+    }
+    fn submit_and_confirm(
+        &self,
+        payer: &Keypair,
+        ixs: &[Instruction],
+    ) -> impl Future<Output = Result<Signature>> {
+        self.submit_and_confirm_with(payer, &[], ixs)
+    }
+    fn submit_and_confirm_with(
         &self,
         payer: &Keypair,
         cosigners: &[&Keypair],
         ixs: &[Instruction],
-    ) -> Result<Signature>;
-    async fn account(&self, pk: &Pubkey) -> Result<Option<Account>> {
-        self.api().get_account(pk).await
+    ) -> impl Future<Output = Result<Signature>>;
+    fn account(&self, pk: &Pubkey) -> impl Future<Output = Result<Option<Account>>> {
+        self.api().get_account(pk)
     }
-    async fn accounts(&self, pks: &[Pubkey]) -> Result<Vec<Option<Account>>> {
-        self.api().get_multiple_accounts(pks).await
+    fn accounts(&self, pks: &[Pubkey]) -> impl Future<Output = Result<Vec<Option<Account>>>> {
+        self.api().get_multiple_accounts(pks)
     }
-    async fn airdrop(&self, pk: &Pubkey, lamports: u64) -> Result<()>;
 }
 
 pub(crate) struct BlockhashCache {
@@ -132,13 +147,8 @@ impl TxSender {
         )
     }
 
-    pub fn staged(
-        &self,
-        ixs: &[Instruction],
-    ) -> impl Future<Output = Result<impl Delivery>> + 'static {
-        let sender = self.clone();
-        let ixs = ixs.to_vec();
-        async move { Ok(sender.deliver(sender.prepare(&ixs).await?)) }
+    pub async fn staged(self, ixs: impl AsRef<[Instruction]>) -> Result<impl Delivery> {
+        Ok(self.deliver(self.prepare(ixs.as_ref()).await?))
     }
 
     pub async fn submit(&self, ixs: &[Instruction]) -> Result<Signature> {
@@ -169,7 +179,7 @@ pub struct ErClient {
 }
 
 impl ErClient {
-    pub fn new(rpc_url: impl Into<String>) -> Self {
+    pub fn new(rpc_url: Url) -> Self {
         Self {
             api: Api::new(rpc_url),
             blockhash: Rc::new(BlockhashCache::new(ER_BLOCKHASH_TTL)),
@@ -190,22 +200,27 @@ impl ErClient {
 }
 
 pub struct BaseCtx {
+    pub(crate) scenario: Option<String>,
     api: Api,
-    ws_url: String,
-    grpc: Option<(String, String)>,
+    ws_url: Url,
+    grpc: Option<(Url, String)>,
     blockhash: Rc<BlockhashCache>,
     resources: Rc<Resources>,
     config: ExecutionConfig,
 }
 
 impl BaseCtx {
+    pub async fn airdrop(&self, pk: &Pubkey, lamports: u64) -> Result<()> {
+        airdrop_and_confirm(&self.api, pk, lamports).await
+    }
     pub(crate) fn new(
-        rpc_url: String,
-        ws_url: String,
-        grpc: Option<(String, String)>,
+        rpc_url: Url,
+        ws_url: Url,
+        grpc: Option<(Url, String)>,
         config: ExecutionConfig,
     ) -> Self {
         Self {
+            scenario: None,
             api: Api::new(rpc_url),
             ws_url,
             grpc,
@@ -219,19 +234,26 @@ impl BaseCtx {
         self.resources.clone()
     }
 
+    /// Persists a benchmark cell under this run without making it fatal on I/O failure.
+    pub fn report_cell(&self, label: &str, report: &ScenarioReport) -> Result<()> {
+        let name = self.scenario.as_deref().ok_or("cell report outside a scenario run")?;
+        report::persist_cell(name, label, report);
+        Ok(())
+    }
+
     pub fn reclaim(&self, owner: &str) {
         self.resources.reclaim(owner);
     }
 
-    pub fn grpc(&self) -> Option<(&str, &str)> {
-        self.grpc.as_ref().map(|(url, plugin)| (url.as_str(), plugin.as_str()))
+    pub fn grpc(&self) -> Option<(&Url, &str)> {
+        self.grpc.as_ref().map(|(url, plugin)| (url, plugin.as_str()))
     }
 
     pub fn config(&self) -> ExecutionConfig {
         self.config
     }
 
-    pub fn ws_url(&self) -> &str {
+    pub fn ws_url(&self) -> &Url {
         &self.ws_url
     }
 
@@ -247,8 +269,8 @@ impl BaseCtx {
 #[derive(Clone)]
 pub struct ErCtx {
     api: Api,
-    ws_url: String,
-    metrics: api::MetricsCollector,
+    ws_url: Url,
+    metrics: MetricsCollector,
     identity: Pubkey,
     blockhash: Rc<BlockhashCache>,
     pub(crate) pid: u32,
@@ -257,10 +279,23 @@ pub struct ErCtx {
 }
 
 impl ErCtx {
+    /// Read only resident accounts; unlike account reads, this never triggers cloning.
+    pub async fn local_accounts(
+        &self,
+        owners: &[Pubkey],
+        keys: &[Pubkey],
+    ) -> Result<Vec<Option<Account>>> {
+        let mut accounts = HashMap::new();
+        for owner in owners {
+            accounts.extend(self.api.get_program_accounts(owner).await?);
+        }
+        Ok(keys.iter().map(|key| accounts.get(key).cloned()).collect())
+    }
+
     pub(crate) fn new(
-        rpc_url: String,
-        ws_url: String,
-        metrics_url: String,
+        rpc_url: Url,
+        ws_url: Url,
+        metrics_url: Url,
         identity: Pubkey,
         request_timeout: Option<Duration>,
         pid: u32,
@@ -272,7 +307,7 @@ impl ErCtx {
         Self {
             api,
             ws_url,
-            metrics: api::MetricsCollector::new(&metrics_url),
+            metrics: MetricsCollector::new(metrics_url),
             identity,
             blockhash: Rc::new(BlockhashCache::new(ER_BLOCKHASH_TTL)),
             pid,
@@ -300,7 +335,7 @@ impl ErCtx {
         self.pid
     }
 
-    pub fn ws_url(&self) -> &str {
+    pub fn ws_url(&self) -> &Url {
         &self.ws_url
     }
 
@@ -320,7 +355,7 @@ impl ErCtx {
         self.blockhash.reset();
     }
 
-    pub fn metrics(&self) -> &api::MetricsCollector {
+    pub fn metrics(&self) -> &MetricsCollector {
         &self.metrics
     }
 
@@ -338,7 +373,7 @@ async fn airdrop_and_confirm(api: &Api, pk: &Pubkey, lamports: u64) -> Result<()
             // the request itself, not just the balance poll.
             requested = api.request_airdrop(pk, lamports).await.is_ok();
         }
-        Ok::<_, crate::DynError>(
+        Ok::<_, DynError>(
             (requested && api.get_balance(pk).await.unwrap_or(0) >= before + lamports)
                 .then_some(()),
         )
@@ -347,38 +382,30 @@ async fn airdrop_and_confirm(api: &Api, pk: &Pubkey, lamports: u64) -> Result<()
     .ok_or_else(|| format!("airdrop of {lamports} lamports to {pk} not confirmed").into())
 }
 
-#[async_trait(?Send)]
 impl ChainCtx for BaseCtx {
     fn api(&self) -> &Api {
         &self.api
     }
-    async fn submit_and_confirm_with(
+    fn submit_and_confirm_with(
         &self,
         payer: &Keypair,
         cosigners: &[&Keypair],
         ixs: &[Instruction],
-    ) -> Result<Signature> {
-        submit_and_confirm(&self.api, &self.blockhash, payer, cosigners, ixs).await
-    }
-    async fn airdrop(&self, pk: &Pubkey, lamports: u64) -> Result<()> {
-        airdrop_and_confirm(&self.api, pk, lamports).await
+    ) -> impl Future<Output = Result<Signature>> {
+        submit_and_confirm(&self.api, &self.blockhash, payer, cosigners, ixs)
     }
 }
 
-#[async_trait(?Send)]
 impl ChainCtx for ErCtx {
     fn api(&self) -> &Api {
         &self.api
     }
-    async fn submit_and_confirm_with(
+    fn submit_and_confirm_with(
         &self,
         payer: &Keypair,
         cosigners: &[&Keypair],
         ixs: &[Instruction],
-    ) -> Result<Signature> {
-        submit_and_confirm(&self.api, &self.blockhash, payer, cosigners, ixs).await
-    }
-    async fn airdrop(&self, _pk: &Pubkey, _lamports: u64) -> Result<()> {
-        Err("the ER has no faucet — airdrop on the base; clone-on-access pulls it in".into())
+    ) -> impl Future<Output = Result<Signature>> {
+        submit_and_confirm(&self.api, &self.blockhash, payer, cosigners, ixs)
     }
 }

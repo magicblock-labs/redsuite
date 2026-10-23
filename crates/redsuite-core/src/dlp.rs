@@ -1,11 +1,12 @@
 // Convenience layer over dlp-api: shorter argument lists and the ids/pdas in
 // one place. Nothing here encodes DLP instructions itself.
-pub use dlp_api::args::{CommitStateArgs, DelegateArgs};
 use dlp_api::{
     args::DelegateEphemeralBalanceArgs,
     instruction_builder::{self, Encryptable},
+    state::DelegationMetadata,
 };
 pub use dlp_api::{
+    args::{CommitStateArgs, DelegateArgs},
     pda::{
         delegate_buffer_pda_from_delegated_account_and_owner_program as delegate_buffer_pda,
         delegation_metadata_pda_from_delegated_account as delegation_metadata_pda,
@@ -85,18 +86,6 @@ pub fn undelegate(
     )
 }
 
-pub fn init_validator_fees_vault(
-    payer: &Pubkey,
-    admin: &Pubkey,
-    validator: &Pubkey,
-) -> Instruction {
-    instruction_builder::init_validator_fees_vault(*payer, *admin, *validator)
-}
-
-pub fn validator_claim_fees(validator: &Pubkey, amount: Option<u64>) -> Instruction {
-    instruction_builder::validator_claim_fees(*validator, amount)
-}
-
 pub fn top_up_ephemeral_balance(payer: &Pubkey, lamports: u64, index: u8) -> Instruction {
     top_up_ephemeral_balance_for(payer, payer, lamports, index)
 }
@@ -140,8 +129,7 @@ pub fn close_ephemeral_balance(payer: &Pubkey, index: u8) -> Instruction {
 }
 
 pub fn last_commit_id(delegation_metadata: &[u8]) -> Result<u64> {
-    let metadata =
-        dlp_api::state::DelegationMetadata::try_from_bytes_with_discriminator(delegation_metadata)
-            .map_err(|error| format!("decoding delegation metadata: {error:?}"))?;
+    let metadata = DelegationMetadata::try_from_bytes_with_discriminator(delegation_metadata)
+        .map_err(|error| format!("decoding delegation metadata: {error:?}"))?;
     Ok(metadata.last_commit_id)
 }

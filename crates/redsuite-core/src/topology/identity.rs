@@ -1,9 +1,16 @@
-use std::{collections::BTreeMap, fs, path::Path, time::Duration};
+use std::{
+    collections::BTreeMap,
+    fs,
+    fs::{File, OpenOptions},
+    path::Path,
+    time::Duration,
+};
 
-use base64::Engine;
+use base64::{engine::general_purpose::STANDARD, Engine};
 use keypair::Keypair;
 use pubkey::Pubkey;
 use signer::Signer;
+use tokio::{time, time::Instant};
 
 use super::{config::DLP_ID, state};
 use crate::{context::BaseCtx, ChainCtx, Result};
@@ -29,7 +36,7 @@ pub fn identity_keypair(identity: &Pubkey) -> Result<Keypair> {
 }
 
 fn vault_dump_json(vault: &Pubkey) -> String {
-    let data = base64::engine::general_purpose::STANDARD.encode([0u8; VAULT_SPACE]);
+    let data = STANDARD.encode([0u8; VAULT_SPACE]);
     format!(
         r#"{{"pubkey":"{vault}","account":{{"lamports":{VAULT_LAMPORTS},"data":["{data}","base64"],"owner":"{DLP_ID}","executable":false,"rentEpoch":0,"space":{VAULT_SPACE}}}}}"#
     )
@@ -83,11 +90,11 @@ pub fn identity_for_label(label: &str) -> Result<Keypair> {
         .map_err(|e| format!("corrupt state.json: bad pool identity {slot}: {e}").into())
 }
 
-struct PoolLock(#[allow(dead_code)] fs::File);
+struct PoolLock(#[allow(dead_code)] File);
 
 impl PoolLock {
     fn acquire(dir: &Path) -> Result<Self> {
-        let file = fs::OpenOptions::new()
+        let file = OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
@@ -104,7 +111,7 @@ pub(super) async fn ensure_identity_funded(base: &BaseCtx, identity: &Pubkey) ->
     let funded = || async {
         base.api().get_balance(identity).await.unwrap_or(0) >= IDENTITY_FUNDING_LAMPORTS
     };
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    let deadline = Instant::now() + Duration::from_secs(90);
     let mut ticks = 0u32;
     loop {
         if funded().await {
@@ -116,9 +123,9 @@ pub(super) async fn ensure_identity_funded(base: &BaseCtx, identity: &Pubkey) ->
             let _ = base.api().request_airdrop(identity, IDENTITY_FUNDING_LAMPORTS).await;
         }
         ticks += 1;
-        if tokio::time::Instant::now() >= deadline {
+        if Instant::now() >= deadline {
             return Err(format!("the identity {identity} did not reach the funding target").into());
         }
-        tokio::time::sleep(FUNDING_POLL).await;
+        time::sleep(FUNDING_POLL).await;
     }
 }

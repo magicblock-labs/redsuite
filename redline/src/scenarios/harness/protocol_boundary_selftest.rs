@@ -1,17 +1,18 @@
-use std::{sync::Arc, time::Duration};
+use std::{rc::Rc, sync::Arc, time::Duration};
 
-use async_trait::async_trait;
 use pubkey::Pubkey;
 use redsuite_core::{
     check_eq, prep,
     profile::ProfileValues,
     redline::{copy_three, execute_kernel, Accounts},
-    report,
     report::Unit,
     runner::{Pacing, RunOutcome, ThreadRunConfig},
     BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
 };
 use tracing::{debug, warn};
+use url::Url;
+
+use crate::ACCOUNT_SPACE;
 
 const PREP_PAYER_LAMPORTS: u64 = 4_000_000_000;
 const CLONE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -59,7 +60,7 @@ const FULL: Profile = Profile {
 const PROFILES: ProfileValues<Profile> = ProfileValues { lite: LITE, full: FULL };
 
 fn run_cell(
-    er_rpc_url: String,
+    er_rpc_url: Url,
     config: ThreadRunConfig,
     id_offset: u64,
     pool: Arc<Vec<Pubkey>>,
@@ -81,26 +82,44 @@ struct CellOutcome {
     tx_processing_avg_us: Option<f64>,
 }
 
-pub struct ProtocolBoundarySelftest;
+pub struct ProtocolBoundarySelftest {
+    base: Rc<BaseCtx>,
+    er: ErCtx,
+    profile: &'static Profile,
+    pool: Arc<Vec<Pubkey>>,
+    payer_bytes: Arc<Vec<[u8; 64]>>,
+}
 
-#[async_trait(?Send)]
 impl Scenario<ScenarioReport> for ProtocolBoundarySelftest {
-    fn name(&self) -> &str {
-        "redline/protocol_boundary_selftest"
-    }
-
-    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
+    async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
         let profile = PROFILES.select(base.config().profile);
-        let prep_payers = prep::funded_payers(base, profile.payers, PREP_PAYER_LAMPORTS).await?;
+        let prep_payers = base.funded_payers(profile.payers, PREP_PAYER_LAMPORTS).await?;
         let pool = Arc::new(
-            Accounts::new(crate::ACCOUNT_SPACE, er.identity())
-                .init_batched(base, &prep_payers, profile.accounts, true)
+            Accounts::new(ACCOUNT_SPACE, er.identity())
+                .init_batched(base.as_ref(), &prep_payers, profile.accounts, true)
                 .await?,
         );
-        prep::await_clones(er, &pool, crate::ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
+        er.await_clones(&pool, ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
         let payer_bytes = prep::payer_bytes(&prep_payers);
-        let er_rpc_url = er.api().url().to_owned();
 
+        Ok(Self {
+            base,
+            er,
+            profile,
+            pool,
+            payer_bytes,
+        })
+    }
+
+    async fn run(self) -> Result<ScenarioReport> {
+        let Self {
+            base,
+            er,
+            profile,
+            pool,
+            payer_bytes,
+        } = self;
+        let er_rpc_url = er.api().url().clone();
         let warmup = run_cell(
             er_rpc_url.clone(),
             ThreadRunConfig {
@@ -161,7 +180,7 @@ impl Scenario<ScenarioReport> for ProtocolBoundarySelftest {
                 cell.outcome.first_error
             )?;
 
-            let cell_report = ScenarioReport::ok(&format!("{}/threads{threads}", self.name()))
+            let cell_report = ScenarioReport::ok()
                 .setting("profile", profile.name)
                 .setting("threads", threads)
                 .setting("shape", "read-write 3/tx (1 src + 2 dst data-copy)")
@@ -178,7 +197,7 @@ impl Scenario<ScenarioReport> for ProtocolBoundarySelftest {
                     Unit::Micros,
                     cell.tx_processing_avg_us,
                 );
-            report::persist_cell(self.name(), &cell_report);
+            base.report_cell(&format!("threads{threads}"), &cell_report)?;
             cells.push(cell);
         }
 
@@ -219,7 +238,7 @@ impl Scenario<ScenarioReport> for ProtocolBoundarySelftest {
             );
         }
 
-        Ok(ScenarioReport::ok(self.name())
+        Ok(ScenarioReport::ok()
             .setting("profile", profile.name)
             .setting("shape", "read-write 3/tx (1 src + 2 dst data-copy)")
             .setting("threads boundary", profile.threads)

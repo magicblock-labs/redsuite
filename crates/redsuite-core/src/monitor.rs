@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use derive_more::Display;
 
@@ -51,7 +51,7 @@ pub struct SteadyStateOutcome {
 }
 
 pub fn start(collector: MetricsCollector, spec: MonitorSpec) -> Sampler<Vec<SteadyStateSample>> {
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     Sampler::spawn(
         collector,
         spec.window,

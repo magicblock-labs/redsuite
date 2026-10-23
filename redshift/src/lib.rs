@@ -1,59 +1,14 @@
 pub mod scenarios;
 
-use std::time::Duration;
-
-use keypair::Keypair;
+use account::Account;
 use pubkey::Pubkey;
 pub use redline_interface as program;
-pub use redsuite_core::redline::written_id;
-use redsuite_core::redline::Accounts;
-use redsuite_core::{check, check_eq, dlp, receipt, BaseCtx, ChainCtx, ErCtx, Result};
-
-pub use redsuite_core::phase;
+use redline_interface::DELEGATION_PROGRAM_ID;
+use redsuite_core::{check::CheckError, dlp, BaseCtx, ChainCtx, Result};
+pub use redsuite_core::{phase, redline::written_id};
 
 pub const ACCOUNT_SPACE: u32 = 128;
 pub const PAYER_LAMPORTS: u64 = 2_000_000_000;
-
-const RECEIPT_TIMEOUT: Duration = Duration::from_secs(30);
-const BASE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(20);
-
-pub async fn assert_commit_receipt(
-    base: &BaseCtx,
-    er: &ErCtx,
-    signature: &signature::Signature,
-    expected: &[Pubkey],
-    expect_undelegation: bool,
-) -> Result<receipt::CommitReceipt> {
-    let commit_receipt =
-        receipt::fetch_commit_receipt(er.api(), signature, RECEIPT_TIMEOUT).await?;
-    if let Some(message) = &commit_receipt.error_message {
-        if commit_receipt.failure_is_duplicate_rejection() {
-            receipt::warn_duplicate_rejection("commit receipt", message);
-            return Ok(commit_receipt);
-        }
-        return Err(check::CheckError::new("the commit intent succeeds").actual(message).into());
-    }
-    let mut included = commit_receipt.included.clone();
-    included.sort();
-    let mut expected = expected.to_vec();
-    expected.sort();
-    check_eq!(
-        included,
-        expected,
-        "the receipt must list exactly the committed accounts"
-    )?;
-    check!(
-        commit_receipt.excluded.is_empty(),
-        "the receipt must exclude no accounts"
-    )?;
-    check_eq!(
-        commit_receipt.requested_undelegation,
-        expect_undelegation,
-        "the receipt undelegation flag must match the commit type"
-    )?;
-    receipt::confirm_base_signatures(base.api(), &commit_receipt, BASE_CONFIRM_TIMEOUT).await?;
-    Ok(commit_receipt)
-}
 
 pub const LOCKOUT_REJECTIONS: [&str; 4] = [
     "InvalidWritableAccount",
@@ -68,54 +23,18 @@ pub fn rejection_code(
     error_text: &str,
 ) -> Result<&'static str> {
     accepted.iter().copied().find(|code| error_text.contains(code)).ok_or_else(|| {
-        check::CheckError::new(format!("{what} is rejected with an upstream lockout code"))
+        CheckError::new(format!("{what} is rejected with an upstream lockout code"))
             .expected(accepted.join(", "))
             .actual(error_text)
             .into()
     })
 }
 
-pub fn account_id(account: Option<account::Account>) -> Option<u64> {
+pub fn account_id(account: Option<Account>) -> Option<u64> {
     account.and_then(|account| written_id(&account.data))
 }
 
-// The ER's local view, read without touching the accounts: getProgramAccounts
-// answers from what the validator already holds, so it never triggers a fetch.
-pub async fn local_accounts(er: &ErCtx, keys: &[Pubkey]) -> Result<Vec<Option<account::Account>>> {
-    let mut accounts = std::collections::HashMap::new();
-    for owner in [program::id(), program::DELEGATION_PROGRAM_ID] {
-        accounts.extend(er.api().get_program_accounts(&owner).await?);
-    }
-    Ok(keys.iter().map(|key| accounts.get(key).cloned()).collect())
-}
-
-pub async fn init_account(
-    base: &impl ChainCtx,
-    payer: &Keypair,
-    seed: u8,
-    authority: Pubkey,
-) -> Result<Pubkey> {
-    Accounts::new(ACCOUNT_SPACE, authority).init(base, payer, seed, false).await
-}
-
-pub async fn init_delegated_account(
-    base: &impl ChainCtx,
-    payer: &Keypair,
-    seed: u8,
-    authority: Pubkey,
-) -> Result<Pubkey> {
-    init_delegated_account_at(base, program::id(), payer, seed, authority).await
-}
-
-pub async fn init_delegated_account_sized(
-    base: &impl ChainCtx,
-    payer: &Keypair,
-    seed: u8,
-    authority: Pubkey,
-    space: u32,
-) -> Result<Pubkey> {
-    Accounts::new(space, authority).init(base, payer, seed, true).await
-}
+pub const ACCOUNT_OWNERS: [Pubkey; 2] = [program::ID, DELEGATION_PROGRAM_ID];
 
 pub async fn last_commit_id(base: &BaseCtx, account: &Pubkey) -> Result<u64> {
     let metadata = base
@@ -123,20 +42,4 @@ pub async fn last_commit_id(base: &BaseCtx, account: &Pubkey) -> Result<u64> {
         .await?
         .ok_or("the delegation metadata is missing on base")?;
     dlp::last_commit_id(&metadata.data)
-}
-
-pub async fn init_delegated_account_at(
-    base: &impl ChainCtx,
-    program_id: Pubkey,
-    payer: &Keypair,
-    seed: u8,
-    authority: Pubkey,
-) -> Result<Pubkey> {
-    Accounts {
-        program_id,
-        space: ACCOUNT_SPACE,
-        authority,
-    }
-    .init(base, payer, seed, true)
-    .await
 }

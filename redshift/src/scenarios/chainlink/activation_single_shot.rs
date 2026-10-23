@@ -4,26 +4,25 @@ use std::{
 };
 
 use account::Account;
-
-use async_trait::async_trait;
 use instruction::{AccountMeta, Instruction};
 use keypair::Keypair;
 use pubkey::Pubkey;
-use redshift_interface::flexi::{build as flexi, FlexiCounter};
+use redshift_interface::schedulecommit::{build as counter, MainAccount};
 use redsuite_core::{
-    check, check_eq,
-    dlp::{self, delegate_with_actions, DelegateArgs},
+    check, check_eq, dlp,
+    dlp::{delegate_with_actions, DelegateArgs},
     netfault::{Action, BaseProxies, Selector},
     prep, system, topology,
-    topology::{ErOptions, RestartConfig},
-    BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result,
+    topology::{ErOptions, PrivateEr, RestartConfig},
+    BaseCtx, ChainCtx, DynError, ErCtx, PrivateErScenario, Result,
 };
 use signature::Signature;
 use signer::Signer;
-use tokio::task::JoinHandle;
+use tokio::{task, task::JoinHandle, time};
+
+use crate::PAYER_LAMPORTS;
 
 const LABEL: &str = "activation-single-shot";
-const COUNTER_LABEL: &str = "single shot";
 const AIRDROP: u64 = 2_000_000_000;
 const DEPENDENCY_LAMPORTS: u64 = 1_000_000;
 const ACTION_COUNT: u8 = 7;
@@ -39,8 +38,6 @@ const RECOVERY_WINDOW: Duration = Duration::from_secs(6);
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(20);
 const POLL: Duration = Duration::from_millis(200);
 
-pub struct ActivationSingleShot;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CounterState {
     count: u64,
@@ -53,18 +50,15 @@ struct Discovery {
 }
 
 fn counter_action(actor: &Pubkey, dependency: &Pubkey, count: u8, fail: bool) -> Instruction {
-    let mut instruction = if fail {
-        flexi::add_error(*actor, count)
-    } else {
-        flexi::add_unsigned(*actor, count)
-    };
+    let mut instruction =
+        if fail { counter::fail(*actor) } else { counter::add_unsigned(*actor, count) };
     instruction.accounts.push(AccountMeta::new_readonly(*dependency, false));
     instruction
 }
 
 async fn counter_state(er: &ErCtx, counter: &Pubkey) -> Result<CounterState> {
     let account = er.account(counter).await?.ok_or("the counter vanished from the er")?;
-    let decoded = FlexiCounter::try_decode(&account.data)?;
+    let decoded = MainAccount::try_decode(&account.data)?;
     Ok(CounterState {
         count: decoded.count,
         updates: decoded.updates,
@@ -105,7 +99,7 @@ async fn hold_steady(
             "{what}: the counter must keep exactly one application of the \
              action"
         )?;
-        tokio::time::sleep(POLL).await;
+        time::sleep(POLL).await;
     }
     Ok(())
 }
@@ -189,14 +183,14 @@ async fn race_discovery(
     let mut reads = Vec::with_capacity(CONCURRENT_READS);
     for _ in 0..CONCURRENT_READS {
         let api = er.api().clone();
-        reads.push(tokio::task::spawn_local(async move {
-            api.get_account(&trigger).await
-        }));
+        reads.push(task::spawn_local(
+            async move { api.get_account(&trigger).await },
+        ));
     }
     let mut submissions = Vec::with_capacity(CONCURRENT_SUBMISSIONS);
     for _ in 0..CONCURRENT_SUBMISSIONS {
         let sender = sender.clone();
-        submissions.push(tokio::task::spawn_local(async move {
+        submissions.push(task::spawn_local(async move {
             sender
                 .submit_fresh(&[system::transfer(&sender.payer().pubkey(), &trigger, 1)])
                 .await
@@ -210,17 +204,17 @@ async fn race_discovery(
             before,
             "the action must not apply while its dependency fetch is held"
         )?;
-        tokio::time::sleep(POLL).await;
+        time::sleep(POLL).await;
     }
     Ok(Discovery { reads, submissions })
 }
 
 async fn settle_discovery(discovery: Discovery) {
     for read in discovery.reads {
-        let _ = tokio::time::timeout(SETTLE_TIMEOUT, read).await;
+        let _ = time::timeout(SETTLE_TIMEOUT, read).await;
     }
     for submission in discovery.submissions {
-        let _ = tokio::time::timeout(SETTLE_TIMEOUT, submission).await;
+        let _ = time::timeout(SETTLE_TIMEOUT, submission).await;
     }
 }
 
@@ -233,7 +227,7 @@ async fn run_action(
     actor: &Pubkey,
     fail: bool,
 ) -> Result<Pubkey> {
-    let (counter, _) = FlexiCounter::pda_and_bump(actor);
+    let (counter, _) = redshift_interface::schedulecommit::pda_and_bump(actor);
     let counter = &counter;
     let before = counter_state(er, counter).await?;
     let dependency = fund_dependency(base).await?;
@@ -270,7 +264,7 @@ async fn run_action(
                     "rescued trigger {} owner",
                     trigger.pubkey()
                 )?;
-                Ok::<_, redsuite_core::DynError>(())
+                Ok::<_, DynError>(())
             },
         )
         .await?;
@@ -301,16 +295,17 @@ async fn run_action(
     Ok(trigger.pubkey())
 }
 
-#[async_trait(?Send)]
-impl PrivateErScenario for ActivationSingleShot {
-    fn name(&self) -> &str {
-        "redshift/activation_single_shot"
-    }
+pub struct ActivationSingleShot {
+    base: Rc<BaseCtx>,
+    proxies: BaseProxies,
+    private: PrivateEr,
+}
 
-    async fn run(&self, base: &BaseCtx) -> Result<()> {
-        let proxies = BaseProxies::spawn(base).await?;
-        let mut private = topology::private_er(
-            base,
+impl PrivateErScenario for ActivationSingleShot {
+    async fn setup(base: Rc<BaseCtx>, _: ()) -> Result<Self> {
+        let proxies = BaseProxies::spawn(&base).await?;
+        let private = topology::private_er(
+            &base,
             ErOptions {
                 label: LABEL.to_owned(),
                 base_endpoints: Some(proxies.endpoints()),
@@ -318,22 +313,20 @@ impl PrivateErScenario for ActivationSingleShot {
             },
         )
         .await?;
-        let er = private.ctx();
-        let funder = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
-        let actor = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
-        let er_payer = Rc::new(
-            prep::delegated_payer(base, &funder, er.identity(), crate::PAYER_LAMPORTS).await?,
-        );
+        Ok(Self { base, proxies, private })
+    }
 
-        let (counter, setup) = prep::flexi_counter(
-            actor.pubkey(),
-            COUNTER_LABEL,
-            er.identity(),
-            prep::COMMIT_FREQUENCY_MS,
-        );
-        for instruction in setup {
-            base.submit_and_confirm(&actor, &[instruction]).await?;
-        }
+    async fn run(self) -> Result<()> {
+        let Self { base, proxies, mut private } = self;
+        let er = private.ctx();
+        let funder = base.funded_payer(PAYER_LAMPORTS).await?;
+        let actor = base.funded_payer(PAYER_LAMPORTS).await?;
+        let er_payer = Rc::new(base.delegated_payer(&funder, er.identity(), PAYER_LAMPORTS).await?);
+
+        let counter = base
+            .schedulecommit(&actor)
+            .init_counter(er.identity(), prep::COMMIT_FREQUENCY_MS)
+            .await?;
         let zero = CounterState { count: 0, updates: 0 };
         await_counter(
             er,
@@ -345,7 +338,7 @@ impl PrivateErScenario for ActivationSingleShot {
         .await?;
 
         let trigger = run_action(
-            base,
+            &base,
             &proxies,
             er,
             &funder,
@@ -401,7 +394,7 @@ impl PrivateErScenario for ActivationSingleShot {
         .await?;
 
         run_action(
-            base,
+            &base,
             &proxies,
             er,
             &funder,

@@ -1,46 +1,33 @@
-use std::time::Duration;
+use std::{rc::Rc, time::Duration};
 
 use account::Account;
-use async_trait::async_trait;
 use instruction::Instruction;
 use keypair::Keypair;
 use pubkey::Pubkey;
-use redshift_interface::flexi::{build as flexi, FlexiCounter};
+use redshift_interface::schedulecommit::build as counter;
 use redsuite_core::{
     api::TxError, check, check_eq, prep, topology, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
 use signer::Signer;
 
+use crate::PAYER_LAMPORTS;
+
 const TASK_INTERVAL_MS: i64 = 100;
 const TIMEOUT: Duration = Duration::from_secs(30);
-const LABEL: &str = "redshift task";
-const SCHEDULER_PROGRAM: Pubkey = Pubkey::from_str_const(topology::HYDRA_EPHEMERAL_ID);
-
-pub struct TaskScheduler;
+const SCHEDULER_PROGRAM: Pubkey = topology::HYDRA_EPHEMERAL_ID;
 
 struct Actor {
     payer: Keypair,
     counter: Pubkey,
 }
 
-impl Actor {
-    fn pubkey(&self) -> Pubkey {
-        self.payer.pubkey()
-    }
-}
-
 async fn scheduled_actor(base: &BaseCtx, er: &ErCtx, funder: &Keypair) -> Result<Actor> {
-    let payer = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
-    let (counter, setup) = prep::flexi_counter(
-        payer.pubkey(),
-        LABEL,
-        er.identity(),
-        prep::COMMIT_FREQUENCY_MS,
-    );
-    for instruction in setup {
-        base.submit_and_confirm(&payer, &[instruction]).await?;
-    }
-    prep::delegate_payer(base, funder, &payer, er.identity()).await?;
+    let payer = base.funded_payer(PAYER_LAMPORTS).await?;
+    let counter = base
+        .schedulecommit(&payer)
+        .init_counter(er.identity(), prep::COMMIT_FREQUENCY_MS)
+        .await?;
+    base.delegate_payer(funder, &payer, er.identity()).await?;
     check::poll("the ER clones the counter", TIMEOUT, || async {
         matches!(er.account(&counter).await, Ok(Some(account)) if !account.data.is_empty())
     })
@@ -49,8 +36,7 @@ async fn scheduled_actor(base: &BaseCtx, er: &ErCtx, funder: &Keypair) -> Result
 }
 
 async fn er_count(er: &ErCtx, actor: &Actor) -> Result<u64> {
-    let account = er.account(&actor.counter).await?.ok_or("the ER counter is missing")?;
-    Ok(FlexiCounter::try_decode(&account.data)?.count)
+    Ok(er.schedulecommit(&actor.payer).counter(&actor.counter).await?.count)
 }
 
 async fn tasks(er: &ErCtx) -> Result<Vec<(Pubkey, Account)>> {
@@ -93,8 +79,8 @@ async fn schedule(
 ) -> Result<()> {
     er.submit_and_confirm(
         &actor.payer,
-        &[flexi::schedule_counter_task(
-            actor.pubkey(),
+        &[counter::schedule_counter_task(
+            actor.payer.pubkey(),
             task_id,
             interval_ms,
             iterations,
@@ -109,7 +95,7 @@ async fn cancel(er: &ErCtx, actor: &Actor, task_id: i64) -> Result<()> {
     er.submit_and_confirm(
         &actor.payer,
         &[
-            flexi::cancel_counter_task(actor.pubkey(), task_id),
+            counter::cancel_counter_task(actor.payer.pubkey(), task_id),
             Instruction {
                 program_id: redshift_interface::ID,
                 accounts: vec![],
@@ -168,7 +154,13 @@ async fn test_signed_refusal(er: &ErCtx, actor: &Actor) -> Result<()> {
     let error = tx_failure(
         er.submit_and_confirm(
             &actor.payer,
-            &[flexi::schedule_counter_task(actor.pubkey(), 103, TASK_INTERVAL_MS, 3, true)],
+            &[counter::schedule_counter_task(
+                actor.payer.pubkey(),
+                103,
+                TASK_INTERVAL_MS,
+                3,
+                true,
+            )],
         )
         .await
         .map(drop),
@@ -230,8 +222,11 @@ async fn sponsor_balance(er: &ErCtx) -> Result<u64> {
 }
 
 async fn test_sponsor_refund(er: &ErCtx, actor: &Actor) -> Result<()> {
-    er.submit_and_confirm(&actor.payer, &[flexi::add_unsigned(actor.pubkey(), 0)])
-        .await?;
+    er.submit_and_confirm(
+        &actor.payer,
+        &[counter::add_unsigned(actor.payer.pubkey(), 0)],
+    )
+    .await?;
     let before = sponsor_balance(er).await?;
     schedule(er, actor, 109, TASK_INTERVAL_MS, 3).await?;
     await_tasks(er, 1).await?;
@@ -251,31 +246,38 @@ async fn test_sponsor_refund(er: &ErCtx, actor: &Actor) -> Result<()> {
     Ok(())
 }
 
-#[async_trait(?Send)]
-impl Scenario for TaskScheduler {
-    fn name(&self) -> &str {
-        "redshift/task_scheduler"
-    }
+pub struct TaskScheduler {
+    base: Rc<BaseCtx>,
+    er: ErCtx,
+    funder: Keypair,
+    actor: Actor,
+}
 
-    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<()> {
+impl Scenario for TaskScheduler {
+    async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
         check!(
             matches!(base.account(&SCHEDULER_PROGRAM).await?, Some(program) if program.executable),
             "the base chain hosts the ephemeral scheduler program"
         )?;
-        let funder = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
+        let funder = base.funded_payer(PAYER_LAMPORTS).await?;
         check_eq!(
-            tasks(er).await?.len(),
+            tasks(&er).await?.len(),
             0,
             "the ER holds no scheduled tasks before the scenario"
         )?;
 
-        let actor = scheduled_actor(base, er, &funder).await?;
-        test_schedule_and_cancel(er, &actor).await?;
-        test_signed_refusal(er, &actor).await?;
-        test_authority_isolation(base, er, &funder, &actor).await?;
-        test_cancel_ongoing(er, &actor).await?;
-        test_sponsor_refund(er, &actor).await?;
-        test_reschedule(er, &actor).await?;
+        let actor = scheduled_actor(&base, &er, &funder).await?;
+        Ok(Self { base, er, funder, actor })
+    }
+
+    async fn run(self) -> Result<()> {
+        let Self { base, er, funder, actor } = self;
+        test_schedule_and_cancel(&er, &actor).await?;
+        test_signed_refusal(&er, &actor).await?;
+        test_authority_isolation(&base, &er, &funder, &actor).await?;
+        test_cancel_ongoing(&er, &actor).await?;
+        test_sponsor_refund(&er, &actor).await?;
+        test_reschedule(&er, &actor).await?;
         Ok(())
     }
 }

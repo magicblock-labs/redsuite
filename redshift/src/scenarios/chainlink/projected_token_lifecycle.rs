@@ -1,15 +1,17 @@
-use std::time::{Duration, Instant};
+use std::{
+    rc::Rc,
+    time::{Duration, Instant},
+};
 
-use async_trait::async_trait;
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
     check, check_eq,
     dlp::{self, delegate_with_actions, DelegateArgs},
     netfault::{BaseProxies, Selector},
-    prep, receipt, system, topology,
-    topology::ErOptions,
-    BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result,
+    receipt, system, topology,
+    topology::{ErOptions, PrivateEr},
+    BaseCtx, ChainCtx, DynError, ErCtx, PrivateErScenario, Result,
 };
 use sdk::spl::{
     builders::{
@@ -20,9 +22,10 @@ use sdk::spl::{
 };
 use signature::Signature;
 use signer::Signer;
+use tokio::time;
 
 use super::spl;
-use crate::program::instruction::build;
+use crate::{program::instruction::build, PAYER_LAMPORTS};
 
 const LABEL: &str = "projected-token-lifecycle";
 const NAMES: [&str; 4] = ["source", "destination", "unbacked", "foreign"];
@@ -32,8 +35,6 @@ const ACTION_AMOUNT: u64 = 100;
 const FAILING_AMOUNT: u64 = 1_000_000;
 const TIMEOUT: Duration = Duration::from_secs(60);
 const RECEIPT_TIMEOUT: Duration = Duration::from_secs(120);
-
-pub struct ProjectedTokenLifecycle;
 
 struct Wallet {
     owner: Keypair,
@@ -112,7 +113,7 @@ async fn await_projection(er: &ErCtx, wallets: &[Wallet; 4], expected: &[u64; 4]
                 let actual = amount(er, &wallet.ata).await?;
                 check_eq!(actual, *expected, "projection {}", wallet.ata)?;
             }
-            Ok::<_, redsuite_core::DynError>(())
+            Ok::<_, DynError>(())
         },
     )
     .await?)
@@ -150,7 +151,7 @@ async fn settled(
     undelegate: bool,
 ) -> Result<()> {
     let mut receipt = receipt::fetch_commit_receipt(er.api(), signature, RECEIPT_TIMEOUT).await?;
-    crate::scenarios::committor::require_settled(&receipt, "projected-token commit")?;
+    receipt.check_success("projected-token commit")?;
     receipt.included.sort();
     let mut expected = expected.to_vec();
     expected.sort();
@@ -165,7 +166,7 @@ async fn settled(
         undelegate,
         "receipt lifecycle flag"
     )?;
-    receipt::confirm_base_signatures(base.api(), &receipt, TIMEOUT).await
+    receipt.confirm(base.api(), TIMEOUT).await
 }
 
 async fn magic_atas(
@@ -178,7 +179,7 @@ async fn magic_atas(
 ) -> Result<()> {
     const RECEIVE: u64 = 60;
     const DEPOSIT: u64 = 45;
-    let payer = prep::escrowed_payer(base, er.identity(), crate::PAYER_LAMPORTS).await?.payer;
+    let payer = base.escrowed_payer(er.identity(), PAYER_LAMPORTS).await?.payer;
     let source = &wallets[1];
     let mut source_balance = amount(er, &source.ata).await?;
     let mut extra_base = 0;
@@ -241,7 +242,7 @@ async fn magic_atas(
             "full shuttle withdrawal",
             "transparent shuttle withdrawal",
         ][case];
-        crate::phase(&format!("Magic ATA {label}: {}", destination.ata), async {
+        crate::phase(label, async {
             let ensure = spl::ensure_magic_ata(payer.pubkey(), destination.owner.pubkey(), mint);
             let close = spl::close_magic_ata(destination.owner.pubkey(), mint);
             let transfer = spl::transfer(
@@ -387,7 +388,7 @@ async fn magic_atas(
                         if Instant::now() >= until {
                             break;
                         }
-                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        time::sleep(Duration::from_millis(250)).await;
                     }
                 }
                 er.submit_and_confirm_with(&payer, &[&destination.owner], &[close]).await?;
@@ -426,7 +427,7 @@ async fn magic_atas(
                                 "close restores all original bytes, lamports and ownership"
                             )?;
                         }
-                        Ok::<_, redsuite_core::DynError>(())
+                        Ok::<_, DynError>(())
                     },
                 )
                 .await?;
@@ -480,7 +481,7 @@ async fn magic_atas(
                                 "shuttle account {address} is removed"
                             )?;
                         }
-                        Ok::<_, redsuite_core::DynError>(())
+                        Ok::<_, DynError>(())
                     },
                 )
                 .await?;
@@ -520,18 +521,19 @@ async fn magic_atas(
     Ok(())
 }
 
-#[async_trait(?Send)]
-impl PrivateErScenario for ProjectedTokenLifecycle {
-    fn name(&self) -> &str {
-        "redshift/projected_token_lifecycle"
-    }
+pub struct ProjectedTokenLifecycle {
+    base: Rc<BaseCtx>,
+    proxies: BaseProxies,
+    private: PrivateEr,
+}
 
-    async fn run(&self, base: &BaseCtx) -> Result<()> {
-        let proxies = BaseProxies::spawn(base).await?;
+impl PrivateErScenario for ProjectedTokenLifecycle {
+    async fn setup(base: Rc<BaseCtx>, _: ()) -> Result<Self> {
+        let proxies = BaseProxies::spawn(&base).await?;
         let private = crate::phase(
             "boot",
             topology::private_er(
-                base,
+                &base,
                 ErOptions {
                     label: LABEL.to_owned(),
                     base_endpoints: Some(proxies.endpoints()),
@@ -540,10 +542,15 @@ impl PrivateErScenario for ProjectedTokenLifecycle {
             ),
         )
         .await?;
+        Ok(Self { base, proxies, private })
+    }
+
+    async fn run(self) -> Result<()> {
+        let Self { base, proxies, private } = self;
         let er = private.ctx();
         let validator = topology::identity_for_label(LABEL)?;
         let identity = validator.pubkey();
-        let payer = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
+        let payer = base.funded_payer(PAYER_LAMPORTS).await?;
         let funder = payer.pubkey();
         let mint = Keypair::new();
         let mint_key = mint.pubkey();
@@ -575,7 +582,7 @@ impl PrivateErScenario for ProjectedTokenLifecycle {
         };
         let delegate_with_transfer = async |amount: u64| -> Result<Pubkey> {
             let account = Keypair::new();
-            base.airdrop(&account.pubkey(), crate::PAYER_LAMPORTS).await?;
+            base.airdrop(&account.pubkey(), PAYER_LAMPORTS).await?;
             let action = spl::transfer(&atas[0], &atas[1], &wallets[0].owner.pubkey(), amount);
             // Publish the owner change with its record so discovery sees both.
             base.submit_and_confirm_with(
@@ -600,7 +607,7 @@ impl PrivateErScenario for ProjectedTokenLifecycle {
             Ok(account.pubkey())
         };
         let record = async |phase: &str, expected: &Balances, delegated: bool| -> Result<()> {
-            let observed = balances(base, er, &wallets, &vault).await?;
+            let observed = balances(&base, er, &wallets, &vault).await?;
             check_eq!(&observed, expected, "{phase}: token balances")?;
             observed.conserved(delegated)?;
             Ok(())
@@ -626,7 +633,7 @@ impl PrivateErScenario for ProjectedTokenLifecycle {
             .await?;
             for (i, wallet) in wallets.iter().enumerate() {
                 let owner = wallet.owner.pubkey();
-                base.airdrop(&owner, crate::PAYER_LAMPORTS).await?;
+                base.airdrop(&owner, PAYER_LAMPORTS).await?;
                 let mut instructions = vec![
                     spl::create_ata_idempotent(&funder, &owner, &mint_key),
                     spl::mint_to(&mint_key, &wallet.ata, &funder, INITIAL[i]),
@@ -759,10 +766,10 @@ impl PrivateErScenario for ProjectedTokenLifecycle {
             for rule in confirmations {
                 rule.remove();
             }
-            settled(base, er, &signature, &eatas, false).await?;
+            settled(&base, er, &signature, &eatas, false).await?;
             check_controls(er, &wallets, 2).await?;
             record("recovered", &expected, true).await?;
-            settled(base, er, &commit(2).await?, &eatas, false).await?;
+            settled(&base, er, &commit(2).await?, &eatas, false).await?;
             expected.eatas[..2].copy_from_slice(&[Some(52), Some(248)]);
             record("latest balances committed", &expected, true).await
         })
@@ -781,7 +788,7 @@ impl PrivateErScenario for ProjectedTokenLifecycle {
                         .instruction()],
                     )
                     .await?;
-                settled(base, er, &signature, &[wallet.eata], true).await?;
+                settled(&base, er, &signature, &[wallet.eata], true).await?;
                 owner_is(&wallet.eata, spl::eata_program()).await?;
             }
             expected.projected = expected.base_atas;
@@ -816,13 +823,13 @@ impl PrivateErScenario for ProjectedTokenLifecycle {
             wallets[0].transfer(er, &wallets[1], 7).await?;
             expected.projected = [25, 255, 70, 5];
             record("redelegated transfer", &expected, true).await?;
-            settled(base, er, &commit(3).await?, &eatas, false).await?;
+            settled(&base, er, &commit(3).await?, &eatas, false).await?;
             expected.eatas[..2].copy_from_slice(&[Some(25), Some(255)]);
             record("final committed balances", &expected, true).await
         })
         .await?;
 
-        magic_atas(base, er, &payer, mint_key, &wallets, &vault).await?;
+        magic_atas(&base, er, &payer, mint_key, &wallets, &vault).await?;
 
         crate::phase("teardown", async {
             proxies.finish()?;

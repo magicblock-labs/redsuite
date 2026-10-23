@@ -7,15 +7,16 @@ authors.workspace = true
 
 [dependencies]
 tracing = { workspace = true }
-async-trait = { workspace = true }
 borsh = { workspace = true }
 tokio = { workspace = true }
 futures-util = { workspace = true }
 serde = { workspace = true }
 magicblock-config = { workspace = true }
 redsuite-core = { workspace = true }
+url = { workspace = true }
 redline-interface = { workspace = true }
 redshift-interface = { workspace = true }
+upgrade-probe = { workspace = true, features = ["no-entrypoint"] }
 instruction = { workspace = true }
 pubkey = { workspace = true }
 hash = { workspace = true }
@@ -34,5 +35,5 @@ serde_json = "1"
 solana-account-decoder-client-types = "4.1"
 json = { workspace = true }
 rand = { workspace = true }
-solana-address-lookup-table-interface = { version = "3.0", features = ["bincode", "bytemuck"] }
+solana-address-lookup-table-interface = { version = "3.0", features = ["bincode"] }
 sdk = { workspace = true, features = ["spl", "modular-sdk"] }

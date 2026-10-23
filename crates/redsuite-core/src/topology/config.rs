@@ -1,5 +1,5 @@
 use std::{
-    fs,
+    env, fs,
     net::SocketAddr,
     path::{Path, PathBuf},
     process::{Child, Command},
@@ -9,34 +9,40 @@ use std::{
 use keypair::Keypair;
 use magicblock_config::{
     config::EngineConfig,
-    types::{BindAddress, Remote, SerdePubkey},
+    types::{network::ResolvedUrl, BindAddress, Remote, SerdePubkey},
     LeaderParams, VerifierParams,
 };
 use pubkey::Pubkey;
 use serde::Serialize;
 use signer::Signer;
 use tracing::warn;
+use url::Url;
 
 use super::{process, state};
-use crate::{catalog::Fixture, Result};
+use crate::{catalog::Fixture, CheckError, Result};
 
 const LEDGER_SIZE_LIMIT_UNREACHABLE: u64 = 1 << 60;
 
-pub const DLP_ID: &str = "DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh";
-pub const MDP_ID: &str = "DmnRGfyyftzacFb1XadYhWF6vWqXwtQk5tbr6XgR3BA1";
-pub const COMMITTOR_ID: &str = "ComtrB2KEaWgXsW1dhr1xYL4Ht4Bjj3gXnnL6KMdABq";
-pub const HYDRA_EPHEMERAL_ID: &str = "eHyd5BU8QffvHi4GnXwxrK4WpS7pM2x9UGKHBWii7mf";
+pub const DLP_ID: Pubkey = Pubkey::from_str_const("DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh");
+const MDP_ID: Pubkey = Pubkey::from_str_const("DmnRGfyyftzacFb1XadYhWF6vWqXwtQk5tbr6XgR3BA1");
+pub const COMMITTOR_ID: Pubkey =
+    Pubkey::from_str_const("ComtrB2KEaWgXsW1dhr1xYL4Ht4Bjj3gXnnL6KMdABq");
+pub const HYDRA_EPHEMERAL_ID: Pubkey =
+    Pubkey::from_str_const("eHyd5BU8QffvHi4GnXwxrK4WpS7pM2x9UGKHBWii7mf");
 // The validator's committor (>= 0.13.7)
-const NOOP_ID: &str = "noopb9bkMVfRPU8AsbpTUg8AQkHtKwMYZiFUjNRtMmV";
-const MEMO_V1_ID: &str = "Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo";
-const MEMO_V2_ID: &str = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr";
-const TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
-const ATA_PROGRAM_ID: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
-const EATA_PROGRAM_ID: &str = "SPLxh1LVZzEkX99H6rqYizhytLWPZVV296zyYDPagv2";
+const NOOP_ID: Pubkey = Pubkey::from_str_const("noopb9bkMVfRPU8AsbpTUg8AQkHtKwMYZiFUjNRtMmV");
+const MEMO_V1_ID: Pubkey = Pubkey::from_str_const("Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo");
+const MEMO_V2_ID: Pubkey = Pubkey::from_str_const("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr");
+const TOKEN_PROGRAM_ID: Pubkey =
+    Pubkey::from_str_const("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+const ATA_PROGRAM_ID: Pubkey =
+    Pubkey::from_str_const("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
+const EATA_PROGRAM_ID: Pubkey =
+    Pubkey::from_str_const("SPLxh1LVZzEkX99H6rqYizhytLWPZVV296zyYDPagv2");
 
-const CLONED_UPGRADEABLE_PROGRAMS: &[&str] =
+const CLONED_UPGRADEABLE_PROGRAMS: &[Pubkey] =
     &[DLP_ID, MDP_ID, NOOP_ID, TOKEN_PROGRAM_ID, EATA_PROGRAM_ID, HYDRA_EPHEMERAL_ID];
-const CLONED_LEGACY_PROGRAMS: &[&str] = &[MEMO_V1_ID, MEMO_V2_ID, ATA_PROGRAM_ID];
+const CLONED_LEGACY_PROGRAMS: &[Pubkey] = &[MEMO_V1_ID, MEMO_V2_ID, ATA_PROGRAM_ID];
 
 // Extra genesis copies of redline_program.so under derived addresses, so
 // scenarios can spread identical load across distinct program ids.
@@ -84,11 +90,15 @@ pub fn redline_loader_v3_pair() -> [(Pubkey, Pubkey); 2] {
 pub const CLONE_URL_ENV: &str = "REDSUITE_CLONE_URL";
 const DEFAULT_CLONE_URL: &str = "https://api.mainnet-beta.solana.com";
 
-const PROTOCOL_FEES_VAULT_ID: &str = "7JrkjmZPprHwtuvtuGTXp9hwfGYFAQLnLeFM52kqAgXg";
-pub(super) const CLONED_ACCOUNTS: &[&str] = &[PROTOCOL_FEES_VAULT_ID];
+const PROTOCOL_FEES_VAULT_ID: Pubkey =
+    Pubkey::from_str_const("7JrkjmZPprHwtuvtuGTXp9hwfGYFAQLnLeFM52kqAgXg");
+pub(super) const CLONED_ACCOUNTS: &[Pubkey] = &[PROTOCOL_FEES_VAULT_ID];
 
-pub(super) fn clone_url() -> String {
-    std::env::var(CLONE_URL_ENV).unwrap_or_else(|_| DEFAULT_CLONE_URL.to_owned())
+pub(super) fn clone_url() -> Result<Url> {
+    let value = env::var(CLONE_URL_ENV).unwrap_or_else(|_| DEFAULT_CLONE_URL.to_owned());
+    value
+        .parse()
+        .map_err(|error| CheckError::new(CLONE_URL_ENV).caused_by(error).into())
 }
 
 const BASE_BIN: &str = "solana-test-validator";
@@ -107,7 +117,7 @@ pub(super) fn find_base_bin() -> Result<PathBuf> {
 }
 
 fn explicit_bin(name: &str) -> Result<Option<PathBuf>> {
-    let path = std::env::var_os(name).map(PathBuf::from);
+    let path = env::var_os(name).map(PathBuf::from);
     if let Some(path) = &path {
         if !path.exists() {
             return Err(format!("{name}={} does not exist", path.display()).into());
@@ -150,8 +160,8 @@ pub(super) fn find_verifier_bin() -> Result<PathBuf> {
 }
 
 fn which(bin: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
+    let path = env::var_os("PATH")?;
+    env::split_paths(&path)
         .map(|dir| dir.join(bin))
         .find(|candidate| candidate.is_file())
 }
@@ -161,7 +171,7 @@ pub(super) fn bin_name(path: &Path) -> String {
 }
 
 struct StagedPrograms {
-    bpf: Vec<(String, PathBuf)>,
+    bpf: Vec<(Pubkey, PathBuf)>,
     loaded_fixtures: Vec<String>,
 }
 
@@ -170,7 +180,7 @@ fn base_programs(er_bin: &Path) -> StagedPrograms {
     let mut loaded_fixtures = Vec::new();
 
     match committor_so(er_bin) {
-        Some(so) => bpf.push((COMMITTOR_ID.to_owned(), so)),
+        Some(so) => bpf.push((COMMITTOR_ID, so)),
         None => warn!(
             "magicblock_committor_program.so missing from the ER build; \
              build it with cargo build-sbf or commit scenarios will fail"
@@ -178,12 +188,12 @@ fn base_programs(er_bin: &Path) -> StagedPrograms {
     }
 
     for fixture in Fixture::ALL {
-        if !fixture.loaded_at_base_boot() {
+        let Some(program_id) = fixture.program_id() else {
             continue;
-        }
+        };
         match fixture.resolve() {
             Ok(so) => {
-                bpf.push((fixture.program_id().to_string(), so));
+                bpf.push((program_id, so));
                 loaded_fixtures.push(fixture.so_name().to_owned());
             }
             Err(error) => {
@@ -220,11 +230,11 @@ pub(super) struct BasePlan {
     pub(super) gossip_port: u16,
     pub(super) ledger: PathBuf,
     pub(super) genesis_accounts: PathBuf,
-    pub(super) clone_url: String,
+    pub(super) clone_url: Url,
     // (program id, .so, upgrade authority) preloaded as loader-v3 programs
     pub(super) upgradeable_v3: Vec<(Pubkey, PathBuf, Pubkey)>,
     // (program id, .so) loaded via --bpf-program; redline gets its aliases
-    pub(super) bpf_programs: Vec<(String, PathBuf)>,
+    pub(super) bpf_programs: Vec<(Pubkey, PathBuf)>,
     pub(super) loaded_fixtures: Vec<String>,
     pub(super) geyser_plugin_config: PathBuf,
     // The Yellowstone release serving this base's gRPC feed.
@@ -243,9 +253,10 @@ impl BasePlan {
         gossip_port: u16,
         grpc_port: u16,
     ) -> Result<Self> {
+        let clone_url = clone_url()?;
         let yellowstone = super::yellowstone::ensure(&bin).await?;
         let geyser_plugin_config = stack_dir.join("geyser.json");
-        yellowstone.write_config(&geyser_plugin_config, &format!("127.0.0.1:{grpc_port}"))?;
+        yellowstone.write_config(&geyser_plugin_config, ([127, 0, 0, 1], grpc_port).into())?;
         let mut upgradeable_v3 = Vec::new();
         if let Ok(redshift_so) = Fixture::RedshiftProgram.resolve() {
             let (v3_id, v3_authority) = redshift_loader_v3_target();
@@ -264,7 +275,7 @@ impl BasePlan {
             gossip_port,
             ledger: stack_dir.join("base-ledger"),
             genesis_accounts: stack_dir.join("genesis-accounts"),
-            clone_url: clone_url(),
+            clone_url,
             upgradeable_v3,
             bpf_programs: staged.bpf,
             loaded_fixtures: staged.loaded_fixtures,
@@ -282,16 +293,16 @@ impl BasePlan {
             .args(["--rpc-port", &self.rpc_port.to_string()])
             .args(["--faucet-port", &self.faucet_port.to_string()])
             .args(["--gossip-port", &self.gossip_port.to_string()])
-            .args(["--url", &self.clone_url]);
+            .args(["--url", self.clone_url.as_str()]);
         cmd.arg("--account-dir").arg(&self.genesis_accounts);
         for id in CLONED_ACCOUNTS {
-            cmd.arg("--clone").arg(id);
+            cmd.arg("--clone").arg(id.to_string());
         }
         for id in CLONED_UPGRADEABLE_PROGRAMS {
-            cmd.arg("--clone-upgradeable-program").arg(id);
+            cmd.arg("--clone-upgradeable-program").arg(id.to_string());
         }
         for id in CLONED_LEGACY_PROGRAMS {
-            cmd.arg("--clone").arg(id);
+            cmd.arg("--clone").arg(id.to_string());
         }
         for (id, so, authority) in &self.upgradeable_v3 {
             cmd.arg("--upgradeable-program")
@@ -303,7 +314,7 @@ impl BasePlan {
             for alias in redline_aliases_of(so) {
                 cmd.arg("--bpf-program").arg(alias.to_string()).arg(so);
             }
-            cmd.arg("--bpf-program").arg(id).arg(so);
+            cmd.arg("--bpf-program").arg(id.to_string()).arg(so);
         }
         cmd.arg("--geyser-plugin-config").arg(&self.geyser_plugin_config);
         cmd
@@ -336,13 +347,13 @@ pub(super) fn leader_params(
 ) -> Result<LeaderParams> {
     let mut params = LeaderParams {
         remotes: vec![
-            Remote::Http(endpoints.rpc_url.parse()?),
-            Remote::Websocket(endpoints.ws_url.parse()?, None),
+            Remote::Http(ResolvedUrl(endpoints.rpc_url.clone())),
+            Remote::Websocket(ResolvedUrl(endpoints.ws_url.clone()), None),
         ],
         ..LeaderParams::default()
     };
     if let Some(grpc_url) = &endpoints.grpc_url {
-        params.remotes.push(Remote::Grpc(with_api_key(grpc_url).parse()?));
+        params.remotes.push(Remote::Grpc(ResolvedUrl(with_api_key(grpc_url.clone()))));
     }
     params.aperture.listen = local(ports.rpc);
     params.metrics.address = local(ports.metrics);
@@ -401,12 +412,12 @@ impl<P: Serialize> Plan<P> {
     pub(super) fn command(&self) -> Command {
         let mut cmd = Command::new(&self.bin);
         cmd.arg(&self.config_path);
-        for (key, _) in std::env::vars_os() {
+        for (key, _) in env::vars_os() {
             if key.to_string_lossy().starts_with("MBV_") {
                 cmd.env_remove(&key);
             }
         }
-        if std::env::var_os("RUST_LOG").is_none() {
+        if env::var_os("RUST_LOG").is_none() {
             cmd.env("RUST_LOG", "info");
         }
         cmd
@@ -422,10 +433,6 @@ impl<P: Serialize> Plan<P> {
 }
 
 impl ErPlan {
-    pub(super) fn listen(&self) -> BindAddress {
-        self.params.aperture.listen
-    }
-
     pub(super) fn replication_port(&self) -> u16 {
         self.params.engine.replication.bind_address.port()
     }
@@ -451,12 +458,11 @@ impl VerifierPlan {
 
 const GRPC_API_KEY: &str = "redsuite";
 
-fn with_api_key(grpc_url: &str) -> String {
-    if grpc_url.contains('?') {
-        grpc_url.to_owned()
-    } else {
-        format!("{grpc_url}?api-key={GRPC_API_KEY}")
+fn with_api_key(mut grpc_url: Url) -> Url {
+    if grpc_url.query().is_none() {
+        grpc_url.query_pairs_mut().append_pair("api-key", GRPC_API_KEY);
     }
+    grpc_url
 }
 
 pub struct ErOptions {
@@ -479,9 +485,9 @@ impl Default for ErOptions {
 
 #[derive(Debug, Clone)]
 pub struct BaseEndpoints {
-    pub rpc_url: String,
-    pub ws_url: String,
-    pub grpc_url: Option<String>,
+    pub rpc_url: Url,
+    pub ws_url: Url,
+    pub grpc_url: Option<Url>,
 }
 
 pub struct RestartConfig {

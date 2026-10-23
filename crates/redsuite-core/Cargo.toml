@@ -8,12 +8,14 @@ authors.workspace = true
 [dependencies]
 clap = { workspace = true }
 tracing = { workspace = true }
+tracing-error = { workspace = true }
+const-str = { workspace = true }
 tracing-subscriber = { workspace = true }
 tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
-async-trait = { workspace = true }
 reqwest = { workspace = true }
+url = { workspace = true }
 
 redline-interface = { workspace = true }
 redshift-interface = { workspace = true }

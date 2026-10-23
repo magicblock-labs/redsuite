@@ -1,6 +1,9 @@
-use std::time::{Duration, Instant};
+use std::{
+    rc::Rc,
+    slice,
+    time::{Duration, Instant},
+};
 
-use async_trait::async_trait;
 use borsh::BorshDeserialize;
 use keypair::Keypair;
 use pubkey::Pubkey;
@@ -12,9 +15,11 @@ use redsuite_core::{
     topology::{ErOptions, PrivateEr, RestartConfig},
     BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
+use signature::Signature;
 use signer::Signer;
+use tokio::time;
 
-use super::await_delegated;
+use crate::PAYER_LAMPORTS;
 
 const LABEL_A: &str = "session-isolation-a";
 const CLONE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -25,8 +30,6 @@ const COMPLETION_TIMEOUT: Duration = Duration::from_secs(60);
 const STALE_WINDOW: Duration = Duration::from_secs(5);
 const RECOVERY_WINDOW: Duration = Duration::from_secs(10);
 const POLL: Duration = Duration::from_millis(250);
-
-pub struct DelegationSessionIsolation;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Target {
@@ -150,7 +153,7 @@ async fn hold_steady(
             session.er_id,
             "{what}: the session-b er state must stay"
         )?;
-        tokio::time::sleep(POLL).await;
+        time::sleep(POLL).await;
     }
     Ok(())
 }
@@ -160,7 +163,7 @@ async fn schedule_commit(
     payer: &Keypair,
     player: &Pubkey,
     commit_type: ScheduleCommitType,
-) -> Result<signature::Signature> {
+) -> Result<Signature> {
     let writable = matches!(
         commit_type,
         ScheduleCommitType::CommitAndUndelegate | ScheduleCommitType::CommitFinalizeAndUndelegate
@@ -234,13 +237,15 @@ async fn isolate(
     target: Target,
 ) -> Result<()> {
     let case = u64::from(target == Target::OtherValidator) + 1;
-    let committee = prep::init_committees(base, payer, er_a.identity(), 1)
+    let committee = base
+        .schedulecommit(payer)
+        .init(er_a.identity(), 1)
         .await?
         .pop()
         .ok_or("no committee was created")?;
     let player = committee.player.pubkey();
     let account = committee.pda;
-    prep::await_committee_clones(er_a.ctx(), std::slice::from_ref(&committee)).await?;
+    er_a.ctx().await_committees(slice::from_ref(&committee)).await?;
 
     let staged = value(case, 1);
     write(er_a.ctx(), payer, &player, &account, staged).await?;
@@ -305,13 +310,13 @@ async fn isolate(
     )
     .await?;
     await_clone_count(session_b, &account, base_value).await?;
-    await_delegated(
-        session_b,
-        &account,
-        CLONE_TIMEOUT,
-        "session-b er activates the committee as delegated",
-    )
-    .await?;
+    session_b
+        .await_delegated(
+            &account,
+            CLONE_TIMEOUT,
+            "session-b er activates the committee as delegated",
+        )
+        .await?;
     let er_value = value(case, 3);
     write(session_b, payer, &player, &account, er_value).await?;
     let nonce = crate::last_commit_id(base, &account).await?;
@@ -403,16 +408,19 @@ async fn isolate(
     Ok(())
 }
 
-#[async_trait(?Send)]
-impl Scenario for DelegationSessionIsolation {
-    fn name(&self) -> &str {
-        "redshift/delegation_session_isolation"
-    }
+pub struct DelegationSessionIsolation {
+    base: Rc<BaseCtx>,
+    er: ErCtx,
+    proxies: BaseProxies,
+    er_a: PrivateEr,
+    payer: Keypair,
+}
 
-    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<()> {
-        let proxies = BaseProxies::spawn(base).await?;
-        let mut er_a = topology::private_er(
-            base,
+impl Scenario for DelegationSessionIsolation {
+    async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
+        let proxies = BaseProxies::spawn(&base).await?;
+        let er_a = topology::private_er(
+            &base,
             ErOptions {
                 label: LABEL_A.to_owned(),
                 base_endpoints: Some(proxies.endpoints()),
@@ -420,10 +428,21 @@ impl Scenario for DelegationSessionIsolation {
             },
         )
         .await?;
-        let payer = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
+        let payer = base.funded_payer(PAYER_LAMPORTS).await?;
 
-        isolate(
+        Ok(Self { base, er, proxies, er_a, payer })
+    }
+
+    async fn run(self) -> Result<()> {
+        let Self {
             base,
+            er,
+            proxies,
+            mut er_a,
+            payer,
+        } = self;
+        isolate(
+            &base,
             &proxies,
             &mut er_a,
             None,
@@ -432,10 +451,10 @@ impl Scenario for DelegationSessionIsolation {
         )
         .await?;
         isolate(
-            base,
+            &base,
             &proxies,
             &mut er_a,
-            Some(er),
+            Some(&er),
             &payer,
             Target::OtherValidator,
         )

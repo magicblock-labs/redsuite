@@ -7,9 +7,9 @@ authors.workspace = true
 
 [dependencies]
 tracing = { workspace = true }
-async-trait = { workspace = true }
 tokio = { workspace = true }
 redsuite-core = { workspace = true }
+url = { workspace = true }
 redline-interface = { workspace = true }
 futures-util = { workspace = true }
 instruction = { workspace = true }

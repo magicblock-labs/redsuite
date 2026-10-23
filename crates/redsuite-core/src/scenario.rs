@@ -1,11 +1,11 @@
-use std::{panic::AssertUnwindSafe, time::Instant};
+use std::{future::Future, panic::AssertUnwindSafe, rc::Rc, result, time::Instant};
 
-use async_trait::async_trait;
 use futures_util::FutureExt;
-use tracing::{error, error_span, field, info, Instrument, Span};
+use tokio::task::LocalSet;
+use tracing::{error, info, instrument, Span};
 
 use crate::{
-    catalog::Fixture,
+    catalog::{Er, ErGroup, Fixture, ScenarioEntry},
     context::{BaseCtx, ErCtx},
     profile::ExecutionConfig,
     report::{ScenarioReport, Unit},
@@ -41,16 +41,49 @@ impl Verdict for (ScenarioReport, Result<()>) {
     }
 }
 
-#[async_trait(?Send)]
-pub trait Scenario<V: Verdict = ()> {
-    fn name(&self) -> &str;
-    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<V>;
+/// Setup produces the state consumed by a scenario on a harness-managed ER.
+/// Options are `()` unless setup needs typed configuration.
+pub trait Scenario<V = (), Options = ()>: Sized + 'static
+where
+    V: Verdict + 'static,
+    Options: 'static,
+{
+    fn setup(base: Rc<BaseCtx>, er: ErCtx, options: Options) -> impl Future<Output = Result<Self>>;
+
+    fn run(self) -> impl Future<Output = Result<V>>;
+
+    fn shared(
+        name: &'static str,
+        group: &'static ErGroup,
+        fixtures: &'static [Fixture],
+        options: Options,
+    ) -> ScenarioEntry {
+        ScenarioEntry::shared::<Self, V, Options>(name, Er::Shared(group), fixtures, options)
+    }
+
+    fn exclusive(
+        name: &'static str,
+        group: &'static ErGroup,
+        fixtures: &'static [Fixture],
+        options: Options,
+    ) -> ScenarioEntry {
+        ScenarioEntry::shared::<Self, V, Options>(name, Er::Exclusive(group), fixtures, options)
+    }
 }
 
-#[async_trait(?Send)]
-pub trait PrivateErScenario<V: Verdict = ()> {
-    fn name(&self) -> &str;
-    async fn run(&self, base: &BaseCtx) -> Result<V>;
+/// A scenario that owns its ER topology.
+pub trait PrivateErScenario<V = (), Options = ()>: Sized + 'static
+where
+    V: Verdict + 'static,
+    Options: 'static,
+{
+    fn setup(base: Rc<BaseCtx>, options: Options) -> impl Future<Output = Result<Self>>;
+
+    fn run(self) -> impl Future<Output = Result<V>>;
+
+    fn fresh(name: &'static str, fixtures: &'static [Fixture], options: Options) -> ScenarioEntry {
+        ScenarioEntry::private::<Self, V, Options>(name, fixtures, options)
+    }
 }
 
 #[derive(Debug)]
@@ -79,22 +112,29 @@ impl RunRecord {
         self.outcome.is_ok() && self.report.as_ref().is_none_or(|r| r.passed)
     }
 
-    async fn run<V: Verdict, State>(
+    async fn run<V, State, Body>(
         &mut self,
         fixtures: &[Fixture],
         config: ExecutionConfig,
-        provision: impl AsyncFnOnce(ExecutionConfig) -> Result<(BaseCtx, State)>,
-        body: impl AsyncFnOnce(BaseCtx, State) -> Result<V>,
-    ) -> Result<()> {
+        state: result::Result<State, String>,
+        body: Body,
+    ) -> Result<()>
+    where
+        V: Verdict,
+        Body: AsyncFnOnce(Rc<BaseCtx>, State, &mut &'static str) -> Result<V>,
+    {
         let total = Instant::now();
         preflight(fixtures)?;
         self.phase = "topology";
-        let (base, state) = provision(config).await?;
+        let mut base = topology::base_only(config).await?;
+        base.scenario = Some(self.name.clone());
+        let base = Rc::new(base);
+        let state = state?;
         let resources = base.resources();
-        self.phase = "scenario";
+        self.phase = "setup";
         let started = Instant::now();
         // A scenario panic must not skip cleanup or prevent sibling runs.
-        let result = AssertUnwindSafe(body(base, state)).catch_unwind().await;
+        let result = AssertUnwindSafe(body(base, state, &mut self.phase)).catch_unwind().await;
         let wall = started.elapsed().as_secs_f64();
         resources.reclaim(&self.name);
         self.launches = resources.launches();
@@ -138,67 +178,75 @@ impl RunRecord {
             Ok(()) => error!("verdict failed"),
         }
         for launch in &self.launches {
-            info!(%launch.label, pid = launch.pid, %launch.log, "node log");
+            info!(node = %launch.label, log = %launch.log, "node log");
         }
     }
 }
 
-pub async fn run_shared_scenario<V: Verdict>(
-    scenario: impl Scenario<V>,
-    fixtures: &[Fixture],
-    config: ExecutionConfig,
-    er: std::result::Result<ErCtx, String>,
-) -> RunRecord {
-    execute(
-        scenario.name().to_owned(),
-        fixtures,
-        config,
-        async move |config| Ok((topology::base_only(config).await?, er?)),
-        async move |base, er| {
-            let outcome = scenario.run(&base, &er).await;
-            if let Some(proxies) = er.proxies() {
-                let reset = proxies.reset().await;
-                return outcome.and_then(|verdict| reset.map(|()| verdict));
-            }
-            outcome
-        },
-    )
-    .await
-}
-
-pub async fn run_private_er_scenario<V: Verdict>(
-    scenario: impl PrivateErScenario<V>,
-    fixtures: &[Fixture],
-    config: ExecutionConfig,
-) -> RunRecord {
-    execute(
-        scenario.name().to_owned(),
-        fixtures,
-        config,
-        async |config| Ok((topology::base_only(config).await?, ())),
-        async move |base, ()| scenario.run(&base).await,
-    )
-    .await
-}
-
-async fn execute<V: Verdict, State>(
+pub async fn run_shared_scenario<V, Body>(
     name: String,
     fixtures: &[Fixture],
     config: ExecutionConfig,
-    provision: impl AsyncFnOnce(ExecutionConfig) -> Result<(BaseCtx, State)>,
-    body: impl AsyncFnOnce(BaseCtx, State) -> Result<V>,
-) -> RunRecord {
-    // Error-level spans retain context without emitting standalone events.
-    let span = error_span!("run", scenario = %name, stage = field::Empty);
+    er: result::Result<ErCtx, String>,
+    body: Body,
+) -> RunRecord
+where
+    V: Verdict,
+    Body: AsyncFnOnce(Rc<BaseCtx>, ErCtx, &mut &'static str) -> Result<V>,
+{
+    execute(name, fixtures, config, er, async move |base, er, stage| {
+        let outcome = body(base, er.clone(), stage).await;
+        if let Some(proxies) = er.proxies() {
+            let reset = proxies.reset().await;
+            return outcome.and_then(|verdict| reset.map(|()| verdict));
+        }
+        outcome
+    })
+    .await
+}
+
+pub async fn run_private_er_scenario<V, Body>(
+    name: String,
+    fixtures: &[Fixture],
+    config: ExecutionConfig,
+    body: Body,
+) -> RunRecord
+where
+    V: Verdict,
+    Body: AsyncFnOnce(Rc<BaseCtx>, &mut &'static str) -> Result<V>,
+{
+    execute(
+        name,
+        fixtures,
+        config,
+        Ok(()),
+        async move |base, (), stage| body(base, stage).await,
+    )
+    .await
+}
+
+// Error-level spans retain context without emitting standalone events.
+#[instrument(name = "run", skip_all, level = "error", fields(scenario = %name, stage))]
+async fn execute<V, State, Body>(
+    name: String,
+    fixtures: &[Fixture],
+    config: ExecutionConfig,
+    state: result::Result<State, String>,
+    body: Body,
+) -> RunRecord
+where
+    V: Verdict,
+    Body: AsyncFnOnce(Rc<BaseCtx>, State, &mut &'static str) -> Result<V>,
+{
     let run = async {
         let mut record = RunRecord::new(name);
         info!("started");
-        record.outcome = record.run(fixtures, config, provision, body).await;
+        record.outcome = record.run(fixtures, config, state, body).await;
         record.conclude(V::REPORTS);
         record
     };
     // Dropping the LocalSet cancels scenario-owned readers and background tasks.
-    tokio::task::LocalSet::new().run_until(run.instrument(span)).await
+    LocalSet::new().run_until(run).await
 }
 
 fn preflight(fixtures: &[Fixture]) -> Result<()> {
@@ -210,7 +258,7 @@ fn preflight(fixtures: &[Fixture]) -> Result<()> {
         return Ok(());
     };
     for fixture in fixtures {
-        if fixture.loaded_at_base_boot() && !loaded.iter().any(|name| name == fixture.so_name()) {
+        if fixture.program_id().is_some() && !loaded.iter().any(|name| name == fixture.so_name()) {
             return Err(format!(
                 "{} is staged, but the running base booted without it — \
                  run `cargo xtask stack down`, then run again",

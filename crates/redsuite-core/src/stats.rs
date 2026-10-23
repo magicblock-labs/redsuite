@@ -1,3 +1,5 @@
+use std::mem;
+
 use json::{Deserialize, Serialize};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 
@@ -73,7 +75,7 @@ impl StreamingStats {
             self.reservoir.append(&mut other_reservoir);
             return;
         }
-        let mut own_reservoir = std::mem::take(&mut self.reservoir);
+        let mut own_reservoir = mem::take(&mut self.reservoir);
         let own_value_weight = self.count as f64 / own_reservoir.len() as f64;
         let other_value_weight = other_count as f64 / other_reservoir.len() as f64;
         let mut merged = Vec::with_capacity(self.reservoir_size);

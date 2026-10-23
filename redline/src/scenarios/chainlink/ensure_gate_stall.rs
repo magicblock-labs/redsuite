@@ -1,15 +1,16 @@
 use std::{rc::Rc, time::Duration};
 
-use async_trait::async_trait;
+use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    check, check_eq, prep,
+    check, check_eq,
     profile::ProfileValues,
     redline::Accounts,
-    report,
     report::Unit,
     runner::{execute, Pacing, RunConfig, RunOutcome},
-    topology, BaseCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
+    topology,
+    topology::ErOptions,
+    BaseCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
 };
 use tracing::{debug, warn};
 
@@ -98,23 +99,27 @@ struct CellOutcome {
     evictions: f64,
 }
 
-pub struct EnsureGateStall;
+pub struct EnsureGateStall {
+    base: Rc<BaseCtx>,
+    profile: &'static Profile,
+    pool: Vec<Pubkey>,
+    payer: Rc<Keypair>,
+}
 
-#[async_trait(?Send)]
 impl Scenario<ScenarioReport> for EnsureGateStall {
-    fn name(&self) -> &str {
-        "redline/ensure_gate_stall"
+    async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
+        let profile = PROFILES.select(base.config().profile);
+        let prep_payers = base.funded_payers(profile.prep_payers, PREP_PAYER_LAMPORTS).await?;
+        let pool = Accounts::new(ACCOUNT_SPACE, er.identity())
+            .init_batched(base.as_ref(), &prep_payers, profile.working_set, false)
+            .await?;
+        let payer = Rc::new(base.funded_payer(PAYER_LAMPORTS).await?);
+
+        Ok(Self { base, profile, pool, payer })
     }
 
-    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
-        let profile = PROFILES.select(base.config().profile);
-        let prep_payers =
-            prep::funded_payers(base, profile.prep_payers, PREP_PAYER_LAMPORTS).await?;
-        let pool = Accounts::new(ACCOUNT_SPACE, er.identity())
-            .init_batched(base, &prep_payers, profile.working_set, false)
-            .await?;
-        let payer = Rc::new(prep::funded_payer(base, PAYER_LAMPORTS).await?);
-
+    async fn run(self) -> Result<ScenarioReport> {
+        let Self { base, profile, pool, payer } = self;
         let cells_spec = [
             Cell {
                 name: "healthy",
@@ -133,8 +138,8 @@ impl Scenario<ScenarioReport> for EnsureGateStall {
         let mut cells: Vec<CellOutcome> = Vec::new();
         for cell in cells_spec {
             let private = topology::private_er(
-                base,
-                topology::ErOptions {
+                &base,
+                ErOptions {
                     label: format!("s6-{}", cell.name),
                     settings: Box::new(move |params| {
                         params.engine.accountsdb.lru_capacity = cell.cap;
@@ -149,7 +154,7 @@ impl Scenario<ScenarioReport> for EnsureGateStall {
             .await?;
             let cell_er = private.ctx();
             if cell.prewarm {
-                prep::prewarm(cell_er, &pool, ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
+                cell_er.prewarm(&pool, ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
             }
             let sender = cell_er.sender(payer.clone());
 
@@ -158,7 +163,7 @@ impl Scenario<ScenarioReport> for EnsureGateStall {
                 let accounts = sample_accounts(&pool, id, READ_WIDTH);
                 let ix = build::read_accounts_data(id, &accounts);
                 let sender = sender.clone();
-                sender.staged(&[ix])
+                sender.staged([ix])
             };
             let outcome = execute(
                 RunConfig {
@@ -186,7 +191,7 @@ impl Scenario<ScenarioReport> for EnsureGateStall {
                 cell_outcome.outcome.failed, cell_outcome.evictions, "ensure-gate cell finished",
             );
 
-            let cell_report = ScenarioReport::ok(&format!("{}/{}", self.name(), cell.name))
+            let cell_report = ScenarioReport::ok()
                 .setting("profile", profile.name)
                 .setting("cap", cell.cap)
                 .setting("working set", profile.working_set)
@@ -221,7 +226,7 @@ impl Scenario<ScenarioReport> for EnsureGateStall {
                     cell_outcome.monitored_end,
                 )
                 .metric("evictions in window", Unit::Count, cell_outcome.evictions);
-            report::persist_cell(self.name(), &cell_report);
+            base.report_cell(cell.name, &cell_report)?;
             cells.push(cell_outcome);
             drop(private);
         }
@@ -275,7 +280,7 @@ impl Scenario<ScenarioReport> for EnsureGateStall {
             0.0
         };
 
-        let mut summary = ScenarioReport::ok(self.name())
+        let mut summary = ScenarioReport::ok()
             .setting("profile", profile.name)
             .setting("working set", profile.working_set)
             .setting("read width", READ_WIDTH)

@@ -1,16 +1,21 @@
-use std::time::{Duration, Instant};
+use std::{
+    future,
+    rc::Rc,
+    time::{Duration, Instant},
+};
 
-use async_trait::async_trait;
 use pubkey::Pubkey;
 use redsuite_core::{
-    check, check_eq, prep,
+    check, check_eq,
     profile::ProfileValues,
     redline::Accounts,
-    report,
     report::Unit,
     runner::{execute, Pacing, RunConfig, RunOutcome},
-    topology, BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
+    topology,
+    topology::ErOptions,
+    BaseCtx, ChainCtx, ErCtx, Metrics, MetricsDelta, Result, Scenario, ScenarioReport,
 };
+use tokio::time;
 use tracing::{debug, warn};
 
 const ACCOUNT_SPACE: u32 = 2048;
@@ -28,11 +33,11 @@ const SETTLE_POLL: Duration = Duration::from_millis(500);
 const RESUBSCRIBE: Duration = Duration::from_millis(50);
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-async fn settled_scrape(er: &ErCtx) -> Result<redsuite_core::Metrics> {
+async fn settled_scrape(er: &ErCtx) -> Result<Metrics> {
     let mut last = er.scrape_metrics().await?;
-    let deadline = tokio::time::Instant::now() + SETTLE_TIMEOUT;
-    while tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(SETTLE_POLL).await;
+    let deadline = time::Instant::now() + SETTLE_TIMEOUT;
+    while time::Instant::now() < deadline {
+        time::sleep(SETTLE_POLL).await;
         let next = er.scrape_metrics().await?;
         let stable = next.get(EVICTED_COUNTER) == last.get(EVICTED_COUNTER)
             && next.value_sum(FETCHES_FOUND_COUNTER) == last.value_sum(FETCHES_FOUND_COUNTER);
@@ -112,22 +117,25 @@ struct CellOutcome {
     monitored_end: f64,
 }
 
-pub struct CloneLruChurn;
+pub struct CloneLruChurn {
+    base: Rc<BaseCtx>,
+    profile: &'static Profile,
+    pool: Vec<Pubkey>,
+}
 
-#[async_trait(?Send)]
 impl Scenario<ScenarioReport> for CloneLruChurn {
-    fn name(&self) -> &str {
-        "redline/clone_lru_churn"
-    }
-
-    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
+    async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
         let profile = PROFILES.select(base.config().profile);
-        let prep_payers =
-            prep::funded_payers(base, profile.prep_payers, PREP_PAYER_LAMPORTS).await?;
+        let prep_payers = base.funded_payers(profile.prep_payers, PREP_PAYER_LAMPORTS).await?;
         let pool = Accounts::new(ACCOUNT_SPACE, er.identity())
-            .init_batched(base, &prep_payers, profile.working_set, false)
+            .init_batched(base.as_ref(), &prep_payers, profile.working_set, false)
             .await?;
 
+        Ok(Self { base, profile, pool })
+    }
+
+    async fn run(self) -> Result<ScenarioReport> {
+        let Self { base, profile, pool } = self;
         let mut cells_spec = vec![Cell {
             name: "closure".to_owned(),
             cap: profile.closure_cap,
@@ -144,8 +152,8 @@ impl Scenario<ScenarioReport> for CloneLruChurn {
         let mut cells: Vec<CellOutcome> = Vec::new();
         for cell in cells_spec {
             let private = topology::private_er(
-                base,
-                topology::ErOptions {
+                &base,
+                ErOptions {
                     label: format!("s5-{}", cell.name),
                     settings: Box::new(move |params| {
                         params.engine.accountsdb.lru_capacity = cell.cap;
@@ -158,15 +166,15 @@ impl Scenario<ScenarioReport> for CloneLruChurn {
             .await?;
             let cell_er = private.ctx();
             if cell.closure {
-                prep::prewarm(cell_er, &pool, ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
+                cell_er.prewarm(&pool, ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
             } else {
-                prep::touch(cell_er, &pool).await;
+                cell_er.touch(&pool).await;
             }
 
             let request = |id: u64| {
                 let account = pick_account(&pool, id);
                 let api = cell_er.api().clone();
-                std::future::ready(Ok(move |_: Instant| async move {
+                future::ready(Ok(move |_: Instant| async move {
                     api.get_account(&account).await.map(|_| ())
                 }))
             };
@@ -220,7 +228,7 @@ impl Scenario<ScenarioReport> for CloneLruChurn {
                 "cache churn cell finished",
             );
 
-            let cell_report = ScenarioReport::ok(&format!("{}/{}", self.name(), cell.name))
+            let cell_report = ScenarioReport::ok()
                 .setting("profile", profile.name)
                 .setting("cap", cell.cap)
                 .setting("working set", profile.working_set)
@@ -269,7 +277,7 @@ impl Scenario<ScenarioReport> for CloneLruChurn {
                     Unit::Count,
                     cell_outcome.monitored_end,
                 );
-            report::persist_cell(self.name(), &cell_report);
+            base.report_cell(&cell.name, &cell_report)?;
             cells.push(cell_outcome);
             drop(private);
         }
@@ -328,7 +336,7 @@ impl Scenario<ScenarioReport> for CloneLruChurn {
             }
         }
 
-        let mut summary = ScenarioReport::ok(self.name())
+        let mut summary = ScenarioReport::ok()
             .setting("profile", profile.name)
             .setting("working set", profile.working_set)
             .setting("account space", ACCOUNT_SPACE)

@@ -1,16 +1,22 @@
-use std::time::{Duration, Instant};
+use std::{
+    rc::Rc,
+    slice,
+    time::{Duration, Instant},
+};
 
-use async_trait::async_trait;
 use instruction::{AccountMeta, Instruction};
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    check, check_eq, prep, topology, BaseCtx, ChainCtx, CheckError, ErCtx, Result, Scenario,
+    check, check_eq, topology, BaseCtx, ChainCtx, CheckError, ErCtx, Result, Scenario,
 };
 use signature::Signature;
+use tokio::time;
 
-const MEMO_V1_ID: &str = "Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo";
-const MEMO_V2_ID: &str = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr";
+use crate::PAYER_LAMPORTS;
+
+const MEMO_V1_ID: Pubkey = Pubkey::from_str_const("Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo");
+const MEMO_V2_ID: Pubkey = Pubkey::from_str_const("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr");
 
 const PAYER_DELEGATION: u64 = 1_000_000_000;
 const INVOKE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -20,28 +26,33 @@ const LEDGER_VISIBILITY_TIMEOUT: Duration = Duration::from_millis(250);
 const LEDGER_VISIBILITY_POLL: Duration = Duration::from_millis(10);
 const LOADER_V3_PROGRAMDATA_METADATA: usize = 45;
 
-pub struct LoaderMatrix;
+pub struct LoaderMatrix {
+    base: Rc<BaseCtx>,
+    er: ErCtx,
+    payer: Keypair,
+}
 
-#[async_trait(?Send)]
 impl Scenario for LoaderMatrix {
-    fn name(&self) -> &str {
-        "redshift/loader_matrix"
+    async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
+        let funder = base.funded_payer(PAYER_LAMPORTS).await?;
+        let payer = base.delegated_payer(&funder, er.identity(), PAYER_DELEGATION).await?;
+
+        Ok(Self { base, er, payer })
     }
 
-    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<()> {
-        let funder = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
-        let payer = &prep::delegated_payer(base, &funder, er.identity(), PAYER_DELEGATION).await?;
-
-        let memo_v1: Pubkey = MEMO_V1_ID.parse()?;
-        let memo_v2: Pubkey = MEMO_V2_ID.parse()?;
+    async fn run(self) -> Result<()> {
+        let Self { base, er, payer } = self;
+        let payer = &payer;
+        let memo_v1 = MEMO_V1_ID;
+        let memo_v2 = MEMO_V2_ID;
 
         let base_memo_v1 =
             base.account(&memo_v1).await?.ok_or("memo v1 is not on the base chain")?;
-        invoke_until(er, payer, memo_v1, &memo_data, vec![], |logs| {
+        invoke_until(&er, payer, memo_v1, &memo_data, vec![], |logs| {
             program_succeeded(logs, &memo_v1)
         })
         .await?;
-        let (v1_owner, v1_data) = cloned_program(er, &memo_v1).await?;
+        let (v1_owner, v1_data) = cloned_program(&er, &memo_v1).await?;
         check_eq!(
             v1_owner,
             sdk_ids::bpf_loader_deprecated::ID,
@@ -57,8 +68,8 @@ impl Scenario for LoaderMatrix {
 
         let base_memo_v2 =
             base.account(&memo_v2).await?.ok_or("memo v2 is not on the base chain")?;
-        invoke_until(er, payer, memo_v2, &memo_data, vec![], has_memo).await?;
-        let (v2_owner, v2_data) = cloned_program(er, &memo_v2).await?;
+        invoke_until(&er, payer, memo_v2, &memo_data, vec![], has_memo).await?;
+        let (v2_owner, v2_data) = cloned_program(&er, &memo_v2).await?;
         check_eq!(
             v2_owner,
             sdk_ids::loader_v4::ID,
@@ -73,7 +84,7 @@ impl Scenario for LoaderMatrix {
         )?;
 
         let (v3_id, _) = topology::redshift_loader_v3_target();
-        let v3_logs = invoke_until(er, payer, v3_id, &log_data, vec![], has_log_msg).await?;
+        let v3_logs = invoke_until(&er, payer, v3_id, &log_data, vec![], has_log_msg).await?;
         let v3_programdata =
             Pubkey::find_program_address(&[v3_id.as_ref()], &sdk_ids::bpf_loader_upgradeable::ID).0;
         let mut base_v3_programdata = base
@@ -82,7 +93,7 @@ impl Scenario for LoaderMatrix {
             .ok_or("the v3 programdata account is not on the base chain")?
             .data;
         let base_v3_elf = base_v3_programdata.split_off(LOADER_V3_PROGRAMDATA_METADATA);
-        let (v3_owner, v3_data) = cloned_program(er, &v3_id).await?;
+        let (v3_owner, v3_data) = cloned_program(&er, &v3_id).await?;
         check_eq!(
             v3_owner,
             sdk_ids::loader_v4::ID,
@@ -144,14 +155,18 @@ async fn confirmed_logs(er: &ErCtx, signature: &Signature) -> Result<Vec<String>
     .unwrap_or_default())
 }
 
-async fn invoke_until(
+async fn invoke_until<Data, Accept>(
     er: &ErCtx,
     payer: &Keypair,
     program: Pubkey,
-    data_for: &dyn Fn(u64) -> Vec<u8>,
+    data_for: Data,
     accounts: Vec<AccountMeta>,
-    accept: impl Fn(&[String]) -> bool,
-) -> Result<Vec<String>> {
+    accept: Accept,
+) -> Result<Vec<String>>
+where
+    Data: Fn(u64) -> Vec<u8>,
+    Accept: Fn(&[String]) -> bool,
+{
     let deadline = Instant::now() + INVOKE_TIMEOUT;
     let mut attempt = 0u64;
     let mut last_logs = Vec::new();
@@ -162,7 +177,7 @@ async fn invoke_until(
             accounts: accounts.clone(),
             data: data_for(attempt),
         };
-        match er.submit_and_confirm(payer, std::slice::from_ref(&ix)).await {
+        match er.submit_and_confirm(payer, slice::from_ref(&ix)).await {
             Ok(signature) => {
                 let logs = confirmed_logs(er, &signature).await?;
                 if accept(&logs) {
@@ -187,6 +202,6 @@ async fn invoke_until(
             .actual(format!("{last_logs:?}"))
             .into());
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        time::sleep(Duration::from_millis(500)).await;
     }
 }

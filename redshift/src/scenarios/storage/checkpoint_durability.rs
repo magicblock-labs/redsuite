@@ -1,18 +1,19 @@
-use std::{path::Path, time::Duration};
+use std::{path::Path, rc::Rc, time::Duration};
 
-use async_trait::async_trait;
 use keypair::Keypair;
 use pubkey::Pubkey;
-use redshift_interface::flexi::{build, FlexiCounter};
+use redshift_interface::schedulecommit::{build, MainAccount};
 use redsuite_core::{
     api::TransactionInfo,
-    check, check_eq, prep,
-    topology::{self, ErOptions, RestartConfig},
-    BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result,
+    check, check_eq,
+    topology::{self, ErOptions, PrivateEr, RestartConfig},
+    BaseCtx, ChainCtx, DynError, ErCtx, PrivateErScenario, Result,
 };
 use signature::Signature;
 use signer::Signer;
 use transaction::Transaction;
+
+use crate::PAYER_LAMPORTS;
 
 const ROUNDS: usize = 3;
 const BLOCKTIME: Duration = Duration::from_millis(50);
@@ -20,13 +21,11 @@ const SUPERBLOCK_SLOTS: u64 = 40;
 const TIMEOUT: Duration = Duration::from_secs(30);
 const CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(120);
 
-pub struct CheckpointDurability;
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct State {
     payer_lamports: u64,
     counter_lamports: u64,
-    counter: FlexiCounter,
+    counter: MainAccount,
 }
 
 impl State {
@@ -85,7 +84,7 @@ async fn state(er: &ErCtx, keys: &[Pubkey; 2]) -> Result<State> {
     Ok(State {
         payer_lamports: payer.lamports,
         counter_lamports: counter.lamports,
-        counter: FlexiCounter::try_decode(&counter.data)?,
+        counter: MainAccount::try_decode(&counter.data)?,
     })
 }
 
@@ -112,7 +111,7 @@ impl Workload {
         let id = self.next_id;
         let mut instructions = vec![build::add_unsigned(self.owner, id)];
         if Record::fails(id) {
-            instructions.push(build::add_error(self.owner, id));
+            instructions.push(build::fail(self.owner));
         }
         let tx = Transaction::new_signed_with_payer(
             &instructions,
@@ -158,7 +157,7 @@ async fn checkpoint(er: &ErCtx, storage: &Path) -> Result<u64> {
                 metadata.is_file() && metadata.len() > 0,
                 "archive incomplete"
             )?;
-            Ok::<_, redsuite_core::DynError>(())
+            Ok::<_, DynError>(())
         },
     )
     .await?;
@@ -177,15 +176,15 @@ async fn verify(er: &ErCtx, boundary: u64, protected: &[Record]) -> Result<()> {
     Ok(())
 }
 
-#[async_trait(?Send)]
-impl PrivateErScenario for CheckpointDurability {
-    fn name(&self) -> &str {
-        "redshift/checkpoint_durability"
-    }
+pub struct CheckpointDurability {
+    private: PrivateEr,
+    workload: Workload,
+}
 
-    async fn run(&self, base: &BaseCtx) -> Result<()> {
-        let mut private = topology::private_er(
-            base,
+impl PrivateErScenario for CheckpointDurability {
+    async fn setup(base: Rc<BaseCtx>, _: ()) -> Result<Self> {
+        let private = topology::private_er(
+            &base,
             ErOptions {
                 label: "checkpoint-durability".to_owned(),
                 settings: Box::new(|params| {
@@ -196,12 +195,11 @@ impl PrivateErScenario for CheckpointDurability {
             },
         )
         .await?;
-        let owner = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
+        let owner = base.funded_payer(PAYER_LAMPORTS).await?;
         let (counter, setup) =
-            prep::flexi_counter(owner.pubkey(), self.name(), private.identity(), u32::MAX);
+            base.schedulecommit(&owner).prepare_counter(private.identity(), u32::MAX);
         base.submit_and_confirm(&owner, &setup).await?;
-        let payer =
-            prep::delegated_payer(base, &owner, private.identity(), crate::PAYER_LAMPORTS).await?;
+        let payer = base.delegated_payer(&owner, private.identity(), PAYER_LAMPORTS).await?;
         let keys = [payer.pubkey(), counter];
         let expected =
             check::poll_for("accounts cloned", TIMEOUT, || state(private.ctx(), &keys)).await?;
@@ -210,13 +208,18 @@ impl PrivateErScenario for CheckpointDurability {
             (0, 0),
             "fresh counter"
         )?;
-        let mut workload = Workload {
+        let workload = Workload {
             payer,
             owner: owner.pubkey(),
             keys,
             next_id: 0,
             expected,
         };
+        Ok(Self { private, workload })
+    }
+
+    async fn run(self) -> Result<()> {
+        let Self { mut private, mut workload } = self;
         let mut protected = Vec::new();
         let mut previous_boundary = 0;
 

@@ -1,9 +1,9 @@
-use std::time::Duration;
+use std::{rc::Rc, result, time::Duration};
 
 use account::Account;
-use async_trait::async_trait;
-use futures_util::future::try_join_all;
+use futures_util::{future::try_join_all, TryFutureExt};
 use instruction::{AccountMeta, Instruction};
+use json::Value;
 use keypair::Keypair;
 use magic_api::instruction::{
     MagicBlockInstruction,
@@ -15,12 +15,14 @@ use magic_api::instruction::{
 use pubkey::Pubkey;
 use redshift_interface::{ephemeral_cpi, log_msg_data, schedulecommit::build};
 use redsuite_core::{
-    api::TransactionInfo, check, check_eq, dlp, phase, prep, receipt, system, topology, BaseCtx,
+    api::TransactionInfo, check, check_eq, dlp, phase, receipt, system, topology, BaseCtx,
     ChainCtx, ErCtx, Result, Scenario,
 };
 use sdk::{consts::EPHEMERAL_VAULT_ID, ephemeral_accounts::rent};
 use signer::Signer;
 use transaction::Transaction;
+
+use crate::PAYER_LAMPORTS;
 
 const TIMEOUT: Duration = Duration::from_secs(30);
 const PAYER: usize = 0;
@@ -29,7 +31,12 @@ const TARGET: usize = 2;
 const VAULT: usize = 3;
 const SUBSTITUTE: usize = 4;
 
-pub struct EphemeralAccounts;
+pub struct EphemeralAccounts {
+    base: Rc<BaseCtx>,
+    er: ErCtx,
+    funder: Keypair,
+    signers: Vec<Keypair>,
+}
 
 #[derive(Clone)]
 struct Action {
@@ -109,7 +116,7 @@ impl Action {
     }
 }
 
-fn error(index: usize, name: &str) -> json::Value {
+fn error(index: usize, name: &str) -> Value {
     json::json!({"InstructionError": [index, name]})
 }
 
@@ -148,7 +155,7 @@ impl Record {
         keys: &[Pubkey],
         before: &[Account],
         after: &[Account],
-        expected_error: Option<json::Value>,
+        expected_error: Option<Value>,
     ) -> Result<()> {
         check_eq!(
             self.info.err,
@@ -264,7 +271,7 @@ impl Workload<'_> {
         &mut self,
         label: &str,
         instructions: Vec<Instruction>,
-        effect: std::result::Result<&Action, &str>,
+        effect: result::Result<&Action, &str>,
     ) -> Result<()> {
         check_eq!(
             state(self.er, &self.keys).await?,
@@ -292,27 +299,25 @@ impl Workload<'_> {
             "{label}: state and accounting"
         )?;
         if let Err(error) = record.check(&self.keys, &before, &after, expected_error) {
-            self.failures.push(format!("{label} ({}): {error}", record.tx.signatures[0]));
+            self.failures.push(format!("{label}: {error}"));
         }
         self.expected = after;
         Ok(())
     }
 }
 
-#[async_trait(?Send)]
 impl Scenario for EphemeralAccounts {
-    fn name(&self) -> &str {
-        "redhat/ephemeral_accounts"
-    }
-
-    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<()> {
-        let funder = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
+    async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
+        let funder = base.funded_payer(PAYER_LAMPORTS).await?;
         let mut signers = Vec::new();
         for _ in 0..3 {
-            signers.push(
-                prep::delegated_payer(base, &funder, er.identity(), crate::PAYER_LAMPORTS).await?,
-            );
+            signers.push(base.delegated_payer(&funder, er.identity(), PAYER_LAMPORTS).await?);
         }
+        Ok(Self { base, er, funder, signers })
+    }
+
+    async fn run(self) -> Result<()> {
+        let Self { base, er, funder, mut signers } = self;
         // A delegated (mapped-signing) fee payer may commit ITSELF directly
         // via the magic program: it is the transaction signer and is delegated
         // to this ER, so the pipeline maps the signature and schedules the
@@ -354,7 +359,7 @@ impl Scenario for EphemeralAccounts {
                 "the mapped-signing self-commit {signature} must reach base \
                  through at least one base transaction"
             )?;
-            receipt::confirm_base_signatures(base.api(), &commit_receipt, TIMEOUT).await
+            commit_receipt.confirm(base.api(), TIMEOUT).await
         })
         .await?;
 
@@ -397,10 +402,10 @@ impl Scenario for EphemeralAccounts {
         signers.push(target);
         let foreign = topology::redshift_loader_v3_target().0;
         let mut workload = Workload {
-            er,
+            er: &er,
             signers,
             keys,
-            expected: state(er, &keys).await?,
+            expected: state(&er, &keys).await?,
             nonce: 0,
             failures: Vec::new(),
         };
@@ -531,15 +536,14 @@ impl Scenario for EphemeralAccounts {
                 let tx = workload.prepare(vec![action.instruction(&keys)]).await?;
                 prepared.push((action, tx));
             }
-            let records = try_join_all(prepared.into_iter().map(|(action, tx)| async move {
-                let signature = tx.signatures[0];
-                let record = Record::submit(er, tx)
-                    .await
-                    .map_err(|error| format!("conflicts ({signature}): {error}"))?;
-                Ok::<_, redsuite_core::DynError>((action, record))
-            }))
+            let records = phase(
+                "conflicts",
+                try_join_all(prepared.into_iter().map(|(action, tx)| {
+                    Record::submit(&er, tx).map_ok(move |record| (action, record))
+                })),
+            )
             .await?;
-            let after = state(er, &keys).await?;
+            let after = state(&er, &keys).await?;
             let order = serialized(&keys, &workload.expected, &after, &records, 0)
                 .ok_or("conflicts have no valid serialized outcome")?;
             for index in order {

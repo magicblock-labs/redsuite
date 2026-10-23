@@ -4,21 +4,19 @@ use std::{
     time::{Duration, Instant},
 };
 
-use async_trait::async_trait;
 use pubkey::Pubkey;
 use redsuite_core::{
     check, check_eq,
     monitor::{self, MonitorSpec},
-    prep,
     profile::ProfileValues,
-    receipt,
     redline::Accounts,
     report::Unit,
-    runner::{execute, Pacing, RunConfig, SendTransaction},
-    BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
+    runner::{execute, Pacing, RunConfig, RunOutcome, SendTransaction},
+    BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport, TxSender,
 };
 use signature::Signature;
 use signer::Signer;
+use tokio::time;
 use tracing::{debug, warn};
 
 use crate::program::instruction::build;
@@ -73,13 +71,13 @@ const FULL: Profile = Profile {
 const PROFILES: ProfileValues<Profile> = ProfileValues { lite: LITE, full: FULL };
 
 async fn deliver_commits(
-    sender: &redsuite_core::TxSender,
+    sender: &TxSender,
     payer_pubkey: Pubkey,
     sets: Vec<Vec<Pubkey>>,
     first_id: u64,
     rate: u32,
     concurrency: usize,
-) -> Result<(Vec<(u64, Signature)>, redsuite_core::runner::RunOutcome)> {
+) -> Result<(Vec<(u64, Signature)>, RunOutcome)> {
     let delivered: Rc<RefCell<Vec<(u64, Signature)>>> =
         Rc::new(RefCell::new(Vec::with_capacity(sets.len())));
     let request = |iteration: u64| {
@@ -146,11 +144,11 @@ async fn await_drain(
 ) -> Result<DrainResult> {
     let target = executed_before + expected as f64;
     let started = Instant::now();
-    let deadline = tokio::time::Instant::now() + cap;
+    let deadline = time::Instant::now() + cap;
     loop {
         let executed_now = er.scrape_metrics().await?.value_sum(EXECUTED_COUNTER).unwrap_or(0.0);
         let fully_drained = executed_now >= target;
-        if fully_drained || tokio::time::Instant::now() >= deadline {
+        if fully_drained || time::Instant::now() >= deadline {
             return Ok(DrainResult {
                 fully_drained,
                 drained: if fully_drained {
@@ -161,38 +159,44 @@ async fn await_drain(
                 drain_wall: started.elapsed(),
             });
         }
-        tokio::time::sleep(DRAIN_POLL).await;
+        time::sleep(DRAIN_POLL).await;
     }
 }
 
-pub struct CommitThroughputCeiling;
+pub struct CommitThroughputCeiling {
+    base: Rc<BaseCtx>,
+    er: ErCtx,
+    profile: &'static Profile,
+    pool: Vec<Pubkey>,
+    sender: TxSender,
+}
 
-#[async_trait(?Send)]
 impl Scenario<ScenarioReport> for CommitThroughputCeiling {
-    fn name(&self) -> &str {
-        "redline/commit_throughput_ceiling"
-    }
-
-    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
+    async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
         let profile = PROFILES.select(base.config().profile);
         let pool_size = profile.fresh_commits as usize * COMMIT_WIDTH;
 
-        let prep_payers =
-            prep::funded_payers(base, profile.prep_payers, PREP_PAYER_LAMPORTS).await?;
+        let prep_payers = base.funded_payers(profile.prep_payers, PREP_PAYER_LAMPORTS).await?;
         let pool = Accounts::new(ACCOUNT_SPACE, er.identity())
-            .init_batched(base, &prep_payers, pool_size, true)
+            .init_batched(base.as_ref(), &prep_payers, pool_size, true)
             .await?;
 
-        prep::prewarm(er, &pool, ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
+        er.prewarm(&pool, ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
 
-        let payer = prep::funded_payer(base, PAYER_LAMPORTS).await?;
-        let payer_pubkey = payer.pubkey();
+        let payer = base.funded_payer(PAYER_LAMPORTS).await?;
         let sender = er.sender(Rc::new(payer));
 
+        Ok(Self { base, er, profile, pool, sender })
+    }
+
+    async fn run(self) -> Result<ScenarioReport> {
+        let Self { base, er, profile, pool, sender } = self;
+        let pool_size = pool.len();
+        let payer_pubkey = sender.payer().pubkey();
         let fresh_sets: Vec<Vec<Pubkey>> =
             pool.chunks_exact(COMMIT_WIDTH).map(|window| window.to_vec()).collect();
 
-        quiesce_committor(er).await?;
+        quiesce_committor(&er).await?;
         let before = er.scrape_metrics().await?;
         let intents_before = before.value_sum(INTENTS_COUNTER).unwrap_or(0.0);
         let executed_before = before.value_sum(EXECUTED_COUNTER).unwrap_or(0.0);
@@ -234,7 +238,7 @@ impl Scenario<ScenarioReport> for CommitThroughputCeiling {
         }
 
         let drain = await_drain(
-            er,
+            &er,
             executed_before,
             profile.fresh_commits,
             profile.drain_cap,
@@ -274,8 +278,7 @@ impl Scenario<ScenarioReport> for CommitThroughputCeiling {
                     format!("fresh commit {id} intent"),
                 )
                 .await?;
-                receipt::confirm_base_signatures(base.api(), &commit_receipt, BASE_CONFIRM_TIMEOUT)
-                    .await?;
+                commit_receipt.confirm(base.api(), BASE_CONFIRM_TIMEOUT).await?;
                 receipt_base_txs += commit_receipt.base_signatures.len();
             }
         } else {
@@ -287,7 +290,7 @@ impl Scenario<ScenarioReport> for CommitThroughputCeiling {
             );
         }
 
-        let mut summary = ScenarioReport::ok(self.name())
+        let mut summary = ScenarioReport::ok()
             .setting("profile", profile.name)
             .setting("width", COMMIT_WIDTH)
             .setting("account space", ACCOUNT_SPACE)

@@ -1,22 +1,20 @@
-use super::hold_nonces;
+use std::{rc::Rc, time::Duration};
 
-use std::time::Duration;
-
-use async_trait::async_trait;
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
     check, check_eq,
     netfault::{BaseProxies, Selector},
-    prep,
-    receipt::{self, CommitReceipt},
-    topology::{self, ErOptions},
+    receipt,
+    receipt::CommitReceipt,
+    topology,
+    topology::{ErOptions, PrivateEr},
     BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result,
 };
 use signature::Signature;
-use signer::Signer;
 
-use crate::program::{instruction::build, DELEGATION_PROGRAM_ID};
+use super::hold_nonces;
+use crate::{program::DELEGATION_PROGRAM_ID, ACCOUNT_SPACE, PAYER_LAMPORTS};
 
 const LABEL: &str = "commit-settlement-order";
 const CLONE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -27,10 +25,8 @@ const RECEIPT_TIMEOUT: Duration = Duration::from_secs(120);
 const BUFFER_CLEANUP_TIMEOUT: Duration = Duration::from_secs(60);
 const HOLD_WINDOW: Duration = Duration::from_secs(5);
 const HISTORY_LIMIT: usize = 32;
-const SMALL_SPACE: u32 = crate::ACCOUNT_SPACE;
+const SMALL_SPACE: u32 = ACCOUNT_SPACE;
 const LARGE_SPACE: u32 = 2048;
-
-pub struct CommitSettlementOrder;
 
 #[derive(Clone, Copy)]
 struct Variant {
@@ -77,12 +73,12 @@ struct Bundle {
 }
 
 async fn buffer_accounts(base: &BaseCtx) -> Result<usize> {
-    let committor: Pubkey = topology::COMMITTOR_ID.parse()?;
+    let committor: Pubkey = topology::COMMITTOR_ID;
     Ok(base.api().get_program_accounts(&committor).await?.len())
 }
 
 async fn write(er: &ErCtx, payer: &Keypair, id: u64, account: &Pubkey) -> Result<Vec<u8>> {
-    er.submit_and_confirm(payer, &[build::simple_byte_set(id, &[*account])]).await?;
+    er.redline(payer).write(id, &[*account]).await?;
     let snapshot = er.account(account).await?.ok_or("er copy vanished after the write")?.data;
     check_eq!(
         crate::written_id(&snapshot),
@@ -98,11 +94,7 @@ async fn schedule(
     commit_id: u64,
     accounts: &[Pubkey],
 ) -> Result<Signature> {
-    er.submit_and_confirm(
-        payer,
-        &[build::commit_accounts(commit_id, payer.pubkey(), accounts)],
-    )
-    .await
+    er.redline(payer).commit(commit_id, accounts).await
 }
 
 async fn base_data(base: &BaseCtx, account: &Pubkey) -> Result<Vec<u8>> {
@@ -130,7 +122,7 @@ async fn settled(
 ) -> Result<Bundle> {
     let receipt =
         receipt::fetch_commit_receipt(er.api(), commit_signature, RECEIPT_TIMEOUT).await?;
-    super::require_settled(&receipt, phase)?;
+    receipt.check_success(phase)?;
     let mut included = receipt.included.clone();
     included.sort();
     let mut expected = expected.to_vec();
@@ -140,7 +132,7 @@ async fn settled(
         expected,
         "{phase}: the receipt must list exactly the bundled accounts"
     )?;
-    receipt::confirm_base_signatures(base.api(), &receipt, BASE_CONFIRM_TIMEOUT).await?;
+    receipt.confirm(base.api(), BASE_CONFIRM_TIMEOUT).await?;
     let last = receipt.base_signatures[receipt.base_signatures.len() - 1];
     let slot = base.api().await_transaction(&last, BASE_CONFIRM_TIMEOUT).await?.slot;
     Ok(Bundle { receipt, slot })
@@ -154,7 +146,7 @@ async fn history_position(
     let history = base.api().get_signatures_for_address(account, HISTORY_LIMIT).await?;
     history
         .iter()
-        .position(|text| text == &signature.to_string())
+        .position(|entry| entry == signature)
         .ok_or_else(|| format!("base history of {account} does not list {signature}").into())
 }
 
@@ -167,21 +159,17 @@ async fn prepare_accounts(
 ) -> Result<Accounts> {
     let mut keys = Vec::with_capacity(4);
     for index in 0..4u8 {
-        let account = crate::init_delegated_account_sized(
-            base,
-            payer,
-            variant.seed_base + index,
-            identity,
-            variant.space,
-        )
-        .await?;
+        let account = base
+            .redline(payer)
+            .init_delegated(variant.space, identity, variant.seed_base + index)
+            .await?;
         let on_base = base.account(&account).await?.ok_or("pda not on base")?;
         check_eq!(
             on_base.owner,
             DELEGATION_PROGRAM_ID,
             "a delegated pda must be dlp-owned on base"
         )?;
-        prep::await_clones(er, &[account], variant.space as usize, CLONE_TIMEOUT).await?;
+        er.await_clones(&[account], variant.space as usize, CLONE_TIMEOUT).await?;
         keys.push(account);
     }
     Ok(Accounts {
@@ -200,7 +188,7 @@ async fn run_variant(
     variant: Variant,
 ) -> Result<()> {
     let phase = variant.name;
-    let payer = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
+    let payer = base.funded_payer(PAYER_LAMPORTS).await?;
     let accounts = prepare_accounts(base, er, &payer, identity, variant).await?;
     let value = |offset: u64| variant.value_base + offset;
     let buffers_before = buffer_accounts(base).await?;
@@ -395,16 +383,18 @@ async fn run_variant(
     Ok(())
 }
 
-#[async_trait(?Send)]
-impl PrivateErScenario for CommitSettlementOrder {
-    fn name(&self) -> &str {
-        "redshift/commit_settlement_order"
-    }
+pub struct CommitSettlementOrder {
+    base: Rc<BaseCtx>,
+    proxies: BaseProxies,
+    private: PrivateEr,
+    identity: Pubkey,
+}
 
-    async fn run(&self, base: &BaseCtx) -> Result<()> {
-        let proxies = BaseProxies::spawn(base).await?;
+impl PrivateErScenario for CommitSettlementOrder {
+    async fn setup(base: Rc<BaseCtx>, _: ()) -> Result<Self> {
+        let proxies = BaseProxies::spawn(&base).await?;
         let private = topology::private_er(
-            base,
+            &base,
             ErOptions {
                 label: LABEL.to_owned(),
                 base_endpoints: Some(proxies.endpoints()),
@@ -414,8 +404,13 @@ impl PrivateErScenario for CommitSettlementOrder {
         .await?;
         let identity = private.identity();
 
+        Ok(Self { base, proxies, private, identity })
+    }
+
+    async fn run(self) -> Result<()> {
+        let Self { base, proxies, private, identity } = self;
         for variant in VARIANTS {
-            run_variant(&proxies, base, private.ctx(), identity, variant).await?;
+            run_variant(&proxies, &base, private.ctx(), identity, variant).await?;
         }
 
         proxies.finish()?;

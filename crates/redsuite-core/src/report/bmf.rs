@@ -4,7 +4,7 @@ use json::Serialize;
 use serde_with::skip_serializing_none;
 use tracing::warn;
 
-use super::{store, MeasureValue, ScenarioRun, Unit, LATENCY_ORIGIN};
+use super::{store, store::Campaign, MeasureValue, ScenarioRun, Unit, LATENCY_ORIGIN, LOAD_FLAGS};
 use crate::{
     runner::{REQUEST_ORIGIN, SEND_ORIGIN},
     Result,
@@ -52,7 +52,7 @@ fn origin_suffix(run: &ScenarioRun) -> String {
 fn withheld(run: &ScenarioRun) -> Option<String> {
     run.config
         .iter()
-        .find(|(key, _)| super::LOAD_FLAGS.contains(&key.as_str()))
+        .find(|(key, _)| LOAD_FLAGS.contains(&key.as_str()))
         .map(|(flag, reason)| format!("{flag}: {reason}"))
 }
 
@@ -66,6 +66,8 @@ struct MeasureVal {
     upper_value: Option<f64>,
 }
 
+type Document = BTreeMap<String, BTreeMap<String, MeasureVal>>;
+
 fn slug(label: &str) -> String {
     label
         .trim_end_matches(" us")
@@ -77,7 +79,7 @@ fn slug(label: &str) -> String {
         .collect()
 }
 
-fn export_run(doc: &mut BTreeMap<String, BTreeMap<String, MeasureVal>>, run: &ScenarioRun) {
+fn export_run(doc: &mut Document, run: &ScenarioRun) {
     let withheld = withheld(run);
     if let Some(reason) = &withheld {
         warn!(%run.scenario, reason, "BMF latency withheld");
@@ -126,8 +128,8 @@ fn export_run(doc: &mut BTreeMap<String, BTreeMap<String, MeasureVal>>, run: &Sc
     }
 }
 
-fn bmf_document(campaign: &store::Campaign) -> BTreeMap<String, BTreeMap<String, MeasureVal>> {
-    let mut doc: BTreeMap<String, BTreeMap<String, MeasureVal>> = BTreeMap::new();
+fn bmf_document(campaign: &Campaign) -> Document {
+    let mut doc = Document::new();
     for (name, scenario) in &campaign.scenarios {
         let Some(run) = &scenario.run else {
             warn!(

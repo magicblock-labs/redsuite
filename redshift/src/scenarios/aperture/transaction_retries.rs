@@ -1,6 +1,5 @@
-use std::time::Duration;
+use std::{rc::Rc, time::Duration};
 
-use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use futures_util::future::join_all;
 use hash::Hash;
@@ -8,26 +7,34 @@ use instruction::{AccountMeta, Instruction};
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redline_interface::instruction::build as load;
-use redshift_interface::flexi::{build, FlexiCounter};
+use redshift_interface::schedulecommit::{build, MainAccount};
 use redsuite_core::{
     api::RpcError,
     check, check_eq,
     netfault::Selector,
-    prep, topology,
-    topology::{ErOptions, RestartConfig},
+    topology,
+    topology::{ErOptions, PrivateEr, RestartConfig},
     transport::wsraw::RawWs,
-    BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result, Scenario,
+    BaseCtx, ChainCtx, CheckError, DynError, ErCtx, PrivateErScenario, Result, Scenario,
 };
 use serde_json::{json, Value};
 use signature::Signature;
 use signer::Signer;
 use transaction::Transaction;
 
+use crate::PAYER_LAMPORTS;
+
 const TIMEOUT: Duration = Duration::from_secs(30);
 const EXPIRY_TIMEOUT: Duration = Duration::from_secs(120);
 const COPIES: usize = 32;
 
-pub enum TransactionRetries {
+pub struct TransactionRetries {
+    base: Rc<BaseCtx>,
+    er: ErCtx,
+    mode: Mode,
+}
+
+pub enum Mode {
     ColdFetch,
     Concurrent,
     Subscriptions,
@@ -56,7 +63,7 @@ impl Signed {
             instructions[0].accounts.push(AccountMeta::new_readonly(cold, false));
         }
         if fail {
-            instructions.push(build::add_error(owner, count));
+            instructions.push(build::fail(owner));
         }
         let blockhash = er.api().get_latest_blockhash().await?;
         let tx = Transaction::new_signed_with_payer(
@@ -126,7 +133,7 @@ impl Signed {
                     ),
                 )
                 .await?
-                .ok_or_else(|| redsuite_core::DynError::from("transaction missing"))
+                .ok_or_else(|| DynError::from("transaction missing"))
         })
         .await?;
         check_eq!(
@@ -145,16 +152,16 @@ impl Signed {
     }
 }
 
-async fn state(er: &ErCtx, keys: &[Pubkey; 2]) -> Result<(u64, FlexiCounter)> {
+async fn state(er: &ErCtx, keys: &[Pubkey; 2]) -> Result<(u64, MainAccount)> {
     let accounts = er.accounts(keys).await?;
     let payer = accounts[0].as_ref().ok_or_else(|| format!("payer {} missing", keys[0]))?;
     let counter = accounts[1].as_ref().ok_or_else(|| format!("counter {} missing", keys[1]))?;
-    Ok((payer.lamports, FlexiCounter::try_decode(&counter.data)?))
+    Ok((payer.lamports, MainAccount::try_decode(&counter.data)?))
 }
 
 async fn subscribe(er: &ErCtx, tx: &Signed) -> Result<(RawWs, u64)> {
     let mut ws = RawWs::connect(er.ws_url()).await?;
-    let id = ws.signature_subscribe(&tx.signature.to_string()).await?;
+    let id = ws.signature_subscribe(&tx.signature).await?;
     Ok((ws, id))
 }
 
@@ -225,7 +232,7 @@ async fn execute(
     for (index, (mut ws, id)) in listeners.into_iter().enumerate() {
         let (method, subscription, payload) =
             ws.next_notification(TIMEOUT).await?.ok_or_else(|| {
-                redsuite_core::CheckError::new(format!(
+                CheckError::new(format!(
                     "{}: subscriber {index} missed terminal result",
                     tx.signature
                 ))
@@ -287,53 +294,48 @@ async fn audit(er: &ErCtx, start: u64, expected: &[(&Signed, usize)]) -> Result<
     Ok(end + 1)
 }
 
-#[async_trait(?Send)]
-impl Scenario for TransactionRetries {
-    fn name(&self) -> &str {
-        TransactionRetries::name(self)
+impl Scenario<(), Mode> for TransactionRetries {
+    async fn setup(base: Rc<BaseCtx>, er: ErCtx, mode: Mode) -> Result<Self> {
+        Ok(Self { base, er, mode })
     }
 
-    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<()> {
-        self.run_phases(base, er, None).await
+    async fn run(self) -> Result<()> {
+        self.mode.run_phases(&self.base, &self.er, None).await
     }
 }
 
-#[async_trait(?Send)]
-impl PrivateErScenario for TransactionRetries {
-    fn name(&self) -> &str {
-        TransactionRetries::name(self)
-    }
+pub struct ExpiryRestart {
+    base: Rc<BaseCtx>,
+    private: PrivateEr,
+}
 
-    async fn run(&self, base: &BaseCtx) -> Result<()> {
-        let mut private = topology::private_er(
-            base,
+impl PrivateErScenario for ExpiryRestart {
+    async fn setup(base: Rc<BaseCtx>, _: ()) -> Result<Self> {
+        let private = topology::private_er(
+            &base,
             ErOptions {
-                label: self.name().replace("redshift/", ""),
+                label: "transaction_retry_expiry_restart".to_owned(),
                 ..Default::default()
             },
         )
         .await?;
+        Ok(Self { base, private })
+    }
+
+    async fn run(self) -> Result<()> {
+        let Self { base, mut private } = self;
         let er = private.ctx().clone();
-        self.run_phases(base, &er, Some(&mut private)).await?;
+        Mode::ExpiryRestart.run_phases(&base, &er, Some(&mut private)).await?;
         private.finish().await
     }
 }
 
-impl TransactionRetries {
-    fn name(&self) -> &str {
-        match self {
-            Self::ColdFetch => "redshift/transaction_retry_cold_fetch",
-            Self::Concurrent => "redshift/transaction_retry_concurrent",
-            Self::Subscriptions => "redshift/transaction_retry_subscriptions",
-            Self::ExpiryRestart => "redshift/transaction_retry_expiry_restart",
-        }
-    }
-
+impl Mode {
     async fn run_phases(
         &self,
         base: &BaseCtx,
         er: &ErCtx,
-        mut private: Option<&mut topology::PrivateEr>,
+        mut private: Option<&mut PrivateEr>,
     ) -> Result<()> {
         let phases: &[&str] = if matches!(self, Self::Concurrent) {
             &["success", "failure"]
@@ -356,16 +358,14 @@ impl TransactionRetries {
         base: &BaseCtx,
         er: &ErCtx,
         phase: &str,
-        private: Option<&mut topology::PrivateEr>,
+        private: Option<&mut PrivateEr>,
     ) -> Result<()> {
-        let owner = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
-        let (counter, setup) =
-            prep::flexi_counter(owner.pubkey(), self.name(), er.identity(), u32::MAX);
+        let owner = base.funded_payer(PAYER_LAMPORTS).await?;
+        let (counter, setup) = base.schedulecommit(&owner).prepare_counter(er.identity(), u32::MAX);
         base.submit_and_confirm(&owner, &setup).await?;
-        let payer =
-            prep::delegated_payer(base, &owner, er.identity(), crate::PAYER_LAMPORTS).await?;
+        let payer = base.delegated_payer(&owner, er.identity(), PAYER_LAMPORTS).await?;
         let load_payer = if matches!(self, Self::Subscriptions) {
-            Some(prep::delegated_payer(base, &owner, er.identity(), crate::PAYER_LAMPORTS).await?)
+            Some(base.delegated_payer(&owner, er.identity(), PAYER_LAMPORTS).await?)
         } else {
             None
         };
@@ -382,7 +382,7 @@ impl TransactionRetries {
 
         match self {
             Self::ColdFetch => {
-                let cold = prep::funded_payer(base, 1_000_000).await?.pubkey();
+                let cold = base.funded_payer(1_000_000).await?.pubkey();
                 let selector = Selector::methods(&["getAccountInfo", "getMultipleAccounts"])
                     .http()
                     .request()
@@ -395,7 +395,7 @@ impl TransactionRetries {
                 let tx = Signed::new(er, &payer, owner, 7, false, Some(cold)).await?;
                 let (failed, fault) = tokio::join!(tx.send(er), async {
                     trap.wait(TIMEOUT).await?.reject("retry-test cold fetch unavailable");
-                    Ok::<_, redsuite_core::DynError>(())
+                    Ok::<_, DynError>(())
                 });
                 fault?;
                 let error = failed.expect_err("cold fetch must fail before scheduling");
@@ -501,7 +501,7 @@ impl TransactionRetries {
                             for (tx, _) in &probes {
                                 check!(!tx.valid(er).await?, "blockhash still valid")?;
                             }
-                            Ok::<_, redsuite_core::DynError>(())
+                            Ok::<_, DynError>(())
                         })
                         .await?;
                     } else {

@@ -1,9 +1,13 @@
-use std::{thread::JoinHandle, time::Duration};
+use std::{thread, thread::JoinHandle, time::Duration};
 
 use derive_more::Display;
 use futures_util::future::{AbortHandle, Abortable};
-use tokio::sync::{oneshot, watch};
-use tracing::{info, warn, Instrument, Span};
+use tokio::{
+    runtime::Builder,
+    sync::{oneshot, watch},
+    time,
+};
+use tracing::{info, warn, Span};
 
 use crate::{
     api::{Metrics, MetricsCollector},
@@ -32,18 +36,25 @@ pub struct Sampler<T> {
     handle: Option<JoinHandle<()>>,
 }
 
-impl<T: Default + Send + 'static> Sampler<T> {
-    pub fn spawn(
+impl<T> Sampler<T>
+where
+    T: Default + Send + 'static,
+{
+    pub fn spawn<Observe>(
         collector: MetricsCollector,
         interval: Duration,
         trailing: Trailing,
-        mut observe: impl FnMut(&Metrics, &mut T) -> Option<()> + Send + 'static,
-    ) -> Self {
+        mut observe: Observe,
+    ) -> Self
+    where
+        Observe: FnMut(&Metrics, &mut T) -> Option<()> + Send + 'static,
+    {
         let (stop, mut halted) = watch::channel(false);
         let (abort, registration) = AbortHandle::new_pair();
         let (done, result) = oneshot::channel();
         let span = Span::current();
-        let handle = std::thread::spawn(move || {
+        let handle = thread::spawn(move || {
+            let _entered = span.enter();
             let sampling = async move {
                 let mut samples = Sampled::<T>::default();
                 let mut consecutive_failures = 0usize;
@@ -73,7 +84,7 @@ impl<T: Default + Send + 'static> Sampler<T> {
                         break;
                     }
                     tokio::select! {
-                        _ = tokio::time::sleep(interval) => {}
+                        _ = time::sleep(interval) => {}
                         _ = halted.changed(), if trailing == Trailing::Skip => {}
                     }
                 }
@@ -86,15 +97,13 @@ impl<T: Default + Send + 'static> Sampler<T> {
                     );
                 }
                 samples
-            }
-            .instrument(span);
-            let output = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(Into::into)
-                .and_then(|runtime| {
-                    runtime.block_on(Abortable::new(sampling, registration)).map_err(Into::into)
-                });
+            };
+            let output =
+                Builder::new_current_thread().enable_all().build().map_err(Into::into).and_then(
+                    |runtime| {
+                        runtime.block_on(Abortable::new(sampling, registration)).map_err(Into::into)
+                    },
+                );
             let _ = done.send(output);
         });
         Self {

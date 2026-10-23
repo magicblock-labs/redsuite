@@ -1,10 +1,15 @@
+use std::slice;
+
 use magic_api::{
     args::{CommitTypeArgs, MagicIntentBundleArgs},
     instruction::MagicBlockInstruction,
     pda::CALLBACK_SIGNER,
     response::MagicResponse,
 };
-use sdk::ephem::{ActionCallback, FoldableIntentBuilder};
+use sdk::{
+    cpi::DELEGATION_PROGRAM_ID,
+    ephem::{ActionCallback, FoldableIntentBuilder},
+};
 
 use super::*;
 
@@ -31,7 +36,7 @@ fn handler<'a>(
 ) -> CallHandler<'a> {
     CallHandler {
         args: ActionArgs {
-            data: tagged(&FlexiInstruction::BaseAction { amount, change, fail }),
+            data: tagged(&ScheduleCommitInstruction::BaseAction { amount, change, fail }),
             escrow_index: ACTOR_ESCROW_INDEX,
         },
         compute_units: ACTION_COMPUTE_UNITS,
@@ -82,7 +87,7 @@ pub(super) fn schedule(
     for (pair, mode) in pairs.chunks_exact(2).zip(modes) {
         let owner = &pair[0];
         let counter = &pair[1];
-        if counter.key != &FlexiCounter::pda_and_bump(owner.key).0 {
+        if counter.key != &pda_and_bump(owner.key).0 {
             return Err(ProgramError::InvalidSeeds);
         }
         let post_commit = || {
@@ -98,7 +103,7 @@ pub(super) fn schedule(
         };
         builder = match mode {
             IntentMode::Undelegate(change) => builder
-                .commit_and_undelegate(std::slice::from_ref(counter))
+                .commit_and_undelegate(slice::from_ref(counter))
                 .add_post_commit_actions(actions.then(post_commit))
                 .add_post_undelegate_actions(actions.then(|| {
                     handler(
@@ -113,7 +118,7 @@ pub(super) fn schedule(
                 }))
                 .fold_builder(),
             IntentMode::Commit => builder
-                .commit(std::slice::from_ref(counter))
+                .commit(slice::from_ref(counter))
                 .add_post_commit_actions(actions.then(post_commit))
                 .fold_builder(),
             IntentMode::Finalize => return Err(ProgramError::InvalidInstructionData),
@@ -137,7 +142,7 @@ pub(super) fn action(
     if !escrow.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
-    let owner = if change.is_some() { crate::ID } else { sdk::cpi::DELEGATION_PROGRAM_ID };
+    let owner = if change.is_some() { crate::ID } else { DELEGATION_PROGRAM_ID };
     if counter.owner != &owner {
         return Err(ProgramError::InvalidAccountOwner);
     }
@@ -177,7 +182,7 @@ pub(super) fn transfer(accounts: &[AccountInfo], amount: u64, fail: bool) -> Pro
     };
     MagicIntentBundleBuilder::new(payer.clone(), context.clone(), magic.clone())
         .magic_fee_vault(vault.clone())
-        .commit(std::slice::from_ref(counter))
+        .commit(slice::from_ref(counter))
         .add_post_commit_action(handler(
             payer,
             counter,

@@ -1,12 +1,10 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, rc::Rc, sync::Arc, time::Duration};
 
-use async_trait::async_trait;
 use pubkey::Pubkey;
 use redsuite_core::{
     check, check_eq, prep,
     profile::ProfileValues,
     redline::{copy_three, execute_kernel, Accounts},
-    report,
     report::Unit,
     runner::{Pacing, RunOutcome, ThreadRunConfig},
     stats::{ObservationsStats, StreamingStats},
@@ -17,6 +15,9 @@ use redsuite_core::{
     BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
 };
 use tracing::{debug, warn};
+use url::Url;
+
+use crate::{metrics, ACCOUNT_SPACE};
 
 const PREP_PAYER_LAMPORTS: u64 = 4_000_000_000;
 
@@ -79,7 +80,7 @@ fn cell_expected_writes(pool: &[Pubkey], first_id: u64, iterations: u64) -> Expe
 }
 
 fn execute_cell(
-    er_rpc_url: String,
+    er_rpc_url: Url,
     config: ThreadRunConfig,
     id_offset: u64,
     pool: Arc<Vec<Pubkey>>,
@@ -108,25 +109,43 @@ struct CellOutcome {
     received_total: u64,
 }
 
-pub struct WsFanoutThreshold;
+pub struct WsFanoutThreshold {
+    base: Rc<BaseCtx>,
+    er: ErCtx,
+    profile: &'static Profile,
+    payer_bytes: Arc<Vec<[u8; 64]>>,
+    pool: Arc<Vec<Pubkey>>,
+}
 
-#[async_trait(?Send)]
 impl Scenario<ScenarioReport> for WsFanoutThreshold {
-    fn name(&self) -> &str {
-        "redline/ws_fanout_threshold"
-    }
-
-    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
+    async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
         let profile = PROFILES.select(base.config().profile);
-        let prep_payers = prep::funded_payers(base, profile.payers, PREP_PAYER_LAMPORTS).await?;
-        let pool = Accounts::new(crate::ACCOUNT_SPACE, er.identity())
-            .init_batched(base, &prep_payers, profile.accounts, true)
+        let prep_payers = base.funded_payers(profile.payers, PREP_PAYER_LAMPORTS).await?;
+        let pool = Accounts::new(ACCOUNT_SPACE, er.identity())
+            .init_batched(base.as_ref(), &prep_payers, profile.accounts, true)
             .await?;
-        prep::await_clones(er, &pool, crate::ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
+        er.await_clones(&pool, ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
         let payer_bytes = prep::payer_bytes(&prep_payers);
         let pool: Arc<Vec<Pubkey>> = Arc::new(pool);
-        let er_rpc_url = er.api().url().to_owned();
 
+        Ok(Self {
+            base,
+            er,
+            profile,
+            payer_bytes,
+            pool,
+        })
+    }
+
+    async fn run(self) -> Result<ScenarioReport> {
+        let Self {
+            base,
+            er,
+            profile,
+            payer_bytes,
+            pool,
+        } = self;
+        let er_rpc_url = er.api().url().clone();
         let warmup = execute_cell(
             er_rpc_url.clone(),
             ThreadRunConfig {
@@ -220,7 +239,7 @@ impl Scenario<ScenarioReport> for WsFanoutThreshold {
                 missing_final, incomplete, "fan-out cell finished",
             );
 
-            let cell_report = ScenarioReport::ok(&format!("{}/ws{connections}", self.name()))
+            let cell_report = ScenarioReport::ok()
                 .setting("profile", profile.name)
                 .setting("ws connections", connections)
                 .setting("subscriber threads", profile.subscriber_threads)
@@ -263,7 +282,7 @@ impl Scenario<ScenarioReport> for WsFanoutThreshold {
                 .metric_if(
                     "validator txs in window",
                     Unit::Count,
-                    delta.counter(crate::metrics::ENGINE_TRANSACTIONS),
+                    delta.counter(metrics::ENGINE_TRANSACTIONS),
                 )
                 .metric_if(
                     "validator tx processing avg us",
@@ -272,8 +291,8 @@ impl Scenario<ScenarioReport> for WsFanoutThreshold {
                         .histogram_avg("mbv_transaction_processing_time")
                         .map(|seconds| seconds * 1e6),
                 );
-            report::persist_cell(self.name(), &cell_report);
-            if let Some(failed_txs) = delta.counter_all(crate::metrics::FAILED_TRANSACTIONS) {
+            base.report_cell(&format!("ws{connections}"), &cell_report)?;
+            if let Some(failed_txs) = delta.counter_all(metrics::FAILED_TRANSACTIONS) {
                 check_eq!(
                     failed_txs,
                     0.0,
@@ -324,7 +343,7 @@ impl Scenario<ScenarioReport> for WsFanoutThreshold {
             .map(|cell| cell.connections)
             .unwrap_or(0);
 
-        let mut summary = ScenarioReport::ok(self.name())
+        let mut summary = ScenarioReport::ok()
             .setting("profile", profile.name)
             .setting("shape", "read-write 3/tx (1 src + 2 dst data-copy)")
             .setting(

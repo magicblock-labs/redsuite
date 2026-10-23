@@ -1,41 +1,56 @@
-use async_trait::async_trait;
-use redsuite_core::{check, check_eq, topology, BaseCtx, ChainCtx, ErCtx, Result, Scenario};
+use std::rc::Rc;
 
-use crate::program::instruction::build;
+use instruction::Instruction;
+use keypair::Keypair;
+use pubkey::Pubkey;
+use redsuite_core::{
+    check, check::CheckError, check_eq, topology, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
+};
 
-const FIRST_WRITE: u64 = 61;
-const SECOND_WRITE: u64 = 62;
+use crate::{program::instruction::build, ACCOUNT_SPACE, PAYER_LAMPORTS};
 
-pub struct MultiProgramClone;
+const WRITES: [u64; 2] = [61, 62];
 
-#[async_trait(?Send)]
+pub struct MultiProgramClone {
+    er: ErCtx,
+    payer: Keypair,
+    accounts: [(Pubkey, Pubkey); 2],
+}
+
 impl Scenario for MultiProgramClone {
-    fn name(&self) -> &str {
-        "redshift/multi_program_clone"
-    }
-
-    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<()> {
+    async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
         let [(first_program, _), (second_program, _)] = topology::redline_loader_v3_pair();
 
-        let payer = redsuite_core::prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
-        let first_pda =
-            crate::init_delegated_account_at(base, first_program, &payer, 0, er.identity()).await?;
-        let second_pda =
-            crate::init_delegated_account_at(base, second_program, &payer, 1, er.identity())
-                .await?;
+        let payer = base.funded_payer(PAYER_LAMPORTS).await?;
+        let first_pda = base
+            .redline(&payer)
+            .at(first_program)
+            .init_delegated(ACCOUNT_SPACE, er.identity(), 0)
+            .await?;
+        let second_pda = base
+            .redline(&payer)
+            .at(second_program)
+            .init_delegated(ACCOUNT_SPACE, er.identity(), 1)
+            .await?;
 
-        er.submit_and_confirm(
-            &payer,
-            &[
-                build::simple_byte_set_at(first_program, FIRST_WRITE, &[first_pda]),
-                build::simple_byte_set_at(second_program, SECOND_WRITE, &[second_pda]),
-            ],
-        )
-        .await?;
+        Ok(Self {
+            er,
+            payer,
+            accounts: [(first_program, first_pda), (second_program, second_pda)],
+        })
+    }
 
-        for (program, label) in [(first_program, "first"), (second_program, "second")] {
-            let clone = er.account(&program).await?.ok_or_else(|| {
-                check::CheckError::new(format!(
+    async fn run(self) -> Result<()> {
+        let Self { er, payer, accounts } = self;
+        let writes: [Instruction; 2] = std::array::from_fn(|index| {
+            let (program, account) = accounts[index];
+            build::simple_byte_set_at(program, WRITES[index], &[account])
+        });
+        er.submit_and_confirm(&payer, &writes).await?;
+
+        for ((program, _), label) in accounts.iter().zip(["first", "second"]) {
+            let clone = er.account(program).await?.ok_or_else(|| {
+                CheckError::new(format!(
                     "the {label} program must be cloned to the ER after the tx"
                 ))
             })?;
@@ -44,24 +59,17 @@ impl Scenario for MultiProgramClone {
                 "the {label} cloned program must be executable on the ER"
             )?;
         }
-        let first_clone = er
-            .account(&first_pda)
-            .await?
-            .ok_or("first program's account missing on the ER")?;
-        check_eq!(
-            crate::written_id(&first_clone.data),
-            Some(FIRST_WRITE),
-            "the first program must have executed its write"
-        )?;
-        let second_clone = er
-            .account(&second_pda)
-            .await?
-            .ok_or("second program's account missing on the ER")?;
-        check_eq!(
-            crate::written_id(&second_clone.data),
-            Some(SECOND_WRITE),
-            "the second program must have executed its write"
-        )?;
+        for ((_, key), expected) in accounts.iter().zip(WRITES) {
+            let clone = er
+                .account(key)
+                .await?
+                .ok_or_else(|| format!("account {key} missing on the ER"))?;
+            check_eq!(
+                crate::written_id(&clone.data),
+                Some(expected),
+                "program write to {key}"
+            )?;
+        }
 
         Ok(())
     }

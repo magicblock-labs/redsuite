@@ -1,20 +1,16 @@
 use std::{
+    future,
     rc::Rc,
     sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
-use async_trait::async_trait;
 use instruction::Instruction;
 use pubkey::Pubkey;
 use redsuite_core::{
     check, check_eq, host, prep,
     profile::ProfileValues,
-    redline::{
-        causal::{compute_unit_limit, CU_LIMIT, HASH_INIT},
-        Accounts,
-    },
-    report,
+    redline::{causal, Accounts},
     report::Unit::{Count, Micros, Ratio, Seconds, Tps},
     runner::{
         execute_raw, merge_outcomes, spawn_workers, Pacing, RawRunOutcome, RunConfig, RunOutcome,
@@ -26,14 +22,19 @@ use redsuite_core::{
 };
 use signature::Signature;
 use tracing::debug;
+use url::Url;
 
-use crate::program::{instruction::build, layout, utils::hash_chain};
+use crate::{
+    metrics,
+    program::{instruction::build, layout, utils::hash_chain},
+    ACCOUNT_SPACE,
+};
 
 const PAYER_LAMPORTS: u64 = 200_000_000;
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(900);
 const CLONE_TIMEOUT: Duration = Duration::from_secs(60);
 const BUSY_SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
-const TX_COUNT: &str = crate::metrics::ENGINE_TRANSACTIONS;
+const TX_COUNT: &str = metrics::ENGINE_TRANSACTIONS;
 const BUSY_EXECUTORS: &str = "engine_processor_busy_executors";
 const ORDERING_DEPENDENCIES: &str = "engine_processor_ordering_dependencies";
 const BLOCKED_TRANSACTIONS: &str = "engine_processor_blocked_transactions";
@@ -145,9 +146,10 @@ fn build_ixs(
     raise_budget: bool,
 ) -> Vec<Instruction> {
     let pda = accounts[slot_of(global_id, accounts.len())];
-    let compute = build::expensive_hash_compute_at(PROGRAM, global_id, HASH_INIT, iters, &[pda]);
+    let compute =
+        build::expensive_hash_compute_at(PROGRAM, global_id, causal::HASH_INIT, iters, &[pda]);
     if raise_budget {
-        vec![compute_unit_limit(CU_LIMIT), compute]
+        vec![causal::compute_unit_limit(causal::CU_LIMIT), compute]
     } else {
         vec![compute]
     }
@@ -155,7 +157,7 @@ fn build_ixs(
 
 #[allow(clippy::too_many_arguments)]
 async fn execute_cell_burst(
-    er_rpc_url: String,
+    er_rpc_url: Url,
     config: BurstConfig,
     id_offset: u64,
     accounts: Arc<Vec<Pubkey>>,
@@ -226,7 +228,7 @@ async fn execute_cell_burst(
                     |index| {
                         let body = bodies[(index - 1) as usize].clone();
                         let api = api.clone();
-                        std::future::ready(Ok(SendTransaction(move |_: Instant| async move {
+                        future::ready(Ok(SendTransaction(move |_: Instant| async move {
                             let rejected = api.send_prepared(&body).await?;
                             if rejected != 0 {
                                 return Err(format!("{rejected} entries rejected").into());
@@ -301,31 +303,49 @@ impl Cell {
     }
 }
 
-pub struct ExecutorSaturation;
+pub struct ExecutorSaturation {
+    base: Rc<BaseCtx>,
+    er: ErCtx,
+    profile: &'static Profile,
+    accounts: Arc<Vec<Pubkey>>,
+    payer_bytes: Arc<Vec<[u8; 64]>>,
+}
 
-#[async_trait(?Send)]
 impl Scenario<ScenarioReport> for ExecutorSaturation {
-    fn name(&self) -> &str {
-        "redline/executor_saturation"
-    }
-
-    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
+    async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
         let profile = PROFILES.select(base.config().profile);
 
-        let payers = prep::funded_payers(base, profile.accounts, PAYER_LAMPORTS).await?;
+        let payers = base.funded_payers(profile.accounts, PAYER_LAMPORTS).await?;
         let accounts = Accounts {
             program_id: PROGRAM,
-            space: crate::ACCOUNT_SPACE,
+            space: ACCOUNT_SPACE,
             authority: er.identity(),
         }
-        .init_batched(base, &payers, profile.accounts, true)
+        .init_batched(base.as_ref(), &payers, profile.accounts, true)
         .await?;
-        prep::await_clones(er, &accounts, crate::ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
+        er.await_clones(&accounts, ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
         let accounts = Arc::new(accounts);
         let payer_bytes = prep::payer_bytes(&payers);
-        let er_rpc_url = er.api().url().to_owned();
-        let er_pid = er.pid();
 
+        Ok(Self {
+            base,
+            er,
+            profile,
+            accounts,
+            payer_bytes,
+        })
+    }
+
+    async fn run(self) -> Result<ScenarioReport> {
+        let Self {
+            base,
+            er,
+            profile,
+            accounts,
+            payer_bytes,
+        } = self;
+        let er_rpc_url = er.api().url().clone();
+        let er_pid = er.pid();
         let count_before_warmup = er.scrape_metrics().await?.get(TX_COUNT);
         let warm = execute_cell_burst(
             er_rpc_url.clone(),
@@ -351,7 +371,7 @@ impl Scenario<ScenarioReport> for ExecutorSaturation {
             warm.outcome.first_error
         )?;
         if let Some(seen) = count_before_warmup {
-            crate::await_executed(er, seen + profile.warmup as f64, DRAIN_TIMEOUT).await?;
+            crate::await_executed(&er, seen + profile.warmup as f64, DRAIN_TIMEOUT).await?;
         }
 
         let mut offset = profile.warmup;
@@ -399,7 +419,7 @@ impl Scenario<ScenarioReport> for ExecutorSaturation {
             )?;
             let drain = match before.get(TX_COUNT) {
                 Some(seen) => {
-                    crate::await_executed(er, seen + cell_iterations as f64, DRAIN_TIMEOUT).await?
+                    crate::await_executed(&er, seen + cell_iterations as f64, DRAIN_TIMEOUT).await?
                 }
                 None => Duration::ZERO,
             };
@@ -411,7 +431,7 @@ impl Scenario<ScenarioReport> for ExecutorSaturation {
             let failed_kind = |kind: &str| {
                 delta.counter(&format!(
                     "{}{{kind=\"{kind}\"}}",
-                    crate::metrics::FAILED_TRANSACTIONS
+                    metrics::FAILED_TRANSACTIONS
                 ))
             };
             let dropped = failed_kind("dropped");
@@ -433,12 +453,13 @@ impl Scenario<ScenarioReport> for ExecutorSaturation {
                     0.0,
                     "{label}: {execution_failed:.0} of {cell_iterations} \
                      transactions reached the SVM and failed there — compare \
-                     the probe's consumed CUs against the {CU_LIMIT} CU limit"
+                     the probe's consumed CUs against the {} CU limit",
+                    causal::CU_LIMIT
                 )?;
             }
 
             let probe_sig = probe.get().copied().ok_or("no probe signature captured")?;
-            let probe_cus = crate::probe_cus(er, &probe_sig, label, iters).await?;
+            let probe_cus = crate::probe_cus(&er, &probe_sig, label, iters).await?;
 
             let thread_cores = cpu_after.thread_cores_since(&cpu_before);
             let cell = Cell {
@@ -472,7 +493,7 @@ impl Scenario<ScenarioReport> for ExecutorSaturation {
                 "executor saturation cell finished",
             );
 
-            let mut cell_report = ScenarioReport::ok(&format!("{}/{label}", self.name()))
+            let mut cell_report = ScenarioReport::ok()
                 .setting("profile", profile.name)
                 .setting("sha256 iters", cell.iters)
                 .setting("shape", "width-1 sha256 hash-chain, one payer per account")
@@ -511,11 +532,11 @@ impl Scenario<ScenarioReport> for ExecutorSaturation {
             ] {
                 cell_report = cell_report.metric_if(name, unit, value);
             }
-            report::persist_cell(self.name(), &cell_report);
+            base.report_cell(label, &cell_report)?;
             cells.push(cell);
         }
 
-        let expected_hash = hash_chain(HASH_INIT.to_bytes(), profile.heavy_iters);
+        let expected_hash = hash_chain(causal::HASH_INIT.to_bytes(), profile.heavy_iters);
         for (index, pda) in accounts.iter().enumerate() {
             let on_er = er.account(pda).await?.ok_or("pda not on er")?;
             let hash_bytes =
@@ -540,7 +561,7 @@ impl Scenario<ScenarioReport> for ExecutorSaturation {
             light.probe_cus,
         )?;
 
-        let mut summary = ScenarioReport::ok(self.name())
+        let mut summary = ScenarioReport::ok()
             .setting("profile", profile.name)
             .setting("shape", "width-1 sha256 hash-chain, one payer per account")
             .setting("accounts", profile.accounts)

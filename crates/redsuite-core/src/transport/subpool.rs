@@ -1,18 +1,24 @@
 use std::{
     collections::HashMap,
+    mem,
     sync::{Arc, Mutex},
+    thread,
+    thread::JoinHandle,
     time::Duration,
 };
 
 use json::LazyValue;
 use pubkey::Pubkey;
-use tokio::sync::watch;
+use tokio::{runtime::Builder, sync::watch, task::LocalSet, time, time::Instant};
+use tracing::Span;
+use url::Url;
 
 use super::{
     clock::SendClock,
     conn::{self, CloseReason, FrameHandler},
     ws::account_update_data,
 };
+
 use crate::{stats::StreamingStats, Result};
 
 const AWAIT_POLL: Duration = Duration::from_millis(20);
@@ -71,14 +77,14 @@ pub type ExpectedWrites = HashMap<Pubkey, Vec<u64>>;
 
 pub struct SubscriberPool {
     states: Vec<Arc<Mutex<ConnState>>>,
-    threads: Vec<std::thread::JoinHandle<()>>,
+    threads: Vec<JoinHandle<()>>,
     shutdown: watch::Sender<bool>,
 }
 
 impl SubscriberPool {
     #[allow(clippy::too_many_arguments)]
     pub fn start(
-        url: &str,
+        url: &Url,
         accounts: &[Pubkey],
         connections: usize,
         threads: usize,
@@ -98,18 +104,20 @@ impl SubscriberPool {
         for thread_index in 0..thread_count {
             let my_states: Vec<Arc<Mutex<ConnState>>> =
                 states.iter().skip(thread_index).step_by(thread_count).cloned().collect();
-            let url = url.to_owned();
+            let url = url.clone();
             let accounts = accounts.clone();
             let clock = clock.clone();
             let expected = expected.clone();
             let extractor = extractor.clone();
             let shutdown_rx = shutdown.subscribe();
-            handles.push(std::thread::spawn(move || {
-                let runtime = tokio::runtime::Builder::new_current_thread()
+            let span = Span::current();
+            handles.push(thread::spawn(move || {
+                let _entered = span.enter();
+                let runtime = Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .expect("subscriber runtime build is infallible");
-                let local = tokio::task::LocalSet::new();
+                let local = LocalSet::new();
                 runtime.block_on(local.run_until(async move {
                     let mut conn_tasks = Vec::with_capacity(my_states.len());
                     for state in my_states {
@@ -201,13 +209,13 @@ impl SubscriberPool {
     }
 
     pub async fn await_final(&self, expected: &ExpectedWrites, timeout: Duration) -> usize {
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = Instant::now() + timeout;
         loop {
             let missing = self.missing_final(expected);
-            if missing == 0 || tokio::time::Instant::now() >= deadline {
+            if missing == 0 || Instant::now() >= deadline {
                 return missing;
             }
-            tokio::time::sleep(AWAIT_POLL).await;
+            time::sleep(AWAIT_POLL).await;
         }
     }
 
@@ -299,7 +307,7 @@ impl FrameHandler for PoolHandler {
 
 #[allow(clippy::too_many_arguments)]
 async fn run_connection(
-    url: String,
+    url: Url,
     accounts: Arc<Vec<Pubkey>>,
     state: Arc<Mutex<ConnState>>,
     clock: Arc<SendClock>,
@@ -342,5 +350,5 @@ async fn run_connection(
         _ = shutdown.changed() => {}
         _ = conn::drive(&mut stream, &mut handler) => {}
     }
-    state.lock().unwrap().lag = Some(std::mem::take(&mut handler.local_lag));
+    state.lock().unwrap().lag = Some(mem::take(&mut handler.local_lag));
 }

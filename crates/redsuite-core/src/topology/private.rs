@@ -1,20 +1,23 @@
 use std::{
     fs,
+    os::unix::process::ExitStatusExt,
     path::{Path, PathBuf},
     rc::Rc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use magicblock_config::LeaderParams;
 use pubkey::Pubkey;
 use signer::Signer;
-use tokio::sync::Mutex;
+use tokio::{sync::Mutex, time};
 use tracing::debug;
 
 use super::{
     config,
-    config::{ErOptions, ErPorts, RestartConfig},
-    identity, process, state,
+    config::{BaseEndpoints, ErOptions, ErPlan, ErPorts, RestartConfig},
+    identity, process,
+    process::PortLease,
+    state,
 };
 use crate::{
     api::Api,
@@ -44,10 +47,10 @@ pub struct RestartTiming {
 
 pub struct PrivateEr {
     proc: process::Owned,
-    plan: config::ErPlan,
+    plan: ErPlan,
     log: PathBuf,
     ctx: ErCtx,
-    ports: process::PortLease,
+    ports: PortLease,
 }
 
 impl PrivateEr {
@@ -94,7 +97,7 @@ impl PrivateEr {
     }
 
     fn rpc_api(&self) -> Api {
-        Api::new(self.plan.listen().http())
+        Api::new(self.ctx.api().url().clone())
     }
 
     pub async fn wait_ready(&self, timeout: Duration) -> Result<()> {
@@ -142,7 +145,7 @@ impl PrivateEr {
     pub async fn restart(&mut self, config: RestartConfig) -> Result<RestartTiming> {
         let api = self.rpc_api();
         let slot_before = api.get_slot().await.ok();
-        let restart_started = std::time::Instant::now();
+        let restart_started = Instant::now();
         let (exit_status, needed_sigkill) = self
             .proc
             .terminate(config.hard_kill)
@@ -150,10 +153,10 @@ impl PrivateEr {
             .ok_or("private ER has no running process to restart")?;
         let shutdown = restart_started.elapsed();
         let exit_code = exit_status.code();
-        let exit_signal = std::os::unix::process::ExitStatusExt::signal(&exit_status);
+        let exit_signal = ExitStatusExt::signal(&exit_status);
 
         self.plan.params.ledger.reset = config.reset;
-        let launch_started = std::time::Instant::now();
+        let launch_started = Instant::now();
         self.proc.relaunch(self.plan.spawn(&self.log)?);
         let ready = process::wait_until_every(
             process::RESTART_POLL,
@@ -193,21 +196,21 @@ const VAULT_POLL: Duration = Duration::from_millis(250);
 // base races that init, loses with "Invalid account owner", and exits.
 async fn await_magic_fee_vault(base: &BaseCtx, identity: &Pubkey) -> Result<()> {
     let vault = crate::dlp::magic_fee_vault_pda(identity);
-    let deadline = tokio::time::Instant::now() + MAGIC_FEE_VAULT_TIMEOUT;
+    let deadline = time::Instant::now() + MAGIC_FEE_VAULT_TIMEOUT;
     loop {
         if let Ok(Some(account)) = base.account(&vault).await {
             if account.owner == crate::dlp::dlp_id() {
                 return Ok(());
             }
         }
-        if tokio::time::Instant::now() >= deadline {
+        if time::Instant::now() >= deadline {
             return Err(format!(
                 "the magic fee vault {vault} for identity {identity} is not \
                  on base — the er did not create it in time"
             )
             .into());
         }
-        tokio::time::sleep(VAULT_POLL).await;
+        time::sleep(VAULT_POLL).await;
     }
 }
 
@@ -235,7 +238,7 @@ async fn launch(
     let er_identity = identity::identity_for_label(&options.label)?;
     identity::ensure_identity_funded(base, &er_identity.pubkey()).await?;
 
-    let mut ports = process::PortLease::default();
+    let mut ports = PortLease::default();
     let (rpc_port, ws_port) = ports.pair()?;
     let metrics_port = ports.single()?;
     let replication_port = ports.single()?;
@@ -244,12 +247,12 @@ async fn launch(
     let log = dir.join(format!("er-{}.log", options.label));
     let identity_pubkey = er_identity.pubkey();
     let role = if allowed_followers.is_empty() { "private-er" } else { "leader" };
-    let endpoints = options.base_endpoints.unwrap_or_else(|| config::BaseEndpoints {
-        rpc_url: base.api().url().to_owned(),
-        ws_url: base.ws_url().to_owned(),
+    let endpoints = options.base_endpoints.unwrap_or_else(|| BaseEndpoints {
+        rpc_url: base.api().url().clone(),
+        ws_url: base.ws_url().clone(),
         grpc_url: None,
     });
-    let plan = config::ErPlan {
+    let plan = ErPlan {
         bin: er_bin,
         config_path: config::config_path(&dir, &options.label),
         params: config::leader_params(
@@ -290,7 +293,7 @@ async fn launch(
     });
 
     let proc = process::Owned::new("private ER", options.label, child, record);
-    let er_api = Api::new(format!("http://127.0.0.1:{rpc_port}"));
+    let er_api = Api::new(format!("http://127.0.0.1:{rpc_port}").parse()?);
     let ready = process::wait_until(
         config::ER_READY_TIMEOUT,
         "private ER RPC answering",
@@ -304,9 +307,9 @@ async fn launch(
     await_magic_fee_vault(base, &identity_pubkey).await?;
 
     let ctx = ErCtx::new(
-        format!("http://127.0.0.1:{rpc_port}"),
-        format!("ws://127.0.0.1:{ws_port}"),
-        format!("http://127.0.0.1:{metrics_port}"),
+        er_api.url().clone(),
+        format!("ws://127.0.0.1:{ws_port}").parse()?,
+        format!("http://127.0.0.1:{metrics_port}").parse()?,
         identity_pubkey,
         options.request_timeout,
         pid,

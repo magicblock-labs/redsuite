@@ -1,5 +1,7 @@
 use std::{
     cell::{Cell, RefCell},
+    fs,
+    io::ErrorKind,
     rc::Rc,
 };
 
@@ -68,9 +70,9 @@ impl Resources {
                 warn!(owner, %launch.label, "reclaimed running rollup");
             }
             for dir in std::iter::once(&launch.storage_dir).chain(launch.accountsdb_dir.iter()) {
-                match std::fs::remove_dir_all(dir) {
+                match fs::remove_dir_all(dir) {
                     Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) if error.kind() == ErrorKind::NotFound => {}
                     Err(error) => {
                         warn!(owner, dir, %error, "storage cleanup failed")
                     }

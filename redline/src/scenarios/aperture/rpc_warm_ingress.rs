@@ -1,8 +1,8 @@
 use std::{rc::Rc, sync::Arc, time::Duration};
 
-use async_trait::async_trait;
+use pubkey::Pubkey;
 use redsuite_core::{
-    check_eq, prep,
+    check_eq,
     profile::{LoopMode, ProfileValues},
     redline::{copy_three, Accounts},
     report::Unit,
@@ -13,7 +13,10 @@ use redsuite_core::{
     },
     BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport, TxSender,
 };
+use tokio::time;
 use tracing::warn;
+
+use crate::{metrics, ACCOUNT_SPACE};
 
 const PAYER_LAMPORTS: u64 = 2_000_000_000;
 
@@ -51,31 +54,31 @@ const FULL: Profile = Profile {
 
 const PROFILES: ProfileValues<Profile> = ProfileValues { lite: LITE, full: FULL };
 
-pub struct WarmIngress;
+pub struct WarmIngress {
+    base: Rc<BaseCtx>,
+    er: ErCtx,
+    profile: &'static Profile,
+    senders: Vec<TxSender>,
+    pdas: Vec<Pubkey>,
+}
 
-#[async_trait(?Send)]
 impl Scenario<ScenarioReport> for WarmIngress {
-    fn name(&self) -> &str {
-        "redline/rpc_warm_ingress"
-    }
-
-    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
+    async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
         let profile = PROFILES.select(base.config().profile);
-        let payers = prep::funded_payers(base, profile.payers, PAYER_LAMPORTS).await?;
-        let pdas = Accounts::new(crate::ACCOUNT_SPACE, er.identity())
-            .init_delegated(base, &payers[0], profile.accounts)
+        let payers = base.funded_payers(profile.payers, PAYER_LAMPORTS).await?;
+        let pdas = Accounts::new(ACCOUNT_SPACE, er.identity())
+            .init_delegated(base.as_ref(), &payers[0], profile.accounts)
             .await?;
-        prep::await_clones(
-            er,
-            &pdas,
-            crate::ACCOUNT_SPACE as usize,
-            Duration::from_secs(15),
-        )
-        .await?;
+        er.await_clones(&pdas, ACCOUNT_SPACE as usize, Duration::from_secs(15)).await?;
 
         let senders: Vec<TxSender> =
             payers.into_iter().map(|payer| er.sender(Rc::new(payer))).collect();
 
+        Ok(Self { base, er, profile, senders, pdas })
+    }
+
+    async fn run(self) -> Result<ScenarioReport> {
+        let Self { base, er, profile, senders, pdas } = self;
         let warmup = execute(
             RunConfig {
                 iterations: profile.warmup,
@@ -85,7 +88,7 @@ impl Scenario<ScenarioReport> for WarmIngress {
             |id| {
                 let sender = senders[(id as usize) % senders.len()].clone();
                 let (ix, _) = copy_three(&pdas, id);
-                sender.staged(&[ix])
+                sender.staged([ix])
             },
         )
         .await?;
@@ -130,7 +133,7 @@ impl Scenario<ScenarioReport> for WarmIngress {
             let sigs = sigs.clone();
             let updates = updates.clone();
             async move {
-                tokio::time::timeout(CONFIRM_TIMEOUT, async move {
+                time::timeout(CONFIRM_TIMEOUT, async move {
                     sigs.await_id(id).await?;
                     updates.await_id(id).await
                 })
@@ -170,7 +173,7 @@ impl Scenario<ScenarioReport> for WarmIngress {
         // validator-side cross-checks, gated on what this build exposes:
         // the no-op gate (our load provably hit the validator) and the
         // nothing-failed-on-chain invariant
-        if let Some(processed) = delta.counter(crate::metrics::ENGINE_TRANSACTIONS) {
+        if let Some(processed) = delta.counter(metrics::ENGINE_TRANSACTIONS) {
             if processed < profile.iterations as f64 {
                 warn!(
                     processed,
@@ -179,7 +182,7 @@ impl Scenario<ScenarioReport> for WarmIngress {
                 );
             }
         }
-        if let Some(failed) = delta.counter_all(crate::metrics::FAILED_TRANSACTIONS) {
+        if let Some(failed) = delta.counter_all(metrics::FAILED_TRANSACTIONS) {
             check_eq!(failed, 0.0, "transactions failed on the validator")?;
         }
 
@@ -222,7 +225,7 @@ impl Scenario<ScenarioReport> for WarmIngress {
             )?;
         }
 
-        let mut report = ScenarioReport::ok(self.name())
+        let mut report = ScenarioReport::ok()
             .setting("profile", profile.name)
             .setting("shape", "read-write 3/tx (1 src + 2 dst data-copy)")
             .setting("loop", mode.name())
@@ -268,7 +271,7 @@ impl Scenario<ScenarioReport> for WarmIngress {
             .metric_if(
                 "validator txs in window",
                 Unit::Count,
-                delta.counter(crate::metrics::ENGINE_TRANSACTIONS),
+                delta.counter(metrics::ENGINE_TRANSACTIONS),
             )
             .metric_if(
                 "monitored accounts (gauge)",

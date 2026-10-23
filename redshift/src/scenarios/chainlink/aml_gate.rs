@@ -1,20 +1,23 @@
 use std::{
     collections::HashMap,
-    io::{Read, Write},
+    io::{ErrorKind, Read, Write},
     net::TcpListener,
+    rc::Rc,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, RwLock,
     },
     thread,
+    thread::JoinHandle,
     time::Duration,
 };
 
-use async_trait::async_trait;
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    check, check_eq, dlp, prep, topology, BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result,
+    check, check_eq, dlp, topology,
+    topology::{ErOptions, PrivateEr},
+    BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result,
 };
 use sdk::spl::{
     builders::{
@@ -24,6 +27,7 @@ use sdk::spl::{
     find_rent_pda, find_shuttle_ata, find_shuttle_ephemeral_ata,
 };
 use signer::Signer;
+use url::Url;
 
 use super::spl;
 
@@ -43,11 +47,11 @@ const RISK_THRESHOLD: u64 = 5;
 // GET /risk?pubkey=<addr>, answering the camelCase {"isRisky":bool} shape
 // magicblock-aml deserializes.
 pub struct MockRiskServer {
-    base_url: String,
+    base_url: Url,
     shutdown: Arc<AtomicBool>,
-    worker: Option<thread::JoinHandle<()>>,
-    risks: Arc<RwLock<HashMap<String, u64>>>,
-    requested_addresses: Arc<RwLock<Vec<String>>>,
+    worker: Option<JoinHandle<()>>,
+    risks: Arc<RwLock<HashMap<Pubkey, u64>>>,
+    requested_addresses: Arc<RwLock<Vec<Pubkey>>>,
 }
 
 impl MockRiskServer {
@@ -70,24 +74,26 @@ impl MockRiskServer {
                         let read = stream.read(&mut buffer).unwrap_or(0);
                         let request = String::from_utf8_lossy(&buffer[..read]);
 
-                        let body = if request.starts_with("GET /risk?")
-                            && request.contains("pubkey=")
-                        {
-                            let address = request
-                                .split("pubkey=")
-                                .nth(1)
-                                .unwrap_or("")
-                                .split(['&', ' '])
-                                .next()
-                                .unwrap_or("");
-                            worker_requested_addresses.write().unwrap().push(address.to_string());
-                            let risk_score =
-                                worker_risks.read().unwrap().get(address).copied().unwrap_or(0);
-                            let is_risky = risk_score >= RISK_THRESHOLD;
-                            format!(r#"{{"isRisky":{is_risky}}}"#)
-                        } else {
-                            r#"{"error":"not found"}"#.to_string()
-                        };
+                        let body =
+                            if request.starts_with("GET /risk?") && request.contains("pubkey=") {
+                                let address = request
+                                    .split("pubkey=")
+                                    .nth(1)
+                                    .unwrap_or("")
+                                    .split(['&', ' '])
+                                    .next()
+                                    .unwrap_or("");
+                                let risk_score = if let Ok(key) = address.parse::<Pubkey>() {
+                                    worker_requested_addresses.write().unwrap().push(key);
+                                    worker_risks.read().unwrap().get(&key).copied().unwrap_or(0)
+                                } else {
+                                    0
+                                };
+                                let is_risky = risk_score >= RISK_THRESHOLD;
+                                format!(r#"{{"isRisky":{is_risky}}}"#)
+                            } else {
+                                r#"{"error":"not found"}"#.to_string()
+                            };
                         let status = if request.starts_with("GET /risk?") {
                             "200 OK"
                         } else {
@@ -100,7 +106,7 @@ impl MockRiskServer {
                         );
                         let _ = stream.write_all(response.as_bytes());
                     }
-                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    Err(err) if err.kind() == ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(25));
                     }
                     Err(_) => break,
@@ -109,7 +115,7 @@ impl MockRiskServer {
         });
 
         Ok(Self {
-            base_url: format!("http://{addr}"),
+            base_url: format!("http://{addr}").parse()?,
             shutdown,
             worker: Some(worker),
             risks,
@@ -124,21 +130,20 @@ impl MockRiskServer {
         }
     }
 
-    pub fn set_risk(&self, address: &str, risk_score: u64) {
-        self.risks.write().unwrap().insert(address.to_string(), risk_score);
+    pub fn set_risk(&self, address: Pubkey, risk_score: u64) {
+        self.risks.write().unwrap().insert(address, risk_score);
     }
 
-    pub fn base_url(&self) -> &str {
+    pub fn base_url(&self) -> &Url {
         &self.base_url
     }
 
     fn query_count(&self, owner: &Pubkey) -> usize {
-        let owner = owner.to_string();
         self.requested_addresses
             .read()
             .unwrap()
             .iter()
-            .filter(|address| **address == owner)
+            .filter(|address| *address == owner)
             .count()
     }
 }
@@ -149,27 +154,26 @@ impl Drop for MockRiskServer {
     }
 }
 
-pub struct AmlGate;
+pub struct AmlGate {
+    base: Rc<BaseCtx>,
+    server: MockRiskServer,
+    private: PrivateEr,
+}
 
-#[async_trait(?Send)]
 impl PrivateErScenario for AmlGate {
-    fn name(&self) -> &str {
-        "redshift/aml_gate"
-    }
-
-    async fn run(&self, base: &BaseCtx) -> Result<()> {
+    async fn setup(base: Rc<BaseCtx>, _: ()) -> Result<Self> {
         let server = MockRiskServer::start()?;
         // No api key or threshold: both belong to the risk server now; loopback
         // http is the one plaintext scheme magicblock-aml accepts.
         let private = topology::private_er(
-            base,
-            topology::ErOptions {
+            &base,
+            ErOptions {
                 label: "aml-gate".to_owned(),
                 settings: Box::new({
-                    let url = server.base_url().to_owned();
+                    let url = server.base_url().clone();
                     move |params| {
                         params.chainlink.risk.enabled = true;
-                        params.chainlink.risk.risk_server_url = url;
+                        params.chainlink.risk.risk_server_url = url.to_string();
                     }
                 }),
                 ..Default::default()
@@ -178,12 +182,17 @@ impl PrivateErScenario for AmlGate {
         .await?;
         private.wait_ready(READY_TIMEOUT).await?;
 
+        Ok(Self { base, server, private })
+    }
+
+    async fn run(self) -> Result<()> {
+        let Self { base, server, private } = self;
         // High-risk owner (score 9): the merge is blocked, no tokens move,
         // and the shuttle ATA is undelegated on base.
-        run_risk_case(base, private.ctx(), &server, 9, false).await?;
+        run_risk_case(&base, private.ctx(), &server, 9, false).await?;
 
         // Low-risk owner (score 1): the gate allows a merge attempt.
-        run_risk_case(base, private.ctx(), &server, 1, true).await?;
+        run_risk_case(&base, private.ctx(), &server, 1, true).await?;
 
         private.finish().await?;
         Ok(())
@@ -200,9 +209,9 @@ async fn run_risk_case(
     let er_identity = er_ctx.identity();
     let owner = Keypair::new();
     let owner_pk = owner.pubkey();
-    server.set_risk(&owner_pk.to_string(), owner_risk);
+    server.set_risk(owner_pk, owner_risk);
 
-    let fee_payer = prep::funded_payer(base, AIRDROP).await?;
+    let fee_payer = base.funded_payer(AIRDROP).await?;
     base.airdrop(&owner_pk, AIRDROP).await?;
     let recipient = Keypair::new();
     let mint = Keypair::new();
@@ -359,7 +368,7 @@ async fn merge_attempt(
     else {
         return Ok(None);
     };
-    let tx = er.api().await_transaction(&shared.parse()?, Duration::from_secs(5)).await?;
+    let tx = er.api().await_transaction(shared, Duration::from_secs(5)).await?;
     Ok(Some(tx.err.map(|err| format!("{err:?}"))))
 }
 

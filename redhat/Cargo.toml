@@ -6,7 +6,6 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-async-trait = { workspace = true }
 account = { workspace = true }
 futures-util = { workspace = true }
 json = { workspace = true }

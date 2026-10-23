@@ -1,10 +1,11 @@
 use std::{rc::Rc, sync::Arc, time::Duration};
 
-use async_trait::async_trait;
-use redsuite_core::redline::Accounts;
-use redsuite_core::report::Unit;
+use keypair::Keypair;
+use pubkey::Pubkey;
 use redsuite_core::{
-    check, check_eq, prep,
+    check, check_eq,
+    redline::Accounts,
+    report::Unit,
     runner::{execute_and_sync, Pacing, RunConfig},
     transport::{
         clock::SendClock,
@@ -12,8 +13,12 @@ use redsuite_core::{
     },
     BaseCtx, ChainCtx, ErCtx, Result, Scenario, ScenarioReport,
 };
+use tokio::time;
 
-use crate::program::{layout, DELEGATION_PROGRAM_ID};
+use crate::{
+    program::{layout, DELEGATION_PROGRAM_ID},
+    ACCOUNT_SPACE,
+};
 
 const ACCOUNTS: u8 = 4;
 const ITERATIONS: u64 = 40;
@@ -22,18 +27,18 @@ const CONCURRENCY: usize = 1;
 const CONFIRM_TIMEOUT: Duration = Duration::from_secs(20);
 const PAYER_LAMPORTS: u64 = 2_000_000_000;
 
-pub struct SimpleLoad;
+pub struct SimpleLoad {
+    base: Rc<BaseCtx>,
+    er: ErCtx,
+    payer: Keypair,
+    pdas: Vec<Pubkey>,
+}
 
-#[async_trait(?Send)]
 impl Scenario<ScenarioReport> for SimpleLoad {
-    fn name(&self) -> &str {
-        "redline/simple_load"
-    }
-
-    async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
-        let payer = prep::funded_payer(base, PAYER_LAMPORTS).await?;
-        let pdas = Accounts::new(crate::ACCOUNT_SPACE, er.identity())
-            .init_delegated(base, &payer, ACCOUNTS)
+    async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
+        let payer = base.funded_payer(PAYER_LAMPORTS).await?;
+        let pdas = Accounts::new(ACCOUNT_SPACE, er.identity())
+            .init_delegated(base.as_ref(), &payer, ACCOUNTS)
             .await?;
 
         for pda in &pdas {
@@ -44,14 +49,13 @@ impl Scenario<ScenarioReport> for SimpleLoad {
                 "delegated pda must be dlp-owned on base"
             )?;
         }
-        prep::await_clones(
-            er,
-            &pdas,
-            crate::ACCOUNT_SPACE as usize,
-            Duration::from_secs(15),
-        )
-        .await?;
+        er.await_clones(&pdas, ACCOUNT_SPACE as usize, Duration::from_secs(15)).await?;
 
+        Ok(Self { base, er, payer, pdas })
+    }
+
+    async fn run(self) -> Result<ScenarioReport> {
+        let Self { base, er, payer, pdas } = self;
         let clock = Arc::new(SendClock::new(1, ITERATIONS as usize));
         let updates = Rc::new(
             AccountUpdates::connect(er.ws_url(), crate::account_update_id, clock.clone()).await?,
@@ -77,7 +81,7 @@ impl Scenario<ScenarioReport> for SimpleLoad {
         let sync = |id: u64| {
             let sigs = sigs.clone();
             async move {
-                tokio::time::timeout(CONFIRM_TIMEOUT, sigs.await_id(id)).await.map_err(|_| {
+                time::timeout(CONFIRM_TIMEOUT, sigs.await_id(id)).await.map_err(|_| {
                     format!("confirmation for id {id} not within {CONFIRM_TIMEOUT:?}")
                 })?
             }
@@ -125,7 +129,7 @@ impl Scenario<ScenarioReport> for SimpleLoad {
             )?;
         }
 
-        Ok(ScenarioReport::ok(self.name())
+        Ok(ScenarioReport::ok()
             .setting("offered tps", RATE)
             .setting("concurrency", CONCURRENCY)
             .observe(

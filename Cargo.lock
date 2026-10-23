@@ -767,6 +767,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
 
 [[package]]
+name = "const-str"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "18f12cc9948ed9604230cdddc7c86e270f9401ccbe3c2e98a4378c5e7632212f"
+
+[[package]]
 name = "constant_time_eq"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3143,7 +3149,6 @@ dependencies = [
 name = "redhat"
 version = "2.0.0"
 dependencies = [
- "async-trait",
  "ephemeral-rollups-sdk",
  "futures-util",
  "magicblock-magic-program-api",
@@ -3184,7 +3189,6 @@ dependencies = [
 name = "redline"
 version = "2.0.0"
 dependencies = [
- "async-trait",
  "futures-util",
  "redline-interface",
  "redsuite-core",
@@ -3197,6 +3201,7 @@ dependencies = [
  "sonic-rs",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]
@@ -3237,7 +3242,6 @@ dependencies = [
 name = "redshift"
 version = "2.0.0"
 dependencies = [
- "async-trait",
  "base64 0.22.1",
  "bincode",
  "borsh 1.7.0",
@@ -3267,6 +3271,8 @@ dependencies = [
  "sonic-rs",
  "tokio",
  "tracing",
+ "upgrade-probe",
+ "url",
 ]
 
 [[package]]
@@ -3289,7 +3295,6 @@ dependencies = [
  "borsh 1.7.0",
  "ephemeral-rollups-sdk",
  "magicblock-magic-program-api",
- "redline-interface",
  "redshift-interface",
  "solana-program 3.0.0",
  "solana-sdk-ids 3.1.0",
@@ -3316,10 +3321,10 @@ dependencies = [
 name = "redsuite-core"
 version = "2.0.0"
 dependencies = [
- "async-trait",
  "base64 0.22.1",
  "bytes",
  "clap",
+ "const-str",
  "derive_more",
  "futures-util",
  "libproc",
@@ -3350,7 +3355,9 @@ dependencies = [
  "tokio-tungstenite",
  "toml 0.8.23",
  "tracing",
+ "tracing-error",
  "tracing-subscriber",
+ "url",
  "wincode",
 ]
 
@@ -6971,7 +6978,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100"
 dependencies = [
  "pin-project-lite",
+ "tracing-attributes",
  "tracing-core",
+]
+
+[[package]]
+name = "tracing-attributes"
+version = "0.1.31"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7490cfa5ec963746568740651ac6781f701c9c5ea257c58e057f3ba8cf69e8da"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.118",
 ]
 
 [[package]]
@@ -6981,6 +7000,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 dependencies = [
  "once_cell",
+]
+
+[[package]]
+name = "tracing-error"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b1581020d7a273442f5b45074a6a57d5757ad0a47dac0e9f0bd57b81936f3db"
+dependencies = [
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -7086,6 +7115,14 @@ name = "untrusted"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
+
+[[package]]
+name = "upgrade-probe"
+version = "2.0.0"
+dependencies = [
+ "redline-interface",
+ "solana-program 3.0.0",
+]
 
 [[package]]
 name = "ureq"

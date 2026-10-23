@@ -4,16 +4,20 @@
 
 use std::{
     num::{NonZeroU32, NonZeroUsize},
+    rc::Rc,
     time::{Duration, Instant},
 };
 
-use async_trait::async_trait;
-use redsuite_core::{topology, BaseCtx, PrivateErScenario, Result, ScenarioReport};
+use redsuite_core::{
+    topology,
+    topology::{ErOptions, PrivateEr},
+    BaseCtx, PrivateErScenario, Result, ScenarioReport,
+};
 use tokio::sync::watch;
 
-use crate::scenarios::scheduler::mixed_sustained_load;
+use crate::scenarios::scheduler::mixed_sustained_load::Workload;
 
-pub struct Load {
+pub struct Options {
     pub duration: Duration,
     pub rate: Option<NonZeroU32>,
     pub concurrency: Option<NonZeroUsize>,
@@ -21,30 +25,53 @@ pub struct Load {
     pub stop: watch::Receiver<bool>,
 }
 
-#[async_trait(?Send)]
-impl PrivateErScenario<(ScenarioReport, Result<()>)> for Load {
-    fn name(&self) -> &str {
-        "redline/load"
-    }
+pub struct Load {
+    options: Options,
+    private: PrivateEr,
+    workload: Workload,
+    started: Instant,
+}
 
-    async fn run(&self, base: &BaseCtx) -> Result<(ScenarioReport, Result<()>)> {
+impl PrivateErScenario<(ScenarioReport, Result<()>), Options> for Load {
+    async fn setup(base: Rc<BaseCtx>, options: Options) -> Result<Self> {
         let started = Instant::now();
         let private = topology::private_er(
-            base,
-            topology::ErOptions {
+            &base,
+            ErOptions {
                 label: "load".to_owned(),
                 ..Default::default()
             },
         )
         .await?;
         private.wait_ready(topology::ER_READY_TIMEOUT).await?;
-        let result = mixed_sustained_load::run(base, private.ctx(), Some(self), started).await;
+        match Workload::setup(&base, private.ctx()).await {
+            Ok(workload) => Ok(Self {
+                options,
+                private,
+                workload,
+                started,
+            }),
+            Err(error) => {
+                let _ = private.finish().await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn run(self) -> Result<(ScenarioReport, Result<()>)> {
+        let Self {
+            options,
+            private,
+            workload,
+            started,
+        } = self;
+        let result = workload.run(private.ctx(), Some(&options), started).await;
         let cleanup = private.finish().await;
         let (report, outcome) = result?;
         let outcome = outcome.and(cleanup);
         let report = report.setting(
             "completion",
-            if *self.stop.borrow() {
+            if *options.stop.borrow() {
                 "interrupted"
             } else if outcome.is_ok() {
                 "completed"

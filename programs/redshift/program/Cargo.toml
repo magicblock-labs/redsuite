@@ -8,25 +8,12 @@ authors.workspace = true
 [lib]
 crate-type = ["cdylib", "lib"]
 
-[features]
-default = ["schedulecommit"]
-schedulecommit = [
-    "dep:borsh",
-    "dep:sdk",
-    "dep:sdk-ids",
-    "dep:magic-api",
-    "dep:bincode",
-    "dep:system-interface",
-]
-upgraded = []
-
 [dependencies]
 redshift-interface = { workspace = true }
-redline-interface = { workspace = true }
-borsh = { workspace = true, optional = true }
-sdk = { workspace = true, optional = true }
+borsh = { workspace = true }
+sdk = { workspace = true }
 solana-program = { workspace = true }
-sdk-ids = { workspace = true, optional = true }
-magic-api = { workspace = true, optional = true }
-bincode = { workspace = true, optional = true }
-system-interface = { workspace = true, optional = true }
+sdk-ids = { workspace = true }
+magic-api = { workspace = true }
+bincode = { workspace = true }
+system-interface = { workspace = true }

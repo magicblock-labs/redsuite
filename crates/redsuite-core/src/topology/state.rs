@@ -1,9 +1,14 @@
 use std::{
-    fs,
+    env, fs,
+    fs::{File, OpenOptions},
+    io,
+    io::ErrorKind,
     path::{Path, PathBuf},
 };
 
 use json::{Deserialize, Serialize};
+use tokio::task;
+use url::Url;
 
 use crate::Result;
 
@@ -20,7 +25,7 @@ pub struct StackState {
     pub base_pid: u32,
     pub base_bin: String,
     pub er_identity_pool: Vec<Vec<u8>>,
-    pub clone_url: String,
+    pub clone_url: Url,
     pub base_programs: Vec<String>,
 }
 
@@ -30,7 +35,7 @@ pub const ACCOUNTSDB_ROOT_ENV: &str = "REDSUITE_ACCOUNTSDB_DIR";
 
 pub fn workspace_root() -> PathBuf {
     // `REDSUITE_ROOT` covers the binary running outside the checkout.
-    if let Some(root) = std::env::var_os(ROOT_ENV) {
+    if let Some(root) = env::var_os(ROOT_ENV) {
         return PathBuf::from(root);
     }
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -41,14 +46,14 @@ pub fn workspace_root() -> PathBuf {
 }
 
 pub fn stack_dir() -> PathBuf {
-    match std::env::var_os(STACK_DIR_ENV) {
+    match env::var_os(STACK_DIR_ENV) {
         Some(dir) => PathBuf::from(dir),
         None => workspace_root().join("target/redsuite-stack"),
     }
 }
 
 pub fn accountsdb_root() -> Option<PathBuf> {
-    std::env::var_os(ACCOUNTSDB_ROOT_ENV).map(PathBuf::from)
+    env::var_os(ACCOUNTSDB_ROOT_ENV).map(PathBuf::from)
 }
 
 pub(super) fn accountsdb_dir(storage_dir: &Path) -> PathBuf {
@@ -63,7 +68,7 @@ pub(super) fn split_accountsdb_dir(storage_dir: &Path) -> Option<PathBuf> {
     Some(root.join(storage_dir.file_name()?))
 }
 
-pub(super) fn remove_storage(storage_dir: &Path) -> std::io::Result<()> {
+pub(super) fn remove_storage(storage_dir: &Path) -> io::Result<()> {
     remove_dir_if_present(storage_dir)?;
     if let Some(split) = split_accountsdb_dir(storage_dir) {
         remove_dir_if_present(&split)?;
@@ -71,10 +76,10 @@ pub(super) fn remove_storage(storage_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-pub(crate) fn remove_dir_if_present(dir: &Path) -> std::io::Result<()> {
+pub(crate) fn remove_dir_if_present(dir: &Path) -> io::Result<()> {
     match fs::remove_dir_all(dir) {
         Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
     }
 }
@@ -98,13 +103,13 @@ pub(super) fn remove_state() {
     let _ = fs::remove_file(state_path());
 }
 
-pub(super) struct LockGuard(#[allow(dead_code)] std::fs::File);
+pub(super) struct LockGuard(#[allow(dead_code)] File);
 
 pub(super) async fn acquire_lock() -> Result<LockGuard> {
-    let file = tokio::task::spawn_blocking(|| -> std::io::Result<std::fs::File> {
+    let file = task::spawn_blocking(|| -> io::Result<File> {
         let dir = stack_dir();
         fs::create_dir_all(&dir)?;
-        let file = fs::OpenOptions::new()
+        let file = OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)

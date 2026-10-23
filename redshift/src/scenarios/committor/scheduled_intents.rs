@@ -1,15 +1,21 @@
 use std::{rc::Rc, time::Duration};
 
+use instruction::Instruction;
 use keypair::Keypair;
 use pubkey::Pubkey;
-use redshift_interface::flexi::{
-    build as flexi, FlexiCounter, IntentMode, ACTION_PRIZE, ACTOR_ESCROW_INDEX,
+use redshift_interface::{
+    schedulecommit,
+    schedulecommit::{build as counter, IntentMode, MainAccount},
 };
 use redsuite_core::{
-    api::custom_error_code, check, check_eq, dlp, prep, receipt, BaseCtx, ChainCtx, ErCtx, Result,
+    api::custom_error_code, check, check_eq, dlp, prep, receipt, BaseCtx, ChainCtx, DynError,
+    ErCtx, Result,
 };
+use sdk::dlp_api::consts::COMMIT_FEE_LAMPORTS;
 use signature::Signature;
 use signer::Signer;
+
+use crate::PAYER_LAMPORTS;
 
 const TIMEOUT: Duration = Duration::from_secs(60);
 const PAID_COMMIT_LIMIT: u64 = 25;
@@ -20,12 +26,13 @@ async fn redelegate(base: &BaseCtx, er: &ErCtx, payer: &Keypair, phase: &str) ->
     base.submit_and_confirm(
         payer,
         &[
-            flexi::delegate_counter(
+            counter::delegate_cpi(
+                payer.pubkey(),
                 payer.pubkey(),
                 prep::COMMIT_FREQUENCY_MS,
                 Some(er.identity()),
             ),
-            instruction::Instruction {
+            Instruction {
                 program_id: redshift_interface::ID,
                 accounts: vec![],
                 data: redshift_interface::log_msg_data(phase),
@@ -38,35 +45,35 @@ async fn redelegate(base: &BaseCtx, er: &ErCtx, payer: &Keypair, phase: &str) ->
 
 pub(super) async fn run(base: &BaseCtx, er: &ErCtx) -> Result<()> {
     let delegated = async |key: &Pubkey| {
-        super::await_delegated(er, key, TIMEOUT, &format!("{key} is delegated locally")).await
+        er.await_delegated(key, TIMEOUT, &format!("{key} is delegated locally")).await
     };
     let settled = async |signature: &Signature, accounts: &[Pubkey], undelegates| {
-        let receipt =
-            crate::assert_commit_receipt(base, er, signature, accounts, undelegates).await?;
-        super::require_settled(&receipt, "scheduled intent")
+        let receipt = er.check_commit(base, signature, accounts, undelegates).await?;
+        receipt.check_success("scheduled intent")
     };
-    let funder = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
-    let payers = prep::funded_payers(base, 3, crate::PAYER_LAMPORTS).await?;
+    let funder = base.funded_payer(PAYER_LAMPORTS).await?;
+    let payers = base.funded_payers(3, PAYER_LAMPORTS).await?;
     let keys: Vec<_> = payers.iter().map(Signer::pubkey).collect();
     let mut counters = Vec::new();
     let mut expected = Vec::new();
     for payer in &payers {
-        let (counter, setup) = prep::flexi_counter(
-            payer.pubkey(),
-            "scheduled-intents",
-            er.identity(),
-            prep::COMMIT_FREQUENCY_MS,
-        );
+        let (counter, setup) = base
+            .schedulecommit(payer)
+            .prepare_counter(er.identity(), prep::COMMIT_FREQUENCY_MS);
         base.submit_and_confirm(
             payer,
             &[
                 setup[0].clone(),
                 setup[1].clone(),
-                dlp::top_up_ephemeral_balance(&payer.pubkey(), 500_000_000, ACTOR_ESCROW_INDEX),
+                dlp::top_up_ephemeral_balance(
+                    &payer.pubkey(),
+                    500_000_000,
+                    schedulecommit::ACTOR_ESCROW_INDEX,
+                ),
             ],
         )
         .await?;
-        expected.push(FlexiCounter::try_decode(
+        expected.push(MainAccount::try_decode(
             &base.account(&counter).await?.ok_or("counter missing")?.data,
         )?);
         counters.push(counter);
@@ -129,16 +136,17 @@ pub(super) async fn run(base: &BaseCtx, er: &ErCtx) -> Result<()> {
                             "ER counter ownership"
                         )?;
                         check_eq!(
-                            FlexiCounter::try_decode(&account.data)?,
+                            MainAccount::try_decode(&account.data)?,
                             expected[i],
                             "ER sees the latest counter before another intent"
                         )?;
-                        Ok::<_, redsuite_core::DynError>(())
+                        Ok::<_, DynError>(())
                     },
                 )
                 .await?;
                 if additions[i] != 0 {
-                    er.submit_and_confirm(&payers[i], &[flexi::add(keys[i], additions[i])]).await?;
+                    er.submit_and_confirm(&payers[i], &[counter::add(keys[i], additions[i])])
+                        .await?;
                     expected[i].count += additions[i] as u64;
                     expected[i].updates += 1;
                 }
@@ -147,7 +155,7 @@ pub(super) async fn run(base: &BaseCtx, er: &ErCtx) -> Result<()> {
                 .submit_and_confirm_with(
                     &payers[0],
                     &payers[1..n].iter().collect::<Vec<_>>(),
-                    &[flexi::schedule_intents(
+                    &[counter::schedule_intents(
                         &keys[..n],
                         er.identity(),
                         destination,
@@ -173,7 +181,7 @@ pub(super) async fn run(base: &BaseCtx, er: &ErCtx) -> Result<()> {
                 let account =
                     base.account(&counters[i]).await?.ok_or("committed counter missing")?;
                 check_eq!(
-                    FlexiCounter::try_decode(&account.data)?,
+                    MainAccount::try_decode(&account.data)?,
                     expected[i],
                     "{label} {signature}: exact counter {}",
                     counters[i]
@@ -187,7 +195,7 @@ pub(super) async fn run(base: &BaseCtx, er: &ErCtx) -> Result<()> {
             }
             check_eq!(
                 base.api().get_balance(&destination).await?,
-                prizes as u64 * ACTION_PRIZE,
+                prizes as u64 * schedulecommit::ACTION_PRIZE,
                 "{label} {signature}: exactly one prize per routed action"
             )?;
             Ok(())
@@ -207,8 +215,8 @@ pub(super) async fn run(base: &BaseCtx, er: &ErCtx) -> Result<()> {
                 .submit_and_confirm(
                     payer,
                     &[
-                        flexi::add(keys[0], nonce as u8 + 1),
-                        flexi::schedule_intents(
+                        counter::add(keys[0], nonce as u8 + 1),
+                        counter::schedule_intents(
                             &keys[..1],
                             er.identity(),
                             keys[1],
@@ -229,8 +237,8 @@ pub(super) async fn run(base: &BaseCtx, er: &ErCtx) -> Result<()> {
         let signature = er
             .sender(Rc::new(prep::payer_from_bytes(&payer.to_bytes())))
             .submit(&[
-                flexi::add(keys[0], 99),
-                flexi::schedule_intents(&keys[..1], er.identity(), keys[1], vec![Commit], false),
+                counter::add(keys[0], 99),
+                counter::schedule_intents(&keys[..1], er.identity(), keys[1], vec![Commit], false),
             ])
             .await?;
         let tx = er.api().await_transaction(&signature, TIMEOUT).await?;
@@ -247,7 +255,7 @@ pub(super) async fn run(base: &BaseCtx, er: &ErCtx) -> Result<()> {
         let signature = er
             .submit_and_confirm(
                 payer,
-                &[flexi::schedule_intents(
+                &[counter::schedule_intents(
                     &keys[..1],
                     er.identity(),
                     keys[1],
@@ -273,7 +281,7 @@ pub(super) async fn run(base: &BaseCtx, er: &ErCtx) -> Result<()> {
     })
     .await?;
 
-    prep::delegate_payer(base, &funder, &payers[0], er.identity()).await?;
+    base.delegate_payer(&funder, &payers[0], er.identity()).await?;
     delegated(&keys[0]).await?;
     delegated(&counters[0]).await?;
     let vault = dlp::magic_fee_vault_pda(&er.identity());
@@ -292,8 +300,8 @@ pub(super) async fn run(base: &BaseCtx, er: &ErCtx) -> Result<()> {
                 .submit_and_confirm(
                     &payers[0],
                     &[
-                        flexi::add(keys[0], nonce as u8 + 1),
-                        flexi::schedule_intents(
+                        counter::add(keys[0], nonce as u8 + 1),
+                        counter::schedule_intents(
                             &keys[..1],
                             er.identity(),
                             destination,
@@ -304,11 +312,8 @@ pub(super) async fn run(base: &BaseCtx, er: &ErCtx) -> Result<()> {
                 )
                 .await?;
             settled(&signature, &counters[..1], false).await?;
-            let fee = if nonce >= PAID_COMMIT_LIMIT {
-                sdk::dlp_api::consts::COMMIT_FEE_LAMPORTS
-            } else {
-                0
-            } + if actions { ACTION_FEE } else { 0 };
+            let fee = if nonce >= PAID_COMMIT_LIMIT { COMMIT_FEE_LAMPORTS } else { 0 }
+                + if actions { ACTION_FEE } else { 0 };
             check_eq!(
                 er.api().get_balance(&keys[0]).await?,
                 payer_before - fee,
@@ -326,7 +331,7 @@ pub(super) async fn run(base: &BaseCtx, er: &ErCtx) -> Result<()> {
             )?;
             check_eq!(
                 base.api().get_balance(&destination).await?,
-                if actions { ACTION_PRIZE } else { 0 },
+                if actions { schedulecommit::ACTION_PRIZE } else { 0 },
                 "combined charge retains action execution"
             )?;
         }
@@ -334,7 +339,7 @@ pub(super) async fn run(base: &BaseCtx, er: &ErCtx) -> Result<()> {
     })
     .await?;
 
-    prep::delegate_payer(base, &funder, &payers[1], er.identity()).await?;
+    base.delegate_payer(&funder, &payers[1], er.identity()).await?;
     delegated(&keys[1]).await?;
     for fail in [false, true] {
         crate::phase(
@@ -343,13 +348,13 @@ pub(super) async fn run(base: &BaseCtx, er: &ErCtx) -> Result<()> {
                 const AMOUNT: u64 = 890_880;
                 let destination = Keypair::new().pubkey();
                 let before = er.account(&counters[1]).await?.ok_or("transfer counter missing")?;
-                let state = FlexiCounter::try_decode(&before.data)?;
+                let state = MainAccount::try_decode(&before.data)?;
                 let payer_before = er.api().get_balance(&keys[1]).await?;
                 let vault_before = er.api().get_balance(&vault).await?;
                 let signature = er
                     .submit_and_confirm(
                         &payers[1],
-                        &[flexi::transfer_intent(
+                        &[counter::transfer_intent(
                             keys[1],
                             er.identity(),
                             destination,
@@ -365,7 +370,7 @@ pub(super) async fn run(base: &BaseCtx, er: &ErCtx) -> Result<()> {
                     || async {
                         let account =
                             er.account(&counters[1]).await?.ok_or("callback counter missing")?;
-                        let actual = FlexiCounter::try_decode(&account.data)?;
+                        let actual = MainAccount::try_decode(&account.data)?;
                         check_eq!(actual.updates, state.updates + 1, "callback delivery count")?;
                         check_eq!(
                             actual.count,
@@ -385,7 +390,7 @@ pub(super) async fn run(base: &BaseCtx, er: &ErCtx) -> Result<()> {
                                 - if fail { 0 } else { AMOUNT },
                             "exact payer balance after callback"
                         )?;
-                        Ok::<_, redsuite_core::DynError>(())
+                        Ok::<_, DynError>(())
                     },
                 )
                 .await?;
