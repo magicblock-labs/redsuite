@@ -1,5 +1,4 @@
 use std::{
-    fmt,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -27,9 +26,7 @@ impl Pacing {
     pub fn interval(self) -> Result<Option<Duration>> {
         match self {
             Pacing::Unlimited => Ok(None),
-            Pacing::PerSecond(0) => {
-                Err("a paced run needs an offered rate above zero".into())
-            }
+            Pacing::PerSecond(0) => Err("a paced run needs an offered rate above zero".into()),
             Pacing::PerSecond(rate) => Ok(Some(ONESEC / rate)),
         }
     }
@@ -64,21 +61,10 @@ impl Pacing {
     }
 }
 
-impl fmt::Display for Pacing {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Pacing::Unlimited => f.write_str("unlimited"),
-            Pacing::PerSecond(rate) => write!(f, "{rate}/s"),
-        }
-    }
-}
-
 pub fn split_budget(total: u64, parts: usize) -> Vec<u64> {
     let base = total / (parts.max(1) as u64);
     let remainder = total % (parts.max(1) as u64);
-    (0..parts as u64)
-        .map(|index| base + u64::from(index < remainder))
-        .collect()
+    (0..parts as u64).map(|index| base + u64::from(index < remainder)).collect()
 }
 
 pub struct Pacer {
@@ -117,9 +103,7 @@ pub struct Admission {
 impl Admission {
     pub fn new(concurrency: usize) -> Result<Self> {
         if concurrency == 0 {
-            return Err(
-                "an admission budget needs a concurrency above zero".into()
-            );
+            return Err("an admission budget needs a concurrency above zero".into());
         }
         Ok(Self {
             permits: Arc::new(Semaphore::new(concurrency)),
@@ -172,8 +156,7 @@ impl AdmissionStats {
     pub fn finish(mut self) -> ObservationsStats {
         let tail = self.origin.elapsed() - Duration::from_secs(self.bucket);
         if self.count > 0 && (self.bucket == 0 || tail >= TAIL_BUCKET_MIN) {
-            self.rps
-                .push((f64::from(self.count) / tail.as_secs_f64()) as u32);
+            self.rps.push((f64::from(self.count) / tail.as_secs_f64()) as u32);
         }
         self.rps.finalize(true)
     }

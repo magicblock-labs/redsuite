@@ -1,7 +1,5 @@
 use async_trait::async_trait;
-use redsuite_core::{
-    check, dlp, topology, BaseCtx, ChainCtx, PrivateErScenario, Result,
-};
+use redsuite_core::{check, dlp, topology, BaseCtx, ChainCtx, PrivateErScenario, Result};
 use signer::Signer;
 
 const TEST_FEE_LAMPORTS: u64 = 1_000_000;
@@ -16,8 +14,7 @@ impl PrivateErScenario for ClaimFees {
 
     async fn run(&self, base: &BaseCtx) -> Result<()> {
         let validator = topology::identity_for_label("claim-fees")?;
-        base.airdrop(&validator.pubkey(), crate::PAYER_LAMPORTS)
-            .await?;
+        base.airdrop(&validator.pubkey(), crate::PAYER_LAMPORTS).await?;
         let vault = dlp::validator_fees_vault_pda(&validator.pubkey());
         let vault_at_boot = base.api().get_balance(&vault).await?;
         check!(
@@ -34,8 +31,7 @@ impl PrivateErScenario for ClaimFees {
              amount {TEST_FEE_LAMPORTS}"
         )?;
 
-        let claimer_before =
-            base.api().get_balance(&validator.pubkey()).await?;
+        let claimer_before = base.api().get_balance(&validator.pubkey()).await?;
         base.submit_and_confirm(
             &validator,
             &[dlp::validator_claim_fees(&validator.pubkey(), None)],

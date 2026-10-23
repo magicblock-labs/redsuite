@@ -10,11 +10,12 @@ use std::{
 
 pub use bmf::bmf;
 use json::{Deserialize, Serialize};
+use serde_with::skip_serializing_none;
 use tracing::warn;
 
 use crate::{
-    resources::LaunchRecord, runner::RunOutcome, scenario::RunRecord,
-    stats::ObservationsStats, topology, Result,
+    resources::LaunchRecord, runner::RunOutcome, scenario::RunRecord, stats::ObservationsStats,
+    topology, Result,
 };
 
 pub const SCHEMA_VERSION: u32 = 2;
@@ -69,17 +70,10 @@ impl ScenarioReport {
     }
 
     pub fn failed(name: &str) -> Self {
-        Self {
-            passed: false,
-            ..Self::ok(name)
-        }
+        Self { passed: false, ..Self::ok(name) }
     }
 
-    pub fn setting(
-        mut self,
-        key: impl Into<String>,
-        value: impl ToString,
-    ) -> Self {
+    pub fn setting(mut self, key: impl Into<String>, value: impl ToString) -> Self {
         self.config.push((key.into(), value.to_string()));
         self
     }
@@ -98,12 +92,7 @@ impl ScenarioReport {
         self
     }
 
-    pub fn metric(
-        mut self,
-        label: impl Into<String>,
-        unit: Unit,
-        value: f64,
-    ) -> Self {
+    pub fn metric(mut self, label: impl Into<String>, unit: Unit, value: f64) -> Self {
         self.measurements.push(Measurement {
             label: label.into(),
             unit,
@@ -112,12 +101,7 @@ impl ScenarioReport {
         self
     }
 
-    pub fn metric_if(
-        self,
-        label: impl Into<String>,
-        unit: Unit,
-        value: Option<f64>,
-    ) -> Self {
+    pub fn metric_if(self, label: impl Into<String>, unit: Unit, value: Option<f64>) -> Self {
         match value {
             Some(value) => self.metric(label, unit, value),
             None => self,
@@ -128,27 +112,18 @@ impl ScenarioReport {
         self.client_side_as("scheduling delay us", outcome)
     }
 
-    pub fn client_side_as(
-        self,
-        label: impl Into<String>,
-        outcome: &RunOutcome,
-    ) -> Self {
+    pub fn client_side_as(self, label: impl Into<String>, outcome: &RunOutcome) -> Self {
         if outcome.scheduling.count == 0 {
             return self.with_flags(outcome);
         }
-        self.observe(label, Unit::Micros, outcome.scheduling)
-            .with_flags(outcome)
+        self.observe(label, Unit::Micros, outcome.scheduling).with_flags(outcome)
     }
 
     pub fn latency_origin(mut self, origin: &str) -> Self {
         if origin.is_empty() {
             return self;
         }
-        match self
-            .config
-            .iter_mut()
-            .find(|(key, _)| key == LATENCY_ORIGIN)
-        {
+        match self.config.iter_mut().find(|(key, _)| key == LATENCY_ORIGIN) {
             Some((_, origins)) => {
                 if !origins.split("; ").any(|known| known == origin) {
                     origins.push_str("; ");
@@ -178,8 +153,7 @@ impl ScenarioReport {
 
 pub const LATENCY_ORIGIN: &str = "latency origin";
 
-pub const LOAD_FLAGS: [&str; 2] =
-    ["client saturated", "offered rate not sustained"];
+pub const LOAD_FLAGS: [&str; 2] = ["client saturated", "offered rate not sustained"];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CampaignMeta {
@@ -205,13 +179,12 @@ pub struct ScenarioRun {
     pub launches: Vec<LaunchRecord>,
 }
 
+#[skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedFailure {
     pub phase: String,
     pub message: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actual: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub context: Vec<(String, String)>,
@@ -257,10 +230,7 @@ pub fn persist_run(record: &RunRecord) -> Result<PathBuf> {
     store::persist(None, doc)
 }
 
-pub fn persist_summary(
-    mut report: ScenarioReport,
-    outcome: &Result<()>,
-) -> Result<()> {
+pub fn persist_summary(mut report: ScenarioReport, outcome: &Result<()>) -> Result<()> {
     report.passed = outcome.is_ok();
     let failures: Vec<_> = outcome
         .as_ref()
@@ -273,8 +243,7 @@ pub fn persist_summary(
 }
 
 pub fn persist_cell(parent: &str, report: &ScenarioReport) {
-    let persisted =
-        store::persist(Some(parent), scenario_run_doc(report, &[], &[]));
+    let persisted = store::persist(Some(parent), scenario_run_doc(report, &[], &[]));
     if let Err(error) = persisted {
         warn!(%error, "cell report not persisted");
     }
@@ -350,10 +319,7 @@ fn binary_version(path: &std::path::Path) -> String {
 }
 
 fn version_line(output: &str) -> Option<String> {
-    let line = output
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())?;
+    let line = output.lines().map(str::trim).find(|line| !line.is_empty())?;
     let mut cleaned = String::with_capacity(line.len());
     let mut chars = line.chars().peekable();
     while let Some(ch) = chars.next() {
@@ -388,27 +354,17 @@ fn fingerprint(path: &std::path::Path) -> String {
 }
 
 pub(crate) fn utc_stamp() -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let (hours, minutes, seconds) =
-        ((secs / 3600) % 24, (secs / 60) % 60, secs % 60);
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let (hours, minutes, seconds) = ((secs / 3600) % 24, (secs / 60) % 60, secs % 60);
     let days = (secs / 86_400) as i64 + 719_468;
     let era = days.div_euclid(146_097);
     let day_of_era = days.rem_euclid(146_097);
-    let year_of_era = (day_of_era - day_of_era / 1460 + day_of_era / 36524
-        - day_of_era / 146_096)
-        / 365;
-    let day_of_year =
-        day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
     let month_index = (5 * day_of_year + 2) / 153;
     let day = day_of_year - (153 * month_index + 2) / 5 + 1;
-    let month = if month_index < 10 {
-        month_index + 3
-    } else {
-        month_index - 9
-    };
+    let month = if month_index < 10 { month_index + 3 } else { month_index - 9 };
     let year = year_of_era + era * 400 + i64::from(month <= 2);
     format!("{year:04}{month:02}{day:02}T{hours:02}{minutes:02}{seconds:02}Z")
 }

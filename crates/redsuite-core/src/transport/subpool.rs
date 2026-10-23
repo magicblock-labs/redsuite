@@ -87,9 +87,8 @@ impl SubscriberPool {
         extractor: Extractor,
         lag_threshold: Duration,
     ) -> Self {
-        let states: Vec<Arc<Mutex<ConnState>>> = (0..connections)
-            .map(|_| Arc::new(Mutex::new(ConnState::default())))
-            .collect();
+        let states: Vec<Arc<Mutex<ConnState>>> =
+            (0..connections).map(|_| Arc::new(Mutex::new(ConnState::default()))).collect();
         let (shutdown, _) = watch::channel(false);
         let thread_count = threads.clamp(1, connections.max(1));
         let accounts: Arc<Vec<Pubkey>> = Arc::new(accounts.to_vec());
@@ -97,12 +96,8 @@ impl SubscriberPool {
 
         let mut handles = Vec::with_capacity(thread_count);
         for thread_index in 0..thread_count {
-            let my_states: Vec<Arc<Mutex<ConnState>>> = states
-                .iter()
-                .skip(thread_index)
-                .step_by(thread_count)
-                .cloned()
-                .collect();
+            let my_states: Vec<Arc<Mutex<ConnState>>> =
+                states.iter().skip(thread_index).step_by(thread_count).cloned().collect();
             let url = url.to_owned();
             let accounts = accounts.clone();
             let clock = clock.clone();
@@ -118,18 +113,16 @@ impl SubscriberPool {
                 runtime.block_on(local.run_until(async move {
                     let mut conn_tasks = Vec::with_capacity(my_states.len());
                     for state in my_states {
-                        conn_tasks.push(tokio::task::spawn_local(
-                            run_connection(
-                                url.clone(),
-                                accounts.clone(),
-                                state,
-                                clock.clone(),
-                                expected.clone(),
-                                extractor.clone(),
-                                shutdown_rx.clone(),
-                                threshold_micros,
-                            ),
-                        ));
+                        conn_tasks.push(tokio::task::spawn_local(run_connection(
+                            url.clone(),
+                            accounts.clone(),
+                            state,
+                            clock.clone(),
+                            expected.clone(),
+                            extractor.clone(),
+                            shutdown_rx.clone(),
+                            threshold_micros,
+                        )));
                     }
                     for task in conn_tasks {
                         let _ = task.await;
@@ -145,31 +138,25 @@ impl SubscriberPool {
     }
 
     pub fn first_error(&self) -> Option<String> {
-        self.states
-            .iter()
-            .enumerate()
-            .find_map(|(conn_index, state)| {
-                state
-                    .lock()
-                    .unwrap()
-                    .error
-                    .as_ref()
-                    .map(|error| format!("conn {conn_index}: {error}"))
-            })
+        self.states.iter().enumerate().find_map(|(conn_index, state)| {
+            state
+                .lock()
+                .unwrap()
+                .error
+                .as_ref()
+                .map(|error| format!("conn {conn_index}: {error}"))
+        })
     }
 
-    pub async fn await_subscribed(
-        &self,
-        per_connection: usize,
-        timeout: Duration,
-    ) -> Result<()> {
+    pub async fn await_subscribed(&self, per_connection: usize, timeout: Duration) -> Result<()> {
         conn::await_condition(timeout, "pool subscriptions", || {
             if let Some(error) = self.first_error() {
                 return Err(format!("subscriber pool: {error}").into());
             }
-            Ok(self.states.iter().all(|state| {
-                state.lock().unwrap().ready_subs >= per_connection
-            }))
+            Ok(self
+                .states
+                .iter()
+                .all(|state| state.lock().unwrap().ready_subs >= per_connection))
         })
         .await
     }
@@ -213,11 +200,7 @@ impl SubscriberPool {
             .sum()
     }
 
-    pub async fn await_final(
-        &self,
-        expected: &ExpectedWrites,
-        timeout: Duration,
-    ) -> usize {
+    pub async fn await_final(&self, expected: &ExpectedWrites, timeout: Duration) -> usize {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let missing = self.missing_final(expected);
@@ -237,9 +220,7 @@ impl SubscriberPool {
             .into_iter()
             .map(|state| {
                 let state = Arc::try_unwrap(state)
-                    .unwrap_or_else(|_| {
-                        panic!("subscriber thread still holds a conn state")
-                    })
+                    .unwrap_or_else(|_| panic!("subscriber thread still holds a conn state"))
                     .into_inner()
                     .unwrap();
                 ConnReport {
@@ -275,12 +256,7 @@ impl FrameHandler for PoolHandler {
         self.state.lock().unwrap().ready_subs += 1;
     }
 
-    fn on_notification(
-        &mut self,
-        method: &str,
-        subscription: u64,
-        payload: &LazyValue<'_>,
-    ) {
+    fn on_notification(&mut self, method: &str, subscription: u64, payload: &LazyValue<'_>) {
         if method != "accountNotification" {
             return;
         }
@@ -293,8 +269,7 @@ impl FrameHandler for PoolHandler {
         let Some(lag_micros) = self.clock.elapsed_micros(id) else {
             return;
         };
-        let Some(account) = self.account_by_subid.get(&subscription).copied()
-        else {
+        let Some(account) = self.account_by_subid.get(&subscription).copied() else {
             return;
         };
         let Some(write_ids) = self.expected.get(&account) else {
@@ -355,9 +330,8 @@ async fn run_connection(
     for account in accounts.iter() {
         let req_id = requester.mint();
         handler.account_by_req.insert(req_id, *account);
-        if let Err(error) = requester
-            .send(req_id, "accountSubscribe", &conn::account_params(account))
-            .await
+        if let Err(error) =
+            requester.send(req_id, "accountSubscribe", &conn::account_params(account)).await
         {
             state.lock().unwrap().error = Some(error.to_string());
             return;

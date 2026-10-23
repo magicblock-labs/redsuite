@@ -1,7 +1,6 @@
 use pubkey::Pubkey;
 
-pub const ID: Pubkey =
-    Pubkey::from_str_const("AijneHkXJVVWyimuwfSJdrJktARZu2WiMaZBqHsq7CS5");
+pub const ID: Pubkey = Pubkey::from_str_const("AijneHkXJVVWyimuwfSJdrJktARZu2WiMaZBqHsq7CS5");
 
 pub const fn id() -> Pubkey {
     ID
@@ -49,16 +48,7 @@ pub mod schedulecommit {
         pub commit_payer: bool,
     }
 
-    #[derive(
-        BorshSerialize,
-        BorshDeserialize,
-        Debug,
-        Clone,
-        Copy,
-        Default,
-        PartialEq,
-        Eq,
-    )]
+    #[derive(BorshSerialize, BorshDeserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
     pub struct OrderLevel {
         pub price: u64,
         pub size: u64,
@@ -110,26 +100,18 @@ pub mod schedulecommit {
     fn write_level(data: &mut [u8], index: usize, level: &OrderLevel) {
         let offset = ORDER_BOOK_HEADER_SIZE + index * ORDER_LEVEL_SIZE;
         data[offset..offset + 8].copy_from_slice(&level.price.to_le_bytes());
-        data[offset + 8..offset + 16]
-            .copy_from_slice(&level.size.to_le_bytes());
+        data[offset + 8..offset + 16].copy_from_slice(&level.size.to_le_bytes());
     }
 
     fn read_level(data: &[u8], index: usize) -> OrderLevel {
         let offset = ORDER_BOOK_HEADER_SIZE + index * ORDER_LEVEL_SIZE;
         OrderLevel {
-            price: u64::from_le_bytes(
-                data[offset..offset + 8].try_into().unwrap(),
-            ),
-            size: u64::from_le_bytes(
-                data[offset + 8..offset + 16].try_into().unwrap(),
-            ),
+            price: u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap()),
+            size: u64::from_le_bytes(data[offset + 8..offset + 16].try_into().unwrap()),
         }
     }
 
-    pub fn order_book_apply(
-        data: &mut [u8],
-        update: &BookUpdate,
-    ) -> Result<(), ProgramError> {
+    pub fn order_book_apply(data: &mut [u8], update: &BookUpdate) -> Result<(), ProgramError> {
         let (bids_len, asks_len, capacity) =
             book_lens(data).ok_or(ProgramError::InvalidAccountData)?;
         let mut remaining = capacity - bids_len - asks_len;
@@ -151,9 +133,7 @@ pub mod schedulecommit {
         Ok(())
     }
 
-    pub fn order_book_view(
-        data: &[u8],
-    ) -> Option<(Vec<OrderLevel>, Vec<OrderLevel>)> {
+    pub fn order_book_view(data: &[u8]) -> Option<(Vec<OrderLevel>, Vec<OrderLevel>)> {
         let (bids_len, asks_len, capacity) = book_lens(data)?;
         let bids = (0..bids_len).map(|index| read_level(data, index)).collect();
         let asks = (0..asks_len)
@@ -176,10 +156,7 @@ pub mod schedulecommit {
     }
 
     pub fn order_book_pda_and_bump(book_manager: &Pubkey) -> (Pubkey, u8) {
-        Pubkey::find_program_address(
-            &[ORDER_BOOK_SEED, book_manager.as_ref()],
-            &crate::ID,
-        )
+        Pubkey::find_program_address(&[ORDER_BOOK_SEED, book_manager.as_ref()], &crate::ID)
     }
 
     pub mod build {
@@ -194,10 +171,7 @@ pub mod schedulecommit {
             metas: Vec<AccountMeta>,
         ) -> Instruction {
             let mut data = vec![crate::SCHEDULE_COMMIT_TAG];
-            data.extend(
-                borsh::to_vec(instruction)
-                    .expect("instruction serialization cannot fail"),
-            );
+            data.extend(borsh::to_vec(instruction).expect("instruction serialization cannot fail"));
             Instruction {
                 program_id: crate::id(),
                 accounts: metas,
@@ -213,16 +187,12 @@ pub mod schedulecommit {
             magic_fee_vault: Option<Pubkey>,
             committees: &[Pubkey],
         ) -> Instruction {
-            let mut metas = vec![
-                AccountMeta::new(payer, true),
-                AccountMeta::new(MAGIC_CONTEXT_ID, false),
-            ];
+            let mut metas =
+                vec![AccountMeta::new(payer, true), AccountMeta::new(MAGIC_CONTEXT_ID, false)];
             if let Some(vault) = magic_fee_vault {
                 metas.push(AccountMeta::new(vault, false));
             }
-            metas.extend(
-                committees.iter().map(|key| AccountMeta::new(*key, false)),
-            );
+            metas.extend(committees.iter().map(|key| AccountMeta::new(*key, false)));
             Instruction {
                 program_id: MAGIC_PROGRAM_ID,
                 accounts: metas,
@@ -230,10 +200,7 @@ pub mod schedulecommit {
             }
         }
 
-        pub fn init_account(
-            payer: Pubkey,
-            player: Pubkey,
-        ) -> (Instruction, Pubkey) {
+        pub fn init_account(payer: Pubkey, player: Pubkey) -> (Instruction, Pubkey) {
             let (pda, _) = pda_and_bump(&player);
             let metas = vec![
                 AccountMeta::new(payer, true),
@@ -244,19 +211,14 @@ pub mod schedulecommit {
             (with_tag(&ScheduleCommitInstruction::Init, metas), pda)
         }
 
-        pub fn request_undelegation(
-            payer: Pubkey,
-            player: Pubkey,
-        ) -> Instruction {
-            let mut ix =
-                sdk::dlp_api::instruction_builder::request_undelegation(
-                    payer,
-                    pda_and_bump(&player).0,
-                    crate::ID,
-                );
+        pub fn request_undelegation(payer: Pubkey, player: Pubkey) -> Instruction {
+            let mut ix = sdk::dlp_api::instruction_builder::request_undelegation(
+                payer,
+                pda_and_bump(&player).0,
+                crate::ID,
+            );
             ix.accounts[1].is_signer = false;
-            ix.accounts
-                .push(AccountMeta::new_readonly(ix.program_id, false));
+            ix.accounts.push(AccountMeta::new_readonly(ix.program_id, false));
             with_tag(
                 &ScheduleCommitInstruction::RequestUndelegation(player),
                 ix.accounts,
@@ -329,9 +291,7 @@ pub mod schedulecommit {
         ) -> Instruction {
             let metas = commit_metas(payer, &players, true);
             with_tag(
-                &ScheduleCommitInstruction::ScheduleCommitAndUndelegateCpiModAfter(
-                    players,
-                ),
+                &ScheduleCommitInstruction::ScheduleCommitAndUndelegateCpiModAfter(players),
                 metas,
             )
         }
@@ -342,9 +302,7 @@ pub mod schedulecommit {
         ) -> Instruction {
             let metas = commit_metas(payer, &players, true);
             with_tag(
-                &ScheduleCommitInstruction::ScheduleCommitAndUndelegateCpiTwice(
-                    players,
-                ),
+                &ScheduleCommitInstruction::ScheduleCommitAndUndelegateCpiTwice(players),
                 metas,
             )
         }
@@ -365,10 +323,7 @@ pub mod schedulecommit {
             )
         }
 
-        pub fn init_order_book(
-            payer: Pubkey,
-            book_manager: Pubkey,
-        ) -> (Instruction, Pubkey) {
+        pub fn init_order_book(payer: Pubkey, book_manager: Pubkey) -> (Instruction, Pubkey) {
             let (pda, _) = order_book_pda_and_bump(&book_manager);
             let metas = vec![
                 AccountMeta::new(payer, true),
@@ -408,13 +363,11 @@ pub mod schedulecommit {
         ) -> Instruction {
             let (pda, _) = order_book_pda_and_bump(&book_manager);
             with_tag(
-                &ScheduleCommitInstruction::DelegateOrderBook(
-                    DelegateOrderBookArgs {
-                        commit_frequency_ms,
-                        book_manager,
-                        validator,
-                    },
-                ),
+                &ScheduleCommitInstruction::DelegateOrderBook(DelegateOrderBookArgs {
+                    commit_frequency_ms,
+                    book_manager,
+                    validator,
+                }),
                 crate::delegate_metas(payer, pda),
             )
         }
@@ -425,10 +378,7 @@ pub mod schedulecommit {
             update: BookUpdate,
         ) -> Instruction {
             let (pda, _) = order_book_pda_and_bump(&book_manager);
-            let metas = vec![
-                AccountMeta::new(payer, true),
-                AccountMeta::new(pda, false),
-            ];
+            let metas = vec![AccountMeta::new(payer, true), AccountMeta::new(pda, false)];
             with_tag(&ScheduleCommitInstruction::UpdateOrderBook(update), metas)
         }
 
@@ -445,9 +395,7 @@ pub mod schedulecommit {
                 AccountMeta::new_readonly(MAGIC_PROGRAM_ID, false),
             ];
             with_tag(
-                &ScheduleCommitInstruction::ScheduleCommitForOrderBook(
-                    commit_type,
-                ),
+                &ScheduleCommitInstruction::ScheduleCommitForOrderBook(commit_type),
                 metas,
             )
         }
@@ -477,12 +425,10 @@ pub fn ephemeral_cpi(
     mut instruction: instruction::Instruction,
     fill: u8,
 ) -> instruction::Instruction {
-    instruction
-        .accounts
-        .push(instruction::AccountMeta::new_readonly(
-            instruction.program_id,
-            false,
-        ));
+    instruction.accounts.push(instruction::AccountMeta::new_readonly(
+        instruction.program_id,
+        false,
+    ));
     instruction.program_id = id();
     instruction.data.splice(..0, [EPHEMERAL_TAG, fill]);
     instruction

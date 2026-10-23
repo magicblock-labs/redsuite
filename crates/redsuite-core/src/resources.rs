@@ -4,10 +4,12 @@ use std::{
 };
 
 use json::{Deserialize, Serialize};
+use serde_with::skip_serializing_none;
 use tracing::warn;
 
 use crate::{host, report, topology};
 
+#[skip_serializing_none]
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaunchRecord {
     pub label: String,
@@ -17,26 +19,19 @@ pub struct LaunchRecord {
     pub bin_fingerprint: String,
     pub identity: String,
     pub launched_at: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rpc_port: Option<u16>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ws_port: Option<u16>,
     pub metrics_port: u16,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replication_port: Option<u16>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream: Option<String>,
     pub storage_dir: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accountsdb_dir: Option<String>,
     pub log: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config: Option<String>,
     #[serde(default)]
     pub pid: u32,
     #[serde(default)]
     pub relaunches: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit: Option<String>,
 }
 
@@ -46,10 +41,7 @@ pub struct Resources {
 }
 
 impl Resources {
-    pub(crate) fn register_launch(
-        &self,
-        mut launch: LaunchRecord,
-    ) -> Rc<ResourceRecord> {
+    pub(crate) fn register_launch(&self, mut launch: LaunchRecord) -> Rc<ResourceRecord> {
         launch.launched_at = report::utc_stamp();
         let record = Rc::new(ResourceRecord {
             finished: Cell::new(false),
@@ -75,13 +67,10 @@ impl Resources {
                 record.mark_finished();
                 warn!(owner, %launch.label, "reclaimed running rollup");
             }
-            for dir in std::iter::once(&launch.storage_dir)
-                .chain(launch.accountsdb_dir.iter())
-            {
+            for dir in std::iter::once(&launch.storage_dir).chain(launch.accountsdb_dir.iter()) {
                 match std::fs::remove_dir_all(dir) {
                     Ok(()) => {}
-                    Err(error)
-                        if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                     Err(error) => {
                         warn!(owner, dir, %error, "storage cleanup failed")
                     }

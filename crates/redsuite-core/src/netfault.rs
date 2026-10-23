@@ -1,7 +1,6 @@
 use std::{
     cell::RefCell,
     collections::HashMap,
-    fmt,
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -22,7 +21,7 @@ use crate::{
     api::decode_transaction,
     context::{BaseCtx, ChainCtx},
     topology::BaseEndpoints,
-    transport::http::{self, TransportError},
+    transport::http,
     Result,
 };
 
@@ -37,30 +36,11 @@ pub enum Transport {
     Ws,
 }
 
-impl fmt::Display for Transport {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Transport::Http => "http",
-            Transport::Ws => "ws",
-        })
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stage {
     Request,
     Response,
     Notification,
-}
-
-impl fmt::Display for Stage {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Stage::Request => "request",
-            Stage::Response => "response",
-            Stage::Notification => "notification",
-        })
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -139,45 +119,14 @@ impl Selector {
     }
 
     fn matches(&self, operation: &Operation) -> bool {
-        self.transport
-            .is_none_or(|transport| transport == operation.transport)
-            && (self.stages.is_empty()
-                || self.stages.contains(&operation.stage))
-            && (self.methods.is_empty()
-                || self.methods.contains(&operation.method))
-            && self.signature.as_ref().is_none_or(|signature| {
-                operation.signatures.contains(signature)
-            })
+        self.transport.is_none_or(|transport| transport == operation.transport)
+            && (self.stages.is_empty() || self.stages.contains(&operation.stage))
+            && (self.methods.is_empty() || self.methods.contains(&operation.method))
             && self
-                .account
+                .signature
                 .as_ref()
-                .is_none_or(|account| operation.accounts.contains(account))
-    }
-}
-
-impl fmt::Display for Selector {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.transport {
-            Some(transport) => write!(f, "{transport} ")?,
-            None => f.write_str("any-transport ")?,
-        }
-        if self.stages.is_empty() {
-            f.write_str("any-stage")?;
-        } else {
-            let stages: Vec<String> =
-                self.stages.iter().map(ToString::to_string).collect();
-            f.write_str(&stages.join("|"))?;
-        }
-        if !self.methods.is_empty() {
-            write!(f, " {}", self.methods.join("|"))?;
-        }
-        if let Some(signature) = &self.signature {
-            write!(f, " sig={signature}")?;
-        }
-        if let Some(account) = &self.account {
-            write!(f, " account={account}")?;
-        }
-        Ok(())
+                .is_none_or(|signature| operation.signatures.contains(signature))
+            && self.account.as_ref().is_none_or(|account| operation.accounts.contains(account))
     }
 }
 
@@ -258,19 +207,15 @@ enum GateStart {
 
 fn gate_start(shared: &Shared, operation: Operation) -> GateStart {
     let mut state = shared.borrow_mut();
-    let rule = state
-        .rules
-        .iter()
-        .find(|rule| rule.selector.matches(&operation))
-        .map(|rule| {
-            (
-                rule.id,
-                match &rule.effect {
-                    Effect::Reject(message) => Some(message.clone()),
-                    Effect::Stall => None,
-                },
-            )
-        });
+    let rule = state.rules.iter().find(|rule| rule.selector.matches(&operation)).map(|rule| {
+        (
+            rule.id,
+            match &rule.effect {
+                Effect::Reject(message) => Some(message.clone()),
+                Effect::Stall => None,
+            },
+        )
+    });
     match rule {
         Some((_, Some(message))) => {
             state.record(Action::Rejected, Some(operation));
@@ -287,10 +232,7 @@ fn gate_start(shared: &Shared, operation: Operation) -> GateStart {
             let trap = state
                 .traps
                 .iter()
-                .find(|trap| {
-                    trap.fired.borrow().is_none()
-                        && trap.selector.matches(&operation)
-                })
+                .find(|trap| trap.fired.borrow().is_none() && trap.selector.matches(&operation))
                 .cloned();
             match trap {
                 None => GateStart::Decided(Decision::Release),
@@ -305,11 +247,7 @@ fn gate_start(shared: &Shared, operation: Operation) -> GateStart {
                     state.record(Action::Held, Some(operation.clone()));
                     state.holding += 1;
                     trap.notify.notify_waiters();
-                    GateStart::Pending(
-                        receiver,
-                        operation,
-                        Holding(shared.clone()),
-                    )
+                    GateStart::Pending(receiver, operation, Holding(shared.clone()))
                 }
             }
         }
@@ -339,10 +277,7 @@ async fn gate_finish(
     decision
 }
 
-async fn gate(
-    shared: &Shared,
-    operation: Operation,
-) -> (Decision, Option<Holding>) {
+async fn gate(shared: &Shared, operation: Operation) -> (Decision, Option<Holding>) {
     match gate_start(shared, operation) {
         GateStart::Decided(decision) => (decision, None),
         GateStart::Pending(receiver, operation, holding) => (
@@ -412,23 +347,20 @@ impl Trap {
                     });
                 }
                 return Err(format!(
-                    "the interception `{}` was already taken",
+                    "the interception `{:?}` was already taken",
                     self.state.selector
                 )
                 .into());
             }
-            let remaining = deadline
-                .checked_duration_since(tokio::time::Instant::now())
-                .ok_or_else(|| {
+            let remaining =
+                deadline.checked_duration_since(tokio::time::Instant::now()).ok_or_else(|| {
                     format!(
-                        "the interception `{}` did not occur within \
+                        "the interception `{:?}` did not occur within \
                          {timeout:?}",
                         self.state.selector
                     )
                 })?;
-            let _ =
-                tokio::time::timeout(remaining, self.state.notify.notified())
-                    .await;
+            let _ = tokio::time::timeout(remaining, self.state.notify.notified()).await;
         }
     }
 }
@@ -442,10 +374,8 @@ impl RuleHandle {
     pub fn remove(self) {
         let mut state = self.shared.borrow_mut();
         state.rules.retain(|rule| rule.id != self.id);
-        let (release, keep): (Vec<_>, Vec<_>) = state
-            .stalled
-            .drain(..)
-            .partition(|(rule, _)| *rule == self.id);
+        let (release, keep): (Vec<_>, Vec<_>) =
+            state.stalled.drain(..).partition(|(rule, _)| *rule == self.id);
         state.stalled = keep;
         for (_, decide) in release {
             let _ = decide.send(Decision::Release);
@@ -489,17 +419,9 @@ impl BaseProxies {
                 client,
                 shared.clone(),
             )),
-            tokio::task::spawn_local(accept_ws(
-                ws_listener,
-                upstream_ws,
-                shared.clone(),
-            )),
+            tokio::task::spawn_local(accept_ws(ws_listener, upstream_ws, shared.clone())),
         ];
-        Ok(Self {
-            shared,
-            endpoints,
-            listeners,
-        })
+        Ok(Self { shared, endpoints, listeners })
     }
 
     pub fn endpoints(&self) -> BaseEndpoints {
@@ -528,15 +450,8 @@ impl BaseProxies {
         let mut state = self.shared.borrow_mut();
         let id = state.next_rule;
         state.next_rule += 1;
-        state.rules.push(Rule {
-            id,
-            selector,
-            effect,
-        });
-        RuleHandle {
-            id,
-            shared: self.shared.clone(),
-        }
+        state.rules.push(Rule { id, selector, effect });
+        RuleHandle { id, shared: self.shared.clone() }
     }
 
     pub fn close_connections(&self) {
@@ -562,7 +477,7 @@ impl BaseProxies {
                         let _ = decide.send(Decision::Release);
                     }
                 }
-                None => state.unfired.push(trap.selector.to_string()),
+                None => state.unfired.push(format!("{:?}", trap.selector)),
             }
         }
         state.record(Action::Restored, None);
@@ -643,12 +558,7 @@ fn classify(strings: Vec<String>) -> (Vec<String>, Vec<String>) {
             accounts.push(text);
         } else if let Ok(tx) = decode_transaction(&text) {
             signatures.extend(tx.signatures.iter().map(ToString::to_string));
-            accounts.extend(
-                tx.message
-                    .static_account_keys()
-                    .iter()
-                    .map(ToString::to_string),
-            );
+            accounts.extend(tx.message.static_account_keys().iter().map(ToString::to_string));
         }
     }
     (signatures, accounts)
@@ -664,10 +574,7 @@ struct Parsed {
 
 fn parse(text: &str) -> Option<Parsed> {
     let value: json::Value = json::from_str(text).ok()?;
-    let method = value
-        .get("method")
-        .and_then(|m| m.as_str())
-        .map(str::to_owned);
+    let method = value.get("method").and_then(|m| m.as_str()).map(str::to_owned);
     let mut strings = Vec::new();
     if let Some(params) = value.get("params") {
         collect_strings(params, &mut strings);
@@ -688,12 +595,7 @@ fn parse(text: &str) -> Option<Parsed> {
     })
 }
 
-fn operation(
-    transport: Transport,
-    stage: Stage,
-    method: &str,
-    strings: Vec<String>,
-) -> Operation {
+fn operation(transport: Transport, stage: Stage, method: &str, strings: Vec<String>) -> Operation {
     let (signatures, accounts) = classify(strings);
     Operation {
         transport,
@@ -752,10 +654,7 @@ async fn accept_http(
     }
 }
 
-async fn read_request(
-    socket: &mut TcpStream,
-    buffer: &mut Vec<u8>,
-) -> Option<(String, String)> {
+async fn read_request(socket: &mut TcpStream, buffer: &mut Vec<u8>) -> Option<(String, String)> {
     loop {
         if let Some(split) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
             let head = String::from_utf8_lossy(&buffer[..split]).into_owned();
@@ -781,10 +680,8 @@ async fn read_request(
                 }
                 buffer.extend_from_slice(&chunk[..read]);
             }
-            let body = String::from_utf8_lossy(
-                &buffer[body_start..body_start + content_length],
-            )
-            .into_owned();
+            let body = String::from_utf8_lossy(&buffer[body_start..body_start + content_length])
+                .into_owned();
             buffer.drain(..body_start + content_length);
             return Some((head, body));
         }
@@ -800,11 +697,7 @@ async fn read_request(
     }
 }
 
-async fn write_response(
-    socket: &mut TcpStream,
-    status: u16,
-    body: &str,
-) -> bool {
+async fn write_response(socket: &mut TcpStream, status: u16, body: &str) -> bool {
     let reason = if status == 200 { "OK" } else { "Error" };
     let head = format!(
         "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\n\
@@ -824,8 +717,7 @@ async fn serve_http(
 ) {
     let mut buffer = Vec::new();
     loop {
-        let Some((head, body)) = read_request(&mut socket, &mut buffer).await
-        else {
+        let Some((head, body)) = read_request(&mut socket, &mut buffer).await else {
             return;
         };
         let keep_alive = !head.lines().any(|line| {
@@ -854,9 +746,7 @@ async fn serve_http(
         match decision {
             Decision::Discard => return,
             Decision::Reject(message) => {
-                if !write_response(&mut socket, 200, &rejection(&id, &message))
-                    .await
-                {
+                if !write_response(&mut socket, 200, &rejection(&id, &message)).await {
                     return;
                 }
                 if !keep_alive {
@@ -866,28 +756,17 @@ async fn serve_http(
             }
             Decision::Release => {}
         }
-        let (status, text) = match http::post_json(&client, &upstream, body)
-            .await
-        {
+        let (status, text) = match http::post_json(&client, &upstream, body).await {
             Ok(text) => (200, text),
-            Err(error) => match error.downcast_ref::<TransportError>() {
-                Some(transport) => {
-                    (transport.status.unwrap_or(502), transport.detail.clone())
-                }
-                None => (502, error.to_string()),
-            },
+            Err(error) => (error.status.unwrap_or(502), error.detail),
         };
-        let extra = parse(&text)
-            .map(|parsed| parsed.strings)
-            .unwrap_or_default();
+        let extra = parse(&text).map(|parsed| parsed.strings).unwrap_or_default();
         let response = merged(request, Stage::Response, extra);
         let (decision, _response_hold) = gate(&shared, response).await;
         match decision {
             Decision::Discard => return,
             Decision::Reject(message) => {
-                if !write_response(&mut socket, 200, &rejection(&id, &message))
-                    .await
-                {
+                if !write_response(&mut socket, 200, &rejection(&id, &message)).await {
                     return;
                 }
             }
@@ -908,11 +787,7 @@ async fn accept_ws(listener: TcpListener, upstream: String, shared: Shared) {
         let Ok((socket, _)) = listener.accept().await else {
             return;
         };
-        let handle = tokio::task::spawn_local(serve_ws(
-            socket,
-            upstream.clone(),
-            shared.clone(),
-        ));
+        let handle = tokio::task::spawn_local(serve_ws(socket, upstream.clone(), shared.clone()));
         shared.borrow_mut().track(handle);
     }
 }
@@ -930,12 +805,7 @@ fn response_operation(
                 op.method = method.to_owned();
                 op
             }
-            None => operation(
-                Transport::Ws,
-                Stage::Notification,
-                method,
-                parsed.strings,
-            ),
+            None => operation(Transport::Ws, Stage::Notification, method, parsed.strings),
         };
     }
     let request = parsed
@@ -958,8 +828,7 @@ async fn serve_ws(socket: TcpStream, upstream: String, shared: Shared) {
     let Ok(client) = tokio_tungstenite::accept_async(socket).await else {
         return;
     };
-    let Ok((server, _)) = tokio_tungstenite::connect_async(&upstream).await
-    else {
+    let Ok((server, _)) = tokio_tungstenite::connect_async(&upstream).await else {
         return;
     };
     let (mut client_sink, mut client_stream) = client.split();

@@ -30,8 +30,7 @@ pub use context::{BaseCtx, ChainCtx, ErClient, ErCtx, TxSender};
 pub use report::ScenarioReport;
 pub use resources::LaunchRecord;
 pub use scenario::{
-    run_private_er_scenario, run_shared_scenario, PrivateErScenario, RunRecord,
-    Scenario,
+    run_private_er_scenario, run_shared_scenario, PrivateErScenario, RunRecord, Scenario,
 };
 pub use solana_rpc_client as rpc_client;
 pub use solana_rpc_client_api as rpc_client_api;

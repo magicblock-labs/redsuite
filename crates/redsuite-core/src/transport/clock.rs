@@ -53,11 +53,7 @@ impl SendClock {
         Some(now.saturating_sub(stamp - 1).min(u64::from(u32::MAX)) as u32)
     }
 
-    pub fn stamped<D: Delivery>(
-        self: &Arc<Self>,
-        id: u64,
-        inner: D,
-    ) -> Stamped<D> {
+    pub fn stamped<D: Delivery>(self: &Arc<Self>, id: u64, inner: D) -> Stamped<D> {
         Stamped::new(Some(self.clone()), id, inner)
     }
 }

@@ -140,9 +140,7 @@ impl Verifier {
             shutdown: started.elapsed(),
             needed_sigkill,
             exit_code: exit_status.code(),
-            exit_signal: std::os::unix::process::ExitStatusExt::signal(
-                &exit_status,
-            ),
+            exit_signal: std::os::unix::process::ExitStatusExt::signal(&exit_status),
         })
     }
 
@@ -232,28 +230,21 @@ impl ReplicatedTopology {
     }
 
     pub fn running_verifiers(&self) -> usize {
-        self.verifiers
-            .iter()
-            .filter(|verifier| verifier.is_running())
-            .count()
+        self.verifiers.iter().filter(|verifier| verifier.is_running()).count()
     }
 
     pub async fn leader_connections(&self) -> Result<f64> {
         let metrics = self.leader.ctx().scrape_metrics().await?;
-        metrics.get(SERVER_CONNECTIONS).ok_or_else(|| {
-            format!("the leader exposes no {SERVER_CONNECTIONS} metric").into()
-        })
+        metrics
+            .get(SERVER_CONNECTIONS)
+            .ok_or_else(|| format!("the leader exposes no {SERVER_CONNECTIONS} metric").into())
     }
 
-    pub async fn wait_verifiers_connected(
-        &self,
-        timeout: Duration,
-    ) -> Result<Duration> {
+    pub async fn wait_verifiers_connected(&self, timeout: Duration) -> Result<Duration> {
         let started = Instant::now();
         let deadline = tokio::time::Instant::now() + timeout;
         for verifier in self.verifiers.iter().filter(|v| v.is_running()) {
-            let remaining =
-                deadline.saturating_duration_since(tokio::time::Instant::now());
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             verifier.wait_connected(remaining).await?;
         }
         let expected = self.running_verifiers() as f64;
@@ -273,10 +264,7 @@ impl ReplicatedTopology {
     }
 
     pub async fn finish(self) -> Result<()> {
-        let Self {
-            mut verifiers,
-            leader,
-        } = self;
+        let Self { mut verifiers, leader } = self;
         let mut first_error = None;
         for verifier in verifiers.iter_mut() {
             if let Err(error) = verifier.finish().await {
@@ -294,16 +282,12 @@ impl ReplicatedTopology {
     }
 }
 
-pub async fn replicated(
-    base: &BaseCtx,
-    options: ReplicatedOptions,
-) -> Result<ReplicatedTopology> {
+pub async fn replicated(base: &BaseCtx, options: ReplicatedOptions) -> Result<ReplicatedTopology> {
     if options.verifiers == 0 {
         return Err("a replicated topology needs at least one verifier".into());
     }
     let verifier_bin = config::find_verifier_bin()?;
-    let identities: Vec<Keypair> =
-        (0..options.verifiers).map(|_| Keypair::new()).collect();
+    let identities: Vec<Keypair> = (0..options.verifiers).map(|_| Keypair::new()).collect();
     let leader = leader_er(
         base,
         ErOptions {
@@ -312,16 +296,12 @@ pub async fn replicated(
             request_timeout: options.request_timeout,
             ..ErOptions::default()
         },
-        identities
-            .iter()
-            .map(|identity| identity.pubkey())
-            .collect(),
+        identities.iter().map(|identity| identity.pubkey()).collect(),
     )
     .await?;
 
     let dir = state::stack_dir();
-    let (bin_version, bin_fingerprint) =
-        report::binary_provenance(&verifier_bin);
+    let (bin_version, bin_fingerprint) = report::binary_provenance(&verifier_bin);
 
     let mut verifiers = Vec::with_capacity(options.verifiers);
     for (index, identity) in identities.into_iter().enumerate() {
@@ -333,12 +313,7 @@ pub async fn replicated(
         let plan = VerifierPlan {
             bin: verifier_bin.clone(),
             config_path: config::config_path(&dir, &label),
-            params: config::verifier_params(
-                leader.params(),
-                identity,
-                metrics_port,
-                storage_dir,
-            ),
+            params: config::verifier_params(leader.params(), identity, metrics_port, storage_dir),
         };
         let log = dir.join(format!("er-{label}.log"));
         debug!(%label, "starting verifier");

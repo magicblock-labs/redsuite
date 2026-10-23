@@ -11,9 +11,7 @@ use solana_program::{
     program_error::ProgramError,
 };
 
-use crate::layout::{
-    DATA_OFFSET, HASH_OFFSET, HASH_SIZE, ID_OFFSET, OWNER_PUBKEY_SIZE,
-};
+use crate::layout::{DATA_OFFSET, HASH_OFFSET, HASH_SIZE, ID_OFFSET, OWNER_PUBKEY_SIZE};
 
 fn prepare_buffer(index: &mut usize, target: &mut [u8], data: &[u8]) {
     target[*index..*index + data.len()].copy_from_slice(data);
@@ -90,11 +88,7 @@ pub fn init_account(
     Ok(())
 }
 
-pub fn delegate_account(
-    accs: &[AccountInfo],
-    seed: u8,
-    authority: Pubkey,
-) -> ProgramResult {
+pub fn delegate_account(accs: &[AccountInfo], seed: u8, authority: Pubkey) -> ProgramResult {
     let [payer, pda, owner_program, buffer, delegation_record, delegation_metadata, delegation_program, system_program, base] =
         accs
     else {
@@ -112,11 +106,7 @@ pub fn delegate_account(
     };
 
     verify_account_owner(payer, accounts.pda)?;
-    let seeds = crate::utils::pda_seed(
-        accounts.pda.data_len() as u32,
-        seed,
-        &authority,
-    );
+    let seeds = crate::utils::pda_seed(accounts.pda.data_len() as u32, seed, &authority);
     let seeds = [base.key.as_ref(), &seeds];
     let pda = *accounts.pda.key;
     let config = DelegateConfig {
@@ -128,10 +118,7 @@ pub fn delegate_account(
     Ok(())
 }
 
-pub fn simple_byte_set(
-    iter: &mut std::slice::Iter<AccountInfo>,
-    id: u64,
-) -> ProgramResult {
+pub fn simple_byte_set(iter: &mut std::slice::Iter<AccountInfo>, id: u64) -> ProgramResult {
     let mut count = 0;
     let mut total_bytes = 0;
 
@@ -222,10 +209,7 @@ pub fn expensive_hash_compute(
     Ok(())
 }
 
-pub fn account_data_copy(
-    iter: &mut std::slice::Iter<AccountInfo>,
-    id: u64,
-) -> ProgramResult {
+pub fn account_data_copy(iter: &mut std::slice::Iter<AccountInfo>, id: u64) -> ProgramResult {
     let accounts = iter.as_slice();
     if accounts.is_empty() {
         return Err(ProgramError::NotEnoughAccountKeys);
@@ -257,12 +241,10 @@ pub fn account_data_copy(
         let mut index = DATA_OFFSET;
         prepare_buffer(&mut index, &mut dst_data, &buffer);
 
-        let copy_len =
-            (src_data.len() - DATA_OFFSET).min(dst_data.len() - index);
+        let copy_len = (src_data.len() - DATA_OFFSET).min(dst_data.len() - index);
         if copy_len > 0 {
-            dst_data[index..index + copy_len].copy_from_slice(
-                &src_data[DATA_OFFSET..DATA_OFFSET + copy_len],
-            );
+            dst_data[index..index + copy_len]
+                .copy_from_slice(&src_data[DATA_OFFSET..DATA_OFFSET + copy_len]);
             total_bytes += copy_len;
         }
     }
@@ -277,10 +259,7 @@ pub fn account_data_copy(
     Ok(())
 }
 
-pub fn read_accounts_data(
-    iter: &mut std::slice::Iter<AccountInfo>,
-    id: u64,
-) -> ProgramResult {
+pub fn read_accounts_data(iter: &mut std::slice::Iter<AccountInfo>, id: u64) -> ProgramResult {
     while let Ok(account) = next_account_info(iter) {
         msg!(
             "account {} has {} space, txn: {}",
@@ -292,11 +271,7 @@ pub fn read_accounts_data(
     Ok(())
 }
 
-pub fn hash_fold(
-    iter: &mut std::slice::Iter<AccountInfo>,
-    id: u64,
-    iters: u32,
-) -> ProgramResult {
+pub fn hash_fold(iter: &mut std::slice::Iter<AccountInfo>, id: u64, iters: u32) -> ProgramResult {
     let accounts = iter.as_slice();
     if accounts.is_empty() {
         return Err(ProgramError::NotEnoughAccountKeys);
@@ -355,22 +330,17 @@ pub fn commit_accounts(
     Ok(())
 }
 
-pub fn undelegate(
-    program_id: &Pubkey,
-    accounts: &[AccountInfo],
-    data: &[u8],
-) -> ProgramResult {
+pub fn undelegate(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     let iter = &mut accounts.iter();
     let delegated_account = next_account_info(iter)?;
     let buffer = next_account_info(iter)?;
     let payer = next_account_info(iter)?;
     let system_program = next_account_info(iter)?;
 
-    let account_seeds =
-        <Vec<Vec<u8>>>::try_from_slice(data).map_err(|err| {
-            msg!("ERROR: failed to parse account seeds {:?}", err);
-            ProgramError::InvalidArgument
-        })?;
+    let account_seeds = <Vec<Vec<u8>>>::try_from_slice(data).map_err(|err| {
+        msg!("ERROR: failed to parse account seeds {:?}", err);
+        ProgramError::InvalidArgument
+    })?;
 
     undelegate_account(
         delegated_account,

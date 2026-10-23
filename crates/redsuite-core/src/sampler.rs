@@ -1,5 +1,6 @@
 use std::{thread::JoinHandle, time::Duration};
 
+use derive_more::Display;
 use futures_util::future::{AbortHandle, Abortable};
 use tokio::sync::{oneshot, watch};
 use tracing::{info, warn, Instrument, Span};
@@ -9,22 +10,13 @@ use crate::{
     check, Result,
 };
 
-#[derive(Default)]
+#[derive(Default, Display)]
+#[display("{observations}/{scrapes} observations, {failures} failed scrapes")]
 pub struct Sampled<T> {
     pub value: T,
     pub scrapes: usize,
     pub failures: usize,
     pub observations: usize,
-}
-
-impl<T> std::fmt::Display for Sampled<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}/{} observations, {} failed scrapes",
-            self.observations, self.scrapes, self.failures
-        )
-    }
 }
 
 #[derive(PartialEq, Eq)]
@@ -60,15 +52,11 @@ impl<T: Default + Send + 'static> Sampler<T> {
                     match collector.scrape().await {
                         Ok(metrics) => {
                             if consecutive_failures != 0 {
-                                info!(
-                                    consecutive_failures,
-                                    "metrics scraping recovered",
-                                );
+                                info!(consecutive_failures, "metrics scraping recovered",);
                                 consecutive_failures = 0;
                             }
-                            samples.observations += usize::from(
-                                observe(&metrics, &mut samples.value).is_some(),
-                            )
+                            samples.observations +=
+                                usize::from(observe(&metrics, &mut samples.value).is_some())
                         }
                         Err(error) => {
                             samples.failures += 1;
@@ -98,15 +86,14 @@ impl<T: Default + Send + 'static> Sampler<T> {
                     );
                 }
                 samples
-            }.instrument(span);
+            }
+            .instrument(span);
             let output = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .map_err(Into::into)
                 .and_then(|runtime| {
-                    runtime
-                        .block_on(Abortable::new(sampling, registration))
-                        .map_err(Into::into)
+                    runtime.block_on(Abortable::new(sampling, registration)).map_err(Into::into)
                 });
             let _ = done.send(output);
         });
@@ -120,9 +107,7 @@ impl<T: Default + Send + 'static> Sampler<T> {
 
     pub async fn finish(mut self) -> Result<Sampled<T>> {
         let _ = self.stop.send(true);
-        (&mut self.result)
-            .await
-            .map_err(|_| "metrics sampler worker failed")?
+        (&mut self.result).await.map_err(|_| "metrics sampler worker failed")?
     }
 
     pub async fn finish_complete(self, what: &str) -> Result<Sampled<T>> {

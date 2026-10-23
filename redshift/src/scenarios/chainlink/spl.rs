@@ -2,8 +2,8 @@ use instruction::{AccountMeta, Instruction};
 use pubkey::Pubkey;
 use redsuite_core::{system, ChainCtx, Result};
 use sdk::spl::builders::{
-    DelegateEphemeralAtaBuilder, DepositSplTokensBuilder,
-    InitializeEphemeralAtaBuilder, InitializeGlobalVaultBuilder,
+    DelegateEphemeralAtaBuilder, DepositSplTokensBuilder, InitializeEphemeralAtaBuilder,
+    InitializeGlobalVaultBuilder,
 };
 
 pub(crate) const MINT_LEN: u64 = 82;
@@ -26,11 +26,7 @@ pub(crate) fn eata_program() -> Pubkey {
 }
 
 pub(crate) fn derive_eata(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
-    Pubkey::find_program_address(
-        &[owner.as_ref(), mint.as_ref()],
-        &eata_program(),
-    )
-    .0
+    Pubkey::find_program_address(&[owner.as_ref(), mint.as_ref()], &eata_program()).0
 }
 
 pub(crate) fn derive_global_vault(mint: &Pubkey) -> Pubkey {
@@ -45,11 +41,7 @@ pub(crate) fn derive_ata(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
     .0
 }
 
-pub(crate) fn ensure_magic_ata(
-    payer: Pubkey,
-    owner: Pubkey,
-    mint: Pubkey,
-) -> Instruction {
+pub(crate) fn ensure_magic_ata(payer: Pubkey, owner: Pubkey, mint: Pubkey) -> Instruction {
     Instruction {
         program_id: eata_program(),
         accounts: vec![
@@ -84,10 +76,7 @@ pub(crate) fn allocate_mint(payer: &Pubkey, mint: &Pubkey) -> Instruction {
     system::create_account(payer, mint, MINT_RENT, MINT_LEN, &token_program())
 }
 
-pub(crate) fn initialize_mint(
-    mint: &Pubkey,
-    authority: &Pubkey,
-) -> Instruction {
+pub(crate) fn initialize_mint(mint: &Pubkey, authority: &Pubkey) -> Instruction {
     let mut data = vec![20u8, 0u8];
     data.extend_from_slice(authority.as_ref());
     data.push(0);
@@ -98,11 +87,7 @@ pub(crate) fn initialize_mint(
     }
 }
 
-pub(crate) fn create_ata_idempotent(
-    funder: &Pubkey,
-    owner: &Pubkey,
-    mint: &Pubkey,
-) -> Instruction {
+pub(crate) fn create_ata_idempotent(funder: &Pubkey, owner: &Pubkey, mint: &Pubkey) -> Instruction {
     Instruction {
         program_id: ata_program(),
         accounts: vec![
@@ -136,17 +121,11 @@ pub(crate) fn mint_to(
     }
 }
 
-pub(crate) async fn token_balance(
-    ctx: &impl ChainCtx,
-    account: &Pubkey,
-) -> Result<Option<u64>> {
+pub(crate) async fn token_balance(ctx: &impl ChainCtx, account: &Pubkey) -> Result<Option<u64>> {
     let Some(account) = ctx.account(account).await? else {
         return Ok(None);
     };
-    let Some(bytes) = account
-        .data
-        .get(TOKEN_AMOUNT_OFFSET..TOKEN_AMOUNT_OFFSET + 8)
-    else {
+    let Some(bytes) = account.data.get(TOKEN_AMOUNT_OFFSET..TOKEN_AMOUNT_OFFSET + 8) else {
         return Ok(None);
     };
     Ok(Some(u64::from_le_bytes(bytes.try_into()?)))
@@ -190,22 +169,11 @@ pub(crate) fn approve(
     }
 }
 
-pub(crate) fn initialize_global_vault(
-    payer: &Pubkey,
-    mint: &Pubkey,
-) -> Instruction {
-    InitializeGlobalVaultBuilder {
-        payer: *payer,
-        mint: *mint,
-    }
-    .instruction()
+pub(crate) fn initialize_global_vault(payer: &Pubkey, mint: &Pubkey) -> Instruction {
+    InitializeGlobalVaultBuilder { payer: *payer, mint: *mint }.instruction()
 }
 
-pub(crate) fn initialize_eata(
-    payer: &Pubkey,
-    user: &Pubkey,
-    mint: &Pubkey,
-) -> Instruction {
+pub(crate) fn initialize_eata(payer: &Pubkey, user: &Pubkey, mint: &Pubkey) -> Instruction {
     InitializeEphemeralAtaBuilder {
         payer: *payer,
         user: *user,
@@ -214,11 +182,7 @@ pub(crate) fn initialize_eata(
     .instruction()
 }
 
-pub(crate) fn deposit_spl_tokens(
-    user: &Pubkey,
-    mint: &Pubkey,
-    amount: u64,
-) -> Instruction {
+pub(crate) fn deposit_spl_tokens(user: &Pubkey, mint: &Pubkey, amount: u64) -> Instruction {
     DepositSplTokensBuilder {
         authority: *user,
         user: *user,
@@ -228,11 +192,7 @@ pub(crate) fn deposit_spl_tokens(
     .instruction()
 }
 
-pub(crate) fn withdraw_spl_tokens(
-    user: &Pubkey,
-    mint: &Pubkey,
-    amount: u64,
-) -> Instruction {
+pub(crate) fn withdraw_spl_tokens(user: &Pubkey, mint: &Pubkey, amount: u64) -> Instruction {
     let vault = derive_global_vault(mint);
     let mut data = vec![3u8];
     data.extend_from_slice(&amount.to_le_bytes());

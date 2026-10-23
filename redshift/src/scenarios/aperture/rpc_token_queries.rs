@@ -17,9 +17,7 @@ use redsuite_core::{
     BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
 use signer::Signer;
-use solana_account_decoder_client_types::{
-    UiAccount, UiAccountData, UiAccountEncoding,
-};
+use solana_account_decoder_client_types::{UiAccount, UiAccountData, UiAccountEncoding};
 use solana_commitment_config::CommitmentConfig;
 
 use crate::scenarios::chainlink::spl;
@@ -103,14 +101,8 @@ fn read_u64(data: &[u8], offset: usize) -> Option<u64> {
 }
 
 fn read_delegate(data: &[u8]) -> Option<Pubkey> {
-    let tag = u32::from_le_bytes(
-        data.get(DELEGATE_OFFSET..DELEGATE_OFFSET + 4)?
-            .try_into()
-            .ok()?,
-    );
-    (tag == 1)
-        .then(|| read_pubkey(data, DELEGATE_OFFSET + 4))
-        .flatten()
+    let tag = u32::from_le_bytes(data.get(DELEGATE_OFFSET..DELEGATE_OFFSET + 4)?.try_into().ok()?);
+    (tag == 1).then(|| read_pubkey(data, DELEGATE_OFFSET + 4)).flatten()
 }
 
 fn raw_data(account: &UiAccount) -> Result<Vec<u8>> {
@@ -118,9 +110,7 @@ fn raw_data(account: &UiAccount) -> Result<Vec<u8>> {
         UiAccountData::Binary(encoded, UiAccountEncoding::Base64) => {
             Ok(base64::engine::general_purpose::STANDARD.decode(encoded)?)
         }
-        other => {
-            Err(format!("expected base64 account data, got {other:?}").into())
-        }
+        other => Err(format!("expected base64 account data, got {other:?}").into()),
     }
 }
 
@@ -179,13 +169,10 @@ fn token_view(account: &UiAccount) -> Result<TokenView> {
                 owner: read_pubkey(&data, spl::OWNER_OFFSET),
                 amount: read_u64(&data, 64),
                 delegate,
-                delegated_amount: delegate
-                    .and_then(|_| read_u64(&data, DELEGATED_AMOUNT_OFFSET)),
+                delegated_amount: delegate.and_then(|_| read_u64(&data, DELEGATED_AMOUNT_OFFSET)),
             })
         }
-        other => {
-            Err(format!("unsupported token account encoding {other:?}").into())
-        }
+        other => Err(format!("unsupported token account encoding {other:?}").into()),
     }
 }
 
@@ -215,16 +202,12 @@ fn check_token_account(
                 "{label}: delegated amount"
             )?;
         }
-        None => {
-            check!(view.delegate.is_none(), "{label}: no delegate expected")?
-        }
+        None => check!(view.delegate.is_none(), "{label}: no delegate expected")?,
     }
     Ok(view.encoding)
 }
 
-fn program_accounts_config(
-    filters: Vec<RpcFilterType>,
-) -> RpcProgramAccountsConfig {
+fn program_accounts_config(filters: Vec<RpcFilterType>) -> RpcProgramAccountsConfig {
     RpcProgramAccountsConfig {
         filters: Some(filters),
         account_config: RpcAccountInfoConfig {
@@ -238,11 +221,7 @@ fn program_accounts_config(
     }
 }
 
-async fn run_query(
-    client: &RpcClient,
-    fixture: &Fixture,
-    query: Query,
-) -> Result<()> {
+async fn run_query(client: &RpcClient, fixture: &Fixture, query: Query) -> Result<()> {
     match query {
         Query::ProgramAccountsByMint => {
             let accounts = client
@@ -257,10 +236,8 @@ async fn run_query(
                     ]),
                 )
                 .await?;
-            let listed: BTreeSet<String> = accounts
-                .iter()
-                .map(|(pubkey, _)| pubkey.to_string())
-                .collect();
+            let listed: BTreeSet<String> =
+                accounts.iter().map(|(pubkey, _)| pubkey.to_string()).collect();
             check_eq!(
                 listed,
                 expected(&[fixture.ata_a, fixture.ata_b]),
@@ -308,10 +285,8 @@ async fn run_query(
                     ]),
                 )
                 .await?;
-            let listed: BTreeSet<String> = accounts
-                .iter()
-                .map(|(pubkey, _)| pubkey.to_string())
-                .collect();
+            let listed: BTreeSet<String> =
+                accounts.iter().map(|(pubkey, _)| pubkey.to_string()).collect();
             check_eq!(
                 listed,
                 expected(&[fixture.ata_a, fixture.ata_a_other]),
@@ -324,10 +299,8 @@ async fn run_query(
                 Query::BalanceA => (fixture.ata_a, OWNER_A_BALANCE),
                 _ => (fixture.ata_b, OWNER_B_BALANCE),
             };
-            let balance = client
-                .get_token_account_balance_with_commitment(&ata, confirmed())
-                .await?
-                .value;
+            let balance =
+                client.get_token_account_balance_with_commitment(&ata, confirmed()).await?.value;
             check_eq!(
                 balance.amount,
                 amount.to_string(),
@@ -367,11 +340,7 @@ async fn run_query(
                 ),
             };
             let accounts = client
-                .get_token_accounts_by_owner_with_commitment(
-                    &owner,
-                    filter,
-                    confirmed(),
-                )
+                .get_token_accounts_by_owner_with_commitment(&owner, filter, confirmed())
                 .await?
                 .value;
             check_eq!(
@@ -380,28 +349,23 @@ async fn run_query(
                 "{label}: exactly the materialized accounts"
             )?;
             for entry in &accounts {
-                let (mint, amount, delegate) =
-                    if entry.pubkey == fixture.ata_a.to_string() {
-                        (
-                            fixture.mint,
-                            OWNER_A_BALANCE,
-                            Some((&fixture.delegate, DELEGATED_AMOUNT)),
-                        )
-                    } else if entry.pubkey == fixture.ata_b.to_string() {
-                        (fixture.mint, OWNER_B_BALANCE, None)
-                    } else {
-                        (fixture.other_mint, OTHER_MINT_BALANCE, None)
-                    };
-                check_token_account(
-                    &label, entry, &mint, &owner, amount, delegate,
-                )?;
+                let (mint, amount, delegate) = if entry.pubkey == fixture.ata_a.to_string() {
+                    (
+                        fixture.mint,
+                        OWNER_A_BALANCE,
+                        Some((&fixture.delegate, DELEGATED_AMOUNT)),
+                    )
+                } else if entry.pubkey == fixture.ata_b.to_string() {
+                    (fixture.mint, OWNER_B_BALANCE, None)
+                } else {
+                    (fixture.other_mint, OTHER_MINT_BALANCE, None)
+                };
+                check_token_account(&label, entry, &mint, &owner, amount, delegate)?;
             }
         }
         Query::DelegateByMint | Query::DelegateByProgram => {
             let filter = match query {
-                Query::DelegateByMint => {
-                    TokenAccountsFilter::Mint(fixture.mint)
-                }
+                Query::DelegateByMint => TokenAccountsFilter::Mint(fixture.mint),
                 _ => TokenAccountsFilter::ProgramId(spl::token_program()),
             };
             let accounts = client
@@ -435,21 +399,14 @@ async fn expect_rejection<T: std::fmt::Debug>(
     label: &str,
     needles: &[&str],
     call: impl std::future::Future<
-        Output = std::result::Result<
-            T,
-            redsuite_core::rpc_client_api::client_error::Error,
-        >,
+        Output = std::result::Result<T, redsuite_core::rpc_client_api::client_error::Error>,
     >,
 ) -> Result<()> {
     let outcome = tokio::time::timeout(NEGATIVE_DEADLINE, call)
         .await
-        .map_err(|_| {
-            format!("{label} did not answer within {NEGATIVE_DEADLINE:?}")
-        })?;
+        .map_err(|_| format!("{label} did not answer within {NEGATIVE_DEADLINE:?}"))?;
     match outcome {
-        Ok(value) => {
-            Err(format!("{label} must be rejected, got {value:?}").into())
-        }
+        Ok(value) => Err(format!("{label} must be rejected, got {value:?}").into()),
         Err(error) => {
             let message = error.to_string();
             check!(
@@ -469,10 +426,7 @@ impl Scenario for RpcTokenQueries {
     }
 
     async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<()> {
-        let client = RpcClient::new_with_commitment(
-            er.api().url().to_owned(),
-            confirmed(),
-        );
+        let client = RpcClient::new_with_commitment(er.api().url().to_owned(), confirmed());
         let fee_payer = prep::funded_payer(base, AIRDROP).await?;
         let owner_a = Keypair::new();
         let owner_b = Keypair::new();
@@ -492,14 +446,8 @@ impl Scenario for RpcTokenQueries {
             unrelated_owner: unrelated_owner.pubkey(),
             ata_a: spl::derive_ata(&owner_a.pubkey(), &mint.pubkey()),
             ata_b: spl::derive_ata(&owner_b.pubkey(), &mint.pubkey()),
-            ata_a_other: spl::derive_ata(
-                &owner_a.pubkey(),
-                &other_mint.pubkey(),
-            ),
-            ata_unrelated: spl::derive_ata(
-                &unrelated_owner.pubkey(),
-                &mint.pubkey(),
-            ),
+            ata_a_other: spl::derive_ata(&owner_a.pubkey(), &other_mint.pubkey()),
+            ata_unrelated: spl::derive_ata(&unrelated_owner.pubkey(), &mint.pubkey()),
         };
         let payer = fee_payer.pubkey();
 
@@ -511,26 +459,10 @@ impl Scenario for RpcTokenQueries {
                 spl::initialize_mint(&fixture.mint, &fixture.owner_a),
                 spl::allocate_mint(&payer, &fixture.other_mint),
                 spl::initialize_mint(&fixture.other_mint, &fixture.owner_a),
-                spl::create_ata_idempotent(
-                    &payer,
-                    &fixture.owner_a,
-                    &fixture.mint,
-                ),
-                spl::create_ata_idempotent(
-                    &payer,
-                    &fixture.owner_b,
-                    &fixture.mint,
-                ),
-                spl::create_ata_idempotent(
-                    &payer,
-                    &fixture.owner_a,
-                    &fixture.other_mint,
-                ),
-                spl::create_ata_idempotent(
-                    &payer,
-                    &fixture.unrelated_owner,
-                    &fixture.mint,
-                ),
+                spl::create_ata_idempotent(&payer, &fixture.owner_a, &fixture.mint),
+                spl::create_ata_idempotent(&payer, &fixture.owner_b, &fixture.mint),
+                spl::create_ata_idempotent(&payer, &fixture.owner_a, &fixture.other_mint),
+                spl::create_ata_idempotent(&payer, &fixture.unrelated_owner, &fixture.mint),
                 spl::mint_to(
                     &fixture.mint,
                     &fixture.ata_a,
@@ -572,34 +504,16 @@ impl Scenario for RpcTokenQueries {
             &fee_payer,
             &[&owner_a, &owner_b],
             &[
-                spl::deposit_spl_tokens(
-                    &fixture.owner_a,
-                    &fixture.mint,
-                    OWNER_A_BALANCE,
-                ),
-                spl::deposit_spl_tokens(
-                    &fixture.owner_b,
-                    &fixture.mint,
-                    OWNER_B_BALANCE,
-                ),
+                spl::deposit_spl_tokens(&fixture.owner_a, &fixture.mint, OWNER_A_BALANCE),
+                spl::deposit_spl_tokens(&fixture.owner_b, &fixture.mint, OWNER_B_BALANCE),
             ],
         )
         .await?;
         base.submit_and_confirm(
             &fee_payer,
             &[
-                spl::delegate_eata(
-                    &payer,
-                    &fixture.owner_a,
-                    &fixture.mint,
-                    &er.identity(),
-                ),
-                spl::delegate_eata(
-                    &payer,
-                    &fixture.owner_b,
-                    &fixture.mint,
-                    &er.identity(),
-                ),
+                spl::delegate_eata(&payer, &fixture.owner_a, &fixture.mint, &er.identity()),
+                spl::delegate_eata(&payer, &fixture.owner_b, &fixture.mint, &er.identity()),
             ],
         )
         .await?;
@@ -610,24 +524,12 @@ impl Scenario for RpcTokenQueries {
             MATERIALIZATION_TIMEOUT,
             || async {
                 matches!(er.account(&fixture.mint).await, Ok(Some(_)))
-                    && matches!(
-                        er.account(&fixture.other_mint).await,
-                        Ok(Some(_))
-                    )
-                    && spl::token_balance(er, &fixture.ata_a)
-                        .await
-                        .ok()
-                        .flatten()
+                    && matches!(er.account(&fixture.other_mint).await, Ok(Some(_)))
+                    && spl::token_balance(er, &fixture.ata_a).await.ok().flatten()
                         == Some(OWNER_A_BALANCE)
-                    && spl::token_balance(er, &fixture.ata_b)
-                        .await
-                        .ok()
-                        .flatten()
+                    && spl::token_balance(er, &fixture.ata_b).await.ok().flatten()
                         == Some(OWNER_B_BALANCE)
-                    && spl::token_balance(er, &fixture.ata_a_other)
-                        .await
-                        .ok()
-                        .flatten()
+                    && spl::token_balance(er, &fixture.ata_a_other).await.ok().flatten()
                         == Some(OTHER_MINT_BALANCE)
             },
         )
@@ -659,16 +561,12 @@ impl Scenario for RpcTokenQueries {
         )
         .await?;
 
-        let reads = join_all((0..READS).map(|index| {
-            run_query(&client, &fixture, CYCLE[index % CYCLE.len()])
-        }));
+        let reads = join_all(
+            (0..READS).map(|index| run_query(&client, &fixture, CYCLE[index % CYCLE.len()])),
+        );
         let outcomes = tokio::time::timeout(BURST_DEADLINE, reads)
             .await
-            .map_err(|_| {
-                format!(
-                    "the burst of {READS} reads exceeded {BURST_DEADLINE:?}"
-                )
-            })?;
+            .map_err(|_| format!("the burst of {READS} reads exceeded {BURST_DEADLINE:?}"))?;
         let mut failures = 0u64;
         let mut first_failure = None;
         for (index, outcome) in outcomes.iter().enumerate() {
@@ -677,10 +575,7 @@ impl Scenario for RpcTokenQueries {
                 Err(error) => {
                     failures += 1;
                     first_failure.get_or_insert_with(|| {
-                        format!(
-                            "read {index} ({}) failed: {error}",
-                            index % CYCLE.len()
-                        )
+                        format!("read {index} ({}) failed: {error}", index % CYCLE.len())
                     });
                 }
             }
@@ -736,10 +631,7 @@ impl Scenario for RpcTokenQueries {
         expect_rejection(
             "getTokenAccountBalance on a missing account",
             &["token account not found", "not a token account"],
-            client.get_token_account_balance_with_commitment(
-                &missing_mint,
-                confirmed(),
-            ),
+            client.get_token_account_balance_with_commitment(&missing_mint, confirmed()),
         )
         .await?;
 

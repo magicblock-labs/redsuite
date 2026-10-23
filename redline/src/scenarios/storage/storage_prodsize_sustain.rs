@@ -9,8 +9,7 @@ use redsuite_core::{
     report,
     report::Unit,
     runner::{execute, Pacing, RunConfig, RunOutcome},
-    topology, BaseCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
-    TxSender,
+    topology, BaseCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport, TxSender,
 };
 use tracing::{debug, warn};
 
@@ -58,10 +57,7 @@ const FULL: Profile = Profile {
     frequent_superblock_slots: 400,
 };
 
-const PROFILES: ProfileValues<Profile> = ProfileValues {
-    lite: LITE,
-    full: FULL,
-};
+const PROFILES: ProfileValues<Profile> = ProfileValues { lite: LITE, full: FULL };
 
 struct WindowOutcome {
     outcome: RunOutcome,
@@ -123,14 +119,11 @@ impl Scenario<ScenarioReport> for StorageProdsizeSustain {
 
     async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
         let profile = PROFILES.select(base.config().profile);
-        let prep_payers =
-            prep::funded_payers(base, profile.payers, PREP_PAYER_LAMPORTS)
-                .await?;
+        let prep_payers = prep::funded_payers(base, profile.payers, PREP_PAYER_LAMPORTS).await?;
         let pool = Accounts::new(crate::ACCOUNT_SPACE, er.identity())
             .init_batched(base, &prep_payers, profile.accounts, true)
             .await?;
-        let payers: Vec<Rc<keypair::Keypair>> =
-            prep_payers.into_iter().map(Rc::new).collect();
+        let payers: Vec<Rc<keypair::Keypair>> = prep_payers.into_iter().map(Rc::new).collect();
 
         let cells_spec = [
             ("prod_cadence", PROD_SUPERBLOCK_SLOTS),
@@ -152,24 +145,14 @@ impl Scenario<ScenarioReport> for StorageProdsizeSustain {
             )
             .await?;
             let cell_er = private.ctx();
-            prep::await_clones(
-                cell_er,
-                &pool,
-                crate::ACCOUNT_SPACE as usize,
-                CLONE_TIMEOUT,
-            )
-            .await?;
-            let senders: Vec<TxSender> = payers
-                .iter()
-                .map(|payer| cell_er.sender(payer.clone()))
-                .collect();
+            prep::await_clones(cell_er, &pool, crate::ACCOUNT_SPACE as usize, CLONE_TIMEOUT)
+                .await?;
+            let senders: Vec<TxSender> =
+                payers.iter().map(|payer| cell_er.sender(payer.clone())).collect();
 
             let storage_at_boot = host::dir_size_bytes(private.storage_dir())?;
-            let ledger_txs_at_boot = cell_er
-                .scrape_metrics()
-                .await?
-                .get(LEDGER_TRANSACTIONS_GAUGE)
-                .unwrap_or(0.0);
+            let ledger_txs_at_boot =
+                cell_er.scrape_metrics().await?.get(LEDGER_TRANSACTIONS_GAUGE).unwrap_or(0.0);
             let fill = execute(
                 RunConfig {
                     iterations: profile.fill,
@@ -207,15 +190,11 @@ impl Scenario<ScenarioReport> for StorageProdsizeSustain {
                 },
             )
             .await?;
-            let fill_ledger_txs = cell_er
-                .scrape_metrics()
-                .await?
-                .get(LEDGER_TRANSACTIONS_GAUGE)
-                .unwrap_or(0.0)
-                - ledger_txs_at_boot;
+            let fill_ledger_txs =
+                cell_er.scrape_metrics().await?.get(LEDGER_TRANSACTIONS_GAUGE).unwrap_or(0.0)
+                    - ledger_txs_at_boot;
             let fill_growth_bytes =
-                host::dir_size_bytes(private.storage_dir())?
-                    .saturating_sub(storage_at_boot);
+                host::dir_size_bytes(private.storage_dir())?.saturating_sub(storage_at_boot);
 
             let window_a = execute_window(
                 cell_er,
@@ -248,30 +227,23 @@ impl Scenario<ScenarioReport> for StorageProdsizeSustain {
                 cell.fill_ledger_txs, "storage sustain cell finished",
             );
 
-            let mut cell_report =
-                ScenarioReport::ok(&format!("{}/{}", self.name(), cell.name))
-                    .setting("profile", profile.name)
-                    .setting("superblock slots", cell.superblock_slots)
-                    .setting("block time", "50ms")
-                    .setting("payers", profile.payers)
-                    .setting("accounts", profile.accounts)
-                    .setting("fill iters", profile.fill)
-                    .setting("window iters", profile.window)
-                    .setting("offered tps", profile.rate)
-                    .setting("concurrency", profile.concurrency)
-                    .metric(
-                        "fill storage growth mb",
-                        Unit::Megabytes,
-                        cell.fill_growth_bytes as f64 / 1e6,
-                    )
-                    .metric(
-                        "fill ledger txs",
-                        Unit::Count,
-                        cell.fill_ledger_txs,
-                    );
-            for (window_name, window) in
-                [("A", &cell.windows[0]), ("B", &cell.windows[1])]
-            {
+            let mut cell_report = ScenarioReport::ok(&format!("{}/{}", self.name(), cell.name))
+                .setting("profile", profile.name)
+                .setting("superblock slots", cell.superblock_slots)
+                .setting("block time", "50ms")
+                .setting("payers", profile.payers)
+                .setting("accounts", profile.accounts)
+                .setting("fill iters", profile.fill)
+                .setting("window iters", profile.window)
+                .setting("offered tps", profile.rate)
+                .setting("concurrency", profile.concurrency)
+                .metric(
+                    "fill storage growth mb",
+                    Unit::Megabytes,
+                    cell.fill_growth_bytes as f64 / 1e6,
+                )
+                .metric("fill ledger txs", Unit::Count, cell.fill_ledger_txs);
+            for (window_name, window) in [("A", &cell.windows[0]), ("B", &cell.windows[1])] {
                 cell_report = cell_report
                     .observe(
                         format!("window {window_name} delivery us"),
@@ -313,16 +285,12 @@ impl Scenario<ScenarioReport> for StorageProdsizeSustain {
                     window.outcome.first_error
                 )?;
             }
-            let window_a_p50_us =
-                cell.windows[0].outcome.delivery.median.max(1) as f64;
-            let window_b_p50_us =
-                cell.windows[1].outcome.delivery.median as f64;
+            let window_a_p50_us = cell.windows[0].outcome.delivery.median.max(1) as f64;
+            let window_b_p50_us = cell.windows[1].outcome.delivery.median as f64;
             if window_b_p50_us > window_a_p50_us * FLATNESS_P50_FACTOR {
                 warn!(
                     cell.name,
-                    window_a_p50_us,
-                    window_b_p50_us,
-                    "median latency drifted across equal windows",
+                    window_a_p50_us, window_b_p50_us, "median latency drifted across equal windows",
                 );
             }
         }

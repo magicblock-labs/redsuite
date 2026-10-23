@@ -13,12 +13,9 @@ use redsuite_core::{
     redline::Accounts,
     report,
     report::Unit,
-    runner::{
-        execute, Pacing, RunConfig, RunOutcome, SendTransaction, REQUEST_ORIGIN,
-    },
+    runner::{execute, Pacing, RunConfig, RunOutcome, SendTransaction, REQUEST_ORIGIN},
     stats::{ObservationsStats, StreamingStats},
-    topology, BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario,
-    ScenarioReport, TxSender,
+    topology, BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport, TxSender,
 };
 use tracing::{debug, warn};
 
@@ -30,10 +27,8 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const SLOW_THRESHOLD: Duration = Duration::from_millis(100);
 const MIN_COLD_WARM_RATIO: f64 = 10.0;
 
-const ENSURE_ACCOUNT_HISTOGRAM: &str =
-    r#"mbv_ensure_accounts_time{kind="account"}"#;
-const ENSURE_TX_HISTOGRAM: &str =
-    r#"mbv_ensure_accounts_time{kind="transaction"}"#;
+const ENSURE_ACCOUNT_HISTOGRAM: &str = r#"mbv_ensure_accounts_time{kind="account"}"#;
+const ENSURE_TX_HISTOGRAM: &str = r#"mbv_ensure_accounts_time{kind="transaction"}"#;
 
 struct Profile {
     name: &'static str,
@@ -62,10 +57,7 @@ const FULL: Profile = Profile {
     prep_payers: 8,
 };
 
-const PROFILES: ProfileValues<Profile> = ProfileValues {
-    lite: LITE,
-    full: FULL,
-};
+const PROFILES: ProfileValues<Profile> = ProfileValues { lite: LITE, full: FULL };
 
 async fn touch_pass(er: &ErCtx, pool: &[Pubkey]) -> Result<ObservationsStats> {
     let mut latencies = StreamingStats::new();
@@ -75,10 +67,7 @@ async fn touch_pass(er: &ErCtx, pool: &[Pubkey]) -> Result<ObservationsStats> {
         latencies.push(started.elapsed().as_micros() as u32);
         let data_len = fetched.map(|account| account.data.len()).unwrap_or(0);
         if data_len != ACCOUNT_SPACE as usize {
-            return Err(format!(
-                "hydration broken: {account} read back {data_len} bytes"
-            )
-            .into());
+            return Err(format!("hydration broken: {account} read back {data_len} bytes").into());
         }
     }
     Ok(latencies.finalize(false))
@@ -110,18 +99,12 @@ async fn burst_cell(
     )
     .await?;
     let cell_er = private.ctx();
-    let senders: Vec<TxSender> = payers
-        .iter()
-        .map(|payer| cell_er.sender(payer.clone()))
-        .collect();
+    let senders: Vec<TxSender> = payers.iter().map(|payer| cell_er.sender(payer.clone())).collect();
 
     if prewarm_deps {
         for sender in &senders {
             let warm_ix =
-                crate::program::instruction::build::read_accounts_data(
-                    0,
-                    &[prewarm_account],
-                );
+                crate::program::instruction::build::read_accounts_data(0, &[prewarm_account]);
             sender.submit(&[warm_ix]).await?;
         }
     }
@@ -131,10 +114,7 @@ async fn burst_cell(
     let request = |id: u64| {
         let sender = senders[(id as usize) % senders.len()].clone();
         let account = pool[(id as usize - 1) % pool.len()];
-        let ix = crate::program::instruction::build::read_accounts_data(
-            id,
-            &[account],
-        );
+        let ix = crate::program::instruction::build::read_accounts_data(id, &[account]);
         let slow = slow.clone();
         async move {
             let tx = sender.prepare(&[ix]).await?;
@@ -180,8 +160,7 @@ impl Scenario<ScenarioReport> for ColdHydrationTail {
     async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
         let profile = PROFILES.select(base.config().profile);
         let prep_payers =
-            prep::funded_payers(base, profile.prep_payers, PREP_PAYER_LAMPORTS)
-                .await?;
+            prep::funded_payers(base, profile.prep_payers, PREP_PAYER_LAMPORTS).await?;
         let all_accounts = Accounts::new(ACCOUNT_SPACE, er.identity())
             .init_batched(
                 base,
@@ -220,20 +199,19 @@ impl Scenario<ScenarioReport> for ColdHydrationTail {
             warn!(warm.quantile95, "warm read p95 exceeds latency bound");
         }
 
-        let touch_report =
-            ScenarioReport::ok(&format!("{}/cold_vs_warm", self.name()))
-                .setting("profile", profile.name)
-                .setting("accounts", profile.cold_accounts)
-                .setting("account space", ACCOUNT_SPACE)
-                .latency_origin(REQUEST_ORIGIN)
-                .observe("cold first-touch us", Unit::Micros, cold)
-                .observe("warm repeat us", Unit::Micros, warm)
-                .metric("collapse ratio", Unit::Ratio, collapse_ratio)
-                .metric_if(
-                    "validator ensure (account) avg s",
-                    Unit::Seconds,
-                    touch_delta.histogram_avg(ENSURE_ACCOUNT_HISTOGRAM),
-                );
+        let touch_report = ScenarioReport::ok(&format!("{}/cold_vs_warm", self.name()))
+            .setting("profile", profile.name)
+            .setting("accounts", profile.cold_accounts)
+            .setting("account space", ACCOUNT_SPACE)
+            .latency_origin(REQUEST_ORIGIN)
+            .observe("cold first-touch us", Unit::Micros, cold)
+            .observe("warm repeat us", Unit::Micros, warm)
+            .metric("collapse ratio", Unit::Ratio, collapse_ratio)
+            .metric_if(
+                "validator ensure (account) avg s",
+                Unit::Seconds,
+                touch_delta.histogram_avg(ENSURE_ACCOUNT_HISTOGRAM),
+            );
         report::persist_cell(self.name(), &touch_report);
 
         let burst_payers: Vec<Rc<Keypair>> =
@@ -265,15 +243,12 @@ impl Scenario<ScenarioReport> for ColdHydrationTail {
         )
         .await?;
 
-        for (cell_name, outcome) in [
-            ("burst cold-deps", &cold_deps),
-            ("burst warm-deps", &warm_deps),
-        ] {
+        for (cell_name, outcome) in
+            [("burst cold-deps", &cold_deps), ("burst warm-deps", &warm_deps)]
+        {
             debug!(
                 cell_name,
-                outcome.outcome.failed,
-                outcome.slow,
-                "dependency hydration cell finished",
+                outcome.outcome.failed, outcome.slow, "dependency hydration cell finished",
             );
             check_eq!(
                 outcome.outcome.failed,
@@ -285,41 +260,28 @@ impl Scenario<ScenarioReport> for ColdHydrationTail {
         if warm_deps.slow > cold_deps.slow {
             warn!(
                 warm_deps.slow,
-                cold_deps.slow,
-                "warm dependency tail exceeded cold dependency tail",
+                cold_deps.slow, "warm dependency tail exceeded cold dependency tail",
             );
         }
 
-        for (slug, outcome) in [
-            ("burst_cold_deps", &cold_deps),
-            ("burst_warm_deps", &warm_deps),
-        ] {
-            let cell_report =
-                ScenarioReport::ok(&format!("{}/{slug}", self.name()))
-                    .setting("profile", profile.name)
-                    .setting("burst accounts", half)
-                    .setting("payers", profile.burst_payers)
-                    .setting("concurrency", profile.burst_concurrency)
-                    .setting("account space", ACCOUNT_SPACE)
-                    .setting("slow threshold ms", SLOW_THRESHOLD.as_millis())
-                    .observe(
-                        "delivery us",
-                        Unit::Micros,
-                        outcome.outcome.delivery,
-                    )
-                    .client_side(&outcome.outcome)
-                    .metric(
-                        "delivered",
-                        Unit::Count,
-                        outcome.outcome.delivered as f64,
-                    )
-                    .metric("slow (>100ms)", Unit::Count, outcome.slow as f64)
-                    .metric("burst wall s", Unit::Seconds, outcome.wall_s)
-                    .metric_if(
-                        "validator ensure (tx) avg s",
-                        Unit::Seconds,
-                        outcome.ensure_avg_s,
-                    );
+        for (slug, outcome) in [("burst_cold_deps", &cold_deps), ("burst_warm_deps", &warm_deps)] {
+            let cell_report = ScenarioReport::ok(&format!("{}/{slug}", self.name()))
+                .setting("profile", profile.name)
+                .setting("burst accounts", half)
+                .setting("payers", profile.burst_payers)
+                .setting("concurrency", profile.burst_concurrency)
+                .setting("account space", ACCOUNT_SPACE)
+                .setting("slow threshold ms", SLOW_THRESHOLD.as_millis())
+                .observe("delivery us", Unit::Micros, outcome.outcome.delivery)
+                .client_side(&outcome.outcome)
+                .metric("delivered", Unit::Count, outcome.outcome.delivered as f64)
+                .metric("slow (>100ms)", Unit::Count, outcome.slow as f64)
+                .metric("burst wall s", Unit::Seconds, outcome.wall_s)
+                .metric_if(
+                    "validator ensure (tx) avg s",
+                    Unit::Seconds,
+                    outcome.ensure_avg_s,
+                );
             report::persist_cell(self.name(), &cell_report);
         }
 
@@ -347,15 +309,7 @@ impl Scenario<ScenarioReport> for ColdHydrationTail {
                 Unit::Micros,
                 warm_deps.outcome.delivery.quantile95 as f64,
             )
-            .metric(
-                "burst cold-deps >100ms",
-                Unit::Count,
-                cold_deps.slow as f64,
-            )
-            .metric(
-                "burst warm-deps >100ms",
-                Unit::Count,
-                warm_deps.slow as f64,
-            ))
+            .metric("burst cold-deps >100ms", Unit::Count, cold_deps.slow as f64)
+            .metric("burst warm-deps >100ms", Unit::Count, warm_deps.slow as f64))
     }
 }

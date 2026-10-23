@@ -20,16 +20,11 @@ const COMMITTEE_CLONE_TIMEOUT: Duration = Duration::from_secs(15);
 
 const PREP_CONCURRENCY: usize = 32;
 
-pub async fn funded_payer(
-    ctx: &impl ChainCtx,
-    lamports: u64,
-) -> Result<Keypair> {
+pub async fn funded_payer(ctx: &impl ChainCtx, lamports: u64) -> Result<Keypair> {
     let payer = Keypair::new();
     ctx.airdrop(&payer.pubkey(), lamports)
         .await
-        .map_err(|error| {
-            format!("funding payer {}: {error}", payer.pubkey())
-        })?;
+        .map_err(|error| format!("funding payer {}: {error}", payer.pubkey()))?;
     Ok(payer)
 }
 
@@ -41,11 +36,7 @@ pub async fn funded_payers(
     bounded(count, "payer", |_| funded_payer(ctx, lamports)).await
 }
 
-pub(crate) async fn bounded<T, F, Fut>(
-    count: usize,
-    what: &str,
-    make: F,
-) -> Result<Vec<T>>
+pub(crate) async fn bounded<T, F, Fut>(count: usize, what: &str, make: F) -> Result<Vec<T>>
 where
     F: Fn(usize) -> Fut,
     Fut: std::future::Future<Output = Result<T>>,
@@ -54,9 +45,7 @@ where
     futures_util::stream::iter(0..count)
         .map(|index| {
             make(index).map_err(move |error| {
-                DynError::from(format!(
-                    "preparing {what} {index} of {count}: {error}"
-                ))
+                DynError::from(format!("preparing {what} {index} of {count}: {error}"))
             })
         })
         .buffered(PREP_CONCURRENCY)
@@ -154,11 +143,11 @@ pub async fn init_committees(
             COMMIT_FREQUENCY_MS,
             Some(validator),
         );
-        base.submit_and_confirm_with(payer, &[&player], &[init, delegate])
-            .await?;
-        let on_base = base.account(&pda).await?.ok_or(
-            "the committee pda is not on base after init and delegate",
-        )?;
+        base.submit_and_confirm_with(payer, &[&player], &[init, delegate]).await?;
+        let on_base = base
+            .account(&pda)
+            .await?
+            .ok_or("the committee pda is not on base after init and delegate")?;
         crate::check_eq!(
             on_base.owner,
             dlp::dlp_id(),
@@ -169,12 +158,8 @@ pub async fn init_committees(
     Ok(committees)
 }
 
-pub async fn await_committee_clones(
-    er: &ErCtx,
-    committees: &[Committee],
-) -> Result<()> {
-    let pdas: Vec<Pubkey> =
-        committees.iter().map(|committee| committee.pda).collect();
+pub async fn await_committee_clones(er: &ErCtx, committees: &[Committee]) -> Result<()> {
+    let pdas: Vec<Pubkey> = committees.iter().map(|committee| committee.pda).collect();
     await_clones(er, &pdas, MainAccount::SIZE, COMMITTEE_CLONE_TIMEOUT).await
 }
 
@@ -188,9 +173,7 @@ pub async fn await_clones(
         check::poll(
             &format!("the ER clones the delegated pda {pda}"),
             timeout,
-            || async {
-                matches!(er.account(pda).await, Ok(Some(acc)) if acc.data.len() == space)
-            },
+            || async { matches!(er.account(pda).await, Ok(Some(acc)) if acc.data.len() == space) },
         )
         .await?;
     }
@@ -217,21 +200,13 @@ pub async fn prewarm(
     await_clones(er, accounts, space, timeout).await
 }
 
-pub async fn await_cloned_payers(
-    er: &ErCtx,
-    payers: &[Pubkey],
-    timeout: Duration,
-) -> Result<()> {
+pub async fn await_cloned_payers(er: &ErCtx, payers: &[Pubkey], timeout: Duration) -> Result<()> {
     bounded(payers.len(), "cloned payer", |index| {
         let payer = payers[index];
         async move {
-            check::poll(
-                &format!("the ER clones payer {payer}"),
-                timeout,
-                || async {
-                    matches!(er.account(&payer).await, Ok(Some(acc)) if acc.lamports > 0)
-                },
-            )
+            check::poll(&format!("the ER clones payer {payer}"), timeout, || async {
+                matches!(er.account(&payer).await, Ok(Some(acc)) if acc.lamports > 0)
+            })
             .await?;
             Ok(())
         }
@@ -240,18 +215,13 @@ pub async fn await_cloned_payers(
     Ok(())
 }
 
-pub async fn await_program_clone(
-    er: &ErCtx,
-    program: &Pubkey,
-    timeout: Duration,
-) -> Result<()> {
+pub async fn await_program_clone(er: &ErCtx, program: &Pubkey, timeout: Duration) -> Result<()> {
     check::poll(
         &format!("the er clones the program {program} as executable"),
         timeout,
-        || async {
-            matches!(er.account(program).await, Ok(Some(clone)) if clone.executable)
-        },
-    ).await?;
+        || async { matches!(er.account(program).await, Ok(Some(clone)) if clone.executable) },
+    )
+    .await?;
     Ok(())
 }
 
@@ -264,14 +234,7 @@ pub fn flexi_counter(
     let (init, counter) = flexi::init_counter(owner, label);
     (
         counter,
-        [
-            init,
-            flexi::delegate_counter(
-                owner,
-                commit_frequency_ms,
-                Some(validator),
-            ),
-        ],
+        [init, flexi::delegate_counter(owner, commit_frequency_ms, Some(validator))],
     )
 }
 
@@ -297,8 +260,7 @@ pub async fn delegate_payer(
         system::assign(&delegatee_pubkey, &dlp::dlp_id()),
         dlp::delegate_account(&funder.pubkey(), &delegatee_pubkey, &validator),
     ];
-    ctx.submit_and_confirm_with(funder, &[delegatee], &delegate_setup)
-        .await?;
+    ctx.submit_and_confirm_with(funder, &[delegatee], &delegate_setup).await?;
     let on_chain = ctx
         .account(&delegatee_pubkey)
         .await?

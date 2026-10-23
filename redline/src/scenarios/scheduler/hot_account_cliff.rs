@@ -58,10 +58,7 @@ const FULL: Profile = Profile {
     concurrency: 2_048,
 };
 
-const PROFILES: ProfileValues<Profile> = ProfileValues {
-    lite: LITE,
-    full: FULL,
-};
+const PROFILES: ProfileValues<Profile> = ProfileValues { lite: LITE, full: FULL };
 
 // same read-write 3/tx shape as S1, confined to the hot set
 // (hot-set sizes are powers of two — coprime with the stride)
@@ -98,8 +95,7 @@ impl Scenario<ScenarioReport> for HotAccountCliff {
     async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
         let profile = PROFILES.select(base.config().profile);
         let pool = *profile.cells.iter().max().unwrap();
-        let payers =
-            prep::funded_payers(base, profile.payers, PAYER_LAMPORTS).await?;
+        let payers = prep::funded_payers(base, profile.payers, PAYER_LAMPORTS).await?;
         let pdas = Accounts::new(crate::ACCOUNT_SPACE, er.identity())
             .init_delegated(base, &payers[0], pool)
             .await?;
@@ -116,8 +112,7 @@ impl Scenario<ScenarioReport> for HotAccountCliff {
         let mut offset = 0u64;
         let mut cells: Vec<CellResult> = Vec::new();
         for &hot in profile.cells {
-            let hot_set: Arc<Vec<Pubkey>> =
-                Arc::new(pdas[..hot as usize].to_vec());
+            let hot_set: Arc<Vec<Pubkey>> = Arc::new(pdas[..hot as usize].to_vec());
 
             let count_before_warmup = er.scrape_metrics().await?.get(TX_COUNT);
             let warm = execute_cell(
@@ -140,12 +135,7 @@ impl Scenario<ScenarioReport> for HotAccountCliff {
             )?;
             offset += profile.warmup;
             if let Some(seen) = count_before_warmup {
-                crate::await_executed(
-                    er,
-                    seen + profile.warmup as f64,
-                    DRAIN_TIMEOUT,
-                )
-                .await?;
+                crate::await_executed(er, seen + profile.warmup as f64, DRAIN_TIMEOUT).await?;
             }
 
             let before = er.scrape_metrics().await?;
@@ -169,18 +159,11 @@ impl Scenario<ScenarioReport> for HotAccountCliff {
                 outcome.first_error
             )?;
             if let Some(seen) = before.get(TX_COUNT) {
-                crate::await_executed(
-                    er,
-                    seen + profile.iterations as f64,
-                    DRAIN_TIMEOUT,
-                )
-                .await?;
+                crate::await_executed(er, seen + profile.iterations as f64, DRAIN_TIMEOUT).await?;
             }
             let after = er.scrape_metrics().await?;
             let delta = MetricsDelta::new(before, after);
-            if let Some(failed) =
-                delta.counter_all(crate::metrics::FAILED_TRANSACTIONS)
-            {
+            if let Some(failed) = delta.counter_all(crate::metrics::FAILED_TRANSACTIONS) {
                 check_eq!(
                     failed,
                     0.0,
@@ -195,42 +178,34 @@ impl Scenario<ScenarioReport> for HotAccountCliff {
                 "hot account cell finished",
             );
 
-            let cell_report =
-                ScenarioReport::ok(&format!("{}/hot{hot}", self.name()))
-                    .setting("profile", profile.name)
-                    .setting("hot accounts", hot)
-                    .setting(
-                        "shape",
-                        "read-write 3/tx (1 src + 2 dst data-copy)",
-                    )
-                    .setting("driver threads", profile.threads)
-                    .setting("measured iters", profile.iterations)
-                    .setting("offered tps", profile.rate)
-                    .setting("concurrency", profile.concurrency)
-                    .observe("delivery us", Unit::Micros, cell.outcome.delivery)
-                    .client_side(&cell.outcome)
-                    .metric(
-                        "achieved tps",
-                        Unit::Tps,
-                        cell.outcome.achieved_rps(),
-                    )
-                    .metric_if(
-                        "validator tx processing avg us",
-                        Unit::Micros,
-                        delta
-                            .histogram_avg("mbv_transaction_processing_time")
-                            .map(|seconds| seconds * 1e6),
-                    )
-                    .metric_if(
-                        "max lock contention queue",
-                        Unit::Count,
-                        delta.gauge("mbv_max_lock_contention_queue_size"),
-                    )
-                    .metric_if(
-                        "validator txs in window",
-                        Unit::Count,
-                        delta.counter(crate::metrics::ENGINE_TRANSACTIONS),
-                    );
+            let cell_report = ScenarioReport::ok(&format!("{}/hot{hot}", self.name()))
+                .setting("profile", profile.name)
+                .setting("hot accounts", hot)
+                .setting("shape", "read-write 3/tx (1 src + 2 dst data-copy)")
+                .setting("driver threads", profile.threads)
+                .setting("measured iters", profile.iterations)
+                .setting("offered tps", profile.rate)
+                .setting("concurrency", profile.concurrency)
+                .observe("delivery us", Unit::Micros, cell.outcome.delivery)
+                .client_side(&cell.outcome)
+                .metric("achieved tps", Unit::Tps, cell.outcome.achieved_rps())
+                .metric_if(
+                    "validator tx processing avg us",
+                    Unit::Micros,
+                    delta
+                        .histogram_avg("mbv_transaction_processing_time")
+                        .map(|seconds| seconds * 1e6),
+                )
+                .metric_if(
+                    "max lock contention queue",
+                    Unit::Count,
+                    delta.gauge("mbv_max_lock_contention_queue_size"),
+                )
+                .metric_if(
+                    "validator txs in window",
+                    Unit::Count,
+                    delta.counter(crate::metrics::ENGINE_TRANSACTIONS),
+                );
             report::persist_cell(self.name(), &cell_report);
             cells.push(cell);
         }
@@ -267,8 +242,7 @@ impl Scenario<ScenarioReport> for HotAccountCliff {
             .find(|cell| p50(cell) > baseline_p50_us * CLIFF_FACTOR)
             .map(|cell| cell.hot);
 
-        let cell_names: Vec<String> =
-            profile.cells.iter().map(|hot| hot.to_string()).collect();
+        let cell_names: Vec<String> = profile.cells.iter().map(|hot| hot.to_string()).collect();
         let mut summary = ScenarioReport::ok(self.name())
             .setting("profile", profile.name)
             .setting("cells", cell_names.join("/"))

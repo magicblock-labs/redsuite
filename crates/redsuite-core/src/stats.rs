@@ -61,27 +61,21 @@ impl StreamingStats {
         let combined_weight = own_weight + other_weight;
         let delta = other.mean - self.mean;
         self.mean += delta * other_weight / combined_weight;
-        self.m2 += other.m2
-            + delta * delta * own_weight * other_weight / combined_weight;
+        self.m2 += other.m2 + delta * delta * own_weight * other_weight / combined_weight;
         self.min = self.min.min(other.min);
         self.max = self.max.max(other.max);
         self.merge_reservoir(other.reservoir, other.count);
         self.count += other.count;
     }
 
-    fn merge_reservoir(
-        &mut self,
-        mut other_reservoir: Vec<u32>,
-        other_count: usize,
-    ) {
+    fn merge_reservoir(&mut self, mut other_reservoir: Vec<u32>, other_count: usize) {
         if self.reservoir.len() + other_reservoir.len() <= self.reservoir_size {
             self.reservoir.append(&mut other_reservoir);
             return;
         }
         let mut own_reservoir = std::mem::take(&mut self.reservoir);
         let own_value_weight = self.count as f64 / own_reservoir.len() as f64;
-        let other_value_weight =
-            other_count as f64 / other_reservoir.len() as f64;
+        let other_value_weight = other_count as f64 / other_reservoir.len() as f64;
         let mut merged = Vec::with_capacity(self.reservoir_size);
         while merged.len() < self.reservoir_size
             && !(own_reservoir.is_empty() && other_reservoir.is_empty())
@@ -91,12 +85,9 @@ impl StreamingStats {
             } else if other_reservoir.is_empty() {
                 &mut own_reservoir
             } else {
-                let own_remaining =
-                    own_reservoir.len() as f64 * own_value_weight;
-                let other_remaining =
-                    other_reservoir.len() as f64 * other_value_weight;
-                let draw =
-                    self.rng.gen_range(0.0..own_remaining + other_remaining);
+                let own_remaining = own_reservoir.len() as f64 * own_value_weight;
+                let other_remaining = other_reservoir.len() as f64 * other_value_weight;
+                let draw = self.rng.gen_range(0.0..own_remaining + other_remaining);
                 if draw < own_remaining {
                     &mut own_reservoir
                 } else {
@@ -129,17 +120,10 @@ impl StreamingStats {
         } else {
             q95_count.saturating_sub(1).min(self.reservoir.len() - 1)
         };
-        let quantile95 = if !self.reservoir.is_empty() {
-            self.reservoir[p95_idx] as i32
-        } else {
-            avg
-        };
+        let quantile95 =
+            if !self.reservoir.is_empty() { self.reservoir[p95_idx] as i32 } else { avg };
 
-        let variance = if self.count > 1 {
-            self.m2 / self.count as f64
-        } else {
-            0.0
-        };
+        let variance = if self.count > 1 { self.m2 / self.count as f64 } else { 0.0 };
         let stddev = variance.sqrt() as u32;
 
         ObservationsStats {

@@ -3,9 +3,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use keypair::Keypair;
 use pubkey::Pubkey;
-use redshift_interface::flexi::{
-    build as flexi, FlexiCounter, ACTOR_ESCROW_INDEX,
-};
+use redshift_interface::flexi::{build as flexi, FlexiCounter, ACTOR_ESCROW_INDEX};
 use redsuite_core::{
     check, check_eq, dlp,
     netfault::{BaseProxies, RuleHandle, Selector},
@@ -20,8 +18,7 @@ use signer::Signer;
 use crate::program::DELEGATION_PROGRAM_ID;
 
 use super::{
-    hold_nonces, prove_landed, write_and_commit, BASE_CONFIRM_TIMEOUT,
-    BASE_STATE_TIMEOUT,
+    hold_nonces, prove_landed, write_and_commit, BASE_CONFIRM_TIMEOUT, BASE_STATE_TIMEOUT,
 };
 
 const LABEL: &str = "commit-exactly-once";
@@ -50,10 +47,7 @@ struct FaultedCommit<'a> {
 }
 
 async fn base_count(base: &BaseCtx, counter: &Pubkey) -> Result<u64> {
-    let account = base
-        .account(counter)
-        .await?
-        .ok_or("the base counter is missing")?;
+    let account = base.account(counter).await?.ok_or("the base counter is missing")?;
     Ok(FlexiCounter::try_decode(&account.data)?.count)
 }
 
@@ -80,17 +74,10 @@ async fn hold_count(
     }
 }
 
-fn withhold_confirmations(
-    proxies: &BaseProxies,
-    signature: &Signature,
-) -> [RuleHandle; 2] {
+fn withhold_confirmations(proxies: &BaseProxies, signature: &Signature) -> [RuleHandle; 2] {
     [
-        proxies.stall(
-            Selector::method("getSignatureStatuses")
-                .http()
-                .response()
-                .signature(signature),
-        ),
+        proxies
+            .stall(Selector::method("getSignatureStatuses").http().response().signature(signature)),
         proxies.stall(
             Selector::method("signatureNotification")
                 .ws()
@@ -116,12 +103,7 @@ async fn settled_receipt(
         )
         .await?
     } else {
-        receipt::fetch_commit_receipt(
-            er.api(),
-            commit_signature,
-            RECEIPT_TIMEOUT,
-        )
-        .await?
+        receipt::fetch_commit_receipt(er.api(), commit_signature, RECEIPT_TIMEOUT).await?
     };
     check!(
         !receipt.failure_is_duplicate_rejection(),
@@ -130,12 +112,7 @@ async fn settled_receipt(
         receipt.error_message
     )?;
     super::require_settled(&receipt, phase)?;
-    receipt::confirm_base_signatures(
-        base.api(),
-        &receipt,
-        BASE_CONFIRM_TIMEOUT,
-    )
-    .await?;
+    receipt::confirm_base_signatures(base.api(), &receipt, BASE_CONFIRM_TIMEOUT).await?;
     Ok(receipt)
 }
 
@@ -147,19 +124,10 @@ async fn commit_blackout(
     account: Pubkey,
     faulted: FaultedCommit<'_>,
 ) -> Result<()> {
-    let FaultedCommit {
-        phase,
-        commit_id,
-        write,
-        restart,
-    } = faulted;
+    let FaultedCommit { phase, commit_id, write, restart } = faulted;
     let nonce_before = crate::last_commit_id(base, &account).await?;
-    let submission = proxies.intercept(
-        Selector::method("sendTransaction")
-            .http()
-            .response()
-            .account(&account),
-    );
+    let submission =
+        proxies.intercept(Selector::method("sendTransaction").http().response().account(&account));
     let (snapshot, commit_signature) =
         write_and_commit(er, payer, commit_id, write, &account).await?;
     let held = submission.wait(INTERCEPT_TIMEOUT).await?;
@@ -189,9 +157,7 @@ async fn commit_blackout(
     for rule in confirmations {
         rule.remove();
     }
-    let receipt =
-        settled_receipt(base, er, &commit_signature, restart_intent_id, phase)
-            .await?;
+    let receipt = settled_receipt(base, er, &commit_signature, restart_intent_id, phase).await?;
     check!(
         receipt.base_signatures.contains(&landed),
         "{phase}: the receipt must name the base transaction that landed \
@@ -199,10 +165,7 @@ async fn commit_blackout(
         receipt.base_signatures
     )?;
     hold_nonces(base, &[account], &[settled], SETTLE_WINDOW, phase).await?;
-    let on_base = base
-        .account(&account)
-        .await?
-        .ok_or("the delegated pda vanished from base")?;
+    let on_base = base.account(&account).await?.ok_or("the delegated pda vanished from base")?;
     check!(
         on_base.data == snapshot,
         "{phase}: the base copy must still carry the settled er snapshot"
@@ -226,9 +189,7 @@ async fn follow_up_commit(
     check::poll(
         "the base copy matches the er snapshot after the follow-up commit",
         BASE_STATE_TIMEOUT,
-        || async {
-            matches!(base.account(&account).await, Ok(Some(acc)) if acc.data == snapshot)
-        },
+        || async { matches!(base.account(&account).await, Ok(Some(acc)) if acc.data == snapshot) },
     )
     .await?;
     let nonce = crate::last_commit_id(base, &account).await?;
@@ -240,11 +201,7 @@ async fn follow_up_commit(
     Ok(())
 }
 
-async fn action_blackout(
-    proxies: &BaseProxies,
-    base: &BaseCtx,
-    er: &ErCtx,
-) -> Result<()> {
+async fn action_blackout(proxies: &BaseProxies, base: &BaseCtx, er: &ErCtx) -> Result<()> {
     let payer = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
     let (init, counter) = flexi::init_counter(payer.pubkey(), LABEL);
     base.submit_and_confirm(
@@ -264,12 +221,8 @@ async fn action_blackout(
         0,
         "the base counter starts at zero"
     )?;
-    let submission = proxies.intercept(
-        Selector::method("sendTransaction")
-            .http()
-            .response()
-            .account(&counter),
-    );
+    let submission =
+        proxies.intercept(Selector::method("sendTransaction").http().response().account(&counter));
     let intent_signature = er
         .submit_and_confirm(
             &payer,
@@ -283,10 +236,7 @@ async fn action_blackout(
         .await?;
     let held = submission.wait(INTERCEPT_TIMEOUT).await?;
     let landed = held.operation.signature()?;
-    let base_tx = base
-        .api()
-        .await_transaction(&landed, BASE_CONFIRM_TIMEOUT)
-        .await?;
+    let base_tx = base.api().await_transaction(&landed, BASE_CONFIRM_TIMEOUT).await?;
     check!(
         base_tx.err.is_none(),
         "the intercepted base action {landed} must succeed on base, got {:?}",
@@ -304,24 +254,15 @@ async fn action_blackout(
     for rule in confirmations {
         rule.remove();
     }
-    let receipt = receipt::fetch_commit_receipt(
-        er.api(),
-        &intent_signature,
-        RECEIPT_TIMEOUT,
-    )
-    .await?;
+    let receipt =
+        receipt::fetch_commit_receipt(er.api(), &intent_signature, RECEIPT_TIMEOUT).await?;
     if receipt.succeeded() {
         check!(
             !receipt.base_signatures.is_empty(),
             "a succeeded action receipt must name the base transaction it \
              confirmed"
         )?;
-        receipt::confirm_base_signatures(
-            base.api(),
-            &receipt,
-            BASE_CONFIRM_TIMEOUT,
-        )
-        .await?;
+        receipt::confirm_base_signatures(base.api(), &receipt, BASE_CONFIRM_TIMEOUT).await?;
     }
     hold_count(base, &counter, 1, SETTLE_WINDOW, "action settle").await?;
     Ok(())
@@ -337,24 +278,16 @@ impl Scenario for CommitExactlyOnce {
         let proxies = er.proxies().ok_or(super::PROXIED_GROUP)?;
         let identity = er.identity();
         let payer = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
-        let account =
-            crate::init_delegated_account(base, &payer, 0, identity).await?;
+        let account = crate::init_delegated_account(base, &payer, 0, identity).await?;
         let on_base = base.account(&account).await?.ok_or("pda not on base")?;
         check_eq!(
             on_base.owner,
             DELEGATION_PROGRAM_ID,
             "a delegated pda must be dlp-owned on base"
         )?;
-        prep::await_clones(
-            er,
-            &[account],
-            crate::ACCOUNT_SPACE as usize,
-            CLONE_TIMEOUT,
-        )
-        .await?;
+        prep::await_clones(er, &[account], crate::ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
 
-        follow_up_commit(base, er, &payer, account, 1, WARMUP_WRITE, "warm-up")
-            .await?;
+        follow_up_commit(base, er, &payer, account, 1, WARMUP_WRITE, "warm-up").await?;
         commit_blackout(
             proxies,
             base,

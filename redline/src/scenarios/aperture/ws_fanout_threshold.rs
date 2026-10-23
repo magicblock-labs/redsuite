@@ -65,16 +65,9 @@ const FULL: Profile = Profile {
     concurrency: 2_048,
 };
 
-const PROFILES: ProfileValues<Profile> = ProfileValues {
-    lite: LITE,
-    full: FULL,
-};
+const PROFILES: ProfileValues<Profile> = ProfileValues { lite: LITE, full: FULL };
 
-fn cell_expected_writes(
-    pool: &[Pubkey],
-    first_id: u64,
-    iterations: u64,
-) -> ExpectedWrites {
+fn cell_expected_writes(pool: &[Pubkey], first_id: u64, iterations: u64) -> ExpectedWrites {
     let mut expected: ExpectedWrites = HashMap::new();
     for id in first_id + 1..=first_id + iterations {
         let (_, dests) = copy_three(pool, id);
@@ -125,19 +118,11 @@ impl Scenario<ScenarioReport> for WsFanoutThreshold {
 
     async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
         let profile = PROFILES.select(base.config().profile);
-        let prep_payers =
-            prep::funded_payers(base, profile.payers, PREP_PAYER_LAMPORTS)
-                .await?;
+        let prep_payers = prep::funded_payers(base, profile.payers, PREP_PAYER_LAMPORTS).await?;
         let pool = Accounts::new(crate::ACCOUNT_SPACE, er.identity())
             .init_batched(base, &prep_payers, profile.accounts, true)
             .await?;
-        prep::await_clones(
-            er,
-            &pool,
-            crate::ACCOUNT_SPACE as usize,
-            CLONE_TIMEOUT,
-        )
-        .await?;
+        prep::await_clones(er, &pool, crate::ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
         let payer_bytes = prep::payer_bytes(&prep_payers);
         let pool: Arc<Vec<Pubkey>> = Arc::new(pool);
         let er_rpc_url = er.api().url().to_owned();
@@ -165,15 +150,8 @@ impl Scenario<ScenarioReport> for WsFanoutThreshold {
         let mut id_cursor = profile.warmup;
         let mut cells: Vec<CellOutcome> = Vec::new();
         for &connections in profile.ladder {
-            let clock = Arc::new(SendClock::new(
-                id_cursor + 1,
-                profile.iterations as usize,
-            ));
-            let expected = Arc::new(cell_expected_writes(
-                &pool,
-                id_cursor,
-                profile.iterations,
-            ));
+            let clock = Arc::new(SendClock::new(id_cursor + 1, profile.iterations as usize));
+            let expected = Arc::new(cell_expected_writes(&pool, id_cursor, profile.iterations));
             let subscribers = SubscriberPool::start(
                 er.ws_url(),
                 &pool,
@@ -184,9 +162,7 @@ impl Scenario<ScenarioReport> for WsFanoutThreshold {
                 Arc::new(crate::account_update_id),
                 LAG_THRESHOLD,
             );
-            subscribers
-                .await_subscribed(pool.len(), SUBSCRIBE_TIMEOUT)
-                .await?;
+            subscribers.await_subscribed(pool.len(), SUBSCRIBE_TIMEOUT).await?;
 
             let before = er.scrape_metrics().await?;
             let outcome = execute_cell(
@@ -209,33 +185,19 @@ impl Scenario<ScenarioReport> for WsFanoutThreshold {
                 outcome.first_error
             )?;
 
-            let missing_final =
-                subscribers.await_final(&expected, DRAIN_TIMEOUT).await;
+            let missing_final = subscribers.await_final(&expected, DRAIN_TIMEOUT).await;
             let incomplete = subscribers.incomplete(&expected);
             let after = er.scrape_metrics().await?;
             let delta = MetricsDelta::new(before, after);
             if let Some(error) = subscribers.first_error() {
-                return Err(format!(
-                    "ws{connections}: subscriber pool failed: {error}"
-                )
-                .into());
+                return Err(format!("ws{connections}: subscriber pool failed: {error}").into());
             }
             let conn_reports: Vec<ConnReport> = subscribers.finalize();
 
-            let received_min = conn_reports
-                .iter()
-                .map(|conn| conn.received)
-                .min()
-                .unwrap_or(0);
-            let received_max = conn_reports
-                .iter()
-                .map(|conn| conn.received)
-                .max()
-                .unwrap_or(0);
-            let received_total: u64 =
-                conn_reports.iter().map(|conn| conn.received).sum();
-            let over_threshold: u64 =
-                conn_reports.iter().map(|conn| conn.over_threshold).sum();
+            let received_min = conn_reports.iter().map(|conn| conn.received).min().unwrap_or(0);
+            let received_max = conn_reports.iter().map(|conn| conn.received).max().unwrap_or(0);
+            let received_total: u64 = conn_reports.iter().map(|conn| conn.received).sum();
+            let over_threshold: u64 = conn_reports.iter().map(|conn| conn.over_threshold).sum();
             let mut lag_stats = StreamingStats::new();
             for conn_report in conn_reports {
                 lag_stats.merge(conn_report.lag);
@@ -258,90 +220,60 @@ impl Scenario<ScenarioReport> for WsFanoutThreshold {
                 missing_final, incomplete, "fan-out cell finished",
             );
 
-            let cell_report =
-                ScenarioReport::ok(&format!("{}/ws{connections}", self.name()))
-                    .setting("profile", profile.name)
-                    .setting("ws connections", connections)
-                    .setting("subscriber threads", profile.subscriber_threads)
-                    .setting("driver threads", profile.threads)
-                    .setting(
-                        "shape",
-                        "read-write 3/tx (1 src + 2 dst data-copy)",
-                    )
-                    .setting("payers", profile.payers)
-                    .setting("accounts", profile.accounts)
-                    .setting("measured iters", profile.iterations)
-                    .setting("offered tps", profile.rate)
-                    .setting("concurrency", profile.concurrency)
-                    .setting("drain timeout s", DRAIN_TIMEOUT.as_secs())
-                    .observe(
-                        "delivery us",
-                        Unit::Micros,
-                        cell_outcome.outcome.delivery,
-                    )
-                    .client_side(&cell_outcome.outcome)
-                    .observe("fanout lag us", Unit::Micros, cell_outcome.lag)
-                    .metric(
-                        "achieved tps",
-                        Unit::Tps,
-                        cell_outcome.outcome.achieved_rps(),
-                    )
-                    .metric(
-                        "writes produced",
-                        Unit::Count,
-                        (profile.iterations * 2) as f64,
-                    )
-                    .metric(
-                        "received total",
-                        Unit::Count,
-                        received_total as f64,
-                    )
-                    .metric(
-                        "received per-conn min",
-                        Unit::Count,
-                        received_min as f64,
-                    )
-                    .metric(
-                        "received per-conn max",
-                        Unit::Count,
-                        received_max as f64,
-                    )
-                    .metric(
-                        "received per-conn spread",
-                        Unit::Count,
-                        (received_max - received_min) as f64,
-                    )
-                    .metric(
-                        "missing final states",
-                        Unit::Count,
-                        missing_final as f64,
-                    )
-                    .metric(
-                        "incomplete conn-account pairs",
-                        Unit::Count,
-                        incomplete as f64,
-                    )
-                    .metric(
-                        "notifications over 1s",
-                        Unit::Count,
-                        over_threshold as f64,
-                    )
-                    .metric_if(
-                        "validator txs in window",
-                        Unit::Count,
-                        delta.counter(crate::metrics::ENGINE_TRANSACTIONS),
-                    )
-                    .metric_if(
-                        "validator tx processing avg us",
-                        Unit::Micros,
-                        delta
-                            .histogram_avg("mbv_transaction_processing_time")
-                            .map(|seconds| seconds * 1e6),
-                    );
+            let cell_report = ScenarioReport::ok(&format!("{}/ws{connections}", self.name()))
+                .setting("profile", profile.name)
+                .setting("ws connections", connections)
+                .setting("subscriber threads", profile.subscriber_threads)
+                .setting("driver threads", profile.threads)
+                .setting("shape", "read-write 3/tx (1 src + 2 dst data-copy)")
+                .setting("payers", profile.payers)
+                .setting("accounts", profile.accounts)
+                .setting("measured iters", profile.iterations)
+                .setting("offered tps", profile.rate)
+                .setting("concurrency", profile.concurrency)
+                .setting("drain timeout s", DRAIN_TIMEOUT.as_secs())
+                .observe("delivery us", Unit::Micros, cell_outcome.outcome.delivery)
+                .client_side(&cell_outcome.outcome)
+                .observe("fanout lag us", Unit::Micros, cell_outcome.lag)
+                .metric(
+                    "achieved tps",
+                    Unit::Tps,
+                    cell_outcome.outcome.achieved_rps(),
+                )
+                .metric(
+                    "writes produced",
+                    Unit::Count,
+                    (profile.iterations * 2) as f64,
+                )
+                .metric("received total", Unit::Count, received_total as f64)
+                .metric("received per-conn min", Unit::Count, received_min as f64)
+                .metric("received per-conn max", Unit::Count, received_max as f64)
+                .metric(
+                    "received per-conn spread",
+                    Unit::Count,
+                    (received_max - received_min) as f64,
+                )
+                .metric("missing final states", Unit::Count, missing_final as f64)
+                .metric(
+                    "incomplete conn-account pairs",
+                    Unit::Count,
+                    incomplete as f64,
+                )
+                .metric("notifications over 1s", Unit::Count, over_threshold as f64)
+                .metric_if(
+                    "validator txs in window",
+                    Unit::Count,
+                    delta.counter(crate::metrics::ENGINE_TRANSACTIONS),
+                )
+                .metric_if(
+                    "validator tx processing avg us",
+                    Unit::Micros,
+                    delta
+                        .histogram_avg("mbv_transaction_processing_time")
+                        .map(|seconds| seconds * 1e6),
+                );
             report::persist_cell(self.name(), &cell_report);
-            if let Some(failed_txs) =
-                delta.counter_all(crate::metrics::FAILED_TRANSACTIONS)
-            {
+            if let Some(failed_txs) = delta.counter_all(crate::metrics::FAILED_TRANSACTIONS) {
                 check_eq!(
                     failed_txs,
                     0.0,
@@ -356,15 +288,13 @@ impl Scenario<ScenarioReport> for WsFanoutThreshold {
         if baseline.lag.quantile95 >= CLIFF_P95_US {
             warn!(
                 baseline.connections,
-                baseline.lag.quantile95,
-                "baseline already exceeds fan-out cliff threshold",
+                baseline.lag.quantile95, "baseline already exceeds fan-out cliff threshold",
             );
         }
         if baseline.missing_final > 0 {
             warn!(
                 baseline.connections,
-                baseline.missing_final,
-                "baseline subscriptions missed final state",
+                baseline.missing_final, "baseline subscriptions missed final state",
             );
         }
         if baseline.received_min != baseline.received_max {

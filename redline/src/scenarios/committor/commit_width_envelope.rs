@@ -17,8 +17,8 @@ use redsuite_core::{
     report::Unit,
     runner::{execute, Pacing, RunConfig, RunOutcome, SendTransaction},
     stats::StreamingStats,
-    topology, Api, BaseCtx, ChainCtx, CheckError, ErCtx, MetricsDelta, Result,
-    Scenario, ScenarioReport,
+    topology, Api, BaseCtx, ChainCtx, CheckError, ErCtx, MetricsDelta, Result, Scenario,
+    ScenarioReport,
 };
 use signer::Signer;
 use tracing::debug;
@@ -68,10 +68,7 @@ const FULL: Profile = Profile {
     probes: true,
 };
 
-const PROFILES: ProfileValues<Profile> = ProfileValues {
-    lite: LITE,
-    full: FULL,
-};
+const PROFILES: ProfileValues<Profile> = ProfileValues { lite: LITE, full: FULL };
 
 #[derive(Default)]
 struct CellTally {
@@ -93,9 +90,7 @@ struct CellSummary {
 fn commit_set(pdas: &[Pubkey], width: usize, id: u64) -> Vec<Pubkey> {
     let pool_len = pdas.len();
     let start_index = ((id as usize - 1) * width) % pool_len;
-    (0..width)
-        .map(|position| pdas[(start_index + position) % pool_len])
-        .collect()
+    (0..width).map(|position| pdas[(start_index + position) % pool_len]).collect()
 }
 
 enum SchedulingOutcome {
@@ -110,9 +105,7 @@ async fn scheduling_outcome(
 ) -> redsuite_core::Result<SchedulingOutcome> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        if let Some(status) =
-            er_api.get_signature_status(commit_signature).await?
-        {
+        if let Some(status) = er_api.get_signature_status(commit_signature).await? {
             if let Some(err) = &status.err {
                 return Ok(SchedulingOutcome::Rejected(custom_error_code(err)));
             }
@@ -149,25 +142,18 @@ impl BaseFlowSnapshot {
 }
 
 async fn snapshot_base_flow(base_api: &Api) -> Result<BaseFlowSnapshot> {
-    let committor_program: Pubkey = topology::COMMITTOR_ID
-        .parse()
-        .expect("pinned committor program id parses");
+    let committor_program: Pubkey =
+        topology::COMMITTOR_ID.parse().expect("pinned committor program id parses");
     let alt_program: Pubkey = sdk_ids::address_lookup_table::ID;
     let mut flow = HashSet::new();
     flow.extend(
         base_api
-            .get_signatures_for_address(
-                &DELEGATION_PROGRAM_ID,
-                SIGNATURE_SCAN_LIMIT,
-            )
+            .get_signatures_for_address(&DELEGATION_PROGRAM_ID, SIGNATURE_SCAN_LIMIT)
             .await?,
     );
     flow.extend(
         base_api
-            .get_signatures_for_address(
-                &committor_program,
-                SIGNATURE_SCAN_LIMIT,
-            )
+            .get_signatures_for_address(&committor_program, SIGNATURE_SCAN_LIMIT)
             .await?,
     );
     let alt = base_api
@@ -184,9 +170,7 @@ async fn own_lookup_table_txs(
 ) -> Result<usize> {
     let mut with_lookups = 0;
     for chain_signature in signatures {
-        let tx = base_api
-            .await_transaction(chain_signature, BASE_CONFIRM_TIMEOUT)
-            .await?;
+        let tx = base_api.await_transaction(chain_signature, BASE_CONFIRM_TIMEOUT).await?;
         if tx.lookup_tables > 0 {
             with_lookups += 1;
         }
@@ -209,8 +193,7 @@ impl Scenario<ScenarioReport> for CommitWidthEnvelope {
         let pdas = Accounts::new(ACCOUNT_SPACE, er.identity())
             .init_delegated(base, &payer, profile.pool)
             .await?;
-        prep::await_clones(er, &pdas, ACCOUNT_SPACE as usize, CLONE_TIMEOUT)
-            .await?;
+        prep::await_clones(er, &pdas, ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
         let sender = er.sender(Rc::new(payer));
 
         // the whole pipeline per request: deliver on the ER, await the
@@ -225,10 +208,7 @@ impl Scenario<ScenarioReport> for CommitWidthEnvelope {
                 let tx = sender.prepare(&[ix]).await?;
                 Ok(SendTransaction(move |started: Instant| async move {
                     let commit_signature = sender.submit_prepared(&tx).await?;
-                    tally
-                        .borrow_mut()
-                        .er_delivery
-                        .push(started.elapsed().as_micros() as u32);
+                    tally.borrow_mut().er_delivery.push(started.elapsed().as_micros() as u32);
                     let commit_receipt = super::settled_receipt(
                         &er_api,
                         &commit_signature,
@@ -245,11 +225,8 @@ impl Scenario<ScenarioReport> for CommitWidthEnvelope {
                     .await?;
                     let mut tally = tally.borrow_mut();
                     tally.round_trip.push(round_trip_us);
-                    tally.base_signatures +=
-                        commit_receipt.base_signatures.len();
-                    tally
-                        .base_txs
-                        .extend(commit_receipt.base_signatures.iter());
+                    tally.base_signatures += commit_receipt.base_signatures.len();
+                    tally.base_txs.extend(commit_receipt.base_signatures.iter());
                     let mut reported = commit_receipt.included.clone();
                     reported.sort();
                     let mut expected = accounts;
@@ -272,9 +249,7 @@ impl Scenario<ScenarioReport> for CommitWidthEnvelope {
                     rate: Pacing::PerSecond(profile.rate),
                     concurrency: profile.concurrency,
                 },
-                |iteration| {
-                    request(width, offset + iteration, warmup_tally.clone())
-                },
+                |iteration| request(width, offset + iteration, warmup_tally.clone()),
             )
             .await?;
             drop(warmup_tally);
@@ -313,8 +288,7 @@ impl Scenario<ScenarioReport> for CommitWidthEnvelope {
             let flow_after = snapshot_base_flow(base.api()).await?;
             let delta = MetricsDelta::new(before, after);
 
-            if let Some(intents) = delta.counter("mbv_committor_intents_count")
-            {
+            if let Some(intents) = delta.counter("mbv_committor_intents_count") {
                 check!(
                     intents >= profile.commits as f64,
                     "w{width}: only {intents} intents in the measured window, \
@@ -322,21 +296,17 @@ impl Scenario<ScenarioReport> for CommitWidthEnvelope {
                     profile.commits
                 )?;
             }
-            let failed_intents = delta
-                .counter_all("mbv_committor_failed_intents_count")
-                .unwrap_or(0.0);
+            let failed_intents =
+                delta.counter_all("mbv_committor_failed_intents_count").unwrap_or(0.0);
             check_eq!(
                 failed_intents,
                 0.0,
                 "w{width}: {failed_intents} intents failed"
             )?;
-            let alt_tables_used = delta
-                .counter("mbv_committor_intent_alt_count_sum")
-                .unwrap_or(0.0);
+            let alt_tables_used =
+                delta.counter("mbv_committor_intent_alt_count_sum").unwrap_or(0.0);
             let alt_base_txs = flow_after.new_alt_since(&flow_before);
-            let backlog = delta
-                .gauge("mbv_committor_intent_backlog_count")
-                .unwrap_or(0.0);
+            let backlog = delta.gauge("mbv_committor_intent_backlog_count").unwrap_or(0.0);
             check_eq!(
                 backlog,
                 0.0,
@@ -351,8 +321,7 @@ impl Scenario<ScenarioReport> for CommitWidthEnvelope {
                 0,
                 "w{width}: receipts listed unexpected committed accounts"
             )?;
-            let own_alt_txs =
-                own_lookup_table_txs(base.api(), &tally.base_txs).await?;
+            let own_alt_txs = own_lookup_table_txs(base.api(), &tally.base_txs).await?;
             check_eq!(
                 own_alt_txs,
                 0,
@@ -366,69 +335,55 @@ impl Scenario<ScenarioReport> for CommitWidthEnvelope {
                 "w{width}: not every commit produced a receipt round-trip"
             )?;
 
-            let receipt_txs_per_commit =
-                tally.base_signatures as f64 / profile.commits as f64;
+            let receipt_txs_per_commit = tally.base_signatures as f64 / profile.commits as f64;
             check!(
                 receipt_txs_per_commit >= 1.0,
                 "w{width}: commits averaged fewer than one base tx"
             )?;
-            let flow_txs_per_commit = flow_after.new_flow_since(&flow_before)
-                as f64
-                / profile.commits as f64;
+            let flow_txs_per_commit =
+                flow_after.new_flow_since(&flow_before) as f64 / profile.commits as f64;
 
             debug!(
                 width,
-                commits_per_sec =
-                    profile.commits as f64 / outcome.wall.as_secs_f64(),
+                commits_per_sec = profile.commits as f64 / outcome.wall.as_secs_f64(),
                 "commit width cell finished"
             );
 
-            let cell_report =
-                ScenarioReport::ok(&format!("{}/w{width}", self.name()))
-                    .setting("profile", profile.name)
-                    .setting("width", width)
-                    .setting("account space", ACCOUNT_SPACE)
-                    .setting("commits", profile.commits)
-                    .setting("offered rate /s", profile.rate)
-                    .setting("concurrency", profile.concurrency)
-                    .setting("pool", profile.pool)
-                    .setting("receipt timeout s", RECEIPT_TIMEOUT.as_secs())
-                    .observe("er delivery us", Unit::Micros, er_delivery)
-                    .observe("commit round-trip us", Unit::Micros, round_trip)
-                    .client_side(&outcome)
-                    .metric(
-                        "base txs per commit",
-                        Unit::Count,
-                        flow_txs_per_commit,
-                    )
-                    .metric(
-                        "receipt base txs per commit",
-                        Unit::Count,
-                        receipt_txs_per_commit,
-                    )
-                    .metric("window alt intents", Unit::Count, alt_tables_used)
-                    .metric(
-                        "window alt base txs",
-                        Unit::Count,
-                        alt_base_txs as f64,
-                    )
-                    .metric(
-                        "achieved commits /s",
-                        Unit::PerSecond,
-                        profile.commits as f64 / outcome.wall.as_secs_f64(),
-                    )
-                    .metric_if(
-                        "validator intent exec avg s",
-                        Unit::Seconds,
-                        delta.histogram_avg_all(
-                            "mbv_committor_intent_execution_time_histogram_v2",
-                        ),
-                    )
-                    .metric_if(
-                        "intents in window",
-                        Unit::Count,
-                        delta.counter("mbv_committor_intents_count"),
-                    );
+            let cell_report = ScenarioReport::ok(&format!("{}/w{width}", self.name()))
+                .setting("profile", profile.name)
+                .setting("width", width)
+                .setting("account space", ACCOUNT_SPACE)
+                .setting("commits", profile.commits)
+                .setting("offered rate /s", profile.rate)
+                .setting("concurrency", profile.concurrency)
+                .setting("pool", profile.pool)
+                .setting("receipt timeout s", RECEIPT_TIMEOUT.as_secs())
+                .observe("er delivery us", Unit::Micros, er_delivery)
+                .observe("commit round-trip us", Unit::Micros, round_trip)
+                .client_side(&outcome)
+                .metric("base txs per commit", Unit::Count, flow_txs_per_commit)
+                .metric(
+                    "receipt base txs per commit",
+                    Unit::Count,
+                    receipt_txs_per_commit,
+                )
+                .metric("window alt intents", Unit::Count, alt_tables_used)
+                .metric("window alt base txs", Unit::Count, alt_base_txs as f64)
+                .metric(
+                    "achieved commits /s",
+                    Unit::PerSecond,
+                    profile.commits as f64 / outcome.wall.as_secs_f64(),
+                )
+                .metric_if(
+                    "validator intent exec avg s",
+                    Unit::Seconds,
+                    delta.histogram_avg_all("mbv_committor_intent_execution_time_histogram_v2"),
+                )
+                .metric_if(
+                    "intents in window",
+                    Unit::Count,
+                    delta.counter("mbv_committor_intents_count"),
+                );
             report::persist_cell(self.name(), &cell_report);
 
             cells.push(CellSummary {
@@ -447,23 +402,15 @@ impl Scenario<ScenarioReport> for CommitWidthEnvelope {
             // deliver it via ALTs, gate validators (>= 0.13.7) refuse it at
             // scheduling — both are the envelope working as designed
             {
-                let accounts: Vec<Pubkey> =
-                    pdas.iter().copied().take(15).collect();
+                let accounts: Vec<Pubkey> = pdas.iter().copied().take(15).collect();
                 offset += 1;
-                let ix =
-                    build::commit_accounts(offset, payer_pubkey, &accounts);
+                let ix = build::commit_accounts(offset, payer_pubkey, &accounts);
                 let flow_before = snapshot_base_flow(base.api()).await?;
                 let before = er.scrape_metrics().await?;
                 let tx = sender.prepare(&[ix]).await?;
                 let started = Instant::now();
                 let commit_signature = sender.submit_prepared(&tx).await?;
-                match scheduling_outcome(
-                    er.api(),
-                    &commit_signature,
-                    REJECTION_TIMEOUT,
-                )
-                .await?
-                {
+                match scheduling_outcome(er.api(), &commit_signature, REJECTION_TIMEOUT).await? {
                     SchedulingOutcome::Rejected(code) => {
                         check_eq!(
                             code,
@@ -474,8 +421,7 @@ impl Scenario<ScenarioReport> for CommitWidthEnvelope {
                         debug!("probe refused by scheduling intent-size gate");
                         probe_settings.push((
                             "probe w15".to_owned(),
-                            "refused at scheduling (intent size gate)"
-                                .to_owned(),
+                            "refused at scheduling (intent size gate)".to_owned(),
                         ));
                     }
                     SchedulingOutcome::Confirmed => {
@@ -493,28 +439,19 @@ impl Scenario<ScenarioReport> for CommitWidthEnvelope {
                         )
                         .await?;
                         let wall = started.elapsed();
-                        let delta = MetricsDelta::new(
-                            before,
-                            er.scrape_metrics().await?,
-                        );
+                        let delta = MetricsDelta::new(before, er.scrape_metrics().await?);
                         let flow_after = snapshot_base_flow(base.api()).await?;
-                        let alt_base_txs =
-                            flow_after.new_alt_since(&flow_before);
-                        let own_alt_txs = own_lookup_table_txs(
-                            base.api(),
-                            &alt_receipt.base_signatures,
-                        )
-                        .await?;
+                        let alt_base_txs = flow_after.new_alt_since(&flow_before);
+                        let own_alt_txs =
+                            own_lookup_table_txs(base.api(), &alt_receipt.base_signatures).await?;
                         check!(
                             own_alt_txs >= 1,
                             "the width-15 commit's own base txs must load a \
                              lookup table"
                         )?;
                         debug!(alt_base_txs, "ALT commit probe finished");
-                        probe_settings.push((
-                            "probe w15".to_owned(),
-                            "delivered via ALTs".to_owned(),
-                        ));
+                        probe_settings
+                            .push(("probe w15".to_owned(), "delivered via ALTs".to_owned()));
                         probe_metrics.push((
                             "probe w15 round-trip s".to_owned(),
                             Unit::Seconds,
@@ -549,93 +486,81 @@ impl Scenario<ScenarioReport> for CommitWidthEnvelope {
             }
 
             {
-                let accounts: Vec<Pubkey> =
-                    pdas.iter().copied().take(30).collect();
+                let accounts: Vec<Pubkey> = pdas.iter().copied().take(30).collect();
                 offset += 1;
-                let ix =
-                    build::commit_accounts(offset, payer_pubkey, &accounts);
+                let ix = build::commit_accounts(offset, payer_pubkey, &accounts);
                 let before = er.scrape_metrics().await?;
                 let commit_signature = sender.submit(&[ix]).await?;
-                let outcome_note = match scheduling_outcome(
-                    er.api(),
-                    &commit_signature,
-                    REJECTION_TIMEOUT,
-                )
-                .await?
-                {
-                    SchedulingOutcome::Rejected(code) => {
-                        check_eq!(
-                            code,
-                            Some(receipt::INTENT_TOO_LARGE_ERR),
-                            "the width-30 probe was rejected with an \
+                let outcome_note =
+                    match scheduling_outcome(er.api(), &commit_signature, REJECTION_TIMEOUT).await?
+                    {
+                        SchedulingOutcome::Rejected(code) => {
+                            check_eq!(
+                                code,
+                                Some(receipt::INTENT_TOO_LARGE_ERR),
+                                "the width-30 probe was rejected with an \
                              unexpected code"
-                        )?;
-                        "refused at scheduling (intent size gate)".to_owned()
-                    }
-                    SchedulingOutcome::Confirmed => {
-                        let receipt_outcome = receipt::fetch_commit_receipt(
-                            er.api(),
-                            &commit_signature,
-                            Duration::from_secs(45),
-                        )
-                        .await;
-                        let delta = MetricsDelta::new(
-                            before,
-                            er.scrape_metrics().await?,
-                        );
-                        let failed_intents = delta
-                            .counter_all("mbv_committor_failed_intents_count")
-                            .unwrap_or(0.0);
-                        probe_metrics.push((
-                            "probe w30 failed intents".to_owned(),
-                            Unit::Count,
-                            failed_intents,
-                        ));
-                        match receipt_outcome {
-                            Ok(fit_receipt) => {
-                                check!(
-                                    !fit_receipt.succeeded(),
-                                    "a width-30 commit must exceed the fit \
+                            )?;
+                            "refused at scheduling (intent size gate)".to_owned()
+                        }
+                        SchedulingOutcome::Confirmed => {
+                            let receipt_outcome = receipt::fetch_commit_receipt(
+                                er.api(),
+                                &commit_signature,
+                                Duration::from_secs(45),
+                            )
+                            .await;
+                            let delta = MetricsDelta::new(before, er.scrape_metrics().await?);
+                            let failed_intents = delta
+                                .counter_all("mbv_committor_failed_intents_count")
+                                .unwrap_or(0.0);
+                            probe_metrics.push((
+                                "probe w30 failed intents".to_owned(),
+                                Unit::Count,
+                                failed_intents,
+                            ));
+                            match receipt_outcome {
+                                Ok(fit_receipt) => {
+                                    check!(
+                                        !fit_receipt.succeeded(),
+                                        "a width-30 commit must exceed the fit \
                                      envelope, but the intent succeeded"
-                                )?;
-                                check_eq!(
-                                    fit_receipt.receipt_err_code,
-                                    Some(receipt::INTENT_FAILED_CODE),
-                                    "width-30 receipt should err with the \
+                                    )?;
+                                    check_eq!(
+                                        fit_receipt.receipt_err_code,
+                                        Some(receipt::INTENT_FAILED_CODE),
+                                        "width-30 receipt should err with the \
                                      intent-failed code"
-                                )?;
-                                format!(
-                                    "intent failed as expected: {}",
-                                    fit_receipt
-                                        .error_message
-                                        .unwrap_or_default()
-                                )
-                            }
-                            // a failed receipt tx may be unqueryable — then
-                            // the failed-intents counter must attest to the
-                            // rejection
-                            Err(fetch_error) => {
-                                check!(
-                                    failed_intents >= 1.0,
-                                    "width-30 probe: no failed receipt and \
+                                    )?;
+                                    format!(
+                                        "intent failed as expected: {}",
+                                        fit_receipt.error_message.unwrap_or_default()
+                                    )
+                                }
+                                // a failed receipt tx may be unqueryable — then
+                                // the failed-intents counter must attest to the
+                                // rejection
+                                Err(fetch_error) => {
+                                    check!(
+                                        failed_intents >= 1.0,
+                                        "width-30 probe: no failed receipt and \
                                      no failed-intent count ({fetch_error})"
-                                )?;
-                                format!(
-                                    "no receipt ({fetch_error}); \
+                                    )?;
+                                    format!(
+                                        "no receipt ({fetch_error}); \
                                      failed-intents delta {failed_intents}"
-                                )
+                                    )
+                                }
                             }
                         }
-                    }
-                };
+                    };
                 debug!(%outcome_note, "oversized commit probe finished");
                 probe_settings.push(("probe w30".to_owned(), outcome_note));
             }
 
             // the 11th sponsored commit on one account is rejected on-chain
             {
-                let probe_payer =
-                    prep::funded_payer(base, PAYER_LAMPORTS).await?;
+                let probe_payer = prep::funded_payer(base, PAYER_LAMPORTS).await?;
                 let probe_payer_pubkey = probe_payer.pubkey();
                 let probe_pdas = Accounts::new(ACCOUNT_SPACE, er.identity())
                     .init_delegated(base, &probe_payer, 1)
@@ -652,11 +577,7 @@ impl Scenario<ScenarioReport> for CommitWidthEnvelope {
                 let probe_sender = er.sender(Rc::new(probe_payer));
                 for commit_round in 1..=receipt::SPONSORED_COMMIT_LIMIT {
                     offset += 1;
-                    let ix = build::commit_accounts(
-                        offset,
-                        probe_payer_pubkey,
-                        &[probe_account],
-                    );
+                    let ix = build::commit_accounts(offset, probe_payer_pubkey, &[probe_account]);
                     let commit_signature = probe_sender.submit(&[ix]).await?;
                     super::settled_receipt(
                         er.api(),
@@ -670,29 +591,22 @@ impl Scenario<ScenarioReport> for CommitWidthEnvelope {
                     .await?;
                 }
                 offset += 1;
-                let ix = build::commit_accounts(
-                    offset,
-                    probe_payer_pubkey,
-                    &[probe_account],
-                );
+                let ix = build::commit_accounts(offset, probe_payer_pubkey, &[probe_account]);
                 let rejected_signature = probe_sender.submit(&[ix]).await?;
-                let rejection_code = match scheduling_outcome(
-                    er.api(),
-                    &rejected_signature,
-                    REJECTION_TIMEOUT,
-                )
-                .await?
-                {
-                    SchedulingOutcome::Rejected(code) => code,
-                    SchedulingOutcome::Confirmed => {
-                        return Err(CheckError::new(format!(
-                            "commit {} past the sponsored allowance \
+                let rejection_code =
+                    match scheduling_outcome(er.api(), &rejected_signature, REJECTION_TIMEOUT)
+                        .await?
+                    {
+                        SchedulingOutcome::Rejected(code) => code,
+                        SchedulingOutcome::Confirmed => {
+                            return Err(CheckError::new(format!(
+                                "commit {} past the sponsored allowance \
                              unexpectedly succeeded",
-                            receipt::SPONSORED_COMMIT_LIMIT + 1
-                        ))
-                        .into())
-                    }
-                };
+                                receipt::SPONSORED_COMMIT_LIMIT + 1
+                            ))
+                            .into())
+                        }
+                    };
                 check_eq!(
                     rejection_code,
                     Some(receipt::COMMIT_LIMIT_ERR),
@@ -704,16 +618,12 @@ impl Scenario<ScenarioReport> for CommitWidthEnvelope {
                     receipt::COMMIT_LIMIT_ERR
                 );
                 debug!(%outcome_note, "commit limit probe finished");
-                probe_settings
-                    .push(("probe commit limit".to_owned(), outcome_note));
+                probe_settings.push(("probe commit limit".to_owned(), outcome_note));
             }
         }
 
-        let widths_label: Vec<String> = profile
-            .widths
-            .iter()
-            .map(|width| width.to_string())
-            .collect();
+        let widths_label: Vec<String> =
+            profile.widths.iter().map(|width| width.to_string()).collect();
         let mut summary = ScenarioReport::ok(self.name())
             .setting("profile", profile.name)
             .setting("widths", widths_label.join("/"))

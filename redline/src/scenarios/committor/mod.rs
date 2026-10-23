@@ -15,12 +15,9 @@ async fn settled_receipt(
     timeout: Duration,
     what: impl Display,
 ) -> Result<CommitReceipt> {
-    let receipt =
-        receipt::fetch_commit_receipt(api, signature, timeout).await?;
+    let receipt = receipt::fetch_commit_receipt(api, signature, timeout).await?;
     match &receipt.error_message {
-        Some(message) => Err(CheckError::new(format!("{what} succeeds"))
-            .actual(message)
-            .into()),
+        Some(message) => Err(CheckError::new(format!("{what} succeeds")).actual(message).into()),
         None => Ok(receipt),
     }
 }

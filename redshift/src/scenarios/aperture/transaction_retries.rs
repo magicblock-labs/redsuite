@@ -53,9 +53,7 @@ impl Signed {
     ) -> Result<Self> {
         let mut instructions = vec![build::add_unsigned(owner, count)];
         if let Some(cold) = cold {
-            instructions[0]
-                .accounts
-                .push(AccountMeta::new_readonly(cold, false));
+            instructions[0].accounts.push(AccountMeta::new_readonly(cold, false));
         }
         if fail {
             instructions.push(build::add_error(owner, count));
@@ -80,11 +78,7 @@ impl Signed {
             signature: tx.signatures[0],
             blockhash,
             fee,
-            error: if fail {
-                json!({"InstructionError": [1, {"Custom": 0}]})
-            } else {
-                Value::Null
-            },
+            error: if fail { json!({"InstructionError": [1, {"Custom": 0}]}) } else { Value::Null },
         })
     }
 
@@ -101,28 +95,18 @@ impl Signed {
     }
 
     async fn valid(&self, er: &ErCtx) -> Result<bool> {
-        let result: Value = er
-            .api()
-            .call("isBlockhashValid", &(self.blockhash.to_string(),))
-            .await?;
-        result["value"]
-            .as_bool()
-            .ok_or_else(|| "blockhash validity missing".into())
+        let result: Value =
+            er.api().call("isBlockhashValid", &(self.blockhash.to_string(),)).await?;
+        result["value"].as_bool().ok_or_else(|| "blockhash validity missing".into())
     }
 
     async fn copies(&self, er: &ErCtx, count: usize) -> Result<()> {
         for result in join_all((0..count).map(|_| self.send(er))).await {
             match result {
-                Ok(signature) => check_eq!(
-                    signature,
-                    self.signature.to_string(),
-                    "RPC signature"
-                )?,
+                Ok(signature) => check_eq!(signature, self.signature.to_string(), "RPC signature")?,
                 Err(error) => {
                     check!(
-                        error
-                            .downcast_ref::<RpcError>()
-                            .is_some_and(|rpc| rpc.code == -32003),
+                        error.downcast_ref::<RpcError>().is_some_and(|rpc| rpc.code == -32003),
                         "retry failed outside transaction validation: {error}"
                     )?;
                 }
@@ -136,7 +120,10 @@ impl Signed {
             er.api()
                 .call_nullable::<Value>(
                     "getTransaction",
-                    &(self.signature.to_string(), json!({"encoding": "json", "maxSupportedTransactionVersion": 0})),
+                    &(
+                        self.signature.to_string(),
+                        json!({"encoding": "json", "maxSupportedTransactionVersion": 0}),
+                    ),
                 )
                 .await?
                 .ok_or_else(|| redsuite_core::DynError::from("transaction missing"))
@@ -154,20 +141,14 @@ impl Signed {
             "{} execution fee",
             self.signature
         )?;
-        tx["slot"]
-            .as_u64()
-            .ok_or_else(|| "transaction slot missing".into())
+        tx["slot"].as_u64().ok_or_else(|| "transaction slot missing".into())
     }
 }
 
 async fn state(er: &ErCtx, keys: &[Pubkey; 2]) -> Result<(u64, FlexiCounter)> {
     let accounts = er.accounts(keys).await?;
-    let payer = accounts[0]
-        .as_ref()
-        .ok_or_else(|| format!("payer {} missing", keys[0]))?;
-    let counter = accounts[1]
-        .as_ref()
-        .ok_or_else(|| format!("counter {} missing", keys[1]))?;
+    let payer = accounts[0].as_ref().ok_or_else(|| format!("payer {} missing", keys[0]))?;
+    let counter = accounts[1].as_ref().ok_or_else(|| format!("counter {} missing", keys[1]))?;
     Ok((payer.lamports, FlexiCounter::try_decode(&counter.data)?))
 }
 
@@ -197,12 +178,7 @@ async fn queue_readers(
                 &[
                     budget.clone(),
                     load::read_accounts_data(id, &[counter]),
-                    load::expensive_hash_compute(
-                        u64::from(round) * 256 + id,
-                        counter,
-                        180,
-                        &[],
-                    ),
+                    load::expensive_hash_compute(u64::from(round) * 256 + id, counter, 180, &[]),
                 ],
                 Some(&payer.pubkey()),
                 &[payer],
@@ -240,10 +216,7 @@ async fn execute(
     }
     let pending = if queued.is_some() {
         listeners.push(subscribe(er, tx).await?);
-        er.api()
-            .get_signature_status(&tx.signature)
-            .await?
-            .is_none()
+        er.api().get_signature_status(&tx.signature).await?.is_none()
     } else {
         false
     };
@@ -275,18 +248,12 @@ async fn execute(
     Ok(pending)
 }
 
-async fn audit(
-    er: &ErCtx,
-    start: u64,
-    expected: &[(&Signed, usize)],
-) -> Result<u64> {
+async fn audit(er: &ErCtx, start: u64, expected: &[(&Signed, usize)]) -> Result<u64> {
     let end = er.api().get_slot().await? + 2;
     check::poll(
         "accepted work reaches a block boundary",
         TIMEOUT,
-        || async {
-            matches!(er.api().get_slot().await, Ok(slot) if slot >= end)
-        },
+        || async { matches!(er.api().get_slot().await, Ok(slot) if slot >= end) },
     )
     .await?;
     check::poll("block is published", TIMEOUT, || async {
@@ -296,13 +263,17 @@ async fn audit(
     let blocks: Vec<u64> = er.api().call("getBlocks", &(start, end)).await?;
     let mut counts = vec![0; expected.len()];
     for slot in blocks {
-        let block: Value = er.api().call(
-            "getBlock",
-            &(slot, json!({"transactionDetails": "signatures", "rewards": false})),
-        ).await?;
-        let signatures = block["signatures"]
-            .as_array()
-            .ok_or("block signatures missing")?;
+        let block: Value = er
+            .api()
+            .call(
+                "getBlock",
+                &(
+                    slot,
+                    json!({"transactionDetails": "signatures", "rewards": false}),
+                ),
+            )
+            .await?;
+        let signatures = block["signatures"].as_array().ok_or("block signatures missing")?;
         for (i, (tx, _)) in expected.iter().enumerate() {
             counts[i] += signatures
                 .iter()
@@ -388,38 +359,19 @@ impl TransactionRetries {
         private: Option<&mut topology::PrivateEr>,
     ) -> Result<()> {
         let owner = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
-        let (counter, setup) = prep::flexi_counter(
-            owner.pubkey(),
-            self.name(),
-            er.identity(),
-            u32::MAX,
-        );
+        let (counter, setup) =
+            prep::flexi_counter(owner.pubkey(), self.name(), er.identity(), u32::MAX);
         base.submit_and_confirm(&owner, &setup).await?;
-        let payer = prep::delegated_payer(
-            base,
-            &owner,
-            er.identity(),
-            crate::PAYER_LAMPORTS,
-        )
-        .await?;
+        let payer =
+            prep::delegated_payer(base, &owner, er.identity(), crate::PAYER_LAMPORTS).await?;
         let load_payer = if matches!(self, Self::Subscriptions) {
-            Some(
-                prep::delegated_payer(
-                    base,
-                    &owner,
-                    er.identity(),
-                    crate::PAYER_LAMPORTS,
-                )
-                .await?,
-            )
+            Some(prep::delegated_payer(base, &owner, er.identity(), crate::PAYER_LAMPORTS).await?)
         } else {
             None
         };
         let owner = owner.pubkey();
         let keys = [payer.pubkey(), counter];
-        let mut expected =
-            check::poll_for("accounts cloned", TIMEOUT, || state(er, &keys))
-                .await?;
+        let mut expected = check::poll_for("accounts cloned", TIMEOUT, || state(er, &keys)).await?;
         check_eq!(
             (expected.1.count, expected.1.updates),
             (0, 0),
@@ -431,44 +383,29 @@ impl TransactionRetries {
         match self {
             Self::ColdFetch => {
                 let cold = prep::funded_payer(base, 1_000_000).await?.pubkey();
-                let selector = Selector::methods(&[
-                    "getAccountInfo",
-                    "getMultipleAccounts",
-                ])
-                .http()
-                .request()
-                .account(&cold);
+                let selector = Selector::methods(&["getAccountInfo", "getMultipleAccounts"])
+                    .http()
+                    .request()
+                    .account(&cold);
                 let proxies = er.proxies().ok_or(
                     "the cold-fetch case needs the base-chain proxies of its \
                      ER group",
                 )?;
                 let trap = proxies.intercept(selector);
-                let tx = Signed::new(er, &payer, owner, 7, false, Some(cold))
-                    .await?;
+                let tx = Signed::new(er, &payer, owner, 7, false, Some(cold)).await?;
                 let (failed, fault) = tokio::join!(tx.send(er), async {
-                    trap.wait(TIMEOUT)
-                        .await?
-                        .reject("retry-test cold fetch unavailable");
+                    trap.wait(TIMEOUT).await?.reject("retry-test cold fetch unavailable");
                     Ok::<_, redsuite_core::DynError>(())
                 });
                 fault?;
-                let error =
-                    failed.expect_err("cold fetch must fail before scheduling");
-                let rpc = error
-                    .downcast_ref::<RpcError>()
-                    .ok_or(error.to_string())?;
+                let error = failed.expect_err("cold fetch must fail before scheduling");
+                let rpc = error.downcast_ref::<RpcError>().ok_or(error.to_string())?;
                 check!(
-                    rpc.code == -32003
-                        && rpc
-                            .message
-                            .contains("retry-test cold fetch unavailable"),
+                    rpc.code == -32003 && rpc.message.contains("retry-test cold fetch unavailable"),
                     "wrong cold-fetch error: {rpc}"
                 )?;
                 check!(
-                    er.api()
-                        .get_signature_status(&tx.signature)
-                        .await?
-                        .is_none(),
+                    er.api().get_signature_status(&tx.signature).await?.is_none(),
                     "fetch failure poisoned signature status"
                 )?;
                 check_eq!(
@@ -490,16 +427,10 @@ impl TransactionRetries {
             Self::Concurrent | Self::Subscriptions => {
                 let mut pending_results = [false; 2];
                 for round in 1..=8 {
-                    let fail = phase == "failure"
-                        || matches!(self, Self::Subscriptions)
-                            && round % 2 == 0;
-                    let copies = if matches!(self, Self::Subscriptions) {
-                        1
-                    } else {
-                        COPIES
-                    };
-                    let tx = Signed::new(er, &payer, owner, round, fail, None)
-                        .await?;
+                    let fail =
+                        phase == "failure" || matches!(self, Self::Subscriptions) && round % 2 == 0;
+                    let copies = if matches!(self, Self::Subscriptions) { 1 } else { COPIES };
+                    let tx = Signed::new(er, &payer, owner, round, fail, None).await?;
                     let notifications = execute(
                         er,
                         &tx,
@@ -535,22 +466,16 @@ impl TransactionRetries {
                 }
             }
             Self::ExpiryRestart => {
-                let private = private.ok_or(
-                    "the expiry-restart case needs an ER of its own to restart",
-                )?;
+                let private =
+                    private.ok_or("the expiry-restart case needs an ER of its own to restart")?;
                 let mut probes = Vec::new();
                 for epoch in 0..2 {
                     let start = er.api().get_slot().await? + 1;
                     let first = probes.len();
                     for i in 0..if epoch == 0 { 3 } else { 2 } {
                         let count = epoch * 10 + i * 2 + 3;
-                        let tx =
-                            Signed::new(er, &payer, owner, count, i == 1, None)
-                                .await?;
-                        check!(
-                            tx.valid(er).await?,
-                            "new signed input is valid"
-                        )?;
+                        let tx = Signed::new(er, &payer, owner, count, i == 1, None).await?;
+                        check!(tx.valid(er).await?, "new signed input is valid")?;
                         let slot = if i < 2 {
                             tx.copies(er, 1).await?;
                             let slot = tx.outcome(er).await?;
@@ -570,46 +495,27 @@ impl TransactionRetries {
                         .map(|(tx, slot)| (tx, usize::from(slot.is_some())))
                         .collect();
                     audit(er, start, &appended).await?;
-                    check_eq!(
-                        state(er, &keys).await?,
-                        expected,
-                        "before expiry/restart"
-                    )?;
+                    check_eq!(state(er, &keys).await?, expected, "before expiry/restart")?;
                     if epoch == 0 {
-                        check::poll_for(
-                            "blockhashes expire",
-                            EXPIRY_TIMEOUT,
-                            || async {
-                                for (tx, _) in &probes {
-                                    check!(
-                                        !tx.valid(er).await?,
-                                        "blockhash still valid"
-                                    )?;
-                                }
-                                Ok::<_, redsuite_core::DynError>(())
-                            },
-                        )
+                        check::poll_for("blockhashes expire", EXPIRY_TIMEOUT, || async {
+                            for (tx, _) in &probes {
+                                check!(!tx.valid(er).await?, "blockhash still valid")?;
+                            }
+                            Ok::<_, redsuite_core::DynError>(())
+                        })
                         .await?;
                     } else {
                         for (tx, _) in &probes[first..] {
-                            check!(
-                                tx.valid(er).await?,
-                                "recent input is valid before restart"
-                            )?;
+                            check!(tx.valid(er).await?, "recent input is valid before restart")?;
                         }
                         private.restart(RestartConfig::default()).await?;
                     }
-                    check_eq!(
-                        state(er, &keys).await?,
-                        expected,
-                        "restart preserves state"
-                    )?;
+                    check_eq!(state(er, &keys).await?, expected, "restart preserves state")?;
                     let start = er.api().get_slot().await? + 1;
                     for (tx, _) in &probes {
                         tx.copies(er, COPIES).await?;
                     }
-                    let retries: Vec<_> =
-                        probes.iter().map(|(tx, _)| (tx, 0)).collect();
+                    let retries: Vec<_> = probes.iter().map(|(tx, _)| (tx, 0)).collect();
                     audit(er, start, &retries).await?;
                     check_eq!(
                         state(er, &keys).await?,
@@ -624,20 +530,13 @@ impl TransactionRetries {
                                 "original execution is immutable"
                             )?;
                         } else {
-                            let status = er
-                                .api()
-                                .get_signature_status(&tx.signature)
-                                .await?;
+                            let status = er.api().get_signature_status(&tx.signature).await?;
                             check!(
-                                status
-                                    .is_none_or(|status| status.err.is_some()),
+                                status.is_none_or(|status| status.err.is_some()),
                                 "unscheduled input must be rejected"
                             )?;
                             check!(
-                                er.api()
-                                    .get_transaction(&tx.signature)
-                                    .await?
-                                    .is_none(),
+                                er.api().get_transaction(&tx.signature).await?.is_none(),
                                 "rejected input never executes"
                             )?;
                         }

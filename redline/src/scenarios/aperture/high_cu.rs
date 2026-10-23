@@ -13,8 +13,7 @@ use redsuite_core::{
         clock::SendClock,
         ws::{AccountUpdates, UpdateOutcome},
     },
-    BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
-    TxSender,
+    BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport, TxSender,
 };
 use signature::Signature;
 use tracing::debug;
@@ -59,10 +58,7 @@ const FULL: Profile = Profile {
     concurrency: 256,
 };
 
-const PROFILES: ProfileValues<Profile> = ProfileValues {
-    lite: LITE,
-    full: FULL,
-};
+const PROFILES: ProfileValues<Profile> = ProfileValues { lite: LITE, full: FULL };
 
 struct Cell {
     label: &'static str,
@@ -93,12 +89,7 @@ async fn run_cell(
     let warmup_request = |iteration: u64| {
         let global_id = offset + iteration;
         let pda_index = ((global_id - 1) % pdas.len() as u64) as usize;
-        let ix = build::expensive_hash_compute(
-            global_id,
-            HASH_INIT,
-            iters,
-            &[pdas[pda_index]],
-        );
+        let ix = build::expensive_hash_compute(global_id, HASH_INIT, iters, &[pdas[pda_index]]);
         let sender = senders[(global_id as usize) % senders.len()].clone();
         sender.staged(&[ix])
     };
@@ -119,8 +110,7 @@ async fn run_cell(
         warm.first_error
     )?;
     if let Some(seen) = count_before_warmup {
-        crate::await_executed(er, seen + profile.warmup as f64, DRAIN_TIMEOUT)
-            .await?;
+        crate::await_executed(er, seen + profile.warmup as f64, DRAIN_TIMEOUT).await?;
     }
 
     let clock = Arc::new(SendClock::new(
@@ -128,31 +118,19 @@ async fn run_cell(
         profile.iterations as usize,
     ));
     let updates = Rc::new(
-        AccountUpdates::connect(
-            er.ws_url(),
-            crate::account_update_id,
-            clock.clone(),
-        )
-        .await?,
+        AccountUpdates::connect(er.ws_url(), crate::account_update_id, clock.clone()).await?,
     );
     for pda in pdas {
         updates.account_subscribe(pda).await?;
     }
-    updates
-        .await_subscribed(pdas.len(), Duration::from_secs(5))
-        .await?;
+    updates.await_subscribed(pdas.len(), Duration::from_secs(5)).await?;
 
     let offset = offset + profile.warmup;
     let probe: Rc<RefCell<Option<Signature>>> = Rc::new(RefCell::new(None));
     let request = |iteration: u64| {
         let global_id = offset + iteration;
         let pda_index = ((global_id - 1) % pdas.len() as u64) as usize;
-        let ix = build::expensive_hash_compute(
-            global_id,
-            HASH_INIT,
-            iters,
-            &[pdas[pda_index]],
-        );
+        let ix = build::expensive_hash_compute(global_id, HASH_INIT, iters, &[pdas[pda_index]]);
         updates.track(global_id, pdas[pda_index]);
         let sender = senders[(global_id as usize) % senders.len()].clone();
         let probe = probe.clone();
@@ -183,33 +161,19 @@ async fn run_cell(
     )?;
     let drain = match before.get(TX_COUNT) {
         Some(seen) => {
-            crate::await_executed(
-                er,
-                seen + profile.iterations as f64,
-                DRAIN_TIMEOUT,
-            )
-            .await?
+            crate::await_executed(er, seen + profile.iterations as f64, DRAIN_TIMEOUT).await?
         }
         None => Duration::ZERO,
     };
 
-    let probe_sig = probe
-        .borrow()
-        .as_ref()
-        .cloned()
-        .ok_or("no probe signature captured")?;
+    let probe_sig = probe.borrow().as_ref().cloned().ok_or("no probe signature captured")?;
     let probe_cus = crate::probe_cus(er, &probe_sig, label, iters).await?;
 
     updates.await_settled(SETTLE_TIMEOUT).await?;
     let after = er.scrape_metrics().await?;
     let delta = MetricsDelta::new(before, after);
-    if let Some(failed) = delta.counter_all(crate::metrics::FAILED_TRANSACTIONS)
-    {
-        check_eq!(
-            failed,
-            0.0,
-            "{label}: transactions failed on the validator"
-        )?;
+    if let Some(failed) = delta.counter_all(crate::metrics::FAILED_TRANSACTIONS) {
+        check_eq!(failed, 0.0, "{label}: transactions failed on the validator")?;
     }
     let update_outcome = updates.finalize();
     check_eq!(
@@ -243,8 +207,7 @@ impl Scenario<ScenarioReport> for HighCu {
 
     async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
         let profile = PROFILES.select(base.config().profile);
-        let payers =
-            prep::funded_payers(base, profile.payers, PAYER_LAMPORTS).await?;
+        let payers = prep::funded_payers(base, profile.payers, PAYER_LAMPORTS).await?;
         let pdas = Accounts::new(crate::ACCOUNT_SPACE, er.identity())
             .init_delegated(base, &payers[0], profile.accounts)
             .await?;
@@ -255,17 +218,13 @@ impl Scenario<ScenarioReport> for HighCu {
             Duration::from_secs(15),
         )
         .await?;
-        let senders: Vec<TxSender> = payers
-            .into_iter()
-            .map(|payer| er.sender(Rc::new(payer)))
-            .collect();
+        let senders: Vec<TxSender> =
+            payers.into_iter().map(|payer| er.sender(Rc::new(payer))).collect();
 
         let mut offset = 0u64;
         let mut cells: Vec<Cell> = Vec::new();
         for (label, iters) in [("light", LIGHT_ITERS), ("heavy", HEAVY_ITERS)] {
-            let cell =
-                run_cell(er, &senders, &pdas, profile, label, iters, offset)
-                    .await?;
+            let cell = run_cell(er, &senders, &pdas, profile, label, iters, offset).await?;
             offset += profile.warmup + profile.iterations;
             debug!(
                 label,
@@ -273,50 +232,33 @@ impl Scenario<ScenarioReport> for HighCu {
                 "compute cell finished",
             );
 
-            let cell_report =
-                ScenarioReport::ok(&format!("{}/{label}", self.name()))
-                    .setting("profile", profile.name)
-                    .setting("sha256 iters", cell.iters)
-                    .setting("shape", "width-1 sha256 hash-chain compute")
-                    .setting("payers", profile.payers)
-                    .setting("accounts", profile.accounts)
-                    .setting("measured iters", profile.iterations)
-                    .setting("offered tps", profile.rate)
-                    .setting("concurrency", profile.concurrency)
-                    .observe("delivery us", Unit::Micros, cell.outcome.delivery)
-                    .client_side(&cell.outcome)
-                    .observe(
-                        "account-update lag us",
-                        Unit::Micros,
-                        cell.updates.lag,
-                    )
-                    .metric(
-                        "achieved tps",
-                        Unit::Tps,
-                        cell.outcome.achieved_rps(),
-                    )
-                    .metric(
-                        "executed tps",
-                        Unit::Tps,
-                        cell.executed_tps(profile.iterations),
-                    )
-                    .metric("drain s", Unit::Seconds, cell.drain.as_secs_f64())
-                    .metric(
-                        "superseded",
-                        Unit::Count,
-                        cell.updates.superseded as f64,
-                    )
-                    .metric("probe consumed cus", Unit::Count, cell.probe_cus)
-                    .metric_if(
-                        "validator tx processing avg us",
-                        Unit::Micros,
-                        cell.validator_avg_us,
-                    )
-                    .metric_if(
-                        "validator txs in window",
-                        Unit::Count,
-                        cell.validator_txs,
-                    );
+            let cell_report = ScenarioReport::ok(&format!("{}/{label}", self.name()))
+                .setting("profile", profile.name)
+                .setting("sha256 iters", cell.iters)
+                .setting("shape", "width-1 sha256 hash-chain compute")
+                .setting("payers", profile.payers)
+                .setting("accounts", profile.accounts)
+                .setting("measured iters", profile.iterations)
+                .setting("offered tps", profile.rate)
+                .setting("concurrency", profile.concurrency)
+                .observe("delivery us", Unit::Micros, cell.outcome.delivery)
+                .client_side(&cell.outcome)
+                .observe("account-update lag us", Unit::Micros, cell.updates.lag)
+                .metric("achieved tps", Unit::Tps, cell.outcome.achieved_rps())
+                .metric(
+                    "executed tps",
+                    Unit::Tps,
+                    cell.executed_tps(profile.iterations),
+                )
+                .metric("drain s", Unit::Seconds, cell.drain.as_secs_f64())
+                .metric("superseded", Unit::Count, cell.updates.superseded as f64)
+                .metric("probe consumed cus", Unit::Count, cell.probe_cus)
+                .metric_if(
+                    "validator tx processing avg us",
+                    Unit::Micros,
+                    cell.validator_avg_us,
+                )
+                .metric_if("validator txs in window", Unit::Count, cell.validator_txs);
             report::persist_cell(self.name(), &cell_report);
             cells.push(cell);
         }
@@ -342,8 +284,8 @@ impl Scenario<ScenarioReport> for HighCu {
                 Some(last_id),
                 "er copy must hold the last id written to pda {index}"
             )?;
-            let hash_bytes = &on_er.data
-                [layout::HASH_OFFSET..layout::HASH_OFFSET + layout::HASH_SIZE];
+            let hash_bytes =
+                &on_er.data[layout::HASH_OFFSET..layout::HASH_OFFSET + layout::HASH_SIZE];
             check_eq!(
                 hash_bytes,
                 expected_hash,
@@ -362,13 +304,10 @@ impl Scenario<ScenarioReport> for HighCu {
             heavy.probe_cus,
             light.probe_cus,
         )?;
-        let validator_avg_ratio =
-            match (light.validator_avg_us, heavy.validator_avg_us) {
-                (Some(light_avg), Some(heavy_avg)) if light_avg > 0.0 => {
-                    Some(heavy_avg / light_avg)
-                }
-                _ => None,
-            };
+        let validator_avg_ratio = match (light.validator_avg_us, heavy.validator_avg_us) {
+            (Some(light_avg), Some(heavy_avg)) if light_avg > 0.0 => Some(heavy_avg / light_avg),
+            _ => None,
+        };
 
         let mut summary = ScenarioReport::ok(self.name())
             .setting("profile", profile.name)
@@ -425,14 +364,9 @@ impl Scenario<ScenarioReport> for HighCu {
                     cell.validator_avg_us,
                 );
         }
-        summary =
-            summary.metric("heavy/light probe cu ratio", Unit::Ratio, cu_ratio);
+        summary = summary.metric("heavy/light probe cu ratio", Unit::Ratio, cu_ratio);
         if let Some(ratio) = validator_avg_ratio {
-            summary = summary.metric(
-                "heavy/light validator avg ratio",
-                Unit::Ratio,
-                ratio,
-            );
+            summary = summary.metric("heavy/light validator avg ratio", Unit::Ratio, ratio);
         }
         Ok(summary)
     }

@@ -23,8 +23,7 @@ const PROGRAM_CLONE_TIMEOUT: Duration = Duration::from_secs(20);
 const TX_LEDGER_TIMEOUT: Duration = Duration::from_secs(10);
 const SIGNATURE_WINDOW: usize = 1_000;
 const BLOCK_SETTLE_SLOTS: u64 = 2;
-const TRUNCATIONS: &str =
-    r#"engine_ledger_operation_duration_micros_count{op="truncate"}"#;
+const TRUNCATIONS: &str = r#"engine_ledger_operation_duration_micros_count{op="truncate"}"#;
 const SUPERBLOCKS: &str = "engine_ledger_superblocks";
 
 pub struct LedgerRetention;
@@ -60,11 +59,7 @@ async fn superblocks(er: &ErCtx) -> Result<u64> {
     Ok(metrics.get(SUPERBLOCKS).unwrap_or(0.0) as u64)
 }
 
-async fn delegate_counter(
-    base: &BaseCtx,
-    er: &ErCtx,
-    payer: &Keypair,
-) -> Result<Pubkey> {
+async fn delegate_counter(base: &BaseCtx, er: &ErCtx, payer: &Keypair) -> Result<Pubkey> {
     let payer_chain = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
     let (counter, setup) = prep::flexi_counter(
         payer.pubkey(),
@@ -79,11 +74,7 @@ async fn delegate_counter(
     Ok(counter)
 }
 
-async fn seed_history(
-    er: &ErCtx,
-    counter: &Pubkey,
-    sent: &mut Vec<Sent>,
-) -> Result<()> {
+async fn seed_history(er: &ErCtx, counter: &Pubkey, sent: &mut Vec<Sent>) -> Result<()> {
     let listed = check::poll_for(
         "the er records the clone of the delegated counter",
         PROGRAM_CLONE_TIMEOUT,
@@ -92,10 +83,7 @@ async fn seed_history(
                 er.account(counter).await?.is_some(),
                 "counter {counter} not cloned"
             )?;
-            let signatures = er
-                .api()
-                .get_signatures_for_address(counter, SIGNATURE_WINDOW)
-                .await?;
+            let signatures = er.api().get_signatures_for_address(counter, SIGNATURE_WINDOW).await?;
             check!(!signatures.is_empty(), "counter {counter} has no history")?;
             Ok::<_, redsuite_core::DynError>(signatures)
         },
@@ -103,14 +91,12 @@ async fn seed_history(
     .await?;
     for signature in listed.iter().rev() {
         let signature: Signature = signature.parse()?;
-        let tx =
-            er.api().get_transaction(&signature).await?.ok_or_else(|| {
-                format!("listed transaction {signature} is missing on the er")
-            })?;
-        sent.push(Sent {
-            signature,
-            slot: tx.slot,
-        });
+        let tx = er
+            .api()
+            .get_transaction(&signature)
+            .await?
+            .ok_or_else(|| format!("listed transaction {signature} is missing on the er"))?;
+        sent.push(Sent { signature, slot: tx.slot });
     }
     Ok(())
 }
@@ -119,28 +105,15 @@ fn add_count(adds: u64) -> u8 {
     (adds % 255 + 1) as u8
 }
 
-async fn send_add(
-    er: &ErCtx,
-    payer: &Keypair,
-    count: u8,
-    sent: &mut Vec<Sent>,
-) -> Result<()> {
-    let signature = er
-        .submit_and_confirm(payer, &[build::add(payer.pubkey(), count)])
-        .await?;
-    let tx = er
-        .api()
-        .await_transaction(&signature, TX_LEDGER_TIMEOUT)
-        .await?;
+async fn send_add(er: &ErCtx, payer: &Keypair, count: u8, sent: &mut Vec<Sent>) -> Result<()> {
+    let signature = er.submit_and_confirm(payer, &[build::add(payer.pubkey(), count)]).await?;
+    let tx = er.api().await_transaction(&signature, TX_LEDGER_TIMEOUT).await?;
     check!(
         tx.err.is_none(),
         "add {signature} must succeed on the er, got {:?}",
         tx.err
     )?;
-    sent.push(Sent {
-        signature,
-        slot: tx.slot,
-    });
+    sent.push(Sent { signature, slot: tx.slot });
     Ok(())
 }
 
@@ -167,10 +140,7 @@ async fn observe(er: &ErCtx, sent: &[Sent]) -> Result<HistoryView> {
 }
 
 async fn counter_value(er: &ErCtx, counter: &Pubkey) -> Result<u64> {
-    let account = er
-        .account(counter)
-        .await?
-        .ok_or("the delegated counter is missing on the er")?;
+    let account = er.account(counter).await?.ok_or("the delegated counter is missing on the er")?;
     Ok(FlexiCounter::try_decode(&account.data)?.count)
 }
 
@@ -225,16 +195,9 @@ async fn verify(
         )?;
     }
 
-    let listed = er
-        .api()
-        .get_signatures_for_address(counter, SIGNATURE_WINDOW)
-        .await?;
-    let expected: Vec<String> = view
-        .retained
-        .iter()
-        .rev()
-        .map(|entry| entry.signature.to_string())
-        .collect();
+    let listed = er.api().get_signatures_for_address(counter, SIGNATURE_WINDOW).await?;
+    let expected: Vec<String> =
+        view.retained.iter().rev().map(|entry| entry.signature.to_string()).collect();
     check_eq!(
         listed,
         expected,
@@ -281,12 +244,7 @@ impl PrivateErScenario for LedgerRetention {
         let before;
         {
             let er = private.ctx();
-            prep::await_program_clone(
-                er,
-                &redshift_interface::id(),
-                PROGRAM_CLONE_TIMEOUT,
-            )
-            .await?;
+            prep::await_program_clone(er, &redshift_interface::id(), PROGRAM_CLONE_TIMEOUT).await?;
             counter = delegate_counter(base, er, &payer).await?;
             seed_history(er, &counter, &mut sent).await?;
 
@@ -311,9 +269,7 @@ impl PrivateErScenario for LedgerRetention {
                         total,
                     )
                     .await?;
-                    if view.pruned.len() > previous_pruned
-                        && first_pruning_event.is_none()
-                    {
+                    if view.pruned.len() > previous_pruned && first_pruning_event.is_none() {
                         first_pruning_event = Some(events);
                     }
                     previous_pruned = view.pruned.len();

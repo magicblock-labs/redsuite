@@ -4,8 +4,7 @@ use async_trait::async_trait;
 use instruction::Instruction;
 use redshift_interface::schedulecommit::{build, ScheduleCommitType};
 use redsuite_core::{
-    check, check_eq, dlp, prep, system, BaseCtx, ChainCtx, ErCtx, Result,
-    Scenario,
+    check, check_eq, dlp, prep, system, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
 use signer::Signer;
 
@@ -25,11 +24,9 @@ impl Scenario for IllegalWritable {
 
     async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<()> {
         let funder = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
-        let committees =
-            prep::init_committees(base, &funder, er.identity(), 2).await?;
+        let committees = prep::init_committees(base, &funder, er.identity(), 2).await?;
         prep::await_committee_clones(er, &committees).await?;
-        let players: Vec<_> =
-            committees.iter().map(|c| c.player.pubkey()).collect();
+        let players: Vec<_> = committees.iter().map(|c| c.player.pubkey()).collect();
         let pdas: Vec<_> = committees.iter().map(|c| c.pda).collect();
 
         // A plain (non-delegated) payer for the direct-invocation cells: the
@@ -54,9 +51,7 @@ impl Scenario for IllegalWritable {
             ),
             (
                 "sibling CPIs",
-                &[redhat_interface::build::sibling_schedule_commit_cpis(
-                    payer, &players, &pdas,
-                )],
+                &[redhat_interface::build::sibling_schedule_commit_cpis(payer, &players, &pdas)],
                 &[&[INVALID_ACCOUNT_OWNER], &[NEEDS_TO_BE_OWNED]],
             ),
             (
@@ -71,28 +66,19 @@ impl Scenario for IllegalWritable {
                         ScheduleCommitType::CommitFinalize,
                         true,
                     ),
-                    redhat_interface::build::nested_schedule_commit_cpi(
-                        payer, &pdas,
-                    ),
+                    redhat_interface::build::nested_schedule_commit_cpi(payer, &pdas),
                 ],
                 &[&[INVALID_ACCOUNT_OWNER], &[NEEDS_TO_BE_OWNED]],
             ),
         ];
         for (case, instructions, needles) in cases {
             let signature = sender.submit(instructions).await?;
-            let tx = er
-                .api()
-                .await_transaction(&signature, RECEIPT_TIMEOUT)
-                .await?;
+            let tx = er.api().await_transaction(&signature, RECEIPT_TIMEOUT).await?;
             check!(
                 tx.err.is_some(),
                 "{case} ({signature}): the attack must fail on-chain, got {tx:?}"
             )?;
-            let observed = format!(
-                "{}\n{:?}",
-                tx.logs.join("\n"),
-                tx.err.as_ref().unwrap()
-            );
+            let observed = format!("{}\n{:?}", tx.logs.join("\n"), tx.err.as_ref().unwrap());
             // Every group must match; alternatives within a group are ORed.
             for alternatives in needles {
                 check!(
@@ -105,10 +91,7 @@ impl Scenario for IllegalWritable {
         // The refused attacks must not have scheduled anything: no base commit
         // moved the PDAs off dlp.
         for pda in &pdas {
-            let on_base = base
-                .account(pda)
-                .await?
-                .ok_or("the committee pda vanished from base")?;
+            let on_base = base.account(pda).await?.ok_or("the committee pda vanished from base")?;
             check_eq!(
                 on_base.owner,
                 dlp::dlp_id(),

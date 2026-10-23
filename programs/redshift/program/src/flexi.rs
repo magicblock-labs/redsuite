@@ -24,19 +24,17 @@ pub fn process(accounts: &[AccountInfo], payload: &[u8]) -> ProgramResult {
     if let Some(response) = payload.strip_prefix(&TRANSFER_CALLBACK[1..]) {
         return intents::callback(accounts, response);
     }
-    let instruction =
-        FlexiInstruction::try_from_slice(payload).map_err(|err| {
-            msg!("cannot parse the flexi instruction: {}", err);
-            ProgramError::InvalidInstructionData
-        })?;
+    let instruction = FlexiInstruction::try_from_slice(payload).map_err(|err| {
+        msg!("cannot parse the flexi instruction: {}", err);
+        ProgramError::InvalidInstructionData
+    })?;
 
     use FlexiInstruction::*;
     match instruction {
         Init { label, bump } => process_init(accounts, label, bump),
-        Delegate {
-            commit_frequency_ms,
-            validator,
-        } => process_delegate(accounts, commit_frequency_ms, validator),
+        Delegate { commit_frequency_ms, validator } => {
+            process_delegate(accounts, commit_frequency_ms, validator)
+        }
         Add { count } => process_add(accounts, count),
         AddUnsigned { count } => process_add_unsigned(accounts, count),
         AddError { count } => process_add_error(accounts, count),
@@ -52,33 +50,14 @@ pub fn process(accounts: &[AccountInfo], payload: &[u8]) -> ProgramResult {
             iterations,
             signer,
         ),
-        CancelCounterTask { task_id } => {
-            process_cancel_counter_task(accounts, task_id)
+        CancelCounterTask { task_id } => process_cancel_counter_task(accounts, task_id),
+        CreateActionIntent { counter, count, compute_units } => {
+            process_create_action_intent(accounts, counter, count, compute_units)
         }
-        CreateActionIntent {
-            counter,
-            count,
-            compute_units,
-        } => process_create_action_intent(
-            accounts,
-            counter,
-            count,
-            compute_units,
-        ),
-        AddActionHandler { count } => {
-            process_add_action_handler(accounts, count)
-        }
-        ScheduleIntents { modes, actions } => {
-            intents::schedule(accounts, &modes, actions)
-        }
-        BaseAction {
-            amount,
-            change,
-            fail,
-        } => intents::action(accounts, amount, change, fail),
-        TransferIntent { amount, fail } => {
-            intents::transfer(accounts, amount, fail)
-        }
+        AddActionHandler { count } => process_add_action_handler(accounts, count),
+        ScheduleIntents { modes, actions } => intents::schedule(accounts, &modes, actions),
+        BaseAction { amount, change, fail } => intents::action(accounts, amount, change, fail),
+        TransferIntent { amount, fail } => intents::transfer(accounts, amount, fail),
     }
 }
 
@@ -87,8 +66,7 @@ fn add(counter_account: &AccountInfo, count: u8) -> ProgramResult {
 }
 
 fn adjust(counter_account: &AccountInfo, change: i64) -> ProgramResult {
-    let mut counter =
-        FlexiCounter::try_from_slice(&counter_account.data.borrow())?;
+    let mut counter = FlexiCounter::try_from_slice(&counter_account.data.borrow())?;
     counter.count = counter
         .count
         .checked_add_signed(change)
@@ -100,11 +78,7 @@ fn adjust(counter_account: &AccountInfo, change: i64) -> ProgramResult {
     Ok(())
 }
 
-fn process_init(
-    accounts: &[AccountInfo],
-    label: String,
-    bump: u8,
-) -> ProgramResult {
+fn process_init(accounts: &[AccountInfo], label: String, bump: u8) -> ProgramResult {
     let iter = &mut accounts.iter();
     let payer = next_account_info(iter)?;
     let counter = next_account_info(iter)?;
@@ -116,12 +90,7 @@ fn process_init(
     }
 
     let bump_slice = [bump];
-    let seeds: [&[u8]; 4] = [
-        crate::ID.as_ref(),
-        FLEXI_SEED,
-        payer.key.as_ref(),
-        &bump_slice,
-    ];
+    let seeds: [&[u8]; 4] = [crate::ID.as_ref(), FLEXI_SEED, payer.key.as_ref(), &bump_slice];
     let state = FlexiCounter::new(label);
     let data = to_vec(&state)?;
     let size = data.len();
@@ -147,15 +116,11 @@ fn process_delegate(
     validator: Option<Pubkey>,
 ) -> ProgramResult {
     let accounts = crate::schedulecommit::delegate_accounts(accounts)?;
-    let seeds: [&[u8]; 3] =
-        [crate::ID.as_ref(), FLEXI_SEED, accounts.payer.key.as_ref()];
+    let seeds: [&[u8]; 3] = [crate::ID.as_ref(), FLEXI_SEED, accounts.payer.key.as_ref()];
     delegate_account(
         accounts,
         &seeds,
-        DelegateConfig {
-            commit_frequency_ms,
-            validator,
-        },
+        DelegateConfig { commit_frequency_ms, validator },
     )
 }
 
@@ -189,19 +154,12 @@ fn process_create_action_intent(
             is_writable: true,
         }],
     };
-    MagicIntentBundleBuilder::new(
-        payer.clone(),
-        magic_context.clone(),
-        magic_program.clone(),
-    )
-    .add_standalone_actions([handler])
-    .build_and_invoke()
+    MagicIntentBundleBuilder::new(payer.clone(), magic_context.clone(), magic_program.clone())
+        .add_standalone_actions([handler])
+        .build_and_invoke()
 }
 
-fn process_add_action_handler(
-    accounts: &[AccountInfo],
-    count: u8,
-) -> ProgramResult {
+fn process_add_action_handler(accounts: &[AccountInfo], count: u8) -> ProgramResult {
     let [counter, source_program, _, escrow_account] = accounts else {
         return Err(ProgramError::NotEnoughAccountKeys);
     };
@@ -234,9 +192,7 @@ fn process_schedule_counter_task(
     iterations: i64,
     signer: bool,
 ) -> ProgramResult {
-    use magic_api::{
-        args::ScheduleTaskArgs, instruction::MagicBlockInstruction,
-    };
+    use magic_api::{args::ScheduleTaskArgs, instruction::MagicBlockInstruction};
 
     let [magic_program, payer, counter] = accounts else {
         return Err(ProgramError::NotEnoughAccountKeys);
@@ -251,47 +207,33 @@ fn process_schedule_counter_task(
     } else {
         build::add_unsigned(*payer.key, 1)
     };
-    let data = bincode::serialize(&MagicBlockInstruction::ScheduleTask(
-        ScheduleTaskArgs {
-            task_id,
-            execution_interval_millis,
-            iterations,
-            instructions: vec![task_instruction],
-        },
-    ))
+    let data = bincode::serialize(&MagicBlockInstruction::ScheduleTask(ScheduleTaskArgs {
+        task_id,
+        execution_interval_millis,
+        iterations,
+        instructions: vec![task_instruction],
+    }))
     .map_err(|_| ProgramError::InvalidArgument)?;
 
     let instruction = Instruction::new_with_bytes(
         *magic_program.key,
         &data,
-        vec![
-            AccountMeta::new(*payer.key, true),
-            AccountMeta::new(*counter.key, true),
-        ],
+        vec![AccountMeta::new(*payer.key, true), AccountMeta::new(*counter.key, true)],
     );
 
     let bump_slice = [bump];
-    let seeds: [&[u8]; 4] = [
-        crate::ID.as_ref(),
-        FLEXI_SEED,
-        payer.key.as_ref(),
-        &bump_slice,
-    ];
+    let seeds: [&[u8]; 4] = [crate::ID.as_ref(), FLEXI_SEED, payer.key.as_ref(), &bump_slice];
     invoke_signed(&instruction, &[payer.clone(), counter.clone()], &[&seeds])
 }
 
-fn process_cancel_counter_task(
-    accounts: &[AccountInfo],
-    task_id: i64,
-) -> ProgramResult {
+fn process_cancel_counter_task(accounts: &[AccountInfo], task_id: i64) -> ProgramResult {
     use magic_api::instruction::MagicBlockInstruction;
 
     let [magic_program, payer] = accounts else {
         return Err(ProgramError::NotEnoughAccountKeys);
     };
-    let data =
-        bincode::serialize(&MagicBlockInstruction::CancelTask { task_id })
-            .map_err(|_| ProgramError::InvalidArgument)?;
+    let data = bincode::serialize(&MagicBlockInstruction::CancelTask { task_id })
+        .map_err(|_| ProgramError::InvalidArgument)?;
     let instruction = Instruction::new_with_bytes(
         *magic_program.key,
         &data,

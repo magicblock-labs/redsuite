@@ -72,9 +72,7 @@ fn programs(root: &Path) -> Result<()> {
             Fixture::RedshiftProgram => ("redshift", None),
             Fixture::RedhatProgram => ("redhat", None),
             Fixture::RedshiftProgramSlim => ("redshift", Some("slim")),
-            Fixture::RedshiftProgramSlimUpgraded => {
-                ("redshift", Some("slim-upgraded"))
-            }
+            Fixture::RedshiftProgramSlimUpgraded => ("redshift", Some("slim-upgraded")),
         };
         let out = match variant {
             Some(label) => deploy.join(format!("{family}-{label}")),
@@ -99,9 +97,7 @@ fn programs(root: &Path) -> Result<()> {
             // fs::copy can fail with ENOENT on virtiofs bind mounts.
             std::fs::read(out.join("redshift_program.so"))
                 .and_then(|bytes| std::fs::write(&staged, bytes))
-                .map_err(|error| {
-                    format!("staging {}: {error}", staged.display())
-                })?;
+                .map_err(|error| format!("staging {}: {error}", staged.display()))?;
         }
     }
     Ok(())

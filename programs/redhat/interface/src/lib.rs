@@ -1,8 +1,7 @@
 use borsh::{BorshDeserialize, BorshSerialize};
 use pubkey::Pubkey;
 
-pub const ID: Pubkey =
-    Pubkey::from_str_const("BTczL2chGpVHw25pbmMtkFAD1t7rxoa8pVbaUjsybjiq");
+pub const ID: Pubkey = Pubkey::from_str_const("BTczL2chGpVHw25pbmMtkFAD1t7rxoa8pVbaUjsybjiq");
 
 pub const fn id() -> Pubkey {
     ID
@@ -38,24 +37,17 @@ pub mod build {
             AccountMeta::new_readonly(MAGIC_PROGRAM_ID, false),
         ];
         if pass_schedulecommit_program {
-            metas.push(AccountMeta::new_readonly(
-                redshift_interface::id(),
-                false,
-            ));
+            metas.push(AccountMeta::new_readonly(redshift_interface::id(), false));
         }
         metas.extend(pdas.iter().map(|key| AccountMeta::new(*key, false)));
         metas
     }
 
-    fn borsh_ix(
-        instruction: &SecurityInstruction,
-        metas: Vec<AccountMeta>,
-    ) -> Instruction {
+    fn borsh_ix(instruction: &SecurityInstruction, metas: Vec<AccountMeta>) -> Instruction {
         Instruction {
             program_id: crate::id(),
             accounts: metas,
-            data: borsh::to_vec(instruction)
-                .expect("instruction serialization cannot fail"),
+            data: borsh::to_vec(instruction).expect("instruction serialization cannot fail"),
         }
     }
 
@@ -70,10 +62,7 @@ pub mod build {
         )
     }
 
-    pub fn nested_schedule_commit_cpi(
-        payer: Pubkey,
-        pdas: &[Pubkey],
-    ) -> Instruction {
+    pub fn nested_schedule_commit_cpi(payer: Pubkey, pdas: &[Pubkey]) -> Instruction {
         borsh_ix(
             &SecurityInstruction::DirectScheduleCommitCpi,
             with_pdas(payer, false, pdas),

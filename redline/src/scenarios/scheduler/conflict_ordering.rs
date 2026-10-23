@@ -22,14 +22,14 @@ use redsuite_core::{
     report,
     report::Unit::{Count, Micros, Ratio, Seconds, Tps},
     runner::{
-        execute_until_raw, merge_outcomes, spawn_workers, split_budget, Pacing,
-        RawRunOutcome, RunOutcome, Worker, Workers, SEND_ORIGIN,
+        execute_until_raw, merge_outcomes, spawn_workers, split_budget, Pacing, RawRunOutcome,
+        RunOutcome, Worker, Workers, SEND_ORIGIN,
     },
     sampler::{MeanMax, Sampled, Sampler, Trailing},
     stats::{ObservationsStats, StreamingStats},
     transport::{clock::SendClock, ws::SignatureConfirmations},
-    BaseCtx, ChainCtx, CheckError, ErClient, ErCtx, Metrics, MetricsDelta,
-    Result, Scenario, ScenarioReport, TxSender,
+    BaseCtx, ChainCtx, CheckError, ErClient, ErCtx, Metrics, MetricsDelta, Result, Scenario,
+    ScenarioReport, TxSender,
 };
 use signature::Signature;
 use signer::Signer;
@@ -100,10 +100,7 @@ const FULL: Profile = Profile {
     phase_span: Duration::from_secs(10),
 };
 
-const PROFILES: ProfileValues<Profile> = ProfileValues {
-    lite: LITE,
-    full: FULL,
-};
+const PROFILES: ProfileValues<Profile> = ProfileValues { lite: LITE, full: FULL };
 
 fn heavy_step(chain: u64) -> Step {
     Step::ALL[(chain % STEPS) as usize]
@@ -181,14 +178,11 @@ fn spawn_load(
                 LoadMode::Bounded { lanes } => (lanes, 0),
                 LoadMode::Open { concurrency } => (
                     accounts.len(),
-                    split_budget(concurrency as u64, worker.threads)
-                        [worker.index] as usize,
+                    split_budget(concurrency as u64, worker.threads)[worker.index] as usize,
                 ),
             };
             let mut lanes = Vec::new();
-            for index in (worker.index..lane_limit.min(accounts.len()))
-                .step_by(worker.threads)
-            {
+            for index in (worker.index..lane_limit.min(accounts.len())).step_by(worker.threads) {
                 let payer = prep::payer_from_bytes(&payer_bytes[index]);
                 lanes.push((accounts[index], client.sender(Rc::new(payer))));
             }
@@ -196,15 +190,10 @@ fn spawn_load(
                 return Ok(RawRunOutcome::default());
             }
             match mode {
-                LoadMode::Open { .. } if concurrency == 0 => {
-                    Ok(RawRunOutcome::default())
-                }
-                LoadMode::Open { .. } => {
-                    open_load(lanes, iters, concurrency, &worker).await
-                }
+                LoadMode::Open { .. } if concurrency == 0 => Ok(RawRunOutcome::default()),
+                LoadMode::Open { .. } => open_load(lanes, iters, concurrency, &worker).await,
                 LoadMode::Bounded { .. } => {
-                    bounded_load(&er_ws_url, lanes, iters, worker.stop_flag())
-                        .await
+                    bounded_load(&er_ws_url, lanes, iters, worker.stop_flag()).await
                 }
             }
         }
@@ -217,17 +206,12 @@ async fn open_load(
     concurrency: usize,
     worker: &Worker,
 ) -> Result<RawRunOutcome> {
-    execute_until_raw(
-        Pacing::Unlimited,
-        concurrency,
-        worker.stop_cell(),
-        |id| {
-            let (account, sender) = &lanes[((id - 1) as usize) % lanes.len()];
-            let ixs = independent_ixs(id, *account, iters);
-            let sender = sender.clone();
-            sender.staged(&ixs)
-        },
-    )
+    execute_until_raw(Pacing::Unlimited, concurrency, worker.stop_cell(), |id| {
+        let (account, sender) = &lanes[((id - 1) as usize) % lanes.len()];
+        let ixs = independent_ixs(id, *account, iters);
+        let sender = sender.clone();
+        sender.staged(&ixs)
+    })
     .await
 }
 
@@ -245,10 +229,8 @@ async fn bounded_load(
     iters: u32,
     stop: Arc<AtomicBool>,
 ) -> Result<RawRunOutcome> {
-    let sigs = Rc::new(
-        SignatureConfirmations::connect(ws_url, Arc::new(SendClock::new(1, 0)))
-            .await?,
-    );
+    let sigs =
+        Rc::new(SignatureConfirmations::connect(ws_url, Arc::new(SendClock::new(1, 0))).await?);
     let tally = Rc::new(RefCell::new(LaneTally::default()));
     let next_id = Rc::new(Cell::new(0u64));
     let started = Instant::now();
@@ -268,18 +250,15 @@ async fn bounded_load(
                     sigs.subscribe(id, &tx.signatures[0]).await?;
                     let sent = Instant::now();
                     sender.submit_prepared(&tx).await?;
-                    tally
-                        .borrow_mut()
-                        .delivery
-                        .push(sent.elapsed().as_micros() as u32);
-                    tokio::time::timeout(CONFIRM_TIMEOUT, sigs.await_id(id))
-                        .await
-                        .map_err(|_| {
+                    tally.borrow_mut().delivery.push(sent.elapsed().as_micros() as u32);
+                    tokio::time::timeout(CONFIRM_TIMEOUT, sigs.await_id(id)).await.map_err(
+                        |_| {
                             format!(
                                 "confirmation for independent tx {id} not \
                                      within {CONFIRM_TIMEOUT:?}"
                             )
-                        })??;
+                        },
+                    )??;
                     Ok(())
                 }
                 .await;
@@ -296,8 +275,7 @@ async fn bounded_load(
         }));
     }
     for task in tasks {
-        task.await
-            .map_err(|error| format!("independent lane panicked: {error}"))?;
+        task.await.map_err(|error| format!("independent lane panicked: {error}"))?;
     }
     let confirmations = sigs.finalize();
     let mut tally = tally.borrow_mut();
@@ -371,11 +349,7 @@ async fn drain(er: &ErCtx, target: f64) -> Result<DrainState> {
     check::poll(
         "the execution pipeline goes idle (nothing blocked, busy or pending)",
         SETTLE_TIMEOUT,
-        || async {
-            er.scrape_metrics()
-                .await
-                .is_ok_and(|metrics| is_idle(&metrics))
-        },
+        || async { er.scrape_metrics().await.is_ok_and(|metrics| is_idle(&metrics)) },
     )
     .await?;
     let (blocked, busy, pending) = idle_values(&er.scrape_metrics().await?);
@@ -449,8 +423,7 @@ async fn drive_pair(
 ) -> Result<()> {
     let (first, last) = plan.range;
     for chain in first..last {
-        tokio::time::sleep_until(phase_started + gap * (chain - first) as u32)
-            .await;
+        tokio::time::sleep_until(phase_started + gap * (chain - first) as u32).await;
         let heavy = heavy_step(chain);
         for step in Step::ALL {
             let id = plan.space.step_id(plan.batch, pair_index, chain, step);
@@ -485,23 +458,19 @@ async fn run_phase(
     let phase_started = tokio::time::Instant::now();
     let (first, last) = plan.range;
     let chains = last.saturating_sub(first);
-    let gap = plan
-        .span
-        .checked_div(chains.max(1) as u32)
-        .unwrap_or_default();
+    let gap = plan.span.checked_div(chains.max(1) as u32).unwrap_or_default();
     let send_stats = RefCell::new(StreamingStats::new());
-    let results =
-        join_all(pairs.iter_mut().enumerate().map(|(pair_index, pair)| {
-            drive_pair(
-                pair_index as u64,
-                pair,
-                &plan,
-                phase_started,
-                gap,
-                &send_stats,
-            )
-        }))
-        .await;
+    let results = join_all(pairs.iter_mut().enumerate().map(|(pair_index, pair)| {
+        drive_pair(
+            pair_index as u64,
+            pair,
+            &plan,
+            phase_started,
+            gap,
+            &send_stats,
+        )
+    }))
+    .await;
     let chain_result: Result<()> = results.into_iter().collect();
     tokio::time::sleep_until(phase_started + plan.span).await;
     let load = match handles.take() {
@@ -521,10 +490,7 @@ async fn run_phase(
     })
 }
 
-async fn first_failed_step(
-    er: &ErCtx,
-    steps: &[(u64, Step, Signature)],
-) -> Option<String> {
+async fn first_failed_step(er: &ErCtx, steps: &[(u64, Step, Signature)]) -> Option<String> {
     for (id, step, signature) in steps {
         match er.api().get_transaction(signature).await {
             Ok(None) => {
@@ -550,27 +516,18 @@ async fn first_failed_step(
     None
 }
 
-async fn verify_pairs(
-    er: &ErCtx,
-    pairs: &mut [Pair],
-    batch: usize,
-) -> Result<()> {
+async fn verify_pairs(er: &ErCtx, pairs: &mut [Pair], batch: usize) -> Result<()> {
     for (index, pair) in pairs.iter_mut().enumerate() {
-        if let Err(error) = pair
-            .chain
-            .verify(er, &format!("batch {batch}: pair {index} on the ER"))
-            .await
+        if let Err(error) =
+            pair.chain.verify(er, &format!("batch {batch}: pair {index} on the ER")).await
         {
             let error = match error.downcast::<CheckError>() {
                 Ok(error) => error
                     .context(
                         "first failed step of this batch",
-                        first_failed_step(er, &pair.steps)
-                            .await
-                            .unwrap_or_else(|| {
-                                "none — every step executed successfully"
-                                    .to_owned()
-                            }),
+                        first_failed_step(er, &pair.steps).await.unwrap_or_else(|| {
+                            "none — every step executed successfully".to_owned()
+                        }),
                     )
                     .into(),
                 Err(error) => error,
@@ -582,19 +539,14 @@ async fn verify_pairs(
     Ok(())
 }
 
-async fn verify_independent(
-    er: &ErCtx,
-    accounts: &[Pubkey],
-    iters: u32,
-) -> Result<()> {
+async fn verify_independent(er: &ErCtx, accounts: &[Pubkey], iters: u32) -> Result<()> {
     let expected = hash_chain(HASH_INIT.to_bytes(), iters);
     for (index, address) in accounts.iter().enumerate() {
         let account = er
             .account(address)
             .await?
             .ok_or(format!("independent account {index} is not on the ER"))?;
-        let hash = &account.data
-            [layout::HASH_OFFSET..layout::HASH_OFFSET + layout::HASH_SIZE];
+        let hash = &account.data[layout::HASH_OFFSET..layout::HASH_OFFSET + layout::HASH_SIZE];
         check_eq!(
             hash,
             expected,
@@ -654,8 +606,7 @@ impl Scenario<ScenarioReport> for ConflictOrdering {
             PAYER_LAMPORTS,
         )
         .await?;
-        let (chain_payers, independent_payers) =
-            payers.split_at(profile.pairs * PAYERS_PER_PAIR);
+        let (chain_payers, independent_payers) = payers.split_at(profile.pairs * PAYERS_PER_PAIR);
 
         let prep_payers: Vec<Keypair> = chain_payers
             .iter()
@@ -673,12 +624,7 @@ impl Scenario<ScenarioReport> for ConflictOrdering {
         )
         .await?;
         let independent = Accounts::new(crate::ACCOUNT_SPACE, er.identity())
-            .init_batched(
-                base,
-                independent_payers,
-                profile.independent_accounts,
-                true,
-            )
+            .init_batched(base, independent_payers, profile.independent_accounts, true)
             .await?;
         prep::await_clones(
             er,
@@ -687,8 +633,7 @@ impl Scenario<ScenarioReport> for ConflictOrdering {
             CLONE_TIMEOUT,
         )
         .await?;
-        let payer_keys: Vec<Pubkey> =
-            payers.iter().map(Signer::pubkey).collect();
+        let payer_keys: Vec<Pubkey> = payers.iter().map(Signer::pubkey).collect();
         prep::await_cloned_payers(er, &payer_keys, CLONE_TIMEOUT).await?;
 
         let mut pairs: Vec<Pair> = pair_accounts
@@ -697,8 +642,7 @@ impl Scenario<ScenarioReport> for ConflictOrdering {
             .map(|(index, accounts)| Pair {
                 chain: CausalPair::new(
                     [accounts[0], accounts[1]],
-                    chain_payers[index * PAYERS_PER_PAIR
-                        ..(index + 1) * PAYERS_PER_PAIR]
+                    chain_payers[index * PAYERS_PER_PAIR..(index + 1) * PAYERS_PER_PAIR]
                         .iter()
                         .map(|payer| er.sender(Rc::new(payer.insecure_clone())))
                         .collect(),
@@ -713,9 +657,7 @@ impl Scenario<ScenarioReport> for ConflictOrdering {
         let mut handles = Some(spawn_load(
             er.api().url().to_owned(),
             er.ws_url().to_owned(),
-            LoadMode::Open {
-                concurrency: OPEN_CONCURRENCY,
-            },
+            LoadMode::Open { concurrency: OPEN_CONCURRENCY },
             profile.driver_threads,
             independent.clone(),
             independent_payer_bytes.clone(),
@@ -746,8 +688,7 @@ impl Scenario<ScenarioReport> for ConflictOrdering {
             .min(profile.independent_accounts)
             .max(1);
         let calibration_target =
-            calibration_before.get(TX_COUNT).unwrap_or_default()
-                + calibration.delivered as f64;
+            calibration_before.get(TX_COUNT).unwrap_or_default() + calibration.delivered as f64;
         drain(er, calibration_target).await?;
         debug!(
             executors,
@@ -759,17 +700,12 @@ impl Scenario<ScenarioReport> for ConflictOrdering {
             chains: profile.chains,
         };
         let modes = [
-            LoadMode::Bounded {
-                lanes: contention_lanes,
-            },
-            LoadMode::Open {
-                concurrency: OPEN_CONCURRENCY,
-            },
+            LoadMode::Bounded { lanes: contention_lanes },
+            LoadMode::Open { concurrency: OPEN_CONCURRENCY },
         ];
         let ranges = phase_ranges(profile.chains);
 
-        let mut batches: Vec<BatchOutcome> =
-            Vec::with_capacity(profile.batches);
+        let mut batches: Vec<BatchOutcome> = Vec::with_capacity(profile.batches);
         for batch in 0..profile.batches {
             let before = er.scrape_metrics().await?;
             check!(
@@ -792,14 +728,8 @@ impl Scenario<ScenarioReport> for ConflictOrdering {
                     independent_iters: profile.independent_iters,
                     driver_threads: profile.driver_threads,
                 };
-                let phase = run_phase(
-                    er,
-                    &mut pairs,
-                    &independent,
-                    &independent_payer_bytes,
-                    plan,
-                )
-                .await?;
+                let phase =
+                    run_phase(er, &mut pairs, &independent, &independent_payer_bytes, plan).await?;
                 check_eq!(
                     phase.load.failed,
                     0,
@@ -814,16 +744,13 @@ impl Scenario<ScenarioReport> for ConflictOrdering {
                 phases.push(phase);
             }
 
-            let workload: u64 = phases
-                .iter()
-                .map(|phase| phase.chain_txs + phase.load.delivered)
-                .sum();
+            let workload: u64 =
+                phases.iter().map(|phase| phase.chain_txs + phase.load.delivered).sum();
             let drained = drain(er, txs_before + workload as f64).await?;
             let after = er.scrape_metrics().await?;
             let delta = MetricsDelta::new(before, after);
             let engine_txs = delta.counter(TX_COUNT).unwrap_or_default();
-            let dependencies =
-                delta.counter(ORDERING_DEPENDENCIES).unwrap_or_default();
+            let dependencies = delta.counter(ORDERING_DEPENDENCIES).unwrap_or_default();
             let failed_kind = |kind: &str| {
                 delta.counter(&format!(
                     "{}{{kind=\"{kind}\"}}",
@@ -899,8 +826,7 @@ impl Scenario<ScenarioReport> for ConflictOrdering {
                      reached the SVM and failed there"
                 )?;
             }
-            let contention_chains =
-                outcome.phases[0].chains * profile.pairs as u64;
+            let contention_chains = outcome.phases[0].chains * profile.pairs as u64;
             check!(
                 dependencies >= contention_chains as f64,
                 "batch {batch}: the engine registered {dependencies:.0} \
@@ -911,96 +837,65 @@ impl Scenario<ScenarioReport> for ConflictOrdering {
             verify_pairs(er, &mut pairs, batch).await?;
             debug!(
                 batch,
-                dependencies,
-                "contention batch drained; all pairs match accepted fold",
+                dependencies, "contention batch drained; all pairs match accepted fold",
             );
 
-            let mut cell =
-                ScenarioReport::ok(&format!("{}/batch{batch}", self.name()))
-                    .setting("profile", profile.name)
-                    .setting("batch", batch)
-                    .setting("pairs", profile.pairs)
-                    .setting("chains per pair", profile.chains)
-                    .setting("heavy step iters", profile.heavy_iters)
-                    .setting("independent iters", profile.independent_iters)
-                    .setting("executors", executors)
-                    .setting("contention lanes", contention_lanes)
-                    .setting("open concurrency", OPEN_CONCURRENCY)
-                    .metric("chain txs", Count, outcome.chain_txs() as f64)
-                    .metric(
-                        "independent txs",
-                        Count,
-                        outcome.independent_txs() as f64,
-                    )
-                    .metric("engine txs in window", Count, engine_txs)
-                    .metric(
-                        "engine txs beyond workload",
-                        Count,
-                        engine_txs - workload as f64,
-                    )
-                    .metric("ordering dependencies", Count, dependencies)
-                    .metric(
-                        "dependencies per chain",
-                        Ratio,
-                        dependencies
-                            / (outcome.chains() * profile.pairs as u64) as f64,
-                    )
-                    .metric(
-                        "drain s",
-                        Seconds,
-                        outcome.drained.elapsed.as_secs_f64(),
-                    )
-                    .metric("blocked at drain", Count, outcome.drained.blocked)
-                    .metric("busy at drain", Count, outcome.drained.busy)
-                    .metric("pending at drain", Count, outcome.drained.pending)
-                    .metric_if("dropped txs", Count, outcome.dropped)
-                    .metric_if(
-                        "execution failed txs",
-                        Count,
-                        outcome.execution_failed,
-                    );
+            let mut cell = ScenarioReport::ok(&format!("{}/batch{batch}", self.name()))
+                .setting("profile", profile.name)
+                .setting("batch", batch)
+                .setting("pairs", profile.pairs)
+                .setting("chains per pair", profile.chains)
+                .setting("heavy step iters", profile.heavy_iters)
+                .setting("independent iters", profile.independent_iters)
+                .setting("executors", executors)
+                .setting("contention lanes", contention_lanes)
+                .setting("open concurrency", OPEN_CONCURRENCY)
+                .metric("chain txs", Count, outcome.chain_txs() as f64)
+                .metric("independent txs", Count, outcome.independent_txs() as f64)
+                .metric("engine txs in window", Count, engine_txs)
+                .metric(
+                    "engine txs beyond workload",
+                    Count,
+                    engine_txs - workload as f64,
+                )
+                .metric("ordering dependencies", Count, dependencies)
+                .metric(
+                    "dependencies per chain",
+                    Ratio,
+                    dependencies / (outcome.chains() * profile.pairs as u64) as f64,
+                )
+                .metric("drain s", Seconds, outcome.drained.elapsed.as_secs_f64())
+                .metric("blocked at drain", Count, outcome.drained.blocked)
+                .metric("busy at drain", Count, outcome.drained.busy)
+                .metric("pending at drain", Count, outcome.drained.pending)
+                .metric_if("dropped txs", Count, outcome.dropped)
+                .metric_if("execution failed txs", Count, outcome.execution_failed);
             for phase in &outcome.phases {
                 let samples = &phase.samples.value;
                 cell = cell
                     .setting(format!("{} scrapes", phase.label), &phase.samples)
-                    .observe(
-                        format!("{} chain send us", phase.label),
-                        Micros,
-                        phase.send,
-                    )
+                    .observe(format!("{} chain send us", phase.label), Micros, phase.send)
                     .observe(
                         format!("{} independent delivery us", phase.label),
                         Micros,
                         phase.load.delivery,
                     )
-                    .client_side_as(
-                        format!("{} scheduling delay us", phase.label),
-                        &phase.load,
-                    );
+                    .client_side_as(format!("{} scheduling delay us", phase.label), &phase.load);
                 for (label, unit, value) in [
                     ("chain txs", Count, phase.chain_txs as f64),
                     ("independent txs", Count, phase.load.delivered as f64),
                     (
                         "independent tps",
                         Tps,
-                        phase.load.delivered as f64
-                            / phase.load.wall.as_secs_f64().max(1e-9),
+                        phase.load.delivered as f64 / phase.load.wall.as_secs_f64().max(1e-9),
                     ),
                     ("busy executors mean", Count, samples.busy.mean()),
                     ("busy executors max", Count, samples.busy.max),
                     ("blocked max", Count, samples.blocked_max),
-                    (
-                        "longest stall s",
-                        Seconds,
-                        samples.max_stall.as_secs_f64(),
-                    ),
+                    ("longest stall s", Seconds, samples.max_stall.as_secs_f64()),
                     ("wall s", Seconds, phase.wall.as_secs_f64()),
                 ] {
-                    cell = cell.metric(
-                        format!("{} {label}", phase.label),
-                        unit,
-                        value,
-                    );
+                    cell = cell.metric(format!("{} {label}", phase.label), unit, value);
                 }
             }
             report::persist_cell(self.name(), &cell);
@@ -1010,27 +905,18 @@ impl Scenario<ScenarioReport> for ConflictOrdering {
         verify_independent(er, &independent, profile.independent_iters).await?;
 
         let chain_txs: u64 = batches.iter().map(BatchOutcome::chain_txs).sum();
-        let independent_txs: u64 =
-            batches.iter().map(BatchOutcome::independent_txs).sum();
-        let chains: u64 = batches
-            .iter()
-            .map(|batch| batch.chains() * profile.pairs as u64)
-            .sum();
-        let dependencies: f64 =
-            batches.iter().map(|batch| batch.dependencies).sum();
-        let engine_txs: f64 =
-            batches.iter().map(|batch| batch.engine_txs).sum();
+        let independent_txs: u64 = batches.iter().map(BatchOutcome::independent_txs).sum();
+        let chains: u64 = batches.iter().map(|batch| batch.chains() * profile.pairs as u64).sum();
+        let dependencies: f64 = batches.iter().map(|batch| batch.dependencies).sum();
+        let engine_txs: f64 = batches.iter().map(|batch| batch.engine_txs).sum();
         let longest_stall = batches
             .iter()
             .flat_map(|batch| batch.phases.iter())
             .map(|phase| phase.samples.value.max_stall)
             .max()
             .unwrap_or_default();
-        let slowest_drain = batches
-            .iter()
-            .map(|batch| batch.drained.elapsed)
-            .max()
-            .unwrap_or_default();
+        let slowest_drain =
+            batches.iter().map(|batch| batch.drained.elapsed).max().unwrap_or_default();
         let mut summary = ScenarioReport::ok(self.name())
             .setting("profile", profile.name)
             .setting(
@@ -1050,17 +936,11 @@ impl Scenario<ScenarioReport> for ConflictOrdering {
             .setting("contention lanes", contention_lanes)
             .setting(
                 "contention load",
-                LoadMode::Bounded {
-                    lanes: contention_lanes,
-                }
-                .shape(),
+                LoadMode::Bounded { lanes: contention_lanes }.shape(),
             )
             .setting(
                 "backpressure load",
-                LoadMode::Open {
-                    concurrency: OPEN_CONCURRENCY,
-                }
-                .shape(),
+                LoadMode::Open { concurrency: OPEN_CONCURRENCY }.shape(),
             )
             .metric("chains", Count, chains as f64)
             .metric("chain txs", Count, chain_txs as f64)
@@ -1098,8 +978,7 @@ impl Scenario<ScenarioReport> for ConflictOrdering {
                     (
                         "independent tps",
                         Tps,
-                        phase.load.delivered as f64
-                            / phase.load.wall.as_secs_f64().max(1e-9),
+                        phase.load.delivered as f64 / phase.load.wall.as_secs_f64().max(1e-9),
                     ),
                 ] {
                     summary = summary.metric(

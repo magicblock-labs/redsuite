@@ -52,28 +52,18 @@ struct Discovery {
     submissions: Vec<JoinHandle<Result<Signature>>>,
 }
 
-fn counter_action(
-    actor: &Pubkey,
-    dependency: &Pubkey,
-    count: u8,
-    fail: bool,
-) -> Instruction {
+fn counter_action(actor: &Pubkey, dependency: &Pubkey, count: u8, fail: bool) -> Instruction {
     let mut instruction = if fail {
         flexi::add_error(*actor, count)
     } else {
         flexi::add_unsigned(*actor, count)
     };
-    instruction
-        .accounts
-        .push(AccountMeta::new_readonly(*dependency, false));
+    instruction.accounts.push(AccountMeta::new_readonly(*dependency, false));
     instruction
 }
 
 async fn counter_state(er: &ErCtx, counter: &Pubkey) -> Result<CounterState> {
-    let account = er
-        .account(counter)
-        .await?
-        .ok_or("the counter vanished from the er")?;
+    let account = er.account(counter).await?.ok_or("the counter vanished from the er")?;
     let decoded = FlexiCounter::try_decode(&account.data)?;
     Ok(CounterState {
         count: decoded.count,
@@ -169,18 +159,12 @@ fn held_fetches(proxies: &BaseProxies, dependency: &Pubkey) -> usize {
         .iter()
         .filter(|event| event.action == Action::Held)
         .filter(|event| {
-            event
-                .operation
-                .as_ref()
-                .is_some_and(|op| op.accounts.contains(&dependency))
+            event.operation.as_ref().is_some_and(|op| op.accounts.contains(&dependency))
         })
         .count()
 }
 
-async fn await_fetch_held(
-    proxies: &BaseProxies,
-    dependency: &Pubkey,
-) -> Result<()> {
+async fn await_fetch_held(proxies: &BaseProxies, dependency: &Pubkey) -> Result<()> {
     check::poll(
         "the er fetches the action dependency from base",
         INTERCEPT_TIMEOUT,
@@ -214,19 +198,12 @@ async fn race_discovery(
         let sender = sender.clone();
         submissions.push(tokio::task::spawn_local(async move {
             sender
-                .submit_fresh(&[system::transfer(
-                    &sender.payer().pubkey(),
-                    &trigger,
-                    1,
-                )])
+                .submit_fresh(&[system::transfer(&sender.payer().pubkey(), &trigger, 1)])
                 .await
         }));
     }
-    base.submit_and_confirm(
-        funder,
-        &[system::transfer(&funder.pubkey(), &trigger, 1)],
-    )
-    .await?;
+    base.submit_and_confirm(funder, &[system::transfer(&funder.pubkey(), &trigger, 1)])
+        .await?;
     while started.elapsed() < HOLD_WINDOW {
         check_eq!(
             counter_state(er, counter).await?,
@@ -286,10 +263,7 @@ async fn run_action(
             "the failed activation completes the rescue undelegation on base",
             RESCUE_TIMEOUT,
             || async {
-                let owner = base
-                    .account(&trigger.pubkey())
-                    .await?
-                    .map(|account| account.owner);
+                let owner = base.account(&trigger.pubkey()).await?.map(|account| account.owner);
                 check_eq!(
                     owner,
                     Some(system::system_id()),
@@ -348,13 +322,7 @@ impl PrivateErScenario for ActivationSingleShot {
         let funder = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
         let actor = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
         let er_payer = Rc::new(
-            prep::delegated_payer(
-                base,
-                &funder,
-                er.identity(),
-                crate::PAYER_LAMPORTS,
-            )
-            .await?,
+            prep::delegated_payer(base, &funder, er.identity(), crate::PAYER_LAMPORTS).await?,
         );
 
         let (counter, setup) = prep::flexi_counter(
@@ -366,10 +334,7 @@ impl PrivateErScenario for ActivationSingleShot {
         for instruction in setup {
             base.submit_and_confirm(&actor, &[instruction]).await?;
         }
-        let zero = CounterState {
-            count: 0,
-            updates: 0,
-        };
+        let zero = CounterState { count: 0, updates: 0 };
         await_counter(
             er,
             &counter,
@@ -393,20 +358,13 @@ impl PrivateErScenario for ActivationSingleShot {
             count: u64::from(ACTION_COUNT),
             updates: 1,
         };
-        hold_steady(er, &counter, applied, STEADY_WINDOW, "after activation")
-            .await?;
+        hold_steady(er, &counter, applied, STEADY_WINDOW, "after activation").await?;
 
-        base.submit_and_confirm(
-            &funder,
-            &[system::transfer(&funder.pubkey(), &trigger, 1)],
-        )
-        .await?;
+        base.submit_and_confirm(&funder, &[system::transfer(&funder.pubkey(), &trigger, 1)])
+            .await?;
         proxies.close_connections();
-        base.submit_and_confirm(
-            &funder,
-            &[system::transfer(&funder.pubkey(), &trigger, 1)],
-        )
-        .await?;
+        base.submit_and_confirm(&funder, &[system::transfer(&funder.pubkey(), &trigger, 1)])
+            .await?;
         hold_steady(
             er,
             &counter,
@@ -431,11 +389,8 @@ impl PrivateErScenario for ActivationSingleShot {
             CLONE_TIMEOUT,
         )
         .await?;
-        base.submit_and_confirm(
-            &funder,
-            &[system::transfer(&funder.pubkey(), &trigger, 1)],
-        )
-        .await?;
+        base.submit_and_confirm(&funder, &[system::transfer(&funder.pubkey(), &trigger, 1)])
+            .await?;
         hold_steady(
             er,
             &counter,
@@ -455,8 +410,7 @@ impl PrivateErScenario for ActivationSingleShot {
             true,
         )
         .await?;
-        hold_steady(er, &counter, applied, STEADY_WINDOW, "after the rescue")
-            .await?;
+        hold_steady(er, &counter, applied, STEADY_WINDOW, "after the rescue").await?;
 
         proxies.finish()?;
         private.finish().await?;

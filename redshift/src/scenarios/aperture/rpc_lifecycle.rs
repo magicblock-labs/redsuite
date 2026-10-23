@@ -13,8 +13,7 @@ use redsuite_core::{
     check, check_eq, prep,
     redline::Accounts,
     rpc_client::{
-        nonblocking::rpc_client::RpcClient,
-        rpc_client::GetConfirmedSignaturesForAddress2Config,
+        nonblocking::rpc_client::RpcClient, rpc_client::GetConfirmedSignaturesForAddress2Config,
     },
     rpc_client_api::config::{
         RpcBlockConfig, RpcSendTransactionConfig, RpcSimulateTransactionConfig,
@@ -22,8 +21,7 @@ use redsuite_core::{
     },
     system,
     transport::{
-        clock::SendClock, events::EventSubscriptions,
-        ws::SignatureConfirmations, wsraw::RawWs,
+        clock::SendClock, events::EventSubscriptions, ws::SignatureConfirmations, wsraw::RawWs,
     },
     BaseCtx, ChainCtx, CheckError, ErCtx, Result, Scenario, TxSender,
 };
@@ -123,14 +121,12 @@ async fn await_clones(client: &RpcClient, pdas: &[Pubkey]) -> Result<()> {
     loop {
         let mut all_present = true;
         for chunk in pdas.chunks(ACCOUNTS_PER_CALL) {
-            let accounts = client
-                .get_multiple_accounts_with_commitment(chunk, confirmed())
-                .await?
-                .value;
+            let accounts =
+                client.get_multiple_accounts_with_commitment(chunk, confirmed()).await?.value;
             all_present &= accounts.iter().all(|account| {
-                account.as_ref().is_some_and(|account| {
-                    account.data.len() == crate::ACCOUNT_SPACE as usize
-                })
+                account
+                    .as_ref()
+                    .is_some_and(|account| account.data.len() == crate::ACCOUNT_SPACE as usize)
             });
         }
         if all_present {
@@ -146,10 +142,7 @@ async fn await_clones(client: &RpcClient, pdas: &[Pubkey]) -> Result<()> {
     }
 }
 
-async fn await_statuses(
-    client: &RpcClient,
-    signatures: &[Signature],
-) -> Result<Vec<u64>> {
+async fn await_statuses(client: &RpcClient, signatures: &[Signature]) -> Result<Vec<u64>> {
     let deadline = Instant::now() + CONFIRM_DEADLINE;
     loop {
         let statuses = client.get_signature_statuses(signatures).await?.value;
@@ -190,11 +183,7 @@ async fn await_statuses(
 async fn await_publication(client: &RpcClient, slot: u64) -> Result<()> {
     let deadline = Instant::now() + PUBLICATION_TIMEOUT;
     loop {
-        if client
-            .get_block_with_config(slot, block_config())
-            .await
-            .is_ok()
-        {
+        if client.get_block_with_config(slot, block_config()).await.is_ok() {
             return Ok(());
         }
         check!(
@@ -205,12 +194,7 @@ async fn await_publication(client: &RpcClient, slot: u64) -> Result<()> {
     }
 }
 
-async fn burst(
-    scenario: &str,
-    base: &BaseCtx,
-    er: &ErCtx,
-    client: &RpcClient,
-) -> Result<()> {
+async fn burst(scenario: &str, base: &BaseCtx, er: &ErCtx, client: &RpcClient) -> Result<()> {
     let payers = prep::funded_payers(base, PAYERS, PAYER_LAMPORTS).await?;
     let pdas = Accounts::new(crate::ACCOUNT_SPACE, er.identity())
         .init_batched(base, &payers, WRITES, true)
@@ -223,17 +207,12 @@ async fn burst(
         "getLatestBlockhash returned {blockhash} but isBlockhashValid \
          rejects it"
     )?;
-    let pda_strings: Vec<String> =
-        pdas.iter().map(ToString::to_string).collect();
-    let for_accounts: WithContext<RawBlockhash> = er
-        .api()
-        .call("getBlockhashForAccounts", &(pda_strings,))
-        .await?;
+    let pda_strings: Vec<String> = pdas.iter().map(ToString::to_string).collect();
+    let for_accounts: WithContext<RawBlockhash> =
+        er.api().call("getBlockhashForAccounts", &(pda_strings,)).await?;
     let for_accounts: hash::Hash = for_accounts.value.blockhash.parse()?;
     check!(
-        client
-            .is_blockhash_valid(&for_accounts, confirmed())
-            .await?,
+        client.is_blockhash_valid(&for_accounts, confirmed()).await?,
         "getBlockhashForAccounts returned {for_accounts} but \
          isBlockhashValid rejects it"
     )?;
@@ -259,12 +238,9 @@ async fn burst(
             }
         })
         .collect();
-    let signatures: Vec<Signature> =
-        writes.iter().map(|write| write.signature).collect();
+    let signatures: Vec<Signature> = writes.iter().map(|write| write.signature).collect();
     let probe = &writes[0];
-    client
-        .get_fee_for_message(&probe.transaction.message)
-        .await?;
+    client.get_fee_for_message(&probe.transaction.message).await?;
     let simulation = client
         .simulate_transaction_with_config(
             &probe.transaction,
@@ -291,10 +267,7 @@ async fn burst(
         Some(0),
         "simulateTransaction must not mutate the probe account"
     )?;
-    let after_simulation = client
-        .get_signature_statuses(&[probe.signature])
-        .await?
-        .value;
+    let after_simulation = client.get_signature_statuses(&[probe.signature]).await?.value;
     check!(
         after_simulation.first().is_some_and(Option::is_none),
         "simulateTransaction must not record a signature status"
@@ -305,17 +278,14 @@ async fn burst(
         preflight_commitment: Some(confirmed().commitment),
         ..RpcSendTransactionConfig::default()
     };
-    let sends = join_all(writes.iter().map(|write| {
-        client.send_transaction_with_config(&write.transaction, send_config)
-    }));
-    let sends =
-        tokio::time::timeout(BURST_DEADLINE, sends)
-            .await
-            .map_err(|_| {
-                format!(
-                    "the burst of {WRITES} sends exceeded {BURST_DEADLINE:?}"
-                )
-            })?;
+    let sends = join_all(
+        writes
+            .iter()
+            .map(|write| client.send_transaction_with_config(&write.transaction, send_config)),
+    );
+    let sends = tokio::time::timeout(BURST_DEADLINE, sends)
+        .await
+        .map_err(|_| format!("the burst of {WRITES} sends exceeded {BURST_DEADLINE:?}"))?;
     let mut failures = 0u64;
     let mut first_failure = None;
     for (write, sent) in writes.iter().zip(sends) {
@@ -327,9 +297,8 @@ async fn burst(
             )?,
             Err(error) => {
                 failures += 1;
-                first_failure.get_or_insert_with(|| {
-                    format!("send of {} failed: {error}", write.signature)
-                });
+                first_failure
+                    .get_or_insert_with(|| format!("send of {} failed: {error}", write.signature));
             }
         }
     }
@@ -360,21 +329,14 @@ async fn burst(
             "getTransaction slot must match getSignatureStatuses for {}",
             write.signature
         )?;
-        let meta = transaction
-            .transaction
-            .meta
-            .ok_or("getTransaction returned no meta")?;
+        let meta = transaction.transaction.meta.ok_or("getTransaction returned no meta")?;
         check!(
             meta.err.is_none(),
             "getTransaction reports a failed write {}: {:?}",
             write.signature,
             meta.err
         )?;
-        block_times.push(
-            transaction
-                .block_time
-                .ok_or("getTransaction returned no blockTime")?,
-        );
+        block_times.push(transaction.block_time.ok_or("getTransaction returned no blockTime")?);
     }
 
     for (slot, indices) in &by_slot {
@@ -385,8 +347,7 @@ async fn burst(
             Some(block_time),
             "getBlock.blockTime must match getBlockTime for slot {slot}"
         )?;
-        let listed =
-            block.signatures.ok_or("getBlock returned no signatures")?;
+        let listed = block.signatures.ok_or("getBlock returned no signatures")?;
         for &index in indices {
             let signature = writes[index].signature.to_string();
             check!(
@@ -401,9 +362,7 @@ async fn burst(
             )?;
         }
     }
-    let blocks = client
-        .get_blocks_with_commitment(min_slot, Some(max_slot), confirmed())
-        .await?;
+    let blocks = client.get_blocks_with_commitment(min_slot, Some(max_slot), confirmed()).await?;
     check!(
         blocks.windows(2).all(|pair| pair[0] < pair[1]),
         "getBlocks must return strictly ascending slots"
@@ -441,23 +400,16 @@ async fn burst(
     )?;
 
     for (chunk_index, chunk) in pdas.chunks(ACCOUNTS_PER_CALL).enumerate() {
-        let batched = client
-            .get_multiple_accounts_with_commitment(chunk, confirmed())
-            .await?
-            .value;
+        let batched = client.get_multiple_accounts_with_commitment(chunk, confirmed()).await?.value;
         for (offset, (pda, batched)) in chunk.iter().zip(batched).enumerate() {
             let write = &writes[chunk_index * ACCOUNTS_PER_CALL + offset];
-            let batched = batched
-                .ok_or("getMultipleAccounts dropped a written account")?;
+            let batched = batched.ok_or("getMultipleAccounts dropped a written account")?;
             let single = client
                 .get_account_with_commitment(pda, confirmed())
                 .await?
                 .value
                 .ok_or("getAccountInfo dropped a written account")?;
-            let balance = client
-                .get_balance_with_commitment(pda, confirmed())
-                .await?
-                .value;
+            let balance = client.get_balance_with_commitment(pda, confirmed()).await?.value;
             check_eq!(
                 crate::written_id(&single.data),
                 Some(write.id),
@@ -514,18 +466,14 @@ async fn burst(
             write.signature
         )?;
     }
-    let delegated: RawDelegationStatus = er
-        .api()
-        .call("getDelegationStatus", &(probe.pda.to_string(),))
-        .await?;
+    let delegated: RawDelegationStatus =
+        er.api().call("getDelegationStatus", &(probe.pda.to_string(),)).await?;
     check!(
         delegated.is_delegated,
         "getDelegationStatus must report the written pda as delegated"
     )?;
-    let undelegated: RawDelegationStatus = er
-        .api()
-        .call("getDelegationStatus", &(payers[0].pubkey().to_string(),))
-        .await?;
+    let undelegated: RawDelegationStatus =
+        er.api().call("getDelegationStatus", &(payers[0].pubkey().to_string(),)).await?;
     check!(
         !undelegated.is_delegated,
         "getDelegationStatus must report a plain payer as not delegated"
@@ -541,16 +489,9 @@ async fn transfer(
 ) -> Result<(Signature, u64)> {
     crate::phase("http transfer", async {
         let signature = sender
-            .submit_fresh(&[system::transfer(
-                &sender.payer().pubkey(),
-                to,
-                lamports,
-            )])
+            .submit_fresh(&[system::transfer(&sender.payer().pubkey(), to, lamports)])
             .await?;
-        let confirmed = er
-            .api()
-            .await_transaction(&signature, TRANSFER_TIMEOUT)
-            .await?;
+        let confirmed = er.api().await_transaction(&signature, TRANSFER_TIMEOUT).await?;
         check!(
             confirmed.err.is_none(),
             "transfer {signature} failed: {:?}",
@@ -561,15 +502,11 @@ async fn transfer(
     .await
 }
 
-async fn timestamps(
-    er: &ErCtx,
-    executions: Vec<(Signature, u64)>,
-) -> Result<()> {
+async fn timestamps(er: &ErCtx, executions: Vec<(Signature, u64)>) -> Result<()> {
     let last_slot = executions.last().map_or(0, |(_, slot)| *slot);
     let settled = check::poll_until(LEDGER_SETTLE_TIMEOUT, POLL, async || {
         Ok::<_, redsuite_core::DynError>(
-            (er.api().get_slot().await? >= last_slot + LEDGER_SETTLE_SLOTS)
-                .then_some(()),
+            (er.api().get_slot().await? >= last_slot + LEDGER_SETTLE_SLOTS).then_some(()),
         )
     })
     .await?;
@@ -586,9 +523,7 @@ async fn timestamps(
             ))
         })?;
         let block = er.api().get_block(*slot).await?.ok_or_else(|| {
-            CheckError::new(format!(
-                "getBlock({slot}) returned null for {signature}"
-            ))
+            CheckError::new(format!("getBlock({slot}) returned null for {signature}"))
         })?;
         let transaction = er
             .api()
@@ -616,9 +551,7 @@ async fn await_event_where(
     matches: impl Fn(&json::Value) -> bool,
 ) -> Result<json::Value> {
     check::poll_until(EVENT_TIMEOUT, EVENT_POLL, async || {
-        Ok::<_, CheckError>(
-            events.events(key).into_iter().find(|event| matches(event)),
-        )
+        Ok::<_, CheckError>(events.events(key).into_iter().find(|event| matches(event)))
     })
     .await?
     .ok_or_else(|| {
@@ -634,27 +567,16 @@ fn event_lamports(event: &json::Value) -> Option<u64> {
 }
 
 fn event_signature(event: &json::Value) -> Option<String> {
-    event
-        .get("value")
-        .get("signature")
-        .as_str()
-        .map(str::to_owned)
+    event.get("value").get("signature").as_str().map(str::to_owned)
 }
 
-async fn wallet_stream(
-    base: &BaseCtx,
-    er: &ErCtx,
-    events: &EventSubscriptions,
-) -> Result<()> {
+async fn wallet_stream(base: &BaseCtx, er: &ErCtx, events: &EventSubscriptions) -> Result<()> {
     let system_program = system::system_id();
     let funder = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
-    let account1 =
-        prep::delegated_payer(base, &funder, er.identity(), ACCOUNT_LAMPORTS)
-            .await?;
-    let account2 =
-        prep::delegated_payer(base, &funder, er.identity(), ACCOUNT_LAMPORTS)
-            .await?
-            .pubkey();
+    let account1 = prep::delegated_payer(base, &funder, er.identity(), ACCOUNT_LAMPORTS).await?;
+    let account2 = prep::delegated_payer(base, &funder, er.identity(), ACCOUNT_LAMPORTS)
+        .await?
+        .pubkey();
     let account1_pubkey = account1.pubkey();
     let sender = er.sender(Rc::new(account1));
     let account1_key = events.account_subscribe(&account1_pubkey).await?;
@@ -665,10 +587,7 @@ async fn wallet_stream(
     let executions = crate::phase("ws account stream", async {
         let mut executions = Vec::new();
         while sent < SEQUENTIAL_TRANSFERS {
-            executions.push(
-                transfer(er, &sender, &account2, TRANSFER_LAMPORTS)
-                    .await?,
-            );
+            executions.push(transfer(er, &sender, &account2, TRANSFER_LAMPORTS).await?);
             sent += 1;
             let expected = ACCOUNT_LAMPORTS - sent * TRANSFER_LAMPORTS;
             await_event_where(
@@ -679,24 +598,15 @@ async fn wallet_stream(
             )
             .await?;
             if sent == 1 {
-                await_event_where(
-                    events,
-                    account2_key,
-                    "account 2 credit",
-                    |event| {
-                        event_lamports(event)
-                            == Some(ACCOUNT_LAMPORTS + TRANSFER_LAMPORTS)
-                    },
-                )
+                await_event_where(events, account2_key, "account 2 credit", |event| {
+                    event_lamports(event) == Some(ACCOUNT_LAMPORTS + TRANSFER_LAMPORTS)
+                })
                 .await?;
                 for event in events.events(account2_key) {
                     let lamports = event_lamports(&event);
                     check!(
                         lamports == Some(ACCOUNT_LAMPORTS)
-                            || lamports
-                                == Some(
-                                    ACCOUNT_LAMPORTS + TRANSFER_LAMPORTS
-                                ),
+                            || lamports == Some(ACCOUNT_LAMPORTS + TRANSFER_LAMPORTS),
                         "unexpected account 2 lamports in {event:?}"
                     )?;
                 }
@@ -710,9 +620,7 @@ async fn wallet_stream(
                 ))
             })?;
             check!(
-                lamports == previous
-                    || previous.checked_sub(TRANSFER_LAMPORTS)
-                        == Some(lamports),
+                lamports == previous || previous.checked_sub(TRANSFER_LAMPORTS) == Some(lamports),
                 "out-of-order account 1 notification {lamports}: neither the \
                  previous {previous} nor one step down (a replaying validator \
                  that resent a stale balance would fail here)"
@@ -730,16 +638,13 @@ async fn wallet_stream(
 
     let notifications = async {
         crate::phase("ws logs and program notifications", async {
-            let mentions1_key =
-                events.logs_subscribe_mentions(&account1_pubkey).await?;
-            let mentions2_key =
-                events.logs_subscribe_mentions(&account2).await?;
+            let mentions1_key = events.logs_subscribe_mentions(&account1_pubkey).await?;
+            let mentions2_key = events.logs_subscribe_mentions(&account2).await?;
             let program_key = events.program_subscribe(&system_program).await?;
             events.await_subscribed(6, Duration::from_secs(5)).await?;
             let mut logs_signatures = Vec::with_capacity(LOGS_TRANSFERS);
             for _ in 0..LOGS_TRANSFERS {
-                let (signature, _) =
-                    transfer(er, &sender, &account2, TRANSFER_LAMPORTS).await?;
+                let (signature, _) = transfer(er, &sender, &account2, TRANSFER_LAMPORTS).await?;
                 logs_signatures.push(signature.to_string());
                 sent += 1;
             }
@@ -749,23 +654,16 @@ async fn wallet_stream(
                     (mentions2_key, "logs mentions(account2) entry"),
                 ] {
                     let event = await_event_where(events, key, what, |event| {
-                        event_signature(event).as_deref()
-                            == Some(logs_signature.as_str())
+                        event_signature(event).as_deref() == Some(logs_signature.as_str())
                     })
                     .await?;
                     check!(
                         event.get("value").get("err").is_null(),
                         "{what} carries an error: {event:?}"
                     )?;
-                    let log_count = event
-                        .get("value")
-                        .get("logs")
-                        .as_array()
-                        .map_or(0, |logs| logs.len());
-                    check!(
-                        log_count > 0,
-                        "{what} has no log lines: {event:?}"
-                    )?;
+                    let log_count =
+                        event.get("value").get("logs").as_array().map_or(0, |logs| logs.len());
+                    check!(log_count > 0, "{what} has no log lines: {event:?}")?;
                 }
             }
             let expected1 = ACCOUNT_LAMPORTS - sent * TRANSFER_LAMPORTS;
@@ -775,13 +673,8 @@ async fn wallet_stream(
                 ("program update 2", account2, expected2),
             ] {
                 await_event_where(events, program_key, what, |event| {
-                    event.get("value").get("pubkey").as_str()
-                        == Some(account.to_string().as_str())
-                        && event
-                            .get("value")
-                            .get("account")
-                            .get("lamports")
-                            .as_u64()
+                    event.get("value").get("pubkey").as_str() == Some(account.to_string().as_str())
+                        && event.get("value").get("account").get("lamports").as_u64()
                             == Some(expected)
                 })
                 .await?;
@@ -791,43 +684,27 @@ async fn wallet_stream(
         .await?;
 
         crate::phase("ws signature notifications", async {
-            let confirmations = SignatureConfirmations::connect(
-                er.ws_url(),
-                Arc::new(SendClock::new(1, 2)),
-            )
-            .await?;
-            let immediate_tx = sender
-                .prepare(&[system::transfer(
-                    &account1_pubkey,
-                    &account2,
-                    7_777,
-                )])
-                .await?;
-            confirmations
-                .subscribe(1, &immediate_tx.signatures[0])
-                .await?;
-            crate::phase(
-                "http transfer",
-                sender.submit_prepared(&immediate_tx),
-            )
-            .await?;
+            let confirmations =
+                SignatureConfirmations::connect(er.ws_url(), Arc::new(SendClock::new(1, 2)))
+                    .await?;
+            let immediate_tx =
+                sender.prepare(&[system::transfer(&account1_pubkey, &account2, 7_777)]).await?;
+            confirmations.subscribe(1, &immediate_tx.signatures[0]).await?;
+            crate::phase("http transfer", sender.submit_prepared(&immediate_tx)).await?;
             tokio::time::timeout(EVENT_TIMEOUT, confirmations.await_id(1))
                 .await
-                .map_err(|_| {
-                    CheckError::new("signature notification never fired")
-                })??;
-            let (delayed_signature, _) =
-                transfer(er, &sender, &account2, 8_888).await?;
+                .map_err(|_| CheckError::new("signature notification never fired"))??;
+            let (delayed_signature, _) = transfer(er, &sender, &account2, 8_888).await?;
             tokio::time::sleep(Duration::from_millis(50)).await;
             confirmations.subscribe(2, &delayed_signature).await?;
-            tokio::time::timeout(EVENT_TIMEOUT, confirmations.await_id(2))
-                .await
-                .map_err(|_| {
+            tokio::time::timeout(EVENT_TIMEOUT, confirmations.await_id(2)).await.map_err(
+                |_| {
                     CheckError::new(
                         "delayed signature subscription never fired for \
                          an already-confirmed signature",
                     )
-                })??;
+                },
+            )??;
             let outcome = confirmations.finalize();
             check_eq!(
                 outcome.confirmed,
@@ -847,12 +724,8 @@ async fn wallet_stream(
             let mut raw = RawWs::connect(er.ws_url()).await?;
             for case in ["account", "logs", "program"] {
                 let subscription = match case {
-                    "account" => {
-                        raw.account_subscribe(&account1_pubkey).await?
-                    }
-                    "logs" => {
-                        raw.logs_subscribe_mentions(&account1_pubkey).await?
-                    }
+                    "account" => raw.account_subscribe(&account1_pubkey).await?,
+                    "logs" => raw.logs_subscribe_mentions(&account1_pubkey).await?,
                     _ => raw.program_subscribe(&system_program).await?,
                 };
                 transfer(er, &sender, &account2, TRANSFER_LAMPORTS).await?;
@@ -866,11 +739,8 @@ async fn wallet_stream(
                     _ => raw.program_unsubscribe(subscription).await?,
                 };
                 check!(removed, "the {case} unsubscribe must return true")?;
-                while raw.next_notification(RAW_DRAIN_TIMEOUT).await?.is_some()
-                {
-                }
-                let (signature, _) =
-                    transfer(er, &sender, &account2, TRANSFER_LAMPORTS).await?;
+                while raw.next_notification(RAW_DRAIN_TIMEOUT).await?.is_some() {}
+                let (signature, _) = transfer(er, &sender, &account2, TRANSFER_LAMPORTS).await?;
                 check!(
                     raw.next_notification(RAW_SILENCE_TIMEOUT).await?.is_none(),
                     "{case} notifications continued after unsubscribe \
@@ -896,21 +766,13 @@ async fn wallet_stream(
                 Ok(subid) => format!("accepted as subscription {subid}"),
             };
             check!(
-                refusal.contains("-32602")
-                    && refusal.contains("'all' filter is not supported"),
+                refusal.contains("-32602") && refusal.contains("'all' filter is not supported"),
                 "logsSubscribe(all) must be refused with invalid params \
                  naming the filter, got: {refusal}"
             )?;
-            let unsent = sender
-                .prepare(&[system::transfer(
-                    &account1_pubkey,
-                    &account2,
-                    9_999,
-                )])
-                .await?;
-            let signature_sub = raw
-                .signature_subscribe(&unsent.signatures[0].to_string())
-                .await?;
+            let unsent =
+                sender.prepare(&[system::transfer(&account1_pubkey, &account2, 9_999)]).await?;
+            let signature_sub = raw.signature_subscribe(&unsent.signatures[0].to_string()).await?;
             raw.signature_unsubscribe(signature_sub).await?;
             check_eq!(
                 raw.malformed_frames(),
@@ -934,9 +796,7 @@ async fn slot_stream(events: &EventSubscriptions, slot_key: u64) -> Result<()> {
     let mut last_slot = 0u64;
     for event in events.events(slot_key) {
         let slot = event.get("slot").as_u64().ok_or_else(|| {
-            CheckError::new(format!(
-                "slot event without a slot field: {event:?}"
-            ))
+            CheckError::new(format!("slot event without a slot field: {event:?}"))
         })?;
         check!(
             slot > last_slot,
@@ -955,10 +815,7 @@ impl Scenario for RpcLifecycle {
     }
 
     async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<()> {
-        let client = RpcClient::new_with_commitment(
-            er.api().url().to_owned(),
-            confirmed(),
-        );
+        let client = RpcClient::new_with_commitment(er.api().url().to_owned(), confirmed());
         let events = EventSubscriptions::connect(er.ws_url()).await?;
         let slot_key = events.slot_subscribe().await?;
         tokio::try_join!(

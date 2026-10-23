@@ -14,8 +14,7 @@ pub const PLUGIN_ENV: &str = "REDSUITE_YELLOWSTONE_PLUGIN";
 pub const CACHE_ENV: &str = "REDSUITE_YELLOWSTONE_DIR";
 
 const LIB: &str = "libyellowstone_grpc_geyser.so";
-const DOWNLOADS: &str =
-    "https://github.com/rpcpool/yellowstone-grpc/releases/download";
+const DOWNLOADS: &str = "https://github.com/rpcpool/yellowstone-grpc/releases/download";
 
 const RELEASES: &[(&str, &str)] = &[
     ("4.1", "v14.2.4+solana.4.1.0"),
@@ -85,8 +84,7 @@ fn release_for(agave: &str) -> Result<&'static str> {
         .find_map(|(mapped, tag)| (*mapped == series).then_some(tag))
         .copied()
         .ok_or_else(|| {
-            let known: Vec<&str> =
-                RELEASES.iter().map(|(mapped, _)| *mapped).collect();
+            let known: Vec<&str> = RELEASES.iter().map(|(mapped, _)| *mapped).collect();
             format!(
                 "no Yellowstone geyser release is mapped to solana-test-validator \
                  {agave}; mapped series are {} — add one to \
@@ -107,25 +105,19 @@ fn series(version: &str) -> String {
 }
 
 fn base_version(base_bin: &Path) -> Result<String> {
-    let output =
-        Command::new(base_bin)
-            .arg("--version")
-            .output()
-            .map_err(|err| {
-                format!("running {} --version: {err}", base_bin.display())
-            })?;
+    let output = Command::new(base_bin)
+        .arg("--version")
+        .output()
+        .map_err(|err| format!("running {} --version: {err}", base_bin.display()))?;
     let text = String::from_utf8_lossy(&output.stdout);
-    text.split_whitespace()
-        .nth(1)
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| {
-            format!(
-                "could not read a version out of `{} --version`: {}",
-                base_bin.display(),
-                text.trim()
-            )
-            .into()
-        })
+    text.split_whitespace().nth(1).map(ToOwned::to_owned).ok_or_else(|| {
+        format!(
+            "could not read a version out of `{} --version`: {}",
+            base_bin.display(),
+            text.trim()
+        )
+        .into()
+    })
 }
 
 fn cache_dir(tag: &str) -> PathBuf {
@@ -183,24 +175,13 @@ fn encode(value: &str) -> String {
 }
 
 async fn fetch(url: &str) -> Result<Vec<u8>> {
-    let response = reqwest::get(url)
-        .await
-        .map_err(|err| format!("fetching {url}: {err}"))?;
+    let response = reqwest::get(url).await.map_err(|err| format!("fetching {url}: {err}"))?;
     if !response.status().is_success() {
-        return Err(
-            format!("fetching {url}: HTTP {}", response.status()).into()
-        );
+        return Err(format!("fetching {url}: HTTP {}", response.status()).into());
     }
-    Ok(response
-        .bytes()
-        .await
-        .map_err(|err| format!("reading {url}: {err}"))?
-        .to_vec())
+    Ok(response.bytes().await.map_err(|err| format!("reading {url}: {err}"))?.to_vec())
 }
 
 fn sha256(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect()
 }

@@ -49,12 +49,8 @@ pub struct CpuSample {
 
 #[cfg(target_os = "linux")]
 fn stat_cpu_secs(path: &str) -> Result<f64> {
-    let stat =
-        std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
-    let after_comm = stat
-        .rsplit_once(')')
-        .ok_or_else(|| format!("{path}: no comm field"))?
-        .1;
+    let stat = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+    let after_comm = stat.rsplit_once(')').ok_or_else(|| format!("{path}: no comm field"))?.1;
     let fields: Vec<&str> = after_comm.split_whitespace().collect();
     let utime: u64 = fields
         .get(11)
@@ -80,8 +76,7 @@ pub fn cpu_sample(pid: u32) -> Result<CpuSample> {
         let Ok(tid) = task.file_name().to_string_lossy().parse::<u64>() else {
             continue;
         };
-        if let Ok(secs) = stat_cpu_secs(&format!("/proc/{pid}/task/{tid}/stat"))
-        {
+        if let Ok(secs) = stat_cpu_secs(&format!("/proc/{pid}/task/{tid}/stat")) {
             thread_secs.insert(tid, secs);
         }
     }
@@ -100,8 +95,7 @@ pub fn cpu_sample(pid: u32) -> Result<CpuSample> {
         thread_info::ThreadInfo,
     };
     let pid = pid as i32;
-    let task = pidinfo::<TaskInfo>(pid, 0)
-        .map_err(|e| format!("task info for pid {pid}: {e}"))?;
+    let task = pidinfo::<TaskInfo>(pid, 0).map_err(|e| format!("task info for pid {pid}: {e}"))?;
     let thread_limit = task.pti_threadnum.max(1) as usize;
     let threads = listpidinfo::<ListThreads>(pid, thread_limit)
         .map_err(|e| format!("thread list for pid {pid}: {e}"))?;
@@ -122,15 +116,11 @@ pub fn cpu_sample(pid: u32) -> Result<CpuSample> {
 
 impl CpuSample {
     fn wall_since(&self, earlier: &CpuSample) -> f64 {
-        self.taken
-            .duration_since(earlier.taken)
-            .as_secs_f64()
-            .max(1e-9)
+        self.taken.duration_since(earlier.taken).as_secs_f64().max(1e-9)
     }
 
     pub fn cores_since(&self, earlier: &CpuSample) -> f64 {
-        (self.process_secs - earlier.process_secs).max(0.0)
-            / self.wall_since(earlier)
+        (self.process_secs - earlier.process_secs).max(0.0) / self.wall_since(earlier)
     }
 
     pub fn thread_cores_since(&self, earlier: &CpuSample) -> Vec<f64> {
@@ -139,8 +129,7 @@ impl CpuSample {
             .thread_secs
             .iter()
             .map(|(tid, secs)| {
-                let before =
-                    earlier.thread_secs.get(tid).copied().unwrap_or(0.0);
+                let before = earlier.thread_secs.get(tid).copied().unwrap_or(0.0);
                 (secs - before).max(0.0) / wall
             })
             .collect();
@@ -151,8 +140,8 @@ impl CpuSample {
 
 #[cfg(target_os = "linux")]
 pub fn fd_count(pid: u32) -> Result<usize> {
-    let entries = std::fs::read_dir(format!("/proc/{pid}/fd"))
-        .map_err(|e| format!("/proc/{pid}/fd: {e}"))?;
+    let entries =
+        std::fs::read_dir(format!("/proc/{pid}/fd")).map_err(|e| format!("/proc/{pid}/fd: {e}"))?;
     Ok(entries.count())
 }
 
@@ -163,8 +152,8 @@ pub fn fd_count(pid: u32) -> Result<usize> {
         file_info::ListFDs,
         proc_pid::{listpidinfo, pidinfo},
     };
-    let info = pidinfo::<BSDInfo>(pid as i32, 0)
-        .map_err(|e| format!("bsd info for pid {pid}: {e}"))?;
+    let info =
+        pidinfo::<BSDInfo>(pid as i32, 0).map_err(|e| format!("bsd info for pid {pid}: {e}"))?;
     let table_size = (info.pbi_nfiles as usize).max(1);
     let open = listpidinfo::<ListFDs>(pid as i32, table_size)
         .map_err(|e| format!("fd list for pid {pid}: {e}"))?;
@@ -172,8 +161,7 @@ pub fn fd_count(pid: u32) -> Result<usize> {
 }
 
 pub fn dir_size_bytes(dir: &std::path::Path) -> Result<u64> {
-    let entries = std::fs::read_dir(dir)
-        .map_err(|e| format!("{}: {e}", dir.display()))?;
+    let entries = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     walk_size(entries)
 }
 
@@ -225,7 +213,7 @@ pub fn rss_kb(pid: u32) -> Result<u64> {
 #[cfg(target_os = "macos")]
 pub fn rss_kb(pid: u32) -> Result<u64> {
     use libproc::{proc_pid::pidinfo, task_info::TaskInfo};
-    let task = pidinfo::<TaskInfo>(pid as i32, 0)
-        .map_err(|e| format!("task info for pid {pid}: {e}"))?;
+    let task =
+        pidinfo::<TaskInfo>(pid as i32, 0).map_err(|e| format!("task info for pid {pid}: {e}"))?;
     Ok(task.pti_resident_size / 1024)
 }

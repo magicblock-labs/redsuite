@@ -7,9 +7,7 @@ use pubkey::Pubkey;
 pub use redline_interface as program;
 pub use redsuite_core::redline::written_id;
 use redsuite_core::redline::Accounts;
-use redsuite_core::{
-    check, check_eq, dlp, receipt, BaseCtx, ChainCtx, ErCtx, Result,
-};
+use redsuite_core::{check, check_eq, dlp, receipt, BaseCtx, ChainCtx, ErCtx, Result};
 
 pub use redsuite_core::phase;
 
@@ -27,16 +25,13 @@ pub async fn assert_commit_receipt(
     expect_undelegation: bool,
 ) -> Result<receipt::CommitReceipt> {
     let commit_receipt =
-        receipt::fetch_commit_receipt(er.api(), signature, RECEIPT_TIMEOUT)
-            .await?;
+        receipt::fetch_commit_receipt(er.api(), signature, RECEIPT_TIMEOUT).await?;
     if let Some(message) = &commit_receipt.error_message {
         if commit_receipt.failure_is_duplicate_rejection() {
             receipt::warn_duplicate_rejection("commit receipt", message);
             return Ok(commit_receipt);
         }
-        return Err(check::CheckError::new("the commit intent succeeds")
-            .actual(message)
-            .into());
+        return Err(check::CheckError::new("the commit intent succeeds").actual(message).into());
     }
     let mut included = commit_receipt.included.clone();
     included.sort();
@@ -56,12 +51,7 @@ pub async fn assert_commit_receipt(
         expect_undelegation,
         "the receipt undelegation flag must match the commit type"
     )?;
-    receipt::confirm_base_signatures(
-        base.api(),
-        &commit_receipt,
-        BASE_CONFIRM_TIMEOUT,
-    )
-    .await?;
+    receipt::confirm_base_signatures(base.api(), &commit_receipt, BASE_CONFIRM_TIMEOUT).await?;
     Ok(commit_receipt)
 }
 
@@ -77,18 +67,12 @@ pub fn rejection_code(
     accepted: &[&'static str],
     error_text: &str,
 ) -> Result<&'static str> {
-    accepted
-        .iter()
-        .copied()
-        .find(|code| error_text.contains(code))
-        .ok_or_else(|| {
-            check::CheckError::new(format!(
-                "{what} is rejected with an upstream lockout code"
-            ))
+    accepted.iter().copied().find(|code| error_text.contains(code)).ok_or_else(|| {
+        check::CheckError::new(format!("{what} is rejected with an upstream lockout code"))
             .expected(accepted.join(", "))
             .actual(error_text)
             .into()
-        })
+    })
 }
 
 pub fn account_id(account: Option<account::Account>) -> Option<u64> {
@@ -97,10 +81,7 @@ pub fn account_id(account: Option<account::Account>) -> Option<u64> {
 
 // The ER's local view, read without touching the accounts: getProgramAccounts
 // answers from what the validator already holds, so it never triggers a fetch.
-pub async fn local_accounts(
-    er: &ErCtx,
-    keys: &[Pubkey],
-) -> Result<Vec<Option<account::Account>>> {
+pub async fn local_accounts(er: &ErCtx, keys: &[Pubkey]) -> Result<Vec<Option<account::Account>>> {
     let mut accounts = std::collections::HashMap::new();
     for owner in [program::id(), program::DELEGATION_PROGRAM_ID] {
         accounts.extend(er.api().get_program_accounts(&owner).await?);
@@ -114,9 +95,7 @@ pub async fn init_account(
     seed: u8,
     authority: Pubkey,
 ) -> Result<Pubkey> {
-    Accounts::new(ACCOUNT_SPACE, authority)
-        .init(base, payer, seed, false)
-        .await
+    Accounts::new(ACCOUNT_SPACE, authority).init(base, payer, seed, false).await
 }
 
 pub async fn init_delegated_account(
@@ -135,9 +114,7 @@ pub async fn init_delegated_account_sized(
     authority: Pubkey,
     space: u32,
 ) -> Result<Pubkey> {
-    Accounts::new(space, authority)
-        .init(base, payer, seed, true)
-        .await
+    Accounts::new(space, authority).init(base, payer, seed, true).await
 }
 
 pub async fn last_commit_id(base: &BaseCtx, account: &Pubkey) -> Result<u64> {

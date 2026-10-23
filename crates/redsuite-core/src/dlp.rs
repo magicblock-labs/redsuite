@@ -33,17 +33,8 @@ fn delegate_args(commit_frequency_ms: u32, validator: &Pubkey) -> DelegateArgs {
     }
 }
 
-pub fn delegate_account(
-    payer: &Pubkey,
-    delegatee: &Pubkey,
-    validator: &Pubkey,
-) -> Instruction {
-    instruction_builder::delegate(
-        *payer,
-        *delegatee,
-        None,
-        delegate_args(u32::MAX, validator),
-    )
+pub fn delegate_account(payer: &Pubkey, delegatee: &Pubkey, validator: &Pubkey) -> Instruction {
+    instruction_builder::delegate(*payer, *delegatee, None, delegate_args(u32::MAX, validator))
 }
 
 pub fn delegate_with_actions(
@@ -58,11 +49,7 @@ pub fn delegate_with_actions(
         *delegated_account,
         owner,
         delegate,
-        actions
-            .iter()
-            .cloned()
-            .map(Encryptable::cleartext)
-            .collect(),
+        actions.iter().cloned().map(Encryptable::cleartext).collect(),
     )
 }
 
@@ -106,18 +93,11 @@ pub fn init_validator_fees_vault(
     instruction_builder::init_validator_fees_vault(*payer, *admin, *validator)
 }
 
-pub fn validator_claim_fees(
-    validator: &Pubkey,
-    amount: Option<u64>,
-) -> Instruction {
+pub fn validator_claim_fees(validator: &Pubkey, amount: Option<u64>) -> Instruction {
     instruction_builder::validator_claim_fees(*validator, amount)
 }
 
-pub fn top_up_ephemeral_balance(
-    payer: &Pubkey,
-    lamports: u64,
-    index: u8,
-) -> Instruction {
+pub fn top_up_ephemeral_balance(payer: &Pubkey, lamports: u64, index: u8) -> Instruction {
     top_up_ephemeral_balance_for(payer, payer, lamports, index)
 }
 
@@ -135,11 +115,7 @@ pub fn top_up_ephemeral_balance_for(
     )
 }
 
-pub fn delegate_ephemeral_balance(
-    payer: &Pubkey,
-    validator: &Pubkey,
-    index: u8,
-) -> Instruction {
+pub fn delegate_ephemeral_balance(payer: &Pubkey, validator: &Pubkey, index: u8) -> Instruction {
     delegate_ephemeral_balance_for(payer, payer, validator, index)
 }
 
@@ -165,9 +141,7 @@ pub fn close_ephemeral_balance(payer: &Pubkey, index: u8) -> Instruction {
 
 pub fn last_commit_id(delegation_metadata: &[u8]) -> Result<u64> {
     let metadata =
-        dlp_api::state::DelegationMetadata::try_from_bytes_with_discriminator(
-            delegation_metadata,
-        )
-        .map_err(|error| format!("decoding delegation metadata: {error:?}"))?;
+        dlp_api::state::DelegationMetadata::try_from_bytes_with_discriminator(delegation_metadata)
+            .map_err(|error| format!("decoding delegation metadata: {error:?}"))?;
     Ok(metadata.last_commit_id)
 }

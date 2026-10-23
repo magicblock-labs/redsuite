@@ -15,8 +15,8 @@ use magic_api::instruction::{
 use pubkey::Pubkey;
 use redshift_interface::{ephemeral_cpi, log_msg_data, schedulecommit::build};
 use redsuite_core::{
-    api::TransactionInfo, check, check_eq, dlp, phase, prep, receipt, system,
-    topology, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
+    api::TransactionInfo, check, check_eq, dlp, phase, prep, receipt, system, topology, BaseCtx,
+    ChainCtx, ErCtx, Result, Scenario,
 };
 use sdk::{consts::EPHEMERAL_VAULT_ID, ephemeral_accounts::rent};
 use signer::Signer;
@@ -52,16 +52,10 @@ impl Action {
             program_id: magic_api::id(),
             accounts: vec![
                 AccountMeta::new(keys[SPONSOR], true),
-                AccountMeta::new(
-                    keys[TARGET],
-                    matches!(self.operation, Create { .. }),
-                ),
+                AccountMeta::new(keys[TARGET], matches!(self.operation, Create { .. })),
                 AccountMeta::new(keys[VAULT], false),
             ],
-            data: self
-                .operation
-                .try_to_vec()
-                .expect("ephemeral instruction serialization"),
+            data: self.operation.try_to_vec().expect("ephemeral instruction serialization"),
         };
         if self.caller == magic_api::id() {
             return native;
@@ -74,11 +68,7 @@ impl Action {
     fn apply(&self, state: &mut [Account]) -> Option<&'static str> {
         let account = &mut state[TARGET];
         let exists = account.owner != system::system_id();
-        let old_rent = if exists {
-            rent(account.data.len() as u32)
-        } else {
-            0
-        };
+        let old_rent = if exists { rent(account.data.len() as u32) } else { 0 };
         match self.operation {
             Create { data_len } => {
                 if exists || account.lamports != 0 {
@@ -137,12 +127,7 @@ fn observation(state: &[Account]) -> String {
 }
 
 async fn state(er: &ErCtx, keys: &[Pubkey]) -> Result<Vec<Account>> {
-    Ok(er
-        .accounts(keys)
-        .await?
-        .into_iter()
-        .map(Option::unwrap_or_default)
-        .collect())
+    Ok(er.accounts(keys).await?.into_iter().map(Option::unwrap_or_default).collect())
 }
 
 struct Record {
@@ -198,9 +183,7 @@ impl Record {
                 .info
                 .logs
                 .iter()
-                .filter_map(|line| {
-                    line.strip_prefix("Program log: Ephemeral: ")
-                })
+                .filter_map(|line| line.strip_prefix("Program log: Ephemeral: "))
                 .collect();
             check_eq!(
                 observed,
@@ -209,8 +192,10 @@ impl Record {
             )?;
         }
         check!(
-            self.info.logs.iter().any(|line| line
-                .starts_with(&format!("Program {} invoke", magic_api::id()))),
+            self.info
+                .logs
+                .iter()
+                .any(|line| line.starts_with(&format!("Program {} invoke", magic_api::id()))),
             "ephemeral instruction executed"
         )?;
         Ok(())
@@ -227,23 +212,16 @@ fn serialized(
     if used.count_ones() as usize == records.len() {
         return (before == final_state).then(Vec::new);
     }
-    for (index, (action, record)) in records
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| used & (1 << i) == 0)
+    for (index, (action, record)) in
+        records.iter().enumerate().filter(|(i, _)| used & (1 << i) == 0)
     {
         let mut after = before.to_vec();
         let outcome = action.apply(&mut after).map(|name| error(0, name));
-        after[PAYER].lamports =
-            after[PAYER].lamports.checked_sub(record.info.fee)?;
+        after[PAYER].lamports = after[PAYER].lamports.checked_sub(record.info.fee)?;
         if record.check(keys, before, &after, outcome).is_ok() {
-            if let Some(mut order) = serialized(
-                keys,
-                &after,
-                final_state,
-                records,
-                used | (1 << index),
-            ) {
+            if let Some(mut order) =
+                serialized(keys, &after, final_state, records, used | (1 << index))
+            {
                 order.insert(0, index);
                 return Some(order);
             }
@@ -263,29 +241,21 @@ struct Workload<'a> {
 
 impl Workload<'_> {
     async fn step(&mut self, label: &str, action: &Action) -> Result<()> {
-        self.run(label, vec![action.instruction(&self.keys)], Ok(action))
-            .await
+        self.run(label, vec![action.instruction(&self.keys)], Ok(action)).await
     }
 
-    async fn prepare(
-        &mut self,
-        mut instructions: Vec<Instruction>,
-    ) -> Result<Transaction> {
+    async fn prepare(&mut self, mut instructions: Vec<Instruction>) -> Result<Transaction> {
         self.nonce += 1;
         instructions.push(Instruction {
             program_id: redshift_interface::id(),
             accounts: vec![],
             data: log_msg_data(&self.nonce.to_string()),
         });
-        let mut tx =
-            Transaction::new_with_payer(&instructions, Some(&self.keys[PAYER]));
-        let required = &tx.message.account_keys
-            [..tx.message.header.num_required_signatures as usize];
-        let signers: Vec<_> = self
-            .signers
-            .iter()
-            .filter(|s| required.contains(&s.pubkey()))
-            .collect();
+        let mut tx = Transaction::new_with_payer(&instructions, Some(&self.keys[PAYER]));
+        let required =
+            &tx.message.account_keys[..tx.message.header.num_required_signatures as usize];
+        let signers: Vec<_> =
+            self.signers.iter().filter(|s| required.contains(&s.pubkey())).collect();
         tx.try_sign(&signers, self.er.api().get_latest_blockhash().await?)?;
         Ok(tx)
     }
@@ -309,31 +279,20 @@ impl Workload<'_> {
         let mut after = before.clone();
         let expected_error = match effect {
             Ok(action) => {
-                check_eq!(
-                    action.apply(&mut after),
-                    None,
-                    "{label}: valid operation"
-                )?;
+                check_eq!(action.apply(&mut after), None, "{label}: valid operation")?;
                 None
             }
             Err(name) => Some(error(error_index, name)),
         };
-        after[PAYER].lamports = after[PAYER]
-            .lamports
-            .checked_sub(record.info.fee)
-            .ok_or("payer exhausted")?;
+        after[PAYER].lamports =
+            after[PAYER].lamports.checked_sub(record.info.fee).ok_or("payer exhausted")?;
         check_eq!(
             state(self.er, &self.keys).await?,
             after,
             "{label}: state and accounting"
         )?;
-        if let Err(error) =
-            record.check(&self.keys, &before, &after, expected_error)
-        {
-            self.failures.push(format!(
-                "{label} ({}): {error}",
-                record.tx.signatures[0]
-            ));
+        if let Err(error) = record.check(&self.keys, &before, &after, expected_error) {
+            self.failures.push(format!("{label} ({}): {error}", record.tx.signatures[0]));
         }
         self.expected = after;
         Ok(())
@@ -351,13 +310,7 @@ impl Scenario for EphemeralAccounts {
         let mut signers = Vec::new();
         for _ in 0..3 {
             signers.push(
-                prep::delegated_payer(
-                    base,
-                    &funder,
-                    er.identity(),
-                    crate::PAYER_LAMPORTS,
-                )
-                .await?,
+                prep::delegated_payer(base, &funder, er.identity(), crate::PAYER_LAMPORTS).await?,
             );
         }
         // A delegated (mapped-signing) fee payer may commit ITSELF directly
@@ -382,8 +335,7 @@ impl Scenario for EphemeralAccounts {
                 )
                 .await?;
             let commit_receipt =
-                receipt::fetch_commit_receipt(er.api(), &signature, TIMEOUT)
-                    .await?;
+                receipt::fetch_commit_receipt(er.api(), &signature, TIMEOUT).await?;
             check!(
                 commit_receipt.succeeded(),
                 "the mapped-signing self-commit {signature} succeeds, receipt \
@@ -402,12 +354,7 @@ impl Scenario for EphemeralAccounts {
                 "the mapped-signing self-commit {signature} must reach base \
                  through at least one base transaction"
             )?;
-            receipt::confirm_base_signatures(
-                base.api(),
-                &commit_receipt,
-                TIMEOUT,
-            )
-            .await
+            receipt::confirm_base_signatures(base.api(), &commit_receipt, TIMEOUT).await
         })
         .await?;
 
@@ -431,8 +378,7 @@ impl Scenario for EphemeralAccounts {
             )?;
             let fee_error = format!("{:?}", fee_only.unwrap_err());
             check!(
-                fee_error.contains("InvalidAccountForFee")
-                    || fee_error.contains("Immutable"),
+                fee_error.contains("InvalidAccountForFee") || fee_error.contains("Immutable"),
                 "expected InvalidAccountForFee or Immutable for the \
                  non-delegated payer, got {fee_error}"
             )?;
@@ -485,13 +431,7 @@ impl Scenario for EphemeralAccounts {
                 } else {
                     invalid.accounts[index].is_signer = false;
                 }
-                workload
-                    .run(
-                        &format!("{label}: {case}"),
-                        vec![invalid],
-                        Err(reason),
-                    )
-                    .await?;
+                workload.run(&format!("{label}: {case}"), vec![invalid], Err(reason)).await?;
             }
             let mut direct = action.clone();
             direct.caller = magic_api::id();
@@ -539,11 +479,7 @@ impl Scenario for EphemeralAccounts {
                     Err("IncorrectProgramId"),
                 )
                 .await?;
-            action.fill = if matches!(action.operation, Create { .. }) {
-                0xa5
-            } else {
-                0
-            };
+            action.fill = if matches!(action.operation, Create { .. }) { 0xa5 } else { 0 };
             workload.step(label, &action).await?;
             if matches!(action.operation, Create { .. }) {
                 workload
@@ -567,11 +503,7 @@ impl Scenario for EphemeralAccounts {
             create.caller = caller;
             workload.step("recreate", &create).await?;
             let mut close = Action::new(Close);
-            close.caller = if caller == foreign {
-                redshift_interface::id()
-            } else {
-                foreign
-            };
+            close.caller = if caller == foreign { redshift_interface::id() } else { foreign };
             workload
                 .run(
                     "recreate: previous/foreign owner",
@@ -596,25 +528,20 @@ impl Scenario for EphemeralAccounts {
                 Create { data_len: 112 },
             ] {
                 let action = Action::new(operation);
-                let tx =
-                    workload.prepare(vec![action.instruction(&keys)]).await?;
+                let tx = workload.prepare(vec![action.instruction(&keys)]).await?;
                 prepared.push((action, tx));
             }
-            let records = try_join_all(prepared.into_iter().map(
-                |(action, tx)| async move {
-                    let signature = tx.signatures[0];
-                    let record =
-                        Record::submit(er, tx).await.map_err(|error| {
-                            format!("conflicts ({signature}): {error}")
-                        })?;
-                    Ok::<_, redsuite_core::DynError>((action, record))
-                },
-            ))
+            let records = try_join_all(prepared.into_iter().map(|(action, tx)| async move {
+                let signature = tx.signatures[0];
+                let record = Record::submit(er, tx)
+                    .await
+                    .map_err(|error| format!("conflicts ({signature}): {error}"))?;
+                Ok::<_, redsuite_core::DynError>((action, record))
+            }))
             .await?;
             let after = state(er, &keys).await?;
-            let order =
-                serialized(&keys, &workload.expected, &after, &records, 0)
-                    .ok_or("conflicts have no valid serialized outcome")?;
+            let order = serialized(&keys, &workload.expected, &after, &records, 0)
+                .ok_or("conflicts have no valid serialized outcome")?;
             for index in order {
                 let (action, record) = &records[index];
                 if record.info.err.is_none() {

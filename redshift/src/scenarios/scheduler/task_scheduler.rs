@@ -7,16 +7,14 @@ use keypair::Keypair;
 use pubkey::Pubkey;
 use redshift_interface::flexi::{build as flexi, FlexiCounter};
 use redsuite_core::{
-    api::TxError, check, check_eq, prep, topology, BaseCtx, ChainCtx, ErCtx,
-    Result, Scenario,
+    api::TxError, check, check_eq, prep, topology, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
 use signer::Signer;
 
 const TASK_INTERVAL_MS: i64 = 100;
 const TIMEOUT: Duration = Duration::from_secs(30);
 const LABEL: &str = "redshift task";
-const SCHEDULER_PROGRAM: Pubkey =
-    Pubkey::from_str_const(topology::HYDRA_EPHEMERAL_ID);
+const SCHEDULER_PROGRAM: Pubkey = Pubkey::from_str_const(topology::HYDRA_EPHEMERAL_ID);
 
 pub struct TaskScheduler;
 
@@ -31,11 +29,7 @@ impl Actor {
     }
 }
 
-async fn scheduled_actor(
-    base: &BaseCtx,
-    er: &ErCtx,
-    funder: &Keypair,
-) -> Result<Actor> {
+async fn scheduled_actor(base: &BaseCtx, er: &ErCtx, funder: &Keypair) -> Result<Actor> {
     let payer = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
     let (counter, setup) = prep::flexi_counter(
         payer.pubkey(),
@@ -55,10 +49,7 @@ async fn scheduled_actor(
 }
 
 async fn er_count(er: &ErCtx, actor: &Actor) -> Result<u64> {
-    let account = er
-        .account(&actor.counter)
-        .await?
-        .ok_or("the ER counter is missing")?;
+    let account = er.account(&actor.counter).await?.ok_or("the ER counter is missing")?;
     Ok(FlexiCounter::try_decode(&account.data)?.count)
 }
 
@@ -66,10 +57,7 @@ async fn tasks(er: &ErCtx) -> Result<Vec<(Pubkey, Account)>> {
     er.api().get_program_accounts(&SCHEDULER_PROGRAM).await
 }
 
-async fn await_tasks(
-    er: &ErCtx,
-    expected: usize,
-) -> Result<Vec<(Pubkey, Account)>> {
+async fn await_tasks(er: &ErCtx, expected: usize) -> Result<Vec<(Pubkey, Account)>> {
     let found = check::poll_for(
         &format!("the validator holds {expected} scheduled task account(s)"),
         TIMEOUT,
@@ -125,9 +113,7 @@ async fn cancel(er: &ErCtx, actor: &Actor, task_id: i64) -> Result<()> {
             Instruction {
                 program_id: redshift_interface::ID,
                 accounts: vec![],
-                data: redshift_interface::log_msg_data(
-                    &rand::random::<u64>().to_string(),
-                ),
+                data: redshift_interface::log_msg_data(&rand::random::<u64>().to_string()),
             },
         ],
     )
@@ -136,12 +122,12 @@ async fn cancel(er: &ErCtx, actor: &Actor, task_id: i64) -> Result<()> {
 }
 
 fn tx_failure(attempt: Result<()>, context: &str) -> Result<Box<TxError>> {
-    let error = attempt.err().ok_or_else(|| {
-        format!("{context}: transaction unexpectedly succeeded")
-    })?;
-    error.downcast::<TxError>().map_err(|error| {
-        format!("{context}: expected an on-chain rejection, got {error}").into()
-    })
+    let error = attempt
+        .err()
+        .ok_or_else(|| format!("{context}: transaction unexpectedly succeeded"))?;
+    error
+        .downcast::<TxError>()
+        .map_err(|error| format!("{context}: expected an on-chain rejection, got {error}").into())
 }
 
 async fn test_schedule_and_cancel(er: &ErCtx, actor: &Actor) -> Result<()> {
@@ -182,13 +168,7 @@ async fn test_signed_refusal(er: &ErCtx, actor: &Actor) -> Result<()> {
     let error = tx_failure(
         er.submit_and_confirm(
             &actor.payer,
-            &[flexi::schedule_counter_task(
-                actor.pubkey(),
-                103,
-                TASK_INTERVAL_MS,
-                3,
-                true,
-            )],
+            &[flexi::schedule_counter_task(actor.pubkey(), 103, TASK_INTERVAL_MS, 3, true)],
         )
         .await
         .map(drop),
@@ -250,11 +230,8 @@ async fn sponsor_balance(er: &ErCtx) -> Result<u64> {
 }
 
 async fn test_sponsor_refund(er: &ErCtx, actor: &Actor) -> Result<()> {
-    er.submit_and_confirm(
-        &actor.payer,
-        &[flexi::add_unsigned(actor.pubkey(), 0)],
-    )
-    .await?;
+    er.submit_and_confirm(&actor.payer, &[flexi::add_unsigned(actor.pubkey(), 0)])
+        .await?;
     let before = sponsor_balance(er).await?;
     schedule(er, actor, 109, TASK_INTERVAL_MS, 3).await?;
     await_tasks(er, 1).await?;

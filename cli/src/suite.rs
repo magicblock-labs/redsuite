@@ -38,10 +38,7 @@ impl GroupEr {
             er = er.with_proxies(proxies.clone());
         }
         er.wait_ready(ER_READY_TIMEOUT).await?;
-        Ok(Self {
-            er: er.shared(),
-            proxies,
-        })
+        Ok(Self { er: er.shared(), proxies })
     }
 
     async fn finish(self) {
@@ -77,20 +74,13 @@ impl Lane {
             None => Err(NO_GROUP.to_owned()),
         };
         let records = if suite.serial || self.group.is_none() {
-            let limit = if suite.serial {
-                1
-            } else {
-                suite.fresh_concurrency
-            };
+            let limit = if suite.serial { 1 } else { suite.fresh_concurrency };
             run_entries(self.entries, limit, suite.config, er).await
         } else {
-            let (shared, exclusive): (Vec<_>, Vec<_>) = self
-                .entries
-                .into_iter()
-                .partition(|entry| matches!(entry.er, Er::Shared(_)));
+            let (shared, exclusive): (Vec<_>, Vec<_>) =
+                self.entries.into_iter().partition(|entry| matches!(entry.er, Er::Shared(_)));
             let limit = shared.len();
-            let mut records =
-                run_entries(shared, limit, suite.config, er.clone()).await;
+            let mut records = run_entries(shared, limit, suite.config, er.clone()).await;
             records.extend(run_entries(exclusive, 1, suite.config, er).await);
             records
         };
@@ -154,8 +144,7 @@ impl Suite {
     }
 
     fn summary(&self) -> ScenarioReport {
-        let mut names: Vec<_> =
-            self.entries.iter().map(|entry| entry.name()).collect();
+        let mut names: Vec<_> = self.entries.iter().map(|entry| entry.name()).collect();
         names.sort();
         let hostname = std::env::var("HOSTNAME")
             .ok()
@@ -208,10 +197,7 @@ impl Suite {
         let mut lanes = self.lanes();
         if !self.serial {
             lanes.sort_by_key(|lane| lane.group.is_none());
-            return join_all(
-                lanes.into_iter().map(|lane| lane.run(self, base)),
-            )
-            .await;
+            return join_all(lanes.into_iter().map(|lane| lane.run(self, base))).await;
         }
         let started = Instant::now();
         let mut records = Vec::new();
@@ -223,18 +209,14 @@ impl Suite {
 
     pub async fn run(mut self) -> Result<()> {
         let started = Instant::now();
-        info!(self.selection, "suite started");
+        info!(selection = %self.selection, "suite started");
         let base = topology::base_only(self.config).await;
         let lanes = self.execute(&base).await;
         let mut records = Vec::new();
         for (label, seconds, mut runs) in lanes {
             if !runs.is_empty() {
                 self.report = self.report.map(|report| {
-                    report.metric(
-                        format!("{label} seconds"),
-                        Unit::Seconds,
-                        seconds,
-                    )
+                    report.metric(format!("{label} seconds"), Unit::Seconds, seconds)
                 });
             }
             records.append(&mut runs);
@@ -250,14 +232,11 @@ impl Suite {
                 started.elapsed().as_secs_f64(),
             );
             let persisted = report::persist_summary(report, &outcome)
-                .inspect_err(
-                    |error| error!(%error, "suite report not persisted"),
-                );
+                .inspect_err(|error| error!(%error, "suite report not persisted"));
             outcome = outcome.and(persisted);
         }
         info!(
-            self.selection,
-            elapsed_secs = started.elapsed().as_secs_f64(),
+            selection = %self.selection,
             passed = outcome.is_ok(),
             "suite finished"
         );
@@ -270,9 +249,7 @@ pub fn finish(records: &[RunRecord], cleanup: bool) -> Result<()> {
         .inspect_err(|error| error!(%error, "stack cleanup failed"));
     let failed = records.iter().filter(|record| !record.passed()).count();
     if failed != 0 {
-        return Err(
-            format!("{failed} of {} scenarios failed", records.len()).into()
-        );
+        return Err(format!("{failed} of {} scenarios failed", records.len()).into());
     }
     cleanup
 }

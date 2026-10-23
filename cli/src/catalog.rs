@@ -285,13 +285,8 @@ fn entries(family: Family) -> &'static [ScenarioEntry] {
 fn matching(family: Family, target: &str) -> Vec<&'static ScenarioEntry> {
     let (exact, prefixed): (Vec<_>, Vec<_>) = entries(family)
         .iter()
-        .filter(|entry| {
-            entry.name().starts_with(target)
-                || entry.short_name.starts_with(target)
-        })
-        .partition(|entry| {
-            entry.name() == target || entry.short_name == target
-        });
+        .filter(|entry| entry.name().starts_with(target) || entry.short_name.starts_with(target))
+        .partition(|entry| entry.name() == target || entry.short_name == target);
     if exact.is_empty() {
         prefixed
     } else {
@@ -301,10 +296,7 @@ fn matching(family: Family, target: &str) -> Vec<&'static ScenarioEntry> {
 
 /// Resolve selections within one family, preferring exact names over prefixes.
 /// Overlapping selections form an ordered union; no selections means the family.
-pub fn select(
-    family: Family,
-    targets: &[String],
-) -> Result<Vec<&'static ScenarioEntry>> {
+pub fn select(family: Family, targets: &[String]) -> Result<Vec<&'static ScenarioEntry>> {
     if targets.is_empty() {
         return Ok(entries(family).iter().collect());
     }
@@ -312,13 +304,14 @@ pub fn select(
     for target in targets {
         let matches = matching(family, target);
         if matches.is_empty() {
-            return Err(format!("nothing matches `{target}` — `redsuite {} list` shows what exists", family.prefix()).into());
+            return Err(format!(
+                "nothing matches `{target}` — `redsuite {} list` shows what exists",
+                family.prefix()
+            )
+            .into());
         }
         for entry in matches {
-            if !scenarios
-                .iter()
-                .any(|known| known.short_name == entry.short_name)
-            {
+            if !scenarios.iter().any(|known| known.short_name == entry.short_name) {
                 scenarios.push(entry);
             }
         }

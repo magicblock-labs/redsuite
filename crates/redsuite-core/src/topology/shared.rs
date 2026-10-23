@@ -14,8 +14,7 @@ use crate::{
 
 pub fn running_base_programs() -> Option<Vec<String>> {
     let state = state::read_state()?;
-    process::proc_matches(state.base_pid, &state.base_bin)
-        .then_some(state.base_programs)
+    process::proc_matches(state.base_pid, &state.base_bin).then_some(state.base_programs)
 }
 
 pub async fn base_only(config: ExecutionConfig) -> Result<BaseCtx> {
@@ -71,9 +70,8 @@ async fn boot_base(config: ExecutionConfig) -> Result<StackState> {
     let base_gossip_port = base_ports.single()?;
     let feed_port = base_ports.single()?;
 
-    let identity_pool: Vec<Keypair> = (0..identity::IDENTITY_POOL_SIZE)
-        .map(|_| Keypair::new())
-        .collect();
+    let identity_pool: Vec<Keypair> =
+        (0..identity::IDENTITY_POOL_SIZE).map(|_| Keypair::new()).collect();
     let clone_url = config::clone_url();
     let base_log = dir.join("base.log");
     let plan = config::BasePlan::gather(
@@ -145,8 +143,8 @@ async fn await_base_ready(
         required.push(id.parse()?);
     }
     for reserved in &state.er_identity_pool {
-        let reserved = Keypair::try_from(&reserved[..])
-            .map_err(|e| format!("corrupt pool identity: {e}"))?;
+        let reserved =
+            Keypair::try_from(&reserved[..]).map_err(|e| format!("corrupt pool identity: {e}"))?;
         required.push(crate::dlp::validator_fees_vault_pda(&reserved.pubkey()));
     }
     for account in required {

@@ -5,8 +5,7 @@ use instruction::{AccountMeta, Instruction};
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    check, check_eq, prep, topology, BaseCtx, ChainCtx, CheckError, ErCtx,
-    Result, Scenario,
+    check, check_eq, prep, topology, BaseCtx, ChainCtx, CheckError, ErCtx, Result, Scenario,
 };
 use signature::Signature;
 
@@ -31,21 +30,13 @@ impl Scenario for LoaderMatrix {
 
     async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<()> {
         let funder = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
-        let payer = &prep::delegated_payer(
-            base,
-            &funder,
-            er.identity(),
-            PAYER_DELEGATION,
-        )
-        .await?;
+        let payer = &prep::delegated_payer(base, &funder, er.identity(), PAYER_DELEGATION).await?;
 
         let memo_v1: Pubkey = MEMO_V1_ID.parse()?;
         let memo_v2: Pubkey = MEMO_V2_ID.parse()?;
 
-        let base_memo_v1 = base
-            .account(&memo_v1)
-            .await?
-            .ok_or("memo v1 is not on the base chain")?;
+        let base_memo_v1 =
+            base.account(&memo_v1).await?.ok_or("memo v1 is not on the base chain")?;
         invoke_until(er, payer, memo_v1, &memo_data, vec![], |logs| {
             program_succeeded(logs, &memo_v1)
         })
@@ -64,10 +55,8 @@ impl Scenario for LoaderMatrix {
             base_memo_v1.data.len()
         )?;
 
-        let base_memo_v2 = base
-            .account(&memo_v2)
-            .await?
-            .ok_or("memo v2 is not on the base chain")?;
+        let base_memo_v2 =
+            base.account(&memo_v2).await?.ok_or("memo v2 is not on the base chain")?;
         invoke_until(er, payer, memo_v2, &memo_data, vec![], has_memo).await?;
         let (v2_owner, v2_data) = cloned_program(er, &memo_v2).await?;
         check_eq!(
@@ -84,21 +73,15 @@ impl Scenario for LoaderMatrix {
         )?;
 
         let (v3_id, _) = topology::redshift_loader_v3_target();
-        let v3_logs =
-            invoke_until(er, payer, v3_id, &log_data, vec![], has_log_msg)
-                .await?;
-        let v3_programdata = Pubkey::find_program_address(
-            &[v3_id.as_ref()],
-            &sdk_ids::bpf_loader_upgradeable::ID,
-        )
-        .0;
+        let v3_logs = invoke_until(er, payer, v3_id, &log_data, vec![], has_log_msg).await?;
+        let v3_programdata =
+            Pubkey::find_program_address(&[v3_id.as_ref()], &sdk_ids::bpf_loader_upgradeable::ID).0;
         let mut base_v3_programdata = base
             .account(&v3_programdata)
             .await?
             .ok_or("the v3 programdata account is not on the base chain")?
             .data;
-        let base_v3_elf =
-            base_v3_programdata.split_off(LOADER_V3_PROGRAMDATA_METADATA);
+        let base_v3_elf = base_v3_programdata.split_off(LOADER_V3_PROGRAMDATA_METADATA);
         let (v3_owner, v3_data) = cloned_program(er, &v3_id).await?;
         check_eq!(
             v3_owner,
@@ -142,10 +125,7 @@ fn program_succeeded(logs: &[String], program: &Pubkey) -> bool {
     logs.iter().any(|line| line == &success_line)
 }
 
-async fn cloned_program(
-    er: &ErCtx,
-    program: &Pubkey,
-) -> Result<(Pubkey, Vec<u8>)> {
+async fn cloned_program(er: &ErCtx, program: &Pubkey) -> Result<(Pubkey, Vec<u8>)> {
     let cloned = er
         .account(program)
         .await?
@@ -153,10 +133,7 @@ async fn cloned_program(
     Ok((cloned.owner, cloned.data))
 }
 
-async fn confirmed_logs(
-    er: &ErCtx,
-    signature: &Signature,
-) -> Result<Vec<String>> {
+async fn confirmed_logs(er: &ErCtx, signature: &Signature) -> Result<Vec<String>> {
     Ok(redsuite_core::check::poll_until(
         LEDGER_VISIBILITY_TIMEOUT,
         LEDGER_VISIBILITY_POLL,
@@ -185,10 +162,7 @@ async fn invoke_until(
             accounts: accounts.clone(),
             data: data_for(attempt),
         };
-        match er
-            .submit_and_confirm(payer, std::slice::from_ref(&ix))
-            .await
-        {
+        match er.submit_and_confirm(payer, std::slice::from_ref(&ix)).await {
             Ok(signature) => {
                 let logs = confirmed_logs(er, &signature).await?;
                 if accept(&logs) {
@@ -198,11 +172,11 @@ async fn invoke_until(
             }
             Err(err) => {
                 if Instant::now() >= deadline {
-                    return Err(CheckError::new(format!(
-                        "invoke of {program} never succeeded"
-                    ))
-                    .caused_by(err)
-                    .into());
+                    return Err(
+                        CheckError::new(format!("invoke of {program} never succeeded"))
+                            .caused_by(err)
+                            .into(),
+                    );
                 }
             }
         }

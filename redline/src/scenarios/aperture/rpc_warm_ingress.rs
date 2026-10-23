@@ -11,8 +11,7 @@ use redsuite_core::{
         clock::SendClock,
         ws::{AccountUpdates, SignatureConfirmations},
     },
-    BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
-    TxSender,
+    BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport, TxSender,
 };
 use tracing::warn;
 
@@ -50,10 +49,7 @@ const FULL: Profile = Profile {
     concurrency: 256,
 };
 
-const PROFILES: ProfileValues<Profile> = ProfileValues {
-    lite: LITE,
-    full: FULL,
-};
+const PROFILES: ProfileValues<Profile> = ProfileValues { lite: LITE, full: FULL };
 
 pub struct WarmIngress;
 
@@ -65,8 +61,7 @@ impl Scenario<ScenarioReport> for WarmIngress {
 
     async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
         let profile = PROFILES.select(base.config().profile);
-        let payers =
-            prep::funded_payers(base, profile.payers, PAYER_LAMPORTS).await?;
+        let payers = prep::funded_payers(base, profile.payers, PAYER_LAMPORTS).await?;
         let pdas = Accounts::new(crate::ACCOUNT_SPACE, er.identity())
             .init_delegated(base, &payers[0], profile.accounts)
             .await?;
@@ -78,10 +73,8 @@ impl Scenario<ScenarioReport> for WarmIngress {
         )
         .await?;
 
-        let senders: Vec<TxSender> = payers
-            .into_iter()
-            .map(|payer| er.sender(Rc::new(payer)))
-            .collect();
+        let senders: Vec<TxSender> =
+            payers.into_iter().map(|payer| er.sender(Rc::new(payer))).collect();
 
         let warmup = execute(
             RunConfig {
@@ -104,25 +97,15 @@ impl Scenario<ScenarioReport> for WarmIngress {
         )?;
 
         let offset = profile.warmup;
-        let clock =
-            Arc::new(SendClock::new(offset + 1, profile.iterations as usize));
+        let clock = Arc::new(SendClock::new(offset + 1, profile.iterations as usize));
         let updates = Rc::new(
-            AccountUpdates::connect(
-                er.ws_url(),
-                crate::account_update_id,
-                clock.clone(),
-            )
-            .await?,
+            AccountUpdates::connect(er.ws_url(), crate::account_update_id, clock.clone()).await?,
         );
         for pda in &pdas {
             updates.account_subscribe(pda).await?;
         }
-        updates
-            .await_subscribed(pdas.len(), Duration::from_secs(5))
-            .await?;
-        let sigs = Rc::new(
-            SignatureConfirmations::connect(er.ws_url(), clock.clone()).await?,
-        );
+        updates.await_subscribed(pdas.len(), Duration::from_secs(5)).await?;
+        let sigs = Rc::new(SignatureConfirmations::connect(er.ws_url(), clock.clone()).await?);
 
         // warmup discarded and setup complete — open the measured window
         let before = er.scrape_metrics().await?;
@@ -152,11 +135,7 @@ impl Scenario<ScenarioReport> for WarmIngress {
                     updates.await_id(id).await
                 })
                 .await
-                .map_err(|_| {
-                    format!(
-                        "confirmations for id {id} not within {CONFIRM_TIMEOUT:?}"
-                    )
-                })?
+                .map_err(|_| format!("confirmations for id {id} not within {CONFIRM_TIMEOUT:?}"))?
             }
         };
         let cfg = RunConfig {
@@ -191,9 +170,7 @@ impl Scenario<ScenarioReport> for WarmIngress {
         // validator-side cross-checks, gated on what this build exposes:
         // the no-op gate (our load provably hit the validator) and the
         // nothing-failed-on-chain invariant
-        if let Some(processed) =
-            delta.counter(crate::metrics::ENGINE_TRANSACTIONS)
-        {
+        if let Some(processed) = delta.counter(crate::metrics::ENGINE_TRANSACTIONS) {
             if processed < profile.iterations as f64 {
                 warn!(
                     processed,
@@ -202,9 +179,7 @@ impl Scenario<ScenarioReport> for WarmIngress {
                 );
             }
         }
-        if let Some(failed) =
-            delta.counter_all(crate::metrics::FAILED_TRANSACTIONS)
-        {
+        if let Some(failed) = delta.counter_all(crate::metrics::FAILED_TRANSACTIONS) {
             check_eq!(failed, 0.0, "transactions failed on the validator")?;
         }
 

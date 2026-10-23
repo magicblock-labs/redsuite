@@ -49,10 +49,7 @@ const FULL: Profile = Profile {
     concurrency: 2_048,
 };
 
-const PROFILES: ProfileValues<Profile> = ProfileValues {
-    lite: LITE,
-    full: FULL,
-};
+const PROFILES: ProfileValues<Profile> = ProfileValues { lite: LITE, full: FULL };
 
 pub struct RpcCapacityBlast;
 
@@ -64,21 +61,13 @@ impl Scenario<ScenarioReport> for RpcCapacityBlast {
 
     async fn run(&self, base: &BaseCtx, er: &ErCtx) -> Result<ScenarioReport> {
         let profile = PROFILES.select(base.config().profile);
-        let prep_payers =
-            prep::funded_payers(base, profile.payers, PREP_PAYER_LAMPORTS)
-                .await?;
+        let prep_payers = prep::funded_payers(base, profile.payers, PREP_PAYER_LAMPORTS).await?;
         let pool = Arc::new(
             Accounts::new(crate::ACCOUNT_SPACE, er.identity())
                 .init_batched(base, &prep_payers, profile.accounts, true)
                 .await?,
         );
-        prep::await_clones(
-            er,
-            &pool,
-            crate::ACCOUNT_SPACE as usize,
-            CLONE_TIMEOUT,
-        )
-        .await?;
+        prep::await_clones(er, &pool, crate::ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
         let threads = profile.threads;
 
         let before = er.scrape_metrics().await?;
@@ -100,9 +89,7 @@ impl Scenario<ScenarioReport> for RpcCapacityBlast {
             },
             None,
         )?;
-        if let Some(ledger_txs_before) =
-            before.get(crate::metrics::ENGINE_TRANSACTIONS)
-        {
+        if let Some(ledger_txs_before) = before.get(crate::metrics::ENGINE_TRANSACTIONS) {
             settle_ledger(er, ledger_txs_before, profile.requests as f64).await;
         }
         let after = er.scrape_metrics().await?;
@@ -120,18 +107,14 @@ impl Scenario<ScenarioReport> for RpcCapacityBlast {
         if delivered_rps < CATASTROPHIC_RPS_FLOOR {
             warn!(delivered_rps, "RPC throughput below minimum",);
         }
-        if let Some(processed) =
-            delta.counter(crate::metrics::ENGINE_TRANSACTIONS)
-        {
+        if let Some(processed) = delta.counter(crate::metrics::ENGINE_TRANSACTIONS) {
             check!(
                 processed >= profile.requests as f64,
                 "validator processed {processed} txs, expected at least {}",
                 profile.requests
             )?;
         }
-        if let Some(failed_txs) =
-            delta.counter_all(crate::metrics::FAILED_TRANSACTIONS)
-        {
+        if let Some(failed_txs) = delta.counter_all(crate::metrics::FAILED_TRANSACTIONS) {
             check_eq!(
                 failed_txs,
                 0.0,
@@ -157,9 +140,7 @@ impl Scenario<ScenarioReport> for RpcCapacityBlast {
             .metric_if(
                 "validator tx processing avg us",
                 Unit::Micros,
-                delta
-                    .histogram_avg(TX_PROCESSING_HISTOGRAM)
-                    .map(|seconds| seconds * 1e6),
+                delta.histogram_avg(TX_PROCESSING_HISTOGRAM).map(|seconds| seconds * 1e6),
             )
             .metric_if(
                 "validator txs in window",
@@ -176,9 +157,7 @@ async fn settle_ledger(er: &ErCtx, baseline: f64, expected: f64) {
             .await
             .ok()
             .and_then(|scraped| scraped.ok())
-            .and_then(|metrics| {
-                metrics.get(crate::metrics::ENGINE_TRANSACTIONS)
-            })
+            .and_then(|metrics| metrics.get(crate::metrics::ENGINE_TRANSACTIONS))
             .map(|total| total - baseline)
             .unwrap_or(0.0);
         if committed >= expected || tokio::time::Instant::now() >= deadline {

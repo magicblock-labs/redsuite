@@ -27,11 +27,7 @@ impl RawWs {
         })
     }
 
-    async fn request(
-        &mut self,
-        method: &str,
-        params: &str,
-    ) -> Result<json::Value> {
+    async fn request(&mut self, method: &str, params: &str) -> Result<json::Value> {
         let req_id = self.next_req_id;
         self.next_req_id += 1;
         self.socket
@@ -45,19 +41,12 @@ impl RawWs {
             let remaining = deadline
                 .checked_duration_since(tokio::time::Instant::now())
                 .unwrap_or(Duration::ZERO);
-            let event = tokio::time::timeout(
-                remaining,
-                conn::next_event(&mut self.socket),
-            )
-            .await
-            .map_err(|_| {
-                format!("{method}: no reply within {REQUEST_TIMEOUT:?}")
-            })?;
+            let event = tokio::time::timeout(remaining, conn::next_event(&mut self.socket))
+                .await
+                .map_err(|_| format!("{method}: no reply within {REQUEST_TIMEOUT:?}"))?;
             match event {
                 Ok(RawEvent::Reply { id, result }) if id == req_id => {
-                    return result.ok_or_else(|| {
-                        format!("{method}: reply had no result").into()
-                    });
+                    return result.ok_or_else(|| format!("{method}: reply had no result").into());
                 }
                 Ok(RawEvent::Reply { .. }) => {}
                 Ok(RawEvent::Notification {
@@ -78,21 +67,20 @@ impl RawWs {
 
     async fn subscribe(&mut self, method: &str, params: &str) -> Result<u64> {
         let result = self.request(method, params).await?;
-        result.as_u64().ok_or_else(|| {
-            format!("non-numeric subscription id: {result:?}").into()
-        })
+        result
+            .as_u64()
+            .ok_or_else(|| format!("non-numeric subscription id: {result:?}").into())
     }
 
     async fn unsubscribe(&mut self, method: &str, subid: u64) -> Result<bool> {
         let result = self.request(method, &format!("[{subid}]")).await?;
-        result.as_bool().ok_or_else(|| {
-            format!("non-boolean unsubscribe reply: {result:?}").into()
-        })
+        result
+            .as_bool()
+            .ok_or_else(|| format!("non-boolean unsubscribe reply: {result:?}").into())
     }
 
     pub async fn account_subscribe(&mut self, account: &Pubkey) -> Result<u64> {
-        self.subscribe("accountSubscribe", &conn::account_params(account))
-            .await
+        self.subscribe("accountSubscribe", &conn::account_params(account)).await
     }
 
     pub async fn account_unsubscribe(&mut self, subid: u64) -> Result<bool> {
@@ -100,16 +88,11 @@ impl RawWs {
     }
 
     pub async fn logs_subscribe_all(&mut self) -> Result<u64> {
-        self.subscribe("logsSubscribe", conn::logs_all_params())
-            .await
+        self.subscribe("logsSubscribe", conn::logs_all_params()).await
     }
 
-    pub async fn logs_subscribe_mentions(
-        &mut self,
-        account: &Pubkey,
-    ) -> Result<u64> {
-        self.subscribe("logsSubscribe", &conn::logs_mentions_params(account))
-            .await
+    pub async fn logs_subscribe_mentions(&mut self, account: &Pubkey) -> Result<u64> {
+        self.subscribe("logsSubscribe", &conn::logs_mentions_params(account)).await
     }
 
     pub async fn logs_unsubscribe(&mut self, subid: u64) -> Result<bool> {
@@ -117,8 +100,7 @@ impl RawWs {
     }
 
     pub async fn program_subscribe(&mut self, program: &Pubkey) -> Result<u64> {
-        self.subscribe("programSubscribe", &conn::program_params(program))
-            .await
+        self.subscribe("programSubscribe", &conn::program_params(program)).await
     }
 
     pub async fn program_unsubscribe(&mut self, subid: u64) -> Result<bool> {
@@ -133,12 +115,8 @@ impl RawWs {
         self.unsubscribe("slotUnsubscribe", subid).await
     }
 
-    pub async fn signature_subscribe(
-        &mut self,
-        signature: &str,
-    ) -> Result<u64> {
-        self.subscribe("signatureSubscribe", &conn::signature_params(signature))
-            .await
+    pub async fn signature_subscribe(&mut self, signature: &str) -> Result<u64> {
+        self.subscribe("signatureSubscribe", &conn::signature_params(signature)).await
     }
 
     pub async fn signature_unsubscribe(&mut self, subid: u64) -> Result<bool> {
@@ -157,18 +135,12 @@ impl RawWs {
             let remaining = deadline
                 .checked_duration_since(tokio::time::Instant::now())
                 .unwrap_or(Duration::ZERO);
-            let event = tokio::time::timeout(
-                remaining,
-                conn::next_event(&mut self.socket),
-            )
-            .await;
+            let event = tokio::time::timeout(remaining, conn::next_event(&mut self.socket)).await;
             match event {
                 Err(_) => return Ok(None),
-                Ok(Ok(RawEvent::Notification {
-                    method,
-                    subscription,
-                    payload,
-                })) => return Ok(Some((method, subscription, payload))),
+                Ok(Ok(RawEvent::Notification { method, subscription, payload })) => {
+                    return Ok(Some((method, subscription, payload)))
+                }
                 Ok(Ok(RawEvent::Reply { .. })) => {}
                 Ok(Ok(RawEvent::Malformed)) => self.malformed += 1,
                 Ok(Err(reason)) => return Err(format!("ws: {reason}").into()),
@@ -181,10 +153,7 @@ impl RawWs {
     }
 
     pub async fn close(mut self) -> Result<()> {
-        self.socket
-            .close(None)
-            .await
-            .map_err(|error| format!("ws close: {error}"))?;
+        self.socket.close(None).await.map_err(|error| format!("ws close: {error}"))?;
         Ok(())
     }
 }

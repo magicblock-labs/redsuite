@@ -25,8 +25,7 @@ const LEDGER_SIZE_LIMIT_UNREACHABLE: u64 = 1 << 60;
 pub const DLP_ID: &str = "DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh";
 pub const MDP_ID: &str = "DmnRGfyyftzacFb1XadYhWF6vWqXwtQk5tbr6XgR3BA1";
 pub const COMMITTOR_ID: &str = "ComtrB2KEaWgXsW1dhr1xYL4Ht4Bjj3gXnnL6KMdABq";
-pub const HYDRA_EPHEMERAL_ID: &str =
-    "eHyd5BU8QffvHi4GnXwxrK4WpS7pM2x9UGKHBWii7mf";
+pub const HYDRA_EPHEMERAL_ID: &str = "eHyd5BU8QffvHi4GnXwxrK4WpS7pM2x9UGKHBWii7mf";
 // The validator's committor (>= 0.13.7)
 const NOOP_ID: &str = "noopb9bkMVfRPU8AsbpTUg8AQkHtKwMYZiFUjNRtMmV";
 const MEMO_V1_ID: &str = "Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo";
@@ -35,16 +34,9 @@ const TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const ATA_PROGRAM_ID: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 const EATA_PROGRAM_ID: &str = "SPLxh1LVZzEkX99H6rqYizhytLWPZVV296zyYDPagv2";
 
-const CLONED_UPGRADEABLE_PROGRAMS: &[&str] = &[
-    DLP_ID,
-    MDP_ID,
-    NOOP_ID,
-    TOKEN_PROGRAM_ID,
-    EATA_PROGRAM_ID,
-    HYDRA_EPHEMERAL_ID,
-];
-const CLONED_LEGACY_PROGRAMS: &[&str] =
-    &[MEMO_V1_ID, MEMO_V2_ID, ATA_PROGRAM_ID];
+const CLONED_UPGRADEABLE_PROGRAMS: &[&str] =
+    &[DLP_ID, MDP_ID, NOOP_ID, TOKEN_PROGRAM_ID, EATA_PROGRAM_ID, HYDRA_EPHEMERAL_ID];
+const CLONED_LEGACY_PROGRAMS: &[&str] = &[MEMO_V1_ID, MEMO_V2_ID, ATA_PROGRAM_ID];
 
 // Extra genesis copies of redline_program.so under derived addresses, so
 // scenarios can spread identical load across distinct program ids.
@@ -67,16 +59,9 @@ pub fn redline_alias_ids(count: usize) -> Vec<Pubkey> {
 }
 
 pub fn redshift_loader_v3_target() -> (Pubkey, Pubkey) {
-    let id = Pubkey::find_program_address(
-        &[b"redsuite-loader-v3"],
-        &redshift_interface::ID,
-    )
-    .0;
-    let authority = Pubkey::find_program_address(
-        &[b"redsuite-loader-v3-auth"],
-        &redshift_interface::ID,
-    )
-    .0;
+    let id = Pubkey::find_program_address(&[b"redsuite-loader-v3"], &redshift_interface::ID).0;
+    let authority =
+        Pubkey::find_program_address(&[b"redsuite-loader-v3-auth"], &redshift_interface::ID).0;
     (id, authority)
 }
 
@@ -99,13 +84,11 @@ pub fn redline_loader_v3_pair() -> [(Pubkey, Pubkey); 2] {
 pub const CLONE_URL_ENV: &str = "REDSUITE_CLONE_URL";
 const DEFAULT_CLONE_URL: &str = "https://api.mainnet-beta.solana.com";
 
-const PROTOCOL_FEES_VAULT_ID: &str =
-    "7JrkjmZPprHwtuvtuGTXp9hwfGYFAQLnLeFM52kqAgXg";
+const PROTOCOL_FEES_VAULT_ID: &str = "7JrkjmZPprHwtuvtuGTXp9hwfGYFAQLnLeFM52kqAgXg";
 pub(super) const CLONED_ACCOUNTS: &[&str] = &[PROTOCOL_FEES_VAULT_ID];
 
 pub(super) fn clone_url() -> String {
-    std::env::var(CLONE_URL_ENV)
-        .unwrap_or_else(|_| DEFAULT_CLONE_URL.to_owned())
+    std::env::var(CLONE_URL_ENV).unwrap_or_else(|_| DEFAULT_CLONE_URL.to_owned())
 }
 
 const BASE_BIN: &str = "solana-test-validator";
@@ -119,18 +102,15 @@ pub(super) const BASE_READY_TIMEOUT: Duration = Duration::from_secs(60);
 pub const ER_READY_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub(super) fn find_base_bin() -> Result<PathBuf> {
-    which(BASE_BIN).ok_or_else(|| {
-        format!("{BASE_BIN} not found — put the Solana CLI on PATH").into()
-    })
+    which(BASE_BIN)
+        .ok_or_else(|| format!("{BASE_BIN} not found — put the Solana CLI on PATH").into())
 }
 
 fn explicit_bin(name: &str) -> Result<Option<PathBuf>> {
     let path = std::env::var_os(name).map(PathBuf::from);
     if let Some(path) = &path {
         if !path.exists() {
-            return Err(
-                format!("{name}={} does not exist", path.display()).into()
-            );
+            return Err(format!("{name}={} does not exist", path.display()).into());
         }
     }
     Ok(path)
@@ -177,10 +157,7 @@ fn which(bin: &str) -> Option<PathBuf> {
 }
 
 pub(super) fn bin_name(path: &Path) -> String {
-    path.file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .into_owned()
+    path.file_name().unwrap_or_default().to_string_lossy().into_owned()
 }
 
 struct StagedPrograms {
@@ -218,17 +195,11 @@ fn base_programs(er_bin: &Path) -> StagedPrograms {
             }
         }
     }
-    StagedPrograms {
-        bpf,
-        loaded_fixtures,
-    }
+    StagedPrograms { bpf, loaded_fixtures }
 }
 
 fn redline_aliases_of(so: &Path) -> Vec<Pubkey> {
-    if so
-        .file_name()
-        .is_some_and(|name| name == Fixture::RedlineProgram.so_name())
-    {
+    if so.file_name().is_some_and(|name| name == Fixture::RedlineProgram.so_name()) {
         redline_alias_ids(REDLINE_ALIAS_COUNT)
     } else {
         Vec::new()
@@ -236,10 +207,7 @@ fn redline_aliases_of(so: &Path) -> Vec<Pubkey> {
 }
 
 fn committor_so(er_bin: &Path) -> Option<PathBuf> {
-    let deploy = er_bin
-        .parent()?
-        .parent()?
-        .join("deploy/magicblock_committor_program.so");
+    let deploy = er_bin.parent()?.parent()?.join("deploy/magicblock_committor_program.so");
     deploy.exists().then_some(deploy)
 }
 
@@ -277,10 +245,7 @@ impl BasePlan {
     ) -> Result<Self> {
         let yellowstone = super::yellowstone::ensure(&bin).await?;
         let geyser_plugin_config = stack_dir.join("geyser.json");
-        yellowstone.write_config(
-            &geyser_plugin_config,
-            &format!("127.0.0.1:{grpc_port}"),
-        )?;
+        yellowstone.write_config(&geyser_plugin_config, &format!("127.0.0.1:{grpc_port}"))?;
         let mut upgradeable_v3 = Vec::new();
         if let Ok(redshift_so) = Fixture::RedshiftProgram.resolve() {
             let (v3_id, v3_authority) = redshift_loader_v3_target();
@@ -340,8 +305,7 @@ impl BasePlan {
             }
             cmd.arg("--bpf-program").arg(id).arg(so);
         }
-        cmd.arg("--geyser-plugin-config")
-            .arg(&self.geyser_plugin_config);
+        cmd.arg("--geyser-plugin-config").arg(&self.geyser_plugin_config);
         cmd
     }
 }
@@ -378,9 +342,7 @@ pub(super) fn leader_params(
         ..LeaderParams::default()
     };
     if let Some(grpc_url) = &endpoints.grpc_url {
-        params
-            .remotes
-            .push(Remote::Grpc(with_api_key(grpc_url).parse()?));
+        params.remotes.push(Remote::Grpc(with_api_key(grpc_url).parse()?));
     }
     params.aperture.listen = local(ports.rpc);
     params.metrics.address = local(ports.metrics);
@@ -418,8 +380,7 @@ pub(super) fn verifier_params(
     params.engine.accountsdb.directory = state::accountsdb_dir(&storage_dir);
     params.engine.ledger.directory = storage_dir;
     params.engine.blockstore = leader.engine.blockstore;
-    params.engine.replication.upstream_address =
-        *leader.engine.replication.bind_address;
+    params.engine.replication.upstream_address = *leader.engine.replication.bind_address;
     params.engine.replication.upstream_authority =
         SerdePubkey(leader.engine.authority.local.pubkey());
     params

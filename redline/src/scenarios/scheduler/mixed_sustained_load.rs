@@ -16,9 +16,8 @@ use redsuite_core::{
     },
     report::Unit,
     runner::{
-        execute_for_raw, execute_raw, merge_outcomes, spawn_workers,
-        split_budget, split_iterations, Delivery, Pacing, RawRunOutcome,
-        RunConfig, RunOutcome, SendTransaction,
+        execute_for_raw, execute_raw, merge_outcomes, spawn_workers, split_budget,
+        split_iterations, Delivery, Pacing, RawRunOutcome, RunConfig, RunOutcome, SendTransaction,
     },
     BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
 };
@@ -35,9 +34,7 @@ const CLONE_TIMEOUT: Duration = Duration::from_secs(60);
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(1_800);
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(60);
 
-use crate::metrics::{
-    ENGINE_TRANSACTIONS, RPC_ACCEPTED_TRANSACTIONS, RPC_HANDLED_TRANSACTIONS,
-};
+use crate::metrics::{ENGINE_TRANSACTIONS, RPC_ACCEPTED_TRANSACTIONS, RPC_HANDLED_TRANSACTIONS};
 
 const BLOCKED_TRANSACTIONS: &str = "engine_processor_blocked_transactions";
 const BUSY_EXECUTORS: &str = "engine_processor_busy_executors";
@@ -164,17 +161,9 @@ const FULL: Profile = Profile {
     high_cu_iters: 180,
 };
 
-const PROFILES: ProfileValues<Profile> = ProfileValues {
-    lite: LITE,
-    full: FULL,
-};
+const PROFILES: ProfileValues<Profile> = ProfileValues { lite: LITE, full: FULL };
 
-fn build_ixs(
-    id: u64,
-    pool: &[Pubkey],
-    read_span: usize,
-    high_cu_iters: u32,
-) -> Vec<Instruction> {
+fn build_ixs(id: u64, pool: &[Pubkey], read_span: usize, high_cu_iters: u32) -> Vec<Instruction> {
     let lanes = pool.len() as u64;
     let lane = lane_of(id, lanes);
     let target = pool[lane as usize];
@@ -182,12 +171,7 @@ fn build_ixs(
         Mode::SimpleWrite => vec![build::simple_byte_set(id, &[target])],
         Mode::HighCu => vec![
             compute_unit_limit(CU_LIMIT),
-            build::expensive_hash_compute(
-                id,
-                HASH_INIT,
-                high_cu_iters,
-                &[target],
-            ),
+            build::expensive_hash_compute(id, HASH_INIT, high_cu_iters, &[target]),
         ],
         Mode::ReadWrite => {
             let sources: Vec<Pubkey> = (1..=read_span as u64)
@@ -201,10 +185,7 @@ fn build_ixs(
 #[derive(Clone)]
 enum Limit {
     Iterations(u64),
-    Until {
-        deadline: Instant,
-        stop: watch::Receiver<bool>,
-    },
+    Until { deadline: Instant, stop: watch::Receiver<bool> },
 }
 
 struct Executed {
@@ -254,13 +235,9 @@ async fn execute(
         let pool = pool.clone();
         let payer_bytes = payer_bytes.clone();
         async move {
-            let senders =
-                prep::worker_senders(&er_rpc_url, &payer_bytes, index, threads);
-            let locks: Rc<Vec<Arc<tokio::sync::Mutex<()>>>> = Rc::new(
-                (0..span.len)
-                    .map(|_| Arc::new(tokio::sync::Mutex::new(())))
-                    .collect(),
-            );
+            let senders = prep::worker_senders(&er_rpc_url, &payer_bytes, index, threads);
+            let locks: Rc<Vec<Arc<tokio::sync::Mutex<()>>>> =
+                Rc::new((0..span.len).map(|_| Arc::new(tokio::sync::Mutex::new(()))).collect());
             let request = |iteration| {
                 let id = span.job_id(iteration - 1, lanes);
                 let lane_index = (lane_of(id, lanes) - span.lo) as usize;
@@ -289,8 +266,7 @@ async fn execute(
                     .await?
                 }
                 Limit::Until { deadline, stop } => {
-                    execute_for_raw(rate, concurrency, deadline, stop, request)
-                        .await?
+                    execute_for_raw(rate, concurrency, deadline, stop, request).await?
                 }
             };
             Ok((span, outcome))
@@ -310,23 +286,19 @@ fn summarize(lanes: u64, outcomes: Vec<(LaneSpan, RawRunOutcome)>) -> Executed {
         let admitted = outcome.delivered + outcome.failed;
         for offset in 0..span.len {
             let lane = span.lo + offset;
-            let rounds =
-                admitted / span.len + u64::from(offset < admitted % span.len);
+            let rounds = admitted / span.len + u64::from(offset < admitted % span.len);
             if rounds > 0 {
                 last_ids[lane as usize] = Some(id_for(rounds - 1, lane, lanes));
             }
             // Coprime lane counts visit every mix slot once per period.
             for round in 0..MIX_PERIOD {
-                let count = rounds / MIX_PERIOD
-                    + u64::from(round < rounds % MIX_PERIOD);
+                let count = rounds / MIX_PERIOD + u64::from(round < rounds % MIX_PERIOD);
                 counts[mode_for(id_for(round, lane, lanes)) as usize] += count;
             }
         }
     }
     Executed {
-        outcome: merge_outcomes(
-            outcomes.into_iter().map(|(_, outcome)| outcome),
-        ),
+        outcome: merge_outcomes(outcomes.into_iter().map(|(_, outcome)| outcome)),
         last_ids,
         counts,
     }
@@ -398,8 +370,7 @@ async fn verify_final_state(
                 )?;
             }
             Mode::HighCu => {
-                let hash = &data[layout::HASH_OFFSET
-                    ..layout::HASH_OFFSET + layout::HASH_SIZE];
+                let hash = &data[layout::HASH_OFFSET..layout::HASH_OFFSET + layout::HASH_SIZE];
                 check_eq!(
                     hash,
                     expected_hash,
@@ -474,27 +445,19 @@ pub(crate) async fn run(
         profile.lanes
     )?;
 
-    let rate = load
-        .and_then(|load| load.rate)
-        .map_or(profile.rate, |rate| rate.get());
+    let rate = load.and_then(|load| load.rate).map_or(profile.rate, |rate| rate.get());
     let concurrency = load.and_then(|load| load.concurrency).map_or(
         profile.concurrency_per_thread() * profile.threads,
         |concurrency| concurrency.get(),
     );
     let threads = profile.threads.min(rate as usize).min(concurrency);
-    let name = if load.is_some() {
-        "redline/load"
-    } else {
-        "redline/mixed_sustained_load"
-    };
+    let name = if load.is_some() { "redline/load" } else { "redline/mixed_sustained_load" };
 
-    let payers =
-        prep::funded_payers(base, profile.payers, PAYER_LAMPORTS).await?;
+    let payers = prep::funded_payers(base, profile.payers, PAYER_LAMPORTS).await?;
     let pool = Accounts::new(crate::ACCOUNT_SPACE, er.identity())
         .init_batched(base, &payers, profile.lanes as usize, true)
         .await?;
-    prep::await_clones(er, &pool, crate::ACCOUNT_SPACE as usize, CLONE_TIMEOUT)
-        .await?;
+    prep::await_clones(er, &pool, crate::ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
 
     let pool = Arc::new(pool);
     let payer_bytes = prep::payer_bytes(&payers);
@@ -538,11 +501,7 @@ pub(crate) async fn run(
     )
     .await?;
 
-    let Executed {
-        outcome,
-        last_ids,
-        counts,
-    } = executed;
+    let Executed { outcome, last_ids, counts } = executed;
     let total = outcome.delivered + outcome.failed;
     if load.is_some() {
         info!(
@@ -584,23 +543,13 @@ pub(crate) async fn run(
             .metric(
                 "client drain s",
                 Unit::Seconds,
-                outcome
-                    .wall
-                    .saturating_sub(outcome.admission_wall)
-                    .as_secs_f64(),
+                outcome.wall.saturating_sub(outcome.admission_wall).as_secs_f64(),
             );
     } else {
-        report = report.setting(
-            "concurrency per thread",
-            profile.concurrency_per_thread(),
-        );
+        report = report.setting("concurrency per thread", profile.concurrency_per_thread());
     }
     for (mode, count) in Mode::ALL.into_iter().zip(counts) {
-        report = report.metric(
-            format!("{} txs", mode.label()),
-            Unit::Count,
-            count as f64,
-        );
+        report = report.metric(format!("{} txs", mode.label()), Unit::Count, count as f64);
     }
     let validation = async {
         if load.is_none() {

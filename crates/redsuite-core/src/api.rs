@@ -6,12 +6,15 @@ use hash::Hash;
 use json::{Deserialize, Serialize};
 use pubkey::Pubkey;
 use serde::de::DeserializeOwned;
+use serde_with::{serde_as, DisplayFromStr};
 use signature::Signature;
+use thiserror::Error;
 use transaction::{versioned::VersionedTransaction, Transaction};
 
 use crate::{transport::http, Result};
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
+#[error("{self:?}")]
 pub struct RpcError {
     pub code: i64,
     pub message: String,
@@ -20,58 +23,22 @@ pub struct RpcError {
     pub url: String,
 }
 
-impl std::fmt::Display for RpcError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "rpc error {}: {} ({} at {})",
-            self.code, self.message, self.method, self.url
-        )?;
-        if let Some(data) = &self.data {
-            write!(f, " data: {data:?}")?;
-        }
-        Ok(())
-    }
-}
-
-impl std::error::Error for RpcError {}
-
-#[derive(Debug)]
+#[derive(Debug, Error)]
+#[error("transaction {signature} failed on-chain: {err:?}")]
 pub struct TxError {
     pub signature: Signature,
     pub err: json::Value,
 }
 
-impl std::fmt::Display for TxError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "transaction {} failed on-chain: {:?}",
-            self.signature, self.err
-        )
-    }
-}
-
-impl std::error::Error for TxError {}
-
-#[derive(Debug)]
+#[derive(Debug, Error)]
+#[error(
+    "transaction {signature} not confirmed within {deadline:?} — execution \
+     outcome unknown, do not resubmit"
+)]
 pub struct ConfirmTimeout {
     pub signature: Signature,
     pub deadline: Duration,
 }
-
-impl std::fmt::Display for ConfirmTimeout {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "transaction {} not confirmed within {:?} — execution outcome \
-             unknown, do not resubmit",
-            self.signature, self.deadline
-        )
-    }
-}
-
-impl std::error::Error for ConfirmTimeout {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Commitment {
@@ -112,7 +79,6 @@ impl Default for ConfirmOptions {
 
 #[derive(Deserialize)]
 struct Envelope<T> {
-    #[serde(default)]
     id: Option<u64>,
     result: Option<T>,
     error: Option<EnvelopeError>,
@@ -122,7 +88,6 @@ struct Envelope<T> {
 struct EnvelopeError {
     code: i64,
     message: String,
-    #[serde(default)]
     data: Option<json::Value>,
 }
 
@@ -131,31 +96,37 @@ struct WithContext<T> {
     value: T,
 }
 
+#[serde_as]
 #[derive(Deserialize)]
 struct RpcBlockhash {
-    blockhash: String,
+    #[serde_as(as = "DisplayFromStr")]
+    blockhash: Hash,
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RpcSignatureStatus {
-    #[serde(rename = "confirmationStatus")]
     confirmation_status: Option<String>,
     err: Option<json::Value>,
 }
 
+#[serde_as]
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RpcAccount {
     lamports: u64,
-    owner: String,
+    #[serde_as(as = "DisplayFromStr")]
+    owner: Pubkey,
     data: (String, String),
     executable: bool,
-    #[serde(rename = "rentEpoch")]
     rent_epoch: u64,
 }
 
+#[serde_as]
 #[derive(Deserialize)]
 struct RpcKeyedAccount {
-    pubkey: String,
+    #[serde_as(as = "DisplayFromStr")]
+    pubkey: Pubkey,
     account: RpcAccount,
 }
 
@@ -166,36 +137,34 @@ fn decode_rpc_account(raw: RpcAccount) -> Result<Account> {
     Ok(Account {
         lamports: raw.lamports,
         data,
-        owner: Pubkey::from_str(&raw.owner)?,
+        owner: raw.owner,
         executable: raw.executable,
         rent_epoch: raw.rent_epoch,
     })
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RpcTransaction {
     slot: u64,
-    #[serde(rename = "blockTime")]
     block_time: Option<i64>,
     meta: Option<RpcTransactionMeta>,
     transaction: Option<(String, String)>,
 }
 
 #[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RpcTransactionMeta {
     err: Option<json::Value>,
     fee: u64,
-    #[serde(rename = "preBalances")]
     pre_balances: Vec<u64>,
-    #[serde(rename = "postBalances")]
     post_balances: Vec<u64>,
-    #[serde(rename = "logMessages")]
     log_messages: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BlockInfo {
-    #[serde(rename = "blockTime")]
     pub block_time: Option<i64>,
 }
 
@@ -333,10 +302,9 @@ impl Api {
         method: &str,
         params: &impl Serialize,
     ) -> Result<T> {
-        self.call_nullable(method, params).await?.ok_or_else(|| {
-            format!("{method}: response carried neither result nor error")
-                .into()
-        })
+        self.call_nullable(method, params)
+            .await?
+            .ok_or_else(|| format!("{method}: response carried neither result nor error").into())
     }
 
     // For methods where a null result is a legitimate answer (getTransaction
@@ -348,19 +316,13 @@ impl Api {
     ) -> Result<Option<T>> {
         let params = json::to_string(params)?;
         let body = crate::transport::conn::request_text(1, method, &params);
-        let response = http::post_json(&self.client, &self.url, body)
-            .await
-            .map_err(|mut error| {
-                if let Some(transport) =
-                    error.downcast_mut::<http::TransportError>()
-                {
-                    transport.method = Some(method.to_owned());
-                }
+        let response =
+            http::post_json(&self.client, &self.url, body).await.map_err(|mut error| {
+                error.method = Some(method.to_owned());
                 error
             })?;
-        let envelope: Envelope<T> = json::from_str(&response).map_err(|e| {
-            format!("{method}: unexpected response shape: {e} ({response})")
-        })?;
+        let envelope: Envelope<T> = json::from_str(&response)
+            .map_err(|e| format!("{method}: unexpected response shape: {e} ({response})"))?;
         if let Some(err) = envelope.error {
             return Err(Box::new(RpcError {
                 code: err.code,
@@ -378,8 +340,7 @@ impl Api {
     }
 
     pub async fn get_slot(&self) -> Result<u64> {
-        self.call("getSlot", &(CommitmentConfig::confirmed(),))
-            .await
+        self.call("getSlot", &(CommitmentConfig::confirmed(),)).await
     }
 
     pub async fn server_alive(&self) -> bool {
@@ -403,26 +364,17 @@ impl Api {
         Ok(resp.value)
     }
 
-    pub async fn request_airdrop(
-        &self,
-        pk: &Pubkey,
-        lamports: u64,
-    ) -> Result<String> {
-        self.call("requestAirdrop", &(pk.to_string(), lamports))
-            .await
+    pub async fn request_airdrop(&self, pk: &Pubkey, lamports: u64) -> Result<String> {
+        self.call("requestAirdrop", &(pk.to_string(), lamports)).await
     }
 
     pub async fn get_account(&self, pk: &Pubkey) -> Result<Option<Account>> {
         let params = (pk.to_string(), AccountConfig::base64_confirmed());
-        let resp: WithContext<Option<RpcAccount>> =
-            self.call("getAccountInfo", &params).await?;
+        let resp: WithContext<Option<RpcAccount>> = self.call("getAccountInfo", &params).await?;
         resp.value.map(decode_rpc_account).transpose()
     }
 
-    pub async fn get_multiple_accounts(
-        &self,
-        pks: &[Pubkey],
-    ) -> Result<Vec<Option<Account>>> {
+    pub async fn get_multiple_accounts(&self, pks: &[Pubkey]) -> Result<Vec<Option<Account>>> {
         let keys: Vec<String> = pks.iter().map(Pubkey::to_string).collect();
         let params = (keys, AccountConfig::base64_confirmed());
         let resp: WithContext<Vec<Option<RpcAccount>>> =
@@ -441,36 +393,23 @@ impl Api {
             .collect()
     }
 
-    pub async fn get_program_accounts(
-        &self,
-        program: &Pubkey,
-    ) -> Result<Vec<(Pubkey, Account)>> {
+    pub async fn get_program_accounts(&self, program: &Pubkey) -> Result<Vec<(Pubkey, Account)>> {
         let params = (program.to_string(), AccountConfig::base64_confirmed());
-        let resp: Vec<RpcKeyedAccount> =
-            self.call("getProgramAccounts", &params).await?;
+        let resp: Vec<RpcKeyedAccount> = self.call("getProgramAccounts", &params).await?;
         resp.into_iter()
-            .map(|keyed| {
-                Ok((
-                    Pubkey::from_str(&keyed.pubkey)?,
-                    decode_rpc_account(keyed.account)?,
-                ))
-            })
+            .map(|keyed| Ok((keyed.pubkey, decode_rpc_account(keyed.account)?)))
             .collect()
     }
 
     pub async fn get_latest_blockhash(&self) -> Result<Hash> {
-        let resp: WithContext<RpcBlockhash> = self
-            .call("getLatestBlockhash", &(CommitmentConfig::confirmed(),))
-            .await?;
-        Ok(Hash::from_str(&resp.value.blockhash)?)
+        let resp: WithContext<RpcBlockhash> =
+            self.call("getLatestBlockhash", &(CommitmentConfig::confirmed(),)).await?;
+        Ok(resp.value.blockhash)
     }
 
-    fn send_params(
-        tx: &Transaction,
-    ) -> Result<(String, SendTransactionConfig)> {
+    fn send_params(tx: &Transaction) -> Result<(String, SendTransactionConfig)> {
         Ok((
-            base64::engine::general_purpose::STANDARD
-                .encode(wincode::serialize(tx)?),
+            base64::engine::general_purpose::STANDARD.encode(wincode::serialize(tx)?),
             SendTransactionConfig {
                 encoding: "base64",
                 skip_preflight: true,
@@ -495,19 +434,13 @@ impl Api {
                 "sendTransaction",
                 &json::to_string(&Self::send_params(tx)?)?,
             ));
-            expect.push(
-                *tx.signatures
-                    .first()
-                    .ok_or("a transaction to send carries no signature")?,
-            );
+            expect
+                .push(*tx.signatures.first().ok_or("a transaction to send carries no signature")?);
         }
         if batched {
             body.push(']');
         }
-        Ok(SendBody {
-            body: body.into(),
-            expect,
-        })
+        Ok(SendBody { body: body.into(), expect })
     }
 
     pub async fn send_prepared(&self, body: &SendBody) -> Result<usize> {
@@ -515,8 +448,7 @@ impl Api {
         if count == 0 {
             return Ok(0);
         }
-        let response =
-            http::post_json(&self.client, &self.url, body.body.clone()).await?;
+        let response = http::post_json(&self.client, &self.url, body.body.clone()).await?;
         let envelopes: Vec<Envelope<String>> = match count {
             1 => json::from_str(&response).map(|one| vec![one]),
             _ => json::from_str(&response),
@@ -545,19 +477,14 @@ impl Api {
                     )
                 })?;
             if std::mem::replace(&mut answered[id - 1], true) {
-                return Err(format!(
-                    "sendTransaction: duplicate response id {id}"
-                )
-                .into());
+                return Err(format!("sendTransaction: duplicate response id {id}").into());
             }
             if envelope.error.is_some() {
                 rejected += 1;
                 continue;
             }
             let signature = envelope.result.as_ref().ok_or_else(|| {
-                format!(
-                    "sendTransaction: id {id} carries neither result nor error"
-                )
+                format!("sendTransaction: id {id} carries neither result nor error")
             })?;
             let acknowledged = Signature::from_str(signature)?;
             let expected = body.expect[id - 1];
@@ -572,28 +499,16 @@ impl Api {
         Ok(rejected)
     }
 
-    pub async fn send_transaction(
-        &self,
-        tx: &Transaction,
-    ) -> Result<Signature> {
-        let sig: String = self
-            .call("sendTransaction", &Self::send_params(tx)?)
-            .await?;
+    pub async fn send_transaction(&self, tx: &Transaction) -> Result<Signature> {
+        let sig: String = self.call("sendTransaction", &Self::send_params(tx)?).await?;
         Ok(Signature::from_str(&sig)?)
     }
 
-    pub async fn confirm(
-        &self,
-        sig: &Signature,
-        options: ConfirmOptions,
-    ) -> Result<()> {
+    pub async fn confirm(&self, sig: &Signature, options: ConfirmOptions) -> Result<()> {
         crate::check::poll_until(options.deadline, options.poll, async || {
             if let Some(status) = self.get_signature_status(sig).await? {
                 if let Some(err) = status.err {
-                    return Err(Box::new(TxError {
-                        signature: *sig,
-                        err,
-                    }) as crate::DynError);
+                    return Err(Box::new(TxError { signature: *sig, err }) as crate::DynError);
                 }
                 if status.meets(options.commitment) {
                     return Ok(Some(()));
@@ -610,10 +525,7 @@ impl Api {
         })
     }
 
-    pub async fn get_signature_status(
-        &self,
-        sig: &Signature,
-    ) -> Result<Option<SignatureStatus>> {
+    pub async fn get_signature_status(&self, sig: &Signature) -> Result<Option<SignatureStatus>> {
         let params = ([sig.to_string()],);
         let resp: WithContext<Vec<Option<RpcSignatureStatus>>> =
             self.call("getSignatureStatuses", &params).await?;
@@ -625,20 +537,14 @@ impl Api {
                 status.confirmation_status.as_deref(),
                 Some("confirmed" | "finalized")
             ),
-            finalized: matches!(
-                status.confirmation_status.as_deref(),
-                Some("finalized")
-            ),
+            finalized: matches!(status.confirmation_status.as_deref(), Some("finalized")),
             err: status.err,
         }))
     }
 
     /// Reads receipts without JSON's per-instruction base58 encoding, which is
     /// expensive for materialization transactions carrying whole program images.
-    pub async fn get_transaction(
-        &self,
-        sig: &Signature,
-    ) -> Result<Option<TransactionInfo>> {
+    pub async fn get_transaction(&self, sig: &Signature) -> Result<Option<TransactionInfo>> {
         let params = (
             sig.to_string(),
             TransactionConfig {
@@ -647,8 +553,7 @@ impl Api {
                 max_supported_transaction_version: 1,
             },
         );
-        let raw: Option<RpcTransaction> =
-            self.call_nullable("getTransaction", &params).await?;
+        let raw: Option<RpcTransaction> = self.call_nullable("getTransaction", &params).await?;
         raw.map(|tx| {
             let meta = tx.meta.unwrap_or_default();
             let lookup_tables = match tx.transaction {
@@ -701,8 +606,7 @@ impl Api {
                 commitment: Commitment::Confirmed.as_str(),
             },
         );
-        let infos: Vec<RpcSignatureInfo> =
-            self.call("getSignaturesForAddress", &params).await?;
+        let infos: Vec<RpcSignatureInfo> = self.call("getSignaturesForAddress", &params).await?;
         Ok(infos.into_iter().map(|info| info.signature).collect())
     }
 
@@ -712,13 +616,9 @@ impl Api {
         sig: &Signature,
         timeout: Duration,
     ) -> Result<TransactionInfo> {
-        crate::check::poll_until(timeout, TX_POLL, async || {
-            self.get_transaction(sig).await
-        })
-        .await?
-        .ok_or_else(|| {
-            format!("transaction {sig} not found within {timeout:?}").into()
-        })
+        crate::check::poll_until(timeout, TX_POLL, async || self.get_transaction(sig).await)
+            .await?
+            .ok_or_else(|| format!("transaction {sig} not found within {timeout:?}").into())
     }
 }
 
@@ -749,11 +649,7 @@ impl Metrics {
         self.sum_series(name, |_, value| value)
     }
 
-    fn sum_series(
-        &self,
-        name: &str,
-        value: impl Fn(&str, f64) -> f64,
-    ) -> Option<f64> {
+    fn sum_series(&self, name: &str, value: impl Fn(&str, f64) -> f64) -> Option<f64> {
         let label_prefix = format!("{name}{{");
         let mut sum = 0.0;
         let mut matched = false;
@@ -789,10 +685,7 @@ impl Metrics {
                 },
             };
             let (key, rest) = line.split_at(key_end);
-            let value = rest
-                .split_whitespace()
-                .next()
-                .and_then(|value| value.parse::<f64>().ok());
+            let value = rest.split_whitespace().next().and_then(|value| value.parse::<f64>().ok());
             let Some(value) = value else { continue };
             if let Some((bare, _)) = key.split_once('{') {
                 map.insert(bare.to_owned(), value);

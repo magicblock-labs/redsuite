@@ -5,8 +5,7 @@ use magicblock_config::LeaderParams;
 use pubkey::Pubkey;
 
 use crate::{
-    context::ErCtx, profile::ExecutionConfig, scenario::RunRecord,
-    topology::ErOptions, Result,
+    context::ErCtx, profile::ExecutionConfig, scenario::RunRecord, topology::ErOptions, Result,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
@@ -72,9 +71,7 @@ pub enum Fixture {
 
 impl Fixture {
     pub fn resolve(self) -> Result<PathBuf> {
-        let path = crate::topology::workspace_root()
-            .join("target/deploy")
-            .join(self.so_name());
+        let path = crate::topology::workspace_root().join("target/deploy").join(self.so_name());
         if !path.is_file() {
             return Err(format!(
                 "fixture {} is missing; run `cargo xtask programs`",
@@ -99,18 +96,14 @@ impl Fixture {
             Fixture::RedshiftProgram => "redshift_program.so",
             Fixture::RedhatProgram => "redhat_program.so",
             Fixture::RedshiftProgramSlim => "redshift_program_slim.so",
-            Fixture::RedshiftProgramSlimUpgraded => {
-                "redshift_program_slim_upgraded.so"
-            }
+            Fixture::RedshiftProgramSlimUpgraded => "redshift_program_slim_upgraded.so",
         }
     }
 
     pub const fn loaded_at_base_boot(self) -> bool {
         matches!(
             self,
-            Fixture::RedlineProgram
-                | Fixture::RedshiftProgram
-                | Fixture::RedhatProgram
+            Fixture::RedlineProgram | Fixture::RedshiftProgram | Fixture::RedhatProgram
         )
     }
 
@@ -131,10 +124,7 @@ pub struct ScenarioEntry {
     pub family: Family,
     pub short_name: &'static str,
     pub er: Er,
-    pub run: fn(
-        ExecutionConfig,
-        std::result::Result<ErCtx, String>,
-    ) -> ScenarioFuture,
+    pub run: fn(ExecutionConfig, std::result::Result<ErCtx, String>) -> ScenarioFuture,
 }
 
 impl ScenarioEntry {

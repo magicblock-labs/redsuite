@@ -52,15 +52,11 @@ pub mod build {
     use super::*;
     use crate::utils::derive_pda;
 
-    fn with_bincode(
-        data: &Instruction,
-        accounts: Vec<AccountMeta>,
-    ) -> SolanaInstruction {
+    fn with_bincode(data: &Instruction, accounts: Vec<AccountMeta>) -> SolanaInstruction {
         SolanaInstruction {
             program_id: crate::id(),
             accounts,
-            data: bincode::serialize(data)
-                .expect("instruction serialization is infallible"),
+            data: bincode::serialize(data).expect("instruction serialization is infallible"),
         }
     }
 
@@ -89,12 +85,7 @@ pub mod build {
             AccountMeta::new_readonly(base, false),
             AccountMeta::new_readonly(system_program::ID, false),
         ];
-        let ix = Instruction::InitAccount {
-            space,
-            seed,
-            bump,
-            authority,
-        };
+        let ix = Instruction::InitAccount { space, seed, bump, authority };
         let mut ix = with_bincode(&ix, metas);
         ix.program_id = program_id;
         (ix, pda)
@@ -118,8 +109,7 @@ pub mod build {
         seed: u8,
         authority: Pubkey,
     ) -> SolanaInstruction {
-        let accounts =
-            sdk::delegate_args::DelegateAccounts::new(pda, program_id);
+        let accounts = sdk::delegate_args::DelegateAccounts::new(pda, program_id);
         let m = sdk::delegate_args::DelegateAccountMetas::from(accounts);
         let metas = vec![
             AccountMeta::new(payer, true),
@@ -132,8 +122,7 @@ pub mod build {
             m.system_program,
             AccountMeta::new_readonly(base, false),
         ];
-        let mut ix =
-            with_bincode(&Instruction::Delegate { seed, authority }, metas);
+        let mut ix = with_bincode(&Instruction::Delegate { seed, authority }, metas);
         ix.program_id = program_id;
         ix
     }
@@ -147,10 +136,7 @@ pub mod build {
         id: u64,
         accounts: &[Pubkey],
     ) -> SolanaInstruction {
-        let metas = accounts
-            .iter()
-            .map(|&pk| AccountMeta::new(pk, false))
-            .collect();
+        let metas = accounts.iter().map(|&pk| AccountMeta::new(pk, false)).collect();
         let mut ix = with_bincode(&Instruction::SimpleByteSet { id }, metas);
         ix.program_id = program_id;
         ix
@@ -172,10 +158,7 @@ pub mod build {
         iters: u32,
         accounts: &[Pubkey],
     ) -> SolanaInstruction {
-        let metas = accounts
-            .iter()
-            .map(|&pk| AccountMeta::new(pk, false))
-            .collect();
+        let metas = accounts.iter().map(|&pk| AccountMeta::new(pk, false)).collect();
         let mut ix = with_bincode(
             &Instruction::ExpensiveHashCompute { id, init, iters },
             metas,
@@ -184,49 +167,25 @@ pub mod build {
         ix
     }
 
-    pub fn multi_account_read(
-        id: u64,
-        target: Pubkey,
-        sources: &[Pubkey],
-    ) -> SolanaInstruction {
+    pub fn multi_account_read(id: u64, target: Pubkey, sources: &[Pubkey]) -> SolanaInstruction {
         let mut metas = vec![AccountMeta::new(target, false)];
-        metas.extend(
-            sources
-                .iter()
-                .map(|&pk| AccountMeta::new_readonly(pk, false)),
-        );
+        metas.extend(sources.iter().map(|&pk| AccountMeta::new_readonly(pk, false)));
         with_bincode(&Instruction::MultiAccountRead { id }, metas)
     }
 
-    pub fn account_data_copy(
-        id: u64,
-        sources: &[Pubkey],
-        dests: &[Pubkey],
-    ) -> SolanaInstruction {
-        let mut metas: Vec<_> = sources
-            .iter()
-            .map(|&pk| AccountMeta::new_readonly(pk, false))
-            .collect();
+    pub fn account_data_copy(id: u64, sources: &[Pubkey], dests: &[Pubkey]) -> SolanaInstruction {
+        let mut metas: Vec<_> =
+            sources.iter().map(|&pk| AccountMeta::new_readonly(pk, false)).collect();
         metas.extend(dests.iter().map(|&pk| AccountMeta::new(pk, false)));
         with_bincode(&Instruction::AccountDataCopy { id }, metas)
     }
 
-    pub fn read_accounts_data(
-        id: u64,
-        accounts: &[Pubkey],
-    ) -> SolanaInstruction {
-        let metas = accounts
-            .iter()
-            .map(|&pk| AccountMeta::new_readonly(pk, false))
-            .collect();
+    pub fn read_accounts_data(id: u64, accounts: &[Pubkey]) -> SolanaInstruction {
+        let metas = accounts.iter().map(|&pk| AccountMeta::new_readonly(pk, false)).collect();
         with_bincode(&Instruction::ReadAccountsData { id }, metas)
     }
 
-    pub fn commit_accounts(
-        id: u64,
-        payer: Pubkey,
-        accounts: &[Pubkey],
-    ) -> SolanaInstruction {
+    pub fn commit_accounts(id: u64, payer: Pubkey, accounts: &[Pubkey]) -> SolanaInstruction {
         with_bincode(
             &Instruction::CommitAccounts { id },
             commit_metas(payer, accounts),
@@ -244,15 +203,8 @@ pub mod build {
         )
     }
 
-    pub fn hash_fold(
-        id: u64,
-        iters: u32,
-        accounts: &[Pubkey],
-    ) -> SolanaInstruction {
-        let metas = accounts
-            .iter()
-            .map(|&pk| AccountMeta::new(pk, false))
-            .collect();
+    pub fn hash_fold(id: u64, iters: u32, accounts: &[Pubkey]) -> SolanaInstruction {
+        let metas = accounts.iter().map(|&pk| AccountMeta::new(pk, false)).collect();
         with_bincode(&Instruction::HashFold { id, iters }, metas)
     }
 

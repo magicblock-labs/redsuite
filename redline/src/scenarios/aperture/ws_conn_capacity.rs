@@ -40,10 +40,7 @@ const FULL: Profile = Profile {
     churn_concurrency: 200,
 };
 
-const PROFILES: ProfileValues<Profile> = ProfileValues {
-    lite: LITE,
-    full: FULL,
-};
+const PROFILES: ProfileValues<Profile> = ProfileValues { lite: LITE, full: FULL };
 
 async fn open_connections(url: &str, count: usize) -> Result<Vec<RawWs>> {
     let mut connections = Vec::with_capacity(count);
@@ -64,9 +61,7 @@ async fn await_fd_settle(pid: u32, baseline: usize) -> Result<(usize, f64)> {
     let deadline = tokio::time::Instant::now() + FD_SETTLE_TIMEOUT;
     loop {
         let fds = host::fd_count(pid)?;
-        if fds <= baseline + FD_TOLERANCE
-            || tokio::time::Instant::now() >= deadline
-        {
+        if fds <= baseline + FD_TOLERANCE || tokio::time::Instant::now() >= deadline {
             return Ok((fds, started.elapsed().as_secs_f64()));
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -129,8 +124,7 @@ impl Scenario<ScenarioReport> for WsConnCapacity {
             for conn in held {
                 conn.close().await?;
             }
-            let (fds_after_close, settle_s) =
-                await_fd_settle(pid, fd_baseline).await?;
+            let (fds_after_close, settle_s) = await_fd_settle(pid, fd_baseline).await?;
 
             let rung = RungOutcome {
                 connections,
@@ -180,33 +174,24 @@ impl Scenario<ScenarioReport> for WsConnCapacity {
             },
             |_| {
                 let ws_url = ws_url.clone();
-                std::future::ready(Ok(
-                    move |_: std::time::Instant| async move {
-                        let mut conn = RawWs::connect(&ws_url).await?;
-                        let subid =
-                            conn.account_subscribe(&shared_account).await?;
-                        if !conn.account_unsubscribe(subid).await? {
-                            return Err("unsubscribe returned false".into());
-                        }
-                        conn.close().await
-                    },
-                ))
+                std::future::ready(Ok(move |_: std::time::Instant| async move {
+                    let mut conn = RawWs::connect(&ws_url).await?;
+                    let subid = conn.account_subscribe(&shared_account).await?;
+                    if !conn.account_unsubscribe(subid).await? {
+                        return Err("unsubscribe returned false".into());
+                    }
+                    conn.close().await
+                }))
             },
         )
         .await?;
-        let (fds_after_churn, churn_settle_s) =
-            await_fd_settle(pid, fd_baseline).await?;
+        let (fds_after_churn, churn_settle_s) = await_fd_settle(pid, fd_baseline).await?;
         let rss_after_churn_kb = host::rss_kb(pid)?;
         debug!(
             churn.failed,
             fds_after_churn, fd_baseline, "connection churn finished",
         );
-        check_eq!(
-            churn.failed,
-            0,
-            "churn ops failed: {:?}",
-            churn.first_error
-        )?;
+        check_eq!(churn.failed, 0, "churn ops failed: {:?}", churn.first_error)?;
         check!(
             fds_after_churn <= fd_baseline + FD_TOLERANCE,
             "churn leaked descriptors: {fds_after_churn} vs baseline {fd_baseline}"

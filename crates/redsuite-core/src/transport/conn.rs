@@ -1,8 +1,7 @@
-use std::{cell::Cell, fmt, time::Duration};
+use std::{cell::Cell, time::Duration};
 
-use futures_util::{
-    stream::SplitSink, stream::SplitStream, SinkExt, Stream, StreamExt,
-};
+use derive_more::Display;
+use futures_util::{stream::SplitSink, stream::SplitStream, SinkExt, Stream, StreamExt};
 use json::{Deserialize, LazyValue};
 use pubkey::Pubkey;
 use tokio::net::TcpStream;
@@ -35,29 +34,16 @@ pub(super) async fn await_condition(
     .ok_or_else(|| format!("timed out waiting for {what} ({timeout:?})").into())
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Display)]
 pub enum CloseReason {
+    #[display("connection closed by server")]
     ServerClose,
+    #[display("stream ended")]
     StreamEnded,
+    #[display("transport error: {_0}")]
     Transport(String),
+    #[display("server error: {_0}")]
     ServerError(String),
-}
-
-impl fmt::Display for CloseReason {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            CloseReason::ServerClose => {
-                write!(formatter, "connection closed by server")
-            }
-            CloseReason::StreamEnded => write!(formatter, "stream ended"),
-            CloseReason::Transport(error) => {
-                write!(formatter, "transport error: {error}")
-            }
-            CloseReason::ServerError(error) => {
-                write!(formatter, "server error: {error}")
-            }
-        }
-    }
 }
 
 #[derive(Deserialize)]
@@ -107,10 +93,7 @@ fn classify(text: &str) -> Frame<'_> {
             subscription: params.subscription,
             payload: params.result,
         },
-        (None, _, Some(id)) => Frame::Reply {
-            id,
-            result: envelope.result,
-        },
+        (None, _, Some(id)) => Frame::Reply { id, result: envelope.result },
         _ => Frame::Ignored,
     }
 }
@@ -132,21 +115,14 @@ where
         Ok(Message::Text(text)) => Received::Text(text),
         Ok(Message::Close(_)) => Received::Closed(CloseReason::ServerClose),
         Ok(_) => Received::Skip,
-        Err(error) => {
-            Received::Closed(CloseReason::Transport(error.to_string()))
-        }
+        Err(error) => Received::Closed(CloseReason::Transport(error.to_string())),
     }
 }
 
 pub trait FrameHandler {
     fn on_reply(&mut self, id: u64, result: Option<&LazyValue<'_>>);
 
-    fn on_notification(
-        &mut self,
-        method: &str,
-        subscription: u64,
-        payload: &LazyValue<'_>,
-    );
+    fn on_notification(&mut self, method: &str, subscription: u64, payload: &LazyValue<'_>);
 
     fn on_malformed(&mut self, text: &str) {
         let _ = text;
@@ -172,14 +148,10 @@ where
             }
         };
         match classify(&text) {
-            Frame::Reply { id, result } => {
-                handler.on_reply(id, result.as_ref())
+            Frame::Reply { id, result } => handler.on_reply(id, result.as_ref()),
+            Frame::Notification { method, subscription, payload } => {
+                handler.on_notification(method, subscription, &payload)
             }
-            Frame::Notification {
-                method,
-                subscription,
-                payload,
-            } => handler.on_notification(method, subscription, &payload),
             Frame::ServerError(error) => {
                 let reason = CloseReason::ServerError(error);
                 handler.on_closed(&reason);
@@ -204,9 +176,7 @@ pub enum RawEvent {
     Malformed,
 }
 
-pub async fn next_event<S>(
-    stream: &mut S,
-) -> std::result::Result<RawEvent, CloseReason>
+pub async fn next_event<S>(stream: &mut S) -> std::result::Result<RawEvent, CloseReason>
 where
     S: Stream<Item = std::result::Result<Message, tungstenite::Error>> + Unpin,
 {
@@ -219,24 +189,19 @@ where
         return Ok(match classify(&text) {
             Frame::Reply { id, result } => RawEvent::Reply {
                 id,
-                result: result
-                    .and_then(|value| json::from_str(value.as_raw_str()).ok()),
+                result: result.and_then(|value| json::from_str(value.as_raw_str()).ok()),
             },
-            Frame::Notification {
-                method,
-                subscription,
-                payload,
-            } => match json::from_str(payload.as_raw_str()) {
-                Ok(payload) => RawEvent::Notification {
-                    method: method.to_owned(),
-                    subscription,
-                    payload,
-                },
-                Err(_) => RawEvent::Malformed,
-            },
-            Frame::ServerError(error) => {
-                return Err(CloseReason::ServerError(error))
+            Frame::Notification { method, subscription, payload } => {
+                match json::from_str(payload.as_raw_str()) {
+                    Ok(payload) => RawEvent::Notification {
+                        method: method.to_owned(),
+                        subscription,
+                        payload,
+                    },
+                    Err(_) => RawEvent::Malformed,
+                }
             }
+            Frame::ServerError(error) => return Err(CloseReason::ServerError(error)),
             Frame::Malformed => RawEvent::Malformed,
             Frame::Ignored => continue,
         });
@@ -248,9 +213,7 @@ pub fn reply_u64(result: Option<&LazyValue<'_>>) -> Option<u64> {
 }
 
 pub async fn connect(url: &str) -> Result<Socket> {
-    let (socket, _) = connect_async(url)
-        .await
-        .map_err(|error| format!("{url}: {error}"))?;
+    let (socket, _) = connect_async(url).await.map_err(|error| format!("{url}: {error}"))?;
     Ok(socket)
 }
 
@@ -260,9 +223,7 @@ pub fn split(socket: Socket) -> (Requester, SplitStream<Socket>) {
 }
 
 pub fn request_text(id: u64, method: &str, params: &str) -> String {
-    format!(
-        r#"{{"jsonrpc":"2.0","id":{id},"method":"{method}","params":{params}}}"#
-    )
+    format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"{method}","params":{params}}}"#)
 }
 
 pub fn account_params(account: &Pubkey) -> String {
@@ -302,12 +263,7 @@ impl Requester {
         self.next_req_id.replace(self.next_req_id.get() + 1)
     }
 
-    pub async fn send(
-        &self,
-        id: u64,
-        method: &str,
-        params: &str,
-    ) -> Result<()> {
+    pub async fn send(&self, id: u64, method: &str, params: &str) -> Result<()> {
         self.sink
             .lock()
             .await
@@ -326,9 +282,8 @@ impl Reader {
     where
         H: FrameHandler + 'static,
     {
-        let handle = tokio::task::spawn_local(async move {
-            drive(&mut stream, &mut handler).await
-        });
+        let handle =
+            tokio::task::spawn_local(async move { drive(&mut stream, &mut handler).await });
         Self { handle }
     }
 

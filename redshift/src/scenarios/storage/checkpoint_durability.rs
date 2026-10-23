@@ -30,15 +30,9 @@ struct State {
 }
 
 impl State {
-    fn apply(
-        &mut self,
-        record: &Record,
-        evidence: &TransactionInfo,
-    ) -> Result<()> {
-        self.payer_lamports = self
-            .payer_lamports
-            .checked_sub(evidence.fee)
-            .ok_or("fee payer exhausted")?;
+    fn apply(&mut self, record: &Record, evidence: &TransactionInfo) -> Result<()> {
+        self.payer_lamports =
+            self.payer_lamports.checked_sub(evidence.fee).ok_or("fee payer exhausted")?;
         if !Record::fails(record.id) {
             self.counter.count += u64::from(record.id);
             self.counter.updates += 1;
@@ -60,19 +54,12 @@ impl Record {
     }
 
     fn check(&self, evidence: &TransactionInfo) -> Result<()> {
-        let error = Self::fails(self.id)
-            .then(|| json::json!({"InstructionError": [1, {"Custom": 0}]}));
-        check_eq!(
-            evidence.err,
-            error,
-            "{}: execution outcome",
-            self.signature
-        )?;
+        let error =
+            Self::fails(self.id).then(|| json::json!({"InstructionError": [1, {"Custom": 0}]}));
+        check_eq!(evidence.err, error, "{}: execution outcome", self.signature)?;
         let mut balances = evidence.pre_balances.clone();
         let payer = balances.first_mut().ok_or("missing payer balance")?;
-        *payer = payer
-            .checked_sub(evidence.fee)
-            .ok_or("fee exceeds balance")?;
+        *payer = payer.checked_sub(evidence.fee).ok_or("fee exceeds balance")?;
         check_eq!(
             evidence.post_balances,
             balances,
@@ -121,10 +108,7 @@ impl Workload {
     }
 
     async fn submit(&mut self, er: &ErCtx, confirm: bool) -> Result<Record> {
-        self.next_id = self
-            .next_id
-            .checked_add(1)
-            .ok_or("transaction ids exhausted")?;
+        self.next_id = self.next_id.checked_add(1).ok_or("transaction ids exhausted")?;
         let id = self.next_id;
         let mut instructions = vec![build::add_unsigned(self.owner, id)];
         if Record::fails(id) {
@@ -143,10 +127,7 @@ impl Workload {
         };
         er.api().send_transaction(&tx).await?;
         if confirm {
-            let evidence = er
-                .api()
-                .await_transaction(&record.signature, TIMEOUT)
-                .await?;
+            let evidence = er.api().await_transaction(&record.signature, TIMEOUT).await?;
             record.check(&evidence)?;
             self.expected.apply(&record, &evidence)?;
             self.check(er).await?;
@@ -166,9 +147,7 @@ async fn head(er: &ErCtx) -> Result<u64> {
 
 async fn checkpoint(er: &ErCtx, storage: &Path) -> Result<u64> {
     let sealed = head(er).await?;
-    let archive = storage
-        .join(format!("superblock-{:09}", sealed + 1))
-        .join("accountsdb.tar.zst");
+    let archive = storage.join(format!("superblock-{:09}", sealed + 1)).join("accountsdb.tar.zst");
     check::poll_for(
         &format!("checkpoint {sealed} archived at {}", archive.display()),
         CHECKPOINT_TIMEOUT,
@@ -218,25 +197,14 @@ impl PrivateErScenario for CheckpointDurability {
         )
         .await?;
         let owner = prep::funded_payer(base, crate::PAYER_LAMPORTS).await?;
-        let (counter, setup) = prep::flexi_counter(
-            owner.pubkey(),
-            self.name(),
-            private.identity(),
-            u32::MAX,
-        );
+        let (counter, setup) =
+            prep::flexi_counter(owner.pubkey(), self.name(), private.identity(), u32::MAX);
         base.submit_and_confirm(&owner, &setup).await?;
-        let payer = prep::delegated_payer(
-            base,
-            &owner,
-            private.identity(),
-            crate::PAYER_LAMPORTS,
-        )
-        .await?;
+        let payer =
+            prep::delegated_payer(base, &owner, private.identity(), crate::PAYER_LAMPORTS).await?;
         let keys = [payer.pubkey(), counter];
-        let expected = check::poll_for("accounts cloned", TIMEOUT, || {
-            state(private.ctx(), &keys)
-        })
-        .await?;
+        let expected =
+            check::poll_for("accounts cloned", TIMEOUT, || state(private.ctx(), &keys)).await?;
         check_eq!(
             (expected.counter.count, expected.counter.updates),
             (0, 0),
