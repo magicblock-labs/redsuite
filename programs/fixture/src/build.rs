@@ -136,7 +136,7 @@ impl Program {
     }
     pub fn copy_three(self, pool: &[Pubkey], value: u64) -> (SolanaInstruction, [Pubkey; 2]) {
         let len = pool.len() as u64;
-        let first = (value.wrapping_sub(1) * 3) % len;
+        let first = value.wrapping_sub(1).wrapping_mul(3) % len;
         let source = pool[first as usize];
         let destinations = [pool[((first + 1) % len) as usize], pool[((first + 2) % len) as usize]];
         (self.copy(value, &[source], &destinations), destinations)

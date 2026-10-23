@@ -4,7 +4,7 @@ use redsuite_core::{
     Result,
 };
 
-fn entries(family: Family) -> Vec<ScenarioEntry> {
+pub fn entries(family: Family) -> Vec<ScenarioEntry> {
     match family {
         Family::Redline => redline::scenarios::catalog(),
         Family::Redshift => redshift::scenarios::catalog(),
@@ -17,7 +17,7 @@ fn entries(family: Family) -> Vec<ScenarioEntry> {
 pub fn select(family: Family, targets: &[String]) -> Result<Vec<ScenarioEntry>> {
     let entries = entries(family);
     if targets.is_empty() {
-        return Ok(entries);
+        return Ok(entries.into_iter().filter(|entry| !entry.explicit_only).collect());
     }
     let mut selected = Vec::new();
     for target in targets {

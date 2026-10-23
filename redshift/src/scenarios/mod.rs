@@ -7,180 +7,221 @@ pub mod replication;
 pub mod scheduler;
 pub mod storage;
 
+use chainlink::projected_token_lifecycle::Mode as TokenMode;
 use redsuite_core::{
-    catalog::{ErGroup, Fixture, ScenarioEntry, DEFAULT},
-    scenario, PrivateErScenario, Scenario,
+    catalog::{BasePreparation, ErGroup, Fixture, ProxyMode, ScenarioEntry, DEFAULT},
+    scenario, ChainCtx, PrivateErScenario, Scenario,
 };
+use signer::Signer;
+use std::time::Duration;
 
 static RETRIES: ErGroup = ErGroup {
     label: "transaction-retries",
     settings: |_| {},
-    proxied: true,
+    proxies: ProxyMode::Shared,
+    followers: 0,
 };
 static COMMITTOR: ErGroup = ErGroup {
     label: "committor-faults",
     settings: |_| {},
-    proxied: true,
+    proxies: ProxyMode::Shared,
+    followers: 0,
+};
+static CACHE: ErGroup = ErGroup {
+    label: "small-cache",
+    settings: |p| {
+        p.engine.accountsdb.lru_capacity = 256;
+    },
+    proxies: ProxyMode::Split,
+    followers: 0,
+};
+static STORAGE: ErGroup = ErGroup {
+    label: "storage",
+    settings: |p| {
+        p.engine.blockstore.blocktime = Duration::from_millis(50);
+        p.engine.blockstore.superblock = 20;
+    },
+    proxies: ProxyMode::None,
+    followers: 0,
+};
+static RETENTION: ErGroup = ErGroup {
+    label: "retention",
+    settings: |p| {
+        p.engine.blockstore.blocktime = Duration::from_millis(40);
+        p.engine.blockstore.superblock = 512;
+        p.engine.ledger.size_limit = 1;
+    },
+    proxies: ProxyMode::None,
+    followers: 2,
 };
 
 pub fn catalog() -> Vec<ScenarioEntry> {
     vec![
         scenario!(
             lifecycle::restart_under_load::RestartUnderLoad,
-            fresh(&[Fixture::RedlineProgram], ())
+            exclusive(&STORAGE, &[Fixture::RedlineProgram], ())
         ),
         scenario!(
-            storage::ledger_retention::LedgerRetention,
-            fresh(&[Fixture::RedshiftProgram], ())
+            storage::ledger_retention_consistency::LedgerRetentionConsistency,
+            exclusive(&RETENTION, &[Fixture::RedshiftProgram], ())
         ),
         scenario!(
-            replication::verifier_lifecycle::VerifierLifecycle,
-            fresh(&[Fixture::RedlineProgram], ())
+            replication::replication_recovery::ReplicationRecovery,
+            exclusive(&RETENTION, &[Fixture::RedlineProgram], ())
         ),
         scenario!(
-            storage::checkpoint_durability::CheckpointDurability,
-            fresh(&[Fixture::RedshiftProgram], ())
-        ),
-        scenario!(harness::example::Example, shared(&DEFAULT, &[], ())),
-        scenario!(
-            chainlink::clone_on_access::CloneOnAccess,
-            shared(&DEFAULT, &[Fixture::RedlineProgram], ())
+            storage::checkpoint_recovery::CheckpointRecovery,
+            exclusive(&STORAGE, &[Fixture::RedshiftProgram], ())
         ),
         scenario!(
-            chainlink::cache_lifecycle::CacheLifecycle,
-            fresh(
-                &[Fixture::RedlineProgram],
-                chainlink::cache_lifecycle::Mode::Churn
-            )
+            storage::account_reads_during_resize::AccountReadsDuringResize,
+            exclusive(&STORAGE, &[Fixture::RedshiftProgram], ())
         ),
         scenario!(
             chainlink::cache_lifecycle::CacheLifecycle,
-            fresh(
+            exclusive(
+                &CACHE,
                 &[Fixture::RedlineProgram],
                 chainlink::cache_lifecycle::Mode::UndelegationReconnectGap
             )
         )
-        .named("undelegation_reconnect_gap"),
+        .named("cache_transport_recovery"),
         scenario!(
-            chainlink::undelegation_grpc_redundancy::GrpcRedundancy,
-            fresh(&[Fixture::RedlineProgram], ())
+            chainlink::cache_lifecycle::CacheLifecycle,
+            exclusive(
+                &CACHE,
+                &[Fixture::RedlineProgram],
+                chainlink::cache_lifecycle::Mode::Churn
+            )
         )
-        .named("undelegation_grpc_redundancy"),
+        .named("cache_eviction_and_stale_fetch")
+        .ordered(1),
         scenario!(
-            committor::commit_blackout::CommitBlackout,
-            exclusive(&COMMITTOR, &[Fixture::RedlineProgram], ())
+            committor::intent_execution_and_accounting::IntentExecutionAndAccounting,
+            exclusive(&COMMITTOR, &[Fixture::RedshiftProgram], ())
         ),
         scenario!(
-            committor::commit_exactly_once::CommitExactlyOnce,
+            committor::commit_recovery::CommitRecovery,
             exclusive(
                 &COMMITTOR,
                 &[Fixture::RedlineProgram, Fixture::RedshiftProgram],
                 ()
             )
-        ),
+        )
+        .ordered(1),
         scenario!(
-            committor::commit_settlement_order::CommitSettlementOrder,
-            fresh(&[Fixture::RedlineProgram], ())
-        ),
+            committor::commit_snapshot_ordering::CommitSnapshotOrdering,
+            exclusive(&COMMITTOR, &[Fixture::RedlineProgram], ())
+        )
+        .ordered(1),
         scenario!(
             committor::undelegation_recovery::UndelegationRecovery,
             exclusive(&COMMITTOR, &[Fixture::RedlineProgram], ())
-        ),
+        )
+        .ordered(1),
         scenario!(
-            committor::delegation_session_isolation::DelegationSessionIsolation,
+            committor::stale_delegation_session_isolation::StaleDelegationSessionIsolation,
             shared(&DEFAULT, &[Fixture::RedshiftProgram], ())
         ),
         scenario!(
-            committor::commit_and_undelegate::CommitAndUndelegate,
-            shared(&DEFAULT, &[Fixture::RedshiftProgram], ())
+            committor::settlement_lifecycle::SettlementLifecycle,
+            shared(
+                &DEFAULT,
+                &[Fixture::RedlineProgram, Fixture::RedshiftProgram],
+                ()
+            )
         ),
         scenario!(
-            chainlink::program_allowlist::ProgramAllowlist,
+            chainlink::program_clone_allowlist::ProgramCloneAllowlist,
             fresh(&[Fixture::RedshiftProgram], ())
         ),
         scenario!(
-            chainlink::clone_without_alt_writes::CloneWithoutAltWrites,
-            fresh(&[Fixture::RedshiftProgram], ())
+            chainlink::program_materialization::ProgramMaterialization,
+            fresh(&[Fixture::RedlineProgram, Fixture::RedshiftProgram], ())
         ),
         scenario!(
-            scheduler::task_scheduler::TaskScheduler,
+            scheduler::scheduled_task_lifecycle::ScheduledTaskLifecycle,
             exclusive(&DEFAULT, &[Fixture::RedshiftProgram], ())
         ),
         scenario!(
-            storage::snapshot_read_race::SnapshotReadRace,
-            fresh(&[Fixture::RedshiftProgram], ())
-        ),
+            aperture::transaction_lifecycle::TransactionLifecycle,
+            exclusive(
+                &RETRIES,
+                &[Fixture::RedlineProgram, Fixture::RedshiftProgram],
+                aperture::transaction_lifecycle::Coverage::Admission
+            )
+        )
+        .named("transaction_admission_and_observation"),
         scenario!(
-            aperture::transaction_retries::TransactionRetries,
+            aperture::transaction_lifecycle::TransactionLifecycle,
             exclusive(
                 &RETRIES,
                 &[Fixture::RedshiftProgram],
-                aperture::transaction_retries::Mode::ColdFetch
+                aperture::transaction_lifecycle::Coverage::Replay
             )
         )
-        .named("transaction_retry_cold_fetch"),
+        .named("transaction_replay_protection"),
         scenario!(
-            aperture::transaction_retries::TransactionRetries,
-            exclusive(
-                &RETRIES,
-                &[Fixture::RedshiftProgram],
-                aperture::transaction_retries::Mode::Concurrent
-            )
-        )
-        .named("transaction_retry_concurrent"),
-        scenario!(
-            aperture::transaction_retries::TransactionRetries,
-            exclusive(
-                &RETRIES,
-                &[Fixture::RedshiftProgram, Fixture::RedlineProgram],
-                aperture::transaction_retries::Mode::Subscriptions
-            )
-        )
-        .named("transaction_retry_subscriptions"),
-        scenario!(
-            aperture::transaction_retries::ExpiryRestart,
-            fresh(&[Fixture::RedshiftProgram], ())
-        )
-        .named("transaction_retry_expiry_restart"),
-        scenario!(
-            aperture::rpc_lifecycle::RpcLifecycle,
+            aperture::rpc_state_and_events::RpcStateAndEvents,
             shared(&DEFAULT, &[Fixture::RedlineProgram], ())
         ),
         scenario!(
-            aperture::rpc_token_queries::RpcTokenQueries,
+            aperture::token_rpc_views::TokenRpcViews,
             shared(&DEFAULT, &[], ())
         ),
         scenario!(
-            aperture::rpc_compat_methods::RpcCompatMethods,
-            fresh(&[], ())
-        ),
-        scenario!(
-            chainlink::account_info_semantics::AccountInfoSemantics,
+            aperture::rpc_compat_smoke::RpcCompatSmoke,
             shared(&DEFAULT, &[], ())
         ),
         scenario!(
-            chainlink::multi_program_clone::MultiProgramClone,
+            chainlink::account_mirroring_and_isolation::AccountMirroringAndIsolation,
             shared(&DEFAULT, &[Fixture::RedlineProgram], ())
         ),
         scenario!(
-            chainlink::program_upgrade::ProgramUpgrade,
+            chainlink::program_upgrade_consistency::ProgramUpgradeConsistency,
             fresh(
                 &[Fixture::RedlineProgram, Fixture::UpgradeProbe, Fixture::UpgradeProbeUpgraded],
                 ()
             )
         ),
         scenario!(
-            chainlink::loader_matrix::LoaderMatrix,
-            shared(&DEFAULT, &[Fixture::RedshiftProgram], ())
-        ),
+            chainlink::projected_token_lifecycle::ProjectedTokenLifecycle,
+            exclusive(&COMMITTOR, &[Fixture::RedlineProgram], TokenMode::Backing)
+        )
+        .named("projected_token_backing_lifecycle")
+        .ordered(1),
         scenario!(
             chainlink::projected_token_lifecycle::ProjectedTokenLifecycle,
-            fresh(&[Fixture::RedlineProgram], ())
-        ),
-        scenario!(chainlink::aml_gate::AmlGate, fresh(&[], ())),
+            exclusive(&COMMITTOR, &[Fixture::RedlineProgram], TokenMode::Overlay)
+        )
+        .named("magic_ata_overlay_lifecycle")
+        .ordered(1)
+        .prepare_with(&RENT),
+        scenario!(
+            chainlink::post_delegation_risk_gate::PostDelegationRiskGate,
+            fresh(&[], ())
+        )
+        .prepare_with(&RENT),
         scenario!(
             chainlink::activation_single_shot::ActivationSingleShot,
-            fresh(&[Fixture::RedshiftProgram], ())
-        ),
+            exclusive(&COMMITTOR, &[Fixture::RedshiftProgram], ())
+        )
+        .ordered(1),
     ]
 }
+
+/// Initializes the base-wide rent PDA before any dependent scenario is scheduled.
+static RENT: BasePreparation = BasePreparation {
+    run: |base| {
+        Box::pin(async move {
+            let rent = sdk::spl::find_rent_pda().0;
+            if base.account(&rent).await?.is_none() {
+                let payer = base.funded_payer(2_000_000_000).await?;
+                let ix = sdk::spl::builders::InitializeRentPdaBuilder { payer: payer.pubkey() }
+                    .instruction();
+                base.submit_and_confirm(&payer, &[ix]).await?;
+            }
+            Ok(())
+        })
+    },
+};

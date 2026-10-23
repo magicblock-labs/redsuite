@@ -4,7 +4,7 @@ use anyhow::{ensure, Context};
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    check,
+    expect_error,
     netfault::{BaseProxies, Selector},
     programs::{CellHeader, CellId, SettlementMode, REDLINE},
     topology::RestartConfig,
@@ -21,6 +21,7 @@ const COMPLETION_TIMEOUT: Duration = Duration::from_secs(90);
 const REDELEGATE_TIMEOUT: Duration = Duration::from_secs(60);
 const HIDDEN: &str = "notification hidden by redsuite";
 
+/// Checks pending lockout and discovery of completed undelegation after transport recovery.
 pub struct UndelegationRecovery {
     base: Rc<BaseCtx>,
     er: ErCtx,
@@ -72,7 +73,7 @@ impl UndelegationRecovery {
         when: &str,
     ) -> Result<()> {
         let attempt = self.er.cells(REDLINE, &self.payer).write(id, &[*account]).await;
-        let error = check::expect_error(attempt, &format!("ER write rejected {when}"))?;
+        let error = expect_error(attempt, &format!("ER write rejected {when}"))?;
         let error = format!("{error:#}");
         crate::rejection_code(&format!("the er write {when}"), &LOCKOUT_REJECTIONS, &error)?;
         let on_er =

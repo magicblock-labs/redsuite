@@ -1,3 +1,3 @@
-pub mod checkpoint_durability;
-pub mod ledger_retention;
-pub mod snapshot_read_race;
+pub mod account_reads_during_resize;
+pub mod checkpoint_recovery;
+pub mod ledger_retention_consistency;

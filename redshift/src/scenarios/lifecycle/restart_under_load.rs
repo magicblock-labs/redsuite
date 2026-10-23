@@ -13,8 +13,8 @@ use redsuite_core::{
     api::transaction_meta,
     programs::{CellHeader, REDLINE},
     redline::{causal, Accounts},
-    topology::{self, ErOptions, PrivateEr, RestartConfig, RestartOutcome},
-    wait, Api, BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result, TxSender,
+    topology::{RestartConfig, RestartOutcome},
+    wait, Api, BaseCtx, ChainCtx, ErCtx, Result, Scenario, TxSender,
 };
 use signature::Signature;
 use tokio::{sync::watch, task::JoinSet, time};
@@ -26,8 +26,6 @@ const PREP_PAYER_LAMPORTS: u64 = 4_000_000_000;
 const READY_TIMEOUT: Duration = Duration::from_secs(120);
 const SUPERBLOCK_POLL: Duration = Duration::from_millis(250);
 const LANE_BACKOFF: Duration = Duration::from_millis(100);
-const BLOCKTIME: Duration = Duration::from_millis(50);
-const SUPERBLOCK_SLOTS: u64 = 20;
 const HASH_ITERS: u32 = 1;
 const SIGKILL: i32 = 9;
 const SUPERBLOCKS: &str = "engine_ledger_superblocks";
@@ -279,62 +277,40 @@ fn check_exit(mode: Mode, outcome: &RestartOutcome) -> Result<()> {
     Ok(())
 }
 
-async fn run_mode(base: &BaseCtx, mode: Mode) -> Result<()> {
+async fn run_mode(base: &BaseCtx, er: &ErCtx, mode: Mode) -> Result<()> {
     let label = mode.label();
     let prep_payers = base.funded_payers(LANES, PREP_PAYER_LAMPORTS).await?;
 
-    let mut private = topology::private_er(
-        base,
-        ErOptions {
-            label: format!("restart-{label}"),
-            settings: Box::new(|params| {
-                params.engine.blockstore.blocktime = BLOCKTIME;
-                params.engine.blockstore.superblock = SUPERBLOCK_SLOTS;
-            }),
-            ..Default::default()
-        },
-    )
-    .await?;
-    private.wait_ready(READY_TIMEOUT).await?;
+    let storage_dir = er.storage_dir().await?;
 
     let pool = {
-        let er = private.ctx();
         let pool = Accounts::new(ACCOUNT_SPACE, er.identity())
             .init_batched(base, &prep_payers, LANES, true)
             .await?;
         er.await_clones(&pool, ACCOUNT_SPACE as usize).await?;
         pool
     };
-    let senders: Vec<TxSender> = prep_payers
-        .into_iter()
-        .map(|payer| private.ctx().sender(Rc::new(payer)))
-        .collect();
+    let senders: Vec<TxSender> =
+        prep_payers.into_iter().map(|payer| er.sender(Rc::new(payer))).collect();
     let next_id = Rc::new(Cell::new(1u64));
 
-    let lanes = fill(&private, &senders, &pool, next_id.clone(), label).await?;
+    let lanes = fill(er, &storage_dir, &senders, &pool, next_id.clone(), label).await?;
 
     lanes.halt();
-    let first = private.restart(mode.restart_config()).await?;
+    let first = er.restart(mode.restart_config()).await?;
     check_exit(mode, &first)?;
     let mut records = lanes.drain().await;
     ensure!(records.iter().any(|record| record.outcome == Outcome::Confirmed));
 
-    let api = private.ctx().api().clone();
+    let api = er.api().clone();
     // Restart readiness follows ledger recovery; absent submissions were not retained.
     resolve(&api, &mut records).await?;
     settle_after_restart(&api, mode, &mut records).await?;
-    check_state(
-        private.ctx(),
-        &format!("{label} after first restart"),
-        &pool,
-        &records,
-    )
-    .await?;
+    check_state(er, &format!("{label} after first restart"), &pool, &records).await?;
     debug!(label, "first restart under load finished");
 
-    let superblocks_before = superblocks(private.ctx()).await?;
+    let superblocks_before = superblocks(er).await?;
     let resumed = Lanes::start(api.clone(), &senders, &pool, next_id.clone());
-    let er = private.ctx();
     wait::retry_every(
         &format!("{label}: the resumed load crossing a superblock boundary"),
         RESUME_TIMEOUT,
@@ -352,32 +328,34 @@ async fn run_mode(base: &BaseCtx, mode: Mode) -> Result<()> {
     records.extend(resumed_records);
     check_state(er, &format!("{label} after resume"), &pool, &records).await?;
 
-    let second = private.restart(mode.restart_config()).await?;
+    let second = er.restart(mode.restart_config()).await?;
     check_exit(mode, &second)?;
     settle_after_restart(&api, mode, &mut records).await?;
     check_state(
-        private.ctx(),
+        er,
         &format!("{label} after second restart"),
         &pool,
         &records,
     )
     .await?;
-    private.finish().await
+    Ok(())
 }
 
+/// Checks shutdown outcomes, recovered state, and resumed progress in graceful and SIGKILL modes.
 pub struct RestartUnderLoad {
     base: Rc<BaseCtx>,
+    er: ErCtx,
 }
 
-impl PrivateErScenario for RestartUnderLoad {
-    async fn setup(base: Rc<BaseCtx>, _: ()) -> Result<Self> {
-        Ok(Self { base })
+impl Scenario for RestartUnderLoad {
+    async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
+        Ok(Self { base, er })
     }
 
     async fn run(self) -> Result<()> {
         time::timeout(SCENARIO_TIMEOUT, async {
-            run_mode(&self.base, Mode::Graceful).await?;
-            run_mode(&self.base, Mode::Sigkill).await
+            run_mode(&self.base, &self.er, Mode::Graceful).await?;
+            run_mode(&self.base, &self.er, Mode::Sigkill).await
         })
         .await
         .context("restart under load exceeded its 110-second budget")?
@@ -386,17 +364,16 @@ impl PrivateErScenario for RestartUnderLoad {
 
 #[instrument(skip_all, err, fields(mode = label))]
 async fn fill(
-    private: &PrivateEr,
+    er: &ErCtx,
+    storage_dir: &Path,
     senders: &[TxSender],
     pool: &[Pubkey],
     next_id: Rc<Cell<u64>>,
     label: &str,
 ) -> Result<Lanes> {
-    let superblocks_at_boot = superblocks(private.ctx()).await?;
-    let snapshots_at_boot = archived_snapshots(private.storage_dir())?;
-    let lanes = Lanes::start(private.ctx().api().clone(), senders, pool, next_id);
-    let er = private.ctx();
-    let storage_dir = private.storage_dir();
+    let superblocks_at_boot = superblocks(er).await?;
+    let snapshots_at_boot = archived_snapshots(storage_dir)?;
+    let lanes = Lanes::start(er.api().clone(), senders, pool, next_id);
     wait::retry_every(
         &format!(
             "{label}: the fill of {} confirmed transactions and a sealed \

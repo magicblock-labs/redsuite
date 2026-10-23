@@ -1,16 +1,14 @@
 pub mod api;
 pub mod catalog;
 pub mod cells;
-pub mod check;
+pub mod config;
 pub mod context;
 pub mod dlp;
 pub mod frontend;
 pub mod host;
 pub mod logging;
-pub mod monitor;
 pub mod netfault;
 pub mod prep;
-pub mod profile;
 pub mod programs;
 pub mod random;
 pub mod receipt;
@@ -43,3 +41,11 @@ pub use solana_transaction_status_client_types as transaction_types;
 pub use const_str as __const_str;
 
 pub type Result<T> = anyhow::Result<T>;
+
+/// Requires a failed operation and returns its original error for inspection.
+pub fn expect_error<T>(result: Result<T>, check: &str) -> Result<DynError> {
+    match result {
+        Err(error) => Ok(error),
+        Ok(_) => anyhow::bail!("{check}: unexpectedly succeeded"),
+    }
+}

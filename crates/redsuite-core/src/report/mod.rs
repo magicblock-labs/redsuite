@@ -257,8 +257,16 @@ fn run_failures(record: &RunRecord) -> Vec<PersistedFailure> {
     vec![PersistedFailure::new(record.phase, format!("{error:#}"))]
 }
 
-fn campaign_meta() -> CampaignMeta {
-    let (er_bin, er_version, er_fingerprint) = er_identity();
+fn campaign_meta(attached: bool) -> CampaignMeta {
+    let (er_bin, er_version, er_fingerprint) = if attached {
+        (
+            "attached".to_owned(),
+            "unobserved".to_owned(),
+            "unobserved".to_owned(),
+        )
+    } else {
+        er_identity()
+    };
     CampaignMeta {
         schema: SCHEMA_VERSION,
         run: run_id().to_owned(),

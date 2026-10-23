@@ -58,6 +58,11 @@ impl PrivateEr {
         self
     }
 
+    pub fn with_ws_proxy(mut self, proxies: Rc<BaseProxies>) -> Self {
+        self.ctx.ws_proxies = Some(proxies);
+        self
+    }
+
     pub fn shared(mut self) -> Rc<Mutex<Self>> {
         Rc::new_cyclic(|owner| {
             self.ctx.owner = Some(owner.clone());
@@ -186,7 +191,7 @@ pub async fn private_er(base: &BaseCtx, options: ErOptions) -> Result<PrivateEr>
 }
 
 // A leader is a private ER whose replication listener admits followers.
-pub(super) async fn leader_er(
+pub async fn leader_er(
     base: &BaseCtx,
     options: ErOptions,
     allowed_followers: Vec<Pubkey>,

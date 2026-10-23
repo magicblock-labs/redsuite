@@ -15,8 +15,8 @@ use redsuite_core::{
     prep,
     programs::{CellHeader, REDSHIFT},
     system,
-    topology::{self, ErOptions, PrivateEr, RestartConfig},
-    BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result,
+    topology::RestartConfig,
+    BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
 use signature::Signature;
 use signer::Signer;
@@ -27,7 +27,6 @@ use tokio::{
 
 use crate::PAYER_LAMPORTS;
 
-const LABEL: &str = "activation-single-shot";
 const AIRDROP: u64 = 2_000_000_000;
 const DEPENDENCY_LAMPORTS: u64 = 1_000_000;
 const ACTION_COUNT: u8 = 7;
@@ -62,7 +61,7 @@ struct Activation<'a> {
 
 impl Activation<'_> {
     async fn state(&self) -> Result<CellState> {
-        let er = self.er;
+        let er = &self.er;
         let cell = &self.cell;
         let account = er.account(cell).await?.context("the cell vanished from the er")?;
         let decoded = CellHeader::try_decode(&account.data)?;
@@ -212,29 +211,21 @@ impl Discovery {
     }
 }
 
+/// Checks single activation effects through notifications, reconnect, restart, and rescue.
 pub struct ActivationSingleShot {
     base: Rc<BaseCtx>,
-    proxies: BaseProxies,
-    private: PrivateEr,
+    proxies: Rc<BaseProxies>,
+    er: ErCtx,
 }
 
-impl PrivateErScenario for ActivationSingleShot {
-    async fn setup(base: Rc<BaseCtx>, _: ()) -> Result<Self> {
-        let proxies = BaseProxies::spawn(&base).await?;
-        let private = topology::private_er(
-            &base,
-            ErOptions {
-                label: LABEL.to_owned(),
-                base_endpoints: Some(proxies.endpoints()),
-                ..Default::default()
-            },
-        )
-        .await?;
-        Ok(Self { base, proxies, private })
+impl Scenario for ActivationSingleShot {
+    async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
+        let proxies = er.http_proxy()?;
+        Ok(Self { base, proxies, er })
     }
 
-    async fn run(mut self) -> Result<()> {
-        let er = self.private.ctx();
+    async fn run(self) -> Result<()> {
+        let er = &self.er;
         let funder = self.base.funded_payer(PAYER_LAMPORTS).await?;
         let actor = self.base.funded_payer(PAYER_LAMPORTS).await?;
         let er_payer =
@@ -272,9 +263,9 @@ impl PrivateErScenario for ActivationSingleShot {
             .await?;
         activation.hold_steady(applied, STEADY_WINDOW).await?;
 
-        let restart = self.private.restart(RestartConfig::default()).await?;
+        let restart = self.er.restart(RestartConfig::default()).await?;
         ensure!(restart.exit_code == Some(0));
-        let er = self.private.ctx();
+        let er = &self.er;
         let activation = Activation {
             base: &self.base,
             proxies: &self.proxies,
@@ -297,8 +288,7 @@ impl PrivateErScenario for ActivationSingleShot {
         activation.run(true).await?;
         activation.hold_steady(applied, STEADY_WINDOW).await?;
 
-        self.proxies.finish()?;
-        self.private.finish().await?;
+        self.proxies.reset().await?;
         Ok(())
     }
 }

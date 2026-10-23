@@ -2,14 +2,14 @@
 //! commands neither read nor validate benchmark-only settings.
 
 use std::{
-    num::{NonZeroU32, NonZeroUsize},
+    num::NonZeroUsize,
     time::{Duration, Instant},
 };
 
 use clap::{Args, Parser, Subcommand};
 use redsuite_core::{
+    config::{LoopMode, Profile},
     frontend,
-    profile::{LoopMode, Profile},
 };
 
 #[derive(Parser)]
@@ -61,8 +61,6 @@ pub enum Benchmarks {
     },
     /// Run curated benchmarks sequentially.
     Run(BenchmarkRun),
-    /// Generate continuous mixed transaction load, then drain and verify it.
-    Load(Load),
 }
 
 #[derive(Args)]
@@ -99,28 +97,27 @@ pub struct BenchmarkRun {
     /// Workload preset.
     #[arg(long, env = "REDSUITE_PROFILE", value_enum, default_value = "lite")]
     pub profile: Profile,
-    /// Loop mode for rpc_warm_ingress.
-    #[arg(long = "loop", env = "REDSUITE_LOOP", value_enum, default_value = "open")]
-    pub loop_mode: LoopMode,
-}
-
-#[derive(Args)]
-pub struct Load {
-    /// Workload preset.
-    #[arg(long, env = "REDSUITE_PROFILE", value_enum, default_value = "lite")]
-    pub profile: Profile,
-    /// Load-generation time, excluding setup and drain (e.g. 30s, 10m, 1h).
+    /// Measured load duration per workload, excluding setup and drain.
     #[arg(long, value_parser = duration)]
     pub duration: Duration,
-    /// Total offered transactions/second; defaults to the preset rate.
-    #[arg(long)]
-    pub rate: Option<NonZeroU32>,
-    /// Total outstanding requests across workers; defaults to the preset budget.
-    #[arg(long)]
-    pub concurrency: Option<NonZeroUsize>,
-    /// Stop the stack and delete its storage after the run, retaining logs.
-    #[arg(long)]
-    pub cleanup: bool,
+    /// Existing base-chain HTTP RPC endpoint (normally devnet).
+    #[arg(long, requires_all = ["base_ws", "payer"])]
+    pub base_rpc: Option<String>,
+    #[arg(long, requires = "base_rpc")]
+    pub base_ws: Option<String>,
+    /// Existing ER; requires its matching base chain and observation endpoints.
+    #[arg(long, requires_all = ["base_rpc", "er_ws", "metrics"])]
+    pub er_rpc: Option<String>,
+    #[arg(long, requires = "er_rpc")]
+    pub er_ws: Option<String>,
+    #[arg(long, requires = "er_rpc")]
+    pub metrics: Option<String>,
+    /// Funded setup keypair; fixture programs must already be deployed.
+    #[arg(long, requires = "base_rpc")]
+    pub payer: Option<std::path::PathBuf>,
+    /// Transaction observation loop mode.
+    #[arg(long = "loop", env = "REDSUITE_LOOP", value_enum, default_value = "open")]
+    pub loop_mode: LoopMode,
 }
 
 fn duration(value: &str) -> Result<Duration, String> {

@@ -1,52 +1,30 @@
 pub mod aperture;
-pub mod chainlink;
-pub mod committor;
 pub mod harness;
 pub mod scheduler;
-pub mod storage;
-
+use aperture::transaction_load::{Shape, TransactionLoad};
 use redsuite_core::{
     catalog::{Fixture, ScenarioEntry, DEFAULT},
-    scenario, PrivateErScenario, Scenario,
+    scenario, Scenario,
 };
-
 pub fn catalog() -> Vec<ScenarioEntry> {
     vec![
         scenario!(
-            aperture::account_write_latency::AccountWriteLatency,
-            exclusive(&DEFAULT, &[Fixture::RedlineProgram], ())
-        ),
-        scenario!(
-            aperture::rpc_warm_ingress::WarmIngress,
-            exclusive(&DEFAULT, &[Fixture::RedlineProgram], ())
+            TransactionLoad,
+            exclusive(&DEFAULT, &[Fixture::RedlineProgram], Shape::Write)
         )
-        .named("rpc_warm_ingress"),
+        .named("transaction_load_write"),
         scenario!(
-            aperture::rpc_ingress_capacity::RpcIngressCapacity,
-            exclusive(&DEFAULT, &[Fixture::RedlineProgram], ())
-        ),
+            TransactionLoad,
+            exclusive(&DEFAULT, &[Fixture::RedlineProgram], Shape::Copy)
+        )
+        .named("transaction_load_copy"),
         scenario!(
-            aperture::compute_cost_throughput::ComputeCostThroughput,
-            exclusive(&DEFAULT, &[Fixture::RedlineProgram], ())
-        ),
+            TransactionLoad,
+            exclusive(&DEFAULT, &[Fixture::RedlineProgram], Shape::Compute)
+        )
+        .named("compute_load"),
         scenario!(
-            aperture::ws_fanout_threshold::WsFanoutThreshold,
-            exclusive(&DEFAULT, &[Fixture::RedlineProgram], ())
-        ),
-        scenario!(
-            aperture::ws_connection_capacity::WsConnectionCapacity,
-            exclusive(&DEFAULT, &[], ())
-        ),
-        scenario!(
-            scheduler::hot_account_cliff::HotAccountCliff,
-            exclusive(&DEFAULT, &[Fixture::RedlineProgram], ())
-        ),
-        scenario!(
-            scheduler::executor_saturation::ExecutorSaturation,
-            exclusive(&DEFAULT, &[Fixture::RedlineProgram], ())
-        ),
-        scenario!(
-            scheduler::conflict_ordering::ConflictOrdering,
+            scheduler::scheduler_contention::SchedulerContention,
             exclusive(&DEFAULT, &[Fixture::RedlineProgram], ())
         ),
         scenario!(
@@ -54,36 +32,17 @@ pub fn catalog() -> Vec<ScenarioEntry> {
             exclusive(&DEFAULT, &[Fixture::RedlineProgram], ())
         ),
         scenario!(
-            chainlink::clone_lru_churn::CloneLruChurn,
+            aperture::websocket_fanout::WebsocketFanout,
             exclusive(&DEFAULT, &[Fixture::RedlineProgram], ())
         ),
         scenario!(
-            chainlink::ensure_gate_stall::EnsureGateStall,
-            exclusive(&DEFAULT, &[Fixture::RedlineProgram], ())
+            aperture::websocket_churn::WebsocketChurn,
+            exclusive(&DEFAULT, &[], ())
         ),
         scenario!(
-            chainlink::cold_hydration_tail::ColdHydrationTail,
+            harness::load_generator_thread_scaling::LoadGeneratorThreadScaling,
             exclusive(&DEFAULT, &[Fixture::RedlineProgram], ())
-        ),
-        scenario!(
-            committor::commit_width_envelope::CommitWidthEnvelope,
-            exclusive(&DEFAULT, &[Fixture::RedlineProgram], ())
-        ),
-        scenario!(
-            committor::commit_throughput_ceiling::CommitThroughputCeiling,
-            exclusive(&DEFAULT, &[Fixture::RedlineProgram], ())
-        ),
-        scenario!(
-            storage::storage_prodsize_sustain::StorageProdsizeSustain,
-            exclusive(&DEFAULT, &[Fixture::RedlineProgram], ())
-        ),
-        scenario!(
-            storage::superblock_boundary_latency::SuperblockBoundaryLatency,
-            fresh(&[Fixture::RedlineProgram], ())
-        ),
-        scenario!(
-            harness::protocol_boundary_selftest::ProtocolBoundarySelftest,
-            exclusive(&DEFAULT, &[Fixture::RedlineProgram], ())
-        ),
+        )
+        .explicit_only(),
     ]
 }

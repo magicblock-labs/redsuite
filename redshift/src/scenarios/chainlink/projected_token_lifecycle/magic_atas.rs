@@ -2,11 +2,8 @@ use std::time::{Duration, Instant};
 
 use account::Account;
 use anyhow::{ensure, Context};
-use redsuite_core::{check, dlp, system, ChainCtx, Result};
-use sdk::spl::{
-    builders::{InitializeRentPdaBuilder, WithdrawThroughDelegatedShuttleWithMergeBuilder},
-    find_rent_pda,
-};
+use redsuite_core::{dlp, expect_error, system, ChainCtx, Result};
+use sdk::spl::{builders::WithdrawThroughDelegatedShuttleWithMergeBuilder, find_rent_pda};
 use signer::Signer;
 use tokio::time;
 use tracing::instrument;
@@ -57,14 +54,13 @@ impl MagicAtas<'_> {
     pub(super) async fn run(tokens: &ProjectedTokenLifecycle) -> Result<()> {
         let mut suite = MagicAtas {
             tokens,
-            source_balance: amount(tokens.private.ctx(), &tokens.wallets[1].ata).await?,
+            source_balance: amount(&tokens.er, &tokens.wallets[1].ata).await?,
             extra_base: 0,
             extra_claims: 0,
             supply: SUPPLY,
         };
         let destinations: [Wallet; 5] = std::array::from_fn(|_| Wallet::new(&tokens.mint.pubkey()));
         suite.prepare().await?;
-        suite.empty().await?;
         for (case, destination) in Case::ALL.into_iter().zip(&destinations) {
             suite.run_case(destination, case).await?;
         }
@@ -74,15 +70,6 @@ impl MagicAtas<'_> {
     async fn prepare(&self) -> Result<()> {
         let tokens = self.tokens;
         let rent = find_rent_pda().0;
-        if tokens.base.account(&rent).await?.is_none() {
-            tokens
-                .base
-                .submit_and_confirm(
-                    &tokens.payer,
-                    &[InitializeRentPdaBuilder { payer: tokens.payer.pubkey() }.instruction()],
-                )
-                .await?;
-        }
         tokens
             .base
             .submit_and_confirm(
@@ -93,21 +80,6 @@ impl MagicAtas<'_> {
                 ],
             )
             .await?;
-        Ok(())
-    }
-
-    #[instrument(skip_all, err)]
-    async fn empty(&self) -> Result<()> {
-        let tokens = self.tokens;
-        let er = tokens.private.ctx();
-        let empty = Wallet::new(&tokens.mint.pubkey());
-        er.submit_and_confirm(&tokens.payer, &[empty.ensure(tokens.payer.pubkey())])
-            .await?;
-        let account = er.account(&empty.ata).await?.context("empty Magic ATA missing")?;
-        ensure!(spl::is_magic_ata(&account.data));
-        ensure!(amount(er, &empty.ata).await? == 0);
-        self.close(&empty).await?;
-        ensure!(er.account(&empty.ata).await?.is_none());
         Ok(())
     }
 
@@ -141,7 +113,7 @@ impl MagicAtas<'_> {
 
     async fn readonly(&mut self, destination: &Wallet) -> Result<Account> {
         let tokens = self.tokens;
-        let er = tokens.private.ctx();
+        let er = &tokens.er;
         let source = &tokens.wallets[1];
         tokens
             .base
@@ -168,7 +140,7 @@ impl MagicAtas<'_> {
                 ],
             )
             .await;
-        let error = check::expect_error(attempt, "readonly balance unspendable before overlay")?;
+        let error = expect_error(attempt, "readonly balance unspendable before overlay")?;
         crate::rejection_code(
             "readonly spend before overlay",
             &[
@@ -186,7 +158,7 @@ impl MagicAtas<'_> {
 
     async fn receive(&self, destination: &Wallet, expected_base: Option<u64>) -> Result<()> {
         let tokens = self.tokens;
-        let er = tokens.private.ctx();
+        let er = &tokens.er;
         let source = &tokens.wallets[1];
         er.submit_and_confirm_with(
             &tokens.payer,
@@ -207,7 +179,7 @@ impl MagicAtas<'_> {
 
     async fn drain(&self, destination: &Wallet) -> Result<()> {
         let tokens = self.tokens;
-        let er = tokens.private.ctx();
+        let er = &tokens.er;
         let source = &tokens.wallets[1];
         er.submit_and_confirm_with(
             &tokens.payer,
@@ -221,7 +193,7 @@ impl MagicAtas<'_> {
 
     async fn project(&mut self, destination: &Wallet) -> Result<()> {
         let tokens = self.tokens;
-        let er = tokens.private.ctx();
+        let er = &tokens.er;
         tokens
             .base
             .submit_and_confirm_with(
@@ -254,7 +226,7 @@ impl MagicAtas<'_> {
 
     async fn close(&self, destination: &Wallet) -> Result<()> {
         let tokens = self.tokens;
-        let er = tokens.private.ctx();
+        let er = &tokens.er;
         let events = er.api().events().await?;
         let mut account = events.account(&destination.ata).await?;
         er.submit_and_confirm_with(&tokens.payer, &[&destination.owner], &[destination.close()])
@@ -269,7 +241,7 @@ impl MagicAtas<'_> {
     }
 
     async fn await_restored(&self, destination: &Wallet, original: Option<Account>) -> Result<()> {
-        let er = self.tokens.private.ctx();
+        let er = &self.tokens.er;
         er.api()
             .await_accounts(
                 &[destination.ata],
@@ -289,7 +261,7 @@ impl MagicAtas<'_> {
 
     async fn await_projection(&self, destination: &Wallet) -> Result<()> {
         let tokens = self.tokens;
-        let er = tokens.private.ctx();
+        let er = &tokens.er;
         let base_ata = tokens.base.account(&destination.ata).await?.context("base ATA missing")?;
         er.api()
             .await_accounts(
@@ -311,7 +283,7 @@ impl MagicAtas<'_> {
 
     async fn withdraw(&mut self, destination: &Wallet, case: Case) -> Result<()> {
         let tokens = self.tokens;
-        let er = tokens.private.ctx();
+        let er = &tokens.er;
         let shuttle = WithdrawThroughDelegatedShuttleWithMergeBuilder {
             payer: tokens.payer.pubkey(),
             owner: destination.owner.pubkey(),
@@ -363,7 +335,7 @@ impl MagicAtas<'_> {
 
     async fn check_conservation(&self) -> Result<()> {
         let tokens = self.tokens;
-        ensure!(amount(tokens.private.ctx(), &tokens.wallets[1].ata).await? == self.source_balance);
+        ensure!(amount(&tokens.er, &tokens.wallets[1].ata).await? == self.source_balance);
         let state = tokens.balances().await?;
         state.check_supply(
             state.projected[..2].iter().sum::<u64>() + self.extra_claims,

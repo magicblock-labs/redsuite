@@ -32,7 +32,7 @@ test families.
 
 | Family | Purpose | Result |
 | :-- | :-- | :-- |
-| **Redline** | Measure latency, throughput, capacity, and resource use under load. | Benchmark reports with workload settings and measurements. |
+| **Redline** | Measure latency, throughput, and resource use under sustained load. | Benchmark reports with workload settings and measurements. |
 | **Redshift** | Check observed state and behavior against expected outcomes. | Pass/fail verdicts with diagnostics. |
 | **Redhat** | Exercise ownership, authorization, and fee rules with adversarial transactions. | Required rejections and state-integrity checks. |
 
@@ -43,17 +43,17 @@ The families cover complementary parts of the validator's behavior:
 - **Account lifecycle and settlement:** cloning and freshness, delegation,
   commits, undelegation, program upgrades, and sponsored ephemeral accounts.
 - **Recovery and replication:** restarts, interrupted settlement, checkpoint
-  durability, retained history, and leader/verifier consistency.
+  recovery, retained history, and leader/verifier recovery.
 - **Application services:** recurring tasks and base-chain actions with callbacks.
-- **Performance under pressure:** compute-heavy traffic, hot accounts, cache
-  churn, subscription fanout, storage growth, and restart behavior under load.
+- **Performance under pressure:** compute-heavy traffic, conflicting workloads,
+  subscription fanout, connection churn, and sustained execution with storage observations.
 
 Redhat checks specific adversarial behaviors; it is not a comprehensive security
 assessment of the validator.
 
 ## 🧩 How it works
 
-**Scenario → public APIs → local base chain and rollups → observations and checks**
+**Scenario → public APIs → base chain and ER → observations and checks**
 
 The harness boots the base chain on demand, loads the required programs, and
 allocates ports and funded identities. Scenarios use real transactions and
@@ -136,9 +136,9 @@ when finished with `redsuite stack down`.
 | Preview a selection | `redsuite redshift list rpc_` |
 | Run correctness checks (Redshift) | `redsuite redshift run` |
 | Run security checks (Redhat) | `redsuite redhat run` |
-| Measure performance (Redline) | `redsuite redline run` |
-| Use the larger benchmark workloads | `redsuite redline run --profile full` |
-| Generate an hour of mixed load | `redsuite redline load --profile full --duration 1h --rate 4000 --concurrency 128` |
+| Measure performance (Redline) | `redsuite redline run --duration 1m` |
+| Use the larger benchmark workloads | `redsuite redline run --profile full --duration 5m` |
+| Generate an hour of mixed load | `redsuite redline run mixed_sustained_load --profile full --duration 1h` |
 | Reduce concurrent storage use | `redsuite redshift run --serial` |
 | Stop the stack after a run | `redsuite redshift run --cleanup` |
 | Inspect processes, endpoints, and logs | `redsuite stack status` |
@@ -148,8 +148,8 @@ chosen family. Multiple selections run together without repeating scenarios;
 an exact name takes precedence over prefix matches. Omit selections to run the
 whole family. Use the family's `list` command to preview selections.
 
-Redline defaults to the shorter `lite` workloads. Only `redline run` and
-`redline load` accept `--profile` or read `REDSUITE_PROFILE`. Correctness and
+Redline defaults to the shorter `lite` workloads. Only `redline run` accepts
+`--profile` or reads `REDSUITE_PROFILE`. Correctness and
 adversarial checks use fixed workloads. Redline benchmarks run sequentially;
 checks can use `--fresh-concurrency` to bound concurrent fresh scenarios.
 
@@ -157,13 +157,34 @@ checks can use `--fresh-concurrency` to bound concurrent fresh scenarios.
 for example `redsuite redhat run --seed 12345`. When omitted, a random seed
 is generated. The chosen seed is logged at `info` before stack startup.
 
-`redline load` continuously runs the mixed write/compute/read-write workload.
-The duration covers load generation, not setup or draining. Rate and total
-outstanding-request concurrency default from the selected preset; overrides
-apply across all driver workers. Offered TPS is a target, not a guarantee of
-executed throughput. At the deadline, or on Ctrl+C, admission stops and existing
-work drains before final-state checks and report persistence. Ctrl+C returns
-exit status 130 and marks the report interrupted; BMF excludes interrupted runs.
+Redline requires `--duration` for each selected workload; there is no iteration
+limit. Setup and warmup are outside measurement. At expiry or Ctrl+C, admission
+stops, admitted work drains, and workload-specific state checks run. Ctrl+C
+returns 130 and marks reports interrupted. Performance is reported, not judged
+against machine-wide thresholds or saved baselines.
+
+The active workloads are transaction load (write/copy presets), compute load,
+scheduler contention, sustained mixed load, WebSocket fanout, and connection
+churn. `load_generator_thread_scaling` is an explicit-only diagnostic.
+Periodic logs retain interval observations without keeping every request in memory.
+The [coverage limits](docs/scenario-gaps.md) distinguish existing proofs from
+deferred scenarios and oracle improvements.
+
+For a live devnet-backed ER, supply the matching base/ER HTTP and WebSocket
+endpoints, the ER metrics endpoint, and a funded setup keypair:
+
+```sh
+redsuite redline run transaction_load_copy --duration 5m \
+  --base-rpc https://api.devnet.solana.com --base-ws wss://api.devnet.solana.com \
+  --er-rpc http://localhost:8899 --er-ws ws://localhost:8900 \
+  --metrics http://localhost:9000 --payer /path/to/setup-keypair.json
+```
+
+Required programs must already be deployed. RedSuite creates fresh run accounts
+before timing; it does not provision, reconfigure, restart, or stop supplied
+services. Omit ER endpoints to launch a managed ER; omit all environment options
+to use a managed local stack. Host FD/RSS observations are available only for
+locally owned processes.
 
 ### Host and storage considerations
 
@@ -178,7 +199,7 @@ group's storage when the next scenario cannot reuse it. Scenarios with multiple
 validators still need space for their topology.
 
 Scheduling and cleanup are independent: `--serial` does not stop the shared
-base. Add `--cleanup` to any run/load command to finish with `stack down`;
+base. Add `--cleanup` to a managed run to finish with `stack down`;
 this does not preserve rollups already cleaned up during the run.
 **`stack down` stops the base and leftover rollups and deletes their
 storage, including separately located accounts databases; logs remain.** The
@@ -278,7 +299,7 @@ and checks. Correctness and adversarial scenarios return `Result<()>`;
 benchmarks return a `ScenarioReport`.
 
 Start with the [example scenario](redshift/src/scenarios/harness/example.rs),
-then register the scenario in the [catalog](cli/src/catalog.rs) with its
+then register the scenario in its family's catalog with its
 fixtures and execution contract. Declare shared, exclusive, or fresh execution
 according to the state and topology the check needs. The CLI runs scenarios;
 Cargo tests do not run the suite.

@@ -4,15 +4,12 @@ mod suite;
 
 use std::process::ExitCode;
 
+use anyhow::Context;
 use args::{Benchmarks, Checks, Cli, Command};
 use clap::Parser;
-use redline::load::Options;
-use redsuite_core::{
-    catalog::Family,
-    logging,
-    profile::{ExecutionConfig, LoopMode},
-    PrivateErScenario, Result,
-};
+use redsuite_core::config::{Environment, ErEndpoints};
+use redsuite_core::{catalog::Family, config::ExecutionConfig, logging, Result};
+use std::rc::Rc;
 use suite::Suite;
 use tokio::task::LocalSet;
 use tracing::{error, info};
@@ -36,8 +33,17 @@ async fn main() -> ExitCode {
 }
 
 fn list(family: Family, selections: &[String]) -> Result<()> {
-    for entry in catalog::select(family, selections)? {
-        println!("{}", entry.name(family));
+    let entries = if selections.is_empty() {
+        catalog::entries(family)
+    } else {
+        catalog::select(family, selections)?
+    };
+    for entry in entries {
+        println!(
+            "{}{}",
+            entry.name(family),
+            if entry.explicit_only { " (explicit only)" } else { "" }
+        );
     }
     Ok(())
 }
@@ -72,62 +78,53 @@ async fn dispatch(command: Command) -> Result<ExitCode> {
         Command::Redline(command) => match command {
             Benchmarks::List { selections } => list(Family::Redline, &selections)?,
             Benchmarks::Run(args) => {
+                let environment = if let Some(base_rpc) = args.base_rpc {
+                    let er = args
+                        .er_rpc
+                        .map(|rpc| -> Result<ErEndpoints> {
+                            Ok(ErEndpoints {
+                                rpc: rpc.parse()?,
+                                ws: args.er_ws.context("missing --er-ws")?.parse()?,
+                                metrics: args.metrics.context("missing --metrics")?.parse()?,
+                            })
+                        })
+                        .transpose()?;
+                    Some(Rc::new(Environment {
+                        base_rpc: base_rpc.parse()?,
+                        base_ws: args.base_ws.context("missing --base-ws")?.parse()?,
+                        er,
+                        payer: args.payer.context("missing --payer")?,
+                    }))
+                } else {
+                    None
+                };
+                let (stop, receiver) = tokio::sync::watch::channel(false);
+                let interrupt = tokio::spawn(async move {
+                    if tokio::signal::ctrl_c().await.is_ok() {
+                        stop.send_replace(true);
+                    }
+                });
                 let config = ExecutionConfig {
+                    duration: Some(args.duration),
+                    stop: Some(receiver.clone()),
+                    environment,
                     profile: args.profile,
                     loop_mode: args.loop_mode,
                     ..ExecutionConfig::default()
                 };
-                Suite::new(Family::Redline, args.run, config, true, 1, 1)?.run().await?;
+                let outcome =
+                    Suite::new(Family::Redline, args.run, config, true, 1, 1)?.run().await;
+                interrupt.abort();
+                if *receiver.borrow() {
+                    if let Err(error) = outcome {
+                        error!(error = %format_args!("{error:#}"), "interrupted workload failed");
+                    }
+                    return Ok(ExitCode::from(130));
+                }
+                outcome?;
             }
-            Benchmarks::Load(args) => return load(args).await,
         },
         Command::Shared(command) => command.run()?,
     }
-    Ok(ExitCode::SUCCESS)
-}
-
-async fn load(args: args::Load) -> Result<ExitCode> {
-    use redsuite_core::catalog::Fixture;
-    use tokio::{
-        signal::unix::{signal, SignalKind},
-        sync::watch,
-    };
-
-    let mut interrupts = signal(SignalKind::interrupt())?;
-    let (stop, receiver) = watch::channel(false);
-    let config = ExecutionConfig {
-        profile: args.profile,
-        loop_mode: LoopMode::Open,
-        ..ExecutionConfig::default()
-    };
-    let options = Options {
-        duration: args.duration,
-        rate: args.rate,
-        concurrency: args.concurrency,
-        stop: receiver,
-    };
-    let work = redsuite_core::scenario!(
-        redline::load::Load,
-        fresh(&[Fixture::RedlineProgram], options)
-    )
-    .run(Family::Redline, config, None);
-    tokio::pin!(work);
-    let record = tokio::select! {
-        record = &mut work => record,
-        Some(()) = interrupts.recv() => {
-            stop.send_replace(true);
-            info!("load interrupted; stopping admission and draining");
-            // Finish the same future so admitted work and its report survive SIGINT.
-            work.await
-        }
-    };
-    let outcome = suite::finish(&[record], args.cleanup);
-    if *stop.borrow() {
-        if let Err(error) = outcome {
-            error!(error = %format_args!("{error:#}"), "interrupted load failed");
-        }
-        return Ok(ExitCode::from(130));
-    }
-    outcome?;
     Ok(ExitCode::SUCCESS)
 }

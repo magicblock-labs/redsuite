@@ -1,1 +1,1 @@
-pub mod protocol_boundary_selftest;
+pub mod load_generator_thread_scaling;

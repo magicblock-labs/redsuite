@@ -1,4 +1,4 @@
-pub mod rpc_compat_methods;
-pub mod rpc_lifecycle;
-pub mod rpc_token_queries;
-pub mod transaction_retries;
+pub mod rpc_compat_smoke;
+pub mod rpc_state_and_events;
+pub mod token_rpc_views;
+pub mod transaction_lifecycle;

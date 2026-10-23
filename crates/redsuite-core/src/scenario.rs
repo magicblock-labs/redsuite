@@ -8,8 +8,8 @@ use tracing::{error, info, instrument, Span};
 
 use crate::{
     catalog::{Er, ErGroup, Fixture, ScenarioEntry},
+    config::ExecutionConfig,
     context::{BaseCtx, ErCtx},
-    profile::ExecutionConfig,
     report::{ScenarioReport, Unit},
     resources::LaunchRecord,
     runner::panic_message,
@@ -99,6 +99,18 @@ pub struct RunRecord {
 }
 
 impl RunRecord {
+    pub fn not_run(name: String, reason: &str) -> Self {
+        Self::failed(name, "not run", reason.to_owned())
+    }
+
+    pub fn failed(name: String, phase: &'static str, reason: String) -> Self {
+        let mut record = Self::new(name);
+        record.phase = phase;
+        error!(scenario = %record.name, phase, %reason, "scenario did not complete");
+        record.outcome = Err(crate::DynError::msg(reason));
+        record
+    }
+
     fn new(name: String) -> Self {
         Self {
             name,
@@ -126,7 +138,16 @@ impl RunRecord {
         Body: AsyncFnOnce(Rc<BaseCtx>, State, &mut &'static str) -> Result<V>,
     {
         let total = Instant::now();
-        preflight(fixtures)?;
+        let attached = config.environment.as_ref().is_some_and(|env| env.er.is_some());
+        if V::REPORTS {
+            self.report = Some(
+                ScenarioReport::ok()
+                    .setting("target", if attached { "attached" } else { "managed" }),
+            );
+        }
+        if config.environment.is_none() {
+            preflight(fixtures)?;
+        }
         self.phase = "topology";
         let mut base = topology::base_only(config).await?;
         base.scenario = Some(self.name.clone());
@@ -149,12 +170,15 @@ impl RunRecord {
                 (None, Err(crate::DynError::msg(panic_message(payload))))
             }
         };
-        self.report = report.map(|report| {
-            report.metric("wall seconds", Unit::Seconds, wall).metric(
-                "total seconds",
-                Unit::Seconds,
-                total.elapsed().as_secs_f64(),
-            )
+        self.report = report.or_else(|| self.report.take()).map(|report| {
+            report
+                .setting("target", if attached { "attached" } else { "managed" })
+                .metric("wall seconds", Unit::Seconds, wall)
+                .metric(
+                    "total seconds",
+                    Unit::Seconds,
+                    total.elapsed().as_secs_f64(),
+                )
         });
         outcome
     }
@@ -198,12 +222,12 @@ where
 {
     execute(name, fixtures, config, er, async move |base, er, stage| {
         let er = er.for_scenario();
-        let outcome = body(base, er.clone(), stage).await;
-        if let Some(proxies) = er.proxies() {
-            let reset = proxies.reset().await;
-            return outcome.and_then(|verdict| reset.map(|()| verdict));
+        let outcome = AssertUnwindSafe(body(base, er.clone(), stage)).catch_unwind().await;
+        let reset = er.reset_faults().await;
+        match outcome {
+            Ok(outcome) => outcome.and_then(|verdict| reset.map(|()| verdict)),
+            Err(panic) => std::panic::resume_unwind(panic),
         }
-        outcome
     })
     .await
 }
