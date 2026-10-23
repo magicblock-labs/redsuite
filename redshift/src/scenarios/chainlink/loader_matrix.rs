@@ -4,13 +4,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+use anyhow::{anyhow, ensure, Context};
 use instruction::Instruction;
 use keypair::Keypair;
 use pubkey::Pubkey;
-use redsuite_core::{
-    check, check_eq, programs::Redshift, topology, BaseCtx, ChainCtx, CheckError, ErCtx, Result,
-    Scenario,
-};
+use redsuite_core::{programs::Redshift, topology, BaseCtx, ChainCtx, ErCtx, Result, Scenario};
 use signature::Signature;
 use tokio::time;
 
@@ -48,7 +46,7 @@ impl Scenario for LoaderMatrix {
         let memo_v2 = MEMO_V2_ID;
 
         let base_memo_v1 =
-            base.account(&memo_v1).await?.ok_or("memo v1 is not on the base chain")?;
+            base.account(&memo_v1).await?.context("memo v1 is not on the base chain")?;
         invoke_until(
             &er,
             payer,
@@ -57,21 +55,17 @@ impl Scenario for LoaderMatrix {
         )
         .await?;
         let (v1_owner, v1_data) = cloned_program(&er, &memo_v1).await?;
-        check_eq!(
-            v1_owner,
-            sdk_ids::bpf_loader_deprecated::ID,
-            "the cloned memo v1 must keep LoaderV1 ownership"
-        )?;
-        check!(
+        ensure!(v1_owner == sdk_ids::bpf_loader_deprecated::ID);
+        ensure!(
             v1_data == base_memo_v1.data,
             "the memo v1 clone must byte-equal the base program account \
              (er {} bytes, base {} bytes)",
             v1_data.len(),
             base_memo_v1.data.len()
-        )?;
+        );
 
         let base_memo_v2 =
-            base.account(&memo_v2).await?.ok_or("memo v2 is not on the base chain")?;
+            base.account(&memo_v2).await?.context("memo v2 is not on the base chain")?;
         invoke_until(
             &er,
             payer,
@@ -80,18 +74,14 @@ impl Scenario for LoaderMatrix {
         )
         .await?;
         let (v2_owner, v2_data) = cloned_program(&er, &memo_v2).await?;
-        check_eq!(
-            v2_owner,
-            sdk_ids::loader_v4::ID,
-            "the cloned memo v2 must land under LoaderV4 ownership"
-        )?;
-        check!(
+        ensure!(v2_owner == sdk_ids::loader_v4::ID);
+        ensure!(
             v2_data == base_memo_v2.data,
             "the memo v2 clone must byte-equal the base program account \
              (er {} bytes, base {} bytes)",
             v2_data.len(),
             base_memo_v2.data.len()
-        )?;
+        );
 
         let (v3_id, _) = topology::redshift_loader_v3_target();
         let v3_logs = invoke_until(
@@ -106,26 +96,22 @@ impl Scenario for LoaderMatrix {
         let mut base_v3_programdata = base
             .account(&v3_programdata)
             .await?
-            .ok_or("the v3 programdata account is not on the base chain")?
+            .context("the v3 programdata account is not on the base chain")?
             .data;
         let base_v3_elf = base_v3_programdata.split_off(LOADER_V3_PROGRAMDATA_METADATA);
         let (v3_owner, v3_data) = cloned_program(&er, &v3_id).await?;
-        check_eq!(
-            v3_owner,
-            sdk_ids::loader_v4::ID,
-            "the cloned v3 program must land under LoaderV4 ownership"
-        )?;
-        check!(
+        ensure!(v3_owner == sdk_ids::loader_v4::ID);
+        ensure!(
             v3_data == base_v3_elf,
             "the v3 clone must byte-equal the base programdata ELF \
              (er {} bytes, base {} bytes)",
             v3_data.len(),
             base_v3_elf.len()
-        )?;
-        check!(
+        );
+        ensure!(
             v3_logs.iter().any(|line| line.contains("LogMsg:")),
             "the v3 program invocation must emit its LogMsg line"
-        )?;
+        );
 
         Ok(())
     }
@@ -156,7 +142,7 @@ async fn cloned_program(er: &ErCtx, program: &Pubkey) -> Result<(Pubkey, Vec<u8>
     let cloned = er
         .account(program)
         .await?
-        .ok_or_else(|| CheckError::new("program not present in the ER"))?;
+        .ok_or_else(|| anyhow!("program not present in the ER"))?;
     Ok((cloned.owner, cloned.data))
 }
 
@@ -198,20 +184,14 @@ where
             }
             Err(err) => {
                 if Instant::now() >= deadline {
-                    return Err(
-                        CheckError::new(format!("invoke of {program} never succeeded"))
-                            .caused_by(err)
-                            .into(),
-                    );
+                    return Err(err.context(format!("invoke of {program} never succeeded")));
                 }
             }
         }
         if Instant::now() >= deadline {
-            return Err(CheckError::new(format!(
-                "invoke of {program} never met its log condition"
-            ))
-            .actual(format!("{last_logs:?}"))
-            .into());
+            return Err(anyhow!(
+                "invoke of {program}: log condition unmet: {last_logs:?}"
+            ));
         }
         time::sleep(Duration::from_millis(500)).await;
     }

@@ -7,6 +7,7 @@ use std::{
     time::Duration,
 };
 
+use anyhow::anyhow;
 use json::LazyValue;
 use pubkey::Pubkey;
 use tokio::{runtime::Builder, sync::watch, task::LocalSet, time, time::Instant};
@@ -45,10 +46,7 @@ impl AccountRecv {
     }
 
     fn has(&self, index: usize) -> bool {
-        self.seen
-            .get(index / 64)
-            .map(|word| word & (1u64 << (index % 64)) != 0)
-            .unwrap_or(false)
+        self.seen.get(index / 64).is_some_and(|word| word & (1u64 << (index % 64)) != 0)
     }
 }
 
@@ -104,11 +102,14 @@ impl SubscriberPool {
         for thread_index in 0..thread_count {
             let my_states: Vec<Arc<Mutex<ConnState>>> =
                 states.iter().skip(thread_index).step_by(thread_count).cloned().collect();
-            let url = url.clone();
-            let accounts = accounts.clone();
-            let clock = clock.clone();
-            let expected = expected.clone();
-            let extractor = extractor.clone();
+            let subscriptions = Subscriptions {
+                url: url.clone(),
+                accounts: accounts.clone(),
+                clock: clock.clone(),
+                expected: expected.clone(),
+                extractor: extractor.clone(),
+                threshold_micros,
+            };
             let shutdown_rx = shutdown.subscribe();
             let span = Span::current();
             handles.push(thread::spawn(move || {
@@ -117,25 +118,8 @@ impl SubscriberPool {
                     .enable_all()
                     .build()
                     .expect("subscriber runtime build is infallible");
-                let local = LocalSet::new();
-                runtime.block_on(local.run_until(async move {
-                    let mut conn_tasks = Vec::with_capacity(my_states.len());
-                    for state in my_states {
-                        conn_tasks.push(tokio::task::spawn_local(run_connection(
-                            url.clone(),
-                            accounts.clone(),
-                            state,
-                            clock.clone(),
-                            expected.clone(),
-                            extractor.clone(),
-                            shutdown_rx.clone(),
-                            threshold_micros,
-                        )));
-                    }
-                    for task in conn_tasks {
-                        let _ = task.await;
-                    }
-                }));
+                runtime
+                    .block_on(LocalSet::new().run_until(subscriptions.run(my_states, shutdown_rx)));
             }));
         }
         Self {
@@ -152,14 +136,14 @@ impl SubscriberPool {
                 .unwrap()
                 .error
                 .as_ref()
-                .map(|error| format!("conn {conn_index}: {error}"))
+                .map(|error| format!("conn {conn_index}: {error:#}"))
         })
     }
 
     pub async fn await_subscribed(&self, per_connection: usize, timeout: Duration) -> Result<()> {
         conn::await_condition(timeout, "pool subscriptions", || {
             if let Some(error) = self.first_error() {
-                return Err(format!("subscriber pool: {error}").into());
+                return Err(anyhow!("subscriber pool: {error:#}"));
             }
             Ok(self
                 .states
@@ -305,50 +289,70 @@ impl FrameHandler for PoolHandler {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_connection(
+#[derive(Clone)]
+struct Subscriptions {
     url: Url,
     accounts: Arc<Vec<Pubkey>>,
-    state: Arc<Mutex<ConnState>>,
     clock: Arc<SendClock>,
     expected: Arc<ExpectedWrites>,
     extractor: Extractor,
-    mut shutdown: watch::Receiver<bool>,
     threshold_micros: u64,
-) {
-    let socket = match conn::connect(&url).await {
-        Ok(socket) => socket,
-        Err(error) => {
-            state.lock().unwrap().error = Some(error.to_string());
-            return;
+}
+impl Subscriptions {
+    async fn run(self, states: Vec<Arc<Mutex<ConnState>>>, shutdown: watch::Receiver<bool>) {
+        let mut tasks = Vec::with_capacity(states.len());
+        for state in states {
+            tasks.push(tokio::task::spawn_local(
+                self.clone().connect(state, shutdown.clone()),
+            ));
         }
-    };
-    let (requester, mut stream) = conn::split(socket);
-    let mut handler = PoolHandler {
-        state: state.clone(),
-        clock,
-        expected,
-        extractor,
-        threshold_micros,
-        account_by_req: HashMap::new(),
-        account_by_subid: HashMap::new(),
-        local_lag: StreamingStats::new(),
-    };
-
-    for account in accounts.iter() {
-        let req_id = requester.mint();
-        handler.account_by_req.insert(req_id, *account);
-        if let Err(error) =
-            requester.send(req_id, "accountSubscribe", &conn::account_params(account)).await
-        {
-            state.lock().unwrap().error = Some(error.to_string());
-            return;
+        for task in tasks {
+            let _ = task.await;
         }
     }
+    async fn connect(self, state: Arc<Mutex<ConnState>>, mut shutdown: watch::Receiver<bool>) {
+        let Self {
+            url,
+            accounts,
+            clock,
+            expected,
+            extractor,
+            threshold_micros,
+        } = self;
+        let socket = match conn::connect(&url).await {
+            Ok(socket) => socket,
+            Err(error) => {
+                state.lock().unwrap().error = Some(format!("{error:#}"));
+                return;
+            }
+        };
+        let (requester, mut stream) = conn::split(socket);
+        let mut handler = PoolHandler {
+            state: state.clone(),
+            clock,
+            expected,
+            extractor,
+            threshold_micros,
+            account_by_req: HashMap::new(),
+            account_by_subid: HashMap::new(),
+            local_lag: StreamingStats::new(),
+        };
 
-    tokio::select! {
-        _ = shutdown.changed() => {}
-        _ = conn::drive(&mut stream, &mut handler) => {}
+        for account in accounts.iter() {
+            let req_id = requester.mint();
+            handler.account_by_req.insert(req_id, *account);
+            if let Err(error) =
+                requester.send(req_id, "accountSubscribe", &conn::account_params(account)).await
+            {
+                state.lock().unwrap().error = Some(format!("{error:#}"));
+                return;
+            }
+        }
+
+        tokio::select! {
+            _ = shutdown.changed() => {}
+            _ = conn::drive(&mut stream, &mut handler) => {}
+        }
+        state.lock().unwrap().lag = Some(mem::take(&mut handler.local_lag));
     }
-    state.lock().unwrap().lag = Some(mem::take(&mut handler.local_lag));
 }

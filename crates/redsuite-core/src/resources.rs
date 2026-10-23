@@ -74,7 +74,7 @@ impl Resources {
                     Ok(()) => {}
                     Err(error) if error.kind() == ErrorKind::NotFound => {}
                     Err(error) => {
-                        warn!(owner, dir, %error, "storage cleanup failed")
+                        warn!(owner, dir, error = %format_args!("{error:#}"), "storage cleanup failed")
                     }
                 }
             }

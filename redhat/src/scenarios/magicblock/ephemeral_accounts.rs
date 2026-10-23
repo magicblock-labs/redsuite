@@ -1,6 +1,7 @@
 use std::{rc::Rc, result, time::Duration};
 
 use account::Account;
+use anyhow::{ensure, Context};
 use futures_util::{future::try_join_all, TryFutureExt};
 use instruction::{AccountMeta, Instruction};
 use json::Value;
@@ -13,7 +14,7 @@ use pubkey::Pubkey;
 
 use redsuite_core::{
     api::TransactionInfo,
-    check, check_eq, dlp, phase,
+    check, dlp, phase,
     programs::{Redshift, SettlementMode, MAGIC, REDSHIFT},
     receipt, system, topology, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
@@ -162,34 +163,21 @@ impl Record {
         after: &[Account],
         expected_error: Option<Value>,
     ) -> Result<()> {
-        check_eq!(
+        ensure!(
+            self.info.err == expected_error,
+            "expected {expected_error:?}, got {:?}; logs={:?}",
             self.info.err,
-            expected_error,
-            "{}: execution outcome; logs: {:?}",
-            self.tx.signatures[0],
             self.info.logs
-        )?;
+        );
         let mut balances = self.info.pre_balances.clone();
-        check_eq!(
-            balances.len(),
-            self.tx.message.account_keys.len(),
-            "complete transaction balances"
-        )?;
+        ensure!(balances.len() == self.tx.message.account_keys.len());
         for (index, key) in self.tx.message.account_keys.iter().enumerate() {
             if let Some(i) = keys.iter().position(|tracked| tracked == key) {
-                check_eq!(
-                    balances[index],
-                    before[i].lamports,
-                    "{key}: transaction pre-balance"
-                )?;
+                ensure!(balances[index] == before[i].lamports);
                 balances[index] = after[i].lamports;
             }
         }
-        check_eq!(
-            self.info.post_balances,
-            balances,
-            "only rent transfers and payer fees change balances"
-        )?;
+        ensure!(self.info.post_balances == balances);
         if self.info.err.is_none() {
             let observed: Vec<_> = self
                 .info
@@ -197,19 +185,15 @@ impl Record {
                 .iter()
                 .filter_map(|line| line.strip_prefix("Program log: CellObservation: "))
                 .collect();
-            check_eq!(
-                observed,
-                [observation(before), observation(after)].concat(),
-                "fixture account observations"
-            )?;
+            ensure!(observed == [observation(before), observation(after)].concat());
         }
-        check!(
+        ensure!(
             self.info
                 .logs
                 .iter()
                 .any(|line| line.starts_with(&format!("Program {} invoke", magic_api::id()))),
             "ephemeral instruction executed"
-        )?;
+        );
         Ok(())
     }
 }
@@ -274,33 +258,25 @@ impl Workload<'_> {
         instructions: Vec<Instruction>,
         effect: result::Result<&Action, &str>,
     ) -> Result<()> {
-        check_eq!(
-            state(self.er, &self.keys).await?,
-            self.expected,
-            "{label}: before"
-        )?;
+        ensure!(state(self.er, &self.keys).await? == self.expected);
         let error_index = instructions.len() - 1;
         let record = Record::submit(self.er, self.prepare(instructions).await?)
             .await
-            .map_err(|error| format!("{label}: {error}"))?;
+            .with_context(|| label.to_owned())?;
         let before = self.expected.clone();
         let mut after = before.clone();
         let expected_error = match effect {
             Ok(action) => {
-                check_eq!(action.apply(&mut after), None, "{label}: valid operation")?;
+                ensure!(action.apply(&mut after) == None);
                 None
             }
             Err(name) => Some(error(error_index, name)),
         };
         after[PAYER].lamports =
-            after[PAYER].lamports.checked_sub(record.info.fee).ok_or("payer exhausted")?;
-        check_eq!(
-            state(self.er, &self.keys).await?,
-            after,
-            "{label}: state and accounting"
-        )?;
+            after[PAYER].lamports.checked_sub(record.info.fee).context("payer exhausted")?;
+        ensure!(state(self.er, &self.keys).await? == after);
         if let Err(error) = record.check(&self.keys, &before, &after, expected_error) {
-            self.failures.push(format!("{label}: {error}"));
+            self.failures.push(format!("{label}: {error:#}"));
         }
         self.expected = after;
         Ok(())
@@ -326,10 +302,10 @@ impl Scenario for EphemeralAccounts {
         phase("mapped-signing self-commit", async {
             let payer = &signers[2];
             let vault = dlp::magic_fee_vault_pda(&er.identity());
-            check!(
+            ensure!(
                 er.account(&vault).await?.is_some(),
-                "the magic fee vault for the booted er identity must exist"
-            )?;
+                "magic fee vault exists"
+            );
             let signature = er
                 .submit_and_confirm(
                     payer,
@@ -343,48 +319,29 @@ impl Scenario for EphemeralAccounts {
                 .await?;
             let commit_receipt =
                 receipt::fetch_commit_receipt(er.api(), &signature, TIMEOUT).await?;
-            check!(
-                commit_receipt.succeeded(),
-                "the mapped-signing self-commit {signature} succeeds, receipt \
-                 error {:?} code {:?}",
-                commit_receipt.error_message,
-                commit_receipt.receipt_err_code
-            )?;
-            check!(
+            commit_receipt.check_success("mapped-signing self-commit")?;
+            ensure!(
                 commit_receipt.included.contains(&payer.pubkey()),
-                "the mapped-signing payer must commit itself in {signature}, \
-                 receipt included {:?}",
+                "self-commit includes payer; actual={:?}",
                 commit_receipt.included
-            )?;
-            check!(
-                !commit_receipt.base_signatures.is_empty(),
-                "the mapped-signing self-commit {signature} must reach base \
-                 through at least one base transaction"
-            )?;
+            );
             commit_receipt.confirm(base.api(), TIMEOUT).await
         })
         .await?;
 
-        // A non-delegated payer cannot pay ER fees for a transaction that
-        // touches no delegated account. This is the fee gate outside gasless
-        // mode: only delegated (or otherwise privileged) accounts may pay. The
-        // transfer is to the payer itself, so it lands on an account that
-        // already exists (no rent path) and touches nothing delegated — the
-        // fee gate is the only thing left to fail on.
-        phase("fee gate", async {
-            let fee_only = er
-                .submit_and_confirm(
-                    &funder,
-                    &[system::transfer(&funder.pubkey(), &funder.pubkey(), 1)],
-                )
+        phase("readonly payer", async {
+            let accounts = [funder.pubkey(), signers[0].pubkey()];
+            let before = er.accounts(&accounts).await?;
+            let attempt = er
+                .submit_and_confirm(&funder, &[system::transfer(&accounts[0], &accounts[1], 1)])
                 .await;
-            let error = check::expect_error(fee_only, "non-delegated payer rejected by fee gate")?;
-            let fee_error = format!("{error:?}");
-            check!(
-                fee_error.contains("InvalidAccountForFee") || fee_error.contains("Immutable"),
-                "expected InvalidAccountForFee or Immutable for the \
-                 non-delegated payer, got {fee_error}"
-            )?;
+            let error = check::expect_error(attempt, "non-delegated payer cannot spend")?;
+            let error = format!("{error:#}");
+            ensure!(
+                error.contains("InvalidAccountForFee") || error.contains("Immutable"),
+                "non-delegated debit rejected by the access gate: {error:#}"
+            );
+            ensure!(er.accounts(&accounts).await? == before);
             Ok(())
         })
         .await?;
@@ -407,11 +364,7 @@ impl Scenario for EphemeralAccounts {
             nonce: 0,
             failures: Vec::new(),
         };
-        check_eq!(
-            workload.expected[TARGET],
-            Account::default(),
-            "fresh target"
-        )?;
+        ensure!(workload.expected[TARGET] == Account::default());
         for (label, operation) in [
             ("create", Create { data_len: 32 }),
             ("resize", Resize { new_data_len: 96 }),
@@ -543,7 +496,7 @@ impl Scenario for EphemeralAccounts {
             .await?;
             let after = state(&er, &keys).await?;
             let order = serialized(&keys, &workload.expected, &after, &records, 0)
-                .ok_or("conflicts have no valid serialized outcome")?;
+                .context("conflicts have no valid serialized outcome")?;
             for index in order {
                 let (action, record) = &records[index];
                 if record.info.err.is_none() {
@@ -551,18 +504,18 @@ impl Scenario for EphemeralAccounts {
                 }
                 workload.expected[PAYER].lamports -= record.info.fee;
             }
-            check_eq!(workload.expected, after, "serialized final state")?;
+            ensure!(workload.expected == after);
             if after[TARGET].owner != system::system_id() {
                 let close = Action::new(Close);
                 workload.step("conflicts: close", &close).await?;
             }
         }
         let failures = workload.failures;
-        check!(
+        ensure!(
             failures.is_empty(),
-            "ephemeral transactions with mismatched receipts or accounting: {}",
+            "ephemeral receipt/accounting failures: {}",
             failures.join("; ")
-        )?;
+        );
         Ok(())
     }
 }

@@ -24,6 +24,7 @@ license = "MIT"
 authors = ["Magicblock Labs <dev@magicblock.gg>"]
 
 [workspace.dependencies]
+anyhow = "1"
 fixture = { path = "programs/fixture" }
 clap = { version = "4", features = ["derive", "env"] }
 humantime = "2"
@@ -44,7 +45,6 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", 
 tokio-tungstenite = "0.29"
 futures-util = "0.3"
 tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
-tracing-error = { version = "0.2", default-features = false }
 const-str = "1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "env-filter"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }

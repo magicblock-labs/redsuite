@@ -5,10 +5,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+use anyhow::{anyhow, ensure, Context};
 use instruction::Instruction;
 use pubkey::Pubkey;
 use redsuite_core::{
-    check, check_eq, host, prep,
+    host, prep,
     profile::ProfileValues,
     programs::{HashState, Redline},
     redline::{causal, Accounts},
@@ -227,7 +228,7 @@ async fn execute_cell_burst(
                         future::ready(Ok(SendTransaction(move |_: Instant| async move {
                             let rejected = api.send_prepared(&body).await?;
                             if rejected != 0 {
-                                return Err(format!("{rejected} entries rejected").into());
+                                return Err(anyhow!("{rejected} entries rejected"));
                             }
                             Ok(())
                         })))
@@ -360,12 +361,12 @@ impl Scenario<ScenarioReport> for ExecutorSaturation {
             Arc::new(OnceLock::new()),
         )
         .await?;
-        check_eq!(
+        ensure!(
+            warm.outcome.failed == 0,
+            "failures={:?}; first error={:?}",
             warm.outcome.failed,
-            0,
-            "warmup deliveries failed: {:?}",
             warm.outcome.first_error
-        )?;
+        );
         if let Some(seen) = count_before_warmup {
             crate::await_executed(&er, seen + profile.warmup as f64, DRAIN_TIMEOUT).await?;
         }
@@ -407,12 +408,12 @@ impl Scenario<ScenarioReport> for ExecutorSaturation {
             .await?;
             let outcome = burst.outcome;
             offset += cell_iterations;
-            check_eq!(
+            ensure!(
+                outcome.failed == 0,
+                "failures={:?}; first error={:?}",
                 outcome.failed,
-                0,
-                "{label}: measured deliveries failed: {:?}",
                 outcome.first_error
-            )?;
+            );
             let drain = match before.get(TX_COUNT) {
                 Some(seen) => {
                     crate::await_executed(&er, seen + cell_iterations as f64, DRAIN_TIMEOUT).await?
@@ -433,28 +434,13 @@ impl Scenario<ScenarioReport> for ExecutorSaturation {
             let dropped = failed_kind("dropped");
             let execution_failed = failed_kind("execution");
             if let Some(dropped) = dropped {
-                check_eq!(
-                    dropped,
-                    0.0,
-                    "{label}: the sequencer dropped {dropped:.0} of \
-                     {cell_iterations} transactions before execution — either \
-                     a duplicate signature or a blockhash already outside the \
-                     60 s window. Staging plus blasting took longer than that \
-                     window, or ids collided across cells"
-                )?;
+                ensure!(dropped == 0.0);
             }
             if let Some(execution_failed) = execution_failed {
-                check_eq!(
-                    execution_failed,
-                    0.0,
-                    "{label}: {execution_failed:.0} of {cell_iterations} \
-                     transactions reached the SVM and failed there — compare \
-                     the probe's consumed CUs against the {} CU limit",
-                    causal::CU_LIMIT
-                )?;
+                ensure!(execution_failed == 0.0);
             }
 
-            let probe_sig = probe.get().copied().ok_or("no probe signature captured")?;
+            let probe_sig = probe.get().copied().context("no probe signature captured")?;
             let probe_cus = crate::probe_cus(&er, &probe_sig, label, iters).await?;
 
             let thread_cores = cpu_after.thread_cores_since(&cpu_before);
@@ -533,29 +519,23 @@ impl Scenario<ScenarioReport> for ExecutorSaturation {
         }
 
         let expected_hash = HashState::chain(causal::HASH_INIT.to_bytes(), profile.heavy_iters);
-        for (index, pda) in accounts.iter().enumerate() {
-            let on_er = er.account(pda).await?.ok_or("pda not on er")?;
+        for pda in accounts.iter() {
+            let on_er = er.account(pda).await?.context("pda not on er")?;
             let hash_bytes =
                 &on_er.data[layout::HASH_OFFSET..layout::HASH_OFFSET + layout::HASH_SIZE];
-            check_eq!(
-                hash_bytes,
-                expected_hash,
-                "account {index} must hold the {}-iteration hash chain — \
-                 heavy work was not executed",
-                profile.heavy_iters
-            )?;
+            ensure!(hash_bytes == expected_hash);
         }
 
         let light = &cells[0];
         let heavy = &cells[1];
         let cu_ratio = heavy.probe_cus / light.probe_cus;
-        check!(
+        ensure!(
             cu_ratio >= CU_CONTRAST_FLOOR,
             "heavy cell consumed {:.0} cus per tx vs light {:.0} — not the \
              >= {CU_CONTRAST_FLOOR}x compute contrast this scenario is about",
             heavy.probe_cus,
-            light.probe_cus,
-        )?;
+            light.probe_cus
+        );
 
         let mut summary = ScenarioReport::ok()
             .setting("profile", profile.name)

@@ -1,5 +1,6 @@
 use std::{ops::Range, sync::Arc};
 
+use anyhow::{anyhow, Context};
 use instruction::Instruction;
 use keypair::Keypair;
 use pubkey::Pubkey;
@@ -12,7 +13,7 @@ use crate::{
     programs::{CellId, Redline},
     runner::{execute_threaded, RunOutcome, ThreadRunConfig},
     transport::clock::{SendClock, Stamped},
-    ChainCtx, CheckError, Result,
+    ChainCtx, Result,
 };
 
 pub mod causal;
@@ -83,12 +84,11 @@ impl Accounts {
                     instructions.push(program.delegate(owner, id, Some(self.authority), u32::MAX));
                 }
             }
-            base.submit_and_confirm(payer, &instructions).await.map_err(|error| {
-                CheckError::new(format!(
+            base.submit_and_confirm(payer, &instructions).await.with_context(|| {
+                format!(
                     "program {} payer {owner} seeds {first}..{end}",
                     self.program_id
-                ))
-                .caused_by(error)
+                )
             })?;
         }
         Ok(pdas)
@@ -122,7 +122,7 @@ impl Accounts {
         delegated: bool,
     ) -> Result<Vec<Pubkey>> {
         if payers.is_empty() {
-            return Err("at least one prep payer is required".into());
+            return Err(anyhow!("at least one prep payer is required"));
         }
         let per_payer = count.div_ceil(payers.len());
         let batches = prep::bounded(payers.len().min(count), "accounts for payer", |index| {

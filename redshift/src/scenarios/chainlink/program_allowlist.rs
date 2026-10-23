@@ -1,8 +1,9 @@
 use std::{rc::Rc, time::Duration};
 
+use anyhow::ensure;
 use magicblock_config::config::AllowedProgram;
 use redsuite_core::{
-    check, topology,
+    topology,
     topology::{ErOptions, PrivateEr},
     BaseCtx, ChainCtx, PrivateErScenario, Result,
 };
@@ -18,12 +19,12 @@ pub struct ProgramAllowlist {
 
 impl PrivateErScenario for ProgramAllowlist {
     async fn setup(base: Rc<BaseCtx>, _: ()) -> Result<Self> {
-        check!(
+        ensure!(
             base.account(&topology::COMMITTOR_ID)
                 .await?
                 .is_some_and(|program| program.executable),
-            "the unlisted program must exist on L1 before testing cloning policy"
-        )?;
+            "unlisted program exists on base"
+        );
         let private = topology::private_er(
             &base,
             ErOptions {
@@ -42,15 +43,15 @@ impl PrivateErScenario for ProgramAllowlist {
     async fn run(self) -> Result<()> {
         let er = self.private.ctx();
         er.await_program_clone(&redshift_interface::ID, CLONE_TIMEOUT).await?;
-        check!(
+        ensure!(
             er.account(&topology::COMMITTOR_ID).await?.is_none(),
-            "the unlisted program must be absent before the settle window"
-        )?;
+            "unlisted program initially absent on ER"
+        );
         time::sleep(BLOCKED_SETTLE).await;
-        check!(
+        ensure!(
             er.account(&topology::COMMITTOR_ID).await?.is_none(),
-            "the restricted ER must not clone the unlisted program"
-        )?;
+            "unlisted program remains absent on ER"
+        );
         self.private.finish().await
     }
 }

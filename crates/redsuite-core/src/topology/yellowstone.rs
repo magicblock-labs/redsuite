@@ -5,6 +5,7 @@ use std::{
     process::Command,
 };
 
+use anyhow::{anyhow, Context};
 use sha2::{Digest, Sha256};
 use tracing::info;
 use url::Url;
@@ -52,11 +53,10 @@ pub async fn ensure(base_bin: &Path) -> Result<Plugin> {
     if let Some(path) = env::var_os(PLUGIN_ENV) {
         let libpath = PathBuf::from(path);
         if !libpath.is_file() {
-            return Err(format!(
+            return Err(anyhow!(
                 "{PLUGIN_ENV} points at {}, which is not a file",
                 libpath.display()
-            )
-            .into());
+            ));
         }
         return Ok(Plugin {
             tag: format!("{} (from {PLUGIN_ENV})", libpath.display()),
@@ -66,11 +66,10 @@ pub async fn ensure(base_bin: &Path) -> Result<Plugin> {
     let tag = release_for(&base_version(base_bin)?)?;
 
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-        return Err(format!(
+        return Err(anyhow!(
             "upstream publishes the Yellowstone geyser plugin only for \
              x86_64 linux; build one for this host and point {PLUGIN_ENV} at it"
-        )
-        .into());
+        ));
     }
 
     Ok(Plugin {
@@ -87,14 +86,13 @@ fn release_for(agave: &str) -> Result<&'static str> {
         .copied()
         .ok_or_else(|| {
             let known: Vec<&str> = RELEASES.iter().map(|(mapped, _)| *mapped).collect();
-            format!(
+            anyhow!(
                 "no Yellowstone geyser release is mapped to solana-test-validator \
                  {agave}; mapped series are {} — add one to \
                  crates/redsuite-core/src/topology/yellowstone.rs or point \
                  {PLUGIN_ENV} at a compatible plugin",
                 known.join(", ")
             )
-            .into()
         })
 }
 
@@ -110,15 +108,14 @@ fn base_version(base_bin: &Path) -> Result<String> {
     let output = Command::new(base_bin)
         .arg("--version")
         .output()
-        .map_err(|err| format!("running {} --version: {err}", base_bin.display()))?;
+        .with_context(|| format!("running {} --version", base_bin.display()))?;
     let text = String::from_utf8_lossy(&output.stdout);
-    text.split_whitespace().nth(1).map(ToOwned::to_owned).ok_or_else(|| {
+    text.split_whitespace().nth(1).map(ToOwned::to_owned).with_context(|| {
         format!(
             "could not read a version out of `{} --version`: {}",
             base_bin.display(),
             text.trim()
         )
-        .into()
     })
 }
 
@@ -142,11 +139,10 @@ async fn cached(tag: &str) -> Result<PathBuf> {
     let bytes = fetch(&asset_url(tag, LIB)).await?;
     let actual = sha256(&bytes);
     if actual != expected {
-        return Err(format!(
+        return Err(anyhow!(
             "{LIB} from {tag} hashes to {actual}, but the release checksums \
              list {expected}"
-        )
-        .into());
+        ));
     }
 
     let staged = dir.join(format!("{LIB}.partial"));
@@ -159,13 +155,13 @@ async fn expected_digest(tag: &str) -> Result<String> {
     let version = tag.strip_prefix('v').unwrap_or(tag);
     let name = format!("yellowstone-grpc_{version}_checksums.txt");
     let text = String::from_utf8(fetch(&asset_url(tag, &name)).await?)
-        .map_err(|err| format!("{name} is not utf-8: {err}"))?;
+        .with_context(|| format!("{name} is not utf-8"))?;
     text.lines()
         .find_map(|line| {
             let (digest, file) = line.split_once("  ")?;
             (file.trim() == LIB).then(|| digest.trim().to_owned())
         })
-        .ok_or_else(|| format!("{name} has no entry for {LIB}").into())
+        .with_context(|| format!("{name} has no entry for {LIB}"))
 }
 
 fn asset_url(tag: &str, asset: &str) -> Url {
@@ -177,13 +173,11 @@ fn asset_url(tag: &str, asset: &str) -> Url {
 }
 
 async fn fetch(url: &Url) -> Result<Vec<u8>> {
-    let response = reqwest::get(url.clone())
-        .await
-        .map_err(|err| format!("fetching {url}: {err}"))?;
+    let response = reqwest::get(url.clone()).await.with_context(|| format!("fetching {url}"))?;
     if !response.status().is_success() {
-        return Err(format!("fetching {url}: HTTP {}", response.status()).into());
+        return Err(anyhow!("fetching {url}: HTTP {}", response.status()));
     }
-    Ok(response.bytes().await.map_err(|err| format!("reading {url}: {err}"))?.to_vec())
+    Ok(response.bytes().await.with_context(|| format!("reading {url}"))?.to_vec())
 }
 
 fn sha256(bytes: &[u8]) -> String {

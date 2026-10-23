@@ -8,6 +8,7 @@ use std::{
     time::Instant,
 };
 
+use anyhow::anyhow;
 use futures_util::{future::join_all, StreamExt};
 use redsuite_core::{
     catalog::{Er, ErGroup, Family, ScenarioEntry},
@@ -33,7 +34,7 @@ struct GroupEr {
 
 impl GroupEr {
     async fn boot(group: &ErGroup, base: &Result<BaseCtx>) -> Result<Self> {
-        let base = base.as_ref().map_err(ToString::to_string)?;
+        let base = base.as_ref().map_err(|error| anyhow!("{error:#}"))?;
         let mut options = group.options();
         let proxies = if group.proxied {
             let proxies = Rc::new(BaseProxies::spawn(base).await?);
@@ -53,12 +54,12 @@ impl GroupEr {
     async fn finish(self) {
         if let Some(er) = Rc::into_inner(self.er) {
             if let Err(error) = er.into_inner().finish().await {
-                error!(%error, "group ER cleanup failed");
+                error!(error = %format_args!("{error:#}"), "group ER cleanup failed");
             }
         }
         if let Some(proxies) = self.proxies.and_then(Rc::into_inner) {
             if let Err(error) = proxies.finish() {
-                error!(%error, "group ER proxy cleanup failed");
+                error!(error = %format_args!("{error:#}"), "group ER proxy cleanup failed");
             }
         }
     }
@@ -79,7 +80,7 @@ impl Lane {
         };
         let er = match &group {
             Some(Ok(group)) => Some(Ok(group.er.lock().await.ctx().clone())),
-            Some(Err(error)) => Some(Err(error.to_string())),
+            Some(Err(error)) => Some(Err(format!("{error:#}"))),
             None => None,
         };
         let records = if suite.serial || self.group.is_none() {
@@ -242,9 +243,14 @@ impl Suite {
                 Unit::Seconds,
                 started.elapsed().as_secs_f64(),
             );
-            let persisted =
-                report::persist_summary(&format!("suite/{}", self.selection), report, &outcome)
-                    .inspect_err(|error| error!(%error, "suite report not persisted"));
+            let persisted = report::persist_summary(
+                &format!("suite/{}", self.selection),
+                report,
+                &outcome,
+            )
+            .inspect_err(
+                |error| error!(error = %format_args!("{error:#}"), "suite report not persisted"),
+            );
             outcome = outcome.and(persisted);
         }
         info!(
@@ -258,10 +264,10 @@ impl Suite {
 
 pub fn finish(records: &[RunRecord], cleanup: bool) -> Result<()> {
     let cleanup = if cleanup { topology::down() } else { Ok(()) }
-        .inspect_err(|error| error!(%error, "stack cleanup failed"));
+        .inspect_err(|error| error!(error = %format_args!("{error:#}"), "stack cleanup failed"));
     let failed = records.iter().filter(|record| !record.passed()).count();
     if failed != 0 {
-        return Err(format!("{failed} of {} scenarios failed", records.len()).into());
+        return Err(anyhow!("{failed} of {} scenarios failed", records.len()));
     }
     cleanup
 }

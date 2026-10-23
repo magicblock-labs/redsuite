@@ -1,12 +1,13 @@
 use std::{cell::Cell, rc::Rc, time::Duration};
 
+use anyhow::{ensure, Context};
 use futures_util::future::{try_join, try_join_all};
 use json::JsonValueTrait;
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    check, check_eq,
-    netfault::{Action, BaseProxies, Selector},
+    check,
+    netfault::{BaseProxies, Selector},
     programs::{CellHeader, CellId, HashState, SettlementMode, REDLINE},
     system,
     topology::{self, ErOptions, PrivateEr},
@@ -58,7 +59,7 @@ impl PrivateErScenario<(), Mode> for CacheLifecycle {
         let mut endpoints = http.endpoints();
         endpoints.ws_url = ws.endpoints().ws_url;
         if reconnect_before_settlement {
-            let (grpc_url, _) = base.grpc().ok_or("base L1 Yellowstone gRPC endpoint missing")?;
+            let (grpc_url, _) = base.grpc().context("base L1 Yellowstone gRPC endpoint missing")?;
             endpoints.grpc_url = Some(grpc_url.clone());
         }
         let private = topology::private_er(
@@ -141,12 +142,9 @@ impl PrivateErScenario<(), Mode> for CacheLifecycle {
                 .build()],
         )
         .await?;
-        check::poll("undelegation submission held", TIMEOUT, || async {
-            http.events().iter().any(|e| e.action == Action::Held)
-        })
-        .await?;
+        http.await_held(Selector::default(), TIMEOUT).await?;
         let protected = er.local_accounts(&ACCOUNT_OWNERS, protected_keys).await?;
-        check!(protected.iter().all(Option::is_some), "protected residency")?;
+        ensure!(protected.iter().all(Option::is_some), "protected residency");
         let base_delegated = base.accounts(delegated).await?;
         let pool: Vec<_> = (0..LRU_CAPACITY * 2).map(|_| Keypair::new().pubkey()).collect();
         try_join_all(pool.chunks(FUNDING_BATCH).map(|chunk| async {
@@ -156,10 +154,7 @@ impl PrivateErScenario<(), Mode> for CacheLifecycle {
         }))
         .await?;
         let eviction_count = async || -> Result<f64> {
-            er.scrape_metrics()
-                .await?
-                .get(EVICTIONS)
-                .ok_or_else(|| "eviction metric missing".into())
+            er.scrape_metrics().await?.get(EVICTIONS).context("eviction metric missing")
         };
         let before = eviction_count().await?;
         let progress = Cell::new(0u64);
@@ -185,11 +180,7 @@ impl PrivateErScenario<(), Mode> for CacheLifecycle {
                 .await?;
                 let outcome = er.api().await_transaction(&signature, TIMEOUT).await?;
                 if let Some(error) = &outcome.err {
-                    check_eq!(
-                        error.as_str(),
-                        Some("ProgramAccountNotFound"),
-                        "only transient program eviction may fail traffic"
-                    )?;
+                    ensure!(error.as_str() == Some("ProgramAccountNotFound"));
                 } else {
                     hash = HashState::fold(id, &[hash], 0);
                     let data = &mut expected[0].as_mut().unwrap().data;
@@ -202,7 +193,7 @@ impl PrivateErScenario<(), Mode> for CacheLifecycle {
                 }
                 let count = if completed.get() { delegated.len() } else { protected_keys.len() };
                 let actual = er.local_accounts(&ACCOUNT_OWNERS, &protected_keys[..count]).await?;
-                check_eq!(actual, expected[..count], "protected local state")?;
+                ensure!(actual == expected[..count]);
                 if outcome.err.is_none() {
                     progress.set(progress.get() + 1);
                 }
@@ -221,7 +212,7 @@ impl PrivateErScenario<(), Mode> for CacheLifecycle {
                     er.accounts(chunk).await?;
                 }
                 let next = eviction_count().await?;
-                check!(next > evictions, "evictions before blackout")?;
+                ensure!(next > evictions, "evictions before blackout");
                 evictions = next;
                 blackout.push(ws.stall(Selector::default().response().notification()));
                 for key in protected_keys {
@@ -234,10 +225,10 @@ impl PrivateErScenario<(), Mode> for CacheLifecycle {
                     er.accounts(chunk).await?;
                 }
                 let next = eviction_count().await?;
-                check!(next > evictions, "evictions before reconnect {cycle}")?;
+                ensure!(next > evictions, "evictions before reconnect {cycle}");
                 evictions = next;
                 let cold = er.local_accounts(&ACCOUNT_OWNERS, &[target]).await?;
-                check!(cold[0].is_none(), "new subscription target is cold")?;
+                ensure!(cold[0].is_none(), "new subscription target is cold");
                 let reconnect = observe("accountSubscribe", &pending[0]);
                 ws.close_connections();
                 let reconnect = reconnect.wait(TIMEOUT).await?;
@@ -264,11 +255,7 @@ impl PrivateErScenario<(), Mode> for CacheLifecycle {
                     Ok(())
                 })
                 .await?;
-                check_eq!(
-                    crate::account_id(read),
-                    Some(latest),
-                    "HTTP read stays current"
-                )?;
+                ensure!(crate::account_id(read) == Some(latest));
                 await_local_value(
                     er,
                     "latest base value observed locally",
@@ -277,13 +264,13 @@ impl PrivateErScenario<(), Mode> for CacheLifecycle {
                     TIMEOUT,
                 )
                 .await?;
-                check!(
+                ensure!(
                     base.accounts(pending)
                         .await?
                         .iter()
                         .all(|a| matches!(a, Some(a) if a.owner == DELEGATION_PROGRAM_ID)),
                     "undelegation stayed pending through churn"
-                )?;
+                );
             }
             completed.set(true);
             settlement.remove();
@@ -292,7 +279,7 @@ impl PrivateErScenario<(), Mode> for CacheLifecycle {
                 for (actual, expected) in actual.iter().zip(&protected[delegated.len()..]) {
                     let actual = actual.as_ref().map(|a| (a.owner, &a.data));
                     let expected = expected.as_ref().map(|a| (program::id(), &a.data));
-                    check_eq!(actual, expected, "settled owner and state")?;
+                    ensure!(actual == expected);
                 }
                 Result::Ok(())
             })
@@ -326,11 +313,7 @@ impl PrivateErScenario<(), Mode> for CacheLifecycle {
                             .into_iter()
                             .map(crate::account_id)
                             .collect();
-                        check_eq!(
-                            actual,
-                            vec![Some(BASE_REWRITE); pending.len()],
-                            "completed undelegation values"
-                        )?;
+                        ensure!(actual == vec![Some(BASE_REWRITE); pending.len()]);
                         Result::Ok(())
                     },
                 )
@@ -341,42 +324,32 @@ impl PrivateErScenario<(), Mode> for CacheLifecycle {
             // Base confirmation does not wait for ER subscription delivery.
             check::poll_for("final readonly mirrors synchronized", TIMEOUT, || async {
                 let fetched = er.accounts(readonly).await?;
-                for (key, account) in readonly.iter().zip(fetched) {
-                    check_eq!(
-                        crate::account_id(account),
-                        Some(BASE_REFRESH),
-                        "final fetch of {key}"
-                    )?;
+                for account in fetched {
+                    ensure!(crate::account_id(account) == Some(BASE_REFRESH));
                 }
                 Result::Ok(())
             })
             .await?;
             let local = er.local_accounts(&ACCOUNT_OWNERS, readonly).await?;
-            for (key, local) in readonly.iter().zip(local) {
-                // Readonly entries may be evicted after the fetch.
-                if let Some(local) = local {
-                    check_eq!(
-                        CellHeader::written_id(&local.data),
-                        Some(BASE_REFRESH),
-                        "retained local value of {key}"
-                    )?;
-                }
+            // Readonly entries may be evicted after the fetch.
+            for local in local.into_iter().flatten() {
+                ensure!(CellHeader::written_id(&local.data) == Some(BASE_REFRESH));
             }
             done.set(true);
             Result::Ok(recovery)
         };
         let (_, recovery) = time::timeout(SCENARIO_TIMEOUT, try_join(traffic, faults)).await??;
         let actual = base.accounts(delegated).await?;
-        check_eq!(actual, base_delegated, "base unchanged by ER-only writes")?;
+        ensure!(actual == base_delegated);
         private.finish().await?;
         http.finish()?;
         ws.finish()?;
         if let Some(recovery) = recovery {
             let elapsed = recovery?;
-            check!(
+            ensure!(
                 elapsed <= TIMEOUT,
                 "ER discovered the completed undelegation only after {elapsed:.1?}"
-            )?;
+            );
         }
         Ok(())
     }

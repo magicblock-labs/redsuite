@@ -13,6 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use anyhow::{anyhow, Context};
 use tokio::{
     runtime::Builder,
     sync::{watch, OwnedSemaphorePermit},
@@ -116,7 +117,7 @@ impl Job {
         send.deliver(started).await?;
         self.delivery = Some(started.elapsed().as_micros() as u32);
         if let Some(sync) = sync {
-            sync.await.map_err(|error| format!("sync: {error}"))?;
+            sync.await.context("sync")?;
             self.sync = Some(started.elapsed().as_micros() as u32);
         }
         Ok(())
@@ -235,7 +236,7 @@ impl RawRunOutcome {
             Ok(()) => self.delivered += 1,
             Err(error) => {
                 self.failed += 1;
-                self.first_error.get_or_insert_with(|| error.to_string());
+                self.first_error.get_or_insert_with(|| format!("{error:#}"));
             }
         }
     }
@@ -531,7 +532,7 @@ where
             }
         }
         if let Some(panic) = first_panic {
-            return Err(format!("driver worker thread panicked: {panic}").into());
+            return Err(anyhow!("driver worker thread panicked: {panic}"));
         }
         if let Some(error) = first_error {
             return Err(error);
@@ -543,7 +544,7 @@ where
         self.stop();
         task::spawn_blocking(move || self.join())
             .await
-            .map_err(|error| format!("driver worker join failed: {error}"))?
+            .context("driver worker join failed")?
     }
 }
 
@@ -575,7 +576,9 @@ impl WorkerBudgets {
     ) -> Result<Self> {
         rate.interval()?;
         if concurrency == 0 {
-            return Err("an admission budget needs a concurrency above zero".into());
+            return Err(anyhow!(
+                "an admission budget needs a concurrency above zero"
+            ));
         }
         let mut workers = threads.max(1).min(concurrency);
         if let Pacing::PerSecond(rate) = rate {

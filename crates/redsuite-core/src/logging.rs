@@ -1,7 +1,6 @@
 use std::io::{self, IsTerminal};
 
 use tracing::Level;
-use tracing_error::ErrorLayer;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use crate::Result;
@@ -12,7 +11,6 @@ pub fn init() -> Result<()> {
     let filter = EnvFilter::builder().with_default_directive(Level::INFO.into()).from_env_lossy();
     tracing_subscriber::registry()
         .with(filter)
-        .with(ErrorLayer::default())
         .with(
             fmt::layer()
                 .compact()

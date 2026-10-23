@@ -10,6 +10,7 @@ name = "redsuite"
 path = "src/main.rs"
 
 [dependencies]
+anyhow.workspace = true
 clap = { workspace = true }
 humantime = { workspace = true }
 rand = { workspace = true }

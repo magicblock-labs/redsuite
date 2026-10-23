@@ -1,9 +1,10 @@
 use std::{rc::Rc, sync::Arc, time::Duration};
 
+use anyhow::ensure;
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    check, check_eq, prep,
+    prep,
     profile::ProfileValues,
     programs::REDLINE,
     redline::{execute_kernel, Accounts},
@@ -103,28 +104,24 @@ impl Scenario<ScenarioReport> for RpcIngressCapacity {
         let delivered_rps = outcome.achieved_rps();
         debug!(delivered_rps, outcome.failed, "RPC blast finished");
 
-        check_eq!(
+        ensure!(
+            outcome.failed == 0,
+            "failures={:?}; first error={:?}",
             outcome.failed,
-            0,
-            "blast requests failed: {:?}",
             outcome.first_error
-        )?;
+        );
         if delivered_rps < CATASTROPHIC_RPS_FLOOR {
             warn!(delivered_rps, "RPC throughput below minimum",);
         }
         if let Some(processed) = delta.counter(metrics::ENGINE_TRANSACTIONS) {
-            check!(
+            ensure!(
                 processed >= profile.requests as f64,
                 "validator processed {processed} txs, expected at least {}",
                 profile.requests
-            )?;
+            );
         }
         if let Some(failed_txs) = delta.counter_all(metrics::FAILED_TRANSACTIONS) {
-            check_eq!(
-                failed_txs,
-                0.0,
-                "transactions failed on the validator during the blast"
-            )?;
+            ensure!(failed_txs == 0.0);
         }
 
         Ok(ScenarioReport::ok()

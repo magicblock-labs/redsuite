@@ -4,11 +4,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+use anyhow::{ensure, Context};
 use keypair::Keypair;
 use pubkey::Pubkey;
 
 use redsuite_core::{
-    check, check_eq, dlp,
+    check, dlp,
     netfault::{BaseProxies, Selector},
     prep,
     programs::{CellHeader, CellId, SettlementMode, REDSHIFT},
@@ -45,26 +46,26 @@ async fn await_clone_count(er: &ErCtx, account: &Pubkey, id: u64) -> Result<()> 
         &format!("the er {} clones the cell with count {id}", er.identity()),
         CLONE_TIMEOUT,
         || async {
-            let account = er.account(account).await?.ok_or("ER cell absent")?;
-            check_eq!(count(&account.data)?, id, "cloned cell value")?;
+            let account = er.account(account).await?.context("ER cell absent")?;
+            ensure!(count(&account.data)? == id);
             Ok::<_, DynError>(())
         },
     )
     .await
-    .map_err(|error| error.expected(format!("count {id}")))?;
+    .with_context(|| format!("count {id}"))?;
     Ok(())
 }
 
 async fn write(ctx: &impl ChainCtx, payer: &Keypair, account: &Pubkey, id: u64) -> Result<()> {
     ctx.submit_and_confirm(payer, &[REDSHIFT.batch().set(&[*account], id).build()])
         .await?;
-    let data = ctx.account(account).await?.ok_or("the cell vanished after the write")?.data;
-    check_eq!(count(&data)?, id, "the write must land")?;
+    let data = ctx.account(account).await?.context("the cell vanished after the write")?.data;
+    ensure!(count(&data)? == id);
     Ok(())
 }
 
 async fn base_state(base: &BaseCtx, account: &Pubkey) -> Result<(Pubkey, Option<u64>)> {
-    let on_base = base.account(account).await?.ok_or("the cell vanished from base")?;
+    let on_base = base.account(account).await?.context("the cell vanished from base")?;
     Ok((on_base.owner, count(&on_base.data).ok()))
 }
 
@@ -76,15 +77,11 @@ async fn await_base(
     what: &str,
 ) -> Result<()> {
     check::poll_for(what, COMPLETION_TIMEOUT, || async {
-        check_eq!(
-            base_state(base, account).await?,
-            (owner, Some(id)),
-            "settled cell owner and value"
-        )?;
+        ensure!(base_state(base, account).await? == (owner, Some(id)));
         Ok::<_, DynError>(())
     })
     .await
-    .map_err(|error| error.expected(format!("owner {owner} count {id}")))?;
+    .with_context(|| format!("owner {owner} count {id}"))?;
     Ok(())
 }
 
@@ -96,35 +93,18 @@ struct SessionB<'a> {
     nonce: u64,
 }
 
-async fn hold_steady(
-    base: &BaseCtx,
-    session: &SessionB<'_>,
-    window: Duration,
-    what: &str,
-) -> Result<()> {
+async fn hold_steady(base: &BaseCtx, session: &SessionB<'_>, window: Duration) -> Result<()> {
     let started = Instant::now();
     while started.elapsed() < window {
         let (owner, written) = base_state(base, &session.account).await?;
-        check_eq!(
-            (owner, written),
-            (dlp::dlp_id(), Some(session.base_id)),
-            "{what}: base must keep the session-b delegation and value"
-        )?;
-        check_eq!(
-            crate::last_commit_id(base, &session.account).await?,
-            session.nonce,
-            "{what}: the session-b nonce must not move"
-        )?;
+        ensure!((owner, written) == (dlp::dlp_id(), Some(session.base_id)));
+        ensure!(crate::last_commit_id(base, &session.account).await? == session.nonce);
         let on_er = session
             .er
             .account(&session.account)
             .await?
-            .ok_or("the session-b er copy vanished")?;
-        check_eq!(
-            count(&on_er.data)?,
-            session.er_id,
-            "{what}: the session-b er state must stay"
-        )?;
+            .context("the session-b er copy vanished")?;
+        ensure!(count(&on_er.data)? == session.er_id);
         time::sleep(POLL).await;
     }
     Ok(())
@@ -157,11 +137,7 @@ async fn recover_session_a_commit_after_lost_response(
     let held = submission.wait(INTERCEPT_TIMEOUT).await?;
     let base_signature = held.operation.signature()?;
     let base_tx = base.api().await_transaction(&base_signature, BASE_CONFIRM_TIMEOUT).await?;
-    check_eq!(
-        base_tx.err,
-        None,
-        "the intercepted session-a commit must land on base"
-    )?;
+    ensure!(base_tx.err == None);
     await_base(
         base,
         account,
@@ -173,12 +149,12 @@ async fn recover_session_a_commit_after_lost_response(
     held.discard();
 
     let receipt = receipt::fetch_commit_receipt(er.api(), &signature, RECEIPT_TIMEOUT).await?;
-    check!(
+    ensure!(
         receipt.succeeded() || receipt.failure_is_duplicate_rejection(),
         "the session-a commit intent must converge after a lost base response, \
          got {:?}",
         receipt.error_message
-    )?;
+    );
     Ok(())
 }
 
@@ -190,13 +166,12 @@ async fn isolate(
     payer: &Keypair,
 ) -> Result<()> {
     let case = u64::from(er_b.is_some()) + 1;
-    let label = if er_b.is_some() { "reassignment" } else { "redelegation" };
     let cell = base
         .cells(REDSHIFT, payer)
         .create_owned(er_a.identity(), 1)
         .await?
         .pop()
-        .ok_or("no cell was created")?;
+        .context("no cell was created")?;
     let authority = cell.authority.pubkey();
     let account = cell.address;
     er_a.ctx().await_cells(slice::from_ref(&cell)).await?;
@@ -218,11 +193,11 @@ async fn isolate(
         schedule_commit(er_a.ctx(), payer, &account, SettlementMode::Undelegate).await?;
     let undelegated =
         receipt::fetch_commit_receipt(er_a.ctx().api(), &undelegate, RECEIPT_TIMEOUT).await?;
-    check!(
+    ensure!(
         undelegated.succeeded() || undelegated.failure_is_duplicate_rejection(),
         "the session-a undelegation must complete, got {:?}",
         undelegated.error_message
-    )?;
+    );
     await_base(
         base,
         &account,
@@ -278,16 +253,11 @@ async fn isolate(
             nonce,
         },
         STALE_WINDOW,
-        &format!("{label}: after releasing session-a observations"),
     )
     .await?;
 
     let restart = er_a.restart(RestartConfig::default()).await?;
-    check_eq!(
-        restart.exit_code,
-        Some(0),
-        "the session-a validator must stop cleanly before recovery"
-    )?;
+    ensure!(restart.exit_code == Some(0));
     let session_b = er_b.unwrap_or_else(|| er_a.ctx());
     hold_steady(
         base,
@@ -299,7 +269,6 @@ async fn isolate(
             nonce,
         },
         RECOVERY_WINDOW,
-        &format!("{label}: while the restarted validator recovers"),
     )
     .await?;
 
@@ -311,11 +280,11 @@ async fn isolate(
                 &[REDSHIFT.batch().set(&[account], value(case, 4)).build()],
             )
             .await;
-        check!(
+        ensure!(
             stale_write.is_err(),
             "the old validator must reject writes to the reassigned \
                  account, got {stale_write:?}"
-        )?;
+        );
         let stale_commit =
             schedule_commit(er_a.ctx(), payer, &account, SettlementMode::Commit).await;
         if let Ok(signature) = stale_commit {
@@ -324,23 +293,19 @@ async fn isolate(
                     .await?;
             receipt
                 .error_message
-                .ok_or("the old validator must not commit the reassigned account")?;
+                .context("the old validator must not commit the reassigned account")?;
         }
-        check_eq!(
-            base_state(base, &account).await?,
-            (dlp::dlp_id(), Some(base_value)),
-            "rejected old work must leave base untouched"
-        )?;
+        ensure!(base_state(base, &account).await? == (dlp::dlp_id(), Some(base_value)));
     }
 
     let fresh = schedule_commit(session_b, payer, &account, SettlementMode::Commit).await?;
     let fresh_receipt =
         receipt::fetch_commit_receipt(session_b.api(), &fresh, RECEIPT_TIMEOUT).await?;
-    check!(
+    ensure!(
         fresh_receipt.succeeded() || fresh_receipt.failure_is_duplicate_rejection(),
         "a fresh session-b commit must complete, got {:?}",
         fresh_receipt.error_message
-    )?;
+    );
     await_base(
         base,
         &account,

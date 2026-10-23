@@ -4,10 +4,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+use anyhow::{anyhow, ensure};
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    check_eq,
     profile::ProfileValues,
     programs::REDLINE,
     redline::Accounts,
@@ -67,7 +67,9 @@ async fn touch_pass(er: &ErCtx, pool: &[Pubkey]) -> Result<ObservationsStats> {
         latencies.push(started.elapsed().as_micros() as u32);
         let data_len = fetched.map(|account| account.data.len()).unwrap_or(0);
         if data_len != ACCOUNT_SPACE as usize {
-            return Err(format!("hydration broken: {account} read back {data_len} bytes").into());
+            return Err(anyhow!(
+                "hydration broken: {account} read back {data_len} bytes"
+            ));
         }
     }
     Ok(latencies.finalize(false))
@@ -252,12 +254,12 @@ impl Scenario<ScenarioReport> for ColdHydrationTail {
                 cell_name,
                 outcome.outcome.failed, outcome.slow, "dependency hydration cell finished",
             );
-            check_eq!(
+            ensure!(
+                outcome.outcome.failed == 0,
+                "failures={:?}; first error={:?}",
                 outcome.outcome.failed,
-                0,
-                "{cell_name}: deliveries failed: {:?}",
                 outcome.outcome.first_error
-            )?;
+            );
         }
         if warm_deps.slow > cold_deps.slow {
             warn!(

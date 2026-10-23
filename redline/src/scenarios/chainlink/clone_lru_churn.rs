@@ -4,9 +4,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+use anyhow::ensure;
 use pubkey::Pubkey;
 use redsuite_core::{
-    check, check_eq,
     profile::ProfileValues,
     redline::Accounts,
     report::Unit,
@@ -188,13 +188,12 @@ impl Scenario<ScenarioReport> for CloneLruChurn {
                 request,
             )
             .await?;
-            check_eq!(
+            ensure!(
+                warmup.failed == 0,
+                "failures={:?}; first error={:?}",
                 warmup.failed,
-                0,
-                "{}: warmup reads failed: {:?}",
-                cell.name,
                 warmup.first_error
-            )?;
+            );
 
             let before = cell_er.scrape_metrics().await?;
             let offset = profile.warmup;
@@ -283,24 +282,24 @@ impl Scenario<ScenarioReport> for CloneLruChurn {
         }
 
         let closure = &cells[0];
-        check_eq!(
+        ensure!(
+            closure.outcome.failed == 0,
+            "failures={:?}; first error={:?}",
             closure.outcome.failed,
-            0,
-            "closure cell reads failed: {:?}",
             closure.outcome.first_error
-        )?;
+        );
         // The engine's account cache is a per-bucket sampled LRU (scc
         // HashCache), so a handful of early evictions below capacity are
         // normal; only systematic eviction under the cap marks a broken knob.
         let closure_tolerance = (profile.working_set as f64) * 0.05;
-        check!(
+        ensure!(
             closure.evictions <= closure_tolerance,
             "INVALID: closure cell (cap {} ≥ working set {}) evicted {} \
              accounts — the cap knob or the harness is broken",
             closure.cap,
             profile.working_set,
             closure.evictions
-        )?;
+        );
         if closure.outcome.delivery.median >= 1_000_000 {
             warn!(
                 closure.outcome.delivery.median,
@@ -309,30 +308,30 @@ impl Scenario<ScenarioReport> for CloneLruChurn {
         }
 
         for churn_cell in &cells[1..] {
-            check!(
+            ensure!(
                 churn_cell.outcome.delivered > 0,
                 "INVALID: {} delivered nothing",
                 churn_cell.name
-            )?;
-            check!(
+            );
+            ensure!(
                 churn_cell.evictions > 0.0,
                 "{}: no evictions with cap {} < working set {} — \
                  churn did not engage",
                 churn_cell.name,
                 churn_cell.cap,
                 profile.working_set
-            )?;
+            );
             if let Some(fetches_found) = churn_cell.fetches_found {
                 let deviation = (fetches_found - churn_cell.evictions).abs();
                 let tolerance = (churn_cell.evictions * 0.15).max(profile.concurrency as f64);
-                check!(
+                ensure!(
                     deviation <= tolerance,
                     "{}: {} refetches vs {} evictions — evict/reload left \
                      lockstep",
                     churn_cell.name,
                     fetches_found,
                     churn_cell.evictions
-                )?;
+                );
             }
         }
 

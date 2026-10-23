@@ -1,3 +1,4 @@
+use anyhow::{ensure, Context};
 pub mod commit_and_undelegate;
 pub mod commit_blackout;
 pub mod commit_exactly_once;
@@ -11,7 +12,7 @@ use std::time::{Duration, Instant};
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    check, check_eq,
+    check,
     programs::{CellHeader, SettlementMode, REDLINE},
     BaseCtx, ChainCtx, ErCtx, Result,
 };
@@ -44,12 +45,8 @@ async fn write_snapshot(
     account: &Pubkey,
 ) -> Result<Vec<u8>> {
     er.cells(REDLINE, payer).write(value, &[*account]).await?;
-    let snapshot = er.account(account).await?.ok_or("ER cell missing after write")?.data;
-    check_eq!(
-        CellHeader::written_id(&snapshot),
-        Some(value),
-        "ER write visible before settlement"
-    )?;
+    let snapshot = er.account(account).await?.context("ER cell missing after write")?.data;
+    ensure!(CellHeader::written_id(&snapshot) == Some(value));
     Ok(snapshot)
 }
 
@@ -60,17 +57,15 @@ async fn prove_landed(
     snapshot: &[u8],
 ) -> Result<()> {
     let base_tx = base.api().await_transaction(base_signature, BASE_CONFIRM_TIMEOUT).await?;
-    check!(
+    ensure!(
         base_tx.err.is_none(),
         "the intercepted base commit {base_signature} must succeed on base, \
          got {:?}",
         base_tx.err
-    )?;
-    check::poll(
-        "the base copy carries the er snapshot before the fault is applied",
-        BASE_STATE_TIMEOUT,
-        || async { matches!(base.account(account).await, Ok(Some(acc)) if acc.data == snapshot) },
-    )
+    );
+    check::poll("base snapshot before fault", BASE_STATE_TIMEOUT, || async {
+        matches!(base.account(account).await, Ok(Some(acc)) if acc.data == snapshot)
+    })
     .await?;
     Ok(())
 }
@@ -80,17 +75,12 @@ async fn hold_nonces(
     accounts: &[Pubkey],
     expected: &[u64],
     window: Duration,
-    phase: &str,
 ) -> Result<()> {
     let deadline = Instant::now() + window;
     loop {
         for (account, expected) in accounts.iter().zip(expected) {
             let nonce = crate::last_commit_id(base, account).await?;
-            check_eq!(
-                nonce,
-                *expected,
-                "{phase}: the nonce of {account} must remain unchanged throughout the window"
-            )?;
+            ensure!(nonce == *expected);
         }
         if Instant::now() >= deadline {
             return Ok(());

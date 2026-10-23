@@ -1,12 +1,12 @@
 use std::{future::Future, rc::Rc, time::Duration};
 
+use anyhow::{anyhow, ensure, Context};
 use futures_util::future::join_all;
 use hash::Hash;
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    api::RpcError,
-    check, check_eq,
+    check,
     rpc_client::nonblocking::rpc_client::RpcClient,
     rpc_client_api::{
         config::RpcLargestAccountsConfig, request::RpcRequest, response::RpcBlockCommitment,
@@ -100,31 +100,15 @@ async fn run_method(client: &RpcClient, fixture: &Fixture, method: Method) -> Re
                     serde_json::json!([fixture.slot_floor]),
                 )
                 .await?;
-            check_eq!(
-                commitment.commitment,
-                Some([0u64; 32]),
-                "getBlockCommitment must report an all-zero commitment array"
-            )?;
-            check_eq!(
-                commitment.total_stake,
-                0,
-                "getBlockCommitment must report zero total stake"
-            )?;
+            ensure!(commitment.commitment == Some([0u64; 32]));
+            ensure!(commitment.total_stake == 0);
         }
         Method::ClusterNodes => {
             let nodes = client.get_cluster_nodes().await?;
-            check_eq!(
-                nodes.len(),
-                1,
-                "getClusterNodes must list exactly the validator itself"
-            )?;
+            ensure!(nodes.len() == 1);
             let node = &nodes[0];
-            check_eq!(
-                node.pubkey,
-                fixture.identity.to_string(),
-                "getClusterNodes pubkey must be the validator identity"
-            )?;
-            check!(
+            ensure!(node.pubkey == fixture.identity.to_string());
+            ensure!(
                 node.gossip.is_none()
                     && node.tpu.is_none()
                     && node.rpc.is_none()
@@ -134,93 +118,41 @@ async fn run_method(client: &RpcClient, fixture: &Fixture, method: Method) -> Re
                     && node.shred_version.is_none(),
                 "getClusterNodes must leave every optional field unset, got \
                  {node:?}"
-            )?;
+            );
         }
         Method::EpochInfo => {
             let info = client.get_epoch_info().await?;
-            check_eq!(
-                info.slots_in_epoch,
-                SUPERBLOCK_SLOTS,
-                "getEpochInfo slotsInEpoch"
-            )?;
-            check_eq!(
-                info.epoch,
-                info.absolute_slot / SUPERBLOCK_SLOTS,
-                "getEpochInfo epoch must be derived from absoluteSlot"
-            )?;
-            check_eq!(
-                info.slot_index,
-                info.absolute_slot % SUPERBLOCK_SLOTS,
-                "getEpochInfo slotIndex must be derived from absoluteSlot"
-            )?;
-            check_eq!(
-                info.block_height,
-                info.absolute_slot,
-                "getEpochInfo blockHeight must equal absoluteSlot on the er"
-            )?;
-            check_eq!(
-                info.transaction_count,
-                Some(0),
-                "getEpochInfo transactionCount"
-            )?;
+            ensure!(info.slots_in_epoch == SUPERBLOCK_SLOTS);
+            ensure!(info.epoch == (info.absolute_slot / SUPERBLOCK_SLOTS));
+            ensure!(info.slot_index == (info.absolute_slot % SUPERBLOCK_SLOTS));
+            ensure!(info.block_height == info.absolute_slot);
+            ensure!(info.transaction_count == Some(0));
             observed_slot = Some(info.absolute_slot);
         }
         Method::EpochSchedule => {
             let schedule = client.get_epoch_schedule().await?;
-            check_eq!(
-                schedule.slots_per_epoch,
-                SUPERBLOCK_SLOTS,
-                "getEpochSchedule slotsPerEpoch"
-            )?;
-            check_eq!(
-                schedule.leader_schedule_slot_offset,
-                SUPERBLOCK_SLOTS,
-                "getEpochSchedule leaderScheduleSlotOffset"
-            )?;
-            check!(!schedule.warmup, "getEpochSchedule warmup must be false")?;
-            check_eq!(
-                schedule.first_normal_epoch,
-                0,
-                "getEpochSchedule firstNormalEpoch"
-            )?;
-            check_eq!(
-                schedule.first_normal_slot,
-                0,
-                "getEpochSchedule firstNormalSlot"
-            )?;
+            ensure!(schedule.slots_per_epoch == SUPERBLOCK_SLOTS);
+            ensure!(schedule.leader_schedule_slot_offset == SUPERBLOCK_SLOTS);
+            ensure!(!schedule.warmup, "getEpochSchedule warmup must be false");
+            ensure!(schedule.first_normal_epoch == 0);
+            ensure!(schedule.first_normal_slot == 0);
         }
         Method::FirstAvailableBlock => {
-            check_eq!(
-                client.get_first_available_block().await?,
-                0,
-                "getFirstAvailableBlock"
-            )?;
+            ensure!(client.get_first_available_block().await? == 0);
         }
         Method::GenesisHash => {
-            check_eq!(
-                client.get_genesis_hash().await?,
-                Hash::default(),
-                "getGenesisHash must be the default hash"
-            )?;
+            ensure!(client.get_genesis_hash().await? == Hash::default());
         }
         Method::Health => {
             client.get_health().await?;
         }
         Method::HighestSnapshotSlot => {
             let snapshot = client.get_highest_snapshot_slot().await?;
-            check_eq!(snapshot.full, 0, "getHighestSnapshotSlot full")?;
-            check_eq!(
-                snapshot.incremental,
-                None,
-                "getHighestSnapshotSlot incremental"
-            )?;
+            ensure!(snapshot.full == 0);
+            ensure!(snapshot.incremental == None);
         }
         Method::Identity => {
-            check_eq!(
-                client.get_identity().await?,
-                fixture.identity,
-                "getIdentity must be the validator identity"
-            )?;
+            ensure!(client.get_identity().await? == fixture.identity);
         }
         Method::LargestAccounts => {
             let largest = client
@@ -230,130 +162,106 @@ async fn run_method(client: &RpcClient, fixture: &Fixture, method: Method) -> Re
                     sort_results: None,
                 })
                 .await?;
-            check!(
+            ensure!(
                 largest.value.is_empty(),
                 "getLargestAccounts must be empty, got {:?}",
                 largest.value
-            )?;
+            );
             observed_slot = Some(largest.context.slot);
         }
         Method::RecentPerformanceSamples => {
             let samples =
                 client.get_recent_performance_samples(Some(PERFORMANCE_SAMPLE_LIMIT)).await?;
-            check!(
+            ensure!(
                 !samples.is_empty() && samples.len() <= PERFORMANCE_SAMPLE_LIMIT,
                 "getRecentPerformanceSamples must honour the limit of \
                  {PERFORMANCE_SAMPLE_LIMIT}, got {}",
                 samples.len()
-            )?;
+            );
             for sample in &samples {
-                check_eq!(
-                    sample.sample_period_secs,
-                    PERFORMANCE_SAMPLE_PERIOD_SECS,
-                    "getRecentPerformanceSamples samplePeriodSecs"
-                )?;
-                check!(
+                ensure!(sample.sample_period_secs == PERFORMANCE_SAMPLE_PERIOD_SECS);
+                ensure!(
                     sample.num_slots >= 1,
                     "getRecentPerformanceSamples numSlots must be at least 1, \
                      got {sample:?}"
-                )?;
+                );
             }
         }
         Method::SlotLeader => {
-            check_eq!(
-                client.get_slot_leader().await?,
-                fixture.identity,
-                "getSlotLeader must be the validator identity"
-            )?;
+            ensure!(client.get_slot_leader().await? == fixture.identity);
         }
         Method::SlotLeaders => {
             let leaders = client.get_slot_leaders(fixture.slot_floor, SLOT_LEADER_LIMIT).await?;
-            check!(
+            ensure!(
                 !leaders.is_empty() && leaders.len() as u64 <= SLOT_LEADER_LIMIT,
                 "getSlotLeaders must answer with between 1 and \
                  {SLOT_LEADER_LIMIT} leaders, got {}",
                 leaders.len()
-            )?;
-            check!(
+            );
+            ensure!(
                 leaders.iter().all(|leader| *leader == fixture.identity),
                 "getSlotLeaders must only name the validator identity, got \
                  {leaders:?}"
-            )?;
+            );
         }
         Method::Supply => {
             let supply = client.supply_with_commitment(confirmed()).await?;
-            check_eq!(supply.value.total, u64::MAX, "getSupply total")?;
-            check_eq!(
-                supply.value.circulating,
-                u64::MAX / 2,
-                "getSupply circulating"
-            )?;
-            check_eq!(
-                supply.value.non_circulating,
-                u64::MAX / 2,
-                "getSupply nonCirculating"
-            )?;
-            check!(
+            ensure!(supply.value.total == u64::MAX);
+            ensure!(supply.value.circulating == (u64::MAX / 2));
+            ensure!(supply.value.non_circulating == (u64::MAX / 2));
+            ensure!(
                 supply.value.non_circulating_accounts.is_empty(),
                 "getSupply nonCirculatingAccounts must be empty"
-            )?;
+            );
             observed_slot = Some(supply.context.slot);
         }
         Method::TokenLargestAccounts => {
             let largest = client
                 .get_token_largest_accounts_with_commitment(&fixture.mint, confirmed())
                 .await?;
-            check!(
+            ensure!(
                 largest.value.is_empty(),
                 "getTokenLargestAccounts must be empty, got {:?}",
                 largest.value
-            )?;
+            );
             observed_slot = Some(largest.context.slot);
         }
         Method::TokenSupply => {
             let supply =
                 client.get_token_supply_with_commitment(&fixture.mint, confirmed()).await?;
-            check_eq!(supply.value.amount, "0", "getTokenSupply amount")?;
-            check_eq!(supply.value.decimals, 0, "getTokenSupply decimals")?;
-            check_eq!(supply.value.ui_amount, Some(0.0), "getTokenSupply uiAmount")?;
-            check_eq!(
-                supply.value.ui_amount_string,
-                "0.0",
-                "getTokenSupply uiAmountString"
-            )?;
+            ensure!(supply.value.amount == "0");
+            ensure!(supply.value.decimals == 0);
+            ensure!(supply.value.ui_amount == Some(0.0));
+            ensure!(supply.value.ui_amount_string == "0.0");
             observed_slot = Some(supply.context.slot);
         }
         Method::TransactionCount => {
-            check_eq!(
-                client.get_transaction_count().await?,
-                0,
-                "getTransactionCount"
-            )?;
+            ensure!(client.get_transaction_count().await? == 0);
         }
         Method::Version => {
             let version = client.get_version().await?;
             let parts: Vec<&str> = version.solana_core.split('.').collect();
-            check!(
+            ensure!(
                 parts.len() == 3 && parts.iter().all(|part| part.parse::<u32>().is_ok()),
                 "getVersion solana-core must be a dotted numeric version, got \
                  {:?}",
                 version.solana_core
-            )?;
-            check!(
+            );
+            ensure!(
                 version.feature_set.is_some_and(|set| set != 0),
                 "getVersion feature-set must be a non-zero id, got {:?}",
                 version.feature_set
-            )?;
+            );
         }
         Method::VoteAccounts => {
             let accounts = client.get_vote_accounts().await?;
-            check!(
+            ensure!(
                 accounts.current.is_empty() && accounts.delinquent.is_empty(),
                 "getVoteAccounts must list no current or delinquent accounts"
-            )?;
+            );
         }
         Method::MinimumLedgerSlot => {
-            check_eq!(client.minimum_ledger_slot().await?, 0, "minimumLedgerSlot")?;
+            ensure!(client.minimum_ledger_slot().await? == 0);
         }
     }
     Ok(observed_slot)
@@ -362,7 +270,7 @@ async fn run_method(client: &RpcClient, fixture: &Fixture, method: Method) -> Re
 async fn bounded<T>(label: &str, call: impl Future<Output = T>) -> Result<T> {
     time::timeout(NEGATIVE_DEADLINE, call)
         .await
-        .map_err(|_| format!("{label} did not answer within {NEGATIVE_DEADLINE:?}").into())
+        .with_context(|| format!("{label} did not answer within {NEGATIVE_DEADLINE:?}"))
 }
 
 pub struct RpcCompatMethods {
@@ -388,7 +296,7 @@ impl PrivateErScenario for RpcCompatMethods {
         let client = RpcClient::new_with_commitment(er.api().url().to_string(), confirmed());
         let slot_floor = check::poll_for("configured epoch boundary", BURST_DEADLINE, || async {
             let slot = client.get_slot().await?;
-            check!(slot > SUPERBLOCK_SLOTS, "advance beyond the first epoch")?;
+            ensure!(slot > SUPERBLOCK_SLOTS, "advance beyond the first epoch");
             Result::Ok(slot)
         })
         .await?;
@@ -407,11 +315,8 @@ impl PrivateErScenario for RpcCompatMethods {
         let requests = join_all(
             (0..REQUESTS).map(|index| run_method(&client, &fixture, CYCLE[index % CYCLE.len()])),
         );
-        let outcomes = time::timeout(BURST_DEADLINE, requests).await.map_err(|_| {
-            format!(
-                "the burst of {REQUESTS} requests exceeded \
-                     {BURST_DEADLINE:?}"
-            )
+        let outcomes = time::timeout(BURST_DEADLINE, requests).await.with_context(|| {
+            format!("the burst of {REQUESTS} requests exceeded {BURST_DEADLINE:?}")
         })?;
         let slot_ceiling = client.get_slot().await?;
 
@@ -436,77 +341,61 @@ impl PrivateErScenario for RpcCompatMethods {
                 Err(error) => {
                     failures += 1;
                     first_failure.get_or_insert_with(|| {
-                        format!("request {index} ({method:?}) failed: {error}")
+                        format!("request {index} ({method:?}) failed: {error:#}")
                     });
                 }
             }
         }
-        check_eq!(
+        ensure!(
+            failures == 0,
+            "failures={:?}; first error={:?}",
             failures,
-            0,
-            "every request in the burst must decode and carry the documented \
-             value; first failure: {first_failure:?}"
-        )?;
+            first_failure
+        );
 
         let airdrop = bounded(
             "requestAirdrop",
             client.request_airdrop(&fixture.identity, AIRDROP_LAMPORTS),
         )
         .await?;
-        check!(
+        ensure!(
             airdrop.is_err(),
             "requestAirdrop must be rejected by the official client, got \
              {airdrop:?}"
-        )?;
+        );
         let raw_airdrop = bounded(
             "raw requestAirdrop",
-            er.api().call::<Value>(
+            er.api().try_call::<Value>(
                 "requestAirdrop",
                 &(fixture.identity.to_string(), AIRDROP_LAMPORTS),
             ),
         )
-        .await?;
+        .await??;
         match raw_airdrop {
-            Ok(value) => {
-                return Err(format!("raw requestAirdrop must be rejected, got {value}").into())
-            }
+            Ok(value) => return Err(anyhow!("raw requestAirdrop must be rejected, got {value}")),
             Err(error) => {
-                let rejection = error.downcast_ref::<RpcError>();
-                check_eq!(
-                    rejection.map(|e| e.code),
-                    Some(INVALID_REQUEST),
-                    "requestAirdrop must be rejected with the invalid-request \
-                     code, got {error}"
-                )?;
-                check!(
-                    rejection.is_some_and(|e| e.message.contains(AIRDROP_DISABLED)),
+                ensure!(error.code == INVALID_REQUEST);
+                ensure!(
+                    error.message.contains(AIRDROP_DISABLED),
                     "requestAirdrop must be rejected with \
-                     {AIRDROP_DISABLED:?}, got {error}"
-                )?;
+                     {AIRDROP_DISABLED:?}, got {error:#}"
+                );
             }
         }
 
         let routes: Vec<Value> =
             bounded("getRoutes", er.api().call("getRoutes", &NO_PARAMS)).await??;
-        check!(routes.is_empty(), "getRoutes must be empty, got {routes:?}")?;
+        ensure!(routes.is_empty(), "getRoutes must be empty, got {routes:?}");
 
         let unknown = bounded(
             UNKNOWN_METHOD,
-            er.api().call::<Value>(UNKNOWN_METHOD, &NO_PARAMS),
+            er.api().try_call::<Value>(UNKNOWN_METHOD, &NO_PARAMS),
         )
-        .await?;
+        .await??;
         match unknown {
-            Ok(value) => {
-                return Err(format!("{UNKNOWN_METHOD} must be rejected, got {value}").into())
-            }
+            Ok(value) => return Err(anyhow!("{UNKNOWN_METHOD} must be rejected, got {value}")),
             Err(error) => {
-                let code = error.downcast_ref::<RpcError>().map(|e| e.code);
-                check_eq!(
-                    code,
-                    Some(METHOD_NOT_FOUND),
-                    "an unknown method must be rejected with the JSON-RPC \
-                     method-not-found code, got {error}"
-                )?;
+                ensure!(error.code == METHOD_NOT_FOUND);
             }
         }
 

@@ -6,6 +6,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+anyhow.workspace = true
 tracing = { workspace = true }
 tokio = { workspace = true }
 redsuite-core = { workspace = true }

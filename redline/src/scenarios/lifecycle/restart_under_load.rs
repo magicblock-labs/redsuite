@@ -8,9 +8,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+use anyhow::{ensure, Context};
 use pubkey::Pubkey;
 use redsuite_core::{
-    check, check_eq, host,
+    check, host,
     profile::ProfileValues,
     programs::{CellHeader, Redline},
     redline::{causal, Accounts},
@@ -277,10 +278,10 @@ where
 {
     let deadline = time::Instant::now() + timeout;
     while !done().await? {
-        check!(
+        ensure!(
             time::Instant::now() < deadline,
             "{what} did not happen within {timeout:?}"
-        )?;
+        );
         time::sleep(SUPERBLOCK_POLL).await;
     }
     Ok(())
@@ -327,15 +328,10 @@ async fn check_state(er: &ErCtx, label: &str, pool: &[Pubkey], records: &[Record
         let account = er
             .account(pda)
             .await?
-            .ok_or_else(|| format!("{label}: account {pda} missing on the er"))?;
+            .with_context(|| format!("{label}: account {pda} missing on the er"))?;
         let on_chain = CellHeader::written_id(&account.data)
-            .ok_or_else(|| format!("{label}: account {pda} data too short"))?;
-        check_eq!(
-            on_chain,
-            expected_id,
-            "{label}: account {pda} (lane {lane}) must hold the id of its \
-             last confirmed transaction"
-        )?;
+            .with_context(|| format!("{label}: account {pda} data too short"))?;
+        ensure!(on_chain == expected_id);
     }
     Ok(())
 }
@@ -370,14 +366,14 @@ async fn drop_lost_tail(api: &Api, label: &str, records: &mut [Record]) -> Resul
             let record = &records[index];
             match api.get_transaction(&record.signature).await? {
                 Some(tx) => {
-                    check!(
+                    ensure!(
                         tx.err.is_none(),
                         "{label}: surviving confirmed transaction {} (id {}, \
                          lane {lane}) replayed as a failure: {:?}",
                         record.signature,
                         record.id,
                         tx.err
-                    )?;
+                    );
                     break;
                 }
                 None => {
@@ -398,14 +394,14 @@ async fn check_confirmed_present(api: &Api, label: &str, records: &[Record]) -> 
     let mut checked = 0;
     for record in confirmed.iter().step_by(stride) {
         let tx = api.get_transaction(&record.signature).await?;
-        check!(
+        ensure!(
             tx.as_ref().is_some_and(|tx| tx.err.is_none()),
             "{label}: confirmed transaction {} (id {}) is no longer a \
              successful ledger entry: {:?}",
             record.signature,
             record.id,
             tx.map(|tx| tx.err)
-        )?;
+        );
         checked += 1;
     }
     Ok(checked)
@@ -414,37 +410,23 @@ async fn check_confirmed_present(api: &Api, label: &str, records: &[Record]) -> 
 fn check_exit(mode: Mode, label: &str, timing: &RestartTiming) -> Result<()> {
     match mode {
         Mode::Graceful => {
-            check!(
+            ensure!(
                 !timing.needed_sigkill,
                 "{label}: the ER did not exit on SIGTERM within the grace \
                  window and had to be SIGKILLed"
-            )?;
-            check_eq!(
-                timing.exit_code,
-                Some(0),
-                "{label}: SIGTERM did not produce a clean exit (code {:?}, \
-                 signal {:?})",
-                timing.exit_code,
-                timing.exit_signal
-            )?;
+            );
+            ensure!(timing.exit_code == Some(0));
         }
         Mode::Sigkill => {
-            check_eq!(
-                timing.exit_signal,
-                Some(SIGKILL),
-                "{label}: the ER must die from SIGKILL (code {:?}, signal \
-                 {:?})",
-                timing.exit_code,
-                timing.exit_signal
-            )?;
+            ensure!(timing.exit_signal == Some(SIGKILL));
         }
     }
     if let (Some(before), Some(after)) = (timing.slot_before, timing.slot_after) {
-        check!(
+        ensure!(
             after >= before / 2,
             "INVALID: {label}: post-restart slot {after} collapsed from \
              {before} — the ER did not reopen its database"
-        )?;
+        );
     }
     Ok(())
 }
@@ -524,20 +506,20 @@ async fn run_mode(base: &BaseCtx, profile: &Profile, mode: Mode) -> Result<ModeO
     .await?;
     let db_size_at_restart = host::dir_size_bytes(private.storage_dir())?;
     let fill_growth = db_size_at_restart.saturating_sub(storage_at_boot);
-    check!(
+    ensure!(
         fill_growth > 0,
         "INVALID: {label}: the fill phase did not grow the on-disk database"
-    )?;
+    );
 
     lanes.halt();
     let first = private.restart(mode.restart_config()).await?;
     check_exit(mode, &format!("{label} first restart"), &first)?;
     let mut records = lanes.drain().await?;
     let at_kill = Tally::of(&records);
-    check!(
+    ensure!(
         at_kill.confirmed > 0,
         "INVALID: {label}: no transaction was confirmed before the restart"
-    )?;
+    );
 
     let log_text = fs::read_to_string(private.log()).unwrap_or_default();
     let timing_visible = log_text.contains(LEDGER_TIMING_ANCHOR);
@@ -556,12 +538,7 @@ async fn run_mode(base: &BaseCtx, profile: &Profile, mode: Mode) -> Result<ModeO
     let confirmed_checked = settled.checked;
     let lost_first = settled.lost;
     let resolved = Tally::of(&records);
-    check_eq!(
-        resolved.unresolved + resolved.rejected,
-        0,
-        "{label}: every submitted transaction must reach a terminal outcome \
-         after the restart, got {resolved:?}"
-    )?;
+    ensure!((resolved.unresolved + resolved.rejected) == 0);
     check_state(
         private.ctx(),
         &format!("{label} after first restart"),
@@ -587,15 +564,11 @@ async fn run_mode(base: &BaseCtx, profile: &Profile, mode: Mode) -> Result<ModeO
     let mut resumed_records = resumed.drain().await?;
     resolve(&api, &mut resumed_records).await?;
     let resume = Tally::of(&resumed_records);
-    check!(
+    ensure!(
         resume.confirmed > 0,
         "INVALID: {label}: the resumed load confirmed nothing"
-    )?;
-    check_eq!(
-        resume.unresolved + resume.rejected + resume.dropped + resume.failed,
-        0,
-        "{label}: the resumed load must drain cleanly, got {resume:?}"
-    )?;
+    );
+    ensure!((resume.unresolved + resume.rejected + resume.dropped + resume.failed) == 0);
     records.extend(resumed_records);
     check_state(er, &format!("{label} after resume"), &pool, &records).await?;
 

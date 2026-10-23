@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     io::{ErrorKind, Read, Write},
-    net::TcpListener,
+    net::{TcpListener, TcpStream},
     rc::Rc,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -12,10 +12,11 @@ use std::{
     time::Duration,
 };
 
+use anyhow::{ensure, Context};
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    check, check_eq, dlp, topology,
+    check, dlp, topology,
     topology::{ErOptions, PrivateEr},
     BaseCtx, ChainCtx, ErCtx, PrivateErScenario, Result,
 };
@@ -50,8 +51,7 @@ pub struct MockRiskServer {
     base_url: Url,
     shutdown: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
-    risks: Arc<RwLock<HashMap<Pubkey, u64>>>,
-    requested_addresses: Arc<RwLock<Vec<Pubkey>>>,
+    service: RiskService,
 }
 
 impl MockRiskServer {
@@ -61,65 +61,15 @@ impl MockRiskServer {
         let addr = listener.local_addr()?;
         let shutdown = Arc::new(AtomicBool::new(false));
         let worker_shutdown = Arc::clone(&shutdown);
-        let risks = Arc::new(RwLock::new(HashMap::new()));
-        let requested_addresses = Arc::new(RwLock::new(Vec::new()));
-
-        let worker_risks = Arc::clone(&risks);
-        let worker_requested_addresses = Arc::clone(&requested_addresses);
-        let worker = thread::spawn(move || {
-            while !worker_shutdown.load(Ordering::SeqCst) {
-                match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        let mut buffer = [0u8; 4096];
-                        let read = stream.read(&mut buffer).unwrap_or(0);
-                        let request = String::from_utf8_lossy(&buffer[..read]);
-
-                        let body =
-                            if request.starts_with("GET /risk?") && request.contains("pubkey=") {
-                                let address = request
-                                    .split("pubkey=")
-                                    .nth(1)
-                                    .unwrap_or("")
-                                    .split(['&', ' '])
-                                    .next()
-                                    .unwrap_or("");
-                                let risk_score = if let Ok(key) = address.parse::<Pubkey>() {
-                                    worker_requested_addresses.write().unwrap().push(key);
-                                    worker_risks.read().unwrap().get(&key).copied().unwrap_or(0)
-                                } else {
-                                    0
-                                };
-                                let is_risky = risk_score >= RISK_THRESHOLD;
-                                format!(r#"{{"isRisky":{is_risky}}}"#)
-                            } else {
-                                r#"{"error":"not found"}"#.to_string()
-                            };
-                        let status = if request.starts_with("GET /risk?") {
-                            "200 OK"
-                        } else {
-                            "404 Not Found"
-                        };
-                        let response = format!(
-                            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                            body.len(),
-                            body
-                        );
-                        let _ = stream.write_all(response.as_bytes());
-                    }
-                    Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(25));
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
+        let service = RiskService::default();
+        let worker_service = service.clone();
+        let worker = thread::spawn(move || worker_service.run(listener, worker_shutdown));
 
         Ok(Self {
             base_url: format!("http://{addr}").parse()?,
             shutdown,
             worker: Some(worker),
-            risks,
-            requested_addresses,
+            service,
         })
     }
 
@@ -131,7 +81,7 @@ impl MockRiskServer {
     }
 
     pub fn set_risk(&self, address: Pubkey, risk_score: u64) {
-        self.risks.write().unwrap().insert(address, risk_score);
+        self.service.risks.write().unwrap().entry(address).or_default().score = risk_score;
     }
 
     pub fn base_url(&self) -> &Url {
@@ -139,12 +89,68 @@ impl MockRiskServer {
     }
 
     fn query_count(&self, owner: &Pubkey) -> usize {
-        self.requested_addresses
-            .read()
-            .unwrap()
-            .iter()
-            .filter(|address| *address == owner)
-            .count()
+        self.service.risks.read().unwrap().get(owner).map_or(0, |risk| risk.queries)
+    }
+}
+
+#[derive(Default)]
+struct Risk {
+    score: u64,
+    queries: usize,
+}
+
+#[derive(Clone, Default)]
+struct RiskService {
+    risks: Arc<RwLock<HashMap<Pubkey, Risk>>>,
+}
+
+impl RiskService {
+    fn run(self, listener: TcpListener, shutdown: Arc<AtomicBool>) {
+        while !shutdown.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((stream, _)) => self.respond(stream),
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(25))
+                }
+                Err(_) => break,
+            }
+        }
+    }
+
+    fn respond(&self, mut stream: TcpStream) {
+        let mut buffer = [0u8; 4096];
+        let read = stream.read(&mut buffer).unwrap_or(0);
+        let request = String::from_utf8_lossy(&buffer[..read]);
+        let body = self.body(&request);
+        let status = if request.starts_with("GET /risk?") { "200 OK" } else { "404 Not Found" };
+        let response = format!(
+            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len(),
+        );
+        let _ = stream.write_all(response.as_bytes());
+    }
+
+    fn body(&self, request: &str) -> String {
+        if !request.starts_with("GET /risk?") || !request.contains("pubkey=") {
+            return r#"{"error":"not found"}"#.to_owned();
+        }
+        let address = request
+            .split("pubkey=")
+            .nth(1)
+            .unwrap_or("")
+            .split(['&', ' '])
+            .next()
+            .unwrap_or("");
+        let risk_score = match address.parse::<Pubkey>() {
+            Ok(key) => {
+                let mut risks = self.risks.write().unwrap();
+                let risk = risks.entry(key).or_default();
+                risk.queries += 1;
+                risk.score
+            }
+            Err(_) => 0,
+        };
+        let is_risky = risk_score >= RISK_THRESHOLD;
+        format!(r#"{{"isRisky":{is_risky}}}"#)
     }
 }
 
@@ -250,11 +256,10 @@ async fn run_risk_case(
     base.submit_and_confirm(&fee_payer, &[vault_ix]).await?;
 
     let fees_vault = dlp::validator_fees_vault_pda(&er_identity);
-    check!(
+    ensure!(
         base.account(&fees_vault).await?.is_some(),
-        "the private ER identity {er_identity} has no validator fees vault on \
-         base — genesis did not supply one for this pool slot"
-    )?;
+        "validator fees vault exists on base"
+    );
 
     let _ = er_ctx.account(&source_ata).await;
     let _ = er_ctx.account(&destination_ata).await;
@@ -274,14 +279,14 @@ async fn run_risk_case(
     base.submit_and_confirm_with(&fee_payer, &[&owner], &[shuttle_ix]).await?;
 
     // Verify shuttle ATA delegation record exists on base chain
-    check!(
+    ensure!(
         delegation_record_exists(base, &shuttle_ata).await?,
-        "shuttle ATA delegation record was not created on base chain"
-    )?;
+        "shuttle delegation record exists"
+    );
 
     // 5. Wait for the risk server query
     check::poll(
-        &format!("the risk server receives the shuttle owner {owner_pk} query"),
+        "risk server queried shuttle owner",
         QUERY_TIMEOUT,
         || async { server.query_count(&owner_pk) > 0 },
     )
@@ -290,64 +295,44 @@ async fn run_risk_case(
     // The gate controls attempts. An allowed action can still fail in the
     // deployed token program; only a successful action must move the tokens.
     if expect_allowed {
-        check::poll(
-            &format!("low-risk owner {owner_pk}: a merge attempt references {shuttle_ata} and {destination_ata}"),
-            MERGE_TIMEOUT,
-            || async {
-                matches!(
-                    merge_attempt(er_ctx, &shuttle_ata, &destination_ata).await,
-                    Ok(Some(_))
-                )
-            },
-        )
+        check::poll("low-risk merge attempted", MERGE_TIMEOUT, || async {
+            matches!(
+                merge_attempt(er_ctx, &shuttle_ata, &destination_ata).await,
+                Ok(Some(_))
+            )
+        })
         .await?;
         let attempt = merge_attempt(er_ctx, &shuttle_ata, &destination_ata)
             .await?
-            .ok_or("the merge attempt vanished after the poll")?;
+            .context("merge attempt missing after poll")?;
         if attempt.is_none() {
-            check::poll(
-                &format!("low-risk owner {owner_pk}: the executed merge lands tokens in {destination_ata}"),
-                MERGE_TIMEOUT,
-                || async {
-                    matches!(
-                        er_token_amount(er_ctx, &destination_ata).await,
-                        Ok(amount) if amount == SHUTTLE_AMOUNT
-                    )
-                },
-            )
+            check::poll("low-risk merge settles", MERGE_TIMEOUT, || async {
+                matches!(
+                    er_token_amount(er_ctx, &destination_ata).await,
+                    Ok(amount) if amount == SHUTTLE_AMOUNT
+                )
+            })
             .await?;
-            check_eq!(
-                er_token_amount(er_ctx, &destination_ata).await?,
-                SHUTTLE_AMOUNT,
-                "low-risk owner {owner_pk}: the executed merge moves tokens to {destination_ata}"
-            )?;
+            ensure!(er_token_amount(er_ctx, &destination_ata).await? == SHUTTLE_AMOUNT);
         } else {
-            check_eq!(
-                er_token_amount(er_ctx, &destination_ata).await?,
-                0,
-                "low-risk owner {owner_pk}: a failed merge leaves {destination_ata} unchanged"
-            )?;
+            ensure!(er_token_amount(er_ctx, &destination_ata).await? == 0);
         }
     } else {
         check::poll(
-            &format!("high-risk owner {owner_pk}: shuttle {shuttle_ata} undelegates on base"),
+            "high-risk shuttle undelegates",
             UNDELEGATION_TIMEOUT,
             || async { !delegation_record_exists(base, &shuttle_ata).await.unwrap_or(true) },
         )
         .await?;
-        check!(
+        ensure!(
             !delegation_record_exists(base, &shuttle_ata).await?,
-            "high-risk owner {owner_pk}: shuttle {shuttle_ata} is undelegated on base"
-        )?;
-        check!(
+            "high-risk shuttle undelegated"
+        );
+        ensure!(
             merge_attempt(er_ctx, &shuttle_ata, &destination_ata).await?.is_none(),
-            "high-risk owner {owner_pk}: no merge attempt for {shuttle_ata} and {destination_ata}"
-        )?;
-        check_eq!(
-            er_token_amount(er_ctx, &destination_ata).await?,
-            0,
-            "high-risk owner {owner_pk}: the blocked merge leaves {destination_ata} unchanged"
-        )?;
+            "high-risk merge blocked"
+        );
+        ensure!(er_token_amount(er_ctx, &destination_ata).await? == 0);
     }
     Ok(())
 }

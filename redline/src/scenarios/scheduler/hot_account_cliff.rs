@@ -1,8 +1,9 @@
 use std::{rc::Rc, sync::Arc, time::Duration};
 
+use anyhow::ensure;
 use pubkey::Pubkey;
 use redsuite_core::{
-    check_eq, prep,
+    prep,
     profile::ProfileValues,
     programs::REDLINE,
     redline::{execute_kernel, Accounts},
@@ -141,12 +142,12 @@ impl Scenario<ScenarioReport> for HotAccountCliff {
                 hot_set.clone(),
                 payer_bytes.clone(),
             )?;
-            check_eq!(
+            ensure!(
+                warm.failed == 0,
+                "failures={:?}; first error={:?}",
                 warm.failed,
-                0,
-                "hot{hot} warmup failed: {:?}",
                 warm.first_error
-            )?;
+            );
             offset += profile.warmup;
             if let Some(seen) = count_before_warmup {
                 crate::await_executed(&er, seen + profile.warmup as f64, DRAIN_TIMEOUT).await?;
@@ -166,23 +167,19 @@ impl Scenario<ScenarioReport> for HotAccountCliff {
                 payer_bytes.clone(),
             )?;
             offset += profile.iterations;
-            check_eq!(
+            ensure!(
+                outcome.failed == 0,
+                "failures={:?}; first error={:?}",
                 outcome.failed,
-                0,
-                "hot{hot} deliveries failed: {:?}",
                 outcome.first_error
-            )?;
+            );
             if let Some(seen) = before.get(TX_COUNT) {
                 crate::await_executed(&er, seen + profile.iterations as f64, DRAIN_TIMEOUT).await?;
             }
             let after = er.scrape_metrics().await?;
             let delta = MetricsDelta::new(before, after);
             if let Some(failed) = delta.counter_all(metrics::FAILED_TRANSACTIONS) {
-                check_eq!(
-                    failed,
-                    0.0,
-                    "hot{hot}: transactions failed on the validator"
-                )?;
+                ensure!(failed == 0.0);
             }
 
             let cell = CellResult { hot, outcome };

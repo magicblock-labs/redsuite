@@ -6,6 +6,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+anyhow.workspace = true
 magic-api.workspace = true
 tracing = { workspace = true }
 tokio = { workspace = true }

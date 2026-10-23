@@ -1,13 +1,14 @@
 use std::{rc::Rc, time::Duration};
 
 use account::Account;
+use anyhow::{ensure, Context};
 use instruction::Instruction;
 use keypair::Keypair;
 use pubkey::Pubkey;
 
 use redsuite_core::{
-    api::TxError,
-    check, check_eq, prep,
+    api::ConfirmOptions,
+    check, prep,
     programs::{CellId, Task, MAGIC, REDSHIFT},
     topology, BaseCtx, ChainCtx, DynError, ErCtx, Result, Scenario,
 };
@@ -20,7 +21,7 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 const SCHEDULER_PROGRAM: Pubkey = topology::HYDRA_EPHEMERAL_ID;
 
 struct Actor {
-    payer: Keypair,
+    payer: Rc<Keypair>,
     cell: Pubkey,
 }
 
@@ -38,7 +39,7 @@ impl Actor {
 }
 
 async fn scheduled_actor(base: &BaseCtx, er: &ErCtx, funder: &Keypair) -> Result<Actor> {
-    let payer = base.funded_payer(PAYER_LAMPORTS).await?;
+    let payer = Rc::new(base.funded_payer(PAYER_LAMPORTS).await?);
     let cell = base
         .cells(REDSHIFT, &payer)
         .create_primary(er.identity(), prep::COMMIT_FREQUENCY_MS)
@@ -65,21 +66,17 @@ async fn await_tasks(er: &ErCtx, expected: usize) -> Result<Vec<(Pubkey, Account
         TIMEOUT,
         || async {
             let found = tasks(er).await?;
-            check_eq!(found.len(), expected, "scheduled task count")?;
+            ensure!(found.len() == expected);
             Ok::<_, DynError>(found)
         },
     )
     .await?;
     for (address, account) in &found {
-        check_eq!(
-            account.owner,
-            SCHEDULER_PROGRAM,
-            "task account {address} belongs to the scheduler program"
-        )?;
-        check!(
+        ensure!(account.owner == SCHEDULER_PROGRAM);
+        ensure!(
             !account.data.is_empty(),
             "task account {address} is materialized"
-        )?;
+        );
     }
     Ok(found)
 }
@@ -119,23 +116,12 @@ async fn cancel(er: &ErCtx, actor: &Actor, task_id: i64) -> Result<()> {
     Ok(())
 }
 
-fn tx_failure(attempt: Result<()>, context: &str) -> Result<Box<TxError>> {
-    let error = check::expect_error(attempt, context)?;
-    error
-        .downcast::<TxError>()
-        .map_err(|error| format!("{context}: expected an on-chain rejection, got {error}").into())
-}
-
 async fn test_schedule_and_cancel(er: &ErCtx, actor: &Actor) -> Result<()> {
     schedule(er, actor, 101, TASK_INTERVAL_MS, 3).await?;
     await_tasks(er, 1).await?;
     cancel(er, actor, 101).await?;
     await_tasks(er, 0).await?;
-    check_eq!(
-        er_count(er, actor).await?,
-        0,
-        "the validator itself never executes the scheduled payload"
-    )?;
+    ensure!(er_count(er, actor).await? == 0);
     Ok(())
 }
 
@@ -146,51 +132,41 @@ async fn test_reschedule(er: &ErCtx, actor: &Actor) -> Result<()> {
     await_tasks(er, 0).await?;
     schedule(er, actor, 102, 2 * TASK_INTERVAL_MS, 2).await?;
     let (readdress, replacement) = await_tasks(er, 1).await?.remove(0);
-    check_eq!(
-        readdress,
-        address,
-        "a reused task id maps to the same task account"
-    )?;
-    check!(
+    ensure!(readdress == address);
+    ensure!(
         replacement.data != original.data,
         "the reused task id carries the new schedule"
-    )?;
+    );
     cancel(er, actor, 102).await?;
     await_tasks(er, 0).await?;
     Ok(())
 }
 
 async fn test_signed_refusal(er: &ErCtx, actor: &Actor) -> Result<()> {
-    let error = tx_failure(
-        er.submit_and_confirm(
-            &actor.payer,
-            &[actor.schedule(
-                Task {
-                    id: 103,
-                    interval_ms: TASK_INTERVAL_MS,
-                    iterations: 3,
-                },
-                REDSHIFT
-                    .batch()
-                    .add(&[actor.cell], 1)
-                    .require_signer(actor.payer.pubkey())
-                    .build(),
-            )],
-        )
-        .await
-        .map(drop),
-        "signed task payload",
-    )?;
+    let signature = er
+        .sender(actor.payer.clone())
+        .submit(&[actor.schedule(
+            Task {
+                id: 103,
+                interval_ms: TASK_INTERVAL_MS,
+                iterations: 3,
+            },
+            REDSHIFT
+                .batch()
+                .add(&[actor.cell], 1)
+                .require_signer(actor.payer.pubkey())
+                .build(),
+        )])
+        .await?;
+    let Err(error) = er.api().try_confirm(&signature, ConfirmOptions::default()).await? else {
+        anyhow::bail!("signed task payload unexpectedly succeeded");
+    };
     let detail = format!("{:?}", error.err);
-    check!(
+    ensure!(
         detail.contains("MissingRequiredSignature"),
         "a task payload with a signer is refused as MissingRequiredSignature: {detail}"
-    )?;
-    check_eq!(
-        tasks(er).await?.len(),
-        0,
-        "a refused schedule creates no task account"
-    )?;
+    );
+    ensure!(tasks(er).await?.len() == 0);
     Ok(())
 }
 
@@ -205,16 +181,16 @@ async fn test_authority_isolation(
     let owners = await_tasks(er, 1).await?;
     schedule(er, &other, 106, 2 * TASK_INTERVAL_MS, 3).await?;
     let both = await_tasks(er, 2).await?;
-    check!(
+    ensure!(
         both.iter().any(|(address, _)| *address == owners[0].0),
-        "another authority scheduling the same task id leaves the original task untouched"
-    )?;
+        "task ID isolated by authority"
+    );
     cancel(er, owner, 106).await?;
     let remaining = await_tasks(er, 1).await?;
-    check!(
+    ensure!(
         remaining[0].0 != owners[0].0,
         "cancelling by the owner removes only the owner's task"
-    )?;
+    );
     cancel(er, &other, 106).await?;
     await_tasks(er, 0).await?;
     Ok(())
@@ -232,7 +208,7 @@ async fn sponsor_balance(er: &ErCtx) -> Result<u64> {
     Ok(er
         .account(&er.identity())
         .await?
-        .ok_or("the validator identity is missing on the ER")?
+        .context("the validator identity is missing on the ER")?
         .lamports)
 }
 
@@ -246,10 +222,10 @@ async fn test_sponsor_refund(er: &ErCtx, actor: &Actor) -> Result<()> {
     schedule(er, actor, 109, TASK_INTERVAL_MS, 3).await?;
     await_tasks(er, 1).await?;
     let funded = sponsor_balance(er).await?;
-    check!(
+    ensure!(
         funded < before,
         "the validator identity sponsors the scheduled task ({funded} < {before})"
-    )?;
+    );
     cancel(er, actor, 109).await?;
     await_tasks(er, 0).await?;
     check::poll(
@@ -270,16 +246,12 @@ pub struct TaskScheduler {
 
 impl Scenario for TaskScheduler {
     async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
-        check!(
+        ensure!(
             matches!(base.account(&SCHEDULER_PROGRAM).await?, Some(program) if program.executable),
             "the base chain hosts the ephemeral scheduler program"
-        )?;
+        );
         let funder = base.funded_payer(PAYER_LAMPORTS).await?;
-        check_eq!(
-            tasks(&er).await?.len(),
-            0,
-            "the ER holds no scheduled tasks before the scenario"
-        )?;
+        ensure!(tasks(&er).await?.len() == 0);
 
         let actor = scheduled_actor(&base, &er, &funder).await?;
         Ok(Self { base, er, funder, actor })

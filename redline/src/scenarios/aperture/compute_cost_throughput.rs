@@ -1,8 +1,8 @@
 use std::{cell::RefCell, rc::Rc, sync::Arc, time::Duration};
 
+use anyhow::{ensure, Context};
 use pubkey::Pubkey;
 use redsuite_core::{
-    check, check_eq,
     profile::ProfileValues,
     programs::{CellHeader, HashState, REDLINE},
     redline::{causal, Accounts},
@@ -107,12 +107,12 @@ async fn run_cell(
         warmup_request,
     )
     .await?;
-    check_eq!(
+    ensure!(
+        warm.failed == 0,
+        "failures={:?}; first error={:?}",
         warm.failed,
-        0,
-        "{label} warmup deliveries failed: {:?}",
         warm.first_error
-    )?;
+    );
     if let Some(seen) = count_before_warmup {
         crate::await_executed(er, seen + profile.warmup as f64, DRAIN_TIMEOUT).await?;
     }
@@ -161,12 +161,12 @@ async fn run_cell(
         request,
     )
     .await?;
-    check_eq!(
+    ensure!(
+        outcome.failed == 0,
+        "failures={:?}; first error={:?}",
         outcome.failed,
-        0,
-        "{label} measured deliveries failed: {:?}",
         outcome.first_error
-    )?;
+    );
     let drain = match before.get(TX_COUNT) {
         Some(seen) => {
             crate::await_executed(er, seen + profile.iterations as f64, DRAIN_TIMEOUT).await?
@@ -174,22 +174,17 @@ async fn run_cell(
         None => Duration::ZERO,
     };
 
-    let probe_sig = probe.borrow().as_ref().cloned().ok_or("no probe signature captured")?;
+    let probe_sig = probe.borrow().as_ref().cloned().context("no probe signature captured")?;
     let probe_cus = crate::probe_cus(er, &probe_sig, label, iters).await?;
 
     updates.await_settled(SETTLE_TIMEOUT).await?;
     let after = er.scrape_metrics().await?;
     let delta = MetricsDelta::new(before, after);
     if let Some(failed) = delta.counter_all(metrics::FAILED_TRANSACTIONS) {
-        check_eq!(failed, 0.0, "{label}: transactions failed on the validator")?;
+        ensure!(failed == 0.0);
     }
     let update_outcome = updates.finalize();
-    check_eq!(
-        update_outcome.observed + update_outcome.superseded,
-        profile.iterations as usize,
-        "{label}: every tracked write must be observed or superseded — \
-         missing updates mean transactions executed without writing"
-    )?;
+    ensure!((update_outcome.observed + update_outcome.superseded) == (profile.iterations as usize));
 
     Ok(Cell {
         label,
@@ -286,32 +281,23 @@ impl Scenario<ScenarioReport> for ComputeCostThroughput {
             if last_id < heavy_start {
                 continue;
             }
-            let on_er = er.account(pda).await?.ok_or("pda not on er")?;
-            check_eq!(
-                CellHeader::written_id(&on_er.data),
-                Some(last_id),
-                "er copy must hold the last id written to pda {index}"
-            )?;
+            let on_er = er.account(pda).await?.context("pda not on er")?;
+            ensure!(CellHeader::written_id(&on_er.data) == Some(last_id));
             let hash_bytes =
                 &on_er.data[layout::HASH_OFFSET..layout::HASH_OFFSET + layout::HASH_SIZE];
-            check_eq!(
-                hash_bytes,
-                expected_hash,
-                "pda {index} must hold the full {HEAVY_ITERS}-iteration hash \
-                 chain"
-            )?;
+            ensure!(hash_bytes == expected_hash);
         }
 
         let light = &cells[0];
         let heavy = &cells[1];
         let cu_ratio = heavy.probe_cus / light.probe_cus;
-        check!(
+        ensure!(
             cu_ratio >= CU_CONTRAST_FLOOR,
             "heavy cell consumed {:.0} cus per tx vs light {:.0} — not the \
              >= {CU_CONTRAST_FLOOR}x compute contrast this scenario is about",
             heavy.probe_cus,
-            light.probe_cus,
-        )?;
+            light.probe_cus
+        );
         let validator_avg_ratio = match (light.validator_avg_us, heavy.validator_avg_us) {
             (Some(light_avg), Some(heavy_avg)) if light_avg > 0.0 => Some(heavy_avg / light_avg),
             _ => None,

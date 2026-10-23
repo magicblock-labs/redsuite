@@ -1,11 +1,12 @@
 use std::{collections::BTreeSet, fmt::Debug, future::Future, rc::Rc, result, time::Duration};
 
+use anyhow::{anyhow, ensure, Context};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use futures_util::future::join_all;
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    check, check_eq,
+    check,
     rpc_client::nonblocking::rpc_client::RpcClient,
     rpc_client_api::{
         client_error::Error,
@@ -108,7 +109,7 @@ fn read_delegate(data: &[u8]) -> Option<Pubkey> {
 fn raw_data(account: &UiAccount) -> Result<Vec<u8>> {
     match &account.data {
         UiAccountData::Binary(encoded, UiAccountEncoding::Base64) => Ok(STANDARD.decode(encoded)?),
-        other => Err(format!("expected base64 account data, got {other:?}").into()),
+        other => Err(anyhow!("expected base64 account data, got {other:?}")),
     }
 }
 
@@ -132,11 +133,7 @@ fn parsed_str(info: &Value, path: &[&str]) -> Option<String> {
 fn token_view(account: &UiAccount) -> Result<TokenView> {
     match &account.data {
         UiAccountData::Json(parsed) => {
-            check_eq!(
-                parsed.program.as_str(),
-                "spl-token",
-                "jsonParsed token accounts must be attributed to spl-token"
-            )?;
+            ensure!(parsed.program.as_str() == "spl-token");
             let info = &parsed.parsed["info"];
             let key = |path: &[&str]| -> Option<Pubkey> {
                 parsed_str(info, path).and_then(|s| s.parse().ok())
@@ -155,11 +152,7 @@ fn token_view(account: &UiAccount) -> Result<TokenView> {
         }
         UiAccountData::Binary(_, UiAccountEncoding::Base64) => {
             let data = raw_data(account)?;
-            check_eq!(
-                data.len(),
-                spl::TOKEN_ACCOUNT_LEN,
-                "base64 token account data length"
-            )?;
+            ensure!(data.len() == spl::TOKEN_ACCOUNT_LEN);
             let delegate = read_delegate(&data);
             Ok(TokenView {
                 encoding: "base64",
@@ -170,7 +163,7 @@ fn token_view(account: &UiAccount) -> Result<TokenView> {
                 delegated_amount: delegate.and_then(|_| read_u64(&data, DELEGATED_AMOUNT_OFFSET)),
             })
         }
-        other => Err(format!("unsupported token account encoding {other:?}").into()),
+        other => Err(anyhow!("unsupported token account encoding {other:?}")),
     }
 }
 
@@ -183,24 +176,16 @@ fn check_token_account(
     delegate: Option<(&Pubkey, u64)>,
 ) -> Result<&'static str> {
     let view = token_view(&entry.account)?;
-    check_eq!(
-        entry.account.owner,
-        spl::token_program().to_string(),
-        "{label}: token account owner program"
-    )?;
-    check_eq!(view.mint, Some(*mint), "{label}: mint")?;
-    check_eq!(view.owner, Some(*owner), "{label}: owner")?;
-    check_eq!(view.amount, Some(amount), "{label}: amount")?;
+    ensure!(entry.account.owner == spl::token_program().to_string());
+    ensure!(view.mint == Some(*mint));
+    ensure!(view.owner == Some(*owner));
+    ensure!(view.amount == Some(amount));
     match delegate {
         Some((delegate, delegated_amount)) => {
-            check_eq!(view.delegate, Some(*delegate), "{label}: delegate")?;
-            check_eq!(
-                view.delegated_amount,
-                Some(delegated_amount),
-                "{label}: delegated amount"
-            )?;
+            ensure!(view.delegate == Some(*delegate));
+            ensure!(view.delegated_amount == Some(delegated_amount));
         }
-        None => check!(view.delegate.is_none(), "{label}: no delegate expected")?,
+        None => ensure!(view.delegate.is_none(), "{label}: no delegate expected"),
     }
     Ok(view.encoding)
 }
@@ -236,12 +221,7 @@ async fn run_query(client: &RpcClient, fixture: &Fixture, query: Query) -> Resul
                 .await?;
             let listed: BTreeSet<String> =
                 accounts.iter().map(|(pubkey, _)| pubkey.to_string()).collect();
-            check_eq!(
-                listed,
-                expected(&[fixture.ata_a, fixture.ata_b]),
-                "getProgramAccounts filtered by mint must list exactly the \
-                 materialized token accounts of that mint"
-            )?;
+            ensure!(listed == expected(&[fixture.ata_a, fixture.ata_b]));
             for (pubkey, account) in accounts {
                 let (owner, amount, delegate) = if pubkey == fixture.ata_a {
                     (
@@ -256,18 +236,16 @@ async fn run_query(client: &RpcClient, fixture: &Fixture, query: Query) -> Resul
                     pubkey: pubkey.to_string(),
                     account,
                 };
-                check_eq!(
+                ensure!(
                     check_token_account(
                         &format!("getProgramAccounts {pubkey}"),
                         &entry,
                         &fixture.mint,
                         &owner,
                         amount,
-                        delegate
-                    )?,
-                    "base64",
-                    "getProgramAccounts supplies raw token bytes for {pubkey}"
-                )?;
+                        delegate,
+                    )? == "base64"
+                );
             }
         }
         Query::ProgramAccountsByOwner => {
@@ -285,12 +263,7 @@ async fn run_query(client: &RpcClient, fixture: &Fixture, query: Query) -> Resul
                 .await?;
             let listed: BTreeSet<String> =
                 accounts.iter().map(|(pubkey, _)| pubkey.to_string()).collect();
-            check_eq!(
-                listed,
-                expected(&[fixture.ata_a, fixture.ata_a_other]),
-                "getProgramAccounts filtered by owner must list both of owner \
-                 A's materialized token accounts"
-            )?;
+            ensure!(listed == expected(&[fixture.ata_a, fixture.ata_a_other]));
         }
         Query::BalanceA | Query::BalanceB => {
             let (ata, amount) = match query {
@@ -299,16 +272,8 @@ async fn run_query(client: &RpcClient, fixture: &Fixture, query: Query) -> Resul
             };
             let balance =
                 client.get_token_account_balance_with_commitment(&ata, confirmed()).await?.value;
-            check_eq!(
-                balance.amount,
-                amount.to_string(),
-                "getTokenAccountBalance amount for {ata}"
-            )?;
-            check_eq!(
-                balance.decimals,
-                0,
-                "getTokenAccountBalance decimals for {ata}"
-            )?;
+            ensure!(balance.amount == amount.to_string());
+            ensure!(balance.decimals == 0);
         }
         Query::OwnerAByMint
         | Query::OwnerAByProgram
@@ -341,11 +306,7 @@ async fn run_query(client: &RpcClient, fixture: &Fixture, query: Query) -> Resul
                 .get_token_accounts_by_owner_with_commitment(&owner, filter, confirmed())
                 .await?
                 .value;
-            check_eq!(
-                keys(&accounts),
-                expected(&wanted),
-                "{label}: exactly the materialized accounts"
-            )?;
+            ensure!(keys(&accounts) == expected(&wanted));
             for entry in &accounts {
                 let (mint, amount, delegate) = if entry.pubkey == fixture.ata_a.to_string() {
                     (
@@ -374,12 +335,7 @@ async fn run_query(client: &RpcClient, fixture: &Fixture, query: Query) -> Resul
                 )
                 .await?
                 .value;
-            check_eq!(
-                keys(&accounts),
-                expected(&[fixture.ata_a]),
-                "getTokenAccountsByDelegate must list exactly the account \
-                 approved to the delegate"
-            )?;
+            ensure!(keys(&accounts) == expected(&[fixture.ata_a]));
             check_token_account(
                 "getTokenAccountsByDelegate",
                 &accounts[0],
@@ -400,16 +356,16 @@ where
 {
     let outcome = time::timeout(NEGATIVE_DEADLINE, call)
         .await
-        .map_err(|_| format!("{label} did not answer within {NEGATIVE_DEADLINE:?}"))?;
+        .with_context(|| format!("{label} did not answer within {NEGATIVE_DEADLINE:?}"))?;
     match outcome {
-        Ok(value) => Err(format!("{label} must be rejected, got {value:?}").into()),
+        Ok(value) => Err(anyhow!("{label} must be rejected, got {value:?}")),
         Err(error) => {
-            let message = error.to_string();
-            check!(
+            let message = format!("{error:#}");
+            ensure!(
                 needles.iter().any(|needle| message.contains(needle)),
                 "{label} must be rejected with one of {needles:?}, got \
                  {message:?}"
-            )?;
+            );
             Ok(())
         }
     }
@@ -567,7 +523,7 @@ impl Scenario for RpcTokenQueries {
         );
         let outcomes = time::timeout(BURST_DEADLINE, reads)
             .await
-            .map_err(|_| format!("the burst of {READS} reads exceeded {BURST_DEADLINE:?}"))?;
+            .with_context(|| format!("the burst of {READS} reads exceeded {BURST_DEADLINE:?}"))?;
         let mut failures = 0u64;
         let mut first_failure = None;
         for (index, outcome) in outcomes.iter().enumerate() {
@@ -576,16 +532,17 @@ impl Scenario for RpcTokenQueries {
                 Err(error) => {
                     failures += 1;
                     first_failure.get_or_insert_with(|| {
-                        format!("read {index} ({}) failed: {error}", index % CYCLE.len())
+                        format!("read {index} ({}) failed: {error:#}", index % CYCLE.len())
                     });
                 }
             }
         }
-        check_eq!(
+        ensure!(
+            failures == 0,
+            "failures={:?}; first error={:?}",
             failures,
-            0,
-            "every read in the burst must succeed and agree; first failure: {first_failure:?}"
-        )?;
+            first_failure
+        );
 
         let missing_mint = Keypair::new().pubkey();
         let bogus_program = Keypair::new().pubkey();

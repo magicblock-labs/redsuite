@@ -1,9 +1,10 @@
 use std::{path::Path, rc::Rc, time::Duration};
 
+use anyhow::ensure;
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    check, check_eq, host,
+    check, host,
     profile::ProfileValues,
     programs::REDLINE,
     redline::Accounts,
@@ -173,12 +174,12 @@ impl Scenario<ScenarioReport> for StorageProdsizeSustain {
                 },
             )
             .await?;
-            check_eq!(
+            ensure!(
+                fill.failed == 0,
+                "failures={:?}; first error={:?}",
                 fill.failed,
-                0,
-                "{cell_name}: fill deliveries failed: {:?}",
                 fill.first_error
-            )?;
+            );
             check::poll(
                 &format!(
                     "{cell_name}: the ledger records the {} fill transactions",
@@ -284,13 +285,12 @@ impl Scenario<ScenarioReport> for StorageProdsizeSustain {
 
         for cell in &cells {
             for window in &cell.windows {
-                check_eq!(
+                ensure!(
+                    window.outcome.failed == 0,
+                    "failures={:?}; first error={:?}",
                     window.outcome.failed,
-                    0,
-                    "{}: measured deliveries failed: {:?}",
-                    cell.name,
                     window.outcome.first_error
-                )?;
+                );
             }
             let window_a_p50_us = cell.windows[0].outcome.delivery.median.max(1) as f64;
             let window_b_p50_us = cell.windows[1].outcome.delivery.median as f64;

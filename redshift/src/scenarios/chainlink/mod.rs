@@ -1,3 +1,4 @@
+use anyhow::ensure;
 pub mod account_info_semantics;
 pub mod activation_single_shot;
 pub mod aml_gate;
@@ -15,7 +16,7 @@ pub mod undelegation_grpc_redundancy;
 use std::time::Duration;
 
 use pubkey::Pubkey;
-use redsuite_core::{check, check_eq, ErCtx, Result};
+use redsuite_core::{check, ErCtx, Result};
 
 use crate::ACCOUNT_OWNERS;
 
@@ -32,15 +33,10 @@ async fn await_local_value(
     timeout: Duration,
 ) -> Result<()> {
     check::poll_for(what, timeout, || async {
-        for (key, account) in keys.iter().zip(er.local_accounts(&ACCOUNT_OWNERS, keys).await?) {
-            check_eq!(
-                crate::account_id(account),
-                Some(expected),
-                "local value of {key}"
-            )?;
+        for account in er.local_accounts(&ACCOUNT_OWNERS, keys).await? {
+            ensure!(crate::account_id(account) == Some(expected));
         }
         Result::Ok(())
     })
     .await
-    .map_err(Into::into)
 }

@@ -4,10 +4,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+use anyhow::{ensure, Context};
 use instruction::Instruction;
 use pubkey::Pubkey;
 use redsuite_core::{
-    check, check_eq, host, prep,
+    check, host, prep,
     profile::ProfileValues,
     programs::{CellHeader, HashState, REDLINE},
     redline::{causal, Accounts},
@@ -307,18 +308,14 @@ struct DrainState {
 async fn drain(er: &ErCtx, target: f64) -> Result<DrainState> {
     let started = Instant::now();
     crate::await_executed(er, target, DRAIN_TIMEOUT).await?;
-    check::poll(
-        "the execution pipeline goes idle (nothing blocked, busy or pending)",
-        SETTLE_TIMEOUT,
-        || async {
-            let Ok(metrics) = er.scrape_metrics().await else {
-                return false;
-            };
-            [BLOCKED_TRANSACTIONS, BUSY_EXECUTORS, PENDING_TRANSACTIONS]
-                .iter()
-                .all(|name| metrics.value_sum(name).unwrap_or_default() == 0.0)
-        },
-    )
+    check::poll("execution pipeline idle", SETTLE_TIMEOUT, || async {
+        let Ok(metrics) = er.scrape_metrics().await else {
+            return false;
+        };
+        [BLOCKED_TRANSACTIONS, BUSY_EXECUTORS, PENDING_TRANSACTIONS]
+            .iter()
+            .all(|name| metrics.value_sum(name).unwrap_or_default() == 0.0)
+    })
     .await?;
     let metrics = er.scrape_metrics().await?;
     Ok(DrainState {
@@ -342,44 +339,29 @@ async fn verify_final_state(
         let Some(last_id) = last_ids[index] else {
             continue;
         };
-        let account = er.account(pda).await?.ok_or("pda not on er")?;
+        let account = er.account(pda).await?.context("pda not on er")?;
         let data = &account.data;
         let mode = mode_for(last_id);
-        check_eq!(
-            CellHeader::written_id(data),
-            Some(last_id),
-            "lane {index} must hold id {last_id}, the last {} write",
-            mode.label()
-        )?;
+        ensure!(CellHeader::written_id(data) == Some(last_id));
         match mode {
             Mode::PatternWrite => {
                 let filled = data[layout::DATA_OFFSET..]
                     .chunks_exact(layout::ID_SIZE)
                     .all(|chunk| chunk == last_id.to_le_bytes());
-                check!(
+                ensure!(
                     filled,
                     "lane {index} must be filled with the repeated id \
                      {last_id} — the last pattern write did not land"
-                )?;
+                );
             }
             Mode::HashCompute => {
                 let hash = &data[layout::HASH_OFFSET..layout::HASH_OFFSET + layout::HASH_SIZE];
-                check_eq!(
-                    hash,
-                    expected_hash,
-                    "lane {index} must hold the {hash_iters}-iteration \
-                     hash chain from id {last_id}"
-                )?;
+                ensure!(hash == expected_hash);
             }
             Mode::AccountSizeSum => {
                 let offset = layout::DATA_OFFSET;
                 let sum = &data[offset..offset + 8];
-                check_eq!(
-                    sum,
-                    expected_sum.to_le_bytes(),
-                    "lane {index} must hold the {read_span}-account read-set \
-                     size from id {last_id}"
-                )?;
+                ensure!(sum == expected_sum.to_le_bytes());
             }
         }
     }
@@ -415,35 +397,29 @@ impl Workload {
     pub(crate) async fn setup(base: &BaseCtx, er: &ErCtx) -> Result<Self> {
         let profile = PROFILES.select(base.config().profile);
 
-        check_eq!(
-            gcd(profile.lanes, MIX_PERIOD),
-            1,
-            "profile {}: lanes must be coprime with the {MIX_PERIOD}-slot mix \
-             period so every lane sees every mode",
-            profile.name
-        )?;
-        check!(
+        ensure!(gcd(profile.lanes, MIX_PERIOD) == 1);
+        ensure!(
             profile.lanes >= profile.threads as u64,
             "profile {}: lanes ({}) must cover every one of the {} driver threads",
             profile.name,
             profile.lanes,
             profile.threads
-        )?;
-        check!(
+        );
+        ensure!(
             profile.payers >= profile.threads,
             "profile {}: payers ({}) must cover every one of the {} driver \
              threads — a thread with no payer cannot send",
             profile.name,
             profile.payers,
             profile.threads
-        )?;
-        check!(
+        );
+        ensure!(
             (profile.read_span as u64) < profile.lanes,
             "profile {}: read span ({}) must stay below the lane count ({})",
             profile.name,
             profile.read_span,
             profile.lanes
-        )?;
+        );
 
         let payers = base.funded_payers(profile.payers, PAYER_LAMPORTS).await?;
         let pool = Accounts::new(ACCOUNT_SPACE, er.identity())
@@ -473,20 +449,22 @@ impl Workload {
         let threads = profile.threads.min(rate as usize).min(concurrency);
 
         let before = er.scrape_metrics().await?;
-        let engine_txs_before = before.get(metrics::ENGINE_TRANSACTIONS).ok_or(format!(
-            "the ER exposes no {} metric to drain against",
-            metrics::ENGINE_TRANSACTIONS
-        ))?;
+        let engine_txs_before = before.get(metrics::ENGINE_TRANSACTIONS).with_context(|| {
+            format!(
+                "the ER exposes no {} metric to drain against",
+                metrics::ENGINE_TRANSACTIONS
+            )
+        })?;
         let cpu_before = host::cpu_sample(er_pid)?;
         let rss_before = host::rss_kb(er_pid)?;
 
         let setup = started.elapsed();
         let limit = match load {
             Some(load) => {
-                check!(!load.duration.is_zero(), "load duration must be positive")?;
+                ensure!(!load.duration.is_zero(), "load duration must be positive");
                 let deadline = Instant::now()
                     .checked_add(load.duration)
-                    .ok_or("load duration exceeds monotonic clock range")?;
+                    .context("load duration exceeds monotonic clock range")?;
                 info!(rate, concurrency, ?load.duration, "load generation started");
                 Limit::Until {
                     deadline,
@@ -563,35 +541,19 @@ impl Workload {
         }
         let validation = async {
             if load.is_none() {
-                check_eq!(
-                    total,
-                    profile.iterations,
-                    "every benchmark iteration must be admitted"
-                )?;
+                ensure!(total == profile.iterations);
                 for mode in Mode::ALL {
-                    check_eq!(
-                        counts[mode as usize],
-                        mode_count(mode, total),
-                        "worker mix accounting must match the benchmark prefix"
-                    )?;
+                    ensure!(counts[mode as usize] == mode_count(mode, total));
                 }
             }
-            check_eq!(
-                counts.iter().sum::<u64>(),
-                total,
-                "the per-mode split must account for every transaction"
-            )?;
-            check_eq!(
+            ensure!(counts.iter().sum::<u64>() == total);
+            ensure!(
+                outcome.failed == 0,
+                "failures={:?}; first error={:?}",
                 outcome.failed,
-                0,
-                "deliveries failed: {:?}",
                 outcome.first_error
-            )?;
-            check_eq!(
-                outcome.delivered,
-                total,
-                "every workload transaction must be delivered"
-            )?;
+            );
+            ensure!(outcome.delivered == total);
 
             let drained = drain(er, engine_txs_before + total as f64).await?;
             let cpu_after = host::cpu_sample(er_pid)?;
@@ -636,28 +598,17 @@ impl Workload {
                     delta.counter(ORDERING_DEPENDENCIES),
                 );
             report.measurements.extend(observations.measurements);
-            check!(
+            ensure!(
                 engine_txs >= total as f64,
                 "the engine executed {engine_txs:.0} transactions, fewer than the \
              {total} delivered by the workload"
-            )?;
+            );
 
             if let Some(rpc_handled) = rpc_handled {
-                check_eq!(
-                    rpc_handled,
-                    total as f64,
-                    "the RPC layer handled {rpc_handled:.0} sendTransaction calls, \
-                 not the {total} the workload submitted"
-                )?;
+                ensure!(rpc_handled == (total as f64));
             }
             if let Some(rpc_accepted) = rpc_accepted {
-                check_eq!(
-                    rpc_accepted,
-                    total as f64,
-                    "the RPC layer accepted {rpc_accepted:.0} of the {total} \
-                 transactions the workload submitted — the rest failed decode, \
-                 sanitization or account ensure before reaching the engine"
-                )?;
+                ensure!(rpc_accepted == (total as f64));
             }
 
             verify_final_state(er, &pool, &last_ids, profile.hash_iters, profile.read_span).await?;

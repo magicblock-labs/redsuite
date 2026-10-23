@@ -5,6 +5,7 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
+use anyhow::Context;
 use json::{Deserialize, Serialize};
 
 use super::{CampaignMeta, ScenarioRun};
@@ -55,9 +56,8 @@ pub fn persist(parent: Option<&str>, run: ScenarioRun) -> Result<PathBuf> {
 
 pub fn load() -> Result<Campaign> {
     let root = super::reports_dir();
-    let run = fs::read_to_string(root.join("latest")).map_err(|error| {
-        format!("cannot read latest report campaign; run a scenario first: {error}")
-    })?;
+    let run = fs::read_to_string(root.join("latest"))
+        .context("cannot read latest report campaign; run a scenario first")?;
     Ok(json::from_str(&fs::read_to_string(
         root.join(run).join("campaign.json"),
     )?)?)

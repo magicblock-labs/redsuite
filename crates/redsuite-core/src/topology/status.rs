@@ -6,6 +6,7 @@ use std::{
 
 use super::{process, state};
 use crate::Result;
+use anyhow::Context;
 
 const STACK_STORAGE: &[&str] = &["base-ledger", "genesis-accounts"];
 
@@ -114,7 +115,7 @@ fn sweep(dir: &Path) -> Result<Vec<PathBuf>> {
             }
             fs::remove_file(&path)
         };
-        outcome.map_err(|error| format!("removing stack storage {}: {error}", path.display()))?;
+        outcome.with_context(|| format!("removing stack storage {}", path.display()))?;
         removed.push(path);
     }
     Ok(removed)

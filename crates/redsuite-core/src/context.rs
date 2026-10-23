@@ -7,6 +7,7 @@ use std::{
 };
 
 use account::Account;
+use anyhow::Context;
 use hash::Hash;
 use instruction::Instruction;
 use keypair::Keypair;
@@ -232,7 +233,7 @@ impl BaseCtx {
 
     /// Persists a benchmark cell under this run without making it fatal on I/O failure.
     pub fn report_cell(&self, label: &str, report: &ScenarioReport) -> Result<()> {
-        let name = self.scenario.as_deref().ok_or("cell report outside a scenario run")?;
+        let name = self.scenario.as_deref().context("cell report outside a scenario run")?;
         report::persist_cell(name, label, report);
         Ok(())
     }
@@ -320,7 +321,7 @@ impl ErCtx {
         self.owner
             .as_ref()
             .and_then(Weak::upgrade)
-            .ok_or("only a group ER is restartable through its context")?
+            .context("only a group ER is restartable through its context")?
             .lock()
             .await
             .restart(config)
@@ -375,7 +376,7 @@ async fn airdrop_and_confirm(api: &Api, pk: &Pubkey, lamports: u64) -> Result<()
         )
     })
     .await?
-    .ok_or_else(|| format!("airdrop of {lamports} lamports to {pk} not confirmed").into())
+    .with_context(|| format!("airdrop of {lamports} lamports to {pk} not confirmed"))
 }
 
 impl ChainCtx for BaseCtx {

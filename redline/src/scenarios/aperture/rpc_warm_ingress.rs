@@ -1,8 +1,8 @@
 use std::{rc::Rc, sync::Arc, time::Duration};
 
+use anyhow::{ensure, Context};
 use pubkey::Pubkey;
 use redsuite_core::{
-    check_eq,
     profile::{LoopMode, ProfileValues},
     programs::{CellHeader, REDLINE},
     redline::Accounts,
@@ -93,12 +93,12 @@ impl Scenario<ScenarioReport> for WarmIngress {
             },
         )
         .await?;
-        check_eq!(
+        ensure!(
+            warmup.failed == 0,
+            "failures={:?}; first error={:?}",
             warmup.failed,
-            0,
-            "warmup deliveries failed: {:?}",
             warmup.first_error
-        )?;
+        );
 
         let offset = profile.warmup;
         let clock = Arc::new(SendClock::new(offset + 1, profile.iterations as usize));
@@ -139,7 +139,9 @@ impl Scenario<ScenarioReport> for WarmIngress {
                     updates.await_id(id).await
                 })
                 .await
-                .map_err(|_| format!("confirmations for id {id} not within {CONFIRM_TIMEOUT:?}"))?
+                .with_context(|| {
+                    format!("confirmations for id {id} not within {CONFIRM_TIMEOUT:?}")
+                })?
             }
         };
         let cfg = RunConfig {
@@ -156,12 +158,12 @@ impl Scenario<ScenarioReport> for WarmIngress {
         } else {
             execute(cfg, request).await?
         };
-        check_eq!(
+        ensure!(
+            outcome.failed == 0,
+            "failures={:?}; first error={:?}",
             outcome.failed,
-            0,
-            "measured iterations failed: {:?}",
             outcome.first_error
-        )?;
+        );
 
         // open loop drains here; a closed loop has already settled per id
         sigs.await_all(CONFIRM_TIMEOUT).await?;
@@ -176,54 +178,36 @@ impl Scenario<ScenarioReport> for WarmIngress {
         // nothing-failed-on-chain invariant
         if let Some(processed) = delta.counter(metrics::ENGINE_TRANSACTIONS) {
             if processed < profile.iterations as f64 {
-                warn!(
-                    processed,
-                    profile.iterations,
-                    "validator transaction count below expected total in scrape window",
-                );
+                warn!(processed, profile.iterations, "validator transaction count",);
             }
         }
         if let Some(failed) = delta.counter_all(metrics::FAILED_TRANSACTIONS) {
-            check_eq!(failed, 0.0, "transactions failed on the validator")?;
+            ensure!(failed == 0.0);
         }
 
         let update_outcome = updates.finalize();
-        check_eq!(
-            update_outcome.observed + update_outcome.superseded,
-            profile.iterations as usize,
-            "every tracked write must be observed or superseded"
-        )?;
+        ensure!(
+            (update_outcome.observed + update_outcome.superseded) == (profile.iterations as usize)
+        );
         let sig_outcome = sigs.finalize();
-        check_eq!(
+        ensure!(
+            sig_outcome.failed == 0,
+            "failures={:?}; first error={:?}",
             sig_outcome.failed,
-            0,
-            "transactions failed on-chain: {:?}",
             sig_outcome.first_failure
-        )?;
-        check_eq!(
-            sig_outcome.unconfirmed,
-            0,
-            "signatures unconfirmed after {CONFIRM_TIMEOUT:?}"
-        )?;
-        check_eq!(
-            sig_outcome.confirmed,
-            profile.iterations as usize,
-            "every measured tx must confirm"
-        )?;
+        );
+        ensure!(sig_outcome.unconfirmed == 0);
+        ensure!(sig_outcome.confirmed == (profile.iterations as usize));
 
-        for (idx, pda) in pdas.iter().enumerate() {
+        for pda in pdas.iter() {
             let last_id = (offset + 1..=offset + profile.iterations)
                 .rev()
                 .find(|&id| REDLINE.copy_three(&pdas, id).1.contains(pda));
             let Some(last_id) = last_id else {
                 continue;
             };
-            let on_er = er.account(pda).await?.ok_or("pda not on er")?;
-            check_eq!(
-                CellHeader::written_id(&on_er.data),
-                Some(last_id),
-                "er copy must hold the last id written to pda {idx}"
-            )?;
+            let on_er = er.account(pda).await?.context("pda not on er")?;
+            ensure!(CellHeader::written_id(&on_er.data) == Some(last_id));
         }
 
         let mut report = ScenarioReport::ok()

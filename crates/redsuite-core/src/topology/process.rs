@@ -1,7 +1,5 @@
 use std::{
-    env,
-    fmt::Display,
-    fs,
+    env, fs,
     fs::{File, OpenOptions, TryLockError},
     future::Future,
     net::{TcpListener, UdpSocket},
@@ -13,6 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use anyhow::{anyhow, Context};
 use rand::Rng;
 use tokio::{net::TcpStream, time};
 use tracing::warn;
@@ -39,13 +38,8 @@ pub(super) fn spawn_child(mut cmd: Command, log: &Path) -> Result<Child> {
         .stderr(logfile)
         .stdin(Stdio::null())
         .process_group(0);
-    cmd.spawn().map_err(|e| {
-        format!(
-            "failed to spawn {}: {e}",
-            cmd.get_program().to_string_lossy()
-        )
-        .into()
-    })
+    cmd.spawn()
+        .with_context(|| format!("failed to spawn {}", cmd.get_program().to_string_lossy()))
 }
 
 pub(super) fn spawn_detached(cmd: Command, log: &Path) -> Result<u32> {
@@ -80,9 +74,9 @@ pub(super) async fn terminate(
             needed_sigkill = true;
         }
         if Instant::now() >= hard_deadline {
-            return Err(
-                format!("process {pid} did not exit within {KILL_GRACE:?} of SIGKILL").into(),
-            );
+            return Err(anyhow!(
+                "process {pid} did not exit within {KILL_GRACE:?} of SIGKILL"
+            ));
         }
         time::sleep(RESTART_POLL).await;
     }
@@ -334,19 +328,17 @@ where
         {
             liveness_checked = now;
             if !proc_running(pid) {
-                return Err(format!(
+                return Err(anyhow!(
                     "process exited while waiting for {what}; log tail:\n{}",
                     tail(log, 30)
-                )
-                .into());
+                ));
             }
         }
         if time::Instant::now() >= deadline {
-            return Err(format!(
+            return Err(anyhow!(
                 "timed out after {timeout:?} waiting for {what}; log tail:\n{}",
                 tail(log, 30)
-            )
-            .into());
+            ));
         }
         time::sleep(interval).await;
     }
@@ -505,12 +497,11 @@ impl PortLease {
             self.claims.extend(claims);
             return Ok(first);
         }
-        Err(format!(
+        Err(anyhow!(
             "no free block of {want} in {}-{} after {BAND_ATTEMPTS} attempts",
             PORT_BAND.start,
             PORT_BAND.end - 1
-        )
-        .into())
+        ))
     }
 
     pub(super) fn single(&mut self) -> Result<u16> {
@@ -526,8 +517,8 @@ impl PortLease {
         self.holders.clear();
     }
 
-    pub(super) fn failure(&self, error: impl Display) -> DynError {
+    pub(super) fn failure(&self, error: DynError) -> DynError {
         let ports: Vec<_> = self.claims.iter().map(|(port, _)| *port).collect();
-        format!("{error}\nreserved ports: {ports:?}").into()
+        error.context(format!("reserved ports: {ports:?}"))
     }
 }

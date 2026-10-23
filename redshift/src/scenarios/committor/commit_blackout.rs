@@ -3,11 +3,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+use anyhow::{anyhow, ensure, Context};
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    check, check_eq, netfault::Selector, programs::REDLINE, receipt, BaseCtx, ChainCtx, CheckError,
-    ErCtx, Result, Scenario,
+    check, netfault::Selector, programs::REDLINE, receipt, BaseCtx, ChainCtx, ErCtx, Result,
+    Scenario,
 };
 use signature::Signature;
 use tokio::time;
@@ -39,11 +40,9 @@ async fn await_convergence(
             receipt::warn_duplicate_rejection(message);
         }
         Some(message) => {
-            return Err(
-                CheckError::new("the commit intent converges after the fault is lifted")
-                    .actual(message)
-                    .into(),
-            );
+            return Err(anyhow!(
+                "the commit intent converges after the fault is lifted: {message}"
+            ));
         }
         None => {}
     }
@@ -65,18 +64,14 @@ pub struct CommitBlackout {
 
 impl Scenario for CommitBlackout {
     async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
-        er.proxies().ok_or(PROXIED_GROUP)?;
+        er.proxies().context(PROXIED_GROUP)?;
         let payer = base.funded_payer(PAYER_LAMPORTS).await?;
         let account = base
             .cells(REDLINE, &payer)
             .create_delegated(ACCOUNT_SPACE, er.identity(), 0)
             .await?;
-        let on_base = base.account(&account).await?.ok_or("pda not on base")?;
-        check_eq!(
-            on_base.owner,
-            DELEGATION_PROGRAM_ID,
-            "a delegated pda must be dlp-owned on base"
-        )?;
+        let on_base = base.account(&account).await?.context("pda not on base")?;
+        ensure!(on_base.owner == DELEGATION_PROGRAM_ID);
         er.await_clones(&[account], ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
 
         Ok(Self { base, er, payer, account })
@@ -84,7 +79,7 @@ impl Scenario for CommitBlackout {
 
     async fn run(self) -> Result<()> {
         let Self { base, er, payer, account } = self;
-        let proxies = er.proxies().ok_or(PROXIED_GROUP)?;
+        let proxies = er.proxies().context(PROXIED_GROUP)?;
         let submission_trap = proxies
             .intercept(Selector::method("sendTransaction").http().response().account(&account));
         let (snapshot, commit_signature) =
@@ -120,11 +115,11 @@ impl Scenario for CommitBlackout {
         let held = notification_trap.wait(INTERCEPT_TIMEOUT).await?;
         let blackout_end = Instant::now() + BLACKOUT_WINDOW;
         loop {
-            check!(
+            ensure!(
                 er.api().get_transaction(&receipt_signature).await?.is_none(),
                 "no commit receipt {receipt_signature} may appear while \
                  confirmation is withheld"
-            )?;
+            );
             if Instant::now() >= blackout_end {
                 break;
             }
@@ -144,11 +139,11 @@ impl Scenario for CommitBlackout {
             write_and_commit(&er, &payer, 3, RECONNECT_WRITE, &fresh).await?;
         let plain =
             receipt::fetch_commit_receipt(er.api(), &commit_signature, RECEIPT_TIMEOUT).await?;
-        check!(
+        ensure!(
             plain.succeeded(),
             "a commit after the proxies are restored must succeed, got {:?}",
             plain.error_message
-        )?;
+        );
         plain.confirm(base.api(), BASE_CONFIRM_TIMEOUT).await?;
         check::poll(
             "the fresh account commits to base through restored traffic",

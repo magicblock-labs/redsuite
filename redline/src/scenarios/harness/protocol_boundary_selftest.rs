@@ -1,8 +1,9 @@
 use std::{rc::Rc, sync::Arc, time::Duration};
 
+use anyhow::ensure;
 use pubkey::Pubkey;
 use redsuite_core::{
-    check_eq, prep,
+    prep,
     profile::ProfileValues,
     programs::REDLINE,
     redline::{execute_kernel, Accounts},
@@ -133,12 +134,12 @@ impl Scenario<ScenarioReport> for ProtocolBoundarySelftest {
             pool.clone(),
             payer_bytes.clone(),
         )?;
-        check_eq!(
+        ensure!(
+            warmup.failed == 0,
+            "failures={:?}; first error={:?}",
             warmup.failed,
-            0,
-            "warmup deliveries failed: {:?}",
             warmup.first_error
-        )?;
+        );
 
         let mut id_offset = profile.warmup;
         let mut cells: Vec<CellOutcome> = Vec::new();
@@ -173,13 +174,12 @@ impl Scenario<ScenarioReport> for ProtocolBoundarySelftest {
                 cell.tx_processing_avg_us,
                 "protocol boundary cell finished",
             );
-            check_eq!(
+            ensure!(
+                cell.outcome.failed == 0,
+                "failures={:?}; first error={:?}",
                 cell.outcome.failed,
-                0,
-                "threads={}: deliveries failed: {:?}",
-                cell.threads,
                 cell.outcome.first_error
-            )?;
+            );
 
             let cell_report = ScenarioReport::ok()
                 .setting("profile", profile.name)

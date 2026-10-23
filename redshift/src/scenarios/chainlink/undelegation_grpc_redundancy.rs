@@ -1,8 +1,9 @@
 use std::{rc::Rc, time::Duration};
 
+use anyhow::{anyhow, ensure, Context};
 use redsuite_core::{
     check,
-    netfault::{Action, BaseProxies, Selector},
+    netfault::{BaseProxies, Selector},
     programs::{CellId, SettlementMode, REDLINE},
     topology::{self, ErOptions, PrivateEr},
     BaseCtx, ChainCtx, PrivateErScenario, Result,
@@ -28,7 +29,7 @@ pub struct GrpcRedundancy {
 
 impl PrivateErScenario for GrpcRedundancy {
     async fn setup(shared: Rc<BaseCtx>, _: ()) -> Result<Self> {
-        let (grpc_url, _) = shared.grpc().ok_or("base L1 Yellowstone gRPC endpoint missing")?;
+        let (grpc_url, _) = shared.grpc().context("base L1 Yellowstone gRPC endpoint missing")?;
         let http = BaseProxies::spawn(&shared).await?;
         let ws = BaseProxies::spawn(&shared).await?;
         let mut endpoints = http.endpoints();
@@ -74,13 +75,13 @@ impl PrivateErScenario for GrpcRedundancy {
         shared.submit_and_confirm(&funder, &delegates).await?;
         er.accounts(&keys).await?;
         er.cells(REDLINE, &payer).write(ER_WRITE, pending).await?;
-        check!(
+        ensure!(
             er.local_accounts(&ACCOUNT_OWNERS, pending)
                 .await?
                 .into_iter()
                 .all(|account| crate::account_id(account) == Some(ER_WRITE)),
             "the er serves its own pre-undelegation writes"
-        )?;
+        );
 
         let settlement =
             http.stall(Selector::method("sendTransaction").request().account(&pending[0]));
@@ -93,10 +94,7 @@ impl PrivateErScenario for GrpcRedundancy {
                 .build()],
         )
         .await?;
-        check::poll("undelegation submission held", TIMEOUT, || async {
-            http.events().iter().any(|event| event.action == Action::Held)
-        })
-        .await?;
+        http.await_held(Selector::default(), TIMEOUT).await?;
 
         let mut blackout = vec![ws.stall(Selector::default().response().notification())];
         for key in &keys {
@@ -110,10 +108,10 @@ impl PrivateErScenario for GrpcRedundancy {
                 shared.accounts(pending).await?.into_iter().all(
                     |account| matches!(account, Some(account) if account.owner == program::id()),
                 );
-            check!(
+            ensure!(
                 settled,
                 "the accounts are still owned by the delegation program"
-            )?;
+            );
             Result::Ok(())
         })
         .await?;
@@ -133,7 +131,7 @@ impl PrivateErScenario for GrpcRedundancy {
         let refresh = refresh_started.elapsed();
         if let Err(error) = await_local_value(
             er,
-            "the er observes the completed undelegation while websocket is cut",
+            "undelegation discovered without WebSocket",
             pending,
             BASE_REWRITE,
             RECOVERY,
@@ -142,19 +140,18 @@ impl PrivateErScenario for GrpcRedundancy {
         {
             let served: Vec<_> =
                 er.accounts(pending).await?.into_iter().map(crate::account_id).collect();
-            return Err(format!(
-                "{error}; the cloned account did refresh over grpc after \
+            return Err(anyhow!(
+                "{error:#}; the cloned account did refresh over grpc after \
                  {refresh:.1?}, and a direct client read returns {served:?}"
-            )
-            .into());
+            ));
         }
 
-        let ws_held = ws.events().iter().filter(|event| event.action == Action::Held).count();
-        check!(
+        let ws_held = ws.held_count(&Selector::default());
+        ensure!(
             ws_held > 0,
             "the websocket proxy held nothing, so the blackout this run \
              applied does not show that grpc carried the updates"
-        )?;
+        );
         for rule in blackout {
             rule.remove();
         }

@@ -4,9 +4,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+use anyhow::{anyhow, ensure};
 use pubkey::Pubkey;
 use redsuite_core::{
-    check, check_eq,
+    check,
     monitor::{self, MonitorSpec},
     profile::ProfileValues,
     programs::{SettlementMode, REDLINE},
@@ -108,7 +109,10 @@ async fn deliver_commits(
     )
     .await?;
     if outcome.failed > 0 {
-        return Err(format!("commit deliveries failed: {:?}", outcome.first_error).into());
+        return Err(anyhow!(
+            "commit deliveries failed: {:?}",
+            outcome.first_error
+        ));
     }
     let delivered = Rc::try_unwrap(delivered)
         .unwrap_or_else(|_| panic!("delivery tasks still hold the list"))
@@ -254,14 +258,14 @@ impl Scenario<ScenarioReport> for CommitThroughputCeiling {
         let after = er.scrape_metrics().await?;
         let delta = MetricsDelta::new(before, after);
 
-        check!(
+        ensure!(
             drain.drained > 0.0,
             "INVALID: no intent drained within {:?} — the commit pipeline \
              executed nothing",
-            profile.drain_cap,
-        )?;
+            profile.drain_cap
+        );
         let failed_intents = delta.counter_all("mbv_committor_failed_intents_count").unwrap_or(0.0);
-        check_eq!(failed_intents, 0.0, "fresh-key intents failed")?;
+        ensure!(failed_intents == 0.0);
         let drain_rate = drain.drained / span_wall.as_secs_f64();
         debug!(
             drain.drained,

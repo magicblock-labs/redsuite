@@ -6,6 +6,7 @@ use std::{
     time::Duration,
 };
 
+use anyhow::{anyhow, Context};
 use keypair::Keypair;
 use magicblock_config::{
     config::EngineConfig,
@@ -19,7 +20,7 @@ use tracing::warn;
 use url::Url;
 
 use super::{process, state};
-use crate::{catalog::Fixture, CheckError, Result};
+use crate::{catalog::Fixture, Result};
 
 const LEDGER_SIZE_LIMIT_UNREACHABLE: u64 = 1 << 60;
 
@@ -96,9 +97,7 @@ pub(super) const CLONED_ACCOUNTS: &[Pubkey] = &[PROTOCOL_FEES_VAULT_ID];
 
 pub(super) fn clone_url() -> Result<Url> {
     let value = env::var(CLONE_URL_ENV).unwrap_or_else(|_| DEFAULT_CLONE_URL.to_owned());
-    value
-        .parse()
-        .map_err(|error| CheckError::new(CLONE_URL_ENV).caused_by(error).into())
+    value.parse().context(CLONE_URL_ENV)
 }
 
 const BASE_BIN: &str = "solana-test-validator";
@@ -112,15 +111,14 @@ pub(super) const BASE_READY_TIMEOUT: Duration = Duration::from_secs(60);
 pub const ER_READY_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub(super) fn find_base_bin() -> Result<PathBuf> {
-    which(BASE_BIN)
-        .ok_or_else(|| format!("{BASE_BIN} not found — put the Solana CLI on PATH").into())
+    which(BASE_BIN).with_context(|| format!("{BASE_BIN} not found — put the Solana CLI on PATH"))
 }
 
 fn explicit_bin(name: &str) -> Result<Option<PathBuf>> {
     let path = env::var_os(name).map(PathBuf::from);
     if let Some(path) = &path {
         if !path.exists() {
-            return Err(format!("{name}={} does not exist", path.display()).into());
+            return Err(anyhow!("{name}={} does not exist", path.display()));
         }
     }
     Ok(path)
@@ -130,9 +128,8 @@ pub fn er_bin_path() -> Result<PathBuf> {
     if let Some(explicit) = explicit_bin(ER_BIN_ENV)? {
         return Ok(explicit);
     }
-    which(ER_BIN).ok_or_else(|| {
+    which(ER_BIN).with_context(|| {
         format!("{ER_BIN} not found — set {ER_BIN_ENV} to the built binary or put it on PATH")
-            .into()
     })
 }
 
@@ -149,14 +146,7 @@ pub(super) fn find_verifier_bin() -> Result<PathBuf> {
     {
         return Ok(sibling);
     }
-    which(VERIFIER_BIN).ok_or_else(|| {
-        format!(
-            "{VERIFIER_BIN} not found — build it beside the ER binary \
-             (`cargo build --release -p magicblock-verifier`), set \
-             {VERIFIER_BIN_ENV}, or put it on PATH"
-        )
-        .into()
-    })
+    which(VERIFIER_BIN).with_context(|| format!("{VERIFIER_BIN} not found — build it beside the ER binary (`cargo build --release -p magicblock-verifier`), set {VERIFIER_BIN_ENV}, or put it on PATH"))
 }
 
 fn which(bin: &str) -> Option<PathBuf> {
@@ -199,7 +189,7 @@ fn base_programs(er_bin: &Path) -> StagedPrograms {
             Err(error) => {
                 warn!(
                     ?fixture,
-                    %error,
+                    error = %format_args!("{error:#}"),
                     "fixture unavailable; dependent scenarios cannot run",
                 )
             }

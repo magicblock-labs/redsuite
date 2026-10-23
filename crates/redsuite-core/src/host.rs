@@ -1,5 +1,6 @@
 use std::{collections::HashMap, fs, fs::ReadDir, path::Path, time::Instant};
 
+use anyhow::{anyhow, Context};
 #[cfg(target_os = "macos")]
 use tracing::warn;
 
@@ -34,7 +35,7 @@ pub fn proc_running(pid: u32) -> bool {
         Ok(info) => info.pbi_status != SZOMB,
         Err(error) => {
             if !error.contains("No such process") {
-                warn!(pid, %error, "process liveness query failed");
+                warn!(pid, error = %format_args!("{error:#}"), "process liveness query failed");
             }
             false
         }
@@ -49,19 +50,19 @@ pub struct CpuSample {
 
 #[cfg(target_os = "linux")]
 fn stat_cpu_secs(path: &str) -> Result<f64> {
-    let stat = fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
-    let after_comm = stat.rsplit_once(')').ok_or_else(|| format!("{path}: no comm field"))?.1;
+    let stat = fs::read_to_string(path).with_context(|| path.to_owned())?;
+    let after_comm = stat.rsplit_once(')').with_context(|| format!("{path}: no comm field"))?.1;
     let fields: Vec<&str> = after_comm.split_whitespace().collect();
     let utime: u64 = fields
         .get(11)
-        .ok_or_else(|| format!("{path}: short stat line"))?
+        .with_context(|| format!("{path}: short stat line"))?
         .parse()
-        .map_err(|e| format!("{path}: utime: {e}"))?;
+        .with_context(|| format!("{path}: utime"))?;
     let stime: u64 = fields
         .get(12)
-        .ok_or_else(|| format!("{path}: short stat line"))?
+        .with_context(|| format!("{path}: short stat line"))?
         .parse()
-        .map_err(|e| format!("{path}: stime: {e}"))?;
+        .with_context(|| format!("{path}: stime"))?;
     Ok((utime + stime) as f64 / CLOCK_TICKS_PER_SEC)
 }
 
@@ -70,7 +71,7 @@ pub fn cpu_sample(pid: u32) -> Result<CpuSample> {
     let process_secs = stat_cpu_secs(&format!("/proc/{pid}/stat"))?;
     let mut thread_secs = HashMap::new();
     let tasks =
-        fs::read_dir(format!("/proc/{pid}/task")).map_err(|e| format!("/proc/{pid}/task: {e}"))?;
+        fs::read_dir(format!("/proc/{pid}/task")).with_context(|| format!("/proc/{pid}/task"))?;
     for task in tasks {
         let task = task?;
         let Ok(tid) = task.file_name().to_string_lossy().parse::<u64>() else {
@@ -95,10 +96,11 @@ pub fn cpu_sample(pid: u32) -> Result<CpuSample> {
         thread_info::ThreadInfo,
     };
     let pid = pid as i32;
-    let task = pidinfo::<TaskInfo>(pid, 0).map_err(|e| format!("task info for pid {pid}: {e}"))?;
+    let task = pidinfo::<TaskInfo>(pid, 0)
+        .map_err(|error| anyhow!("task info for pid {pid}: {error:#}"))?;
     let thread_limit = task.pti_threadnum.max(1) as usize;
     let threads = listpidinfo::<ListThreads>(pid, thread_limit)
-        .map_err(|e| format!("thread list for pid {pid}: {e}"))?;
+        .map_err(|error| anyhow!("thread list for pid {pid}: {error:#}"))?;
     let mut thread_secs = HashMap::new();
     for thread in threads {
         if let Ok(info) = pidinfo::<ThreadInfo>(pid, thread) {
@@ -141,7 +143,7 @@ impl CpuSample {
 #[cfg(target_os = "linux")]
 pub fn fd_count(pid: u32) -> Result<usize> {
     let entries =
-        fs::read_dir(format!("/proc/{pid}/fd")).map_err(|e| format!("/proc/{pid}/fd: {e}"))?;
+        fs::read_dir(format!("/proc/{pid}/fd")).with_context(|| format!("/proc/{pid}/fd"))?;
     Ok(entries.count())
 }
 
@@ -152,16 +154,16 @@ pub fn fd_count(pid: u32) -> Result<usize> {
         file_info::ListFDs,
         proc_pid::{listpidinfo, pidinfo},
     };
-    let info =
-        pidinfo::<BSDInfo>(pid as i32, 0).map_err(|e| format!("bsd info for pid {pid}: {e}"))?;
+    let info = pidinfo::<BSDInfo>(pid as i32, 0)
+        .map_err(|error| anyhow!("bsd info for pid {pid}: {error:#}"))?;
     let table_size = (info.pbi_nfiles as usize).max(1);
     let open = listpidinfo::<ListFDs>(pid as i32, table_size)
-        .map_err(|e| format!("fd list for pid {pid}: {e}"))?;
+        .map_err(|error| anyhow!("fd list for pid {pid}: {error:#}"))?;
     Ok(open.len())
 }
 
 pub fn dir_size_bytes(dir: &Path) -> Result<u64> {
-    let entries = fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let entries = fs::read_dir(dir).with_context(|| format!("{}", dir.display()))?;
     walk_size(entries)
 }
 
@@ -195,7 +197,7 @@ fn walk_size(entries: ReadDir) -> Result<u64> {
 #[cfg(target_os = "linux")]
 pub fn rss_kb(pid: u32) -> Result<u64> {
     let status = fs::read_to_string(format!("/proc/{pid}/status"))
-        .map_err(|e| format!("/proc/{pid}/status: {e}"))?;
+        .with_context(|| format!("/proc/{pid}/status"))?;
     for line in status.lines() {
         if let Some(rest) = line.strip_prefix("VmRSS:") {
             let kb = rest
@@ -203,17 +205,17 @@ pub fn rss_kb(pid: u32) -> Result<u64> {
                 .trim_end_matches(" kB")
                 .trim()
                 .parse::<u64>()
-                .map_err(|e| format!("bad VmRSS line `{line}`: {e}"))?;
+                .with_context(|| format!("bad VmRSS line `{line}`"))?;
             return Ok(kb);
         }
     }
-    Err(format!("no VmRSS in /proc/{pid}/status").into())
+    Err(anyhow!("no VmRSS in /proc/{pid}/status"))
 }
 
 #[cfg(target_os = "macos")]
 pub fn rss_kb(pid: u32) -> Result<u64> {
     use libproc::{proc_pid::pidinfo, task_info::TaskInfo};
-    let task =
-        pidinfo::<TaskInfo>(pid as i32, 0).map_err(|e| format!("task info for pid {pid}: {e}"))?;
+    let task = pidinfo::<TaskInfo>(pid as i32, 0)
+        .map_err(|error| anyhow!("task info for pid {pid}: {error:#}"))?;
     Ok(task.pti_resident_size / 1024)
 }

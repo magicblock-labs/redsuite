@@ -6,6 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use anyhow::{anyhow, Context};
 use magicblock_config::LeaderParams;
 use pubkey::Pubkey;
 use signer::Signer;
@@ -119,7 +120,7 @@ impl PrivateEr {
         self.proc
             .terminate(hard_kill)
             .await?
-            .ok_or("private ER has no running process to stop")?;
+            .context("private ER has no running process to stop")?;
         Ok(())
     }
 
@@ -130,13 +131,8 @@ impl PrivateEr {
     }
 
     fn remove_storage(&self) -> Result<()> {
-        state::remove_storage(self.plan.storage_dir()).map_err(|error| {
-            format!(
-                "removing the storage of private ER `{}`: {error}",
-                self.proc.label()
-            )
-            .into()
-        })
+        state::remove_storage(self.plan.storage_dir())
+            .with_context(|| format!("removing the storage of private ER `{}`", self.proc.label()))
     }
 
     // Stop the ER (SIGTERM, or SIGKILL if hard_kill), then relaunch it on the
@@ -150,7 +146,7 @@ impl PrivateEr {
             .proc
             .terminate(config.hard_kill)
             .await?
-            .ok_or("private ER has no running process to restart")?;
+            .context("private ER has no running process to restart")?;
         let shutdown = restart_started.elapsed();
         let exit_code = exit_status.code();
         let exit_signal = ExitStatusExt::signal(&exit_status);
@@ -204,11 +200,10 @@ async fn await_magic_fee_vault(base: &BaseCtx, identity: &Pubkey) -> Result<()> 
             }
         }
         if time::Instant::now() >= deadline {
-            return Err(format!(
+            return Err(anyhow!(
                 "the magic fee vault {vault} for identity {identity} is not \
                  on base — the er did not create it in time"
-            )
-            .into());
+            ));
         }
         time::sleep(VAULT_POLL).await;
     }
@@ -302,7 +297,7 @@ async fn launch(
         || async { er_api.server_alive().await },
     )
     .await
-    .map_err(|e| ports.failure(format_args!("private ER `{}`: {e}", proc.label())));
+    .map_err(|error| ports.failure(error.context(format!("private ER `{}`", proc.label()))));
     ready?;
     await_magic_fee_vault(base, &identity_pubkey).await?;
 

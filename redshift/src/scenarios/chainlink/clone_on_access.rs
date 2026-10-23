@@ -3,10 +3,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+use anyhow::{ensure, Context};
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    check, check_eq,
+    check,
     dlp::{self, commit_state, finalize, undelegate, CommitStateArgs},
     programs::{CellHeader, SettlementMode, REDLINE},
     system, topology, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
@@ -78,16 +79,16 @@ async fn await_landed(
                     head(&acc.data)
                 )),
                 Ok(None) => Err("absent".to_owned()),
-                Err(error) => Err(format!("read failed: {error}")),
+                Err(error) => Err(format!("read failed: {error:#}")),
             }
         },
     )
     .await
-    .map_err(|error| {
-        error.expected(format!(
+    .with_context(|| {
+        format!(
             "owner {owner} lamports {lamports:?} data[..48] {}",
             head(data)
-        ))
+        )
     })?;
     Ok(())
 }
@@ -104,10 +105,7 @@ impl Scenario for CloneOnAccess {
         let Self { base, er, payer, identity } = self;
         crate::phase("negative cache", async {
             let ghost = Keypair::new().pubkey();
-            check!(
-                er.account(&ghost).await?.is_none(),
-                "an account that exists nowhere must read as absent on the ER"
-            )?;
+            ensure!(er.account(&ghost).await?.is_none(), "an account that exists nowhere must read as absent on the ER");
             base.airdrop(&ghost, GHOST_LAMPORTS).await?;
             check::poll(
                 "the base airdrop invalidates the ER's negative cache for the \
@@ -134,24 +132,12 @@ impl Scenario for CloneOnAccess {
             )
             .await?;
             let plain_clone =
-                er.account(&plain).await?.ok_or("plain clone vanished")?;
+                er.account(&plain).await?.context("plain clone vanished")?;
             let plain_on_base =
-                base.account(&plain).await?.ok_or("plain gone on base")?;
-            check_eq!(
-                plain_clone.lamports,
-                plain_on_base.lamports,
-                "the ER clone must mirror the base account's lamports"
-            )?;
-            check_eq!(
-                plain_clone.owner,
-                crate::program::id(),
-                "an undelegated clone must keep its base owner"
-            )?;
-            check_eq!(
-                CellHeader::written_id(&plain_clone.data),
-                Some(PRE_CLONE_WRITE),
-                "the first ER access must observe the state written on base before cloning"
-            )?;
+                base.account(&plain).await?.context("plain gone on base")?;
+            ensure!(plain_clone.lamports == plain_on_base.lamports);
+            ensure!(plain_clone.owner == crate::program::id());
+            ensure!(CellHeader::written_id(&plain_clone.data) == Some(PRE_CLONE_WRITE));
             base.cells(REDLINE, &payer).write(POST_CLONE_WRITE, &[plain]).await?;
             check::poll(
                 "the base write propagates to the existing ER clone",
@@ -163,10 +149,7 @@ impl Scenario for CloneOnAccess {
             .await?;
             let undelegated_write =
                 er.cells(REDLINE, &payer).write(UNDELEGATED_WRITE, &[plain]).await;
-            check!(
-                undelegated_write.is_err(),
-                "the ER must reject a write to an undelegated clone, got {undelegated_write:?}"
-            )?;
+            ensure!(undelegated_write.is_err(), "undelegated write rejected; actual={undelegated_write:?}");
             Ok(())
         })
         .await?;
@@ -178,38 +161,23 @@ impl Scenario for CloneOnAccess {
                 base.cells(REDLINE, &payer).create_delegated(ACCOUNT_SPACE, identity, 2).await?;
             let accounts = [delegated, sibling];
             for pda in &accounts {
-                let on_base = base.account(pda).await?.ok_or("delegated pda missing on base")?;
-                check_eq!(
-                    on_base.owner,
-                    DELEGATION_PROGRAM_ID,
-                    "a delegated pda must be dlp-owned on base"
-                )?;
+                let on_base = base.account(pda).await?.context("delegated pda missing on base")?;
+                ensure!(on_base.owner == DELEGATION_PROGRAM_ID);
             }
             er.await_clones(&accounts, ACCOUNT_SPACE as usize, CLONE_TIMEOUT).await?;
             let delegated_clone =
-                er.account(&delegated).await?.ok_or("delegated clone vanished")?;
-            check_eq!(
-                delegated_clone.owner,
-                crate::program::id(),
-                "the ER must present a delegated account as owned by its program"
-            )?;
+                er.account(&delegated).await?.context("delegated clone vanished")?;
+            ensure!(delegated_clone.owner == crate::program::id());
             er.cells(REDLINE, &payer).write(ER_WRITE, &accounts).await?;
             let snapshot = er
                 .account(&delegated)
                 .await?
-                .ok_or("delegated clone vanished after the ER write")?
+                .context("delegated clone vanished after the ER write")?
                 .data;
-            check_eq!(
-                CellHeader::written_id(&snapshot),
-                Some(ER_WRITE),
-                "the ER copy of a delegated account must accept program writes"
-            )?;
+            ensure!(CellHeader::written_id(&snapshot) == Some(ER_WRITE));
             for pda in &accounts {
-                let on_base = base.account(pda).await?.ok_or("delegated pda gone on base")?;
-                check!(
-                    untouched(&on_base.data),
-                    "ER writes must not reach the base copy without an explicit commit"
-                )?;
+                let on_base = base.account(pda).await?.context("delegated pda gone on base")?;
+                ensure!(untouched(&on_base.data), "base unchanged before commit");
             }
             Ok((accounts, snapshot))
         })
@@ -223,15 +191,11 @@ impl Scenario for CloneOnAccess {
                 .await?;
             let receipt = er.check_commit(&base, &signature, &accounts[..1], false).await?;
             if !receipt.failure_is_duplicate_rejection() {
-                check_eq!(
-                    receipt.payer,
-                    Some(payer.pubkey()),
-                    "the receipt must name the scheduling payer"
-                )?;
-                check!(
+                ensure!(receipt.payer == Some(payer.pubkey()));
+                ensure!(
                     !receipt.base_signatures.is_empty(),
                     "a commit receipt must name at least one base tx"
-                )?;
+                );
             }
             await_landed(
                 &base,
@@ -243,11 +207,11 @@ impl Scenario for CloneOnAccess {
             )
             .await?;
             let sibling_on_base =
-                base.account(&sibling).await?.ok_or("sibling pda gone on base")?;
-            check!(
+                base.account(&sibling).await?.context("sibling pda gone on base")?;
+            ensure!(
                 untouched(&sibling_on_base.data),
                 "committing one account must not touch its sibling on base"
-            )?;
+            );
             Ok(())
         })
         .await?;
@@ -261,24 +225,20 @@ impl Scenario for CloneOnAccess {
                 finals.push(
                     er.account(pda)
                         .await?
-                        .ok_or("er copy vanished before the undelegating commit")?,
+                        .context("er copy vanished before the undelegating commit")?,
                 );
             }
-            check_eq!(
-                CellHeader::written_id(&finals[0].data),
-                Some(SECOND_WRITE),
-                "the second er write must land before the undelegating commit"
-            )?;
+            ensure!(CellHeader::written_id(&finals[0].data) == Some(SECOND_WRITE));
             let signature = er
                 .cells(REDLINE, &payer)
                 .settle(2, &accounts, SettlementMode::Undelegate)
                 .await?;
             let receipt = er.check_commit(&base, &signature, &accounts, true).await?;
             if !receipt.failure_is_duplicate_rejection() {
-                check!(
+                ensure!(
                     !receipt.base_signatures.is_empty(),
                     "an undelegating commit must name at least one base tx"
-                )?;
+                );
             }
             for (pda, expected) in accounts.iter().zip(&finals) {
                 await_landed(
@@ -309,7 +269,7 @@ impl Scenario for CloneOnAccess {
             crate::rejection_code(
                 "the write after undelegation",
                 &LOCKOUT_REJECTIONS,
-                &format!("{error:?}"),
+                &format!("{error:#}"),
             )?;
             Ok(())
         })
@@ -353,27 +313,19 @@ impl Scenario for CloneOnAccess {
             base.submit_and_confirm_with(&payer, &[&validator, &wallet], &cycle).await?;
             let continuity_deadline = Instant::now() + CONTINUITY_WINDOW;
             while Instant::now() < continuity_deadline {
-                check!(
+                ensure!(
                     er.account(&wallet.pubkey()).await?.is_some(),
                     "the er clone must survive a one-transaction undelegate + \
                      redelegate"
-                )?;
+                );
                 time::sleep(CONTINUITY_STEP).await;
             }
             let wallet_on_base = base
                 .account(&wallet.pubkey())
                 .await?
-                .ok_or("the cycled wallet vanished on base")?;
-            check_eq!(
-                wallet_on_base.owner,
-                dlp::dlp_id(),
-                "the wallet must be delegated again on base after the cycle"
-            )?;
-            check_eq!(
-                er.api().get_balance(&wallet.pubkey()).await?,
-                WALLET_LAMPORTS,
-                "the er clone balance must be intact after the cycle"
-            )?;
+                .context("the cycled wallet vanished on base")?;
+            ensure!(wallet_on_base.owner == dlp::dlp_id());
+            ensure!(er.api().get_balance(&wallet.pubkey()).await? == WALLET_LAMPORTS);
             er.submit_and_confirm(
                 &wallet,
                 &[system::transfer(&wallet.pubkey(), &wallet.pubkey(), CYCLE_SPEND)],
