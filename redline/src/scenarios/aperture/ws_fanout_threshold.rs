@@ -12,7 +12,7 @@ use redsuite_core::{
     stats::{ObservationsStats, StreamingStats},
     transport::{
         clock::SendClock,
-        subpool::{ConnReport, ExpectedWrites, SubscriberPool},
+        subpool::{ExpectedWrites, SubscriberPool},
         NETWORK_TIMEOUT,
     },
     BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
@@ -108,7 +108,7 @@ impl Scenario<ScenarioReport> for WsFanoutThreshold {
     }
 
     async fn run(self) -> Result<ScenarioReport> {
-        self.warm_up()?;
+        self.warm_up().await?;
         let mut id_cursor = self.profile.warmup;
         let mut cells: Vec<CellOutcome> = Vec::new();
         for &connections in self.profile.ladder {
@@ -120,7 +120,7 @@ impl Scenario<ScenarioReport> for WsFanoutThreshold {
 }
 
 impl WsFanoutThreshold {
-    fn execute(
+    async fn execute(
         &self,
         iterations: u64,
         offset: u64,
@@ -141,11 +141,12 @@ impl WsFanoutThreshold {
             move |id| REDLINE.copy_three(&pool, id).0,
             clock,
         )
+        .await
     }
 
     #[instrument(skip_all, err)]
-    fn warm_up(&self) -> Result<()> {
-        let warmup = self.execute(self.profile.warmup, 0, None)?;
+    async fn warm_up(&self) -> Result<()> {
+        let warmup = self.execute(self.profile.warmup, 0, None).await?;
         ensure!(warmup.failed == 0);
 
         Ok(())
@@ -158,7 +159,7 @@ impl WsFanoutThreshold {
             self.profile.iterations as usize,
         ));
         let expected = Arc::new(self.cell_expected_writes(*id_cursor));
-        let subscribers = SubscriberPool::start(
+        let mut subscribers = SubscriberPool::start(
             self.er.ws_url(),
             &self.pool,
             connections,
@@ -168,22 +169,23 @@ impl WsFanoutThreshold {
             Arc::new(CellHeader::written_id),
             LAG_THRESHOLD,
         );
-        subscribers.await_subscribed(self.pool.len()).await?;
+        subscribers.await_subscribed().await?;
 
         let before = self.er.scrape_metrics().await?;
-        let outcome = self.execute(self.profile.iterations, *id_cursor, Some(clock))?;
+        let outcome = self.execute(self.profile.iterations, *id_cursor, Some(clock)).await?;
         ensure!(outcome.failed == 0);
 
-        let missing_final = subscribers.await_final(&expected).await;
-        let incomplete = subscribers.incomplete(&expected);
+        subscribers.await_final().await;
         let after = self.er.scrape_metrics().await?;
         let delta = MetricsDelta::new(before, after);
-        if let Some(error) = subscribers.first_error() {
+        let conn_reports = subscribers.finalize().await?;
+        if let Some(error) = conn_reports.iter().find_map(|conn| conn.error.as_ref()) {
             return Err(anyhow!(
                 "ws{connections}: subscriber pool failed: {error:#}"
             ));
         }
-        let conn_reports: Vec<ConnReport> = subscribers.finalize();
+        let missing_final = conn_reports.iter().map(|conn| conn.missing_final).sum();
+        let incomplete = conn_reports.iter().map(|conn| conn.incomplete).sum();
 
         let received_min = conn_reports.iter().map(|conn| conn.received).min().unwrap_or(0);
         let received_max = conn_reports.iter().map(|conn| conn.received).max().unwrap_or(0);

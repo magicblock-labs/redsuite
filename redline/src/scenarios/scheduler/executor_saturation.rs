@@ -546,7 +546,7 @@ impl ExecutorSaturation {
                 })
             }
         })
-        .join_async()
+        .join()
         .await?;
 
         let mut all_outcomes: Vec<RawRunOutcome> = Vec::new();

@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     marker::PhantomData,
-    ops::ControlFlow::{self, Continue},
+    ops::ControlFlow::{self, Break, Continue},
     rc::Rc,
     slice,
 };
@@ -36,7 +36,7 @@ struct EventBuffer {
 }
 
 impl SubscriptionState for EventBuffer {
-    type Key = u64;
+    type Key = (u64, Topic);
 
     fn on_malformed(&mut self) {
         self.malformed += 1;
@@ -50,7 +50,7 @@ impl EventBuffer {
         self.last_key
     }
 
-    fn observe(&mut self, key: u64, payload: &LazyValue<'_>) -> ControlFlow<()> {
+    fn observe(&mut self, (key, topic): (u64, Topic), payload: &LazyValue<'_>) -> ControlFlow<()> {
         match json::from_str(payload.as_raw_str()) {
             Ok(event) => {
                 if let Some(events) = self.by_key.get_mut(&key) {
@@ -59,7 +59,12 @@ impl EventBuffer {
             }
             Err(_) => self.malformed += 1,
         }
-        Continue(())
+        // Signature subscriptions are removed by the server after confirmation.
+        if matches!(topic, Topic::Signature) {
+            Break(())
+        } else {
+            Continue(())
+        }
     }
 }
 
@@ -126,7 +131,7 @@ impl EventSubscriptions {
 
     async fn subscribe(&self, topic: Topic, params: &impl Serialize) -> Result<u64> {
         let key = self.connection.state_mut().register();
-        self.connection.subscribe(topic, params, key).await?;
+        self.connection.subscribe(topic, params, (key, topic)).await?;
         Ok(key)
     }
 }
@@ -212,7 +217,7 @@ impl<T> Drop for Subscription<T> {
         let key = self.key;
         let topic = self.topic;
         task::spawn_local(async move {
-            let _ = connection.unsubscribe(key, topic).await;
+            let _ = connection.unsubscribe((key, topic), topic).await;
         });
     }
 }
@@ -230,8 +235,8 @@ impl EventSubscriptions {
             topic,
             payload: PhantomData,
         };
-        self.connection.subscribe(topic, params, key).await?;
-        self.connection.await_ack(key).await?;
+        self.connection.subscribe(topic, params, (key, topic)).await?;
+        self.connection.await_ack((key, topic)).await?;
         Ok(subscription)
     }
 

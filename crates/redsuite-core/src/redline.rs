@@ -18,7 +18,7 @@ use crate::{
 
 pub mod causal;
 
-pub fn execute_kernel<K>(
+pub async fn execute_kernel<K>(
     config: ThreadRunConfig,
     rpc_url: Url,
     ws_url: Url,
@@ -44,6 +44,7 @@ where
             async move { Ok(Stamped::new(clock, id, staged.await?)) }
         }
     })
+    .await
 }
 
 pub struct Accounts {

@@ -17,7 +17,7 @@ use suite::Suite;
 use tokio::task::LocalSet;
 use tracing::{error, info};
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
     if let Err(error) = logging::init() {

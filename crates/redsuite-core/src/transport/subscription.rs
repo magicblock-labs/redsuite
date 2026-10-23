@@ -37,7 +37,7 @@ use super::{
 use crate::{wait, Result};
 
 // The upstream RpcRequest enum covers HTTP methods only.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub(super) enum Topic {
     Account,
     Logs,
@@ -69,7 +69,7 @@ impl Topic {
 pub(super) trait SubscriptionState {
     type Key: Copy;
 
-    fn on_subscribed(&mut self) {}
+    fn on_subscribed(&mut self, _count: usize) {}
 
     fn on_malformed(&mut self) {}
 
@@ -112,7 +112,7 @@ impl<S: SubscriptionState> Router<S> {
                     let subscription = json::from_str(result.as_raw_str())?;
                     self.subscriptions.insert(subscription, key);
                     self.subscribed += 1;
-                    self.state.on_subscribed();
+                    self.state.on_subscribed(self.subscribed);
                 }
             }
             Frame::Notification { params, .. } => {

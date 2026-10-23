@@ -1,15 +1,9 @@
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 use anyhow::ensure;
 
 use anyhow::anyhow;
-use tokio::{
-    sync::{OwnedSemaphorePermit, Semaphore},
-    time,
-};
+use tokio::time;
 
 use crate::{
     stats::{ObservationsStats, StreamingStats},
@@ -100,30 +94,6 @@ impl Pacer {
     }
 }
 
-pub struct Admission {
-    permits: Arc<Semaphore>,
-}
-
-impl Admission {
-    pub fn new(concurrency: usize) -> Result<Self> {
-        ensure!(
-            concurrency != 0,
-            "an admission budget needs a concurrency above zero"
-        );
-        Ok(Self {
-            permits: Arc::new(Semaphore::new(concurrency)),
-        })
-    }
-
-    pub async fn acquire(&self) -> OwnedSemaphorePermit {
-        self.permits
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("the admission semaphore is never closed")
-    }
-}
-
 pub struct AdmissionStats {
     origin: Instant,
     bucket: u64,
@@ -164,42 +134,5 @@ impl AdmissionStats {
             self.rps.push((f64::from(self.count) / tail.as_secs_f64()) as u32);
         }
         self.rps.finalize(true)
-    }
-}
-
-pub struct Throttle {
-    pacer: Pacer,
-    admission: Admission,
-    stats: AdmissionStats,
-}
-
-impl Throttle {
-    pub fn new(pacing: Pacing, concurrency: usize) -> Result<Self> {
-        Ok(Self {
-            pacer: Pacer::new(pacing)?,
-            admission: Admission::new(concurrency)?,
-            stats: AdmissionStats::new(),
-        })
-    }
-
-    /// Wait for pacing and capacity without counting an admission.
-    /// Call [`Self::record`] only if the caller accepts the permit after its stop check.
-    pub async fn acquire(&mut self) -> OwnedSemaphorePermit {
-        self.pacer.wait().await;
-        self.admission.acquire().await
-    }
-
-    pub async fn admit(&mut self) -> OwnedSemaphorePermit {
-        let permit = self.acquire().await;
-        self.record();
-        permit
-    }
-
-    pub fn record(&mut self) {
-        self.stats.record();
-    }
-
-    pub fn finish(self) -> ObservationsStats {
-        self.stats.finish()
     }
 }

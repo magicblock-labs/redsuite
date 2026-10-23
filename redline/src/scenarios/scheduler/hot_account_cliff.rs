@@ -107,7 +107,7 @@ impl Scenario<ScenarioReport> for HotAccountCliff {
 }
 
 impl HotAccountCliff {
-    fn execute(
+    async fn execute(
         &self,
         hot_set: Arc<Vec<Pubkey>>,
         iterations: u64,
@@ -128,6 +128,7 @@ impl HotAccountCliff {
             move |id| REDLINE.copy_three(&hot_set, id).0,
             None,
         )
+        .await
     }
 
     #[instrument(skip_all, err, fields(hot = hot))]
@@ -135,7 +136,7 @@ impl HotAccountCliff {
         let hot_set: Arc<Vec<Pubkey>> = Arc::new(self.pdas[..hot as usize].to_vec());
 
         let count_before_warmup = self.er.scrape_metrics().await?.get(TX_COUNT);
-        let warm = self.execute(hot_set.clone(), self.profile.warmup, *offset)?;
+        let warm = self.execute(hot_set.clone(), self.profile.warmup, *offset).await?;
         ensure!(warm.failed == 0);
         *offset += self.profile.warmup;
         if let Some(seen) = count_before_warmup {
@@ -144,7 +145,7 @@ impl HotAccountCliff {
         }
 
         let before = self.er.scrape_metrics().await?;
-        let outcome = self.execute(hot_set, self.profile.iterations, *offset)?;
+        let outcome = self.execute(hot_set, self.profile.iterations, *offset).await?;
         *offset += self.profile.iterations;
         ensure!(outcome.failed == 0);
         if let Some(seen) = before.get(TX_COUNT) {

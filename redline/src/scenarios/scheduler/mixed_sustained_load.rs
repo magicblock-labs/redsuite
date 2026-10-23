@@ -268,7 +268,7 @@ async fn execute(
             Ok((span, outcome))
         }
     })
-    .join_async()
+    .join()
     .await?;
     Ok(summarize(lanes, outcomes))
 }
