@@ -276,6 +276,11 @@ pub struct ErCtx {
 }
 
 impl ErCtx {
+    pub(crate) fn for_scenario(mut self) -> Self {
+        self.api = self.api.scoped();
+        self
+    }
+
     /// Read only resident accounts; unlike account reads, this never triggers cloning.
     pub async fn local_accounts(
         &self,

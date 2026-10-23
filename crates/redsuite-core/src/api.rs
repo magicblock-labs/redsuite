@@ -91,6 +91,12 @@ pub struct Api {
 }
 
 impl Api {
+    /// Share HTTP pooling without sharing a reader owned by another scenario's LocalSet.
+    pub(crate) fn scoped(mut self) -> Self {
+        self.events = Rc::default();
+        self
+    }
+
     pub fn new(url: Url, ws_url: Url) -> Self {
         Self {
             rpc: http::RpcClient::new(url),

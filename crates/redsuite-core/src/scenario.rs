@@ -197,6 +197,7 @@ where
     Body: AsyncFnOnce(Rc<BaseCtx>, ErCtx, &mut &'static str) -> Result<V>,
 {
     execute(name, fixtures, config, er, async move |base, er, stage| {
+        let er = er.for_scenario();
         let outcome = body(base, er.clone(), stage).await;
         if let Some(proxies) = er.proxies() {
             let reset = proxies.reset().await;
