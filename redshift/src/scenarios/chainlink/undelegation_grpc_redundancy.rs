@@ -102,8 +102,8 @@ impl PrivateErScenario for GrpcRedundancy {
 
         self.shared
             .api()
-            .await_accounts(pending, "base completes the undelegation", async || {
-                let settled = self.shared.accounts(pending).await?.into_iter().all(
+            .await_accounts(pending, "base completes the undelegation", |accounts| {
+                let settled = accounts.iter().all(
                     |account| matches!(account, Some(account) if account.owner == program::id()),
                 );
                 ensure!(settled);

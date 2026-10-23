@@ -90,13 +90,12 @@ impl CommitAndUndelegate {
             .await_accounts(
                 &[cell.address, request],
                 "base undelegation and request cleanup",
-                async || {
-                    let account =
-                        self.base.account(&cell.address).await?.context("missing cell")?;
+                |accounts| {
+                    let account = accounts[0].as_ref().context("missing cell")?;
                     ensure!(account.owner == redshift_interface::ID);
                     ensure!(account.data == snapshot.data);
                     ensure!(account.lamports == snapshot.lamports);
-                    ensure!(self.base.account(&request).await?.is_none());
+                    ensure!(accounts[1].is_none());
                     Ok(())
                 },
             )
@@ -121,9 +120,8 @@ impl CommitAndUndelegate {
         for pda in pdas {
             self.base
                 .api()
-                .await_accounts(slice::from_ref(pda), "base settlement", async || {
-                    let account =
-                        self.base.account(pda).await?.context("settled cell absent from base")?;
+                .await_accounts(slice::from_ref(pda), "base settlement", |accounts| {
+                    let account = accounts[0].as_ref().context("settled cell absent from base")?;
                     ensure!(account.owner == owner);
                     ensure!(decoded_count(&account.data)? == count);
                     Ok(())
@@ -288,8 +286,8 @@ impl CommitAndUndelegate {
             .await_accounts(
                 &[pda],
                 "large-account data and ownership settle on base",
-                async || {
-                    let account = self.base.account(&pda).await?.context("base account missing")?;
+                |accounts| {
+                    let account = accounts[0].as_ref().context("base account missing")?;
                     ensure!(account.owner == expected_owner);
                     ensure!(account.data == expected);
                     Ok(())
@@ -326,17 +324,21 @@ impl CommitAndUndelegate {
                     .settle(outsider, &[cells[0].address, outsider], commit_type)
                     .build()])
                 .await?;
+            let before = self.er.account(&cells[0].address).await?;
             let signature = self.er.api().send_transaction(&tx).await?;
             let outcome = self.er.api().try_confirm(&signature).await?;
+            let expected = match commit_type {
+                SettlementMode::Commit => InstructionError::IllegalOwner,
+                SettlementMode::Undelegate => InstructionError::ReadonlyDataModified,
+            };
             ensure!(
-                matches!(
-                    &outcome,
-                    Err(TxError {
-                        err: TransactionError::InstructionError(0, InstructionError::IllegalOwner)
-                    })
-                ),
+                outcome
+                    == Err(TxError {
+                        err: TransactionError::InstructionError(0, expected)
+                    }),
                 "foreign {what}: {outcome:?}"
             );
+            ensure!(self.er.account(&cells[0].address).await? == before);
         }
         Ok(())
     }
@@ -427,10 +429,10 @@ impl CommitAndUndelegate {
 
         self.base
             .api()
-            .await_accounts(&[pda], "the rejection policy settles on base", async || {
+            .await_accounts(&[pda], "the rejection policy settles on base", |accounts| {
                 ensure!(matches!(
-                    self.base.account(&pda).await,
-                    Ok(Some(acc))
+                    accounts[0].as_ref(),
+                    Some(acc)
                         if CellHeader::try_decode(&acc.data).ok().map(|cell| cell.undelegation)
                             == Some(UndelegationOutcome::Reject)
                 ));
@@ -484,7 +486,10 @@ impl CommitAndUndelegate {
         let logs = transaction_logs(meta);
         let error = meta.err.as_ref().context("expected ER rejection")?;
         let observed = format!("{}\n{error:?}", logs.join("\n"));
-        ensure!(observed.contains(refusal));
+        ensure!(
+            observed.contains(refusal),
+            "expected {refusal:?}, observed: {observed}"
+        );
 
         let sent_signature = receipt::receipt_signature_in_logs(logs)
             .context("the failed tx logs carry no ScheduledCommitSent signature")?;

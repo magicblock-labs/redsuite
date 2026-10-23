@@ -331,16 +331,17 @@ impl Scenario for RpcTokenQueries {
                 ],
                 "the er materializes both mints, the two projected token accounts \
              and the plain other-mint account",
-                async || {
-                    for mint in [fixture.mint, fixture.other_mint] {
-                        ensure!(er.account(&mint).await?.is_some());
-                    }
-                    for (address, amount) in [
-                        (fixture.ata_a, OWNER_A_BALANCE),
-                        (fixture.ata_b, OWNER_B_BALANCE),
-                        (fixture.ata_a_other, OTHER_MINT_BALANCE),
-                    ] {
-                        ensure!(spl::token_balance(&er, &address).await? == Some(amount));
+                |accounts| {
+                    ensure!(accounts[..2].iter().all(Option::is_some));
+                    for (account, amount) in accounts[2..].iter().zip([
+                        OWNER_A_BALANCE,
+                        OWNER_B_BALANCE,
+                        OTHER_MINT_BALANCE,
+                    ]) {
+                        ensure!(
+                            spl::account_balance(account.as_ref().context("ATA missing")?)
+                                == Some(amount)
+                        );
                     }
                     Ok(())
                 },
@@ -358,18 +359,14 @@ impl Scenario for RpcTokenQueries {
         )
         .await?;
         client
-            .await_accounts(
-                &[fixture.ata_a],
-                "the er reports the approved delegate",
-                async || {
-                    let filter = RpcTokenAccountsFilter::Mint(fixture.mint.to_string());
-                    let params = (fixture.delegate.to_string(), filter, parsed_config());
-                    let accounts: Vec<RpcKeyedAccount> =
-                        client.call_value(RpcRequest::GetTokenAccountsByDelegate, &params).await?;
-                    ensure!(accounts.len() == 1);
-                    Ok(())
-                },
-            )
+            .await_query("the er reports the approved delegate", async || {
+                let filter = RpcTokenAccountsFilter::Mint(fixture.mint.to_string());
+                let params = (fixture.delegate.to_string(), filter, parsed_config());
+                let accounts: Vec<RpcKeyedAccount> =
+                    client.call_value(RpcRequest::GetTokenAccountsByDelegate, &params).await?;
+                ensure!(accounts.len() == 1);
+                Ok(())
+            })
             .await?;
 
         Ok(Self { client, fixture })

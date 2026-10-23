@@ -37,6 +37,7 @@ use transaction::{versioned::VersionedTransaction, Transaction};
 use url::Url;
 
 mod wait;
+pub use wait::AccountWatch;
 
 pub use crate::transport::rpc::{account_config, RpcError};
 use crate::{
@@ -49,7 +50,7 @@ use crate::{
     Result,
 };
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq, Eq)]
 #[error("transaction failed on-chain: {err:?}")]
 pub struct TxError {
     pub err: TransactionError,

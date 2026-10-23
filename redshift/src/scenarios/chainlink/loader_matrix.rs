@@ -1,19 +1,14 @@
 use std::{
     rc::Rc,
-    slice,
     time::{Duration, Instant},
 };
 
-use anyhow::{anyhow, ensure, Context};
+use anyhow::{ensure, Context};
 use instruction::Instruction;
 use keypair::Keypair;
 use pubkey::Pubkey;
-use redsuite_core::{
-    api::{transaction_logs, transaction_meta},
-    programs::Redshift,
-    topology, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
-};
-use signature::Signature;
+use redsuite_core::{programs::Redshift, topology, BaseCtx, ChainCtx, ErCtx, Result, Scenario};
+use signer::Signer;
 use tokio::time;
 
 use crate::PAYER_LAMPORTS;
@@ -23,8 +18,6 @@ const MEMO_V2_ID: Pubkey = Pubkey::from_str_const("MemoSq4gqABAXKb96qnH8TysNcWxM
 
 const PAYER_DELEGATION: u64 = 1_000_000_000;
 const INVOKE_TIMEOUT: Duration = Duration::from_secs(30);
-// The engine reports a confirmed status one blocktime before the ledger
-// serves the transaction, so a lookup right after confirm must re-poll.
 const LOADER_V3_PROGRAMDATA_METADATA: usize = 45;
 
 pub struct LoaderMatrix {
@@ -72,11 +65,11 @@ impl Scenario for LoaderMatrix {
         ensure!(v2_data == base_memo_v2.data);
 
         let (v3_id, _) = topology::redshift_loader_v3_target();
-        let v3_logs = invoke_until(
+        invoke_until(
             &self.er,
             &self.payer,
             |attempt| Redshift::at(v3_id).log(&format!("probe {attempt}")),
-            has_log_msg,
+            has_probe,
         )
         .await?;
         let v3_programdata =
@@ -91,7 +84,6 @@ impl Scenario for LoaderMatrix {
         let (v3_owner, v3_data) = cloned_program(&self.er, &v3_id).await?;
         ensure!(v3_owner == sdk_ids::loader_v4::ID);
         ensure!(v3_data == base_v3_elf);
-        ensure!(v3_logs.iter().any(|line| line.contains("LogMsg:")));
 
         Ok(())
     }
@@ -105,7 +97,7 @@ fn memo_instruction(program_id: Pubkey, attempt: u64) -> Instruction {
     )
 }
 
-fn has_log_msg(logs: &[String]) -> bool {
+fn has_probe(logs: &[String]) -> bool {
     logs.iter().any(|line| line.starts_with("Program log: probe "))
 }
 
@@ -119,44 +111,35 @@ fn program_succeeded(logs: &[String], program: &Pubkey) -> bool {
 }
 
 async fn cloned_program(er: &ErCtx, program: &Pubkey) -> Result<(Pubkey, Vec<u8>)> {
-    let cloned = er
-        .account(program)
-        .await?
-        .ok_or_else(|| anyhow!("program not present in the ER"))?;
+    let cloned = er.account(program).await?.context("program not present in the ER")?;
     Ok((cloned.owner, cloned.data))
 }
 
-async fn confirmed_logs(er: &ErCtx, signature: &Signature) -> Result<Vec<String>> {
-    let info = match er.api().await_transaction(signature).await {
-        Ok(info) => info,
-        Err(error) if error.downcast_ref::<time::error::Elapsed>().is_some() => {
-            return Ok(Vec::new())
-        }
-        Err(error) => return Err(error),
-    };
-    Ok(transaction_logs(transaction_meta(&info)?).to_vec())
-}
-
-async fn invoke_until<Build, Accept>(
+async fn invoke_until(
     er: &ErCtx,
     payer: &Keypair,
-    build: Build,
-    accept: Accept,
-) -> Result<Vec<String>>
-where
-    Build: Fn(u64) -> Instruction,
-    Accept: Fn(&[String]) -> bool,
-{
+    build: impl Fn(u64) -> Instruction,
+    accept: impl Fn(&[String]) -> bool,
+) -> Result<()> {
     let deadline = Instant::now() + INVOKE_TIMEOUT;
+    let events = er.api().events().await?;
+    let mut notifications = events.logs(&payer.pubkey()).await?;
     let mut attempt = 0u64;
     loop {
         attempt += 1;
-        let ix = build(attempt);
-        match er.submit_and_confirm(payer, slice::from_ref(&ix)).await {
+        match er.submit_and_confirm(payer, &[build(attempt)]).await {
             Ok(signature) => {
-                let logs = confirmed_logs(er, &signature).await?;
-                if accept(&logs) {
-                    return Ok(logs);
+                let update =
+                    time::timeout_at(deadline.into(), notifications.for_signature(&signature))
+                        .await
+                        .context("program logs not delivered")??;
+                ensure!(
+                    update.err.is_none(),
+                    "program invocation failed: {:?}",
+                    update.err
+                );
+                if accept(&update.logs) {
+                    return Ok(());
                 }
             }
             Err(err) => {

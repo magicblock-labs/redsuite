@@ -10,6 +10,7 @@ use redsuite_core::{
     check,
     dlp::{self, commit_state, finalize, undelegate, CommitStateArgs},
     programs::{CellHeader, SettlementMode, REDLINE},
+    receipt::CommitWatch,
     system, topology, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
 use signer::Signer;
@@ -78,8 +79,8 @@ impl CloneOnAccess {
         self.base.airdrop(&ghost, GHOST_LAMPORTS).await?;
         self.er
             .api()
-            .await_accounts(&[ghost], "negative cache invalidated", async || {
-                let account = self.er.account(&ghost).await?.context("ghost not cloned")?;
+            .await_accounts(&[ghost], "negative cache invalidated", |accounts| {
+                let account = accounts[0].as_ref().context("ghost not cloned")?;
                 ensure!(account.lamports == GHOST_LAMPORTS);
                 Ok(())
             })
@@ -98,12 +99,12 @@ impl CloneOnAccess {
         let plain_clone = self
             .er
             .api()
-            .await_accounts(&[plain], "plain account cloned", async || {
-                let account = self.er.account(&plain).await?.context("plain clone missing")?;
+            .await_account(&plain, |account| {
                 ensure!(account.data.len() == ACCOUNT_SPACE as usize);
-                Ok(account)
+                Ok(())
             })
-            .await?;
+            .await
+            .context("plain account cloned")?;
         let plain_on_base = self.base.account(&plain).await?.context("plain gone on base")?;
         ensure!(plain_clone.lamports == plain_on_base.lamports);
         ensure!(plain_clone.owner == crate::program::id());
@@ -111,8 +112,8 @@ impl CloneOnAccess {
         self.base.cells(REDLINE, &self.payer).write(POST_CLONE_WRITE, &[plain]).await?;
         self.er
             .api()
-            .await_accounts(&[plain], "base write propagated", async || {
-                let account = self.er.account(&plain).await?.context("plain clone missing")?;
+            .await_accounts(&[plain], "base write propagated", |accounts| {
+                let account = accounts[0].as_ref().context("plain clone missing")?;
                 ensure!(CellHeader::written_id(&account.data) == Some(POST_CLONE_WRITE));
                 Ok(())
             })
@@ -162,12 +163,13 @@ impl CloneOnAccess {
     #[instrument(skip_all, err)]
     async fn commit(&self, accounts: &[Pubkey; 2], snapshot: &[u8]) -> Result<()> {
         let [delegated, sibling] = *accounts;
+        let receipt = CommitWatch::new(&self.er, &self.payer.pubkey()).await?;
         let signature = self
             .er
             .cells(REDLINE, &self.payer)
             .settle(1, &accounts[..1], SettlementMode::Commit)
             .await?;
-        let receipt = self.er.check_commit(&self.base, &signature, &accounts[..1], false).await?;
+        let receipt = receipt.check(&self.base, &signature, &accounts[..1], false).await?;
         if !receipt.failure_is_duplicate_rejection() {
             ensure!(receipt.payer == Some(self.payer.pubkey()));
             ensure!(!receipt.base_signatures.is_empty());
@@ -193,12 +195,13 @@ impl CloneOnAccess {
             );
         }
         ensure!(CellHeader::written_id(&finals[0].data) == Some(SECOND_WRITE));
+        let receipt = CommitWatch::new(&self.er, &self.payer.pubkey()).await?;
         let signature = self
             .er
             .cells(REDLINE, &self.payer)
             .settle(2, accounts, SettlementMode::Undelegate)
             .await?;
-        let receipt = self.er.check_commit(&self.base, &signature, accounts, true).await?;
+        let receipt = receipt.check(&self.base, &signature, accounts, true).await?;
         if !receipt.failure_is_duplicate_rejection() {
             ensure!(!receipt.base_signatures.is_empty());
         }
@@ -216,8 +219,8 @@ impl CloneOnAccess {
             .await_accounts(
                 &[delegated],
                 "the er re-clones the undelegated account with its base owner",
-                async || {
-                    let account = self.er.account(&delegated).await?.context("clone missing")?;
+                |accounts| {
+                    let account = accounts[0].as_ref().context("clone missing")?;
                     ensure!(account.owner == crate::program::id());
                     Ok(())
                 },
@@ -242,8 +245,8 @@ impl CloneOnAccess {
             .await_accounts(
                 &[wallet.pubkey()],
                 "the ER clones the delegated wallet at full balance",
-                async || {
-                    let balance = self.er.api().get_balance(&wallet.pubkey()).await?;
+                |accounts| {
+                    let balance = accounts[0].as_ref().context("wallet missing")?.lamports;
                     ensure!(balance == WALLET_LAMPORTS);
                     Ok(())
                 },
@@ -305,8 +308,8 @@ impl CloneOnAccess {
     ) -> Result<()> {
         self.base
             .api()
-            .await_accounts(&[pda], "base account state", async || {
-                let account = self.base.account(&pda).await?.context("base account missing")?;
+            .await_accounts(&[pda], "base account state", |accounts| {
+                let account = accounts[0].as_ref().context("base account missing")?;
                 ensure!(account.owner == owner);
                 ensure!(account.data == data);
                 if let Some(lamports) = lamports {

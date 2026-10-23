@@ -229,9 +229,8 @@ impl<'a> ScheduledIntents<'a> {
                 .await_accounts(
                     &[actor.cell],
                     &format!("{} restored for {label}", actor.cell),
-                    async || {
-                        let account =
-                            self.er.account(&actor.cell).await?.context("ER cell missing")?;
+                    |accounts| {
+                        let account = accounts[0].as_ref().context("ER cell missing")?;
                         ensure!(account.owner == redshift_interface::ID);
                         ensure!(CellHeader::try_decode(&account.data)? == actor.expected);
                         Ok(())
@@ -425,15 +424,14 @@ impl<'a> ScheduledIntents<'a> {
             .await_accounts(
                 &[actor.cell, key],
                 "callback completes exactly once",
-                async || {
-                    let account =
-                        self.er.account(&actor.cell).await?.context("callback cell missing")?;
+                |accounts| {
+                    let account = accounts[0].as_ref().context("callback cell missing")?;
                     let actual = CellHeader::try_decode(&account.data)?;
                     ensure!(actual.revision == (state.revision + 1));
                     ensure!(actual.value == (state.value + u64::from(fail)));
                     ensure!(account.lamports == (before.lamports + if fail { 0 } else { AMOUNT }));
                     ensure!(
-                        self.er.api().get_balance(&key).await?
+                        accounts[1].as_ref().context("callback payer missing")?.lamports
                             == (payer_before
                                 - ACTION_FEE
                                 - CALLBACK_FEE

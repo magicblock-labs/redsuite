@@ -16,7 +16,7 @@ use redsuite_core::{
         Accounts,
     },
     topology,
-    topology::{ReplicatedOptions, ReplicatedTopology, Verifier, VerifierStop},
+    topology::{ReplicatedOptions, ReplicatedTopology, Verifier},
     wait, BaseCtx, ChainCtx, PrivateErScenario, Result,
 };
 use signer::Signer;
@@ -34,7 +34,7 @@ const PROBE_LAMPORTS: u64 = 1_000_000;
 const CHAIN_GAP: Duration = Duration::from_millis(100);
 const HEAVY_ITERS: u32 = 30;
 const STEADY: Duration = Duration::from_secs(8);
-const BLOCKTIME: Duration = Duration::from_millis(10);
+const BLOCKTIME: Duration = Duration::from_millis(40);
 // Retention removes one superblock every 512 slots; avoid producing a backlog.
 const SUPERBLOCK_SLOTS: u64 = 512;
 const LEDGER_SIZE_LIMIT_BYTES: u64 = 1;
@@ -47,6 +47,7 @@ const SEAL_TIMEOUT: Duration = Duration::from_secs(60);
 const ADVANCE_WINDOW: Duration = Duration::from_secs(2);
 const LAG_SAMPLE: Duration = Duration::from_millis(500);
 const RESTART_BUDGET: Duration = Duration::from_secs(16);
+const RECOVERY_TIMEOUT: Duration = Duration::from_secs(60);
 
 const TRANSACTIONS: &str = "engine_ledger_transactions";
 const BLOCKS: &str = "engine_ledger_blocks";
@@ -103,14 +104,14 @@ impl Workload {
         self.progress.sent.get()
     }
 
-    async fn stop(self, topology: &ReplicatedTopology) -> Result<(Vec<CausalPair>, u64)> {
+    async fn stop(self, topology: &ReplicatedTopology) -> Result<Vec<CausalPair>> {
         self.progress.stop.set(true);
         time::timeout(DRAIN_TIMEOUT, self.drain(topology))
             .await
             .with_context(|| format!("workload did not drain within {DRAIN_TIMEOUT:?}"))?
     }
 
-    async fn drain(self, topology: &ReplicatedTopology) -> Result<(Vec<CausalPair>, u64)> {
+    async fn drain(self, topology: &ReplicatedTopology) -> Result<Vec<CausalPair>> {
         let pairs: Vec<_> = self.tasks.join_all().await.into_iter().collect::<Result<_>>()?;
         for pair in &pairs {
             if let Some(signature) = pair.last_signature {
@@ -126,7 +127,7 @@ impl Workload {
             "ledger metrics after the workload drains",
         )
         .await?;
-        Ok((pairs, self.progress.sent.get()))
+        Ok(pairs)
     }
 }
 
@@ -176,7 +177,7 @@ async fn await_leader_advance(
     name: &str,
     by: f64,
     what: &str,
-) -> Result<f64> {
+) -> Result<()> {
     let from = leader_count(topology, name).await?;
     let target = from + by;
     wait::retry(
@@ -187,11 +188,10 @@ async fn await_leader_advance(
             Ok(())
         },
     )
-    .await?;
-    Ok(target)
+    .await
 }
 
-async fn stop_verifier(verifier: &mut Verifier, hard_kill: bool) -> Result<VerifierStop> {
+async fn stop_verifier(verifier: &mut Verifier, hard_kill: bool) -> Result<()> {
     let stop = verifier.stop(hard_kill).await?;
     if hard_kill {
         ensure!(stop.exit_signal == Some(9));
@@ -201,7 +201,7 @@ async fn stop_verifier(verifier: &mut Verifier, hard_kill: bool) -> Result<Verif
     }
     ensure!(!verifier.is_running());
     ensure!(verifier.scrape_metrics().await.is_err());
-    Ok(stop)
+    Ok(())
 }
 
 async fn blocks_advance(verifier: &Verifier) -> Result<f64> {
@@ -296,21 +296,28 @@ impl PrivateErScenario for VerifierLifecycle {
 
         self.check_steady_load(&workload).await?;
 
-        self.restart_retained_cursor().await?;
+        time::timeout(RECOVERY_TIMEOUT, self.restart_retained_cursor())
+            .await
+            .context("retained-cursor recovery exceeded 60s")??;
 
         let server_snapshots_before = leader_count(&self.topology, SERVER_SNAPSHOTS).await?;
         let truncations_before = leader_count(&self.topology, TRUNCATIONS).await?;
         stop_verifier(self.topology.verifier_mut(1), false).await?;
-
         self.check_retention_gap().await?;
-
-        self.recover_snapshot(server_snapshots_before, truncations_before).await?;
+        time::timeout(
+            RECOVERY_TIMEOUT,
+            self.recover_snapshot(server_snapshots_before, truncations_before),
+        )
+        .await
+        .context("pruned-cursor recovery exceeded 60s")??;
 
         self.kill_verifier().await?;
 
-        self.rejoin_wiped().await?;
+        time::timeout(RECOVERY_TIMEOUT, self.rejoin_wiped())
+            .await
+            .context("wiped verifier recovery exceeded 60s")??;
 
-        let (pairs, _) = workload.stop(&self.topology).await?;
+        let pairs = workload.stop(&self.topology).await?;
         self.check_final_boundary(&pairs).await?;
 
         self.topology.finish().await
@@ -337,7 +344,7 @@ impl VerifierLifecycle {
 
     #[instrument(skip_all, err)]
     async fn check_steady_load(&self, workload: &Workload) -> Result<()> {
-        let (max_lag, _) = self.sample_lag(STEADY).await?;
+        let max_lag = self.sample_lag(STEADY).await?;
         self.catch_up_fleet(&[TRANSACTIONS]).await?;
         self.verify_no_mismatch().await?;
         debug!(
@@ -350,14 +357,26 @@ impl VerifierLifecycle {
 
     #[instrument(skip_all, err)]
     async fn restart_retained_cursor(&mut self) -> Result<()> {
-        await_leader_advance(
-            &self.topology,
-            BLOCKS,
-            SUPERBLOCK_SLOTS as f64,
-            "a fresh superblock boundary before the retained-cursor \
-                 restart",
-        )
-        .await?;
+        let events = self.topology.leader().ctx().api().events().await?;
+        let mut slots = events.slots().await?;
+        loop {
+            let head = leader_metric(&self.topology, SUPERBLOCKS).await?;
+            let sealed = slots
+                .query("new leader superblock", async || {
+                    let current = leader_metric(&self.topology, SUPERBLOCKS).await?;
+                    ensure!(current > head);
+                    Ok(current)
+                })
+                .await?;
+            await_catch_up(self.topology.verifier(0), SUPERBLOCKS, sealed).await?;
+            let blocks = leader_metric(&self.topology, BLOCKS).await?;
+            await_catch_up(self.topology.verifier(0), BLOCKS, blocks).await?;
+            let slot = self.topology.leader().ctx().api().get_slot().await?;
+            let headroom = BLOCKTIME * (SUPERBLOCK_SLOTS - slot % SUPERBLOCK_SLOTS) as u32;
+            if headroom > RESTART_BUDGET + Duration::from_millis(500) {
+                break;
+            }
+        }
         let restart_started = Instant::now();
         stop_verifier(self.topology.verifier_mut(0), false).await?;
         self.topology.verifier_mut(0).start(READY_TIMEOUT).await?;
@@ -426,22 +445,16 @@ impl VerifierLifecycle {
     ) -> Result<()> {
         self.topology.verifier_mut(1).start(READY_TIMEOUT).await?;
         self.topology.verifier(1).wait_connected(CONNECT_TIMEOUT).await?;
+        debug!(phase = "snapshot connected", "verifier recovery progress");
         let client_snapshots = verifier_count(self.topology.verifier(1), CLIENT_SNAPSHOTS).await?;
         ensure!(client_snapshots >= 1.0);
         let server_snapshots =
             leader_count(&self.topology, SERVER_SNAPSHOTS).await? - server_snapshots_before;
         ensure!(server_snapshots >= 1.0);
         let target = leader_metric(&self.topology, TRANSACTIONS).await?;
+        debug!(target, "waiting for recovered verifier transactions");
         await_catch_up(self.topology.verifier(1), TRANSACTIONS, target).await?;
         self.await_leader_connections(VERIFIERS).await?;
-        let sealed = await_leader_advance(
-            &self.topology,
-            SUPERBLOCKS,
-            1.0,
-            "a superblock sealed after the snapshot recovery",
-        )
-        .await?;
-        await_catch_up(self.topology.verifier(1), SUPERBLOCKS, sealed).await?;
         self.verify_no_mismatch().await?;
         let truncations = leader_count(&self.topology, TRUNCATIONS).await? - truncations_before;
         debug!(
@@ -498,8 +511,8 @@ impl VerifierLifecycle {
         let final_txs = leader_metric(&self.topology, TRANSACTIONS).await?;
         await_leader_advance(
             &self.topology,
-            BLOCKS,
-            SUPERBLOCK_SLOTS as f64 + 1.0,
+            SUPERBLOCKS,
+            1.0,
             "the final sealed boundary after the load",
         )
         .await?;
@@ -527,15 +540,14 @@ impl VerifierLifecycle {
     }
 
     #[instrument(skip_all, err)]
-    async fn catch_up_fleet(&self, names: &[&str]) -> Result<Duration> {
-        let mut slowest = Duration::ZERO;
+    async fn catch_up_fleet(&self, names: &[&str]) -> Result<()> {
         for name in names {
             let target = leader_metric(&self.topology, name).await?;
             for verifier in self.topology.verifiers() {
-                slowest = slowest.max(await_catch_up(verifier, name, target).await?);
+                await_catch_up(verifier, name, target).await?;
             }
         }
-        Ok(slowest)
+        Ok(())
     }
 
     async fn await_leader_connections(&self, expected: usize) -> Result<()> {
@@ -547,8 +559,7 @@ impl VerifierLifecycle {
                 Ok(())
             },
         )
-        .await?;
-        Ok(())
+        .await
     }
 
     #[instrument(skip_all, err)]
@@ -560,20 +571,18 @@ impl VerifierLifecycle {
         Ok(())
     }
 
-    async fn sample_lag(&self, window: Duration) -> Result<(Vec<f64>, usize)> {
+    async fn sample_lag(&self, window: Duration) -> Result<Vec<f64>> {
         let deadline = time::Instant::now() + window;
         let mut max_lag = vec![0.0f64; self.topology.verifiers().len()];
-        let mut samples = 0usize;
         while time::Instant::now() < deadline {
             let leader = leader_metric(&self.topology, TRANSACTIONS).await?;
             for (index, verifier) in self.topology.verifiers().iter().enumerate() {
                 let seen = verifier_metric(verifier, TRANSACTIONS).await?;
                 max_lag[index] = max_lag[index].max(leader - seen);
             }
-            samples += 1;
             time::sleep(LAG_SAMPLE).await;
         }
-        Ok((max_lag, samples))
+        Ok(max_lag)
     }
 
     async fn verify_pairs(&self, pairs: &[CausalPair]) -> Result<()> {
@@ -606,9 +615,8 @@ impl VerifierLifecycle {
             let address = probe.pubkey();
             leader
                 .api()
-                .await_accounts(&[address], "leader clones the probe", async || {
-                    let account =
-                        leader.account(&address).await?.context("probe account missing")?;
+                .await_accounts(&[address], "leader clones the probe", |accounts| {
+                    let account = accounts[0].as_ref().context("probe account missing")?;
                     ensure!(account.lamports > 0);
                     Ok(())
                 })

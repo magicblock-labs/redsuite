@@ -78,7 +78,7 @@ pub(super) trait SubscriptionState {
 
 enum Request<K> {
     Subscribe(K),
-    Unsubscribe(Topic),
+    Unsubscribe,
 }
 
 pub(super) struct Router<S: SubscriptionState> {
@@ -120,9 +120,8 @@ impl<S: SubscriptionState> Router<S> {
                         self.subscribed += 1;
                         self.state.on_subscribed(self.subscribed);
                     }
-                    // HTTP may observe confirmation before we receive its notification;
-                    // the server has already retired the one-shot signature route.
-                    (Some(Request::Unsubscribe(Topic::Signature)), Err(error))
+                    // Completed routes may be retired before asynchronous cleanup.
+                    (Some(Request::Unsubscribe), Err(error))
                         if error.code == jsonrpc_core::ErrorCode::InvalidParams
                             && error.message == "Invalid subscription id." => {}
                     (_, Err(error)) => return Err(CloseReason::ServerError(error).into()),
@@ -217,8 +216,8 @@ impl<S: SubscriptionState + 'static> Connection<S> {
     }
 
     pub(super) async fn await_subscribed(&self, count: usize) -> Result<()> {
-        self.wait("subscription acks", |router| {
-            Ok((router.subscribed >= count).then_some(()))
+        self.wait("subscription acks", || {
+            Ok((self.router.borrow().subscribed >= count).then_some(()))
         })
         .await
     }
@@ -236,18 +235,18 @@ impl<S: SubscriptionState + 'static> Connection<S> {
         what: &str,
         mut observe: impl FnMut(&S) -> Result<Option<T>>,
     ) -> Result<T> {
-        self.wait(what, |router| observe(&router.state)).await
+        self.wait(what, || observe(&self.router.borrow().state)).await
     }
 
-    async fn wait<T>(
+    pub(super) async fn wait<T>(
         &self,
         what: &str,
-        mut observe: impl FnMut(&Router<S>) -> Result<Option<T>>,
+        mut observe: impl FnMut() -> Result<Option<T>>,
     ) -> Result<T> {
         let changed = self.router.borrow().changed.clone();
         wait::on_change(&changed, NETWORK_TIMEOUT, what, || {
             self.check_error()?;
-            observe(&self.router.borrow())
+            observe()
         })
         .await
     }
@@ -257,8 +256,10 @@ impl<S: SubscriptionState + 'static> Connection<S> {
         S::Key: PartialEq,
     {
         // A one-shot route can complete before the task awaiting its acknowledgment resumes.
-        self.wait("subscription acknowledgment", |router| {
-            Ok((!router
+        self.wait("subscription acknowledgment", || {
+            Ok((!self
+                .router
+                .borrow()
                 .requests
                 .values()
                 .any(|request| matches!(request, Request::Subscribe(active) if *active == key)))
@@ -289,7 +290,7 @@ impl<S: SubscriptionState + 'static> Connection<S> {
         self.router.borrow_mut().subscriptions.remove(&subscription);
         let id = self.next_id.replace(self.next_id.get() + 1);
         let mut sink = self.sink.lock().await;
-        self.router.borrow_mut().requests.insert(id, Request::Unsubscribe(topic));
+        self.router.borrow_mut().requests.insert(id, Request::Unsubscribe);
         socket::send(&mut *sink, id, topic.unsubscribe(), &(subscription,)).await
     }
 

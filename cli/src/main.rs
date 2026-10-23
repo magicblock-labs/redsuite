@@ -57,6 +57,7 @@ async fn checks(family: Family, command: Checks) -> Result<()> {
                 },
                 args.serial,
                 args.fresh_concurrency.get(),
+                args.shared_concurrency.get(),
             )?
             .run()
             .await
@@ -76,7 +77,7 @@ async fn dispatch(command: Command) -> Result<ExitCode> {
                     loop_mode: args.loop_mode,
                     ..ExecutionConfig::default()
                 };
-                Suite::new(Family::Redline, args.run, config, true, 1)?.run().await?;
+                Suite::new(Family::Redline, args.run, config, true, 1, 1)?.run().await?;
             }
             Benchmarks::Load(args) => return load(args).await,
         },

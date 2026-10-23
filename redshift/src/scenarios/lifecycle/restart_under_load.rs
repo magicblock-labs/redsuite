@@ -201,13 +201,10 @@ async fn resolve(api: &Api, records: &mut [Record]) -> Result<()> {
         if record.outcome != Outcome::Unresolved {
             continue;
         }
-        record.outcome = match api.await_transaction(&record.signature).await {
-            Ok(tx) if transaction_meta(&tx)?.err.is_none() => Outcome::Confirmed,
-            Ok(_) => Outcome::Failed,
-            Err(error) if error.downcast_ref::<time::error::Elapsed>().is_some() => {
-                Outcome::Dropped
-            }
-            Err(error) => return Err(error),
+        record.outcome = match api.get_transaction(&record.signature).await? {
+            Some(tx) if transaction_meta(&tx)?.err.is_none() => Outcome::Confirmed,
+            Some(_) => Outcome::Failed,
+            None => Outcome::Dropped,
         };
     }
     Ok(())
@@ -323,6 +320,7 @@ async fn run_mode(base: &BaseCtx, mode: Mode) -> Result<()> {
     ensure!(records.iter().any(|record| record.outcome == Outcome::Confirmed));
 
     let api = private.ctx().api().clone();
+    // Restart readiness follows ledger recovery; absent submissions were not retained.
     resolve(&api, &mut records).await?;
     settle_after_restart(&api, mode, &mut records).await?;
     check_state(

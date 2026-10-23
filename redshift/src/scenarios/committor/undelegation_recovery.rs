@@ -111,8 +111,8 @@ impl UndelegationRecovery {
     async fn await_er_value(&self, account: &Pubkey, id: u64, what: &str) -> Result<()> {
         self.er
             .api()
-            .await_accounts(slice::from_ref(account), what, async || {
-                let account = self.er.account(account).await?.context("ER cell absent")?;
+            .await_accounts(slice::from_ref(account), what, |accounts| {
+                let account = accounts[0].as_ref().context("ER cell absent")?;
                 ensure!(CellHeader::try_decode(&account.data)?.value == id);
                 Ok(())
             })

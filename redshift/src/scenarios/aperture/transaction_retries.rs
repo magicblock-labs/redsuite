@@ -152,8 +152,12 @@ impl Signed {
 
 async fn state(er: &ErCtx, keys: &[Pubkey; 2]) -> Result<(u64, CellHeader)> {
     let accounts = er.accounts(keys).await?;
-    let payer = accounts[0].as_ref().with_context(|| format!("payer {} missing", keys[0]))?;
-    let cell = accounts[1].as_ref().with_context(|| format!("cell {} missing", keys[1]))?;
+    decode_state(&accounts)
+}
+
+fn decode_state(accounts: &[Option<account::Account>]) -> Result<(u64, CellHeader)> {
+    let payer = accounts[0].as_ref().context("payer missing")?;
+    let cell = accounts[1].as_ref().context("cell missing")?;
     Ok((payer.lamports, CellHeader::try_decode(&cell.data)?))
 }
 
@@ -350,8 +354,7 @@ impl Mode {
         };
         let owner = owner.pubkey();
         let keys = [payer.pubkey(), cell];
-        let mut expected =
-            er.api().await_accounts(&keys, "accounts cloned", || state(er, &keys)).await?;
+        let mut expected = er.api().await_accounts(&keys, "accounts cloned", decode_state).await?;
         ensure!((expected.1.value, expected.1.revision) == (0, 0));
         let mut start = er.api().get_slot().await?;
 

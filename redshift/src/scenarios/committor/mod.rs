@@ -63,8 +63,8 @@ async fn prove_landed(
         .await_accounts(
             slice::from_ref(account),
             "base snapshot before fault",
-            async || {
-                let account = base.account(account).await?.context("base account missing")?;
+            |accounts| {
+                let account = accounts[0].as_ref().context("base account missing")?;
                 ensure!(account.data == snapshot);
                 Ok(())
             },

@@ -254,10 +254,16 @@ impl MagicAtas<'_> {
 
     async fn close(&self, destination: &Wallet) -> Result<()> {
         let tokens = self.tokens;
-        tokens
-            .private
-            .ctx()
-            .submit_and_confirm_with(&tokens.payer, &[&destination.owner], &[destination.close()])
+        let er = tokens.private.ctx();
+        let events = er.api().events().await?;
+        let mut account = events.account(&destination.ata).await?;
+        er.submit_and_confirm_with(&tokens.payer, &[&destination.owner], &[destination.close()])
+            .await?;
+        account
+            .until(|update| {
+                update.value.owner == system::system_id().to_string()
+                    && update.value.data.decode().is_some_and(|data| data.is_empty())
+            })
             .await?;
         Ok(())
     }
@@ -268,8 +274,12 @@ impl MagicAtas<'_> {
             .await_accounts(
                 &[destination.ata],
                 "close restores the base ATA or permits eATA projection",
-                async || {
-                    ensure!(er.account(&destination.ata).await? == original);
+                |accounts| {
+                    ensure!(
+                        accounts[0].as_ref() == original.as_ref(),
+                        "expected restored ATA {original:?}, observed {:?}",
+                        accounts[0]
+                    );
                     Ok(())
                 },
             )
@@ -285,14 +295,13 @@ impl MagicAtas<'_> {
             .await_accounts(
                 &[destination.ata],
                 "close restores the base ATA or permits eATA projection",
-                async || {
-                    let account =
-                        er.account(&destination.ata).await?.context("projection missing")?;
+                |accounts| {
+                    let account = accounts[0].as_ref().context("projection missing")?;
                     ensure!(!spl::is_magic_ata(&account.data));
                     ensure!(account.owner == spl::token_program());
                     ensure!(account.data.len() == spl::TOKEN_ACCOUNT_LEN);
                     ensure!(account.lamports == base_ata.lamports);
-                    ensure!(amount(er, &destination.ata).await? == DEPOSIT);
+                    ensure!(spl::account_balance(account) == Some(DEPOSIT));
                     Ok(())
                 },
             )

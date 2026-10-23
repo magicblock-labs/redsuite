@@ -277,8 +277,9 @@ impl AmlGate {
                 self.private
                     .ctx()
                     .api()
-                    .await_accounts(&[destination_ata], "low-risk merge settles", async || {
-                        ensure!(self.er_token_amount(&destination_ata).await? == SHUTTLE_AMOUNT);
+                    .await_accounts(&[destination_ata], "low-risk merge settles", |accounts| {
+                        let account = accounts[0].as_ref().context("destination ATA missing")?;
+                        ensure!(spl::account_balance(account) == Some(SHUTTLE_AMOUNT));
                         Ok(())
                     })
                     .await?;

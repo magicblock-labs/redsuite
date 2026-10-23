@@ -561,13 +561,10 @@ impl RpcLifecycle {
     async fn await_clones(&self, pdas: &[Pubkey]) -> Result<()> {
         self.er
             .api()
-            .await_accounts(pdas, "delegated account clones", async || {
-                for chunk in pdas.chunks(ACCOUNTS_PER_CALL) {
-                    let accounts = self.er.api().get_multiple_accounts(chunk).await?;
-                    ensure!(accounts.iter().all(|account| account
-                        .as_ref()
-                        .is_some_and(|account| account.data.len() == ACCOUNT_SPACE as usize)));
-                }
+            .await_accounts(pdas, "delegated account clones", |accounts| {
+                ensure!(accounts.iter().all(|account| account
+                    .as_ref()
+                    .is_some_and(|account| account.data.len() == ACCOUNT_SPACE as usize)));
                 Ok(())
             })
             .await

@@ -130,10 +130,12 @@ pub(crate) async fn token_balance(ctx: &impl ChainCtx, account: &Pubkey) -> Resu
     let Some(account) = ctx.account(account).await? else {
         return Ok(None);
     };
-    let Some(bytes) = account.data.get(TOKEN_AMOUNT_OFFSET..TOKEN_AMOUNT_OFFSET + 8) else {
-        return Ok(None);
-    };
-    Ok(Some(u64::from_le_bytes(bytes.try_into()?)))
+    Ok(account_balance(&account))
+}
+
+pub(crate) fn account_balance(account: &account::Account) -> Option<u64> {
+    let bytes = account.data.get(TOKEN_AMOUNT_OFFSET..TOKEN_AMOUNT_OFFSET + 8)?;
+    Some(u64::from_le_bytes(bytes.try_into().ok()?))
 }
 
 pub(crate) fn transfer(

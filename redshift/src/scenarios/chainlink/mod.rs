@@ -14,7 +14,7 @@ pub(crate) mod spl;
 pub mod undelegation_grpc_redundancy;
 
 use pubkey::Pubkey;
-use redsuite_core::{ChainCtx, ErCtx, Result};
+use redsuite_core::{programs::CellHeader, ChainCtx, ErCtx, Result};
 
 use crate::ACCOUNT_OWNERS;
 
@@ -24,10 +24,13 @@ const BASE_REFRESH: u64 = 901;
 const FETCHES: [&str; 2] = ["getAccountInfo", "getMultipleAccounts"];
 
 async fn await_local_value(er: &ErCtx, what: &str, keys: &[Pubkey], expected: u64) -> Result<()> {
-    er.api()
-        .await_accounts(keys, what, async || {
-            for account in er.local_accounts(&ACCOUNT_OWNERS, keys).await? {
-                ensure!(crate::account_id(account) == Some(expected));
+    let mut watch = er.api().watch_accounts(keys).await?;
+    watch.seed(er.local_accounts(&ACCOUNT_OWNERS, keys).await?)?;
+    watch
+        .until(what, |accounts| {
+            for account in accounts {
+                let actual = account.as_ref().and_then(|a| CellHeader::written_id(&a.data));
+                ensure!(actual == Some(expected));
             }
             Result::Ok(())
         })

@@ -362,8 +362,7 @@ impl CacheLifecycle {
         settlement.remove();
         self.base
             .api()
-            .await_accounts(pending, "base undelegation", async || {
-                let actual = self.base.accounts(pending).await?;
+            .await_accounts(pending, "base undelegation", |actual| {
                 for (actual, expected) in actual.iter().zip(&accounts.protected[delegated.len()..])
                 {
                     let actual = actual.as_ref().map(|a| (a.owner, &a.data));
@@ -395,12 +394,12 @@ impl CacheLifecycle {
                 .await_accounts(
                     pending,
                     "completed accounts refetch current base state",
-                    async || {
-                        let actual: Vec<_> = er
-                            .accounts(pending)
-                            .await?
-                            .into_iter()
-                            .map(crate::account_id)
+                    |observed| {
+                        let actual: Vec<_> = observed
+                            .iter()
+                            .map(|account| {
+                                account.as_ref().and_then(|a| CellHeader::written_id(&a.data))
+                            })
                             .collect();
                         ensure!(actual == vec![Some(BASE_REWRITE); pending.len()]);
                         Result::Ok(())
@@ -415,10 +414,10 @@ impl CacheLifecycle {
             .await_accounts(
                 readonly,
                 "final readonly mirrors synchronized",
-                async || {
-                    let fetched = er.accounts(readonly).await?;
-                    for account in fetched {
-                        ensure!(crate::account_id(account) == Some(BASE_REFRESH));
+                |observed| {
+                    for account in observed {
+                        let actual = account.as_ref().and_then(|a| CellHeader::written_id(&a.data));
+                        ensure!(actual == Some(BASE_REFRESH));
                     }
                     Result::Ok(())
                 },

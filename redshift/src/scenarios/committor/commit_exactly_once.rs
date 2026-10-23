@@ -214,9 +214,8 @@ impl CommitExactlyOnce {
             .await_accounts(
                 &[account],
                 "the base copy matches the er snapshot after the follow-up commit",
-                async || {
-                    let account =
-                        self.base.account(&account).await?.context("base account missing")?;
+                |accounts| {
+                    let account = accounts[0].as_ref().context("base account missing")?;
                     ensure!(account.data == snapshot);
                     Ok(())
                 },
@@ -263,8 +262,9 @@ impl CommitExactlyOnce {
             .await_accounts(
                 &[cell],
                 "the base cell shows the action once before the fault is applied",
-                async || {
-                    ensure!(self.base_count(&cell).await? == 1);
+                |accounts| {
+                    let account = accounts[0].as_ref().context("base cell missing")?;
+                    ensure!(CellHeader::try_decode(&account.data)?.value == 1);
                     Ok(())
                 },
             )

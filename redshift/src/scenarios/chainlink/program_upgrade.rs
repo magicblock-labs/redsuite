@@ -379,7 +379,12 @@ impl ProgramUpgrade {
             .await_accounts(
                 &[self.program_id, self.programdata],
                 "fresh B materialization",
-                || self.materialized(er, &self.b),
+                |accounts| {
+                    ensure!(accounts[0]
+                        .as_ref()
+                        .is_some_and(|account| account.executable && account.data == self.b));
+                    Ok(())
+                },
             )
             .await?;
         progress.phase.set(3);
