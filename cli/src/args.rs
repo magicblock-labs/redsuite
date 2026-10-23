@@ -84,6 +84,9 @@ pub struct CheckRun {
     /// Maximum concurrent fresh scenarios.
     #[arg(long, default_value = "2", value_name = "N")]
     pub fresh_concurrency: NonZeroUsize,
+    /// Maximum concurrent shared scenarios in each compatible ER group.
+    #[arg(long, default_value = "4", value_name = "N")]
+    pub shared_concurrency: NonZeroUsize,
     /// Run one scenario at a time; does not change cleanup behavior.
     #[arg(long)]
     pub serial: bool,

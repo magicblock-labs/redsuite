@@ -40,8 +40,8 @@ fn count(data: &[u8]) -> Result<u64> {
 
 async fn await_clone_count(er: &ErCtx, account: &Pubkey, id: u64) -> Result<()> {
     er.api()
-        .await_accounts(slice::from_ref(account), "cloned cell state", async || {
-            let account = er.account(account).await?.context("ER cell absent")?;
+        .await_accounts(slice::from_ref(account), "cloned cell state", |accounts| {
+            let account = accounts[0].as_ref().context("ER cell absent")?;
             ensure!(count(&account.data)? == id);
             Ok(())
         })
@@ -70,8 +70,9 @@ async fn await_base(
     what: &str,
 ) -> Result<()> {
     base.api()
-        .await_accounts(slice::from_ref(account), what, async || {
-            ensure!(base_state(base, account).await? == (owner, Some(id)));
+        .await_accounts(slice::from_ref(account), what, |accounts| {
+            let account = accounts[0].as_ref().context("base cell missing")?;
+            ensure!((account.owner, CellHeader::written_id(&account.data)) == (owner, Some(id)));
             Ok(())
         })
         .await?;

@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, time::Duration};
+use std::{collections::VecDeque, result, time::Duration};
 
 use anyhow::Context;
 use json::Value;
@@ -10,7 +10,7 @@ use tokio::{time, time::Instant};
 use url::Url;
 
 use super::{
-    rpc::NO_PARAMS,
+    rpc::{RpcError, NO_PARAMS},
     socket::{self, Frame, Notification, Socket},
     subscription::{self, Topic},
     NETWORK_TIMEOUT,
@@ -41,6 +41,14 @@ impl RawWs {
         method: RpcRequest,
         params: &impl Serialize,
     ) -> Result<T> {
+        self.try_request(method, params).await?.map_err(Into::into)
+    }
+
+    async fn try_request<T: DeserializeOwned>(
+        &mut self,
+        method: RpcRequest,
+        params: &impl Serialize,
+    ) -> Result<result::Result<T, RpcError>> {
         let id = self.next_id;
         self.next_id += 1;
         socket::send(&mut self.socket, id, method, params).await?;
@@ -52,7 +60,10 @@ impl RawWs {
                 .with_context(|| method.to_string())?;
             match socket::parse(&text).with_context(|| method.to_string())? {
                 Some(Frame::Reply { id: reply, result }) if reply == id => {
-                    return Ok(json::from_str(result.as_raw_str())?);
+                    return match result {
+                        Ok(result) => Ok(Ok(json::from_str(result.as_raw_str())?)),
+                        Err(error) => Ok(Err(RpcError { error, method })),
+                    };
                 }
                 // A cancelled request may leave a late reply on the socket.
                 Some(Frame::Reply { .. }) | None => {}
@@ -83,14 +94,22 @@ impl RawWs {
     }
 
     pub async fn logs_subscribe_all(&mut self) -> Result<u64> {
-        let params = subscription::logs_params(RpcTransactionLogsFilter::All);
-        self.subscribe(Topic::Logs, &params).await
+        self.try_logs_subscribe(RpcTransactionLogsFilter::All)
+            .await?
+            .map_err(Into::into)
     }
 
     pub async fn logs_subscribe_mentions(&mut self, account: &Pubkey) -> Result<u64> {
         let filter = RpcTransactionLogsFilter::Mentions(vec![account.to_string()]);
+        self.try_logs_subscribe(filter).await?.map_err(Into::into)
+    }
+
+    pub async fn try_logs_subscribe(
+        &mut self,
+        filter: RpcTransactionLogsFilter,
+    ) -> Result<result::Result<u64, RpcError>> {
         let params = subscription::logs_params(filter);
-        self.subscribe(Topic::Logs, &params).await
+        self.try_request(Topic::Logs.subscribe(), &params).await
     }
 
     pub async fn logs_unsubscribe(&mut self, subscription: u64) -> Result<bool> {
@@ -141,7 +160,10 @@ impl RawWs {
                         return Ok(Some(notification));
                     }
                 }
-                Some(Frame::Reply { .. }) | None => {}
+                Some(Frame::Reply { result, .. }) => {
+                    result.map_err(socket::CloseReason::from)?;
+                }
+                None => {}
                 Some(Frame::Malformed) => self.malformed += 1,
             }
         }

@@ -75,8 +75,15 @@ impl Activation<'_> {
     async fn await_cell(&self, expected: CellState, what: &str) -> Result<()> {
         self.er
             .api()
-            .await_accounts(&[self.cell], what, async || {
-                ensure!(self.state().await? == expected);
+            .await_accounts(&[self.cell], what, |accounts| {
+                let account = accounts[0].as_ref().context("activation cell missing")?;
+                let cell = CellHeader::try_decode(&account.data)?;
+                ensure!(
+                    CellState {
+                        value: cell.value,
+                        revision: cell.revision
+                    } == expected
+                );
                 Ok(())
             })
             .await
@@ -170,12 +177,8 @@ impl Activation<'_> {
                 .await_accounts(
                     &[trigger.pubkey()],
                     "the failed activation completes the rescue undelegation on base",
-                    async || {
-                        let owner = self
-                            .base
-                            .account(&trigger.pubkey())
-                            .await?
-                            .map(|account| account.owner);
+                    |accounts| {
+                        let owner = accounts[0].as_ref().map(|account| account.owner);
                         ensure!(owner == Some(system::system_id()));
                         Ok(())
                     },

@@ -10,7 +10,7 @@ use redsuite_core::{
     api::{custom_error_code, transaction_logs, transaction_meta},
     catalog::Fixture,
     netfault::{BaseProxies, Selector},
-    programs::UpgradeProbe,
+    programs::{CellHeader, UpgradeProbe},
     redline::Accounts,
     topology::{self, ErOptions, PrivateEr},
     transaction_types::EncodedConfirmedTransactionWithStatusMeta as TransactionInfo,
@@ -253,7 +253,11 @@ impl Invocations<'_> {
             .into_iter()
             .collect::<Option<Vec<_>>>()
             .context("state account missing")?;
-        ensure!(state == self.expected);
+        ensure!(
+            state == self.expected,
+            "state {state:?}, expected {:?}",
+            self.expected
+        );
         let mut counts = self.progress.counts.get();
         counts[current] += 1;
         self.progress.counts.set(counts);
@@ -288,6 +292,11 @@ impl Invocations<'_> {
             ensure!(!id.is_multiple_of(4));
             let value = id * 10 + version;
             for (account, value) in self.expected.iter_mut().zip([value, !value]) {
+                let mut header = CellHeader::try_decode(&account.data)?;
+                header.value = value;
+                // Set and Fill each advance the cell revision.
+                header.revision += 2;
+                header.write(&mut account.data)?;
                 account.data[layout::DATA_OFFSET..].copy_from_slice(&value.to_le_bytes());
             }
         }
@@ -370,7 +379,12 @@ impl ProgramUpgrade {
             .await_accounts(
                 &[self.program_id, self.programdata],
                 "fresh B materialization",
-                || self.materialized(er, &self.b),
+                |accounts| {
+                    ensure!(accounts[0]
+                        .as_ref()
+                        .is_some_and(|account| account.executable && account.data == self.b));
+                    Ok(())
+                },
             )
             .await?;
         progress.phase.set(3);

@@ -2,6 +2,7 @@ pub mod aperture;
 pub mod chainlink;
 pub mod committor;
 pub mod harness;
+pub mod lifecycle;
 pub mod replication;
 pub mod scheduler;
 pub mod storage;
@@ -24,6 +25,10 @@ static COMMITTOR: ErGroup = ErGroup {
 
 pub fn catalog() -> Vec<ScenarioEntry> {
     vec![
+        scenario!(
+            lifecycle::restart_under_load::RestartUnderLoad,
+            fresh(&[Fixture::RedlineProgram], ())
+        ),
         scenario!(
             storage::ledger_retention::LedgerRetention,
             fresh(&[Fixture::RedshiftProgram], ())

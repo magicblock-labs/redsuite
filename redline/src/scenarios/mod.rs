@@ -2,7 +2,6 @@ pub mod aperture;
 pub mod chainlink;
 pub mod committor;
 pub mod harness;
-pub mod lifecycle;
 pub mod scheduler;
 pub mod storage;
 
@@ -80,10 +79,6 @@ pub fn catalog() -> Vec<ScenarioEntry> {
         ),
         scenario!(
             storage::superblock_boundary_latency::SuperblockBoundaryLatency,
-            fresh(&[Fixture::RedlineProgram], ())
-        ),
-        scenario!(
-            lifecycle::restart_under_load::RestartUnderLoad,
             fresh(&[Fixture::RedlineProgram], ())
         ),
         scenario!(

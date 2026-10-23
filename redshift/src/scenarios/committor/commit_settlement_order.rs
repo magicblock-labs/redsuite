@@ -103,8 +103,8 @@ impl CommitSettlementOrder {
     async fn await_base(&self, account: &Pubkey, snapshot: &[u8], what: &str) -> Result<()> {
         self.base
             .api()
-            .await_accounts(slice::from_ref(account), what, async || {
-                let account = self.base.account(account).await?.context("base account missing")?;
+            .await_accounts(slice::from_ref(account), what, |accounts| {
+                let account = accounts[0].as_ref().context("base account missing")?;
                 ensure!(account.data == snapshot);
                 Ok(())
             })

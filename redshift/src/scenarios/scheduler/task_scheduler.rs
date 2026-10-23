@@ -7,7 +7,7 @@ use keypair::Keypair;
 use pubkey::Pubkey;
 
 use redsuite_core::{
-    prep,
+    check, prep,
     programs::{CellId, Task, MAGIC, REDSHIFT},
     topology, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
@@ -16,6 +16,7 @@ use signer::Signer;
 use crate::PAYER_LAMPORTS;
 
 const TASK_INTERVAL_MS: i64 = 100;
+const CANCEL_INTERVAL_MS: i64 = 60_000;
 const SCHEDULER_PROGRAM: Pubkey = topology::HYDRA_EPHEMERAL_ID;
 
 struct Actor {
@@ -24,6 +25,14 @@ struct Actor {
 }
 
 impl Actor {
+    fn address(&self, task_id: i64) -> Pubkey {
+        let mut seed = [0; 40];
+        seed[..32].copy_from_slice(self.payer.pubkey().as_ref());
+        seed[32..].copy_from_slice(&task_id.to_le_bytes());
+        let seed = check::content_hash(&seed);
+        Pubkey::find_program_address(&[b"crank", seed.as_ref()], &SCHEDULER_PROGRAM).0
+    }
+
     fn schedule(&self, task: Task, instruction: Instruction) -> Instruction {
         let authority = self.payer.pubkey();
         REDSHIFT
@@ -43,8 +52,8 @@ impl Actor {
             .await?;
         base.delegate_payer(funder, &payer, er.identity()).await?;
         er.api()
-            .await_accounts(&[cell], "the ER clones the cell", async || {
-                let account = er.account(&cell).await?.context("cell not cloned")?;
+            .await_accounts(&[cell], "the ER clones the cell", |accounts| {
+                let account = accounts[0].as_ref().context("cell not cloned")?;
                 ensure!(!account.data.is_empty());
                 Ok(())
             })
@@ -62,7 +71,8 @@ impl Actor {
         task_id: i64,
         interval_ms: i64,
         iterations: i64,
-    ) -> Result<()> {
+    ) -> Result<Account> {
+        let mut task = er.api().watch_accounts(&[self.address(task_id)]).await?;
         er.submit_and_confirm(
             &self.payer,
             &[self.schedule(
@@ -75,10 +85,17 @@ impl Actor {
             )],
         )
         .await?;
-        Ok(())
+        task.until(&format!("task {task_id} created"), |accounts| {
+            let account = accounts[0].as_ref().context("task missing")?;
+            ensure!(account.owner == SCHEDULER_PROGRAM);
+            ensure!(!account.data.is_empty());
+            Ok(account.clone())
+        })
+        .await
     }
 
     async fn cancel(&self, er: &ErCtx, task_id: i64) -> Result<()> {
+        let mut task = er.api().watch_accounts(&[self.address(task_id)]).await?;
         er.submit_and_confirm(
             &self.payer,
             &[REDSHIFT
@@ -88,7 +105,13 @@ impl Actor {
                 .build()],
         )
         .await?;
-        Ok(())
+        task.until(&format!("task {task_id} cancelled"), |accounts| {
+            ensure!(accounts[0]
+                .as_ref()
+                .is_none_or(|account| account.owner != SCHEDULER_PROGRAM || account.lamports == 0));
+            Ok(())
+        })
+        .await
     }
 }
 
@@ -124,25 +147,19 @@ impl Scenario for TaskScheduler {
 
 impl TaskScheduler {
     async fn test_schedule_and_cancel(&self) -> Result<()> {
-        self.actor.submit_schedule(&self.er, 101, TASK_INTERVAL_MS, 3).await?;
-        self.await_tasks(1).await?;
+        self.actor.submit_schedule(&self.er, 101, CANCEL_INTERVAL_MS, 3).await?;
         self.actor.cancel(&self.er, 101).await?;
-        self.await_tasks(0).await?;
         ensure!(self.actor.count(&self.er).await? == 0);
         Ok(())
     }
 
     async fn test_reschedule(&self) -> Result<()> {
-        self.actor.submit_schedule(&self.er, 102, TASK_INTERVAL_MS, 2).await?;
-        let (address, original) = self.await_tasks(1).await?.remove(0);
+        let original = self.actor.submit_schedule(&self.er, 102, CANCEL_INTERVAL_MS, 2).await?;
         self.actor.cancel(&self.er, 102).await?;
-        self.await_tasks(0).await?;
-        self.actor.submit_schedule(&self.er, 102, 2 * TASK_INTERVAL_MS, 2).await?;
-        let (readdress, replacement) = self.await_tasks(1).await?.remove(0);
-        ensure!(readdress == address);
+        let replacement =
+            self.actor.submit_schedule(&self.er, 102, 2 * CANCEL_INTERVAL_MS, 2).await?;
         ensure!(replacement.data != original.data);
         self.actor.cancel(&self.er, 102).await?;
-        self.await_tasks(0).await?;
         Ok(())
     }
 
@@ -168,15 +185,13 @@ impl TaskScheduler {
         };
         let detail = format!("{:?}", error.err);
         ensure!(detail.contains("MissingRequiredSignature"));
-        ensure!(self.tasks().await?.len() == 0);
+        ensure!(self.er.api().get_program_accounts(&SCHEDULER_PROGRAM).await?.len() == 0);
         Ok(())
     }
 
     async fn test_cancel_ongoing(&self) -> Result<()> {
         self.actor.submit_schedule(&self.er, 108, TASK_INTERVAL_MS, i64::MAX).await?;
-        self.await_tasks(1).await?;
         self.actor.cancel(&self.er, 108).await?;
-        self.await_tasks(0).await?;
         Ok(())
     }
 
@@ -188,19 +203,19 @@ impl TaskScheduler {
             )
             .await?;
         let before = self.sponsor_balance().await?;
-        self.actor.submit_schedule(&self.er, 109, TASK_INTERVAL_MS, 3).await?;
-        self.await_tasks(1).await?;
+        self.actor.submit_schedule(&self.er, 109, CANCEL_INTERVAL_MS, 3).await?;
         let funded = self.sponsor_balance().await?;
         ensure!(funded < before);
+        let mut sponsor = self.er.api().watch_accounts(&[self.er.identity()]).await?;
         self.actor.cancel(&self.er, 109).await?;
-        self.await_tasks(0).await?;
-        self.er
-            .api()
-            .await_accounts(
-                &[self.er.identity()],
+        sponsor
+            .until(
                 "cancellation refunds the validator identity in full",
-                async || {
-                    ensure!(self.sponsor_balance().await? == before);
+                |accounts| {
+                    ensure!(
+                        accounts[0].as_ref().context("validator identity missing")?.lamports
+                            == before
+                    );
                     Ok(())
                 },
             )
@@ -210,37 +225,13 @@ impl TaskScheduler {
 
     async fn test_authority_isolation(&self) -> Result<()> {
         let other = Actor::prepare(self.base.as_ref(), &self.er, &self.funder).await?;
-        self.actor.submit_schedule(&self.er, 106, TASK_INTERVAL_MS, 3).await?;
-        let owners = self.await_tasks(1).await?;
-        other.submit_schedule(&self.er, 106, 2 * TASK_INTERVAL_MS, 3).await?;
-        let both = self.await_tasks(2).await?;
-        ensure!(both.iter().any(|(address, _)| *address == owners[0].0));
+        self.actor.submit_schedule(&self.er, 106, CANCEL_INTERVAL_MS, 3).await?;
+        let original = other.submit_schedule(&self.er, 106, 2 * CANCEL_INTERVAL_MS, 3).await?;
+        ensure!(self.actor.address(106) != other.address(106));
         self.actor.cancel(&self.er, 106).await?;
-        let remaining = self.await_tasks(1).await?;
-        ensure!(remaining[0].0 != owners[0].0);
+        ensure!(self.er.account(&other.address(106)).await? == Some(original));
         other.cancel(&self.er, 106).await?;
-        self.await_tasks(0).await?;
         Ok(())
-    }
-
-    async fn tasks(&self) -> Result<Vec<(Pubkey, Account)>> {
-        self.er.api().get_program_accounts(&SCHEDULER_PROGRAM).await
-    }
-
-    async fn await_tasks(&self, expected: usize) -> Result<Vec<(Pubkey, Account)>> {
-        let found = self
-            .er
-            .api()
-            .await_program_accounts(&SCHEDULER_PROGRAM, |found| {
-                ensure!(found.len() == expected);
-                Ok(found)
-            })
-            .await?;
-        for (_, account) in &found {
-            ensure!(account.owner == SCHEDULER_PROGRAM);
-            ensure!(!account.data.is_empty());
-        }
-        Ok(found)
     }
 
     async fn sponsor_balance(&self) -> Result<u64> {

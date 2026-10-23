@@ -45,6 +45,10 @@ impl State {
 
     async fn read(er: &ErCtx, keys: &[Pubkey; 2]) -> Result<State> {
         let accounts = er.accounts(keys).await?;
+        Self::decode(&accounts)
+    }
+
+    fn decode(accounts: &[Option<account::Account>]) -> Result<State> {
         let payer = accounts[0].as_ref().context("fee payer missing")?;
         let cell = accounts[1].as_ref().context("cell missing")?;
         Ok(State {
@@ -157,9 +161,7 @@ impl PrivateErScenario for CheckpointDurability {
         let expected = private
             .ctx()
             .api()
-            .await_accounts(&keys, "accounts cloned", || {
-                State::read(private.ctx(), &keys)
-            })
+            .await_accounts(&keys, "accounts cloned", State::decode)
             .await?;
         ensure!((expected.cell.value, expected.cell.revision) == (0, 0));
         let workload = Workload {

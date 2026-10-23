@@ -2,8 +2,10 @@ use std::{rc::Rc, result};
 
 use account::Account;
 use anyhow::{anyhow, ensure, Context};
+use futures_util::{stream, StreamExt, TryStreamExt};
 use pubkey::Pubkey;
 use signature::Signature;
+use solana_account_decoder_client_types::UiAccount;
 use solana_commitment_config::CommitmentConfig;
 use solana_rpc_client_types::response::{Response, RpcSignatureResult};
 use solana_transaction_status_client_types::EncodedConfirmedTransactionWithStatusMeta;
@@ -18,6 +20,55 @@ use crate::{
     },
     Result,
 };
+
+/// Acknowledged account subscriptions and their latest observed images, in request order.
+pub struct AccountWatch {
+    addresses: Vec<Pubkey>,
+    subscriptions: Vec<Subscription<Response<UiAccount>>>,
+    accounts: Vec<Option<Account>>,
+    seen: Vec<bool>,
+    deadline: time::Instant,
+}
+
+impl AccountWatch {
+    /// Seed an existing-state observation without refetching on subsequent updates.
+    pub fn seed(&mut self, accounts: Vec<Option<Account>>) -> Result<()> {
+        ensure!(
+            accounts.len() == self.addresses.len(),
+            "account snapshot length mismatch"
+        );
+        self.accounts = accounts;
+        self.seen.fill(true);
+        Ok(())
+    }
+
+    pub async fn until<T>(
+        &mut self,
+        what: &str,
+        ready: impl Fn(&[Option<Account>]) -> Result<T>,
+    ) -> Result<T> {
+        loop {
+            let error = if self.seen.contains(&false) {
+                anyhow!("account notifications missing")
+            } else {
+                match ready(&self.accounts) {
+                    Ok(value) => return Ok(value),
+                    Err(error) => error,
+                }
+            };
+            let (index, update) = time::timeout_at(
+                self.deadline,
+                Subscription::next_from(&mut self.subscriptions),
+            )
+            .await
+            .with_context(|| format!("{what}: {error:#}; accounts={:?}", self.addresses))??;
+            let account = decode_account(update.value)?;
+            // Account subscriptions report closure as the empty system account.
+            self.accounts[index] = (account != Account::default()).then_some(account);
+            self.seen[index] = true;
+        }
+    }
+}
 
 impl Api {
     pub async fn events(&self) -> Result<Rc<EventSubscriptions>> {
@@ -35,42 +86,60 @@ impl Api {
         address: &Pubkey,
         ready: impl Fn(&Account) -> Result<()>,
     ) -> Result<Account> {
-        time::timeout(NETWORK_TIMEOUT, async {
-            let events = self.events().await?;
-            let mut subscription = events.account(address).await?;
-            let mut account = self.get_account(address).await?;
-            loop {
-                let error = match account.take() {
-                    Some(account) => match ready(&account) {
-                        Ok(()) => return Ok(account),
-                        Err(error) => error,
-                    },
-                    None => anyhow!("account missing"),
-                };
-                let update = subscription.next().await.map_err(|cause| cause.context(error))?;
-                account = Some(decode_account(update.value)?);
-            }
+        self.await_accounts(&[*address], "account not ready", |accounts| {
+            let account = accounts[0].as_ref().context("account missing")?;
+            ready(account)?;
+            Ok(account.clone())
         })
         .await
-        .context("account not ready")?
     }
 
     pub async fn await_accounts<T>(
         &self,
         addresses: &[Pubkey],
         what: &str,
-        observe: impl AsyncFnMut() -> Result<T>,
+        ready: impl Fn(&[Option<Account>]) -> Result<T>,
     ) -> Result<T> {
-        time::timeout(NETWORK_TIMEOUT, async {
-            let events = self.events().await?;
-            let mut subscriptions = Vec::with_capacity(addresses.len());
-            for address in addresses {
-                subscriptions.push(events.account(address).await?);
+        let mut watch = self.watch_accounts(addresses).await?;
+        let accounts = time::timeout_at(watch.deadline, async {
+            let mut accounts = Vec::with_capacity(addresses.len());
+            for chunk in addresses.chunks(100) {
+                accounts.extend(self.get_multiple_accounts(chunk).await?);
             }
-            Subscription::query_many(&mut subscriptions, what, observe).await
+            Result::Ok(accounts)
         })
         .await
-        .with_context(|| format!("{what} after {NETWORK_TIMEOUT:?}"))?
+        .with_context(|| format!("{what}: initial snapshot deadline elapsed"))??;
+        watch.seed(accounts)?;
+        watch.until(what, ready).await
+    }
+
+    pub async fn watch_accounts(&self, addresses: &[Pubkey]) -> Result<AccountWatch> {
+        let events = self.events().await?;
+        let deadline = time::Instant::now() + NETWORK_TIMEOUT;
+        let subscriptions = stream::iter(addresses)
+            .map(async |address| {
+                time::timeout_at(deadline, events.account(address))
+                    .await
+                    .with_context(|| events.diagnostics())
+                    .and_then(|result| result)
+                    .with_context(|| {
+                        format!(
+                            "accountSubscribe not acknowledged: address={address}, malformed={}",
+                            events.malformed_frames()
+                        )
+                    })
+            })
+            .buffered(16)
+            .try_collect()
+            .await?;
+        Ok(AccountWatch {
+            addresses: addresses.to_vec(),
+            subscriptions,
+            accounts: vec![None; addresses.len()],
+            seen: vec![false; addresses.len()],
+            deadline,
+        })
     }
 
     pub async fn await_query<T>(
@@ -84,24 +153,6 @@ impl Api {
         })
         .await
         .with_context(|| format!("{what} after {NETWORK_TIMEOUT:?}"))?
-    }
-
-    pub async fn await_program_accounts<T>(
-        &self,
-        program: &Pubkey,
-        ready: impl Fn(Vec<(Pubkey, Account)>) -> Result<T>,
-    ) -> Result<T> {
-        time::timeout(NETWORK_TIMEOUT, async {
-            let events = self.events().await?;
-            let mut subscription = events.program(program).await?;
-            subscription
-                .query("program accounts", async || {
-                    ready(self.get_program_accounts(program).await?)
-                })
-                .await
-        })
-        .await
-        .context("program accounts not ready")?
     }
 
     pub async fn await_slot(&self, slot: u64) -> Result<u64> {
@@ -123,6 +174,13 @@ impl Api {
             let events = self.events().await?;
             let mut subscription =
                 events.signature(signature, CommitmentConfig::confirmed()).await?;
+            if let Some(Response {
+                value: RpcSignatureResult::ProcessedSignature(result),
+                ..
+            }) = subscription.try_next()?
+            {
+                return Ok(result.err.map_or(Ok(()), |err| Err(TxError { err: err.into() })));
+            }
             if let Some(status) = self.get_signature_status(signature).await? {
                 if let Some(err) = status.err {
                     return Ok(Err(TxError { err }));
@@ -143,11 +201,7 @@ impl Api {
         loop {
             let update = subscription.next().await?;
             if let RpcSignatureResult::ProcessedSignature(result) = update.value {
-                let outcome = match result.err {
-                    None => Ok(()),
-                    Some(err) => Err(TxError { err: err.into() }),
-                };
-                return Ok(outcome);
+                return Ok(result.err.map_or(Ok(()), |err| Err(TxError { err: err.into() })));
             }
         }
     }
@@ -170,28 +224,9 @@ impl Api {
         &self,
         signature: &Signature,
     ) -> Result<EncodedConfirmedTransactionWithStatusMeta> {
-        time::timeout(NETWORK_TIMEOUT, async {
-            let events = self.events().await?;
-            let commitment = CommitmentConfig::confirmed();
-            let mut confirmation = events.signature(signature, commitment).await?;
-            let mut slots = events.slots().await?;
-            if let Some(transaction) = self.get_transaction(signature).await? {
-                return Ok(transaction);
-            }
-            let status = self.get_signature_status(signature).await?;
-            if !status.is_some_and(|status| {
-                status.err.is_some() || status.satisfies_commitment(commitment)
-            }) {
-                let _ = Self::signature_outcome(&mut confirmation).await?;
-            }
-            loop {
-                if let Some(transaction) = self.get_transaction(signature).await? {
-                    return Ok(transaction);
-                }
-                slots.next().await?;
-            }
+        self.await_query(&format!("transaction {signature} published"), async || {
+            self.get_transaction(signature).await?.context("transaction not published")
         })
         .await
-        .context("transaction not published")?
     }
 }

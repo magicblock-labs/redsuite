@@ -479,10 +479,11 @@ impl PortLease {
                     Err(TryLockError::WouldBlock) => break,
                     Err(error) => return Err(error.into()),
                 }
-                let Ok(tcp) = TcpListener::bind(("127.0.0.1", port)) else {
+                // A loopback bind can coexist with Agave's wildcard listener on macOS.
+                let Ok(tcp) = TcpListener::bind(("0.0.0.0", port)) else {
                     break;
                 };
-                let Ok(udp) = UdpSocket::bind(("127.0.0.1", port)) else {
+                let Ok(udp) = UdpSocket::bind(("0.0.0.0", port)) else {
                     break;
                 };
                 claims.push((port, lock));

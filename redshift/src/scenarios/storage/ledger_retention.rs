@@ -1,6 +1,5 @@
 use std::{
     rc::Rc,
-    slice,
     time::{Duration, Instant},
 };
 
@@ -205,8 +204,7 @@ impl LedgerRetention {
             .private
             .ctx()
             .api()
-            .await_accounts(
-                slice::from_ref(cell),
+            .await_query(
                 "the er records the clone of the delegated cell",
                 async || {
                     ensure!(self.private.ctx().account(cell).await?.is_some());

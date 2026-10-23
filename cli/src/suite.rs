@@ -91,8 +91,7 @@ impl Lane {
         } else {
             let (shared, exclusive): (Vec<_>, Vec<_>) =
                 self.entries.into_iter().partition(|entry| matches!(entry.er, Er::Shared(_)));
-            let limit = shared.len();
-            let mut records = suite.run_entries(shared, limit, er.clone()).await;
+            let mut records = suite.run_entries(shared, suite.shared_concurrency, er.clone()).await;
             records.extend(suite.run_entries(exclusive, 1, er).await);
             records
         };
@@ -111,6 +110,7 @@ pub struct Suite {
     config: ExecutionConfig,
     serial: bool,
     fresh_concurrency: usize,
+    shared_concurrency: usize,
     cleanup: bool,
     report: Option<ScenarioReport>,
 }
@@ -122,6 +122,7 @@ impl Suite {
         config: ExecutionConfig,
         serial: bool,
         fresh_concurrency: usize,
+        shared_concurrency: usize,
     ) -> Result<Self> {
         let selection = if args.selections.is_empty() {
             family.prefix().to_owned()
@@ -135,6 +136,7 @@ impl Suite {
             config,
             serial: serial || family == Family::Redline,
             fresh_concurrency,
+            shared_concurrency,
             cleanup: args.cleanup,
             report: None,
         };

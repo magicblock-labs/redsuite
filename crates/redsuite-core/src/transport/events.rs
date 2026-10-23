@@ -3,11 +3,9 @@ use std::{
     marker::PhantomData,
     ops::ControlFlow::{self, Break, Continue},
     rc::Rc,
-    slice,
 };
 
-use anyhow::Context;
-use futures_util::{stream::FuturesUnordered, StreamExt};
+use anyhow::{ensure, Context};
 use json::{LazyValue, Value};
 use pubkey::Pubkey;
 use serde::{de::DeserializeOwned, Serialize};
@@ -22,7 +20,8 @@ use tokio::{task, time, time::Instant};
 use url::Url;
 
 use super::{
-    rpc::NO_PARAMS,
+    http::TransportError,
+    rpc::{RpcError, NO_PARAMS},
     subscription::{self, Connection, SubscriptionState, Topic},
     NETWORK_TIMEOUT,
 };
@@ -44,6 +43,19 @@ impl SubscriptionState for EventBuffer {
 }
 
 impl EventBuffer {
+    fn pop<T: DeserializeOwned>(&mut self, key: u64) -> Result<Option<T>> {
+        ensure!(
+            self.malformed == 0,
+            "malformed subscription payloads: {}",
+            self.malformed
+        );
+        self.by_key
+            .get_mut(&key)
+            .and_then(VecDeque::pop_front)
+            .map(|value| json::from_value(&value).map_err(Into::into))
+            .transpose()
+    }
+
     fn register(&mut self) -> u64 {
         self.last_key += 1;
         self.by_key.insert(self.last_key, VecDeque::new());
@@ -104,8 +116,13 @@ impl EventSubscriptions {
 
     pub async fn await_events(&self, key: u64, count: usize) -> Result<()> {
         self.connection
-            .wait_for("notifications", |events| {
-                events.by_key.get(&key).map_or(0, VecDeque::len) >= count
+            .wait_value("notifications", |events| {
+                ensure!(
+                    events.malformed == 0,
+                    "malformed subscription payloads: {}",
+                    events.malformed
+                );
+                Ok((events.by_key.get(&key).map_or(0, VecDeque::len) >= count).then_some(()))
             })
             .await
     }
@@ -123,6 +140,10 @@ impl EventSubscriptions {
 
     pub fn malformed_frames(&self) -> usize {
         self.connection.state().malformed
+    }
+
+    pub(crate) fn diagnostics(&self) -> String {
+        self.connection.diagnostics()
     }
 
     pub fn finalize(&self) {
@@ -144,12 +165,39 @@ pub struct Subscription<T> {
 }
 
 impl<T: DeserializeOwned> Subscription<T> {
+    /// Consume one update from subscriptions on the same connection.
+    pub(crate) async fn next_from(subscriptions: &mut [Self]) -> Result<(usize, T)> {
+        let connection = subscriptions
+            .first()
+            .context("no subscriptions to observe")?
+            .events
+            .connection
+            .clone();
+        connection
+            .wait("notifications", || {
+                let mut events = connection.state_mut();
+                for (index, subscription) in subscriptions.iter().enumerate() {
+                    if let Some(event) = events.pop(subscription.key)? {
+                        return Ok(Some((index, event)));
+                    }
+                }
+                Ok(None)
+            })
+            .await
+    }
+
+    pub fn try_next(&mut self) -> Result<Option<T>> {
+        self.events.connection.check_error()?;
+        self.events.connection.state_mut().pop(self.key)
+    }
+
     pub async fn next(&mut self) -> Result<T> {
-        self.events.await_events(self.key, 1).await?;
-        let mut state = self.events.connection.state_mut();
-        let queue = state.by_key.get_mut(&self.key).unwrap();
-        let value = queue.pop_front().unwrap();
-        Ok(json::from_value(&value)?)
+        self.events
+            .connection
+            .wait("notifications", || {
+                self.events.connection.state_mut().pop(self.key)
+            })
+            .await
     }
 
     pub async fn until(&mut self, matches: impl Fn(&T) -> bool) -> Result<T> {
@@ -164,48 +212,37 @@ impl<T: DeserializeOwned> Subscription<T> {
         .await
         .with_context(|| format!("no matching notification within {NETWORK_TIMEOUT:?}"))?
     }
+}
 
-    /// Reevaluate a query on notifications, retaining the last unmet condition.
+impl Subscription<Response<RpcLogsResponse>> {
+    pub async fn for_signature(&mut self, signature: &Signature) -> Result<RpcLogsResponse> {
+        let signature = signature.to_string();
+        Ok(self.until(|event| event.value.signature == signature).await?.value)
+    }
+}
+
+impl Subscription<SlotInfo> {
+    /// Query information absent from notifications after each observed slot.
     pub async fn query<U>(
         &mut self,
-        what: &str,
-        observe: impl AsyncFnMut() -> Result<U>,
-    ) -> Result<U> {
-        Self::query_many(slice::from_mut(self), what, observe).await
-    }
-
-    pub(crate) async fn query_many<U>(
-        subscriptions: &mut [Self],
         what: &str,
         mut observe: impl AsyncFnMut() -> Result<U>,
     ) -> Result<U> {
         let deadline = Instant::now() + NETWORK_TIMEOUT;
         loop {
-            // The next snapshot covers updates already buffered before the query starts.
-            for subscription in &mut *subscriptions {
-                let connection = &subscription.events.connection;
-                connection.check_error()?;
-                connection.state_mut().by_key.get_mut(&subscription.key).unwrap().clear();
-            }
             let error = match time::timeout_at(deadline, observe()).await {
                 Ok(Ok(value)) => return Ok(value),
                 Ok(Err(error)) => error,
-                Err(error) => {
-                    return Err(error).with_context(|| format!("{what} after {NETWORK_TIMEOUT:?}"))
-                }
+                Err(error) => return Err(error).with_context(|| what.to_owned()),
             };
-            let changed = time::timeout_at(deadline, async {
-                if let [subscription] = subscriptions {
-                    subscription.next().await.map(|_| ())
-                } else {
-                    let mut changes: FuturesUnordered<_> =
-                        subscriptions.iter_mut().map(|subscription| subscription.next()).collect();
-                    changes.next().await.context("no accounts to await")?.map(|_| ())
-                }
-            })
-            .await
-            .unwrap_or_else(|cause| Err(cause.into()));
-            changed.map_err(|cause| cause.context(error)).with_context(|| what.to_owned())?;
+            if error.downcast_ref::<TransportError>().is_some()
+                || error.downcast_ref::<RpcError>().is_some()
+            {
+                return Err(error).with_context(|| what.to_owned());
+            }
+            time::timeout_at(deadline, self.next())
+                .await
+                .with_context(|| format!("{what}: {error:#}"))??;
         }
     }
 }

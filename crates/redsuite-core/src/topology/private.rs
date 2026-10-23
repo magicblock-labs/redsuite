@@ -3,7 +3,7 @@ use std::{
     os::unix::process::ExitStatusExt,
     path::{Path, PathBuf},
     rc::Rc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use anyhow::{ensure, Context};
@@ -30,13 +30,7 @@ use crate::{
 };
 
 #[derive(Debug, Clone)]
-pub struct RestartTiming {
-    // signal sent → old process exited (the graceful drain under load)
-    pub shutdown: Duration,
-    // relaunch → /health/primary 200 (reopen + replay the DB)
-    pub startup: Duration,
-    // signal sent → serving again
-    pub total: Duration,
+pub struct RestartOutcome {
     // a graceful SIGTERM stop had to escalate to SIGKILL (it hung)
     pub needed_sigkill: bool,
     // clean SIGTERM shutdown is Some(0)
@@ -136,25 +130,21 @@ impl PrivateEr {
     }
 
     // Stop the ER (SIGTERM, or SIGKILL if hard_kill), then relaunch it on the
-    // same storage dir, identity and ports, timing each phase. Ports are
-    // reused, so ctx() stays valid across the restart.
-    pub async fn restart(&mut self, config: RestartConfig) -> Result<RestartTiming> {
+    // same storage dir, identity and ports, so ctx() stays valid across the restart.
+    pub async fn restart(&mut self, config: RestartConfig) -> Result<RestartOutcome> {
         let api = self.rpc_api();
         let slot_before = api.get_slot().await.ok();
-        let restart_started = Instant::now();
         let (exit_status, needed_sigkill) = self
             .proc
             .terminate(config.hard_kill)
             .await?
             .context("private ER has no running process to restart")?;
-        let shutdown = restart_started.elapsed();
         let exit_code = exit_status.code();
         let exit_signal = ExitStatusExt::signal(&exit_status);
 
         self.plan.params.ledger.reset = config.reset;
-        let launch_started = Instant::now();
         self.proc.relaunch(self.plan.spawn(&self.log)?);
-        let ready = process::wait_until_every(
+        process::wait_until_every(
             process::RESTART_POLL,
             config.ready_timeout,
             "restarted ER reaching /health/primary",
@@ -163,18 +153,12 @@ impl PrivateEr {
             || api.primary_ready(),
         )
         .await
-        .map_err(|error| self.ports.failure(error));
-        ready?;
-        let startup = launch_started.elapsed();
-        let total = restart_started.elapsed();
+        .map_err(|error| self.ports.failure(error))?;
         self.ctx.pid = self.proc.pid();
         self.ctx.reset_blockhash();
         let slot_after = api.get_slot().await.ok();
 
-        Ok(RestartTiming {
-            shutdown,
-            startup,
-            total,
+        Ok(RestartOutcome {
             needed_sigkill,
             exit_code,
             exit_signal,
@@ -230,11 +214,10 @@ async fn launch(
     let log = dir.join(format!("er-{}.log", options.label));
     let identity_pubkey = er_identity.pubkey();
     let role = if allowed_followers.is_empty() { "private-er" } else { "leader" };
-    let endpoints = options.base_endpoints.unwrap_or_else(|| BaseEndpoints {
-        rpc_url: base.api().url().clone(),
-        ws_url: base.ws_url().clone(),
-        grpc_url: None,
-    });
+    let endpoints = match options.base_endpoints {
+        Some(endpoints) => endpoints,
+        None => BaseEndpoints::from_base(base)?,
+    };
     let plan = ErPlan {
         bin: er_bin,
         config_path: config::config_path(&dir, &options.label),

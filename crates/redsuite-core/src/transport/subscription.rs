@@ -5,7 +5,7 @@ use std::{
     rc::Rc,
 };
 
-use anyhow::{anyhow, ensure};
+use anyhow::{anyhow, ensure, Context};
 use futures_util::{stream::SplitSink, StreamExt};
 use json::LazyValue;
 use pubkey::Pubkey;
@@ -76,11 +76,17 @@ pub(super) trait SubscriptionState {
     fn on_close(&mut self, _reason: &CloseReason) {}
 }
 
+enum Request<K> {
+    Subscribe(K),
+    Unsubscribe,
+}
+
 pub(super) struct Router<S: SubscriptionState> {
     pub(super) state: S,
-    requests: HashMap<u64, S::Key>,
+    requests: HashMap<u64, Request<S::Key>>,
     subscriptions: HashMap<u64, S::Key>,
     subscribed: usize,
+    last_reply: Option<u64>,
     error: Option<String>,
     changed: Rc<Notify>,
 }
@@ -92,13 +98,14 @@ impl<S: SubscriptionState> Router<S> {
             requests: HashMap::new(),
             subscriptions: HashMap::new(),
             subscribed: 0,
+            last_reply: None,
             error: None,
             changed: Rc::new(Notify::new()),
         }
     }
 
     pub(super) fn register(&mut self, request: u64, key: S::Key) {
-        self.requests.insert(request, key);
+        self.requests.insert(request, Request::Subscribe(key));
     }
 
     pub(super) fn dispatch(
@@ -108,11 +115,20 @@ impl<S: SubscriptionState> Router<S> {
     ) -> Result<()> {
         match frame {
             Frame::Reply { id, result } => {
-                if let Some(key) = self.requests.remove(&id) {
-                    let subscription = json::from_str(result.as_raw_str())?;
-                    self.subscriptions.insert(subscription, key);
-                    self.subscribed += 1;
-                    self.state.on_subscribed(self.subscribed);
+                self.last_reply = Some(id);
+                match (self.requests.remove(&id), result) {
+                    (Some(Request::Subscribe(key)), Ok(result)) => {
+                        let subscription = json::from_str(result.as_raw_str())?;
+                        self.subscriptions.insert(subscription, key);
+                        self.subscribed += 1;
+                        self.state.on_subscribed(self.subscribed);
+                    }
+                    // Completed routes may be retired before asynchronous cleanup.
+                    (Some(Request::Unsubscribe), Err(error))
+                        if error.code == jsonrpc_core::ErrorCode::InvalidParams
+                            && error.message == "Invalid subscription id." => {}
+                    (_, Err(error)) => return Err(CloseReason::ServerError(error).into()),
+                    _ => {}
                 }
             }
             Frame::Notification { params, .. } => {
@@ -144,8 +160,10 @@ impl<S: SubscriptionState> Router<S> {
 }
 
 pub(super) struct Connection<S: SubscriptionState> {
+    url: Url,
     sink: Mutex<SplitSink<Socket, Message>>,
     next_id: Cell<u64>,
+    last_sent: Cell<u64>,
     router: Rc<RefCell<Router<S>>>,
     reader: JoinHandle<()>,
 }
@@ -160,16 +178,23 @@ impl<S: SubscriptionState + 'static> Connection<S> {
         let (sink, mut stream) = socket::connect(url).await?.split();
         let router = Rc::new(RefCell::new(Router::new(state)));
         let reader_state = router.clone();
+        let endpoint = url.clone();
         let reader = task::spawn_local(async move {
             let reason = socket::drive(&mut stream, |frame| {
                 reader_state.borrow_mut().dispatch(frame, &mut on_notification)
             })
             .await;
-            reader_state.borrow_mut().close(&reason);
+            let mut router = reader_state.borrow_mut();
+            if !router.requests.is_empty() {
+                tracing::warn!(%endpoint, %reason, pending = router.requests.len(), "websocket closed with pending requests");
+            }
+            router.close(&reason);
         });
         Ok(Self {
+            url: url.clone(),
             sink: Mutex::new(sink),
             next_id: Cell::new(1),
+            last_sent: Cell::new(0),
             router,
             reader,
         })
@@ -185,7 +210,9 @@ impl<S: SubscriptionState + 'static> Connection<S> {
         // Register before sending: the reader may see an acknowledgment as soon as send yields.
         self.router.borrow_mut().register(id, key);
         let mut sink = self.sink.lock().await;
-        socket::send(&mut *sink, id, topic.subscribe(), params).await
+        socket::send(&mut *sink, id, topic.subscribe(), params).await?;
+        self.last_sent.set(id);
+        Ok(())
     }
 
     pub(super) fn state(&self) -> Ref<'_, S> {
@@ -203,8 +230,8 @@ impl<S: SubscriptionState + 'static> Connection<S> {
     }
 
     pub(super) async fn await_subscribed(&self, count: usize) -> Result<()> {
-        self.wait("subscription acks", |router| {
-            Ok((router.subscribed >= count).then_some(()))
+        self.wait("subscription acks", || {
+            Ok((self.router.borrow().subscribed >= count).then_some(()))
         })
         .await
     }
@@ -222,20 +249,31 @@ impl<S: SubscriptionState + 'static> Connection<S> {
         what: &str,
         mut observe: impl FnMut(&S) -> Result<Option<T>>,
     ) -> Result<T> {
-        self.wait(what, |router| observe(&router.state)).await
+        self.wait(what, || observe(&self.router.borrow().state)).await
     }
 
-    async fn wait<T>(
+    pub(super) async fn wait<T>(
         &self,
         what: &str,
-        mut observe: impl FnMut(&Router<S>) -> Result<Option<T>>,
+        mut observe: impl FnMut() -> Result<Option<T>>,
     ) -> Result<T> {
         let changed = self.router.borrow().changed.clone();
         wait::on_change(&changed, NETWORK_TIMEOUT, what, || {
             self.check_error()?;
-            observe(&self.router.borrow())
+            observe()
         })
         .await
+        .with_context(|| self.diagnostics())
+    }
+
+    pub(super) fn diagnostics(&self) -> String {
+        let router = self.router.borrow();
+        let pending: Vec<_> = router.requests.keys().take(16).copied().collect();
+        format!(
+            "websocket state: endpoint={}, last_sent={}, last_reply={:?}, pending={}, request_ids={pending:?}, active={}, acknowledged={}",
+            self.url, self.last_sent.get(), router.last_reply,
+            router.requests.len(), router.subscriptions.len(), router.subscribed
+        )
     }
 
     pub(super) async fn await_ack(&self, key: S::Key) -> Result<()>
@@ -243,8 +281,14 @@ impl<S: SubscriptionState + 'static> Connection<S> {
         S::Key: PartialEq,
     {
         // A one-shot route can complete before the task awaiting its acknowledgment resumes.
-        self.wait("subscription acknowledgment", |router| {
-            Ok((!router.requests.values().any(|pending| *pending == key)).then_some(()))
+        self.wait("subscription acknowledgment", || {
+            Ok((!self
+                .router
+                .borrow()
+                .requests
+                .values()
+                .any(|request| matches!(request, Request::Subscribe(active) if *active == key)))
+            .then_some(()))
         })
         .await
     }
@@ -254,7 +298,9 @@ impl<S: SubscriptionState + 'static> Connection<S> {
         S::Key: PartialEq,
     {
         if let Err(error) = self.await_ack(key).await {
-            self.router.borrow_mut().requests.retain(|_, pending| *pending != key);
+            self.router.borrow_mut().requests.retain(
+                |_, request| !matches!(request, Request::Subscribe(active) if *active == key),
+            );
             return Err(error);
         }
         let subscription = self
@@ -269,7 +315,10 @@ impl<S: SubscriptionState + 'static> Connection<S> {
         self.router.borrow_mut().subscriptions.remove(&subscription);
         let id = self.next_id.replace(self.next_id.get() + 1);
         let mut sink = self.sink.lock().await;
-        socket::send(&mut *sink, id, topic.unsubscribe(), &(subscription,)).await
+        self.router.borrow_mut().requests.insert(id, Request::Unsubscribe);
+        socket::send(&mut *sink, id, topic.unsubscribe(), &(subscription,)).await?;
+        self.last_sent.set(id);
+        Ok(())
     }
 
     pub(super) fn stop(&self) {

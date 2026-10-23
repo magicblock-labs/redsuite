@@ -111,9 +111,8 @@ impl Scenario for CommitBlackout {
             .await_accounts(
                 &[fresh],
                 "the fresh account commits to base through restored traffic",
-                async || {
-                    let account =
-                        self.base.account(&fresh).await?.context("base account missing")?;
+                |accounts| {
+                    let account = accounts[0].as_ref().context("base account missing")?;
                     ensure!(account.data == snapshot);
                     Ok(())
                 },
@@ -145,9 +144,8 @@ impl CommitBlackout {
             .await_accounts(
                 slice::from_ref(account),
                 "the base copy still matches the er snapshot after convergence",
-                async || {
-                    let account =
-                        self.base.account(account).await?.context("base account missing")?;
+                |accounts| {
+                    let account = accounts[0].as_ref().context("base account missing")?;
                     ensure!(account.data == snapshot);
                     Ok(())
                 },

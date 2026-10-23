@@ -10,7 +10,7 @@ use tokio::net::TcpStream;
 use tokio::time;
 use tokio_tungstenite::{
     connect_async,
-    tungstenite::{Error as WsError, Message, Utf8Bytes},
+    tungstenite::{protocol::CloseFrame, Error as WsError, Message, Utf8Bytes},
     MaybeTlsStream, WebSocketStream,
 };
 use url::Url;
@@ -22,8 +22,8 @@ pub(super) type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 #[derive(Debug, Error)]
 pub(super) enum CloseReason {
-    #[error("connection closed by server")]
-    ServerClose,
+    #[error("connection closed by server: {0:?}")]
+    ServerClose(Option<CloseFrame>),
     #[error("stream ended")]
     StreamEnded,
     #[error("transport error: {0}")]
@@ -53,8 +53,14 @@ pub(super) struct Notification<'a> {
 }
 
 pub(super) enum Frame<'a> {
-    Reply { id: u64, result: LazyValue<'a> },
-    Notification { method: &'a str, params: Notification<'a> },
+    Reply {
+        id: u64,
+        result: result::Result<LazyValue<'a>, jsonrpc_core::Error>,
+    },
+    Notification {
+        method: &'a str,
+        params: Notification<'a>,
+    },
     Malformed,
 }
 
@@ -63,7 +69,10 @@ pub(super) fn parse(text: &str) -> result::Result<Option<Frame<'_>>, CloseReason
         return Ok(Some(Frame::Malformed));
     };
     if let Some(error) = envelope.error {
-        return Err(error.into());
+        return match envelope.id {
+            Some(id) => Ok(Some(Frame::Reply { id, result: Err(error) })),
+            None => Err(error.into()),
+        };
     }
     let frame = match (
         envelope.method,
@@ -72,7 +81,7 @@ pub(super) fn parse(text: &str) -> result::Result<Option<Frame<'_>>, CloseReason
         envelope.result,
     ) {
         (Some(method), Some(params), _, _) => Frame::Notification { method, params },
-        (None, _, Some(id), Some(result)) => Frame::Reply { id, result },
+        (None, _, Some(id), Some(result)) => Frame::Reply { id, result: Ok(result) },
         _ => return Ok(None),
     };
     Ok(Some(frame))
@@ -109,7 +118,7 @@ where
     loop {
         match stream.next().await {
             Some(Ok(Message::Text(text))) => return Ok(text),
-            Some(Ok(Message::Close(_))) => return Err(CloseReason::ServerClose),
+            Some(Ok(Message::Close(frame))) => return Err(CloseReason::ServerClose(frame)),
             Some(Ok(_)) => {}
             Some(Err(error)) => return Err(error.into()),
             None => return Err(CloseReason::StreamEnded),

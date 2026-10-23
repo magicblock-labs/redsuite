@@ -286,7 +286,10 @@ impl ProjectedTokenLifecycle {
                 .await_accounts(
                     &[self.wallets[control].ata],
                     &format!("the er clones the {} ATA", NAMES[control]),
-                    || amount(er, &self.wallets[control].ata),
+                    |accounts| {
+                        let account = accounts[0].as_ref().context("ATA missing")?;
+                        spl::account_balance(account).context("token balance missing")
+                    },
                 )
                 .await?;
             ensure!(first == expected.projected[control]);
@@ -323,10 +326,10 @@ impl ProjectedTokenLifecycle {
                 &[failing],
                 "the failing action returns base ownership to the system \
                  program",
-                async || {
+                |accounts| {
                     ensure!(matches!(
-                        self.base.account(&failing).await,
-                        Ok(Some(account)) if account.owner == system::system_id()
+                        accounts[0].as_ref(),
+                        Some(account) if account.owner == system::system_id()
                     ));
                     Ok(())
                 },
@@ -513,9 +516,10 @@ impl ProjectedTokenLifecycle {
             .await_accounts(
                 &self.wallets.iter().map(|wallet| wallet.ata).collect::<Vec<_>>(),
                 "projected balances converge",
-                async || {
-                    for (wallet, expected) in self.wallets.iter().zip(expected) {
-                        let actual = amount(self.private.ctx(), &wallet.ata).await?;
+                |accounts| {
+                    for (account, expected) in accounts.iter().zip(expected) {
+                        let actual = spl::account_balance(account.as_ref().context("ATA missing")?)
+                            .context("token balance missing")?;
                         ensure!(actual == *expected);
                     }
                     Ok(())

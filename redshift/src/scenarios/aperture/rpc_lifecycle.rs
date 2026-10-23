@@ -5,7 +5,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{ensure, Context};
+use anyhow::{bail, ensure, Context};
 use futures_util::future::join_all;
 use hash::Hash;
 use pubkey::Pubkey;
@@ -14,7 +14,10 @@ use redsuite_core::{
     programs::{CellHeader, REDLINE},
     redline::Accounts,
     rpc_types::{
-        config::{RpcBlockConfig, RpcSignaturesForAddressConfig, RpcTransactionConfig},
+        config::{
+            RpcBlockConfig, RpcSignaturesForAddressConfig, RpcTransactionConfig,
+            RpcTransactionLogsFilter,
+        },
         request::RpcRequest,
         response::{
             Response, RpcBlockhash, RpcConfirmedTransactionStatusWithSignature, RpcKeyedAccount,
@@ -240,11 +243,14 @@ impl WalletStream<'_> {
         ensure!(raw.slot_unsubscribe(slot_sub).await?);
         while raw.next_notification(RAW_DRAIN_TIMEOUT).await?.is_some() {}
         ensure!(raw.next_notification(RAW_SILENCE_TIMEOUT).await?.is_none());
-        let refusal = match raw.logs_subscribe_all().await {
-            Err(error) => format!("{error:#}"),
-            Ok(_) => "subscription accepted".to_owned(),
+        let Err(refusal) = raw.try_logs_subscribe(RpcTransactionLogsFilter::All).await? else {
+            bail!("all-log filter unexpectedly accepted");
         };
-        ensure!(refusal.contains("-32602") && refusal.contains("'all' filter is not supported"));
+        ensure!(refusal.error.code.code() == -32602, "{refusal}");
+        ensure!(
+            refusal.error.message.contains("'all' filter is not supported"),
+            "{refusal}"
+        );
         let unsent = self
             .sender
             .prepare(&[system::transfer(&self.account1_pubkey, &self.account2, 9_999)])
@@ -555,13 +561,10 @@ impl RpcLifecycle {
     async fn await_clones(&self, pdas: &[Pubkey]) -> Result<()> {
         self.er
             .api()
-            .await_accounts(pdas, "delegated account clones", async || {
-                for chunk in pdas.chunks(ACCOUNTS_PER_CALL) {
-                    let accounts = self.er.api().get_multiple_accounts(chunk).await?;
-                    ensure!(accounts.iter().all(|account| account
-                        .as_ref()
-                        .is_some_and(|account| account.data.len() == ACCOUNT_SPACE as usize)));
-                }
+            .await_accounts(pdas, "delegated account clones", |accounts| {
+                ensure!(accounts.iter().all(|account| account
+                    .as_ref()
+                    .is_some_and(|account| account.data.len() == ACCOUNT_SPACE as usize)));
                 Ok(())
             })
             .await

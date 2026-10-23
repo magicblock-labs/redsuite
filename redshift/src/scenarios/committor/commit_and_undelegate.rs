@@ -5,27 +5,27 @@ use instruction::Instruction;
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    api::{transaction_logs, transaction_meta},
+    api::{transaction_logs, transaction_meta, TxError},
     check, prep,
     programs::{CellHeader, CellId, SettlementMode, UndelegationOutcome, MAGIC, REDSHIFT},
     receipt::{self, CommitReceipt},
+    rpc_types::response::TransactionError,
     wait, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
 use signature::Signature;
 use signer::Signer;
+use solana_instruction_error::InstructionError;
 use tokio::time;
 use tracing::instrument;
 
-use crate::{
-    program::DELEGATION_PROGRAM_ID, LARGE_ACCOUNT_SPACE, LOCKOUT_REJECTIONS, PAYER_LAMPORTS,
-};
+use crate::{program::DELEGATION_PROGRAM_ID, LOCKOUT_REJECTIONS, PAYER_LAMPORTS};
 
+const LARGE_ACCOUNT_SPACE: u32 = 2 * 1024;
 const ER_WRITE_TIMEOUT: Duration = Duration::from_secs(20);
 const REDELEGATE_SETTLE: Duration = Duration::from_secs(2);
 const ROLLBACK_SETTLE: Duration = Duration::from_millis(1500);
 const MOD_AFTER_REFUSAL: &str = "instruction modified data of an account it does not own";
 const TWICE_REFUSAL: &str = "is required to be writable and delegated in order to be undelegated";
-const FOREIGN_REJECTION: &str = "MissingAccount";
 
 pub struct CommitAndUndelegate {
     base: Rc<BaseCtx>,
@@ -89,13 +89,12 @@ impl CommitAndUndelegate {
             .await_accounts(
                 &[cell.address, request],
                 "base undelegation and request cleanup",
-                async || {
-                    let account =
-                        self.base.account(&cell.address).await?.context("missing cell")?;
+                |accounts| {
+                    let account = accounts[0].as_ref().context("missing cell")?;
                     ensure!(account.owner == redshift_interface::ID);
                     ensure!(account.data == snapshot.data);
                     ensure!(account.lamports == snapshot.lamports);
-                    ensure!(self.base.account(&request).await?.is_none());
+                    ensure!(accounts[1].is_none());
                     Ok(())
                 },
             )
@@ -120,9 +119,8 @@ impl CommitAndUndelegate {
         for pda in pdas {
             self.base
                 .api()
-                .await_accounts(slice::from_ref(pda), "base settlement", async || {
-                    let account =
-                        self.base.account(pda).await?.context("settled cell absent from base")?;
+                .await_accounts(slice::from_ref(pda), "base settlement", |accounts| {
+                    let account = accounts[0].as_ref().context("settled cell absent from base")?;
                     ensure!(account.owner == owner);
                     ensure!(decoded_count(&account.data)? == count);
                     Ok(())
@@ -287,8 +285,8 @@ impl CommitAndUndelegate {
             .await_accounts(
                 &[pda],
                 "large-account data and ownership settle on base",
-                async || {
-                    let account = self.base.account(&pda).await?.context("base account missing")?;
+                |accounts| {
+                    let account = accounts[0].as_ref().context("base account missing")?;
                     ensure!(account.owner == expected_owner);
                     ensure!(account.data == expected);
                     Ok(())
@@ -311,30 +309,35 @@ impl CommitAndUndelegate {
         let payer = self.base.funded_payer(PAYER_LAMPORTS).await?;
         let outsider =
             self.base.delegated_payer(&payer, self.er.identity(), PAYER_LAMPORTS).await?;
+        let sender = self.er.sender(Rc::new(outsider));
+        let outsider = sender.payer().pubkey();
         let validator = Keypair::new().pubkey();
         for (commit_type, what) in
             [(SettlementMode::Commit, "commit"), (SettlementMode::Undelegate, "undelegation")]
         {
             let cells = self.base.cells(REDSHIFT, &payer).create_owned(validator, 1).await?;
             self.er.await_cells(&cells).await?;
-            let attempt = self
-                .er
-                .submit_and_confirm(
-                    &outsider,
-                    &[REDSHIFT
-                        .batch()
-                        .settle(
-                            outsider.pubkey(),
-                            &[cells[0].address, outsider.pubkey()],
-                            commit_type,
-                        )
-                        .build()],
-                )
-                .await;
-
-            let error = check::expect_error(attempt, &format!("foreign {what} rejected"))?;
-            let error = format!("{error:#}");
-            ensure!(error.contains(FOREIGN_REJECTION));
+            let tx = sender
+                .prepare(&[REDSHIFT
+                    .batch()
+                    .settle(outsider, &[cells[0].address, outsider], commit_type)
+                    .build()])
+                .await?;
+            let before = self.er.account(&cells[0].address).await?;
+            let signature = self.er.api().send_transaction(&tx).await?;
+            let outcome = self.er.api().try_confirm(&signature).await?;
+            let expected = match commit_type {
+                SettlementMode::Commit => InstructionError::IllegalOwner,
+                SettlementMode::Undelegate => InstructionError::ReadonlyDataModified,
+            };
+            ensure!(
+                outcome
+                    == Err(TxError {
+                        err: TransactionError::InstructionError(0, expected)
+                    }),
+                "foreign {what}: {outcome:?}"
+            );
+            ensure!(self.er.account(&cells[0].address).await? == before);
         }
         Ok(())
     }
@@ -425,10 +428,10 @@ impl CommitAndUndelegate {
 
         self.base
             .api()
-            .await_accounts(&[pda], "the rejection policy settles on base", async || {
+            .await_accounts(&[pda], "the rejection policy settles on base", |accounts| {
                 ensure!(matches!(
-                    self.base.account(&pda).await,
-                    Ok(Some(acc))
+                    accounts[0].as_ref(),
+                    Some(acc)
                         if CellHeader::try_decode(&acc.data).ok().map(|cell| cell.undelegation)
                             == Some(UndelegationOutcome::Reject)
                 ));
@@ -482,7 +485,10 @@ impl CommitAndUndelegate {
         let logs = transaction_logs(meta);
         let error = meta.err.as_ref().context("expected ER rejection")?;
         let observed = format!("{}\n{error:?}", logs.join("\n"));
-        ensure!(observed.contains(refusal));
+        ensure!(
+            observed.contains(refusal),
+            "expected {refusal:?}, observed: {observed}"
+        );
 
         let sent_signature = receipt::receipt_signature_in_logs(logs)
             .context("the failed tx logs carry no ScheduledCommitSent signature")?;

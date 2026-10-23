@@ -37,6 +37,7 @@ use transaction::{versioned::VersionedTransaction, Transaction};
 use url::Url;
 
 mod wait;
+pub use wait::AccountWatch;
 
 pub use crate::transport::rpc::{account_config, RpcError};
 use crate::{
@@ -49,7 +50,7 @@ use crate::{
     Result,
 };
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq, Eq)]
 #[error("transaction failed on-chain: {err:?}")]
 pub struct TxError {
     pub err: TransactionError,
@@ -90,6 +91,12 @@ pub struct Api {
 }
 
 impl Api {
+    /// Share HTTP pooling without sharing a reader owned by another scenario's LocalSet.
+    pub(crate) fn scoped(mut self) -> Self {
+        self.events = Rc::default();
+        self
+    }
+
     pub fn new(url: Url, ws_url: Url) -> Self {
         Self {
             rpc: http::RpcClient::new(url),

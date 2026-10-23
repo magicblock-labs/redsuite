@@ -3,13 +3,14 @@ use std::{collections::HashSet, mem};
 use anyhow::{anyhow, ensure, Context};
 use pubkey::Pubkey;
 use signature::Signature;
+use solana_rpc_client_types::response::{Response, RpcLogsResponse};
 use solana_transaction_status_client_types::UiTransactionStatusMeta;
 use tokio::time;
 use tracing::warn;
 
 use crate::{
     api::{custom_error_code, transaction_logs, transaction_meta, Api},
-    transport::NETWORK_TIMEOUT,
+    transport::{events::Subscription, NETWORK_TIMEOUT},
     BaseCtx, ChainCtx, ErCtx, Result,
 };
 
@@ -41,6 +42,54 @@ pub struct CommitReceipt {
     pub receipt_err_code: Option<u32>,
 }
 
+/// Live scheduling and receipt observations armed before submitting a commit.
+pub struct CommitWatch {
+    scheduling: Subscription<Response<RpcLogsResponse>>,
+    receipts: Subscription<Response<RpcLogsResponse>>,
+    deadline: time::Instant,
+}
+
+impl CommitWatch {
+    pub async fn new(er: &ErCtx, payer: &Pubkey) -> Result<Self> {
+        let deadline = time::Instant::now() + NETWORK_TIMEOUT;
+        let events = er.api().events().await?;
+        let scheduling = events.logs(payer).await?;
+        let receipts = events.logs(&er.identity()).await?;
+        Ok(Self { scheduling, receipts, deadline })
+    }
+
+    pub async fn check(
+        mut self,
+        base: &BaseCtx,
+        signature: &Signature,
+        expected: &[Pubkey],
+        undelegate: bool,
+    ) -> Result<CommitReceipt> {
+        time::timeout_at(self.deadline, async {
+            let scheduling = self.scheduling.for_signature(signature).await?;
+            ensure!(
+                scheduling.err.is_none(),
+                "scheduling failed: {:?}",
+                scheduling.err
+            );
+            let receipt_signature = receipt_signature_in_logs(&scheduling.logs)
+                .context("missing ScheduledCommitSent signature")?;
+            let receipt = self.receipts.for_signature(&receipt_signature).await?;
+            let receipt = parse_logs(
+                receipt_signature,
+                &receipt.logs,
+                receipt.err.and_then(custom_error_code),
+            );
+            receipt.verify(base, expected, undelegate).await?;
+            Ok(receipt)
+        })
+        .await
+        .with_context(|| {
+            format!("commit {signature}: scheduling or receipt notification missing")
+        })?
+    }
+}
+
 impl ErCtx {
     /// Checks the standard commit receipt and confirms settlement. Duplicate rejection
     /// is returned unchanged; callers must corroborate it against base state.
@@ -52,20 +101,23 @@ impl ErCtx {
         expect_undelegation: bool,
     ) -> Result<CommitReceipt> {
         let receipt = fetch_commit_receipt(self.api(), signature).await?;
-        if let Some(message) = &receipt.error_message {
-            if receipt.failure_is_duplicate_rejection() {
-                warn_duplicate_rejection(message);
-                return Ok(receipt);
-            }
-            return Err(anyhow!("commit intent failed: {message}"));
-        }
-        receipt.check_accounts(expected, expect_undelegation)?;
-        receipt.confirm(base.api()).await?;
+        receipt.verify(base, expected, expect_undelegation).await?;
         Ok(receipt)
     }
 }
 
 impl CommitReceipt {
+    async fn verify(&self, base: &BaseCtx, expected: &[Pubkey], undelegate: bool) -> Result<()> {
+        if let Some(message) = &self.error_message {
+            if self.failure_is_duplicate_rejection() {
+                warn_duplicate_rejection(message);
+                return Ok(());
+            }
+            return Err(anyhow!("commit intent failed: {message}"));
+        }
+        self.check_accounts(expected, undelegate)?;
+        self.confirm(base.api()).await
+    }
     pub fn check_included(&self, expected: &[Pubkey]) -> Result<()> {
         let mut included = self.included.clone();
         included.sort();
@@ -98,11 +150,7 @@ impl CommitReceipt {
 
     pub async fn confirm(&self, base: &Api) -> Result<()> {
         for chain_signature in &self.base_signatures {
-            let base_tx = base
-                .await_transaction(chain_signature)
-                .await
-                .context("base settlement confirmation")?;
-            ensure!(transaction_meta(&base_tx)?.err == None);
+            base.confirm(chain_signature).await.context("base settlement confirmation")?;
         }
         Ok(())
     }
@@ -156,6 +204,18 @@ fn pubkey_list(list: &str) -> Vec<Pubkey> {
 }
 
 pub fn parse_receipt(signature: Signature, receipt_tx: &UiTransactionStatusMeta) -> CommitReceipt {
+    parse_logs(
+        signature,
+        transaction_logs(receipt_tx),
+        receipt_tx.err.clone().and_then(custom_error_code),
+    )
+}
+
+fn parse_logs(
+    signature: Signature,
+    logs: &[String],
+    receipt_err_code: Option<u32>,
+) -> CommitReceipt {
     let mut receipt = CommitReceipt {
         signature,
         commit_id: None,
@@ -165,9 +225,9 @@ pub fn parse_receipt(signature: Signature, receipt_tx: &UiTransactionStatusMeta)
         base_signatures: Vec::new(),
         requested_undelegation: false,
         error_message: None,
-        receipt_err_code: receipt_tx.err.clone().and_then(custom_error_code),
+        receipt_err_code,
     };
-    for line in transaction_logs(receipt_tx) {
+    for line in logs {
         let Some(rest) = strip_program_prefix(line).strip_prefix(LOG_MARKER) else {
             continue;
         };
