@@ -10,7 +10,9 @@ use url::Url;
 
 use crate::{
     context::{BaseCtx, ChainCtx, ErCtx},
-    dlp, system,
+    dlp,
+    random::Rng,
+    system,
     transport::NETWORK_TIMEOUT,
     wait, ErClient, Result, TxSender,
 };
@@ -64,6 +66,19 @@ impl BaseCtx {
     pub async fn funded_payer(&self, lamports: u64) -> Result<Keypair> {
         let payer = Keypair::new();
         self.airdrop(&payer.pubkey(), lamports).await.context("funding payer")?;
+        Ok(payer)
+    }
+
+    pub async fn seeded_payer(&self, rng: &mut impl Rng, lamports: u64) -> Result<Keypair> {
+        let mut secret = [0u8; 32];
+        rng.fill(&mut secret);
+        let payer = Keypair::new_from_array(secret);
+        ensure!(
+            self.account(&payer.pubkey()).await?.is_none(),
+            "seeded payer {} already exists on this stack: rerun with a fresh stack or another seed",
+            payer.pubkey()
+        );
+        self.airdrop(&payer.pubkey(), lamports).await.context("funding seeded payer")?;
         Ok(payer)
     }
 

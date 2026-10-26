@@ -1,33 +1,21 @@
-use std::{rc::Rc, result, time::Duration};
+use std::{rc::Rc, time::Duration};
 
 use anyhow::{anyhow, ensure, Context};
 use futures_util::future::join_all;
-use hash::Hash;
-use instruction::{AccountMeta, Instruction};
+use instruction::Instruction;
 use keypair::Keypair;
 use pubkey::Pubkey;
 
 use redsuite_core::{
-    api::{encode, transaction_meta, RpcError},
     netfault::Selector,
     programs::{CellHeader, REDLINE, REDSHIFT},
-    rpc_types::{
-        config::{RpcBlockConfig, RpcSendTransactionConfig, RpcTransactionConfig},
-        request::RpcRequest,
-        response::TransactionError,
-    },
+    signed::{audit, decode_state, subscribe, Signed},
     topology::RestartConfig,
-    transaction_types::{
-        EncodedConfirmedTransactionWithStatusMeta, TransactionDetails, UiConfirmedBlock,
-        UiTransactionEncoding, UiTransactionError,
-    },
-    transport::wsraw::RawWs,
-    BaseCtx, ChainCtx, DynError, ErCtx, Result, Scenario,
+    BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
 use serde_json::{json, Value};
 use signature::Signature;
 use signer::Signer;
-use solana_instruction_error::InstructionError;
 use tracing::instrument;
 use transaction::Transaction;
 
@@ -54,122 +42,9 @@ enum Mode {
     ExpiryRestart,
 }
 
-struct Signed {
-    encoded: String,
-    signature: Signature,
-    blockhash: Hash,
-    fee: u64,
-    error: Option<UiTransactionError>,
-}
-
-impl Signed {
-    async fn new(
-        er: &ErCtx,
-        payer: &Keypair,
-        owner: Pubkey,
-        count: u8,
-        fail: bool,
-        cold: Option<Pubkey>,
-    ) -> Result<Self> {
-        let mut instructions =
-            vec![REDSHIFT.batch().add(&[REDSHIFT.primary(owner)], i64::from(count)).build()];
-        if let Some(cold) = cold {
-            instructions[0].accounts.push(AccountMeta::new_readonly(cold, false));
-        }
-        if fail {
-            instructions
-                .push(REDSHIFT.batch().writable(&[REDSHIFT.primary(owner)]).fail(0).build());
-        }
-        let blockhash = er.api().get_latest_blockhash().await?;
-        let tx = Transaction::new_signed_with_payer(
-            &instructions,
-            Some(&payer.pubkey()),
-            &[payer],
-            blockhash,
-        );
-        let quoted: Option<u64> = er
-            .api()
-            .call_value(RpcRequest::GetFeeForMessage, &(encode(&tx.message)?,))
-            .await?;
-        let fee = quoted.context("missing fee quote")?;
-        Ok(Self {
-            encoded: encode(&tx)?,
-            signature: tx.signatures[0],
-            blockhash,
-            fee,
-            error: fail
-                .then(|| TransactionError::InstructionError(1, InstructionError::Custom(0)).into()),
-        })
-    }
-
-    async fn send(&self, er: &ErCtx) -> Result<result::Result<String, RpcError>> {
-        let config = RpcSendTransactionConfig {
-            encoding: Some(UiTransactionEncoding::Base64),
-            skip_preflight: true,
-            max_retries: Some(0),
-            ..RpcSendTransactionConfig::default()
-        };
-        er.api().try_call(RpcRequest::SendTransaction, &(&self.encoded, config)).await
-    }
-
-    async fn valid(&self, er: &ErCtx) -> Result<bool> {
-        er.api()
-            .call_value(RpcRequest::IsBlockhashValid, &(self.blockhash.to_string(),))
-            .await
-    }
-
-    async fn copies(&self, er: &ErCtx, count: usize) -> Result<()> {
-        for result in join_all((0..count).map(|_| self.send(er))).await {
-            match result? {
-                Ok(_) => {}
-                Err(error) => {
-                    ensure!(error.error.code.code() == -32003);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn outcome(&self, er: &ErCtx) -> Result<u64> {
-        let config = RpcTransactionConfig {
-            encoding: Some(UiTransactionEncoding::Json),
-            max_supported_transaction_version: Some(0),
-            ..RpcTransactionConfig::default()
-        };
-        let tx = er
-            .api()
-            .await_query("transaction published", async || {
-                er.api()
-                    .call::<Option<EncodedConfirmedTransactionWithStatusMeta>>(
-                        RpcRequest::GetTransaction,
-                        &(self.signature.to_string(), config),
-                    )
-                    .await?
-                    .ok_or_else(|| DynError::msg("transaction missing"))
-            })
-            .await?;
-        let meta = transaction_meta(&tx)?;
-        ensure!(meta.err == self.error);
-        ensure!(meta.fee == self.fee);
-        Ok(tx.slot)
-    }
-}
-
 async fn state(er: &ErCtx, keys: &[Pubkey; 2]) -> Result<(u64, CellHeader)> {
     let accounts = er.accounts(keys).await?;
     decode_state(&accounts)
-}
-
-fn decode_state(accounts: &[Option<account::Account>]) -> Result<(u64, CellHeader)> {
-    let payer = accounts[0].as_ref().context("payer missing")?;
-    let cell = accounts[1].as_ref().context("cell missing")?;
-    Ok((payer.lamports, CellHeader::try_decode(&cell.data)?))
-}
-
-async fn subscribe(er: &ErCtx, tx: &Signed) -> Result<(RawWs, u64)> {
-    let mut ws = RawWs::connect(er.ws_url()).await?;
-    let id = ws.signature_subscribe(&tx.signature).await?;
-    Ok((ws, id))
 }
 
 async fn queue_readers(
@@ -254,36 +129,6 @@ async fn execute(
         er.api().await_transaction(&reader).await?;
     }
     Ok(pending)
-}
-
-async fn audit(er: &ErCtx, start: u64, expected: &[(&Signed, usize)]) -> Result<u64> {
-    let end = er.api().get_slot().await? + 2;
-    er.api().await_slot(end).await?;
-    er.api()
-        .await_query("block is published", async || {
-            ensure!(er.api().get_block(end).await?.is_some());
-            Ok(())
-        })
-        .await?;
-    let blocks: Vec<u64> = er.api().call(RpcRequest::GetBlocks, &(start, end)).await?;
-    let mut counts = vec![0; expected.len()];
-    for slot in blocks {
-        let config = RpcBlockConfig {
-            transaction_details: Some(TransactionDetails::Signatures),
-            rewards: Some(false),
-            ..RpcBlockConfig::default()
-        };
-        let block: UiConfirmedBlock = er.api().call(RpcRequest::GetBlock, &(slot, config)).await?;
-        let signatures = block.signatures.context("block signatures missing")?;
-        for (i, (tx, _)) in expected.iter().enumerate() {
-            let expected = tx.signature.to_string();
-            counts[i] += signatures.iter().filter(|signature| **signature == expected).count();
-        }
-    }
-    for ((_, expected), count) in expected.iter().zip(counts) {
-        ensure!(count == *expected);
-    }
-    Ok(end + 1)
 }
 
 impl Scenario<(), Coverage> for TransactionLifecycle {

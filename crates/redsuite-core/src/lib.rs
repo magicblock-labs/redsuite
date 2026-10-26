@@ -18,6 +18,7 @@ mod resources;
 pub mod runner;
 pub mod sampler;
 pub mod scenario;
+pub mod signed;
 pub mod stats;
 pub mod system;
 pub mod topology;

@@ -44,6 +44,7 @@ signer = { workspace = true }
 sdk-ids = { workspace = true }
 hash = { workspace = true }
 transaction = { workspace = true }
+message = { workspace = true }
 wincode = { workspace = true }
 solana-rpc-client-types = { workspace = true }
 solana-account-decoder-client-types = { workspace = true }
