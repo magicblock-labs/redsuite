@@ -9,6 +9,7 @@ authors.workspace = true
 tracing.workspace = true
 tokio = { workspace = true }
 serde_json = { workspace = true }
+url = { workspace = true }
 anyhow.workspace = true
 account = { workspace = true }
 futures-util = { workspace = true }

@@ -1,7 +1,7 @@
 pub mod aperture;
 pub mod chainlink;
 pub mod magicblock;
-use aperture::{TransactionAdmission, TransactionAuthority, TransactionStructure};
+use aperture::{ProtocolInputs, TransactionAdmission, TransactionAuthority, TransactionStructure};
 use magicblock_config::types::Remote;
 use redsuite_core::{
     catalog::{ErGroup, Fixture, ProxyMode, ScenarioEntry, DEFAULT},
@@ -28,6 +28,10 @@ pub fn catalog() -> Vec<ScenarioEntry> {
         scenario!(
             TransactionAdmission,
             exclusive(&PREPARATION, &[Fixture::RedshiftProgram], ())
+        ),
+        scenario!(
+            ProtocolInputs,
+            exclusive(&DEFAULT, &[Fixture::RedshiftProgram], ())
         ),
         scenario!(
             chainlink::settlement_authorization::SettlementAuthorization,
