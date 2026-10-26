@@ -333,8 +333,13 @@ impl Scenario for TransactionStructure {
         for index in (1..cases.len()).rev() {
             cases.swap(index, rng.gen_range(0..=index));
         }
-        let admitted_before =
-            fixture.er.metrics().scrape().await?.get(ADMITTED).unwrap_or_default();
+        let admitted_before = fixture
+            .er
+            .metrics()
+            .scrape()
+            .await?
+            .get(ADMITTED)
+            .context("admission counter missing from the validator metrics")?;
         let mut admitted_expected = 0.0;
         for (index, (format, mutation)) in cases.into_iter().enumerate() {
             for skip_preflight in [false, true] {
@@ -533,9 +538,14 @@ impl Scenario for TransactionStructure {
             "skip-preflight admissions match the repaired controls",
             ADMISSION_WINDOW,
             async || {
-                let admitted =
-                    fixture.er.metrics().scrape().await?.get(ADMITTED).unwrap_or_default()
-                        - admitted_before;
+                let admitted = fixture
+                    .er
+                    .metrics()
+                    .scrape()
+                    .await?
+                    .get(ADMITTED)
+                    .context("admission counter missing from the validator metrics")?
+                    - admitted_before;
                 ensure!(
                     admitted == admitted_expected,
                     "{admitted} skip-preflight admissions against {admitted_expected} controls"

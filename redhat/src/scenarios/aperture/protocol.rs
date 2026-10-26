@@ -1,7 +1,8 @@
 use super::{
-    hostile::{seeded_key, Fixture},
+    hostile::{seeded_key, Fixture, Images},
     *,
 };
+use base64::{engine::general_purpose::STANDARD, Engine};
 use message::VersionedMessage;
 use redsuite_core::{
     random::{self, Rng},
@@ -10,7 +11,7 @@ use redsuite_core::{
     wait,
 };
 use serde_json::{json, Value};
-use std::time::Instant;
+use std::{io, time::Instant};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -21,7 +22,10 @@ use url::Url;
 
 const FLOOD: usize = 64;
 const NESTING: usize = 256;
-const OVERSIZE: usize = 2 * 1024 * 1024;
+const SIZES: [usize; 4] = [16 * 1024, 256 * 1024, 2 * 1024 * 1024, 8 * 1024 * 1024];
+const QUERY_WITHIN: usize = 5;
+const QUERY_BEYOND: usize = 128;
+const FRAME_ID: u64 = 9_001;
 const FRAME_WAIT: Duration = Duration::from_secs(3);
 
 pub struct ProtocolInputs {
@@ -29,10 +33,10 @@ pub struct ProtocolInputs {
     er: ErCtx,
 }
 
-struct Outcome {
-    label: &'static str,
-    replied: bool,
-    accepted: bool,
+#[derive(Clone, Copy, Debug)]
+enum Permit {
+    Refused,
+    Either,
 }
 
 async fn raw_request(
@@ -49,30 +53,49 @@ async fn raw_request(
         "POST {} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/json\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n",
         url.path()
     );
-    socket.write_all(head.as_bytes()).await?;
-    socket.write_all(body.as_bytes()).await?;
-    socket.flush().await?;
+    let written = async {
+        socket.write_all(head.as_bytes()).await?;
+        socket.write_all(body.as_bytes()).await?;
+        socket.flush().await
+    }
+    .await;
+    if let Err(error) = written {
+        ensure!(
+            matches!(
+                error.kind(),
+                io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+            ),
+            "{error}"
+        );
+        return Ok(None);
+    }
     let mut reply = Vec::new();
     match time::timeout(wait, socket.read_to_end(&mut reply)).await {
-        Ok(read) => {
-            read?;
-            Ok(Some(String::from_utf8_lossy(&reply).into_owned()))
+        Ok(Ok(_)) => Ok(Some(String::from_utf8_lossy(&reply).into_owned())),
+        Ok(Err(error)) => {
+            ensure!(error.kind() == io::ErrorKind::ConnectionReset, "{error}");
+            Ok(None)
         }
         Err(_) => Ok(None),
     }
 }
 
-fn classify(label: &'static str, reply: Option<&str>) -> Outcome {
-    let accepted = reply.is_some_and(|reply| {
+fn accepted(reply: Option<&str>) -> bool {
+    reply.is_some_and(|reply| {
         reply.starts_with("HTTP/1.1 200")
             && reply.contains("\"result\"")
             && !reply.contains("\"error\"")
-    });
-    Outcome {
-        label,
-        replied: reply.is_some(),
-        accepted,
-    }
+    })
+}
+
+fn slot_request(id: u64) -> String {
+    format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"getSlot","params":[]}}"#)
+}
+
+fn notified_data(payload: &json::Value) -> Result<Vec<u8>> {
+    let payload: Value = serde_json::from_str(&payload.to_string())?;
+    let encoded = payload["value"]["data"][0].as_str().context("notification data missing")?;
+    Ok(STANDARD.decode(encoded)?)
 }
 
 impl ProtocolInputs {
@@ -88,53 +111,118 @@ impl ProtocolInputs {
         .await
     }
 
-    async fn http_cases(&self, fixture: &Fixture, rng: &mut impl Rng) -> Result<()> {
+    async fn probe(
+        &self,
+        fixture: &Fixture,
+        before: &Images,
+        label: &str,
+        body: &str,
+        declared: Option<usize>,
+        permit: Permit,
+    ) -> Result<bool> {
         let url = self.er.api().url().clone();
-        let before = fixture.images(&[]).await?;
-        let absent = seeded_key(rng);
-        let slot =
-            |id: u64| format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"getSlot","params":[]}}"#);
+        let reply = raw_request(&url, body, declared, FRAME_WAIT).await?;
+        let accepted = accepted(reply.as_deref());
+        info!(
+            case = label,
+            replied = reply.is_some(),
+            accepted,
+            bytes = body.len(),
+            ?permit,
+            "hostile protocol input"
+        );
+        if matches!(permit, Permit::Refused) {
+            ensure!(!accepted, "{label} was accepted");
+        }
+        self.healthy().await?;
+        fixture.unchanged(before).await?;
+        Ok(accepted)
+    }
 
-        let batch = format!("[{},{}]", slot(1), slot(2));
+    async fn http_cases(&self, fixture: &Fixture) -> Result<()> {
+        let before = fixture.images(&[]).await?;
+        let slot = slot_request(1);
         let nested = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"getSlot","params":[{}{}]}}"#,
             "[".repeat(NESTING),
             "]".repeat(NESTING)
         );
-        let oversized = format!(
-            r#"{{"jsonrpc":"2.0","id":1,"method":"getAccountInfo","params":["{}"]}}"#,
-            "A".repeat(OVERSIZE)
-        );
-        let truncated = slot(1);
-
-        let cases: Vec<(&'static str, String, Option<usize>)> = vec![
-            ("batch", batch, None),
-            ("nesting", nested, None),
-            ("oversized body", oversized, None),
+        let cases: [(&str, String, Option<usize>, Permit); 6] = [
+            (
+                "batch",
+                format!("[{},{}]", slot_request(1), slot_request(2)),
+                None,
+                Permit::Either,
+            ),
+            ("nesting", nested, None, Permit::Either),
             (
                 "short body for declared length",
-                truncated.clone(),
-                Some(truncated.len() + 64),
+                slot.clone(),
+                Some(slot.len() + 64),
+                Permit::Refused,
             ),
-            ("trailing bytes after body", format!("{truncated}{{"), None),
-            ("empty body", String::new(), None),
-            ("not json", "not json at all".to_owned(), None),
+            (
+                "trailing bytes after body",
+                format!("{slot}{{"),
+                None,
+                Permit::Refused,
+            ),
+            ("empty body", String::new(), None, Permit::Refused),
+            (
+                "not json",
+                "not json at all".to_owned(),
+                None,
+                Permit::Refused,
+            ),
         ];
-
-        for (label, body, declared) in cases {
-            let reply = raw_request(&url, &body, declared, FRAME_WAIT).await?;
-            let outcome = classify(label, reply.as_deref());
-            info!(
-                case = outcome.label,
-                replied = outcome.replied,
-                accepted = outcome.accepted,
-                bytes = body.len(),
-                "hostile protocol input"
-            );
-            self.healthy().await?;
-            fixture.unchanged(&before).await?;
+        for (label, body, declared, permit) in cases {
+            self.probe(fixture, &before, label, &body, declared, permit).await?;
         }
+        Ok(())
+    }
 
+    async fn size_cases(&self, fixture: &Fixture) -> Result<()> {
+        let before = fixture.images(&[]).await?;
+        let mut refused_at = None;
+        for size in SIZES {
+            let body = format!(
+                r#"{{"jsonrpc":"2.0",{}"id":1,"method":"getSlot","params":[]}}"#,
+                " ".repeat(size)
+            );
+            let permit = if refused_at.is_some() { Permit::Refused } else { Permit::Either };
+            let taken =
+                self.probe(fixture, &before, "body size ladder", &body, None, permit).await?;
+            if !taken && refused_at.is_none() {
+                refused_at = Some(size);
+            }
+        }
+        info!(?refused_at, "body size boundary located");
+        ensure!(
+            refused_at.is_some(),
+            "no body size in the ladder was refused"
+        );
+        Ok(())
+    }
+
+    async fn query_cases(&self, fixture: &Fixture, rng: &mut impl Rng) -> Result<()> {
+        let before = fixture.images(&[]).await?;
+        for (label, count, permit) in [
+            ("within query bound", QUERY_WITHIN, Permit::Either),
+            ("beyond query bound", QUERY_BEYOND, Permit::Refused),
+        ] {
+            let keys: Vec<String> = (0..count).map(|_| seeded_key(rng).to_string()).collect();
+            let body = format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"getMultipleAccounts","params":[{}]}}"#,
+                json!(keys)
+            );
+            self.probe(fixture, &before, label, &body, None, permit).await?;
+        }
+        Ok(())
+    }
+
+    async fn request_cases(&self, fixture: &Fixture, rng: &mut impl Rng) -> Result<()> {
+        let before = fixture.images(&[]).await?;
+        let absent = seeded_key(rng);
         let lenient: Value = self
             .er
             .api()
@@ -148,16 +236,19 @@ impl ProtocolInputs {
             .await?;
         ensure!(lenient["value"].is_null(), "{lenient}");
 
-        for (label, params) in [
-            ("unknown method", json!([])),
-            ("wrong parameter type", json!([42])),
-            ("missing parameter", json!([])),
+        for (label, method, params) in [
+            (
+                "unknown method",
+                RpcRequest::Custom { method: "redsuiteNoSuchMethod" },
+                json!([]),
+            ),
+            (
+                "wrong parameter type",
+                RpcRequest::GetAccountInfo,
+                json!([42]),
+            ),
+            ("missing parameter", RpcRequest::GetAccountInfo, json!([])),
         ] {
-            let method = if label == "unknown method" {
-                RpcRequest::Custom { method: "redsuiteNoSuchMethod" }
-            } else {
-                RpcRequest::GetAccountInfo
-            };
             let result: result::Result<Value, RpcError> =
                 self.er.api().try_call(method, &params).await?;
             let error = result.err().context("hostile request acknowledged")?;
@@ -201,13 +292,59 @@ impl ProtocolInputs {
         fixture.unchanged(&before).await
     }
 
-    async fn socket_cases(&self, fixture: &Fixture) -> Result<()> {
+    async fn frame_cases(&self, fixture: &Fixture) -> Result<()> {
         let before = fixture.images(&[]).await?;
         let cell = fixture.keys[1];
-        let mut flood = RawWs::connect(self.er.ws_url()).await?;
+        let frames: [(&str, String, bool); 6] = [
+            ("not json", "not a frame".to_owned(), false),
+            ("empty frame", String::new(), false),
+            ("array frame", "[1,2,3]".to_owned(), false),
+            (
+                "unknown subscription method",
+                format!(
+                    r#"{{"jsonrpc":"2.0","id":{FRAME_ID},"method":"redsuiteNoSuchSub","params":[]}}"#
+                ),
+                true,
+            ),
+            (
+                "nested params",
+                format!(
+                    r#"{{"jsonrpc":"2.0","id":{FRAME_ID},"method":"accountSubscribe","params":[{}{}]}}"#,
+                    "[".repeat(NESTING),
+                    "]".repeat(NESTING)
+                ),
+                false,
+            ),
+            (
+                "oversized frame",
+                format!(
+                    r#"{{"jsonrpc":"2.0","id":{FRAME_ID},"method":"accountSubscribe","params":["{}"]}}"#,
+                    "A".repeat(SIZES[1])
+                ),
+                false,
+            ),
+        ];
+        for (label, frame, must_survive) in frames {
+            let mut socket = RawWs::connect(self.er.ws_url()).await?;
+            let bytes = frame.len();
+            socket.send_text(frame).await?;
+            let survived = socket.responsive(&cell).await;
+            info!(case = label, bytes, survived, "hostile socket frame");
+            if must_survive {
+                ensure!(survived, "{label} cost a connection that must stay usable");
+            }
+            let _ = socket.close().await;
+            self.healthy().await?;
+        }
+        fixture.unchanged(&before).await
+    }
+
+    async fn socket_cases(&self, fixture: &mut Fixture) -> Result<()> {
+        let cell = fixture.keys[1];
+        let mut victim = RawWs::connect(self.er.ws_url()).await?;
         let mut ids = Vec::with_capacity(FLOOD);
         for _ in 0..FLOOD {
-            ids.push(flood.account_subscribe(&cell).await?);
+            ids.push(victim.account_subscribe(&cell).await?);
         }
         let mut sorted = ids.clone();
         sorted.sort_unstable();
@@ -224,16 +361,57 @@ impl ProtocolInputs {
                 "cross-connection unsubscribe accepted for {id}"
             );
         }
-        ensure!(flood.account_unsubscribe(ids[0]).await?);
-        ensure!(flood.malformed_frames() == 0 && intruder.malformed_frames() == 0);
+
+        let expected = self.write(fixture, 7_100, 3).await?;
+        let (method, id, payload) = victim
+            .next_notification(TIMEOUT)
+            .await?
+            .context("victim subscription lost after a cross-connection unsubscribe")?;
+        ensure!(method == "accountNotification" && ids.contains(&id));
+        ensure!(
+            notified_data(&payload)? == expected,
+            "victim notification did not carry the fresh write"
+        );
+        ensure!(victim.malformed_frames() == 0 && intruder.malformed_frames() == 0);
         info!(
             subscriptions = ids.len(),
-            "subscription flood isolated from other connections"
+            "flood isolated and victim delivery intact"
         );
         intruder.close().await?;
-        flood.close().await?;
-        self.healthy().await?;
-        fixture.unchanged(&before).await
+        victim.close().await?;
+        self.healthy().await
+    }
+
+    async fn write(&self, fixture: &mut Fixture, nonce: u64, amount: u64) -> Result<Vec<u8>> {
+        let message = fixture.message(nonce, amount as i64, &[]).await?;
+        fixture.repaired(VersionedMessage::Legacy(message), amount, 1, false).await?;
+        Ok(fixture.expected[1].as_ref().context("cell expectation missing")?.data.clone())
+    }
+
+    async fn confirmed_write(
+        &self,
+        fixture: &mut Fixture,
+        control: &mut RawWs,
+        subscription: u64,
+        nonce: u64,
+    ) -> Result<()> {
+        let started = Instant::now();
+        time::timeout(TIMEOUT, async {
+            let expected = self.write(fixture, nonce, 5).await?;
+            loop {
+                let left = TIMEOUT.saturating_sub(started.elapsed());
+                let (method, id, payload) = control
+                    .next_notification(left)
+                    .await?
+                    .context("control notification lost during hostile protocol inputs")?;
+                ensure!(method == "accountNotification" && id == subscription);
+                if notified_data(&payload)? == expected {
+                    return Ok(());
+                }
+            }
+        })
+        .await
+        .context("control write exceeded the confirmation deadline")?
     }
 }
 
@@ -248,22 +426,21 @@ impl Scenario for ProtocolInputs {
         let mut control = RawWs::connect(self.er.ws_url()).await?;
         let subscription = control.account_subscribe(&fixture.keys[1]).await?;
 
-        self.http_cases(&fixture, &mut rng).await?;
-        self.simulation_cases(&mut fixture, &mut rng).await?;
-        self.socket_cases(&fixture).await?;
+        self.http_cases(&fixture).await?;
+        self.confirmed_write(&mut fixture, &mut control, subscription, 7_001).await?;
 
-        let started = Instant::now();
-        let message = fixture.message(9_000, 5, &[]).await?;
-        fixture.repaired(VersionedMessage::Legacy(message), 5, 1, false).await?;
-        let (method, id, _) = control
-            .next_notification(TIMEOUT)
-            .await?
-            .context("control notification lost after hostile protocol inputs")?;
-        ensure!(method == "accountNotification" && id == subscription);
-        ensure!(
-            started.elapsed() < TIMEOUT,
-            "recovery write exceeded the confirmation deadline"
-        );
+        self.size_cases(&fixture).await?;
+        self.confirmed_write(&mut fixture, &mut control, subscription, 7_002).await?;
+
+        self.request_cases(&fixture, &mut rng).await?;
+        self.simulation_cases(&mut fixture, &mut rng).await?;
+        self.confirmed_write(&mut fixture, &mut control, subscription, 7_003).await?;
+
+        self.frame_cases(&fixture).await?;
+        self.socket_cases(&mut fixture).await?;
+        self.confirmed_write(&mut fixture, &mut control, subscription, 7_004).await?;
+
+        self.query_cases(&fixture, &mut rng).await?;
         control.close().await?;
         Ok(())
     }

@@ -111,6 +111,16 @@ where
         .with_context(|| format!("{method} send"))
 }
 
+pub(super) async fn send_text<S>(sink: &mut S, text: String) -> Result<()>
+where
+    S: Sink<Message, Error = WsError> + Unpin,
+{
+    time::timeout(NETWORK_TIMEOUT, sink.send(Message::Text(text.into())))
+        .await
+        .context("raw frame send timed out")?
+        .context("raw frame send")
+}
+
 pub(super) async fn receive<S>(stream: &mut S) -> result::Result<Utf8Bytes, CloseReason>
 where
     S: Stream<Item = result::Result<Message, WsError>> + Unpin,
@@ -126,7 +136,6 @@ where
     }
 }
 
-// Dispatch borrowed payloads so load observers do not allocate a JSON tree per update.
 pub(super) async fn drive<S>(
     stream: &mut S,
     mut dispatch: impl FnMut(Frame<'_>) -> Result<()>,
