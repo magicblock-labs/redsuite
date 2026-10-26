@@ -92,6 +92,13 @@ impl RawWs {
         self.unsubscribe(Topic::Account, subscription).await
     }
 
+    pub async fn try_account_unsubscribe(
+        &mut self,
+        subscription: u64,
+    ) -> Result<result::Result<bool, RpcError>> {
+        self.try_request(Topic::Account.unsubscribe(), &(subscription,)).await
+    }
+
     pub async fn logs_subscribe_all(&mut self) -> Result<u64> {
         self.try_logs_subscribe(RpcTransactionLogsFilter::All)
             .await?

@@ -280,13 +280,14 @@ impl ProtocolInputs {
                 encoding: Some(UiTransactionEncoding::Base64),
                 ..RpcSimulateTransactionConfig::default()
             };
+            let start = self.er.api().get_slot().await?;
             let simulated: Value = self
                 .er
                 .api()
                 .call_value(RpcRequest::SimulateTransaction, &(&tx.encoded, config))
                 .await?;
             ensure!(simulated["err"].is_null(), "{simulated}");
-            fixture.statusless(&tx, self.er.api().get_slot().await?, None).await?;
+            fixture.statusless(&tx, start, None).await?;
             info!(sig_verify, "simulation leaves no admission");
         }
         fixture.unchanged(&before).await
@@ -356,10 +357,14 @@ impl ProtocolInputs {
 
         let mut intruder = RawWs::connect(self.er.ws_url()).await?;
         for id in ids.iter().take(4) {
-            ensure!(
-                !intruder.account_unsubscribe(*id).await?,
-                "cross-connection unsubscribe accepted for {id}"
-            );
+            match intruder.try_account_unsubscribe(*id).await? {
+                Ok(removed) => ensure!(!removed, "cross-connection unsubscribe accepted for {id}"),
+                Err(error) => info!(
+                    id,
+                    code = error.error.code.code(),
+                    "cross-connection unsubscribe refused"
+                ),
+            }
         }
 
         let expected = self.write(fixture, 7_100, 3).await?;
