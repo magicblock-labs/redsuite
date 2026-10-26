@@ -28,6 +28,8 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 
 mod authority;
 mod hostile;
+mod protocol;
 
 pub use authority::TransactionAuthority;
 pub use hostile::{TransactionAdmission, TransactionStructure};
+pub use protocol::ProtocolInputs;

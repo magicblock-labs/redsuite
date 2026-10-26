@@ -2915,6 +2915,7 @@ dependencies = [
  "sonic-rs",
  "tokio",
  "tracing",
+ "url",
  "wincode",
 ]
 

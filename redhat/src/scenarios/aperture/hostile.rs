@@ -15,6 +15,8 @@ use transaction::versioned::VersionedTransaction;
 
 const OWNERS: &[Pubkey] = &[REDSHIFT.id(), sdk_ids::system_program::ID, dlp::DELEGATION_PROGRAM_ID];
 const OBSERVE: Duration = Duration::from_millis(250);
+const ADMITTED: &str = "mbv_transaction_skip_preflight_count";
+const ADMISSION_WINDOW: Duration = Duration::from_secs(90);
 
 pub struct TransactionStructure {
     base: Rc<BaseCtx>,
@@ -57,7 +59,7 @@ fn vacant(account: &Account) -> bool {
         && !account.executable
 }
 
-fn seeded_key(rng: &mut impl Rng) -> Pubkey {
+pub(super) fn seeded_key(rng: &mut impl Rng) -> Pubkey {
     let mut bytes = [0u8; 32];
     rng.fill(&mut bytes);
     Pubkey::new_from_array(bytes)
@@ -281,6 +283,8 @@ enum Mutation {
     Instructions,
     Size,
     Heap,
+    Encoding,
+    Signatures,
 }
 
 fn wire(message: VersionedMessage, payer: &Keypair) -> Result<(Vec<u8>, Signature)> {
@@ -315,6 +319,8 @@ impl Scenario for TransactionStructure {
                 Mutation::Accounts,
                 Mutation::Instructions,
                 Mutation::Size,
+                Mutation::Encoding,
+                Mutation::Signatures,
             ] {
                 cases.push((format, mutation));
             }
@@ -327,6 +333,14 @@ impl Scenario for TransactionStructure {
         for index in (1..cases.len()).rev() {
             cases.swap(index, rng.gen_range(0..=index));
         }
+        let admitted_before = fixture
+            .er
+            .metrics()
+            .scrape()
+            .await?
+            .get(ADMITTED)
+            .context("admission counter missing from the validator metrics")?;
+        let mut admitted_expected = 0.0;
         for (index, (format, mutation)) in cases.into_iter().enumerate() {
             for skip_preflight in [false, true] {
                 let amount = rng.gen_range(1..8u64);
@@ -428,12 +442,15 @@ impl Scenario for TransactionStructure {
                             .resize(current + target - bytes.len(), 0);
                         "SanitizeError"
                     }
+                    Mutation::Encoding => "error parsing request body",
+                    Mutation::Signatures => "ParseError",
                     Mutation::Truncated | Mutation::Trailing | Mutation::Unsupported => {
                         "ParseError"
                     }
                 };
                 let (mut bytes, mut signature) = wire(malformed, &fixture.payer)?;
                 match mutation {
+                    Mutation::Signatures => bytes[0] = 2,
                     Mutation::Truncated => {
                         bytes.pop();
                     }
@@ -460,6 +477,10 @@ impl Scenario for TransactionStructure {
                     gate,
                     "hostile transaction graph"
                 );
+                let mut payload = STANDARD.encode(&bytes);
+                if matches!(mutation, Mutation::Encoding) {
+                    payload.insert(payload.len() / 2, '!');
+                }
                 let before = fixture.images(&extra).await?;
                 let start = fixture.er.api().get_slot().await?;
                 let result: result::Result<String, RpcError> = fixture
@@ -468,7 +489,7 @@ impl Scenario for TransactionStructure {
                     .try_call(
                         RpcRequest::SendTransaction,
                         &(
-                            STANDARD.encode(bytes),
+                            payload,
                             RpcSendTransactionConfig {
                                 skip_preflight,
                                 encoding: Some(UiTransactionEncoding::Base64),
@@ -479,8 +500,9 @@ impl Scenario for TransactionStructure {
                     )
                     .await?;
                 let error = result.expect_err("malformed transaction acknowledged");
+                let code = if matches!(mutation, Mutation::Encoding) { -32700 } else { -32602 };
                 ensure!(
-                    error.error.code.code() == -32602 && error.error.message.contains(gate),
+                    error.error.code.code() == code && error.error.message.contains(gate),
                     "{error}"
                 );
                 let rejected = Signed {
@@ -500,6 +522,9 @@ impl Scenario for TransactionStructure {
                         skip_preflight,
                     )
                     .await?;
+                if skip_preflight {
+                    admitted_expected += 1.0;
+                }
                 ensure!(fixture
                     .er
                     .local_accounts(OWNERS, &extra)
@@ -509,7 +534,26 @@ impl Scenario for TransactionStructure {
                 ensure!(base_images(&fixture.base, &extra).await?.iter().all(Option::is_none));
             }
         }
-        Ok(())
+        wait::retry(
+            "skip-preflight admissions match the repaired controls",
+            ADMISSION_WINDOW,
+            async || {
+                let admitted = fixture
+                    .er
+                    .metrics()
+                    .scrape()
+                    .await?
+                    .get(ADMITTED)
+                    .context("admission counter missing from the validator metrics")?
+                    - admitted_before;
+                ensure!(
+                    admitted == admitted_expected,
+                    "{admitted} skip-preflight admissions against {admitted_expected} controls"
+                );
+                Ok(())
+            },
+        )
+        .await
     }
 }
 

@@ -65,7 +65,6 @@ impl RawWs {
                         Err(error) => Ok(Err(RpcError { error, method })),
                     };
                 }
-                // A cancelled request may leave a late reply on the socket.
                 Some(Frame::Reply { .. }) | None => {}
                 Some(Frame::Notification { method, params }) => {
                     if let Some(notification) = self.decode_notification(method, params) {
@@ -91,6 +90,13 @@ impl RawWs {
 
     pub async fn account_unsubscribe(&mut self, subscription: u64) -> Result<bool> {
         self.unsubscribe(Topic::Account, subscription).await
+    }
+
+    pub async fn try_account_unsubscribe(
+        &mut self,
+        subscription: u64,
+    ) -> Result<result::Result<bool, RpcError>> {
+        self.try_request(Topic::Account.unsubscribe(), &(subscription,)).await
     }
 
     pub async fn logs_subscribe_all(&mut self) -> Result<u64> {
@@ -181,6 +187,14 @@ impl RawWs {
                 None
             }
         }
+    }
+
+    pub async fn send_text(&mut self, text: String) -> Result<()> {
+        socket::send_text(&mut self.socket, text).await
+    }
+
+    pub async fn responsive(&mut self, account: &Pubkey) -> bool {
+        self.account_subscribe(account).await.is_ok()
     }
 
     pub fn malformed_frames(&self) -> usize {
