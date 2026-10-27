@@ -53,7 +53,8 @@ async fn checks(family: Family, command: Checks) -> Result<()> {
         Checks::List { selections } => list(family, &selections),
         Checks::Run(args) => {
             let seed = args.seed.unwrap_or_else(rand::random);
-            info!(seed, "run seed");
+            let runner = redsuite_core::report::binary_hash(&std::env::current_exe()?)?;
+            info!(attack_seed = seed, runner, "run seed");
             Suite::new(
                 family,
                 args.run,

@@ -6,7 +6,7 @@ use magic_api::{
     instruction::MagicBlockInstruction,
 };
 use pubkey::Pubkey;
-use sdk::consts::{MAGIC_CONTEXT_ID, MAGIC_PROGRAM_ID};
+pub use sdk::consts::{MAGIC_CONTEXT_ID, MAGIC_PROGRAM_ID};
 
 use crate::SettlementMode;
 

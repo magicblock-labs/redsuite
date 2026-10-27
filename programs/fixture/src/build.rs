@@ -304,6 +304,11 @@ impl Batch {
         self.operations.push(Operation::FillBytes { account, byte });
         self
     }
+    pub fn resize_bytes(mut self, key: Pubkey, length: u32, byte: u8) -> Self {
+        let account = self.account(AccountMeta::new(key, false));
+        self.operations.push(Operation::ResizeBytes { account, length, byte });
+        self
+    }
     pub fn undelegation(mut self, cells: &[Pubkey], outcome: UndelegationOutcome) -> Self {
         let cells = self.cells(cells, true);
         self.operations.push(Operation::Undelegation { cells, outcome });

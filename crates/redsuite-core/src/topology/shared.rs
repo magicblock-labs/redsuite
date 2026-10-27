@@ -88,8 +88,15 @@ async fn boot_base(config: ExecutionConfig) -> Result<StackState> {
     let base_gossip_port = base_ports.single()?;
     let feed_port = base_ports.single()?;
 
-    let identity_pool: Vec<Keypair> =
-        (0..identity::IDENTITY_POOL_SIZE).map(|_| Keypair::new()).collect();
+    let identity_pool: Vec<Keypair> = (0..identity::IDENTITY_POOL_SIZE)
+        .map(|index| {
+            crate::random::keypair(&mut crate::random::rng(
+                0,
+                &["redsuite", "managed-fixture-identities"],
+                index as u64,
+            ))
+        })
+        .collect();
     let base_log = dir.join("base.log");
     let plan = BasePlan::gather(
         base_bin,

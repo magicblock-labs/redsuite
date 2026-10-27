@@ -2,7 +2,7 @@ use std::{cell::Cell, rc::Rc, time::Duration};
 use tokio::sync::Notify;
 
 use account::Account;
-use anyhow::{ensure, Context};
+use anyhow::ensure;
 use futures_util::future::{try_join, try_join_all};
 use keypair::Keypair;
 use pubkey::Pubkey;
@@ -18,21 +18,19 @@ use tokio::time::{self, Instant};
 use tracing::instrument;
 
 use super::{
-    await_local_value, CacheLifecycle, Mode, BASE_REFRESH, BASE_REWRITE, ER_WRITE, FETCHES,
+    await_local_value, cache_evictions, churn_cache, CacheLifecycle, Mode, BASE_REFRESH,
+    BASE_REWRITE, CACHE_CAPACITY, ER_WRITE, FETCHES,
 };
 use crate::{
     program::{self, layout, DELEGATION_PROGRAM_ID},
     ACCOUNT_OWNERS, ACCOUNT_SPACE, PAYER_LAMPORTS,
 };
 
-const LRU_CAPACITY: usize = 256;
 const READONLY_COUNT: usize = 1;
 const DELEGATED_COUNT: usize = 2;
 const PENDING_COUNT: usize = 2;
 const FUNDING_BATCH: usize = 16;
-const FETCH_BATCH: usize = 32;
 const TIMEOUT: Duration = Duration::from_secs(20);
-const EVICTIONS: &str = "engine_keeper_account_cache_evictions";
 const SCENARIO_TIMEOUT: Duration = Duration::from_secs(180);
 
 impl CacheLifecycle {
@@ -93,14 +91,6 @@ impl CacheLifecycle {
             .intercept(Selector::method(method).response().notification().account(key))
     }
 
-    async fn evictions(&self) -> Result<f64> {
-        self.er
-            .scrape_metrics()
-            .await?
-            .get(EVICTIONS)
-            .context("eviction metric missing")
-    }
-
     #[instrument(skip_all, err)]
     async fn prepare_accounts(&self) -> Result<(CacheAccounts, Vec<Held>, RuleHandle)> {
         let er = &self.er;
@@ -158,14 +148,14 @@ impl CacheLifecycle {
         let protected = er.local_accounts(&ACCOUNT_OWNERS, protected_keys).await?;
         ensure!(protected.iter().all(Option::is_some));
         let base_delegated = self.base.accounts(delegated).await?;
-        let pool: Vec<_> = (0..LRU_CAPACITY * 2).map(|_| Keypair::new().pubkey()).collect();
+        let pool: Vec<_> = (0..CACHE_CAPACITY * 2).map(|_| Keypair::new().pubkey()).collect();
         try_join_all(pool.chunks(FUNDING_BATCH).map(|chunk| async {
             let transfers: Vec<_> =
                 chunk.iter().map(|key| system::transfer(&owner, key, 1_000_000)).collect();
             self.base.submit_and_confirm(&funder, &transfers).await
         }))
         .await?;
-        let before = self.evictions().await?;
+        let before = cache_evictions(&self.er).await?;
         let sender = er.sender(Rc::new(payer));
         Ok((
             CacheAccounts {
@@ -234,7 +224,7 @@ impl CacheLifecycle {
         let pending = &protected_keys[DELEGATED_COUNT..];
         let mut evictions = accounts.evictions;
         if matches!(self.mode, Mode::UndelegationReconnectGap) {
-            self.churn_cache(&accounts.pool, evictions).await?;
+            churn_cache(&self.er, &accounts.pool, evictions).await?;
             self.ws.stall(Selector::default().response().notification());
             for key in protected_keys {
                 self.http.stall(Selector::methods(&FETCHES).response().account(key));
@@ -243,7 +233,7 @@ impl CacheLifecycle {
             return Ok(());
         }
         for (cycle, &target) in readonly.iter().enumerate() {
-            evictions = self.churn_cache(&accounts.pool, evictions).await?;
+            evictions = churn_cache(&self.er, &accounts.pool, evictions).await?;
             let cold = er.local_accounts(&ACCOUNT_OWNERS, &[target]).await?;
             ensure!(cold[0].is_none());
             let reconnect = self.observe("accountSubscribe", &pending[0]);
@@ -277,15 +267,6 @@ impl CacheLifecycle {
         }
 
         Ok(())
-    }
-
-    async fn churn_cache(&self, pool: &[Pubkey], previous: f64) -> Result<f64> {
-        for chunk in pool.chunks(FETCH_BATCH) {
-            self.er.accounts(chunk).await?;
-        }
-        let current = self.evictions().await?;
-        ensure!(current > previous);
-        Ok(current)
     }
 
     #[instrument(skip_all, err)]
