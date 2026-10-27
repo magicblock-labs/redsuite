@@ -304,6 +304,11 @@ impl Batch {
         self.operations.push(Operation::FillBytes { account, byte });
         self
     }
+    /// Resize the entire account and write `byte` at offset zero if nonempty.
+    ///
+    /// For fixture cells, this overwrites the first byte of `CellHeader::id`,
+    /// which can invalidate later delegation or resizing. Use [`Program::resize`]
+    /// to preserve the cell header.
     pub fn resize_bytes(mut self, key: Pubkey, length: u32, byte: u8) -> Self {
         let account = self.account(AccountMeta::new(key, false));
         self.operations.push(Operation::ResizeBytes { account, length, byte });

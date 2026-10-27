@@ -175,6 +175,10 @@ impl ErCtx {
         Ok(keys.iter().map(|key| accounts.get(key).cloned()).collect())
     }
 
+    /// Read resident accounts whose owners are in [`crate::topology::local_account_owners`].
+    ///
+    /// Accounts with other owners return `None` even when resident. Use
+    /// [`Self::local_accounts`] with explicit owners to include them.
     pub async fn local_images(&self, keys: &[Pubkey]) -> Result<Vec<Option<Account>>> {
         self.local_accounts(&crate::topology::local_account_owners(), keys).await
     }
