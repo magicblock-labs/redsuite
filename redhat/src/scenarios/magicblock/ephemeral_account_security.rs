@@ -1138,7 +1138,17 @@ impl Workload {
         }
         let delegated_local = self.er.local_images(&[delegated]).await?;
         let amount = rng.gen_range(1..64);
-        tracing::info!(%confined, %delegated, amount, "confined rent authority plan");
+        let thief = self.base.seeded_payer(&mut rng, PAYER_LAMPORTS).await?;
+        self.base.delegate_payer(&owner, &thief, self.er.identity()).await?;
+        let attacker = thief.pubkey();
+        self.signers.push(thief);
+        let drained = self
+            .base
+            .cells(REDSHIFT, &owner)
+            .create_delegated(space, Pubkey::default(), 2)
+            .await?;
+        self.er.accounts(&[attacker, drained]).await?;
+        tracing::info!(%confined, %delegated, %drained, %attacker, amount, "confined rent authority plan");
         let mut probe = self.keys;
         probe[TARGET] = delegated;
         self.run(
@@ -1149,6 +1159,49 @@ impl Workload {
         .await?;
         ensure!(self.er.local_images(&[delegated]).await? == delegated_local);
         ensure!(self.base.account(&delegated).await? == delegated_base);
+        let restored = (
+            self.keys[TARGET],
+            self.expected[TARGET].clone(),
+            self.base_images[TARGET].clone(),
+        );
+        self.keys[TARGET] = drained;
+        self.expected[TARGET] = self
+            .er
+            .local_images(&[drained])
+            .await?
+            .pop()
+            .flatten()
+            .context("drained local image missing")?;
+        self.base_images[TARGET] = self.base.account(&drained).await?;
+        self.ledger.deposits.insert(drained, 0);
+        ensure!(
+            self.expected[TARGET].lamports == 0 && self.expected[TARGET].owner == REDSHIFT.id()
+        );
+        let theft = Action::new(Close);
+        probe = self.keys;
+        probe[SPONSOR] = attacker;
+        self.run(
+            "unrelated signer cannot collect confined rent",
+            vec![theft.wrap(theft.native(&probe), &self.keys)],
+            Ok(&theft),
+        )
+        .await
+        .context("#251: an ephemeral close refunds only its own funded deposit")?;
+        (
+            self.keys[TARGET],
+            self.expected[TARGET],
+            self.base_images[TARGET],
+        ) = restored;
+        self.step_victim(
+            "funded growth after the unrelated close",
+            &Action::new(Resize { new_data_len: 41 }),
+        )
+        .await?;
+        self.step_victim(
+            "funded refund after the unrelated close",
+            &Action::new(Resize { new_data_len: 40 }),
+        )
+        .await?;
         self.check_surplus_transfer(amount).await?;
         for mode in [SettlementMode::Commit, SettlementMode::Undelegate] {
             for targets in [vec![confined], vec![delegated, confined]] {
