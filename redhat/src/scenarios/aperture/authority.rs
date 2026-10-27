@@ -202,10 +202,7 @@ impl Scenario for TransactionAuthority {
                     program_id: magic_api::id(),
                     accounts: vec![
                         AccountMeta::new_readonly(authority, signer),
-                        AccountMeta::new_readonly(
-                            Pubkey::from_str_const("outboxintent1111111111111111111111111111111"),
-                            false,
-                        ),
+                        AccountMeta::new_readonly(redsuite_core::topology::OUTBOX_INTENT_ID, false),
                         AccountMeta::new(magic_api::MAGIC_CONTEXT_PUBKEY, false),
                         AccountMeta::new(target, false),
                     ],

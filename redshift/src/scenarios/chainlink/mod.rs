@@ -7,4 +7,4 @@ pub mod program_materialization;
 pub mod program_upgrade_consistency;
 pub mod projected_token_lifecycle;
 pub mod settlement_clone_controls;
-pub(crate) mod spl;
+pub mod spl;

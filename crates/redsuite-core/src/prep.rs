@@ -70,9 +70,7 @@ impl BaseCtx {
     }
 
     pub async fn seeded_payer(&self, rng: &mut impl Rng, lamports: u64) -> Result<Keypair> {
-        let mut secret = [0u8; 32];
-        rng.fill(&mut secret);
-        let payer = Keypair::new_from_array(secret);
+        let payer = crate::random::keypair(rng);
         ensure!(
             self.account(&payer.pubkey()).await?.is_none(),
             "seeded payer {} already exists on this stack: rerun with a fresh stack or another seed",

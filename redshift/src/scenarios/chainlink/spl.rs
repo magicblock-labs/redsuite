@@ -30,15 +30,15 @@ pub(crate) fn eata_program() -> Pubkey {
     ESPL_TOKEN_PROGRAM_ID
 }
 
-pub(crate) fn derive_eata(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
+pub fn derive_eata(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(&[owner.as_ref(), mint.as_ref()], &eata_program()).0
 }
 
-pub(crate) fn derive_global_vault(mint: &Pubkey) -> Pubkey {
+pub fn derive_global_vault(mint: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(&[mint.as_ref()], &eata_program()).0
 }
 
-pub(crate) fn derive_ata(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
+pub fn derive_ata(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(
         &[owner.as_ref(), token_program().as_ref(), mint.as_ref()],
         &ata_program(),
@@ -77,11 +77,11 @@ pub(crate) fn is_magic_ata(data: &[u8]) -> bool {
         && data.get(133..165) == Some(sdk_ids::sysvar::rent::ID.as_ref())
 }
 
-pub(crate) fn allocate_mint(payer: &Pubkey, mint: &Pubkey) -> Instruction {
+pub fn allocate_mint(payer: &Pubkey, mint: &Pubkey) -> Instruction {
     system::create_account(payer, mint, MINT_RENT, MINT_LEN, &token_program())
 }
 
-pub(crate) fn initialize_mint(mint: &Pubkey, authority: &Pubkey) -> Instruction {
+pub fn initialize_mint(mint: &Pubkey, authority: &Pubkey) -> Instruction {
     let mut data = vec![20u8, 0u8];
     data.extend_from_slice(authority.as_ref());
     data.push(0);
@@ -92,7 +92,7 @@ pub(crate) fn initialize_mint(mint: &Pubkey, authority: &Pubkey) -> Instruction 
     }
 }
 
-pub(crate) fn create_ata_idempotent(funder: &Pubkey, owner: &Pubkey, mint: &Pubkey) -> Instruction {
+pub fn create_ata_idempotent(funder: &Pubkey, owner: &Pubkey, mint: &Pubkey) -> Instruction {
     Instruction {
         program_id: ata_program(),
         accounts: vec![
@@ -107,7 +107,7 @@ pub(crate) fn create_ata_idempotent(funder: &Pubkey, owner: &Pubkey, mint: &Pubk
     }
 }
 
-pub(crate) fn mint_to(
+pub fn mint_to(
     mint: &Pubkey,
     destination: &Pubkey,
     authority: &Pubkey,
@@ -133,7 +133,7 @@ pub(crate) async fn token_balance(ctx: &impl ChainCtx, account: &Pubkey) -> Resu
     Ok(account_balance(&account))
 }
 
-pub(crate) fn account_balance(account: &account::Account) -> Option<u64> {
+pub fn account_balance(account: &account::Account) -> Option<u64> {
     let bytes = account.data.get(TOKEN_AMOUNT_OFFSET..TOKEN_AMOUNT_OFFSET + 8)?;
     Some(u64::from_le_bytes(bytes.try_into().ok()?))
 }

@@ -204,7 +204,10 @@ impl RunRecord {
             Ok(()) => error!("verdict failed"),
         }
         for launch in &self.launches {
-            info!(node = %launch.label, log = %launch.log, "node log");
+            info!(node = %launch.label, log = %launch.log,
+                version = %launch.bin_version,
+                binary_hash = %crate::report::binary_hash(std::path::Path::new(&launch.bin)).unwrap_or_else(|_| "unavailable".into()),
+                "node log");
         }
     }
 }
@@ -253,7 +256,7 @@ where
 }
 
 // Error-level spans retain context without emitting standalone events.
-#[instrument(name = "run", skip_all, level = "error", fields(scenario = %name, stage))]
+#[instrument(name = "run", skip_all, level = "error", fields(scenario = %name, attack_seed, stage))]
 async fn execute<V, State, Body>(
     name: String,
     fixtures: &[Fixture],
@@ -265,6 +268,9 @@ where
     V: Verdict,
     Body: AsyncFnOnce(Rc<BaseCtx>, State, &mut &'static str) -> Result<V>,
 {
+    if !V::REPORTS {
+        Span::current().record("attack_seed", config.seed);
+    }
     let run = async {
         let mut record = RunRecord::new(name);
         info!("started");

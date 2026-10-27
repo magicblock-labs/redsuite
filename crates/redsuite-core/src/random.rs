@@ -13,3 +13,9 @@ pub fn rng(seed: u64, keys: &[&str], index: u64) -> StdRng {
     hash.update(index.to_le_bytes());
     StdRng::from_seed(hash.finalize().into())
 }
+
+pub fn keypair(rng: &mut impl Rng) -> keypair::Keypair {
+    let mut secret = [0u8; 32];
+    rng.fill(&mut secret);
+    keypair::Keypair::new_from_array(secret)
+}

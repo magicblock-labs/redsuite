@@ -28,6 +28,38 @@ pub const DLP_ID: Pubkey = Pubkey::from_str_const("DELeGGvXpWV2fqJUhqcF5ZSYMS4JT
 const MDP_ID: Pubkey = Pubkey::from_str_const("DmnRGfyyftzacFb1XadYhWF6vWqXwtQk5tbr6XgR3BA1");
 pub const COMMITTOR_ID: Pubkey =
     Pubkey::from_str_const("ComtrB2KEaWgXsW1dhr1xYL4Ht4Bjj3gXnnL6KMdABq");
+pub const OUTBOX_INTENT_ID: Pubkey =
+    Pubkey::from_str_const("outboxintent1111111111111111111111111111111");
+pub const SERVICE_OWNERS: &[Pubkey] =
+    &[fixture::magic::MAGIC_PROGRAM_ID, HYDRA_EPHEMERAL_ID, OUTBOX_INTENT_ID];
+
+pub fn local_account_owners() -> Vec<Pubkey> {
+    let mut owners = vec![
+        crate::system::system_id(),
+        crate::programs::REDSHIFT.id(),
+        crate::programs::REDHAT.id(),
+        crate::programs::REDLINE.id(),
+        fixture::magic::MAGIC_PROGRAM_ID,
+        DLP_ID,
+        COMMITTOR_ID,
+        HYDRA_EPHEMERAL_ID,
+        OUTBOX_INTENT_ID,
+        TOKEN_PROGRAM_ID,
+        EATA_PROGRAM_ID,
+        sdk_ids::bpf_loader::ID,
+        sdk_ids::bpf_loader_deprecated::ID,
+        sdk_ids::bpf_loader_upgradeable::ID,
+        sdk_ids::loader_v4::ID,
+        sdk_ids::native_loader::ID,
+        redshift_loader_v3_target().0,
+    ];
+    owners.extend(redline_alias_ids(REDLINE_ALIAS_COUNT));
+    owners.extend(redline_loader_v3_pair().map(|(key, _)| key));
+    owners.sort_unstable();
+    owners.dedup();
+    owners
+}
+
 pub const HYDRA_EPHEMERAL_ID: Pubkey =
     Pubkey::from_str_const("eHyd5BU8QffvHi4GnXwxrK4WpS7pM2x9UGKHBWii7mf");
 // The validator's committor (>= 0.13.7)
@@ -376,6 +408,7 @@ pub(super) fn verifier_params(
     params.engine.authority = identity.into();
     params.engine.accountsdb.directory = state::accountsdb_dir(&storage_dir);
     params.engine.ledger.directory = storage_dir;
+    params.engine.ledger.size_limit = leader.engine.ledger.size_limit;
     params.engine.blockstore = leader.engine.blockstore;
     params.engine.replication.upstream_address = *leader.engine.replication.bind_address;
     params.engine.replication.upstream_authority =

@@ -3,7 +3,7 @@ use transaction::{submit_and_confirm, BlockhashCache};
 pub use transaction::{ErClient, TxSender};
 
 use std::{
-    collections::HashMap,
+    collections::BTreeMap,
     future::Future,
     path::PathBuf,
     rc::{Rc, Weak},
@@ -171,11 +171,27 @@ impl ErCtx {
         owners: &[Pubkey],
         keys: &[Pubkey],
     ) -> Result<Vec<Option<Account>>> {
-        let mut accounts = HashMap::new();
+        let accounts = self.local_program_accounts(owners).await?;
+        Ok(keys.iter().map(|key| accounts.get(key).cloned()).collect())
+    }
+
+    /// Read resident accounts whose owners are in [`crate::topology::local_account_owners`].
+    ///
+    /// Accounts with other owners return `None` even when resident. Use
+    /// [`Self::local_accounts`] with explicit owners to include them.
+    pub async fn local_images(&self, keys: &[Pubkey]) -> Result<Vec<Option<Account>>> {
+        self.local_accounts(&crate::topology::local_account_owners(), keys).await
+    }
+
+    pub async fn local_program_accounts(
+        &self,
+        owners: &[Pubkey],
+    ) -> Result<BTreeMap<Pubkey, Account>> {
+        let mut accounts = BTreeMap::new();
         for owner in owners {
             accounts.extend(self.api.get_program_accounts(owner).await?);
         }
-        Ok(keys.iter().map(|key| accounts.get(key).cloned()).collect())
+        Ok(accounts)
     }
 
     pub(crate) fn new(

@@ -122,6 +122,11 @@ pub enum Operation {
     },
     Log(String),
     Fail(u32),
+    ResizeBytes {
+        account: u16,
+        length: u32,
+        byte: u8,
+    },
 }
 
 #[derive(SchemaRead, SchemaWrite)]

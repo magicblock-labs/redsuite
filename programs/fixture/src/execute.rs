@@ -257,6 +257,13 @@ fn apply(program_id: &Pubkey, accounts: &[AccountInfo], operation: &Operation) -
                 &[escrow.clone(), destination.clone(), system.clone()],
             )?;
         }
+        Operation::ResizeBytes { account, length, byte } => {
+            let account = info(accounts, *account)?;
+            account.resize(*length as usize)?;
+            if let Some(first) = account.try_borrow_mut_data()?.first_mut() {
+                *first = *byte;
+            }
+        }
         Operation::Log(message) => msg!("{}", message),
         Operation::Fail(code) => return Err(ProgramError::Custom(*code)),
     }
@@ -326,7 +333,12 @@ fn delegate(
     if cell.id != id {
         return Err(ProgramError::InvalidSeeds);
     }
-    delegate_account(
+    let delegate = if config.validator == Some(sdk_ids::system_program::ID) {
+        sdk::cpi::delegate_account_with_any_validator
+    } else {
+        delegate_account
+    };
+    delegate(
         DelegateAccounts {
             payer,
             pda,

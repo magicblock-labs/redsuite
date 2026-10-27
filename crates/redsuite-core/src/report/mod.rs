@@ -10,6 +10,7 @@ use std::{
 
 pub use bmf::bmf;
 use json::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tracing::warn;
 
 use crate::{
@@ -290,6 +291,12 @@ fn er_identity() -> (String, String, String) {
 
 pub(crate) fn binary_provenance(path: &Path) -> (String, String) {
     (binary_version(path), fingerprint(path))
+}
+
+pub fn binary_hash(path: &Path) -> std::io::Result<String> {
+    let mut hash = Sha256::new();
+    std::io::copy(&mut fs::File::open(path)?, &mut hash)?;
+    Ok(format!("{:x}", hash.finalize()))
 }
 
 // A validator prints its version and then its shutdown log lines; only the
