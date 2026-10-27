@@ -5,7 +5,6 @@ use message::{
     compiled_instruction::CompiledInstruction, v0, v1, Message, MessageHeader, VersionedMessage,
 };
 use redsuite_core::{
-    dlp,
     random::{self, Rng},
     wait,
 };
@@ -13,7 +12,6 @@ use std::time::Instant;
 use tracing::info;
 use transaction::versioned::VersionedTransaction;
 
-const OWNERS: &[Pubkey] = &[REDSHIFT.id(), sdk_ids::system_program::ID, dlp::DELEGATION_PROGRAM_ID];
 const OBSERVE: Duration = Duration::from_millis(250);
 const ADMITTED: &str = "mbv_transaction_skip_preflight_count";
 const ADMISSION_WINDOW: Duration = Duration::from_secs(90);
@@ -90,7 +88,7 @@ impl Fixture {
         let foreign_image =
             er.account(&foreign).await?.context("foreign readonly control missing")?;
         let keys = vec![payer.pubkey(), cell, warm, cold, absent, foreign];
-        let expected = er.local_accounts(OWNERS, &keys).await?;
+        let expected = er.local_images(&keys).await?;
         ensure!(expected[..2].iter().all(Option::is_some));
         ensure!(expected[3].is_none() && expected[4].is_none());
         let base_images = base_images(&base, &keys).await?;
@@ -112,7 +110,7 @@ impl Fixture {
                 keys.push(*key);
             }
         }
-        let local = self.er.local_accounts(OWNERS, &keys).await?;
+        let local = self.er.local_images(&keys).await?;
         let base = base_images(&self.base, &keys).await?;
         Ok(Images { keys, local, base })
     }
@@ -120,7 +118,7 @@ impl Fixture {
     pub(super) async fn unchanged(&self, before: &Images) -> Result<()> {
         let until = Instant::now() + OBSERVE;
         loop {
-            ensure!(self.er.local_accounts(OWNERS, &before.keys).await? == before.local);
+            ensure!(self.er.local_images(&before.keys).await? == before.local);
             ensure!(base_images(&self.base, &before.keys).await? == before.base);
             if Instant::now() >= until {
                 return Ok(());
@@ -173,7 +171,7 @@ impl Fixture {
         header.value += amount;
         header.revision += revisions;
         header.write(&mut cell.data)?;
-        let actual = self.er.local_accounts(OWNERS, &self.keys).await?;
+        let actual = self.er.local_images(&self.keys).await?;
         ensure!(actual[..2] == self.expected[..2]);
         for (index, account) in actual.iter().enumerate().skip(2) {
             let expected = if index == 5 {
@@ -527,7 +525,7 @@ impl Scenario for TransactionStructure {
                 }
                 ensure!(fixture
                     .er
-                    .local_accounts(OWNERS, &extra)
+                    .local_images(&extra)
                     .await?
                     .iter()
                     .all(|account| account.as_ref().is_none_or(vacant)));
@@ -573,7 +571,7 @@ impl Scenario for TransactionAdmission {
         for skip_preflight in [false, true] {
             let cold = fixture.base.seeded_payer(&mut rng, 1_000_000).await?.pubkey();
             let source = fixture.base.account(&cold).await?;
-            ensure!(fixture.er.local_accounts(OWNERS, &[cold]).await? == vec![None]);
+            ensure!(fixture.er.local_images(&[cold]).await? == vec![None]);
             let selector = Selector::methods(&["getAccountInfo", "getMultipleAccounts"])
                 .http()
                 .request()
@@ -634,7 +632,7 @@ impl Scenario for TransactionAdmission {
             fixture
                 .repaired(VersionedMessage::Legacy(message), 3, 1, skip_preflight)
                 .await?;
-            let local = fixture.er.local_accounts(OWNERS, &[cold]).await?;
+            let local = fixture.er.local_images(&[cold]).await?;
             ensure!(
                 local[0]
                     .as_ref()
@@ -670,7 +668,7 @@ impl Scenario for TransactionAdmission {
             for skip_preflight in [false, true] {
                 let cold = fixture.base.seeded_payer(&mut rng, 1_000_000).await?.pubkey();
                 let source = fixture.base.account(&cold).await?;
-                ensure!(fixture.er.local_accounts(OWNERS, &[cold]).await? == vec![None]);
+                ensure!(fixture.er.local_images(&[cold]).await? == vec![None]);
                 let mut message = fixture
                     .message(
                         3_000 + index as u64 * 2 + u64::from(skip_preflight),
@@ -704,7 +702,7 @@ impl Scenario for TransactionAdmission {
                     tokio::join!(tx.send_config(&fixture.er, skip_preflight), async {
                         let held = trap.wait(TIMEOUT).await?;
                         let held_started = Instant::now();
-                        ensure!(fixture.er.local_accounts(OWNERS, &[cold]).await? == vec![None]);
+                        ensure!(fixture.er.local_images(&[cold]).await? == vec![None]);
                         fixture.unchanged(&before).await?;
                         held.release();
                         Result::Ok(held_started.elapsed())
@@ -723,7 +721,7 @@ impl Scenario for TransactionAdmission {
                     );
                 }
                 fixture.unchanged(&before).await?;
-                let local = fixture.er.local_accounts(OWNERS, &[cold]).await?;
+                let local = fixture.er.local_images(&[cold]).await?;
                 ensure!(
                     local[0]
                         .as_ref()

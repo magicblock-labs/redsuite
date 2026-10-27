@@ -57,7 +57,7 @@ pub fn catalog() -> Vec<ScenarioEntry> {
         scenario!(
             chainlink::settlement_authorization::SettlementAuthorization,
             exclusive(
-                &DEFAULT,
+                &PREPARATION,
                 &[Fixture::RedhatProgram, Fixture::RedshiftProgram],
                 ()
             )
