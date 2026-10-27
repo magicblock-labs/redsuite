@@ -2898,6 +2898,7 @@ dependencies = [
  "magicblock-magic-program-api",
  "rand 0.8.6",
  "redhat-interface",
+ "redshift",
  "redshift-interface",
  "redsuite-core",
  "serde_json",

@@ -25,6 +25,7 @@ signature = { workspace = true }
 rand = { workspace = true }
 sdk-ids = { workspace = true }
 redsuite-core = { workspace = true }
+redshift = { workspace = true }
 magicblock-config = { workspace = true }
 redshift-interface = { workspace = true }
 redhat-interface = { workspace = true }

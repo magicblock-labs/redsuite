@@ -67,7 +67,11 @@ pub fn catalog() -> Vec<ScenarioEntry> {
         ),
         scenario!(
             replication::replication_recovery::ReplicationRecovery,
-            exclusive(&RETENTION, &[Fixture::RedlineProgram], ())
+            exclusive(
+                &RETENTION,
+                &[Fixture::RedlineProgram],
+                replication::replication_recovery::Coverage::Recovery
+            )
         ),
         scenario!(
             storage::checkpoint_recovery::CheckpointRecovery,
