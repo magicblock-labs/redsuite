@@ -33,3 +33,5 @@ pubkey = { workspace = true }
 keypair = { workspace = true }
 signer = { workspace = true }
 solana-instruction-error = { workspace = true }
+
+redshift = { workspace = true }
