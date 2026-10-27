@@ -55,7 +55,7 @@ serde_with = { version = "3", default-features = false, features = ["macros"] }
 thiserror = "2"
 derive_more = { version = "2", default-features = false, features = ["display"] }
 toml = "0.8"
-magicblock-config = { git = "https://github.com/magicblock-labs/magicblock-validator.git", rev = "fb23ace883d65b5c1c99a9e5b651248b2b35ac06" }
+magicblock-config = { git = "https://github.com/magicblock-labs/magicblock-validator.git", rev = "10a3ef3c2610f16e6bfbda48beebf37a4329344e" }
 json = { package = "sonic-rs", version = "0.5" }
 rand = "0.8"
 base64 = "0.22"
@@ -79,7 +79,7 @@ signer = { package = "solana-signer", version = "3" }
 sdk-ids = { package = "solana-sdk-ids", version = "3" }
 solana-program-error = "3"
 dlp-api = { package = "magicblock-delegation-program-api", version = "3.1.0", default-features = false }
-magic-api = { package = "magicblock-magic-program-api", git = "https://github.com/magicblock-labs/magicblock-validator.git", rev = "fb23ace883d65b5c1c99a9e5b651248b2b35ac06", default-features = false }
+magic-api = { package = "magicblock-magic-program-api", git = "https://github.com/magicblock-labs/magicblock-validator.git", rev = "10a3ef3c2610f16e6bfbda48beebf37a4329344e", default-features = false }
 solana-rpc-client-types = { version = "4.2.2", features = ["agave-unstable-api"] }
 solana-account-decoder-client-types = { version = "4.2.2", features = ["agave-unstable-api"] }
 solana-transaction-status-client-types = { version = "4.2.2", features = ["agave-unstable-api"] }

@@ -28,7 +28,7 @@ redsuite-core = { workspace = true }
 magicblock-config = { workspace = true }
 dlp-api = { workspace = true }
 borsh = "1.6"
-committor-interface = { package = "magicblock-committor-interface", git = "https://github.com/magicblock-labs/magicblock-validator.git", rev = "fb23ace883d65b5c1c99a9e5b651248b2b35ac06" }
+committor-interface = { package = "magicblock-committor-interface", git = "https://github.com/magicblock-labs/magicblock-validator.git", rev = "10a3ef3c2610f16e6bfbda48beebf37a4329344e" }
 redshift-interface = { workspace = true }
 redhat-interface = { workspace = true }
 instruction = { workspace = true }
