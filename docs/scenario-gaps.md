@@ -21,6 +21,3 @@ contract clarification or a later scenario-design pass.
 New race/edge-case scenarios and the broader Redline redesign follow assertion
 pruning and consolidation. Performance observations alone are not a no-regression
 verdict, and a progress timeout is not a diagnosis of deadlock.
-
-[Security case ownership](security-dispositions.md) assigns the #235 candidates
-to one scenario, existing proof, owning crate or concrete prerequisite.
