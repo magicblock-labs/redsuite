@@ -10,11 +10,12 @@ contract clarification or a later scenario-design pass.
 | Replay after restart | A blockhash checked before restart is not proven still valid afterward. |
 | Activation contention | Joining contenders does not establish that each entered the intended race. |
 | Crash recovery | A missing indexed transaction is not proof its effect was unapplied; a wholly dropped confirmed lane can evade the existing suffix oracle. |
-| Replication | Final causal verification uses the leader; absent mismatch metrics and log fallbacks are not direct follower-state comparison. |
+| Replication | Final causal verification uses the leader; seal progress is not direct follower-state comparison. Ordinary replay does not cover forged streams, storage corruption, duplicate-work identity or materialization leases. |
 | Resize/read overlap | Background readers and final lengths do not establish that reads overlapped relocation or snapshot boundaries. |
 | Scheduler cancellation | Canceling a fast task does not establish it executed first or that cancellation stopped an executing task. |
 | Signature unsubscribe | The RPC lifecycle performs the requests but does not prove notification suppression after signature unsubscribe. |
 | Commit-size probes | The removed Redline probes allowed alternative rejection paths or global-counter fallbacks; they are not definitive ALT/size-limit regression proofs. |
+| Account-query bound | Main requires refusal of oversized account queries; acceptance remains validator#1845 and cannot be classified as supported leniency. |
 | External timing | Live base-chain fetch and settlement latency are excluded from active Redline measurements; controlled replacements remain deferred. |
 
 New race/edge-case scenarios and the broader Redline redesign follow assertion
