@@ -25,6 +25,7 @@ signature = { workspace = true }
 rand = { workspace = true }
 sdk-ids = { workspace = true }
 redsuite-core = { workspace = true }
+redshift = { workspace = true }
 magicblock-config = { workspace = true }
 dlp-api = { workspace = true }
 borsh = "1.6"
@@ -36,5 +37,3 @@ pubkey = { workspace = true }
 keypair = { workspace = true }
 signer = { workspace = true }
 solana-instruction-error = { workspace = true }
-
-redshift = { workspace = true }
