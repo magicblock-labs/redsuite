@@ -1,11 +1,8 @@
-use std::time::{Duration, Instant};
-
 use account::Account;
 use anyhow::{ensure, Context};
 use redsuite_core::{dlp, expect_error, system, ChainCtx, Result};
 use sdk::spl::{builders::WithdrawThroughDelegatedShuttleWithMergeBuilder, find_rent_pda};
 use signer::Signer;
-use tokio::time;
 use tracing::instrument;
 
 use super::{amount, spl, ProjectedTokenLifecycle, Wallet, SUPPLY};
@@ -35,7 +32,7 @@ impl Case {
         match self {
             Self::Drain => "receive/drain/close",
             Self::Readonly => "readonly overlay",
-            Self::Projection => "projection after explicit close",
+            Self::Projection => "automatic projection over empty overlay",
             Self::FullShuttle => "full shuttle withdrawal",
             Self::TransparentShuttle => "transparent shuttle withdrawal",
         }
@@ -59,7 +56,8 @@ impl MagicAtas<'_> {
             extra_claims: 0,
             supply: SUPPLY,
         };
-        let destinations: [Wallet; 5] = std::array::from_fn(|_| Wallet::new(&tokens.mint.pubkey()));
+        let destinations: [_; Case::ALL.len()] =
+            std::array::from_fn(|_| Wallet::new(&tokens.mint.pubkey()));
         suite.prepare().await?;
         for (case, destination) in Case::ALL.into_iter().zip(&destinations) {
             suite.run_case(destination, case).await?;
@@ -92,20 +90,16 @@ impl MagicAtas<'_> {
         };
         self.receive(destination, readonly.as_ref().map(|_| DEPOSIT)).await?;
         match case {
-            Case::FullShuttle | Case::TransparentShuttle => {
-                self.withdraw(destination, case).await?
-            }
-            _ => {
+            Case::Drain | Case::Readonly => {
                 self.drain(destination).await?;
-                if case == Case::Projection {
-                    self.project(destination).await?;
-                }
-                self.close(destination).await?;
-                if case == Case::Projection {
-                    self.await_projection(destination).await?;
-                } else {
-                    self.await_restored(destination, readonly).await?;
-                }
+                self.close(destination, readonly.as_ref()).await?;
+            }
+            Case::Projection => {
+                self.drain(destination).await?;
+                self.project(destination).await?;
+            }
+            Case::FullShuttle | Case::TransparentShuttle => {
+                self.withdraw(destination, case == Case::TransparentShuttle).await?;
             }
         }
         self.check_conservation().await
@@ -210,63 +204,11 @@ impl MagicAtas<'_> {
             .await?;
         self.supply += DEPOSIT;
         self.extra_claims += DEPOSIT;
-        let until = Instant::now() + Duration::from_secs(5);
-        loop {
-            let account =
-                er.account(&destination.ata).await?.context("empty overlay disappeared")?;
-            ensure!(spl::is_magic_ata(&account.data));
-            ensure!(amount(er, &destination.ata).await? == 0);
-            if Instant::now() >= until {
-                break;
-            }
-            time::sleep(Duration::from_millis(250)).await;
-        }
-        Ok(())
-    }
-
-    async fn close(&self, destination: &Wallet) -> Result<()> {
-        let tokens = self.tokens;
-        let er = &tokens.er;
-        let events = er.api().events().await?;
-        let mut account = events.account(&destination.ata).await?;
-        er.submit_and_confirm_with(&tokens.payer, &[&destination.owner], &[destination.close()])
-            .await?;
-        account
-            .until(|update| {
-                update.value.owner == system::system_id().to_string()
-                    && update.value.data.decode().is_some_and(|data| data.is_empty())
-            })
-            .await?;
-        Ok(())
-    }
-
-    async fn await_restored(&self, destination: &Wallet, original: Option<Account>) -> Result<()> {
-        let er = &self.tokens.er;
-        er.api()
-            .await_accounts(
-                &[destination.ata],
-                "close restores the base ATA or permits eATA projection",
-                |accounts| {
-                    ensure!(
-                        accounts[0].as_ref() == original.as_ref(),
-                        "expected restored ATA {original:?}, observed {:?}",
-                        accounts[0]
-                    );
-                    Ok(())
-                },
-            )
-            .await?;
-        Ok(())
-    }
-
-    async fn await_projection(&self, destination: &Wallet) -> Result<()> {
-        let tokens = self.tokens;
-        let er = &tokens.er;
         let base_ata = tokens.base.account(&destination.ata).await?.context("base ATA missing")?;
         er.api()
             .await_accounts(
                 &[destination.ata],
-                "close restores the base ATA or permits eATA projection",
+                "delegation replaces the empty Magic ATA without closing it",
                 |accounts| {
                     let account = accounts[0].as_ref().context("projection missing")?;
                     ensure!(!spl::is_magic_ata(&account.data));
@@ -281,7 +223,39 @@ impl MagicAtas<'_> {
         Ok(())
     }
 
-    async fn withdraw(&mut self, destination: &Wallet, case: Case) -> Result<()> {
+    async fn close(&self, destination: &Wallet, original: Option<&Account>) -> Result<()> {
+        let tokens = self.tokens;
+        let er = &tokens.er;
+        let events = er.api().events().await?;
+        let mut account = events.account(&destination.ata).await?;
+        er.submit_and_confirm_with(&tokens.payer, &[&destination.owner], &[destination.close()])
+            .await?;
+        account
+            .until(|update| {
+                update.value.owner == system::system_id().to_string()
+                    && update.value.data.decode().is_some_and(|data| data.is_empty())
+            })
+            .await?;
+        drop(account);
+        drop(events);
+        er.api()
+            .await_accounts(
+                &[destination.ata],
+                "close restores the base ATA",
+                |accounts| {
+                    ensure!(
+                        accounts[0].as_ref() == original,
+                        "expected restored ATA {original:?}, observed {:?}",
+                        accounts[0]
+                    );
+                    Ok(())
+                },
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn withdraw(&mut self, destination: &Wallet, transparent: bool) -> Result<()> {
         let tokens = self.tokens;
         let er = &tokens.er;
         let shuttle = WithdrawThroughDelegatedShuttleWithMergeBuilder {
@@ -289,7 +263,7 @@ impl MagicAtas<'_> {
             owner: destination.owner.pubkey(),
             owner_ata: destination.ata,
             mint: tokens.mint.pubkey(),
-            shuttle_id: if case == Case::FullShuttle { 3 } else { 4 },
+            shuttle_id: if transparent { 4 } else { 3 },
             amount: RECEIVE,
             validator: Some(er.identity()),
         }
@@ -297,7 +271,7 @@ impl MagicAtas<'_> {
         let shuttle_accounts: Vec<_> =
             shuttle.accounts[2..5].iter().map(|meta| meta.pubkey).collect();
         let mut instructions = vec![destination.create(tokens.payer.pubkey())];
-        if case == Case::TransparentShuttle {
+        if transparent {
             instructions.extend([
                 destination.initialize(tokens.payer.pubkey()),
                 destination.delegate(tokens.payer.pubkey(), er.identity()),
@@ -322,7 +296,7 @@ impl MagicAtas<'_> {
                 Ok(())
             })
             .await?;
-        if case == Case::TransparentShuttle {
+        if transparent {
             ensure!(
                 tokens.base.account(&destination.eata).await?.map(|a| a.owner)
                     == Some(dlp::dlp_id())
