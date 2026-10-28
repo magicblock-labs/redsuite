@@ -3,6 +3,7 @@
 use anyhow::Context;
 pub use dlp_api::{
     args::{CommitStateArgs, DelegateArgs},
+    consts::COMMIT_FEE_LAMPORTS,
     pda::{
         delegate_buffer_pda_from_delegated_account_and_owner_program as delegate_buffer_pda,
         delegation_metadata_pda_from_delegated_account as delegation_metadata_pda,

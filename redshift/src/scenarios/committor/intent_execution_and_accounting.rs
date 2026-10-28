@@ -7,7 +7,8 @@ use magic_api::args::{CommitTypeArgs, MagicIntentBundleArgs};
 use pubkey::Pubkey;
 use redsuite_core::{
     api::{custom_error_code, transaction_meta},
-    dlp, prep,
+    dlp::{self, COMMIT_FEE_LAMPORTS},
+    prep,
     programs::{
         Action, CellHeader, CellId, Commit, IntentBundle, Refund, ResultCallback, SettlementMode,
         MAGIC, REDSHIFT,
@@ -21,7 +22,6 @@ use tracing::instrument;
 use crate::PAYER_LAMPORTS;
 
 const PAID_COMMIT_LIMIT: u64 = 25;
-const COMMIT_FEE_LAMPORTS: u64 = 1_000_000;
 const ACTION_FEE: u64 = 5_000;
 const CALLBACK_FEE: u64 = 5_000;
 const TRANSFER_LAMPORTS: u64 = 1_000_000;

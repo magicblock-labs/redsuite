@@ -78,7 +78,7 @@ account = { package = "solana-account", version = "4.3" }
 signer = { package = "solana-signer", version = "3" }
 sdk-ids = { package = "solana-sdk-ids", version = "3" }
 solana-program-error = "3"
-dlp-api = { package = "magicblock-delegation-program-api", version = "3.1.0", default-features = false }
+dlp-api = { package = "magicblock-delegation-program-api", version = "4.0.0", default-features = false }
 magic-api = { package = "magicblock-magic-program-api", git = "https://github.com/magicblock-labs/magicblock-validator.git", rev = "10a3ef3c2610f16e6bfbda48beebf37a4329344e", default-features = false }
 solana-rpc-client-types = { version = "4.2.2", features = ["agave-unstable-api"] }
 solana-account-decoder-client-types = { version = "4.2.2", features = ["agave-unstable-api"] }
