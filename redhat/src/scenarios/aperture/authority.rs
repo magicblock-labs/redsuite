@@ -137,7 +137,7 @@ impl Scenario for TransactionAuthority {
                     privileged == privileged_before,
                     "privileged state changed: {privileged:?} against {privileged_before:?}"
                 );
-                tracing::info!(
+                tracing::debug!(
                     skip_preflight,
                     impersonate,
                     "private wire authority rejected before execution"
@@ -258,7 +258,7 @@ impl Scenario for TransactionAuthority {
                     privileged == privileged_before,
                     "privileged state changed: {privileged:?} against {privileged_before:?}"
                 );
-                tracing::info!(
+                tracing::debug!(
                     label,
                     skip_preflight,
                     "privileged instruction rejected during execution"
@@ -344,7 +344,7 @@ impl Scenario for TransactionAuthority {
                 .await?;
             if record.is_none() {
                 fixture.statusless(&tx, start, Some(&control)).await?;
-                tracing::info!(
+                tracing::debug!(
                     skip_preflight,
                     acknowledged,
                     signal_gap = 261,

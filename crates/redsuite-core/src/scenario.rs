@@ -256,7 +256,7 @@ where
 }
 
 // Error-level spans retain context without emitting standalone events.
-#[instrument(name = "run", skip_all, level = "error", fields(scenario = %name, attack_seed, stage))]
+#[instrument(name = "run", skip_all, level = "error", fields(scenario = %name, seed, stage))]
 async fn execute<V, State, Body>(
     name: String,
     fixtures: &[Fixture],
@@ -269,7 +269,7 @@ where
     Body: AsyncFnOnce(Rc<BaseCtx>, State, &mut &'static str) -> Result<V>,
 {
     if !V::REPORTS {
-        Span::current().record("attack_seed", config.seed);
+        Span::current().record("seed", config.seed);
     }
     let run = async {
         let mut record = RunRecord::new(name);

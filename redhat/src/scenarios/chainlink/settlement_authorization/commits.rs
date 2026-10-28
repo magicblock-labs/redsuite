@@ -33,33 +33,33 @@ pub(super) struct Plan {
     buffers: buffers::Plan,
 }
 
-pub(super) fn plan(attack_seed: u64) -> Result<Plan> {
-    let mut rng = random::rng(attack_seed, &["redhat", "commit_order"], 0);
+pub(super) fn plan(seed: u64) -> Result<Plan> {
+    let mut rng = random::rng(seed, &["redhat", "commit_order"], 0);
     let markers = (0..16).map(|_| rng.gen_range(1..u64::MAX)).collect();
     let mut cases = [0u8, 1, 2, 3, 4, 5];
     cases.shuffle(&mut rng);
-    let mut fixtures = random::rng(attack_seed, &["redhat", "commit_order", "fixtures"], 0);
+    let mut fixtures = random::rng(seed, &["redhat", "commit_order", "fixtures"], 0);
     Ok(Plan {
         markers,
         cases,
         authority: topology::identity_for_label("redhat-commit-order-authority")?,
         foreign: topology::identity_for_label("redhat-commit-order-foreign")?,
         fixtures: std::array::from_fn(|_| random::keypair(&mut fixtures).pubkey()),
-        buffers: buffers::plan(attack_seed)?,
+        buffers: buffers::plan(seed)?,
     })
 }
 
 impl Plan {
-    pub(super) fn log(&self, attack_seed: u64) {
+    pub(super) fn log(&self, seed: u64) {
         let accounts = self.fixtures[1..]
             .iter()
             .map(|owner| REDSHIFT.primary(*owner))
             .collect::<Vec<_>>();
-        tracing::info!(attack_seed, cases = ?self.cases, markers = ?self.markers, fixtures = ?self.fixtures, ?accounts, "commit ordering plan");
-        tracing::info!(authority = %self.authority.pubkey(), foreign = %self.foreign.pubkey(),
+        tracing::debug!(seed, cases = ?self.cases, markers = ?self.markers, fixtures = ?self.fixtures, ?accounts, "commit ordering plan");
+        tracing::debug!(authority = %self.authority.pubkey(), foreign = %self.foreign.pubkey(),
             authority_vault = %dlp::validator_fees_vault_pda(&self.authority.pubkey()),
             foreign_vault = %dlp::validator_fees_vault_pda(&self.foreign.pubkey()), "commit authority fixtures");
-        self.buffers.log(attack_seed);
+        self.buffers.log(seed);
     }
 }
 
@@ -133,7 +133,7 @@ impl SettlementAuthorization {
                     _ => InstructionError::Custom(DlpError::NonceOutOfOrder as u32),
                 };
                 let signers = if *case == 5 { vec![] } else { vec![signer] };
-                tracing::info!(case, buffered, attempted, nonce, "commit refusal");
+                tracing::debug!(case, buffered, attempted, nonce, "commit refusal");
                 fixture.rejected(&[instruction], &signers, expected).await?;
                 if buffered {
                     fixture.close(attempted).await?;
