@@ -2,8 +2,8 @@
 
 use instruction::{AccountMeta, Instruction};
 use magic_api::{
-    args::{MagicIntentBundleArgs, ScheduleTaskArgs},
-    instruction::MagicBlockInstruction,
+    args::{AddActionCallbackArgs, MagicIntentBundleArgs, ScheduleTaskArgs},
+    instruction::{CallbackInstruction, MagicBlockInstruction},
 };
 use pubkey::Pubkey;
 pub use sdk::consts::{MAGIC_CONTEXT_ID, MAGIC_PROGRAM_ID};
@@ -69,6 +69,37 @@ impl Magic {
             MagicBlockInstruction::CancelTask { task_id },
             vec![AccountMeta::new(payer, true)],
         )
+    }
+
+    pub fn add_callback(
+        self,
+        payer: Pubkey,
+        vault: Pubkey,
+        args: AddActionCallbackArgs,
+    ) -> Instruction {
+        self.encode(
+            MagicBlockInstruction::AddActionCallback(args),
+            vec![
+                AccountMeta::new(payer, true),
+                AccountMeta::new(MAGIC_CONTEXT_ID, false),
+                AccountMeta::new(vault, false),
+            ],
+        )
+    }
+
+    pub fn execute_callback(self, authority: AccountMeta, instruction: Instruction) -> Instruction {
+        let mut accounts = vec![
+            authority,
+            AccountMeta::new_readonly(magic_api::pda::CALLBACK_SIGNER, false),
+            AccountMeta::new_readonly(instruction.program_id, false),
+        ];
+        accounts.extend(instruction.accounts.iter().cloned());
+        Instruction {
+            program_id: magic_api::CALLBACK_PROGRAM_ID,
+            accounts,
+            data: bincode::serialize(&CallbackInstruction::ExecuteCallback { instruction })
+                .expect("callback instruction serialization"),
+        }
     }
 
     pub fn intents(

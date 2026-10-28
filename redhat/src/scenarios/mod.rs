@@ -5,8 +5,8 @@ use aperture::{ProtocolInputs, TransactionAdmission, TransactionAuthority, Trans
 use magicblock_config::types::Remote;
 use redshift::scenarios::replication::replication_recovery::{Coverage, ReplicationRecovery};
 use redsuite_core::{
-    catalog::{ErGroup, Fixture, ProxyMode, ScenarioEntry, DEFAULT},
-    scenario, Scenario,
+    catalog::{BasePreparation, ErGroup, Fixture, ProxyMode, ScenarioEntry, DEFAULT},
+    scenario, topology, Scenario,
 };
 use std::time::Duration;
 
@@ -14,6 +14,16 @@ static PREPARATION: ErGroup = ErGroup {
     label: "hostile-preparation",
     settings: |p| p.remotes.retain(|remote| !matches!(remote, Remote::Grpc(_))),
     proxies: ProxyMode::Shared,
+    followers: 0,
+};
+
+static EPHEMERAL: ErGroup = ErGroup {
+    label: "ephemeral-security",
+    settings: |p| {
+        p.engine.accountsdb.lru_capacity =
+            redshift::scenarios::chainlink::cache_lifecycle::CACHE_CAPACITY
+    },
+    proxies: ProxyMode::None,
     followers: 0,
 };
 
@@ -26,6 +36,17 @@ static REPLICATION: ErGroup = ErGroup {
     },
     proxies: ProxyMode::None,
     followers: 2,
+};
+
+static IDENTITIES: BasePreparation = BasePreparation {
+    run: |_| {
+        Box::pin(async {
+            for group in [&DEFAULT, &PREPARATION, &EPHEMERAL, &REPLICATION] {
+                topology::identity_for_label(group.label)?;
+            }
+            Ok(())
+        })
+    },
 };
 
 pub fn catalog() -> Vec<ScenarioEntry> {
@@ -58,7 +79,7 @@ pub fn catalog() -> Vec<ScenarioEntry> {
         scenario!(
             chainlink::settlement_authorization::SettlementAuthorization,
             exclusive(
-                &DEFAULT,
+                &PREPARATION,
                 &[Fixture::RedhatProgram, Fixture::RedshiftProgram],
                 ()
             )
@@ -66,8 +87,11 @@ pub fn catalog() -> Vec<ScenarioEntry> {
         .named("settlement_authorization"),
         scenario!(
             magicblock::ephemeral_account_security::EphemeralAccountSecurity,
-            exclusive(&DEFAULT, &[Fixture::RedshiftProgram], ())
+            exclusive(&EPHEMERAL, &[Fixture::RedshiftProgram], ())
         )
         .named("ephemeral_account_security"),
     ]
+    .into_iter()
+    .map(|entry| entry.prepare_with(&IDENTITIES))
+    .collect()
 }

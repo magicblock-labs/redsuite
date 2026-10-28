@@ -5,8 +5,11 @@ use super::{
 use base64::{engine::general_purpose::STANDARD, Engine};
 use message::VersionedMessage;
 use redsuite_core::{
+    dlp,
+    programs::{Action, CellId, Commit, IntentBundle, ResultCallback, SettlementMode, Task, MAGIC},
     random::{self, Rng},
     rpc_types::config::RpcSimulateTransactionConfig,
+    topology,
     transport::wsraw::RawWs,
     wait,
 };
@@ -263,10 +266,175 @@ impl ProtocolInputs {
     }
 
     async fn simulation_cases(&self, fixture: &mut Fixture, rng: &mut impl Rng) -> Result<()> {
-        let before = fixture.images(&[]).await?;
         for sig_verify in [false, true] {
-            let nonce = rng.gen_range(1..u64::MAX);
-            let message = fixture.message(nonce, 1, &[]).await?;
+            for skip_preflight in [false, true] {
+                let mut before = fixture.images(&[]).await?;
+                let nonce = rng.gen_range(1..u64::MAX);
+                let message = fixture.message(nonce, 1, &fixture.keys[3..4]).await?;
+                let tx = Signed::from_versioned(
+                    &self.er,
+                    &fixture.payer,
+                    VersionedMessage::Legacy(message.clone()),
+                    None,
+                )
+                .await?;
+                let config = RpcSimulateTransactionConfig {
+                    sig_verify,
+                    replace_recent_blockhash: !sig_verify,
+                    encoding: Some(UiTransactionEncoding::Base64),
+                    ..RpcSimulateTransactionConfig::default()
+                };
+                let start = self.er.api().get_slot().await?;
+                let simulated: Value = self
+                    .er
+                    .api()
+                    .call_value(
+                        RpcRequest::SimulateTransaction,
+                        &(&tx.encoded, config.clone()),
+                    )
+                    .await?;
+                ensure!(simulated["err"].is_null(), "{simulated}");
+                ensure!(simulated["unitsConsumed"].as_u64().is_some_and(|units| units > 0));
+                fixture.statusless(&tx, start, None).await?;
+                let cold = self.er.local_images(&fixture.keys[3..4]).await?.pop().flatten();
+                ensure!(cold.is_none() || cold == fixture.base_images[3]);
+                before.local[3] = cold;
+                fixture.unchanged(&before).await?;
+                let mut forged: transaction::versioned::VersionedTransaction =
+                    wincode::deserialize_exact(&STANDARD.decode(&tx.encoded)?)?;
+                forged.signatures[0] = Signature::default();
+                let encoded = STANDARD.encode(wincode::serialize(&forged)?);
+                let result: result::Result<
+                    redsuite_core::rpc_types::response::Response<Value>,
+                    RpcError,
+                > = self
+                    .er
+                    .api()
+                    .try_call(RpcRequest::SimulateTransaction, &(&encoded, config))
+                    .await?;
+                if sig_verify {
+                    let error =
+                        result.expect_err("forged signature simulated with verification enabled");
+                    ensure!(
+                        error.error.message.to_lowercase().contains("signature"),
+                        "{error}"
+                    );
+                } else {
+                    ensure!(result?.value["err"].is_null());
+                }
+                let result: result::Result<String, RpcError> = self
+                    .er
+                    .api()
+                    .try_call(
+                        RpcRequest::SendTransaction,
+                        &(
+                            &encoded,
+                            RpcSendTransactionConfig {
+                                skip_preflight,
+                                encoding: Some(UiTransactionEncoding::Base64),
+                                max_retries: Some(0),
+                                ..Default::default()
+                            },
+                        ),
+                    )
+                    .await?;
+                let error = result.expect_err("forged signature submitted");
+                ensure!(
+                    error.error.message.to_lowercase().contains("signature"),
+                    "{error}"
+                );
+                fixture.unchanged(&before).await?;
+                let signature = fixture
+                    .repaired(VersionedMessage::Legacy(message), 1, 1, skip_preflight)
+                    .await?;
+                ensure!(signature == tx.signature);
+                info!(sig_verify, "simulation leaves no admission");
+            }
+        }
+        self.service_simulations(fixture).await
+    }
+
+    async fn service_simulations(&self, fixture: &mut Fixture) -> Result<()> {
+        let payer = fixture.payer.pubkey();
+        let cell = fixture.keys[1];
+        let vault = dlp::magic_fee_vault_pda(&self.er.identity());
+        self.er.account(&vault).await?.context("simulation fee vault missing")?;
+        let protected = [magic_api::MAGIC_CONTEXT_PUBKEY, magic_api::EPHEMERAL_VAULT_PUBKEY, vault];
+        self.er.accounts(&protected).await?;
+        let id = CellId::new(payer, 777);
+        let target = REDSHIFT.pda(id).0;
+        let create = Instruction {
+            program_id: magic_api::id(),
+            accounts: vec![
+                AccountMeta::new(payer, true),
+                AccountMeta::new(target, true),
+                AccountMeta::new(magic_api::EPHEMERAL_VAULT_PUBKEY, false),
+            ],
+            data: magic_api::instruction::MagicBlockInstruction::CreateEphemeralAccount {
+                data_len: 32,
+            }
+            .try_to_vec()?,
+        };
+        let mut commit = Commit::new(SettlementMode::Commit, &[cell]);
+        commit.after_commit.push(
+            Action::new(
+                payer,
+                REDSHIFT
+                    .batch()
+                    .transfer_from_escrow(fixture.keys[2], 1)
+                    .action(cell, dlp::dlp_id()),
+                100_000,
+            )
+            .then(ResultCallback {
+                cell,
+                refund: None,
+                compute_units: 20_000,
+            }),
+        );
+        let mut bundle = IntentBundle::new(payer);
+        bundle.validator = Some(self.er.identity());
+        bundle.commits.push(commit);
+        let settle = |mode| {
+            let mut bundle = IntentBundle::new(payer);
+            bundle.validator = Some(self.er.identity());
+            bundle.commits.push(Commit::new(mode, &[cell]));
+            REDSHIFT.batch().intents(bundle).build()
+        };
+        let services = [
+            ("commit", settle(SettlementMode::Commit)),
+            ("undelegate", settle(SettlementMode::Undelegate)),
+            ("callback", REDSHIFT.batch().intents(bundle).build()),
+            (
+                "ephemeral",
+                REDSHIFT.batch().invoke_signed(create, &[id]).build(),
+            ),
+            (
+                "task",
+                REDSHIFT
+                    .batch()
+                    .invoke(MAGIC.schedule(
+                        payer,
+                        payer,
+                        Task {
+                            id: 254,
+                            interval_ms: 100,
+                            iterations: 1,
+                        },
+                        vec![REDSHIFT.batch().add(&[cell], 1).build()],
+                    ))
+                    .build(),
+            ),
+        ];
+        for (label, instruction) in services {
+            let service = self.er.local_program_accounts(topology::SERVICE_OWNERS).await?;
+            let mut before = fixture.images(&[target]).await?;
+            let local = self.er.local_images(&protected).await?;
+            let base = self.base.accounts(&protected).await?;
+            let message = transaction::Message::new_with_blockhash(
+                &[instruction],
+                Some(&payer),
+                &self.er.api().get_latest_blockhash().await?,
+            );
             let tx = Signed::from_versioned(
                 &self.er,
                 &fixture.payer,
@@ -274,23 +442,65 @@ impl ProtocolInputs {
                 None,
             )
             .await?;
-            let config = RpcSimulateTransactionConfig {
-                sig_verify,
-                replace_recent_blockhash: !sig_verify,
-                encoding: Some(UiTransactionEncoding::Base64),
-                ..RpcSimulateTransactionConfig::default()
-            };
             let start = self.er.api().get_slot().await?;
             let simulated: Value = self
                 .er
                 .api()
-                .call_value(RpcRequest::SimulateTransaction, &(&tx.encoded, config))
+                .call_value(
+                    RpcRequest::SimulateTransaction,
+                    &(
+                        &tx.encoded,
+                        RpcSimulateTransactionConfig {
+                            sig_verify: true,
+                            encoding: Some(UiTransactionEncoding::Base64),
+                            ..Default::default()
+                        },
+                    ),
+                )
                 .await?;
-            ensure!(simulated["err"].is_null(), "{simulated}");
+            ensure!(
+                simulated["err"].is_null()
+                    && simulated["unitsConsumed"].as_u64().is_some_and(|units| units > 0),
+                "{label}: {simulated}"
+            );
+            let hydrated = self.er.local_images(&[target]).await?.pop().flatten();
+            let index = before.keys.iter().position(|key| *key == target).unwrap();
+            if before.local[index].is_none() {
+                ensure!(
+                    hydrated.as_ref().is_none_or(|account| account.lamports == 0
+                        && account.data.is_empty()
+                        && account.owner == sdk_ids::system_program::ID
+                        && !account.executable),
+                    "{label}: simulated creation persisted: {hydrated:?}"
+                );
+                before.local[index] = hydrated;
+            }
             fixture.statusless(&tx, start, None).await?;
-            info!(sig_verify, "simulation leaves no admission");
+            fixture.unchanged(&before).await?;
+            ensure!(
+                self.er.local_images(&protected).await? == local,
+                "{label}: simulation changed protocol state"
+            );
+            ensure!(self.base.accounts(&protected).await? == base);
+            ensure!(
+                self.er.local_program_accounts(topology::SERVICE_OWNERS).await? == service,
+                "{label}: simulation published task or outbox state"
+            );
+            info!(label, "simulated service body leaves live state unchanged");
         }
-        fixture.unchanged(&before).await
+        let signature = self
+            .er
+            .submit_and_confirm(&fixture.payer, &[settle(SettlementMode::Commit)])
+            .await?;
+        self.er
+            .check_commit(&self.base, &signature, &[cell], false)
+            .await?
+            .check_success("settlement after simulation")?;
+        let mut expected = fixture.base_images[1].clone().context("base cell missing")?;
+        expected.data = fixture.expected[1].as_ref().context("local cell missing")?.data.clone();
+        ensure!(self.base.account(&cell).await? == Some(expected.clone()));
+        fixture.base_images[1] = Some(expected);
+        Ok(())
     }
 
     async fn frame_cases(&self, fixture: &Fixture) -> Result<()> {
@@ -445,7 +655,9 @@ impl Scenario for ProtocolInputs {
         self.socket_cases(&mut fixture).await?;
         self.confirmed_write(&mut fixture, &mut control, subscription, 7_004).await?;
 
-        self.query_cases(&fixture, &mut rng).await?;
+        self.query_cases(&fixture, &mut rng)
+            .await
+            .context("validator#1845: account-query bound")?;
         control.close().await?;
         Ok(())
     }

@@ -7,11 +7,54 @@ use pubkey::Pubkey;
 use redsuite_core::{
     netfault::BaseProxies, programs::CellHeader, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
-use std::rc::Rc;
+use std::{rc::Rc, time::Duration};
 
 pub const CACHE_CAPACITY: usize = 256;
 const FETCH_BATCH: usize = 32;
 const EVICTIONS: &str = "engine_keeper_account_cache_evictions";
+
+pub async fn pressure_preserves(
+    base: &BaseCtx,
+    er: &ErCtx,
+    mirror: Pubkey,
+    pool: &[Pubkey],
+    protected: &[Pubkey],
+) -> Result<()> {
+    ensure!(pool.len() == CACHE_CAPACITY * 2 && !pool.contains(&mirror));
+    ensure!(protected.iter().all(|key| !pool.contains(key) && *key != mirror));
+    let before = er.local_images(protected).await?;
+    ensure!(
+        before.iter().all(Option::is_some),
+        "protected cache image missing"
+    );
+    let base_before = base.accounts(protected).await?;
+    let expected = er.account(&mirror).await?.context("cache mirror missing")?;
+    ensure!(expected.owner == redsuite_core::system::system_id() && expected.lamports > 0);
+    ensure!(base.account(&mirror).await? == Some(expected.clone()));
+    ensure!(er.local_images(&[mirror]).await? == vec![Some(expected.clone())]);
+    let evictions = cache_evictions(er).await?;
+    churn_cache(er, pool, evictions).await?;
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        er.api().await_query(
+            "resident mirror evicted under bounded cache pressure",
+            async || {
+                ensure!(er.local_images(&[mirror]).await? == vec![None]);
+                Ok(())
+            },
+        ),
+    )
+    .await
+    .context("cache mirror eviction not witnessed within 20s")??;
+    ensure!(er.local_images(protected).await? == before);
+    ensure!(base.accounts(protected).await? == base_before);
+    ensure!(er.account(&mirror).await? == Some(expected.clone()));
+    ensure!(er.local_images(&[mirror]).await? == vec![Some(expected.clone())]);
+    ensure!(base.account(&mirror).await? == Some(expected));
+    ensure!(er.local_images(protected).await? == before);
+    ensure!(base.accounts(protected).await? == base_before);
+    Ok(())
+}
 
 async fn cache_evictions(er: &ErCtx) -> Result<f64> {
     er.scrape_metrics().await?.get(EVICTIONS).context("eviction metric missing")
