@@ -69,8 +69,8 @@ impl Scenario for SettlementAuthorization {
         ));
         let commit_plan = commits::plan(base.config().seed)?;
         let callback_plan = callbacks::plan(base.config().seed);
-        tracing::info!(
-            attack_seed = base.config().seed,
+        tracing::debug!(
+            seed = base.config().seed,
             ?roles,
             ?case_order,
             "settlement permission plan"
@@ -93,7 +93,7 @@ impl Scenario for SettlementAuthorization {
         );
         let mapped_wallets: [Pubkey; 2] =
             std::array::from_fn(|_| random::keypair(&mut mapped).pubkey());
-        tracing::info!(attack_seed = base.config().seed, %funder_key, ?cells, %foreign_key, %mirror_key, ?mapped_wallets, "settlement fixture plan");
+        tracing::debug!(seed = base.config().seed, %funder_key, ?cells, %foreign_key, %mirror_key, ?mapped_wallets, "settlement fixture plan");
         let funder = base.seeded_payer(&mut rng, PAYER_LAMPORTS).await?;
         ensure!(funder.pubkey() == funder_key);
         let mut pdas = Vec::new();

@@ -63,8 +63,8 @@ pub(super) struct Plan {
     handoff: Pubkey,
 }
 
-pub(super) fn plan(attack_seed: u64) -> Plan {
-    let mut rng = random::rng(attack_seed, &["redhat", "callback_provenance", "plan"], 0);
+pub(super) fn plan(seed: u64) -> Plan {
+    let mut rng = random::rng(seed, &["redhat", "callback_provenance", "plan"], 0);
     let nonce = rng.gen_range(1..u64::MAX / 2);
     let mut cases: Vec<_> = (0..11u8).collect();
     cases.shuffle(&mut rng);
@@ -73,7 +73,7 @@ pub(super) fn plan(attack_seed: u64) -> Plan {
     let padding: u8 = rng.gen();
     let fixture = |role| {
         random::keypair(&mut random::rng(
-            attack_seed,
+            seed,
             &["redhat", "callback_provenance", "fixtures", role],
             0,
         ))
@@ -105,8 +105,8 @@ pub(super) fn plan(attack_seed: u64) -> Plan {
 }
 
 impl Plan {
-    pub(super) fn log(&self, attack_seed: u64) {
-        tracing::info!(attack_seed, cases = ?self.cases, nonce = self.nonce, controls = ?self.controls, leads = ?self.leads, gap = self.gap, padding = self.padding, funder = %self.funder.pubkey(), payer = %self.payer.pubkey(), alternate = %self.alternate.pubkey(), cells = ?self.cells, handoff = %self.handoff, "callback plan");
+    pub(super) fn log(&self, seed: u64) {
+        tracing::debug!(seed, cases = ?self.cases, nonce = self.nonce, controls = ?self.controls, leads = ?self.leads, gap = self.gap, padding = self.padding, funder = %self.funder.pubkey(), payer = %self.payer.pubkey(), alternate = %self.alternate.pubkey(), cells = ?self.cells, handoff = %self.handoff, "callback plan");
     }
 }
 
@@ -225,7 +225,7 @@ impl SettlementAuthorization {
     }
 
     pub(super) async fn check_callbacks(&self) -> Result<()> {
-        let attack_seed = self.base.config().seed;
+        let seed = self.base.config().seed;
         let plan = &self.callback_plan;
         let nonce = plan.nonce;
         let (funder, payer, alternate) = (&plan.funder, &plan.payer, &plan.alternate);
@@ -233,7 +233,7 @@ impl SettlementAuthorization {
         let handoff = plan.handoff;
         for role in ["funder", "payer", "alternate"] {
             let mut rng = random::rng(
-                attack_seed,
+                seed,
                 &["redhat", "callback_provenance", "fixtures", role],
                 0,
             );
@@ -396,7 +396,7 @@ impl SettlementAuthorization {
         )
         .await?;
         let accepted = callback_args(cells[0], 0)?.payload.len();
-        tracing::info!(
+        tracing::debug!(
             accepted,
             rejected = accepted + 1,
             padding = plan.padding,
@@ -528,7 +528,7 @@ impl SettlementAuthorization {
                 let mut base_handoff = handoff_before.clone();
                 base_handoff.owner = dlp::dlp_id();
                 ensure!(self.base.account(&handoff).await? == Some(base_handoff));
-                tracing::info!(%handoff, outbox = %pending[0].0, "accepted callback survives destination redelegation");
+                tracing::debug!(%handoff, outbox = %pending[0].0, "accepted callback survives destination redelegation");
                 held.release();
                 Some(held_signature)
             } else {
@@ -767,7 +767,7 @@ impl SettlementAuthorization {
                 .collect();
             if index == 0 {
                 instructions.extend([attach, schedule]);
-                tracing::info!(
+                tracing::debug!(
                     lead,
                     slot = self.er.api().get_slot().await?,
                     "callback attached ahead of its intent"
@@ -791,7 +791,7 @@ impl SettlementAuthorization {
                 )
                 .await?;
                 instructions.push(attach);
-                tracing::info!(
+                tracing::debug!(
                     lead,
                     gap,
                     scheduled_slot,

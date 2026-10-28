@@ -20,7 +20,7 @@ use tokio::{
     net::TcpStream,
     time,
 };
-use tracing::info;
+use tracing::debug;
 use url::Url;
 
 const FLOOD: usize = 64;
@@ -126,7 +126,7 @@ impl ProtocolInputs {
         let url = self.er.api().url().clone();
         let reply = raw_request(&url, body, declared, FRAME_WAIT).await?;
         let accepted = accepted(reply.as_deref());
-        info!(
+        debug!(
             case = label,
             replied = reply.is_some(),
             accepted,
@@ -199,7 +199,7 @@ impl ProtocolInputs {
                 refused_at = Some(size);
             }
         }
-        info!(?refused_at, "body size boundary located");
+        debug!(?refused_at, "body size boundary located");
         ensure!(
             refused_at.is_some(),
             "no body size in the ladder was refused"
@@ -255,7 +255,7 @@ impl ProtocolInputs {
             let result: result::Result<Value, RpcError> =
                 self.er.api().try_call(method, &params).await?;
             let error = result.err().context("hostile request acknowledged")?;
-            info!(
+            debug!(
                 case = label,
                 code = error.error.code.code(),
                 "hostile protocol request"
@@ -348,7 +348,7 @@ impl ProtocolInputs {
                     .repaired(VersionedMessage::Legacy(message), 1, 1, skip_preflight)
                     .await?;
                 ensure!(signature == tx.signature);
-                info!(sig_verify, "simulation leaves no admission");
+                debug!(sig_verify, "simulation leaves no admission");
             }
         }
         self.service_simulations(fixture).await
@@ -486,7 +486,7 @@ impl ProtocolInputs {
                 self.er.local_program_accounts(topology::SERVICE_OWNERS).await? == service,
                 "{label}: simulation published task or outbox state"
             );
-            info!(label, "simulated service body leaves live state unchanged");
+            debug!(label, "simulated service body leaves live state unchanged");
         }
         let signature = self
             .er
@@ -540,7 +540,7 @@ impl ProtocolInputs {
             let bytes = frame.len();
             socket.send_text(frame).await?;
             let survived = socket.responsive(&cell).await;
-            info!(case = label, bytes, survived, "hostile socket frame");
+            debug!(case = label, bytes, survived, "hostile socket frame");
             if must_survive {
                 ensure!(survived, "{label} cost a connection that must stay usable");
             }
@@ -569,7 +569,7 @@ impl ProtocolInputs {
         for id in ids.iter().take(4) {
             match intruder.try_account_unsubscribe(*id).await? {
                 Ok(removed) => ensure!(!removed, "cross-connection unsubscribe accepted for {id}"),
-                Err(error) => info!(
+                Err(error) => debug!(
                     id,
                     code = error.error.code.code(),
                     "cross-connection unsubscribe refused"
@@ -588,7 +588,7 @@ impl ProtocolInputs {
             "victim notification did not carry the fresh write"
         );
         ensure!(victim.malformed_frames() == 0 && intruder.malformed_frames() == 0);
-        info!(
+        debug!(
             subscriptions = ids.len(),
             "flood isolated and victim delivery intact"
         );

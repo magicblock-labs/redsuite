@@ -822,7 +822,7 @@ impl Workload {
             .await?;
         let source = self.er.local_images(&[self.er.identity()]).await?;
         ensure!(source.iter().all(Option::is_some));
-        tracing::info!(
+        tracing::debug!(
             cloned_funding,
             projected_reserve = projected.lamports,
             projected_funding = projected.lamports - cloned_funding,
@@ -883,7 +883,7 @@ impl Workload {
             ensure!(self.base.accounts(&tracked).await? == base);
         }
         let value = rng.gen_range(1..1_000_000);
-        tracing::info!(%cell, %vault, value, "duplicate committee plan");
+        tracing::debug!(%cell, %vault, value, "duplicate committee plan");
         let duplicate = MAGIC.commit(
             self.keys[PAYER],
             Some(vault),
@@ -1148,7 +1148,7 @@ impl Workload {
             .create_delegated(space, Pubkey::default(), 2)
             .await?;
         self.er.accounts(&[attacker, drained]).await?;
-        tracing::info!(%confined, %delegated, %drained, %attacker, amount, "confined rent authority plan");
+        tracing::debug!(%confined, %delegated, %drained, %attacker, amount, "confined rent authority plan");
         let mut probe = self.keys;
         probe[TARGET] = delegated;
         self.run(
@@ -1312,7 +1312,7 @@ impl Workload {
             "{label}: charge {charge} out of reach of balance {balance}"
         );
         let drain = balance - charge;
-        tracing::info!(
+        tracing::debug!(
             label,
             balance,
             deposit,
@@ -1420,8 +1420,8 @@ impl Workload {
         let mut plan = random::rng(seed, &["redhat", "charge_boundaries"], 0);
         let sizes = [plan.gen_range(64..1024), plan.gen_range(1024..4096)];
         let growth = plan.gen_range(1..256);
-        tracing::info!(
-            attack_seed = seed,
+        tracing::debug!(
+            seed,
             ?sizes,
             growth,
             charges = ?sizes.map(rent),
@@ -1519,20 +1519,20 @@ impl Scenario for EphemeralAccountSecurity {
         )
         .fill(&mut secret);
         let victim = Keypair::new_from_array(secret);
-        tracing::info!(attack_seed = seed, ?sizes, target = %target.pubkey(), victim = %victim.pubkey(), "ephemeral lifecycle plan");
+        tracing::debug!(seed, ?sizes, target = %target.pubkey(), victim = %victim.pubkey(), "ephemeral lifecycle plan");
         let (failures, batches) = failure_plan(seed, target.pubkey());
-        tracing::info!(
-            attack_seed = seed,
+        tracing::debug!(
+            seed,
             failures = ?failures.iter().map(|(mode, index)| (matches!(mode, SettlementMode::Undelegate), index)).collect::<Vec<_>>(),
             ?batches,
             "failure placement plan"
         );
         let (mut funding, mint) = funding_plan(seed);
         let owner = random::keypair(&mut funding).pubkey();
-        tracing::info!(attack_seed = seed, accounts = ?funding_accounts(owner, mint.pubkey()), amount = 25, "funding attribution plan");
+        tracing::debug!(seed, accounts = ?funding_accounts(owner, mint.pubkey()), amount = 25, "funding attribution plan");
         let mirror =
             random::keypair(&mut random::rng(seed, &["redhat", "confined_accounts"], 0)).pubkey();
-        tracing::info!(attack_seed = seed, %mirror, pool = ?cache_pool(seed), "confined cache pressure plan");
+        tracing::debug!(seed, %mirror, pool = ?cache_pool(seed), "confined cache pressure plan");
         let mut rng = random::rng(
             seed,
             &["redhat", "ephemeral_account_security", "fixtures"],
@@ -1662,7 +1662,7 @@ impl EphemeralAccountSecurity {
         workload.ledger.floor =
             workload.starting_vault.checked_sub(refundable).context("vault underfunded")?;
         workload.ledger.check(workload.starting_vault)?;
-        tracing::info!(
+        tracing::debug!(
             starting_vault = workload.starting_vault,
             refundable,
             floor = workload.ledger.floor,
