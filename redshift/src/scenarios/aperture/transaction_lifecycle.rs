@@ -11,7 +11,7 @@ use redsuite_core::{
     programs::{CellHeader, REDLINE, REDSHIFT},
     signed::{audit, decode_state, subscribe, Signed},
     topology::RestartConfig,
-    BaseCtx, ChainCtx, ErCtx, Result, Scenario,
+    wait, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
 use serde_json::{json, Value};
 use signature::Signature;
@@ -22,6 +22,9 @@ use transaction::Transaction;
 use crate::PAYER_LAMPORTS;
 
 const TIMEOUT: Duration = Duration::from_secs(30);
+// The 1,200-slot blockhash window already takes 60s at 50ms/slot;
+// allow additional time for delayed block production in CI.
+const BLOCKHASH_EXPIRY_TIMEOUT: Duration = Duration::from_secs(180);
 const COPIES: usize = 32;
 
 pub struct TransactionLifecycle {
@@ -277,14 +280,13 @@ impl Mode {
                     audit(er, start, &appended).await?;
                     ensure!(state(er, &keys).await? == expected);
                     if epoch == 0 {
-                        er.api()
-                            .await_query("blockhashes expire", async || {
-                                for (tx, _) in &probes {
-                                    ensure!(!tx.valid(er).await?);
-                                }
-                                Ok(())
-                            })
-                            .await?;
+                        wait::retry("blockhashes expire", BLOCKHASH_EXPIRY_TIMEOUT, async || {
+                            for (tx, _) in &probes {
+                                ensure!(!tx.valid(er).await?);
+                            }
+                            Ok(())
+                        })
+                        .await?;
                     } else {
                         for (tx, _) in &probes[first..] {
                             ensure!(tx.valid(er).await?);
