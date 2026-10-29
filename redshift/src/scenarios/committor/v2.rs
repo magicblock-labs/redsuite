@@ -5,11 +5,13 @@ use delegation_program_interface::{self as dpi, DelegationState};
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
+    api::transaction_meta,
     programs::{CellHeader, CellId, SettlementMode, REDSHIFT},
     random,
     receipt::CommitReceipt,
     BaseCtx, ChainCtx, ErCtx, Result,
 };
+use signature::Signature;
 use signer::Signer;
 use wheels::layout::Decodable;
 
@@ -137,5 +139,27 @@ impl Fixture {
             )
             .await?;
         Ok(())
+    }
+
+    pub async fn dlp_instructions(&self, signatures: &[Signature]) -> Result<Vec<Vec<u8>>> {
+        let mut instructions = Vec::new();
+        for signature in signatures {
+            let confirmed = self.base.api().await_transaction(signature).await?;
+            if transaction_meta(&confirmed)?.err.is_some() {
+                continue;
+            }
+            let transaction =
+                confirmed.transaction.transaction.decode().context("decode base transaction")?;
+            let keys = transaction.message.static_account_keys();
+            instructions.extend(
+                transaction
+                    .message
+                    .instructions()
+                    .iter()
+                    .filter(|ix| keys.get(ix.program_id_index as usize) == Some(&dpi::id()))
+                    .map(|ix| ix.data.clone()),
+            );
+        }
+        Ok(instructions)
     }
 }
