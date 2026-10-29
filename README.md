@@ -124,6 +124,20 @@ redsuite redshift list
 redsuite redshift run
 ```
 
+The `dlp_v2_lifecycle` scenario needs the DLP revision pinned by this workspace,
+which may not be deployed on mainnet yet. Build that checkout and select its
+program before booting a fresh stack:
+
+```bash
+cargo build-sbf --manifest-path /path/to/delegation-program/program/Cargo.toml
+export REDSUITE_DLP_SO=/path/to/delegation-program/target/deploy/delegation_program.so
+redsuite stack down
+redsuite redshift run dlp_v2_lifecycle
+```
+
+The override only replaces the base-chain DLP program. V2 scenarios still require
+a validator that discovers v2 delegations and settles them through the committor.
+
 The first base-chain boot needs access to an RPC endpoint to clone its programs;
 this defaults to mainnet-beta. Later runs reuse the local base. Stop the stack
 when finished with `redsuite stack down`.

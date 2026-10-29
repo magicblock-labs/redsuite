@@ -1296,6 +1296,7 @@ version = "2.0.0"
 dependencies = [
  "bincode",
  "ephemeral-rollups-sdk",
+ "magicblock-delegation-program-interface",
  "magicblock-magic-program-api 1.0.1",
  "sha2 0.10.9",
  "solana-instruction 3.4.0",
@@ -2225,6 +2226,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "magicblock-delegation-program-interface"
+version = "0.1.0"
+source = "git+https://github.com/magicblock-labs/delegation-program?rev=3fb00596169d5963fbada0bf90e099e731fbacb4#3fb00596169d5963fbada0bf90e099e731fbacb4"
+dependencies = [
+ "bincode",
+ "borsh 1.8.1",
+ "bytemuck",
+ "const-crypto",
+ "num_enum",
+ "pinocchio 0.10.2",
+ "pinocchio-log",
+ "pinocchio-system",
+ "serde",
+ "solana-address 2.6.1",
+ "solana-instruction 3.4.0",
+ "solana-loader-v3-interface 7.0.0",
+ "solana-program 4.0.0",
+ "solana-sdk-ids 3.1.0",
+ "solana-sha256-hasher 3.1.0",
+ "solana-system-interface 3.2.0",
+ "static_assertions",
+ "strum",
+ "thiserror 1.0.69",
+ "wheels",
+]
+
+[[package]]
 name = "magicblock-engine-nucleus"
 version = "0.17.0"
 source = "git+https://github.com/magicblock-labs/magicblock-engine.git?rev=5538432a4bde44bb66e28857badfc2af66a1a396#5538432a4bde44bb66e28857badfc2af66a1a396"
@@ -3032,6 +3060,7 @@ dependencies = [
  "ephemeral-rollups-sdk",
  "futures-util",
  "magicblock-config",
+ "magicblock-delegation-program-interface",
  "magicblock-magic-program-api 1.0.1",
  "rand 0.8.6",
  "redline-interface",
@@ -3060,6 +3089,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "wheels",
 ]
 
 [[package]]
@@ -4570,6 +4600,20 @@ dependencies = [
  "solana-pubkey 4.2.0",
  "solana-sdk-ids 3.1.0",
  "solana-system-interface 3.2.0",
+]
+
+[[package]]
+name = "solana-loader-v3-interface"
+version = "7.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68029ab11d9c891d4ce23ada75745e40f983c5674af366f447b672569634231b"
+dependencies = [
+ "serde",
+ "serde_bytes",
+ "serde_derive",
+ "solana-instruction 3.4.0",
+ "solana-pubkey 4.2.0",
+ "solana-sdk-ids 3.1.0",
 ]
 
 [[package]]
@@ -6645,6 +6689,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf85cb06032201fa7c6f829d7db5a7e5aa45bcc0655327713065f6f0576731bf"
 dependencies = [
  "rustls-pki-types",
+]
+
+[[package]]
+name = "wheels"
+version = "0.1.0"
+source = "git+https://github.com/magicblock-labs/magicblock-wheels?branch=snawaz%2Fnested-layout-options#5c4f690288acb95f662734edc0853e7c0e2f9f1c"
+dependencies = [
+ "bytemuck",
+ "pinocchio 0.10.2",
+ "pinocchio-log",
+ "solana-address 2.6.1",
+ "wheels-macros",
+]
+
+[[package]]
+name = "wheels-macros"
+version = "0.1.0"
+source = "git+https://github.com/magicblock-labs/magicblock-wheels?branch=snawaz%2Fnested-layout-options#5c4f690288acb95f662734edc0853e7c0e2f9f1c"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.118",
 ]
 
 [[package]]

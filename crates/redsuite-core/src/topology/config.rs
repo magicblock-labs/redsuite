@@ -25,6 +25,7 @@ use crate::{catalog::Fixture, BaseCtx, ChainCtx, Result};
 const LEDGER_SIZE_LIMIT_UNREACHABLE: u64 = 1 << 60;
 
 pub const DLP_ID: Pubkey = Pubkey::from_str_const("DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh");
+pub const DLP_SO_ENV: &str = "REDSUITE_DLP_SO";
 const MDP_ID: Pubkey = Pubkey::from_str_const("DmnRGfyyftzacFb1XadYhWF6vWqXwtQk5tbr6XgR3BA1");
 pub const COMMITTOR_ID: Pubkey =
     Pubkey::from_str_const("ComtrB2KEaWgXsW1dhr1xYL4Ht4Bjj3gXnnL6KMdABq");
@@ -278,6 +279,14 @@ impl BasePlan {
         let geyser_plugin_config = stack_dir.join("geyser.json");
         yellowstone.write_config(&geyser_plugin_config, ([127, 0, 0, 1], grpc_port).into())?;
         let mut upgradeable_v3 = Vec::new();
+        if let Some(path) = env::var_os(DLP_SO_ENV).map(PathBuf::from) {
+            ensure!(
+                path.is_file(),
+                "{DLP_SO_ENV}={} is not a file",
+                path.display()
+            );
+            upgradeable_v3.push((DLP_ID, fs::canonicalize(path)?, Pubkey::default()));
+        }
         if let Ok(redshift_so) = Fixture::RedshiftProgram.resolve() {
             let (v3_id, v3_authority) = redshift_loader_v3_target();
             upgradeable_v3.push((v3_id, redshift_so, v3_authority));
@@ -319,6 +328,9 @@ impl BasePlan {
             cmd.arg("--clone").arg(id.to_string());
         }
         for id in CLONED_UPGRADEABLE_PROGRAMS {
+            if self.upgradeable_v3.iter().any(|(loaded, _, _)| loaded == id) {
+                continue;
+            }
             cmd.arg("--clone-upgradeable-program").arg(id.to_string());
         }
         for id in CLONED_LEGACY_PROGRAMS {
