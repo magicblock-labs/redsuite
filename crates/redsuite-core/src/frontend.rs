@@ -4,6 +4,10 @@ use crate::{report, topology, Result};
 
 pub const ENV_VARS: &[(&str, &str)] = &[
     (
+        topology::DLP_SO_ENV,
+        "a local DLP program to load on base instead of cloning the deployed program",
+    ),
+    (
         topology::ER_BIN_ENV,
         "the ER binary under test (else `magicblock-validator` on PATH)",
     ),
