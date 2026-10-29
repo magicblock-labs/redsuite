@@ -2,6 +2,7 @@ use anyhow::{ensure, Context};
 use std::slice;
 
 pub mod commit_snapshot_ordering;
+pub mod dlp_mixed_settlement;
 pub mod dlp_v2_buffered_settlement;
 pub mod dlp_v2_lifecycle;
 pub mod intent_execution_and_accounting;
