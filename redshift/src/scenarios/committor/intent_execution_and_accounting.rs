@@ -7,14 +7,14 @@ use magic_api::args::{CommitTypeArgs, MagicIntentBundleArgs};
 use pubkey::Pubkey;
 use redsuite_core::{
     api::{custom_error_code, transaction_meta},
-    dlp, prep,
+    dlp::{self, COMMIT_FEE_LAMPORTS},
+    prep,
     programs::{
         Action, CellHeader, CellId, Commit, IntentBundle, Refund, ResultCallback, SettlementMode,
         MAGIC, REDSHIFT,
     },
     receipt, system, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
-use sdk::dlp_api::consts::COMMIT_FEE_LAMPORTS;
 use signature::Signature;
 use signer::Signer;
 use tracing::instrument;
@@ -139,8 +139,9 @@ struct Actor {
 }
 
 impl<'a> IntentFixture<'a> {
-    async fn await_delegated(&self, key: &Pubkey) -> Result<()> {
-        self.er.await_delegated(key, "local delegation").await
+    async fn delegate_payer(&self, payer: &Keypair) -> Result<()> {
+        self.base.delegate_payer(&self.funder, payer, self.er.identity()).await?;
+        self.er.await_delegated(&payer.pubkey(), "local delegation").await
     }
 
     async fn check_settled(
@@ -169,7 +170,7 @@ impl<'a> IntentFixture<'a> {
                 self.redelegate(&self.actors[i].payer, label).await?;
                 self.actors[i].delegated = true;
             }
-            self.await_delegated(&self.actors[i].cell).await?;
+            self.er.await_delegated(&self.actors[i].cell, "local delegation").await?;
             let actor = &mut self.actors[i];
             let key = actor.payer.pubkey();
             self.er
@@ -354,6 +355,8 @@ impl<'a> IntentFixture<'a> {
         let vault = dlp::magic_fee_vault_pda(&self.er.identity());
 
         const AMOUNT: u64 = 890_880;
+        let transferred = if fail { 0 } else { AMOUNT };
+        let fee = ACTION_FEE + CALLBACK_FEE;
         let destination = Keypair::new().pubkey();
         let before = self.er.account(&actor.cell).await?.context("transfer cell missing")?;
         let state = CellHeader::try_decode(&before.data)?;
@@ -377,22 +380,17 @@ impl<'a> IntentFixture<'a> {
                     let actual = CellHeader::try_decode(&account.data)?;
                     ensure!(actual.revision == (state.revision + 1));
                     ensure!(actual.value == (state.value + u64::from(fail)));
-                    ensure!(account.lamports == (before.lamports + if fail { 0 } else { AMOUNT }));
+                    ensure!(account.lamports == (before.lamports + transferred));
                     ensure!(
                         accounts[1].as_ref().context("callback payer missing")?.lamports
-                            == (payer_before
-                                - ACTION_FEE
-                                - CALLBACK_FEE
-                                - if fail { 0 } else { AMOUNT })
+                            == (payer_before - fee - transferred)
                     );
                     Ok(())
                 },
             )
             .await?;
-        ensure!(self.base.api().get_balance(&destination).await? == if fail { 0 } else { AMOUNT });
-        ensure!(
-            self.er.api().get_balance(&vault).await? == (vault_before + ACTION_FEE + CALLBACK_FEE)
-        );
+        ensure!(self.base.api().get_balance(&destination).await? == transferred);
+        ensure!(self.er.api().get_balance(&vault).await? == (vault_before + fee));
         Ok(())
     }
 
@@ -483,17 +481,11 @@ impl Scenario for IntentExecutionAndAccounting {
         }
 
         suite.check_sponsored_quota().await?;
-        self.base
-            .delegate_payer(&suite.funder, &suite.actors[0].payer, self.er.identity())
-            .await?;
-        suite.await_delegated(&suite.actors[0].payer.pubkey()).await?;
-        suite.await_delegated(&suite.actors[0].cell).await?;
+        suite.delegate_payer(&suite.actors[0].payer).await?;
+        self.er.await_delegated(&suite.actors[0].cell, "local delegation").await?;
         suite.check_paid_threshold().await?;
 
-        self.base
-            .delegate_payer(&suite.funder, &suite.actors[1].payer, self.er.identity())
-            .await?;
-        suite.await_delegated(&suite.actors[1].payer.pubkey()).await?;
+        suite.delegate_payer(&suite.actors[1].payer).await?;
         for fail in [false, true] {
             suite.check_callback(fail).await?;
         }

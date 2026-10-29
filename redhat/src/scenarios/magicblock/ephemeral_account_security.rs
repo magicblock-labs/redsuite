@@ -1183,10 +1183,10 @@ impl Workload {
         self.run(
             "unrelated signer cannot collect confined rent",
             vec![theft.wrap(theft.native(&probe), &self.keys)],
-            Ok(&theft),
+            Err(InstructionError::InvalidAccountData),
         )
         .await
-        .context("#251: an ephemeral close refunds only its own funded deposit")?;
+        .context("#1855: confined close cannot refund ephemeral rent")?;
         (
             self.keys[TARGET],
             self.expected[TARGET],
@@ -1247,9 +1247,16 @@ impl Workload {
 
         ensure!(state(&self.er, &self.keys).await? == self.expected);
         ensure!(self.base.accounts(&self.keys).await? == self.base_images);
-        let mut growth = Action::new(Resize { new_data_len: space + 1 });
-        growth.sponsor = SUBSTITUTE;
-        self.step("confined substitute-funded growth", &growth).await?;
+        for size in [space - 1, space, space + 1] {
+            let mut resize = Action::new(Resize { new_data_len: size });
+            resize.sponsor = SUBSTITUTE;
+            self.run(
+                "confined resize is not an ephemeral rent operation",
+                vec![resize.instruction(&self.keys)],
+                Err(InstructionError::InvalidAccountData),
+            )
+            .await?;
+        }
         cache_lifecycle::pressure_preserves(
             &self.base,
             &self.er,
@@ -1261,17 +1268,13 @@ impl Workload {
         ensure!(state(&self.er, &self.keys).await? == self.expected);
         self.ledger.check(self.expected[VAULT].lamports)?;
         self.ledger.check_sponsors(&self.keys, &self.expected)?;
-        self.step(
-            "confined funded shrink",
-            &Action::new(Resize { new_data_len: space }),
-        )
-        .await?;
-        self.step(
+        self.run(
             "confined close cannot refund victim rent",
-            &Action::new(Close),
+            vec![Action::new(Close).instruction(&self.keys)],
+            Err(InstructionError::InvalidAccountData),
         )
         .await
-        .context("#251: confined close must refund only its own funded deposit")?;
+        .context("#1855: confined close cannot refund ephemeral rent")?;
         (
             self.keys[TARGET],
             self.expected[TARGET],
