@@ -184,7 +184,8 @@ impl Mode {
 
         match self {
             Self::ColdFetch => {
-                let cold = base.funded_payer(1_000_000).await?.pubkey();
+                // An absent key has no subscription image to bypass the HTTP fault.
+                let cold = Pubkey::new_unique();
                 let selector = Selector::methods(&["getAccountInfo", "getMultipleAccounts"])
                     .http()
                     .request()
