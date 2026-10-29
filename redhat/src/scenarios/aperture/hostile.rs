@@ -9,7 +9,7 @@ use redsuite_core::{
     wait,
 };
 use std::time::Instant;
-use tracing::info;
+use tracing::debug;
 use transaction::versioned::VersionedTransaction;
 
 const OBSERVE: Duration = Duration::from_millis(250);
@@ -467,7 +467,7 @@ impl Scenario for TransactionStructure {
                     }
                     _ => {}
                 }
-                info!(
+                debug!(
                     ?format,
                     ?mutation,
                     skip_preflight,
@@ -585,7 +585,7 @@ impl Scenario for TransactionAdmission {
                         account.as_ref().is_none_or(vacant),
                         "refused account read leaked {account:?}"
                     );
-                    info!(
+                    debug!(
                         skip_preflight,
                         signal_gap = 261,
                         placeholder = account.is_some(),
@@ -730,7 +730,7 @@ impl Scenario for TransactionAdmission {
                     local[0]
                 );
                 ensure!(fixture.base.account(&cold).await? == source);
-                info!(
+                debug!(
                     index,
                     skip_preflight,
                     preparation_ms = preparation_elapsed.saturating_sub(held_elapsed).as_millis(),

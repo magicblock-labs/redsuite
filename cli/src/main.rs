@@ -56,7 +56,7 @@ async fn checks(family: Family, command: Checks) -> Result<()> {
             let runner = std::env::current_exe()
                 .and_then(|path| redsuite_core::report::binary_hash(&path))
                 .unwrap_or_else(|_| "unavailable".into());
-            info!(attack_seed = seed, runner, "run seed");
+            info!(seed, runner, "run seed");
             Suite::new(
                 family,
                 args.run,
