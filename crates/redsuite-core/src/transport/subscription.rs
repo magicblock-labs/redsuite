@@ -3,6 +3,7 @@ use std::{
     collections::HashMap,
     ops::ControlFlow,
     rc::Rc,
+    result,
 };
 
 use anyhow::{anyhow, ensure, Context};
@@ -112,7 +113,7 @@ impl<S: SubscriptionState> Router<S> {
         &mut self,
         frame: Frame<'_>,
         on_notification: &mut impl FnMut(&mut S, S::Key, &LazyValue<'_>) -> ControlFlow<()>,
-    ) -> Result<()> {
+    ) -> result::Result<(), CloseReason> {
         match frame {
             Frame::Reply { id, result } => {
                 self.last_reply = Some(id);
@@ -127,7 +128,7 @@ impl<S: SubscriptionState> Router<S> {
                     (Some(Request::Unsubscribe), Err(error))
                         if error.code == jsonrpc_core::ErrorCode::InvalidParams
                             && error.message == "Invalid subscription id." => {}
-                    (_, Err(error)) => return Err(CloseReason::ServerError(error).into()),
+                    (_, Err(error)) => return Err(CloseReason::ServerError(error)),
                     _ => {}
                 }
             }

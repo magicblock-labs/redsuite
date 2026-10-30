@@ -5,7 +5,7 @@ use std::{
     rc::Rc,
 };
 
-use anyhow::{ensure, Context};
+use anyhow::{ensure, Context, Error};
 use json::{LazyValue, Value};
 use pubkey::Pubkey;
 use serde::{de::DeserializeOwned, Serialize};
@@ -20,8 +20,7 @@ use tokio::{task, time, time::Instant};
 use url::Url;
 
 use super::{
-    http::TransportError,
-    rpc::{RpcError, NO_PARAMS},
+    rpc::NO_PARAMS,
     subscription::{self, Connection, SubscriptionState, Topic},
     NETWORK_TIMEOUT,
 };
@@ -223,23 +222,31 @@ impl Subscription<Response<RpcLogsResponse>> {
 
 impl Subscription<SlotInfo> {
     /// Query information absent from notifications after each observed slot.
-    pub async fn query<U>(
+    /// Errors fail immediately; `Continue` retries and retains the pending reason.
+    pub async fn query<T>(
         &mut self,
         what: &str,
-        mut observe: impl AsyncFnMut() -> Result<U>,
-    ) -> Result<U> {
-        let deadline = Instant::now() + NETWORK_TIMEOUT;
+        observe: impl AsyncFnMut() -> Result<ControlFlow<T, Error>>,
+    ) -> Result<T> {
+        self.query_until(Instant::now() + NETWORK_TIMEOUT, what, observe).await
+    }
+
+    pub(crate) async fn query_until<T>(
+        &mut self,
+        deadline: Instant,
+        what: &str,
+        mut observe: impl AsyncFnMut() -> Result<ControlFlow<T, Error>>,
+    ) -> Result<T> {
         loop {
-            let error = match time::timeout_at(deadline, observe()).await {
-                Ok(Ok(value)) => return Ok(value),
-                Ok(Err(error)) => error,
-                Err(error) => return Err(error).with_context(|| what.to_owned()),
+            let observed = time::timeout_at(deadline, observe())
+                .await
+                .map_err(Error::from)
+                .flatten()
+                .with_context(|| what.to_owned())?;
+            let error = match observed {
+                Break(value) => return Ok(value),
+                Continue(error) => error,
             };
-            if error.downcast_ref::<TransportError>().is_some()
-                || error.downcast_ref::<RpcError>().is_some()
-            {
-                return Err(error).with_context(|| what.to_owned());
-            }
             time::timeout_at(deadline, self.next())
                 .await
                 .with_context(|| format!("{what}: {error:#}"))??;

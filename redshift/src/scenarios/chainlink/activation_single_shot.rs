@@ -39,17 +39,20 @@ const RECOVERY_WINDOW: Duration = Duration::from_secs(6);
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(20);
 const POLL: Duration = Duration::from_millis(200);
 
+/// Value and revision together distinguish a single action from repeated identical writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CellState {
     value: u64,
     revision: u64,
 }
 
+/// Competing client discovery paths kept alive while activation's dependency fetch is held.
 struct Discovery {
     reads: Vec<JoinHandle<Result<Option<Account>>>>,
     submissions: Vec<JoinHandle<Result<Signature>>>,
 }
 
+/// One activation target and the actors needed to race its discovery and observe its effects.
 struct Activation<'a> {
     base: &'a BaseCtx,
     faults: &'a Faults,
@@ -87,6 +90,7 @@ impl Activation<'_> {
             })
             .await
     }
+    /// Watches for delayed duplicate activation, not just the first correct value.
     async fn hold_steady(&self, expected: CellState, window: Duration) -> Result<()> {
         let started = Instant::now();
         while started.elapsed() < window {
@@ -95,6 +99,7 @@ impl Activation<'_> {
         }
         Ok(())
     }
+    /// Delegates a trigger whose activation body either updates the cell or deliberately fails.
     async fn delegate_trigger(&self, dependency: &Pubkey, fail: bool) -> Result<Keypair> {
         let mut action = if fail {
             REDSHIFT.batch().writable(&[self.cell]).fail(0).build()
@@ -124,6 +129,7 @@ impl Activation<'_> {
             .await?;
         Ok(trigger)
     }
+    /// Races reads and submissions while a required dependency prevents activation completion.
     async fn race_discovery(&self, trigger: &Pubkey, before: CellState) -> Result<Discovery> {
         let started = Instant::now();
         let sender = self.er.sender(self.er_payer.clone());
@@ -157,6 +163,7 @@ impl Activation<'_> {
         Ok(Discovery { reads, submissions })
     }
 
+    /// Releases the blocked dependency, requiring one action effect or failed-activation rescue.
     async fn run(&self, fail: bool) -> Result<Pubkey> {
         let before = self.state().await?;
         let dependency = self.base.funded_payer(DEPENDENCY_LAMPORTS).await?.pubkey();
@@ -201,6 +208,8 @@ impl Activation<'_> {
 }
 
 impl Discovery {
+    /// Lets discovery probes settle without treating their individual transport
+    /// results as the oracle.
     async fn settle(self) {
         for read in self.reads {
             let _ = time::timeout(SETTLE_TIMEOUT, read).await;
@@ -212,6 +221,7 @@ impl Discovery {
 }
 
 /// Checks single activation effects through notifications, reconnect, restart, and rescue.
+/// Repeated discovery of a successful trigger must not replay its post-delegation action.
 pub struct ActivationSingleShot {
     base: Rc<BaseCtx>,
     faults: Rc<Faults>,
@@ -224,6 +234,7 @@ impl Scenario for ActivationSingleShot {
         Ok(Self { base, faults, er })
     }
 
+    /// Reobserves a completed trigger across reconnect/restart before probing failed-action rescue.
     async fn run(self) -> Result<()> {
         let er = &self.er;
         let funder = self.base.funded_payer(PAYER_LAMPORTS).await?;

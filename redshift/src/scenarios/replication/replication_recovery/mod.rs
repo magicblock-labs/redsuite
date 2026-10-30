@@ -60,6 +60,7 @@ const SERVER_SNAPSHOTS: &str =
     r#"engine_replicator_operation_duration_micros_count{op="server_send_snapshot"}"#;
 const TRUNCATIONS: &str = r#"engine_ledger_operation_duration_micros_count{op="truncate"}"#;
 
+/// Stop/progress state for causally linked writes shared across independent account pairs.
 #[derive(Default)]
 struct Progress {
     stop: Cell<bool>,
@@ -86,6 +87,7 @@ impl Progress {
     }
 }
 
+/// Owned causal-writer tasks retained across follower failures and recovery.
 struct Workload {
     progress: Rc<Progress>,
     tasks: JoinSet<Result<CausalPair>>,
@@ -105,6 +107,7 @@ impl Workload {
         self.progress.sent.get()
     }
 
+    /// Stops at a complete causal chain and waits for its final transactions to enter the ledger.
     async fn stop(self, topology: &ReplicatedTopology) -> Result<Vec<CausalPair>> {
         self.progress.stop.set(true);
         time::timeout(DRAIN_TIMEOUT, self.drain(topology))
@@ -156,6 +159,7 @@ async fn verifier_count(verifier: &Verifier, name: &str) -> Result<f64> {
     Ok(verifier.scrape_metrics().await?.get(name).unwrap_or(0.0))
 }
 
+/// Waits for a fixed leader cutoff, surfacing mismatch log evidence if the verifier exits first.
 async fn await_catch_up(verifier: &Verifier, name: &str, target: f64) -> Result<Duration> {
     let started = Instant::now();
     let caught = wait::retry(
@@ -209,6 +213,7 @@ async fn await_leader_advance(
     .await
 }
 
+/// Checks the requested exit mode and that the stopped verifier no longer serves metrics.
 async fn stop_verifier(verifier: &mut Verifier, hard_kill: bool) -> Result<()> {
     let stop = verifier.stop(hard_kill).await?;
     if hard_kill {
@@ -248,6 +253,7 @@ fn strip_ansi(line: &str) -> String {
     cleaned
 }
 
+/// Preserves the first mismatch diagnostic, including when verifier shutdown prevents metric reads.
 fn log_mentions_mismatch(log: &Path) -> Result<Option<String>> {
     let text = fs::read_to_string(log)?;
     Ok(text
@@ -256,6 +262,7 @@ fn log_mentions_mismatch(log: &Path) -> Result<Option<String>> {
         .map(strip_ansi))
 }
 
+/// Separate correctness and security registrations using the same leader/follower topology.
 #[derive(Clone, Copy)]
 pub enum Coverage {
     /// Checks incremental/snapshot recovery, surviving peers, and wiped follower rejoin.
@@ -264,6 +271,9 @@ pub enum Coverage {
     Settlement,
 }
 
+/// Checks authenticated replication while causal traffic or settlement crosses recovery boundaries.
+/// Leader state is checked against an independent workload oracle; follower catch-up,
+/// seal progress, and mismatch diagnostics provide replication evidence.
 pub struct ReplicationRecovery {
     base: Rc<BaseCtx>,
     topology: ReplicatedTopology,
@@ -271,6 +281,7 @@ pub struct ReplicationRecovery {
 }
 
 impl Scenario<(), Coverage> for ReplicationRecovery {
+    /// Adds two verifier followers under the coverage-specific topology label.
     async fn setup(base: Rc<BaseCtx>, er: ErCtx, coverage: Coverage) -> Result<Self> {
         let topology = topology::replicated(
             &base,
@@ -289,6 +300,7 @@ impl Scenario<(), Coverage> for ReplicationRecovery {
         Ok(Self { base, topology, coverage })
     }
 
+    /// Establishes replicated cursors before running the chosen recovery or settlement workload.
     async fn run(mut self) -> Result<()> {
         self.check_ready().await?;
 
@@ -305,6 +317,8 @@ impl Scenario<(), Coverage> for ReplicationRecovery {
 }
 
 impl ReplicationRecovery {
+    /// Keeps traffic active through retained-cursor, pruned-cursor,
+    /// killed-peer, and wiped-peer recovery.
     async fn check_recovery(&mut self) -> Result<()> {
         let pairs = self.prepare_pairs(PAIRS).await?;
         let workload = Workload::start(pairs);
@@ -347,6 +361,7 @@ impl ReplicationRecovery {
         Ok(())
     }
 
+    /// Samples follower lag, then requires catch-up and no mismatch before introducing failures.
     #[instrument(skip_all, err)]
     async fn check_steady_load(&self, workload: &Workload) -> Result<()> {
         let max_lag = self.sample_lag(STEADY).await?;
@@ -360,6 +375,7 @@ impl ReplicationRecovery {
         Ok(())
     }
 
+    /// Restarts within retention headroom and requires incremental rather than snapshot recovery.
     #[instrument(skip_all, err)]
     async fn restart_retained_cursor(&mut self) -> Result<()> {
         let events = self.topology.leader().api().events().await?;
@@ -369,8 +385,7 @@ impl ReplicationRecovery {
             let sealed = slots
                 .query("new leader superblock", async || {
                     let current = leader_metric(&self.topology, SUPERBLOCKS).await?;
-                    ensure!(current > head);
-                    Ok(current)
+                    Ok(wait::when(current > head, current))
                 })
                 .await?;
             await_catch_up(self.topology.verifier(0), SUPERBLOCKS, sealed).await?;
@@ -399,6 +414,7 @@ impl ReplicationRecovery {
         Ok(())
     }
 
+    /// Witnesses pruning beyond a stopped follower's cursor while its surviving peer advances.
     #[instrument(skip_all, err)]
     async fn check_retention_gap(&self) -> Result<()> {
         self.await_leader_connections(1).await?;
@@ -417,9 +433,9 @@ impl ReplicationRecovery {
                                  after verifier 1 stopped"
                         ),
                         async || {
-                            let block = self.topology.leader().api().get_block(slot).await?;
-                            ensure!(block.is_some() == retained);
-                            Ok(())
+                            let present =
+                                self.topology.leader().api().get_block(slot).await?.is_some();
+                            Ok(wait::when(present == retained, present))
                         },
                     )
                     .await?;
@@ -439,6 +455,7 @@ impl ReplicationRecovery {
         Ok(())
     }
 
+    /// Requires client/server snapshot evidence when restarting beyond the retained cursor range.
     #[instrument(skip_all, err)]
     async fn recover_snapshot(
         &mut self,
@@ -466,6 +483,8 @@ impl ReplicationRecovery {
         Ok(())
     }
 
+    /// Hard-kills one follower while requiring leader writes, clones, and the
+    /// surviving stream to progress.
     #[instrument(skip_all, err)]
     async fn kill_verifier(&mut self) -> Result<()> {
         stop_verifier(self.topology.verifier_mut(1), true).await?;
@@ -484,6 +503,7 @@ impl ReplicationRecovery {
         Ok(())
     }
 
+    /// Wipes stopped follower storage and requires snapshot bootstrap plus resumed replication.
     #[instrument(skip_all, err)]
     async fn rejoin_wiped(&mut self) -> Result<()> {
         let served_before = leader_count(&self.topology, SERVER_SNAPSHOTS).await?;
@@ -507,6 +527,7 @@ impl ReplicationRecovery {
         Ok(())
     }
 
+    /// Seals a fixed workload cutoff before checking follower agreement and leader pair state.
     #[instrument(skip_all, err)]
     async fn check_final_boundary(&self, pairs: &[CausalPair]) -> Result<()> {
         // Background services can append transactions after the workload drains.
@@ -537,6 +558,7 @@ impl ReplicationRecovery {
         Ok(())
     }
 
+    /// Samples each leader metric once so catch-up targets do not move with background services.
     #[instrument(skip_all, err)]
     async fn catch_up_fleet(&self, names: &[&str]) -> Result<()> {
         for name in names {
@@ -560,6 +582,7 @@ impl ReplicationRecovery {
         .await
     }
 
+    /// Records maximum transaction lag per follower; lag is diagnostic, not a pass/fail threshold.
     async fn sample_lag(&self, window: Duration) -> Result<Vec<f64>> {
         let deadline = time::Instant::now() + window;
         let mut max_lag = vec![0.0f64; self.topology.verifiers().len()];
@@ -574,6 +597,8 @@ impl ReplicationRecovery {
         Ok(max_lag)
     }
 
+    /// Checks the leader's causal-state oracle; follower agreement is
+    /// checked through replication seals.
     async fn verify_pairs(&self, pairs: &[CausalPair]) -> Result<()> {
         let leader = self.topology.leader();
         for (index, pair) in pairs.iter().enumerate() {
@@ -582,6 +607,8 @@ impl ReplicationRecovery {
         Ok(())
     }
 
+    /// Checks live streams and mismatch evidence; settlement coverage first
+    /// reaches an authenticated seal.
     async fn verify_no_mismatch(&self) -> Result<()> {
         if matches!(self.coverage, Coverage::Settlement) {
             if leader_metric(&self.topology, SUPERBLOCKS).await? < 1.0 {
@@ -614,6 +641,7 @@ impl ReplicationRecovery {
         Ok(())
     }
 
+    /// Requires fresh account materialization to keep working with one verifier offline.
     async fn probe_clones(&self) -> Result<()> {
         let leader = self.topology.leader();
         for _ in 0..PROBES {

@@ -60,6 +60,7 @@ const REQUIRED_METRICS: [&str; 5] = [
     ORDERING_DEPENDENCIES,
 ];
 
+/// Causal-chain and disjoint-background scales; executor calibration determines bounded load lanes.
 struct Profile {
     name: &'static str,
     pairs: usize,
@@ -99,6 +100,7 @@ fn heavy_step(chain: u64) -> Step {
     Step::ALL[(chain % causal::STEPS) as usize]
 }
 
+/// Unique transaction-ID namespace across batches, account pairs, chains, and causal steps.
 #[derive(Clone, Copy)]
 struct ChainSpace {
     pairs: u64,
@@ -117,11 +119,13 @@ fn phase_ranges(chains: u64) -> [(u64, u64); 2] {
     [(0, split), (split, chains)]
 }
 
+/// Causal fold oracle plus this batch's signatures for first-failure diagnostics.
 struct Pair {
     chain: CausalPair,
     steps: Vec<(u64, Step, Signature)>,
 }
 
+/// Executor activity and longest observed execution stall sampled while a phase runs.
 #[derive(Default)]
 struct Samples {
     busy: MeanMax,
@@ -129,6 +133,7 @@ struct Samples {
     max_stall: Duration,
 }
 
+/// Samples stalls from changes in executed-transaction count, not from client delivery latency.
 fn spawn_sampler(er: &ErCtx) -> Sampler<Samples> {
     let mut last_txs: Option<f64> = None;
     let mut last_progress = Instant::now();
@@ -152,6 +157,7 @@ fn spawn_sampler(er: &ErCtx) -> Sampler<Samples> {
     )
 }
 
+/// Quiescent queue gauges and time needed to settle the complete measured workload.
 struct DrainState {
     elapsed: Duration,
     blocked: f64,
@@ -171,6 +177,7 @@ fn is_idle(metrics: &Metrics) -> bool {
     idle_values(metrics) == (0.0, 0.0, 0.0)
 }
 
+/// Waits for the workload execution count and then for blocked/busy/pending gauges to reach zero.
 async fn drain(er: &ErCtx, target: f64) -> Result<DrainState> {
     let started = Instant::now();
     crate::await_executed(er, target, DRAIN_TIMEOUT).await?;
@@ -189,6 +196,7 @@ async fn drain(er: &ErCtx, target: f64) -> Result<DrainState> {
     })
 }
 
+/// One causal-chain range and its competing-load policy under the shared run deadline.
 struct PhasePlan {
     batch: u64,
     space: ChainSpace,
@@ -202,6 +210,8 @@ struct PhasePlan {
     driver_threads: usize,
 }
 
+/// Causal delivery samples kept distinct from disjoint background
+/// traffic and executor observations.
 struct PhaseOutcome {
     label: &'static str,
     chains: u64,
@@ -211,6 +221,7 @@ struct PhaseOutcome {
     samples: Sampled<Samples>,
 }
 
+/// Paces complete X→Y→Z chains and rotates the expensive step to exercise different dependencies.
 async fn drive_pair(
     pair_index: u64,
     pair: &mut Pair,
@@ -237,6 +248,7 @@ async fn drive_pair(
     Ok(())
 }
 
+/// Starts disjoint load before causal chains and samples both execution activity and stalls.
 async fn run_phase(
     er: &ErCtx,
     pairs: &mut [Pair],
@@ -290,6 +302,8 @@ async fn run_phase(
     })
 }
 
+/// Adds the earliest available failed or missing execution record to
+/// a causal-state mismatch diagnostic.
 async fn first_failed_step(er: &ErCtx, steps: &[(u64, Step, Signature)]) -> Option<String> {
     for (id, step, signature) in steps {
         match er.api().get_transaction(signature).await {
@@ -309,6 +323,7 @@ async fn first_failed_step(er: &ErCtx, steps: &[(u64, Step, Signature)]) -> Opti
     None
 }
 
+/// Checks causal fold state and retires signature diagnostics only after the batch is verified.
 async fn verify_pairs(er: &ErCtx, pairs: &mut [Pair], batch: usize) -> Result<()> {
     for (index, pair) in pairs.iter_mut().enumerate() {
         let accounts = pair.chain.read(er).await?;
@@ -325,6 +340,7 @@ async fn verify_pairs(er: &ErCtx, pairs: &mut [Pair], batch: usize) -> Result<()
     Ok(())
 }
 
+/// Ensures competing compute work produced its expected hash, not merely successful send responses.
 async fn verify_independent(er: &ErCtx, accounts: &[Pubkey], iters: u32) -> Result<()> {
     let expected = HashState::chain(causal::HASH_INIT.to_bytes(), iters);
     for (index, address) in accounts.iter().enumerate() {
@@ -338,6 +354,7 @@ async fn verify_independent(er: &ErCtx, accounts: &[Pubkey], iters: u32) -> Resu
     Ok(())
 }
 
+/// Both contention phases plus a shared drain and validator accounting for their combined work.
 struct BatchOutcome {
     phases: Vec<PhaseOutcome>,
     drained: DrainState,
@@ -362,6 +379,8 @@ impl BatchOutcome {
 }
 
 /// Checks causal ordering and progress under sustained competing execution.
+/// Calibrates available executors, then contrasts bounded competing lanes with open-loop
+/// backpressure while requiring causal state, pipeline drain, and execution progress to agree.
 pub struct SchedulerContention {
     base: Rc<BaseCtx>,
     er: ErCtx,
@@ -372,6 +391,7 @@ pub struct SchedulerContention {
 }
 
 impl Scenario<(ScenarioReport, Result<()>)> for SchedulerContention {
+    /// Provisions disjoint causal and background accounts and warms their execution paths.
     async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
         let profile = PROFILES.select(base.config().profile);
 
@@ -436,6 +456,7 @@ impl Scenario<(ScenarioReport, Result<()>)> for SchedulerContention {
         })
     }
 
+    /// Verifies each measured batch and reports the last retained batch rather than pooled windows.
     async fn run(mut self) -> Result<(ScenarioReport, Result<()>)> {
         let (executors, contention_lanes) = self.calibrate().await?;
         let options = crate::RunControl::from_config(&self.base.config())?;
@@ -470,6 +491,8 @@ impl Scenario<(ScenarioReport, Result<()>)> for SchedulerContention {
 }
 
 impl SchedulerContention {
+    /// Observes executor utilization under open load to size contention
+    /// lanes, then drains calibration.
     #[instrument(skip_all, err)]
     async fn calibrate(&self) -> Result<(f64, usize)> {
         let calibration_before = self.er.scrape_metrics().await?;
@@ -504,6 +527,8 @@ impl SchedulerContention {
         Ok((executors, contention_lanes))
     }
 
+    /// Runs the bounded/open phases with unique IDs before measuring
+    /// their combined execution drain.
     #[instrument(skip_all, err, fields(batch = batch))]
     async fn measure_batch(
         &mut self,
@@ -586,6 +611,7 @@ impl SchedulerContention {
         Ok(outcome)
     }
 
+    /// Checks contention, stalls, execution outcomes, and causal state without aborting on check misses.
     #[instrument(skip_all, err, fields(batch = batch))]
     async fn check_batch(&mut self, batch: usize, outcome: &BatchOutcome) -> Result<()> {
         let workload: u64 =

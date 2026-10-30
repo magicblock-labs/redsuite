@@ -15,6 +15,8 @@ use redsuite_core::{
 use std::{rc::Rc, sync::Arc, time::Instant};
 
 /// Measures notification fanout while requiring each subscriber to settle both write targets.
+/// A later observed write may supersede an earlier notification; every tracked write must
+/// be either observed or accounted for as superseded, and final account values must agree.
 pub struct WebsocketFanout {
     base: Rc<BaseCtx>,
     er: ErCtx,
@@ -24,6 +26,7 @@ pub struct WebsocketFanout {
     rate: u32,
 }
 impl Scenario<(ScenarioReport, Result<()>)> for WebsocketFanout {
+    /// Materializes and warms the shared write pool before creating measured subscribers.
     async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
         let (count, connections, rate) = match base.config().profile {
             Profile::Lite => (16, 8, 200),
@@ -44,6 +47,7 @@ impl Scenario<(ScenarioReport, Result<()>)> for WebsocketFanout {
             rate,
         })
     }
+    /// Tracks both copy destinations per reader and reports the worst subscriber-window latency.
     async fn run(self) -> Result<(ScenarioReport, Result<()>)> {
         let options = RunControl::from_config(&self.base.config())?;
         let mut remaining = options.duration;

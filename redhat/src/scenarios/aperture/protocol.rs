@@ -30,11 +30,17 @@ const QUERY_LIMIT: usize = 100;
 const FRAME_ID: u64 = 9_001;
 const FRAME_WAIT: Duration = Duration::from_secs(3);
 
+/// Checks HTTP/JSON/WebSocket input bounds and isolation between client connections.
+///
+/// Malformed requests are interleaved with confirmed writes on a healthy connection,
+/// so refusal alone cannot mask lost RPC or subscription service.
 pub struct ProtocolInputs {
     base: Rc<BaseCtx>,
     er: ErCtx,
 }
 
+/// Sends deliberately malformed HTTP framing that a normal client would repair.
+/// A reset or incomplete-body timeout may be a valid refusal, represented by `None`.
 async fn raw_request(url: &Url, body: &str, declared: Option<usize>) -> Result<Option<String>> {
     let host = url.host_str().context("rpc host missing")?;
     let port = url.port_or_known_default().context("rpc port missing")?;
@@ -77,6 +83,7 @@ async fn raw_request(url: &Url, body: &str, declared: Option<usize>) -> Result<O
     }
 }
 
+/// Distinguishes a successfully served slot query from a transport-level refusal.
 fn slot_reply(reply: Option<&str>) -> Result<bool> {
     let Some(reply) = reply.filter(|reply| reply.starts_with("HTTP/1.1 200")) else {
         return Ok(false);
@@ -113,6 +120,7 @@ impl ProtocolInputs {
         .await
     }
 
+    /// Applies the case-specific acceptance policy, then requires RPC service to recover.
     async fn probe(
         &self,
         label: &str,
@@ -141,6 +149,7 @@ impl ProtocolInputs {
         Ok(())
     }
 
+    /// Exercises JSON nesting and framing ambiguity separately from body-size bounds.
     async fn http_cases(&self) -> Result<()> {
         let slot = slot_request(1);
         let nested = format!(
@@ -177,6 +186,7 @@ impl ProtocolInputs {
         Ok(())
     }
 
+    /// Checks both sides of the HTTP body limit with an otherwise valid query.
     async fn size_cases(&self) -> Result<()> {
         for (size, expected) in [(BODY_LIMIT, true), (BODY_LIMIT + 1, false)] {
             let mut body = slot_request(1);
@@ -186,6 +196,7 @@ impl ProtocolInputs {
         Ok(())
     }
 
+    /// Requires intact account data at the query limit and rejection above it.
     async fn query_cases(&self, fixture: &Fixture) -> Result<()> {
         for count in [QUERY_LIMIT, QUERY_LIMIT + 1] {
             let keys = vec![fixture.keys[1].to_string(); count];
@@ -216,6 +227,7 @@ impl ProtocolInputs {
         Ok(())
     }
 
+    /// Checks unknown-field tolerance separately from invalid methods and parameter shapes.
     async fn request_cases(&self, rng: &mut impl Rng) -> Result<()> {
         let absent = random::pubkey(rng);
         let lenient: Value = self
@@ -257,6 +269,7 @@ impl ProtocolInputs {
         Ok(())
     }
 
+    /// Separates per-socket refusal policy from continued service on fresh connections.
     async fn frame_cases(&self, fixture: &Fixture) -> Result<()> {
         let cell = fixture.keys[1];
         let frames = [
@@ -306,6 +319,7 @@ impl ProtocolInputs {
         Ok(())
     }
 
+    /// Floods one socket and attempts to cancel its subscriptions from another connection.
     async fn socket_cases(&self, fixture: &mut Fixture) -> Result<()> {
         let cell = fixture.keys[1];
         let mut victim = RawWs::connect(self.er.ws_url()).await?;
@@ -368,6 +382,7 @@ impl ProtocolInputs {
         Ok(fixture.expected[1].as_ref().context("cell expectation missing")?.data.clone())
     }
 
+    /// Proves that an established subscription still observes a newly confirmed write.
     async fn confirmed_write(
         &self,
         fixture: &mut Fixture,
@@ -398,6 +413,7 @@ impl Scenario for ProtocolInputs {
         Ok(Self { base, er })
     }
 
+    /// Keeps a control subscription alive across hostile HTTP and WebSocket stages.
     async fn run(self) -> Result<()> {
         let mut rng = random::rng(self.base.config().seed, &["redhat", "protocol_inputs"], 0);
         let mut fixture = Fixture::new(self.base.clone(), self.er.clone(), &mut rng).await?;

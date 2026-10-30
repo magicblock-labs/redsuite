@@ -21,6 +21,11 @@ use std::{rc::Rc, time::Duration};
 use tracing::debug;
 use transaction::versioned::VersionedTransaction;
 
+/// Checks admission boundaries when account preparation fails or blockhashes are invalid.
+///
+/// A refused transaction must leave no history or account effects; an executed failure
+/// may charge its fee but must roll back writes. Repaired controls distinguish rejection
+/// from a validator that has stopped processing transactions.
 pub struct TransactionAdmission {
     base: Rc<BaseCtx>,
     er: ErCtx,
@@ -31,6 +36,7 @@ impl Scenario for TransactionAdmission {
         Ok(Self { base, er })
     }
 
+    /// Exercises each boundary with and without preflight, then verifies recovery.
     async fn run(self) -> Result<()> {
         let mut rng = random::rng(
             self.base.config().seed,
@@ -113,6 +119,7 @@ impl Scenario for TransactionAdmission {
             ensure!(fixture.base.account(&cold).await? == source);
         }
 
+        // Expire a real ER hash so the lifetime checks include a once-valid input.
         let expiry_message = fixture.message(2_000, 7, &[]).await?;
         let expired = expiry_message.recent_blockhash;
         wait::retry(
@@ -255,6 +262,7 @@ impl Scenario for TransactionAdmission {
                 .context("executed failure lost its terminal status")?;
             ensure!(status.slot == slot && status.err.map(Into::into) == tx.error);
             audit(&fixture.er, start, &[(&tx, 1)]).await?;
+            // Execution failure rolls back program state, but not the transaction fee.
             before.local[0].as_mut().unwrap().lamports -= tx.fee;
             fixture.expected[0].as_mut().unwrap().lamports -= tx.fee;
             fixture.unchanged(&before).await?;

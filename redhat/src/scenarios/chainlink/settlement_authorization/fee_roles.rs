@@ -14,6 +14,8 @@ use solana_instruction_error::InstructionError;
 use transaction::Transaction;
 
 impl SettlementAuthorization {
+    /// Rejects absent/substituted/readonly fee vaults, then checks duplicate committee keys.
+    /// Neither refusal nor duplicate membership may introduce extra balance effects.
     pub(super) async fn check_fee_roles(&self) -> Result<()> {
         let mut rng = random::rng(self.base.config().seed, &["redhat", "commit_fee_roles"], 0);
         let owner = self.base.seeded_payer(&mut rng, PAYER_LAMPORTS).await?;

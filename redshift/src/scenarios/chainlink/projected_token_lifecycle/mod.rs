@@ -5,23 +5,25 @@ use instruction::Instruction;
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    api::transaction_meta,
+    api::{transaction_meta, SendError},
     dlp::{self, delegate_with_actions, DelegateArgs},
-    expect_error,
     netfault::{Faults, Held, RuleHandle, Selector, Transport},
     programs::{SettlementMode, REDLINE},
-    receipt, system, topology, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
+    receipt,
+    rpc_types::response::TransactionError,
+    system, topology, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
 use sdk::spl::builders::UndelegateEphemeralAtaBuilder;
 use signature::Signature;
 use signer::Signer;
+use solana_instruction_error::InstructionError;
+use tracing::instrument;
 
 mod magic_atas;
-use tracing::instrument;
+use magic_atas::MagicAtas;
 
 use super::spl;
 use crate::PAYER_LAMPORTS;
-use magic_atas::MagicAtas;
 
 const NAMES: [&str; 4] = ["source", "destination", "unbacked", "foreign"];
 const INITIAL: [u64; 4] = [200, 100, 70, 45];
@@ -30,6 +32,36 @@ const ACTION_AMOUNT: u64 = 100;
 const FAILING_AMOUNT: u64 = 1_000_000;
 const TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Accepts readonly enforcement at either RPC admission or execution, never a transport failure.
+fn check_readonly(error: &SendError) -> Result<()> {
+    let readonly = match error {
+        SendError::Rejected(error) => {
+            error.error.code.code() == -32003
+                && [
+                    "InvalidWritableAccount",
+                    "ExternalAccountDataModified",
+                    "ReadonlyDataModified",
+                    "Immutable",
+                ]
+                .iter()
+                .any(|code| error.error.message.contains(code))
+        }
+        SendError::Execution(error) => matches!(
+            error.err,
+            TransactionError::InvalidWritableAccount
+                | TransactionError::InstructionError(
+                    _,
+                    InstructionError::ExternalAccountDataModified
+                        | InstructionError::ReadonlyDataModified
+                        | InstructionError::Immutable
+                )
+        ),
+    };
+    ensure!(readonly, "expected readonly refusal, got {error}");
+    Ok(())
+}
+
+/// One owner's physical ATA, backing eATA, and the ER projection exposed at the ATA address.
 struct Wallet {
     owner: Keypair,
     mint: Pubkey,
@@ -85,6 +117,7 @@ impl Wallet {
     }
 }
 
+/// Separate physical balances and projected claims; projections must not be counted as new supply.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Balances {
     base_atas: [u64; 4],
@@ -94,6 +127,7 @@ struct Balances {
 }
 
 impl Balances {
+    /// Reconciles vault backing with claims, then physical base balances with minted supply.
     fn check_supply(&self, active_claims: u64, extra_base: u64, supply: u64) -> Result<()> {
         let claims = active_claims + self.eatas[3].unwrap_or(0) + self.vault[1];
         ensure!(self.vault[0] == claims);
@@ -107,12 +141,17 @@ async fn amount(ctx: &impl ChainCtx, address: &Pubkey) -> Result<u64> {
     spl::token_balance(ctx, address).await?.context("token balance missing")
 }
 
+/// Independently prepared scenario branches sharing token/vault provisioning.
 pub enum Mode {
+    /// Exercises backing commits, lost confirmations, undelegation, withdrawal, and redelegation.
     Backing,
+    /// Exercises temporary Magic ATA overlays and their replacement/cleanup rules.
     Overlay,
 }
 
 /// Checks backing settlement or an independently prepared Magic ATA overlay lifecycle.
+/// Unbacked and foreign-validator wallets remain readonly controls while active wallets
+/// move between physical base balances, backing eATAs, and ER-local projections.
 pub struct ProjectedTokenLifecycle {
     base: Rc<BaseCtx>,
     faults: Rc<Faults>,
@@ -151,6 +190,7 @@ impl Scenario<(), Mode> for ProjectedTokenLifecycle {
         })
     }
 
+    /// Establishes backing and projections before branching into settlement or overlay coverage.
     async fn run(self) -> Result<()> {
         let er = &self.er;
         let mut expected = Balances {
@@ -160,7 +200,7 @@ impl Scenario<(), Mode> for ProjectedTokenLifecycle {
             vault: [40, 0],
         };
         self.create_tokens(&expected).await?;
-        self.check_balances(&expected, false).await?;
+        self.check_balances(&expected).await?;
 
         self.deposit().await?;
         expected.base_atas = [0, 0, 70, 5];
@@ -168,7 +208,7 @@ impl Scenario<(), Mode> for ProjectedTokenLifecycle {
         expected.projected = expected.base_atas;
         expected.vault[0] = 340;
         self.await_projection(&expected.projected).await?;
-        self.check_balances(&expected, false).await?;
+        self.check_balances(&expected).await?;
 
         self.delegate_wallets().await?;
         expected.projected = [200, 100, 70, 5];
@@ -179,40 +219,41 @@ impl Scenario<(), Mode> for ProjectedTokenLifecycle {
             return self.finish().await;
         }
         self.check_controls(1).await?;
-        self.check_balances(&expected, true).await?;
+        self.check_balances(&expected).await?;
 
         let delegated = self.delegate_with_transfer(ACTION_AMOUNT).await?;
         expected.projected = [100, 200, 70, 5];
         self.await_projection(&expected.projected).await?;
         self.check_owner(&delegated, dlp::dlp_id()).await?;
-        self.check_balances(&expected, true).await?;
+        self.check_balances(&expected).await?;
 
         self.check_failing_action().await?;
-        self.check_balances(&expected, true).await?;
+        self.check_balances(&expected).await?;
 
         self.wallets[0].transfer(er, &self.wallets[1], 37).await?;
         expected.projected = [63, 237, 70, 5];
-        self.check_balances(&expected, true).await?;
+        self.check_balances(&expected).await?;
 
+        // Base settlement lands first; newer ER transfers must survive lost confirmation recovery.
         let (signature, held, confirmations) = self.commit_withheld().await?;
         expected.eatas[..2].copy_from_slice(&[Some(63), Some(237)]);
-        self.check_balances(&expected, true).await?;
+        self.check_balances(&expected).await?;
         self.wallets[0].transfer(er, &self.wallets[1], 11).await?;
         expected.projected = [52, 248, 70, 5];
-        self.check_balances(&expected, true).await?;
+        self.check_balances(&expected).await?;
 
         self.recover_confirmation(signature, held, confirmations).await?;
         self.check_controls(2).await?;
-        self.check_balances(&expected, true).await?;
+        self.check_balances(&expected).await?;
         let eatas = [self.wallets[0].eata, self.wallets[1].eata];
         self.settled(&self.commit(2).await?, &eatas, false).await?;
         expected.eatas[..2].copy_from_slice(&[Some(52), Some(248)]);
-        self.check_balances(&expected, true).await?;
+        self.check_balances(&expected).await?;
 
         self.undelegate_wallets().await?;
         expected.projected = expected.base_atas;
         self.await_projection(&expected.projected).await?;
-        self.check_balances(&expected, false).await?;
+        self.check_balances(&expected).await?;
 
         self.withdraw().await?;
         expected.base_atas[0] = 20;
@@ -220,26 +261,27 @@ impl Scenario<(), Mode> for ProjectedTokenLifecycle {
         expected.projected[0] = 20;
         expected.vault[0] = 320;
         self.await_projection(&expected.projected).await?;
-        self.check_balances(&expected, false).await?;
+        self.check_balances(&expected).await?;
 
         self.redelegate().await?;
         expected.projected = [32, 248, 70, 5];
         self.await_projection(&expected.projected).await?;
         self.check_controls(3).await?;
-        self.check_balances(&expected, true).await?;
+        self.check_balances(&expected).await?;
         self.wallets[0].transfer(er, &self.wallets[1], 7).await?;
         expected.projected = [25, 255, 70, 5];
-        self.check_balances(&expected, true).await?;
+        self.check_balances(&expected).await?;
         let signature = self.commit(3).await?;
         self.settled(&signature, &eatas, false).await?;
         expected.eatas[..2].copy_from_slice(&[Some(25), Some(255)]);
-        self.check_balances(&expected, true).await?;
+        self.check_balances(&expected).await?;
 
         self.finish().await
     }
 }
 
 impl ProjectedTokenLifecycle {
+    /// Provisions distinct active, unbacked, and foreign backing roles for one mint.
     #[instrument(skip_all, err)]
     async fn create_tokens(&self, expected: &Balances) -> Result<()> {
         let er = &self.er;
@@ -306,10 +348,9 @@ impl ProjectedTokenLifecycle {
         Ok(())
     }
 
+    /// Requires a failed post-delegation transfer to rescue its trigger back to base ownership.
     #[instrument(skip_all, err)]
     async fn check_failing_action(&self) -> Result<()> {
-        // A failing post-delegation action schedules undelegation, returning
-        // base ownership to the system program.
         let failing = self.delegate_with_transfer(FAILING_AMOUNT).await?;
         self.base
             .api()
@@ -329,6 +370,7 @@ impl ProjectedTokenLifecycle {
         Ok(())
     }
 
+    /// Lets a base commit land while withholding its send response and both confirmation paths.
     #[instrument(skip_all, err)]
     async fn commit_withheld(&self) -> Result<(Signature, Held, [RuleHandle; 2])> {
         let confirmations = [
@@ -350,6 +392,8 @@ impl ProjectedTokenLifecycle {
         Ok((signature, held, confirmations))
     }
 
+    /// Discards the landed response, reconnects, and requires receipt recovery
+    /// for the same snapshot.
     #[instrument(skip_all, err)]
     async fn recover_confirmation(
         &self,
@@ -371,6 +415,7 @@ impl ProjectedTokenLifecycle {
         .await
     }
 
+    /// Waits for backing ownership to return before testing base withdrawals.
     #[instrument(skip_all, err)]
     async fn undelegate_wallets(&self) -> Result<()> {
         for wallet in &self.wallets[..2] {
@@ -436,6 +481,8 @@ impl ProjectedTokenLifecycle {
         self.check_owner(&wallet.eata, dlp::dlp_id()).await
     }
 
+    /// Uses a fresh delegated trigger to test post-delegation execution
+    /// against active token projections.
     #[instrument(skip_all, err)]
     async fn delegate_with_transfer(&self, amount: u64) -> Result<Pubkey> {
         let account = self.base.funded_payer(PAYER_LAMPORTS).await?;
@@ -465,7 +512,7 @@ impl ProjectedTokenLifecycle {
     }
 
     #[instrument(skip_all, err)]
-    async fn check_balances(&self, expected: &Balances, _delegated: bool) -> Result<()> {
+    async fn check_balances(&self, expected: &Balances) -> Result<()> {
         let observed = self.balances().await?;
         ensure!(&observed == expected);
         Ok(())
@@ -483,6 +530,7 @@ impl ProjectedTokenLifecycle {
         Ok(())
     }
 
+    /// Reads backing and projections independently so stale settlement cannot hide in an aggregate.
     async fn balances(&self) -> Result<Balances> {
         let mut state = Balances::default();
         for (i, wallet) in self.wallets.iter().enumerate() {
@@ -511,29 +559,27 @@ impl ProjectedTokenLifecycle {
             .await
     }
 
+    /// Requires both transfer directions involving unbacked/foreign wallets to preserve all images.
     async fn check_controls(&self, amount: u64) -> Result<()> {
         let atas = self.wallets.each_ref().map(|wallet| wallet.ata);
         let before = self.er.accounts(&atas).await?;
         for control in [2, 3] {
             for (from, to) in [(control, 0), (0, control)] {
-                let attempt =
-                    self.wallets[from].transfer(&self.er, &self.wallets[to], amount).await;
-                let error = expect_error(attempt, &format!("unauthorized transfer {from}->{to}"))?;
-                let error = format!("{error:#}");
-                ensure!([
-                    "InvalidWritableAccount",
-                    "ExternalAccountDataModified",
-                    "ReadonlyDataModified",
-                    "Immutable",
-                ]
-                .iter()
-                .any(|code| error.contains(code)));
+                let instruction = self.wallets[from].transfer_to(&self.wallets[to], amount);
+                let error = self
+                    .er
+                    .try_submit_and_confirm(&self.wallets[from].owner, &[instruction])
+                    .await?
+                    .err()
+                    .with_context(|| format!("unauthorized transfer {from}->{to} accepted"))?;
+                check_readonly(&error)?;
                 ensure!(self.er.accounts(&atas).await? == before);
             }
         }
         Ok(())
     }
 
+    /// Checks receipt membership/mode before confirming the base settlement transactions.
     async fn settled(
         &self,
         signature: &Signature,

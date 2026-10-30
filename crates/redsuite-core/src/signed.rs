@@ -24,7 +24,7 @@ use crate::{
         UiTransactionEncoding, UiTransactionError,
     },
     transport::wsraw::RawWs,
-    ChainCtx, ErCtx, Result,
+    wait, ChainCtx, ErCtx, Result,
 };
 
 pub struct Signed {
@@ -137,16 +137,17 @@ impl Signed {
             max_supported_transaction_version: Some(1),
             ..RpcTransactionConfig::default()
         };
-        let tx = er
-            .api()
+        let api = er.api();
+        let params = (self.signature.to_string(), config);
+        let tx = api
             .await_query("transaction published", async || {
-                er.api()
+                let transaction = api
                     .call::<Option<EncodedConfirmedTransactionWithStatusMeta>>(
                         RpcRequest::GetTransaction,
-                        &(self.signature.to_string(), config),
+                        &params,
                     )
-                    .await?
-                    .context("transaction missing")
+                    .await?;
+                Ok(wait::check(transaction.context("transaction missing")))
             })
             .await?;
         let meta = transaction_meta(&tx)?;
@@ -185,8 +186,8 @@ pub async fn audit_signatures(
     er.api().await_slot(end).await?;
     er.api()
         .await_query("block is published", async || {
-            ensure!(er.api().get_block(end).await?.is_some());
-            Ok(())
+            let block = er.api().get_block(end).await?;
+            Ok(wait::check(block.context("block not published")))
         })
         .await?;
     let blocks: Vec<u64> = er.api().call(RpcRequest::GetBlocks, &(start, end)).await?;

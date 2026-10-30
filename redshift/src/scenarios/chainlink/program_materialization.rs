@@ -35,6 +35,7 @@ const LOADER_V3_PROGRAMDATA_METADATA: usize = 45;
 const WRITES: [u64; 2] = [61, 62];
 
 /// Materializes supported loaders and multiple programs without L1 lookup-table writes.
+/// A post-shutdown lookup-table creation proves the base-history detector can observe such writes.
 pub struct ProgramMaterialization {
     base: Rc<BaseCtx>,
     identity: Keypair,
@@ -43,6 +44,7 @@ pub struct ProgramMaterialization {
 }
 
 impl PrivateErScenario for ProgramMaterialization {
+    /// Captures the validator identity's base history before booting the private ER.
     async fn setup(base: Rc<BaseCtx>, _: ()) -> Result<Self> {
         let identity = topology::identity_for_label(LABEL)?;
         let baseline = base
@@ -65,6 +67,7 @@ impl PrivateErScenario for ProgramMaterialization {
         })
     }
 
+    /// Checks loader normalization and execution while guarding against incidental ALT creation.
     async fn run(self) -> Result<()> {
         let alt_program = sdk_ids::address_lookup_table::ID.to_string();
         let alt_transactions = async || -> Result<usize> {
@@ -113,6 +116,7 @@ impl PrivateErScenario for ProgramMaterialization {
     }
 }
 
+/// Executes supported loader fixtures and checks their ER code images after normalization.
 async fn verify_loaders(base: &BaseCtx, er: &ErCtx) -> Result<()> {
     let funder = base.funded_payer(PAYER_LAMPORTS).await?;
     let payer = base.delegated_payer(&funder, er.identity(), PAYER_DELEGATION).await?;
@@ -166,6 +170,7 @@ async fn verify_loaders(base: &BaseCtx, er: &ErCtx) -> Result<()> {
     Ok(())
 }
 
+/// Requires a single transaction to materialize and update accounts owned by two distinct programs.
 async fn verify_multi_program(base: &BaseCtx, er: &ErCtx) -> Result<()> {
     let [(first_program, _), (second_program, _)] = topology::redline_loader_v3_pair();
 
@@ -229,6 +234,7 @@ async fn cloned_program(er: &ErCtx, program: &Pubkey) -> Result<(Pubkey, Vec<u8>
     Ok((cloned.owner, cloned.data))
 }
 
+/// Retries through asynchronous materialization, requiring matching execution logs on success.
 async fn invoke_until(
     er: &ErCtx,
     payer: &Keypair,

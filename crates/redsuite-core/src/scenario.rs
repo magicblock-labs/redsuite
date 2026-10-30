@@ -1,6 +1,6 @@
 use std::{future::Future, panic::AssertUnwindSafe, rc::Rc, result, time::Instant};
 
-use anyhow::ensure;
+use anyhow::{ensure, Error};
 
 use futures_util::FutureExt;
 use tokio::task::LocalSet;
@@ -107,7 +107,7 @@ impl RunRecord {
         let mut record = Self::new(name);
         record.phase = phase;
         error!(scenario = %record.name, phase, %reason, "scenario did not complete");
-        record.outcome = Err(crate::DynError::msg(reason));
+        record.outcome = Err(Error::msg(reason));
         record
     }
 
@@ -152,7 +152,7 @@ impl RunRecord {
         let mut base = topology::base_only(config).await?;
         base.scenario = Some(self.name.clone());
         let base = Rc::new(base);
-        let state = state.map_err(crate::DynError::msg)?;
+        let state = state.map_err(Error::msg)?;
         let resources = base.resources();
         self.phase = "setup";
         let started = Instant::now();
@@ -167,7 +167,7 @@ impl RunRecord {
             Ok(Err(error)) => (None, Err(error)),
             Err(payload) => {
                 self.phase = "panic";
-                (None, Err(crate::DynError::msg(panic_message(payload))))
+                (None, Err(Error::msg(panic_message(payload))))
             }
         };
         self.report = report.or_else(|| self.report.take()).map(|report| {

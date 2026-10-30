@@ -24,6 +24,7 @@ const CHUNK: usize = 256;
 
 mod buffers;
 
+/// Seeded successor-nonce probes shared by inline and buffered commit paths.
 pub(super) struct Plan {
     markers: Vec<u64>,
     cases: [u8; 6],
@@ -46,6 +47,7 @@ pub(super) fn plan(seed: u64) -> Result<Plan> {
     })
 }
 
+/// A base account delegated to a known signing authority, independent of ER settlement delivery.
 struct CommitFixture<'a> {
     base: &'a BaseCtx,
     er: &'a ErCtx,
@@ -56,6 +58,7 @@ struct CommitFixture<'a> {
 }
 
 impl SettlementAuthorization {
+    /// Rejects stale, skipped, and unauthorized successors before accepting the exact next nonce.
     pub(super) async fn check_commit_ordering(&self) -> Result<()> {
         let plan = &self.commit_plan;
         let markers = &plan.markers;
@@ -128,6 +131,7 @@ impl SettlementAuthorization {
 }
 
 impl CommitFixture<'_> {
+    /// Makes otherwise identical base transactions distinct without changing the commit nonce.
     fn tag(&self) -> Instruction {
         let nonce = self.sequence.get() + 1;
         self.sequence.set(nonce);
@@ -144,6 +148,7 @@ impl CommitFixture<'_> {
         Ok(data)
     }
 
+    /// Builds equivalent inline or buffered updates while preserving the account's lamports.
     async fn instruction(
         &self,
         authority: Pubkey,
@@ -183,6 +188,7 @@ impl CommitFixture<'_> {
         })
     }
 
+    /// Initializes and fills a nonce-scoped buffer, checking the assembled payload before use.
     async fn buffer(&self, nonce: u64, data: &[u8]) -> Result<Pubkey> {
         let (_, buffer) = self.initialize_buffer(nonce, data.len()).await?;
         for (index, chunk) in data.chunks(CHUNK).enumerate() {
@@ -207,6 +213,7 @@ impl CommitFixture<'_> {
         Ok(buffer)
     }
 
+    /// Creates the chunk bitmap and payload account for a specific commit successor.
     async fn initialize_buffer(&self, nonce: u64, size: usize) -> Result<(Pubkey, Pubkey)> {
         let count = size.div_ceil(CHUNK);
         let (init, chunks, buffer) = create_init_ix(CreateInitIxArgs {
@@ -250,6 +257,7 @@ impl CommitFixture<'_> {
         Ok(())
     }
 
+    /// Accepts a successor and checks both its marked data and persisted last-commit ID.
     async fn commit(&self, nonce: u64, marker: u64, buffered: bool) -> Result<()> {
         let data = self.marked_data(marker).await?;
         let buffer = if buffered { Some(self.buffer(nonce, &data).await?) } else { None };
@@ -289,6 +297,7 @@ impl CommitFixture<'_> {
         self.rejected_at(instructions, signers, 0, error).await
     }
 
+    /// Requires the exact failing instruction and rollback of all non-payer inputs on both chains.
     async fn rejected_at(
         &self,
         instructions: &[Instruction],

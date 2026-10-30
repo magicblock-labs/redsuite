@@ -23,6 +23,8 @@ const EXECUTED_TRANSFER: u64 = 300_000_000;
 const RENT_EXEMPT: u64 = 890_880;
 
 /// Checks cold reads, negative-cache invalidation, mirror refresh, and delegated isolation.
+/// Plain mirrors follow base updates; delegated execution must remain isolated
+/// from later base top-ups.
 pub struct AccountMirroringAndIsolation {
     base: Rc<BaseCtx>,
     er: ErCtx,
@@ -33,6 +35,7 @@ impl Scenario for AccountMirroringAndIsolation {
         Ok(Self { base, er })
     }
 
+    /// Establishes mirror behavior before comparing delegated and base-chain balances.
     async fn run(self) -> Result<()> {
         self.check_cold_reads().await?;
         self.check_plain_clone().await?;
@@ -54,6 +57,7 @@ impl Scenario for AccountMirroringAndIsolation {
 }
 
 impl AccountMirroringAndIsolation {
+    /// Requires the first ER reads to materialize funded base accounts correctly.
     #[instrument(skip_all, err)]
     async fn check_cold_reads(&self) -> Result<()> {
         let keys: Vec<_> = (0..3).map(|_| Keypair::new().pubkey()).collect();
@@ -70,6 +74,7 @@ impl AccountMirroringAndIsolation {
         Ok(())
     }
 
+    /// Reads an absent key before funding it to exercise negative-cache invalidation.
     #[instrument(skip_all, err)]
     async fn check_absent(&self) -> Result<()> {
         let key = Keypair::new().pubkey();
@@ -79,6 +84,7 @@ impl AccountMirroringAndIsolation {
         Ok(())
     }
 
+    /// Requires an already-cloned wallet to observe a later base-chain top-up.
     #[instrument(skip_all, err)]
     async fn check_refresh(&self) -> Result<Keypair> {
         let wallet = self.base.funded_payer(FIRST_AIRDROP).await?;
@@ -88,6 +94,7 @@ impl AccountMirroringAndIsolation {
         Ok(wallet)
     }
 
+    /// Delegates a wallet, then ensures base funding cannot overwrite its ER-owned balance.
     #[instrument(skip_all, err)]
     async fn check_balance_isolation(&self, funder: &Keypair) -> Result<Keypair> {
         let spender = self.base.delegated_payer(funder, self.er.identity(), PAYER_LAMPORTS).await?;
@@ -102,6 +109,7 @@ impl AccountMirroringAndIsolation {
         Ok(spender)
     }
 
+    /// Checks mixed account states in one batch without losing input order or absence information.
     #[instrument(skip_all, err)]
     async fn check_batch_reads(
         &self,
@@ -155,6 +163,7 @@ impl AccountMirroringAndIsolation {
 }
 
 impl AccountMirroringAndIsolation {
+    /// A non-delegated program account follows base writes but cannot be written on the ER.
     #[instrument(skip_all, err)]
     async fn check_plain_clone(&self) -> Result<()> {
         let payer = self.base.funded_payer(PAYER_LAMPORTS).await?;

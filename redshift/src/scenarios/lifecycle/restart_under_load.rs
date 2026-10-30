@@ -35,6 +35,7 @@ const FILL: usize = 128;
 const SCENARIO_TIMEOUT: Duration = Duration::from_secs(110);
 const RESUME_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Shutdown modes with distinct durability expectations for the per-lane confirmed tail.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Mode {
     Graceful,
@@ -62,6 +63,7 @@ impl Mode {
     }
 }
 
+/// Submission knowledge; transport interruption is unresolved until recovered history is queried.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Outcome {
     Unresolved,
@@ -70,6 +72,7 @@ enum Outcome {
     Dropped,
 }
 
+/// Per-lane write identity used to reconstruct the latest retained account value.
 struct Record {
     id: u64,
     lane: usize,
@@ -94,6 +97,7 @@ fn archived_snapshots(storage_dir: &Path) -> Result<usize> {
     Ok(count)
 }
 
+/// Shared admission gate and submission journal for one set of concurrent writers.
 struct LaneState {
     admit: Cell<bool>,
     stop: watch::Sender<bool>,
@@ -111,6 +115,7 @@ impl LaneState {
         }
     }
 
+    /// Journals the signature before delivery so a shutdown-raced send can be resolved afterward.
     async fn send(&self, lane: usize, account: Pubkey, sender: &TxSender) -> Result<()> {
         let id = self.next_id.get();
         self.next_id.set(id + 1);
@@ -137,6 +142,7 @@ impl LaneState {
     }
 }
 
+/// Owned writer tasks with separate stop-admitting and interrupt-confirmation controls.
 struct Lanes {
     state: Rc<LaneState>,
     tasks: JoinSet<()>,
@@ -158,6 +164,7 @@ impl Lanes {
         Self { state, tasks }
     }
 
+    /// Stops admission and releases in-flight confirmation waits before shutting down the ER.
     fn halt(&self) {
         self.state.admit.set(false);
         self.state.stop.send_replace(true);
@@ -172,6 +179,7 @@ impl Lanes {
             .count()
     }
 
+    /// Stops admission but lets current confirmations finish before collecting the journal.
     async fn drain(self) -> Vec<Record> {
         self.state.admit.set(false);
         self.tasks.join_all().await;
@@ -179,6 +187,8 @@ impl Lanes {
     }
 }
 
+/// Retains interrupted/transport-failed confirmation as unresolved, not as
+/// execution failure or loss.
 async fn await_status(api: &Api, signature: &Signature, stop: &watch::Sender<bool>) -> Outcome {
     let mut stopped = stop.subscribe();
     if *stopped.borrow() {
@@ -194,6 +204,7 @@ async fn await_status(api: &Api, signature: &Signature, stop: &watch::Sender<boo
     }
 }
 
+/// Resolves transport-ambiguous submissions against the recovered ledger, not send acknowledgments.
 async fn resolve(api: &Api, records: &mut [Record]) -> Result<()> {
     for record in records.iter_mut() {
         if record.outcome != Outcome::Unresolved {
@@ -208,6 +219,7 @@ async fn resolve(api: &Api, records: &mut [Record]) -> Result<()> {
     Ok(())
 }
 
+/// Requires each lane's account to contain its latest retained successful write.
 async fn check_state(er: &ErCtx, label: &str, pool: &[Pubkey], records: &[Record]) -> Result<()> {
     let mut expected = vec![None; pool.len()];
     for record in records.iter().filter(|record| record.outcome == Outcome::Confirmed) {
@@ -229,6 +241,7 @@ async fn check_state(er: &ErCtx, label: &str, pool: &[Pubkey], records: &[Record
     Ok(())
 }
 
+/// Allows only per-lane tail loss after SIGKILL; graceful shutdown may lose no confirmed record.
 async fn settle_after_restart(api: &Api, mode: Mode, records: &mut [Record]) -> Result<()> {
     let mut per_lane: BTreeMap<usize, Vec<&mut Record>> = BTreeMap::new();
     for record in records.iter_mut().filter(|record| record.outcome == Outcome::Confirmed) {
@@ -277,6 +290,8 @@ fn check_exit(mode: Mode, outcome: &RestartOutcome) -> Result<()> {
     Ok(())
 }
 
+/// Crosses a checkpoint under load, checks recovery, then checks a second
+/// restart after new progress.
 async fn run_mode(base: &BaseCtx, er: &ErCtx, mode: Mode) -> Result<()> {
     let label = mode.label();
     let prep_payers = base.funded_payers(LANES, PREP_PAYER_LAMPORTS).await?;
@@ -352,6 +367,7 @@ impl Scenario for RestartUnderLoad {
         Ok(Self { base, er })
     }
 
+    /// Applies mode-specific durability expectations within one overall scenario deadline.
     async fn run(self) -> Result<()> {
         time::timeout(SCENARIO_TIMEOUT, async {
             run_mode(&self.base, &self.er, Mode::Graceful).await?;
@@ -362,6 +378,7 @@ impl Scenario for RestartUnderLoad {
     }
 }
 
+/// Keeps writers active after enough confirmations and an archived superblock establish real load.
 #[instrument(skip_all, err, fields(mode = label))]
 async fn fill(
     er: &ErCtx,
