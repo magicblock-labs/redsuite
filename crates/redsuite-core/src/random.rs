@@ -1,3 +1,5 @@
+use keypair::Keypair;
+use pubkey::Pubkey;
 pub use rand::Rng;
 use rand::{rngs::StdRng, SeedableRng};
 use sha2::{Digest, Sha256};
@@ -14,8 +16,14 @@ pub fn rng(seed: u64, keys: &[&str], index: u64) -> StdRng {
     StdRng::from_seed(hash.finalize().into())
 }
 
-pub fn keypair(rng: &mut impl Rng) -> keypair::Keypair {
+pub fn keypair(rng: &mut impl Rng) -> Keypair {
     let mut secret = [0u8; 32];
     rng.fill(&mut secret);
-    keypair::Keypair::new_from_array(secret)
+    Keypair::new_from_array(secret)
+}
+
+pub fn pubkey(rng: &mut impl Rng) -> Pubkey {
+    let mut bytes = [0u8; 32];
+    rng.fill(&mut bytes);
+    Pubkey::new_from_array(bytes)
 }

@@ -198,7 +198,7 @@ impl RunRecord {
             info!("passed");
             return;
         }
-        Span::current().record("stage", self.phase);
+        Span::current().record("phase", self.phase);
         match &self.outcome {
             Err(error) => error!(error = %format_args!("{error:#}"), "failed"),
             Ok(()) => error!("verdict failed"),
@@ -256,7 +256,7 @@ where
 }
 
 // Error-level spans retain context without emitting standalone events.
-#[instrument(name = "run", skip_all, level = "error", fields(scenario = %name, seed, stage))]
+#[instrument(name = "run", skip_all, level = "error", fields(scenario = %name, phase))]
 async fn execute<V, State, Body>(
     name: String,
     fixtures: &[Fixture],
@@ -268,9 +268,6 @@ where
     V: Verdict,
     Body: AsyncFnOnce(Rc<BaseCtx>, State, &mut &'static str) -> Result<V>,
 {
-    if !V::REPORTS {
-        Span::current().record("seed", config.seed);
-    }
     let persist = V::REPORTS && !config.continuous;
     let run = async {
         let mut record = RunRecord::new(name);

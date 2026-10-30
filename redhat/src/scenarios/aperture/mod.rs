@@ -1,35 +1,16 @@
-use std::{rc::Rc, result, time::Duration};
-
-use anyhow::{ensure, Context};
-use hash::Hash;
-use instruction::{AccountMeta, Instruction};
-use keypair::Keypair;
-use pubkey::Pubkey;
-use serde_json::{json, Value};
-use signature::Signature;
-use signer::Signer;
-use solana_instruction_error::InstructionError;
-
-use redsuite_core::{
-    api::{transaction_meta, RpcError},
-    netfault::Selector,
-    programs::{CellHeader, REDSHIFT},
-    rpc_types::{
-        config::RpcSendTransactionConfig, request::RpcRequest, response::TransactionError,
-    },
-    signed::{audit, audit_signatures, decode_state, subscribe, Signed},
-    transaction_types::{UiTransactionEncoding, UiTransactionError},
-    BaseCtx, ChainCtx, ErCtx, Result, Scenario,
-};
-
-use crate::PAYER_LAMPORTS;
+use std::time::Duration;
 
 const TIMEOUT: Duration = Duration::from_secs(30);
 
+mod admission;
 mod authority;
-mod hostile;
+mod fixture;
 mod protocol;
+mod simulation;
+mod structure;
 
+pub use admission::TransactionAdmission;
 pub use authority::TransactionAuthority;
-pub use hostile::{TransactionAdmission, TransactionStructure};
 pub use protocol::ProtocolInputs;
+pub use simulation::SimulationIsolation;
+pub use structure::TransactionStructure;
