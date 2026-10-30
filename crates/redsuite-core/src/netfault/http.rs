@@ -1,5 +1,6 @@
-use super::{gate, merged, operation, parse, rejection, Decision, Shared, Stage, Transport};
+use super::{gate, rpc, Decision, Shared, Stage, Transport};
 use crate::transport::http::{self, TransportError};
+use json::Value;
 use reqwest::{Client, StatusCode};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -22,7 +23,7 @@ pub(super) async fn accept(listener: TcpListener, upstream: Url, client: Client,
             client.clone(),
             shared.clone(),
         ));
-        shared.borrow_mut().track(handle);
+        shared.borrow_mut().track(Transport::Http, handle);
     }
 }
 
@@ -94,58 +95,30 @@ async fn serve_http(mut socket: TcpStream, upstream: Url, client: Client, shared
                     && value.trim().eq_ignore_ascii_case("close")
             })
         });
-        let parsed = parse(&body);
-        let (id, request) = match &parsed {
-            Some(parsed) => (
-                parsed.id.clone(),
-                operation(
-                    Transport::Http,
-                    Stage::Request,
-                    parsed.method.as_deref().unwrap_or("?"),
-                    parsed.strings.clone(),
-                ),
-            ),
-            None => (
-                None,
-                operation(Transport::Http, Stage::Request, "?", Vec::new()),
-            ),
-        };
-        let (decision, _request_hold) = gate(&shared, request.clone()).await;
-        match decision {
+        let parsed: Value = json::from_str(&body).unwrap_or_default();
+        let mut operation = rpc::request(Transport::Http, &parsed);
+        let (decision, _request_hold) = gate(&shared, operation.clone()).resolve().await;
+        let (status, text, _response_hold) = match decision {
             Decision::Discard => return,
-            Decision::Reject(message) => {
-                if !write_response(&mut socket, StatusCode::OK, &rejection(&id, &message)).await {
-                    return;
-                }
-                if !keep_alive {
-                    return;
-                }
-                continue;
-            }
-            Decision::Release => {}
-        }
-        let (status, text) = match http::post_json(&client, &upstream, body).await {
-            Ok(text) => (StatusCode::OK, text),
-            Err(TransportError::Status { status, body }) => (status, body),
-            Err(error) => (StatusCode::BAD_GATEWAY, error.to_string()),
-        };
-        let extra = parse(&text).map(|parsed| parsed.strings).unwrap_or_default();
-        let response = merged(request, Stage::Response, extra);
-        let (decision, _response_hold) = gate(&shared, response).await;
-        match decision {
-            Decision::Discard => return,
-            Decision::Reject(message) => {
-                if !write_response(&mut socket, StatusCode::OK, &rejection(&id, &message)).await {
-                    return;
-                }
-            }
+            Decision::Reject(message) => (StatusCode::OK, rpc::rejection(&parsed, &message), None),
             Decision::Release => {
-                if !write_response(&mut socket, status, &text).await {
-                    return;
+                let (status, text) = match http::post_json(&client, &upstream, body).await {
+                    Ok(text) => (StatusCode::OK, text),
+                    Err(TransportError::Status { status, body }) => (status, body),
+                    Err(error) => (StatusCode::BAD_GATEWAY, error.to_string()),
+                };
+                operation.stage = Stage::Response;
+                let (decision, holding) = gate(&shared, operation).resolve().await;
+                match decision {
+                    Decision::Discard => return,
+                    Decision::Reject(message) => {
+                        (StatusCode::OK, rpc::rejection(&parsed, &message), holding)
+                    }
+                    Decision::Release => (status, text, holding),
                 }
             }
-        }
-        if !keep_alive {
+        };
+        if !write_response(&mut socket, status, &text).await || !keep_alive {
             return;
         }
     }

@@ -11,7 +11,7 @@ use pubkey::Pubkey;
 
 use redsuite_core::{
     dlp::{self, delegate_with_actions, DelegateArgs},
-    netfault::{BaseProxies, Selector},
+    netfault::{Faults, Selector, Transport},
     prep,
     programs::{CellHeader, REDSHIFT},
     system,
@@ -52,7 +52,7 @@ struct Discovery {
 
 struct Activation<'a> {
     base: &'a BaseCtx,
-    proxies: &'a BaseProxies,
+    faults: &'a Faults,
     er: &'a ErCtx,
     funder: &'a Keypair,
     er_payer: &'a Rc<Keypair>,
@@ -164,9 +164,9 @@ impl Activation<'_> {
             .http()
             .response()
             .account(&dependency);
-        let stall = self.proxies.stall(selector.clone());
+        let stall = self.faults.stall(selector);
         let trigger = self.delegate_trigger(&dependency, fail).await?;
-        self.proxies.await_held(selector, INTERCEPT_TIMEOUT).await?;
+        stall.wait_hit(INTERCEPT_TIMEOUT).await?;
         let discovery = self.race_discovery(&trigger.pubkey(), before).await?;
         stall.remove();
         discovery.settle().await;
@@ -214,14 +214,14 @@ impl Discovery {
 /// Checks single activation effects through notifications, reconnect, restart, and rescue.
 pub struct ActivationSingleShot {
     base: Rc<BaseCtx>,
-    proxies: Rc<BaseProxies>,
+    faults: Rc<Faults>,
     er: ErCtx,
 }
 
 impl Scenario for ActivationSingleShot {
     async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
-        let proxies = er.http_proxy()?;
-        Ok(Self { base, proxies, er })
+        let faults = er.faults()?;
+        Ok(Self { base, faults, er })
     }
 
     async fn run(self) -> Result<()> {
@@ -238,7 +238,7 @@ impl Scenario for ActivationSingleShot {
             .await?;
         let activation = Activation {
             base: &self.base,
-            proxies: &self.proxies,
+            faults: &self.faults,
             er,
             funder: &funder,
             er_payer: &er_payer,
@@ -257,7 +257,8 @@ impl Scenario for ActivationSingleShot {
         self.base
             .submit_and_confirm(&funder, &[system::transfer(&funder.pubkey(), &trigger, 1)])
             .await?;
-        self.proxies.close_connections();
+        self.faults.disconnect(Transport::Http);
+        self.faults.disconnect(Transport::Ws);
         self.base
             .submit_and_confirm(&funder, &[system::transfer(&funder.pubkey(), &trigger, 1)])
             .await?;
@@ -268,7 +269,7 @@ impl Scenario for ActivationSingleShot {
         let er = &self.er;
         let activation = Activation {
             base: &self.base,
-            proxies: &self.proxies,
+            faults: &self.faults,
             er,
             funder: &funder,
             er_payer: &er_payer,
@@ -288,7 +289,7 @@ impl Scenario for ActivationSingleShot {
         activation.run(true).await?;
         activation.hold_steady(applied, STEADY_WINDOW).await?;
 
-        self.proxies.reset().await?;
+        self.faults.reset().await?;
         Ok(())
     }
 }

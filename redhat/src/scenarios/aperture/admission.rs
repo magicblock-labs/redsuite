@@ -39,7 +39,7 @@ impl Scenario for TransactionAdmission {
             0,
         );
         let mut fixture = Fixture::new(self.base, self.er, &mut rng).await?;
-        let proxies = fixture.er.http_proxy()?;
+        let faults = fixture.er.faults()?;
         for skip_preflight in [false, true] {
             let cold = fixture.base.seeded_payer(&mut rng, 1_000_000).await?.pubkey();
             let source = fixture.base.account(&cold).await?;
@@ -48,7 +48,7 @@ impl Scenario for TransactionAdmission {
                 .http()
                 .request()
                 .account(&cold);
-            let refused = proxies.reject(selector, "hostile account read refused");
+            let refused = faults.reject(selector, "hostile account read refused");
             let before = fixture.snapshot(&[]).await?;
             let read = fixture.er.account(&cold).await;
             match read {
@@ -160,7 +160,7 @@ impl Scenario for TransactionAdmission {
                     error: None,
                 };
                 let before = fixture.snapshot(&[]).await?;
-                let trap = proxies.intercept(
+                let trap = faults.intercept(
                     Selector::methods(&["getAccountInfo", "getMultipleAccounts"])
                         .http()
                         .request()
@@ -275,7 +275,7 @@ impl Scenario for TransactionAdmission {
                 .check_control(VersionedMessage::Legacy(repaired), 11, 1, skip_preflight)
                 .await?;
         }
-        proxies.reset().await?;
+        faults.reset().await?;
         Ok(())
     }
 }

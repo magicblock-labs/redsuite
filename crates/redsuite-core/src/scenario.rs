@@ -224,7 +224,7 @@ where
     Body: AsyncFnOnce(Rc<BaseCtx>, ErCtx, &mut &'static str) -> Result<V>,
 {
     execute(name, fixtures, config, er, async move |base, er, stage| {
-        let er = er.for_scenario();
+        let er = er.for_scenario()?;
         let outcome = AssertUnwindSafe(body(base, er.clone(), stage)).catch_unwind().await;
         let reset = er.reset_faults().await;
         match outcome {
