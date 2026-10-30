@@ -25,6 +25,7 @@ pub mod topology;
 pub mod transport;
 pub mod wait;
 
+pub use account::Account;
 pub use anyhow::Error as DynError;
 pub use api::{Api, Metrics, MetricsDelta, SendBody};
 pub use context::{BaseCtx, ChainCtx, ErClient, ErCtx, TxSender};

@@ -149,8 +149,8 @@ chosen family. Multiple selections run together without repeating scenarios;
 an exact name takes precedence over prefix matches. Omit selections to run the
 whole family. Use the family's `list` command to preview selections.
 
-Redline defaults to the shorter `lite` workloads. Only `redline run` accepts
-`--profile` or reads `REDSUITE_PROFILE`. Correctness and
+Redline defaults to the shorter `lite` workloads. Only `redline run` and
+`continuous` accept `--profile` or read `REDSUITE_PROFILE`. Correctness and
 adversarial checks use fixed workloads. Redline benchmarks run sequentially;
 checks can use `--fresh-concurrency` to bound concurrent fresh scenarios.
 
@@ -164,8 +164,8 @@ stops, admitted work drains, and workload-specific state checks run. Ctrl+C
 returns 130 and marks reports interrupted. Performance is reported, not judged
 against machine-wide thresholds or saved baselines. Redline assertions, including
 state checks, only log warnings; use Bencher metrics to catch regressions.
-Operational errors, such as failed RPC calls and confirmation timeouts, still
-fail the workload.
+Operational errors, such as failed RPC calls and confirmation or execution-drain
+timeouts, still fail the workload.
 
 `redsuite continuous` repeatedly runs the Redshift, Redhat, and Redline scenarios
 that use the default ER, all on one ER, until a scenario fails or Ctrl+C. Each
@@ -291,7 +291,7 @@ the campaign to export; older report layouts are not read.
 | `REDSUITE_STACK_DIR` | Place ledgers, stack state, and logs on another disk; defaults to `target/redsuite-stack` under the resource root. |
 | `REDSUITE_ACCOUNTSDB_DIR` | Place rollup and verifier accounts databases separately from their ledgers. |
 | `REDSUITE_CLONE_URL` | Choose the RPC endpoint used to acquire base-chain programs on a cold boot. |
-| `REDSUITE_PROFILE` | Set the Redline run/load preset to `lite` or `full`; `--profile` overrides it. Other commands do not read it. |
+| `REDSUITE_PROFILE` | Set the `redline run` and `continuous` preset to `lite` or `full`; `--profile` overrides it. Other commands do not read it. |
 | `RUST_LOG` | Log filter for RedSuite and launched validators; defaults to `info`. Use `debug` for passing-run details. |
 
 The compiled runner works without Cargo or a source checkout at runtime, but it

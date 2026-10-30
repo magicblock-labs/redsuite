@@ -17,7 +17,8 @@ use redsuite_core::{
     programs::{CellHeader, HashState, REDLINE},
     redline::{causal, check_ok, Accounts},
     report::Unit,
-    wait, BaseCtx, ChainCtx, ErCtx, Metrics, MetricsDelta, Result, Scenario, ScenarioReport,
+    wait, Account, BaseCtx, ChainCtx, ErCtx, Metrics, MetricsDelta, Result, Scenario,
+    ScenarioReport,
 };
 use tracing::{debug, info, instrument};
 
@@ -145,20 +146,31 @@ struct DrainState {
     pending: f64,
 }
 
-async fn verify_final_state(
+async fn read_final_state(
     er: &ErCtx,
     pool: &[Pubkey],
+    last_ids: &[Option<u64>],
+) -> Result<Vec<Option<Account>>> {
+    let mut accounts = Vec::with_capacity(pool.len());
+    for (pda, last_id) in pool.iter().zip(last_ids) {
+        accounts.push(if last_id.is_some() { er.account(pda).await? } else { None });
+    }
+    Ok(accounts)
+}
+
+fn verify_final_state(
+    accounts: &[Option<Account>],
     last_ids: &[Option<u64>],
     hash_iters: u32,
     read_span: usize,
 ) -> Result<()> {
     let expected_hash = HashState::chain(causal::HASH_INIT.to_bytes(), hash_iters);
     let expected_sum = (read_span as u64) * u64::from(ACCOUNT_SPACE);
-    for (index, pda) in pool.iter().enumerate() {
-        let Some(last_id) = last_ids[index] else {
+    for (account, last_id) in accounts.iter().zip(last_ids) {
+        let Some(last_id) = *last_id else {
             continue;
         };
-        let account = er.account(pda).await?.context("pda not on er")?;
+        let account = account.as_ref().context("pda not on er")?;
         let data = &account.data;
         let mode = mode_for(last_id);
         ensure!(CellHeader::written_id(data) == Some(last_id));
@@ -363,14 +375,13 @@ impl Executed {
 
         let state_started = Instant::now();
         let settled = wait::retry("workload final state", SETTLE_TIMEOUT, async || {
+            let accounts = read_final_state(er, pool, &self.last_ids).await?;
             verify_final_state(
-                er,
-                pool,
+                &accounts,
                 &self.last_ids,
                 profile.hash_iters,
                 profile.read_span,
             )
-            .await
         })
         .await;
         check_ok(settled, "workload final state did not settle");
@@ -451,14 +462,13 @@ impl Executed {
             debug!(rpc_accepted, total, "RPC acceptance window");
         }
 
+        let accounts = read_final_state(er, pool, &self.last_ids).await?;
         let verified = verify_final_state(
-            er,
-            pool,
+            &accounts,
             &self.last_ids,
             profile.hash_iters,
             profile.read_span,
-        )
-        .await;
+        );
         check_ok(verified, "workload final state changed after settling");
 
         debug!(

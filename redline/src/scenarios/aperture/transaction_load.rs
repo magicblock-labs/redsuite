@@ -1,13 +1,13 @@
 use std::{rc::Rc, sync::Arc, time::Instant};
 
-use anyhow::{ensure, Context};
+use anyhow::Context;
 use instruction::Instruction;
 use pubkey::Pubkey;
 use redsuite_core::{
     check,
     config::{LoopMode, ProfileValues},
     programs::{CellHeader, HashState, REDLINE},
-    redline::{causal, check_ok, Accounts},
+    redline::{causal, Accounts},
     report::Unit,
     runner::{execute, execute_and_sync, Pacing, RunConfig, RunOutcome},
     transport::{
@@ -18,7 +18,7 @@ use redsuite_core::{
     BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport, TxSender,
 };
 use tokio::sync::watch::Receiver;
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
 
 use crate::{metrics, program::layout, RunControl, ACCOUNT_SPACE};
 
@@ -129,10 +129,7 @@ impl Scenario<(ScenarioReport, Result<()>), Shape> for TransactionLoad {
                 if measured.outcome.delivered == 0 {
                     break;
                 }
-                check_ok(
-                    self.check_final_state(cursor, measured.outcome.delivered).await,
-                    "final account state missed the delivered writes",
-                );
+                self.check_final_state(cursor, measured.outcome.delivered).await?;
                 remaining = remaining.saturating_sub(measured.outcome.admission_wall);
                 cursor += measured.outcome.delivered;
                 delivered += measured.outcome.delivered;
@@ -292,7 +289,7 @@ impl TransactionLoad {
         })
     }
 
-    #[instrument(skip_all)]
+    #[instrument(skip_all, err)]
     async fn check_final_state(&self, offset: u64, count: u64) -> Result<()> {
         for pda in self.pdas.iter() {
             let last_id =
@@ -300,11 +297,14 @@ impl TransactionLoad {
             let Some(last_id) = last_id else {
                 continue;
             };
-            let on_er = self.er.account(pda).await?.context("pda not on er")?;
-            ensure!(CellHeader::written_id(&on_er.data) == Some(last_id));
+            let Some(on_er) = self.er.account(pda).await? else {
+                warn!(%pda, "pda not on er");
+                continue;
+            };
+            check!(CellHeader::written_id(&on_er.data) == Some(last_id));
             if matches!(self.shape, Shape::Compute) {
                 let expected = HashState::chain(causal::HASH_INIT.to_bytes(), 180);
-                ensure!(
+                check!(
                     on_er.data[layout::HASH_OFFSET..layout::HASH_OFFSET + layout::HASH_SIZE]
                         == expected
                 );

@@ -182,7 +182,7 @@ pub(super) async fn join_load(handles: Workers<RawRunOutcome>) -> Result<RunOutc
     Ok(merge_outcomes(handles.join().await?))
 }
 
-pub(super) async fn await_load_reaching_executors(er: &ErCtx) {
+pub(super) async fn await_load_reaching_executors(er: &ErCtx) -> Result<()> {
     let reached = wait::retry(
         "the independent load reaches the executors",
         WARM_IN_TIMEOUT,
@@ -195,4 +195,6 @@ pub(super) async fn await_load_reaching_executors(er: &ErCtx) {
     )
     .await;
     check_ok(reached, "independent load did not reach the executors");
+    er.scrape_metrics().await?;
+    Ok(())
 }

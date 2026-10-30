@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{ensure, Context};
+use anyhow::ensure;
 use futures_util::future::join_all;
 use keypair::Keypair;
 use pubkey::Pubkey;
@@ -21,7 +21,7 @@ use redsuite_core::{
     programs::HashState,
     redline::{
         causal::{self, CausalPair, Step},
-        check_ok, Accounts,
+        Accounts,
     },
     runner::RunOutcome,
     sampler::{MeanMax, Sampled, Sampler, Trailing},
@@ -173,15 +173,14 @@ fn is_idle(metrics: &Metrics) -> bool {
 
 async fn drain(er: &ErCtx, target: f64) -> Result<DrainState> {
     let started = Instant::now();
-    let executed = crate::await_executed(er, target, DRAIN_TIMEOUT).await;
-    check_ok(executed, "the workload did not finish executing");
-    let idle = wait::retry("execution pipeline idle", SETTLE_TIMEOUT, async || {
-        ensure!(is_idle(&er.scrape_metrics().await?));
-        Ok(())
-    })
-    .await;
-    check_ok(idle, "the execution pipeline did not idle");
-    let (blocked, busy, pending) = idle_values(&er.scrape_metrics().await?);
+    crate::await_executed(er, target, DRAIN_TIMEOUT).await?;
+    let (blocked, busy, pending) =
+        wait::retry("execution pipeline idle", SETTLE_TIMEOUT, async || {
+            let metrics = er.scrape_metrics().await?;
+            ensure!(is_idle(&metrics));
+            Ok(idle_values(&metrics))
+        })
+        .await?;
     Ok(DrainState {
         elapsed: started.elapsed(),
         blocked,
@@ -254,7 +253,7 @@ async fn run_phase(
         independent_payers.clone(),
         plan.independent_iters,
     );
-    await_load_reaching_executors(er).await;
+    await_load_reaching_executors(er).await?;
     let sampler = spawn_sampler(er);
 
     let stop_task = handles.stop_at(plan.deadline, plan.stop.clone());
@@ -310,10 +309,11 @@ async fn first_failed_step(er: &ErCtx, steps: &[(u64, Step, Signature)]) -> Opti
     None
 }
 
-async fn verify_pairs(er: &ErCtx, pairs: &mut [Pair], batch: usize) {
+async fn verify_pairs(er: &ErCtx, pairs: &mut [Pair], batch: usize) -> Result<()> {
     for (index, pair) in pairs.iter_mut().enumerate() {
+        let accounts = pair.chain.read(er).await?;
         if let Err(error) =
-            pair.chain.verify(er, &format!("batch {batch}: pair {index} on the ER")).await
+            pair.chain.compare(&accounts, &format!("batch {batch}: pair {index} on the ER"))
         {
             let step = first_failed_step(er, &pair.steps)
                 .await
@@ -322,17 +322,18 @@ async fn verify_pairs(er: &ErCtx, pairs: &mut [Pair], batch: usize) {
         }
         pair.steps.clear();
     }
+    Ok(())
 }
 
 async fn verify_independent(er: &ErCtx, accounts: &[Pubkey], iters: u32) -> Result<()> {
     let expected = HashState::chain(causal::HASH_INIT.to_bytes(), iters);
     for (index, address) in accounts.iter().enumerate() {
-        let account = er
-            .account(address)
-            .await?
-            .with_context(|| format!("independent account {index} is not on the ER"))?;
+        let Some(account) = er.account(address).await? else {
+            warn!(index, "independent account is not on the ER");
+            continue;
+        };
         let hash = &account.data[layout::HASH_OFFSET..layout::HASH_OFFSET + layout::HASH_SIZE];
-        ensure!(hash == expected);
+        check!(hash == expected);
     }
     Ok(())
 }
@@ -456,10 +457,7 @@ impl Scenario<(ScenarioReport, Result<()>)> for SchedulerContention {
                 batches.push(outcome);
                 batch += 1;
             }
-            let independent =
-                verify_independent(&self.er, &self.independent, self.profile.independent_iters)
-                    .await;
-            check_ok(independent, "independent account state diverged");
+            verify_independent(&self.er, &self.independent, self.profile.independent_iters).await?;
             Ok(())
         }
         .await;
@@ -484,7 +482,7 @@ impl SchedulerContention {
             self.independent_payer_bytes.clone(),
             self.profile.independent_iters,
         );
-        await_load_reaching_executors(&self.er).await;
+        await_load_reaching_executors(&self.er).await?;
         let sampler = spawn_sampler(&self.er);
         time::sleep(CALIBRATION).await;
         let calibration = join_load(handles).await?;
@@ -616,7 +614,7 @@ impl SchedulerContention {
         let contention_chains =
             outcome.phases.first().map_or(0, |phase| phase.chains) * self.profile.pairs as u64;
         check!(outcome.dependencies >= contention_chains as f64);
-        verify_pairs(&self.er, &mut self.pairs, batch).await;
+        verify_pairs(&self.er, &mut self.pairs, batch).await?;
         debug!(
             batch,
             outcome.dependencies, "contention batch drained; all pairs match accepted fold",
