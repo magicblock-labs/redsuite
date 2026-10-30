@@ -1,15 +1,17 @@
 use account::Account;
 use anyhow::{ensure, Context};
-use redsuite_core::{dlp, expect_error, system, ChainCtx, Result};
+use redsuite_core::{dlp, system, wait, ChainCtx, Result};
 use sdk::spl::{builders::WithdrawThroughDelegatedShuttleWithMergeBuilder, find_rent_pda};
 use signer::Signer;
 use tracing::instrument;
 
-use super::{amount, spl, ProjectedTokenLifecycle, Wallet, SUPPLY};
+use super::{amount, check_readonly, spl, ProjectedTokenLifecycle, Wallet, SUPPLY};
 
 const RECEIVE: u64 = 60;
 const DEPOSIT: u64 = 45;
 
+/// Distinct ways a temporary token overlay can drain, close, be replaced, or
+/// settle through a shuttle.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Case {
     Drain,
@@ -39,6 +41,7 @@ impl Case {
     }
 }
 
+/// Tracks overlay claims and additional base tokens separately from the shared fixture supply.
 pub(super) struct MagicAtas<'a> {
     tokens: &'a ProjectedTokenLifecycle,
     source_balance: u64,
@@ -48,6 +51,7 @@ pub(super) struct MagicAtas<'a> {
 }
 
 impl MagicAtas<'_> {
+    /// Gives each overlay case a fresh destination while reconciling conservation after every case.
     pub(super) async fn run(tokens: &ProjectedTokenLifecycle) -> Result<()> {
         let mut suite = MagicAtas {
             tokens,
@@ -81,6 +85,7 @@ impl MagicAtas<'_> {
         Ok(())
     }
 
+    /// Receives into an overlay, then exercises its case-specific terminal path.
     #[instrument(skip_all, err, fields(case = case.label()))]
     async fn run_case(&mut self, destination: &Wallet, case: Case) -> Result<()> {
         let readonly = if case == Case::Readonly {
@@ -105,6 +110,7 @@ impl MagicAtas<'_> {
         self.check_conservation().await
     }
 
+    /// Seeds a readonly base balance and proves it is unspendable before overlay creation.
     async fn readonly(&mut self, destination: &Wallet) -> Result<Account> {
         let tokens = self.tokens;
         let er = &tokens.er;
@@ -123,8 +129,8 @@ impl MagicAtas<'_> {
         self.extra_base += DEPOSIT;
         let original = tokens.base.account(&destination.ata).await?.context("base ATA missing")?;
         ensure!(er.account(&destination.ata).await?.as_ref() == Some(&original));
-        let attempt = er
-            .submit_and_confirm_with(
+        let error = er
+            .try_submit_and_confirm_with(
                 &tokens.payer,
                 &[&destination.owner, &source.owner],
                 &[
@@ -133,23 +139,16 @@ impl MagicAtas<'_> {
                     source.transfer_to(destination, RECEIVE),
                 ],
             )
-            .await;
-        let error = expect_error(attempt, "readonly balance unspendable before overlay")?;
-        crate::rejection_code(
-            "readonly spend before overlay",
-            &[
-                "InvalidWritableAccount",
-                "ExternalAccountDataModified",
-                "ReadonlyDataModified",
-                "Immutable",
-            ],
-            &format!("{error:#}"),
-        )?;
+            .await?
+            .err()
+            .context("readonly balance spent before overlay")?;
+        check_readonly(&error)?;
         ensure!(er.account(&destination.ata).await?.as_ref() == Some(&original));
         ensure!(amount(er, &source.ata).await? == self.source_balance);
         Ok(original)
     }
 
+    /// Creates an ER-local Magic ATA without changing any pre-existing physical base balance.
     async fn receive(&self, destination: &Wallet, expected_base: Option<u64>) -> Result<()> {
         let tokens = self.tokens;
         let er = &tokens.er;
@@ -185,6 +184,7 @@ impl MagicAtas<'_> {
         Ok(())
     }
 
+    /// Requires delegated backing to replace an empty overlay without an explicit close.
     async fn project(&mut self, destination: &Wallet) -> Result<()> {
         let tokens = self.tokens;
         let er = &tokens.er;
@@ -223,6 +223,7 @@ impl MagicAtas<'_> {
         Ok(())
     }
 
+    /// Observes overlay closure before checking that the original base ATA becomes visible again.
     async fn close(&self, destination: &Wallet, original: Option<&Account>) -> Result<()> {
         let tokens = self.tokens;
         let er = &tokens.er;
@@ -255,6 +256,7 @@ impl MagicAtas<'_> {
         Ok(())
     }
 
+    /// Settles tokens through a shuttle and waits for both overlay and shuttle-account cleanup.
     async fn withdraw(&mut self, destination: &Wallet, transparent: bool) -> Result<()> {
         let tokens = self.tokens;
         let er = &tokens.er;
@@ -286,14 +288,14 @@ impl MagicAtas<'_> {
             .base
             .api()
             .await_query("shuttle settlement and cleanup", async || {
-                ensure!(amount(tokens.base.as_ref(), &destination.ata).await? == RECEIVE);
-                if let Some(local) = er.account(&destination.ata).await? {
-                    ensure!(!spl::is_magic_ata(&local.data));
-                }
-                for address in &shuttle_accounts {
-                    ensure!(tokens.base.account(address).await?.is_none());
-                }
-                Ok(())
+                let balance = amount(tokens.base.as_ref(), &destination.ata).await?;
+                let local = er.account(&destination.ata).await?;
+                let shuttles = tokens.base.accounts(&shuttle_accounts).await?;
+                let projected =
+                    local.as_ref().is_some_and(|account| spl::is_magic_ata(&account.data));
+                let cleaned = shuttles == vec![None; shuttle_accounts.len()];
+                let ready = balance == RECEIVE && !projected && cleaned;
+                Ok(wait::when(ready, (balance, projected, cleaned)))
             })
             .await?;
         if transparent {
@@ -307,6 +309,7 @@ impl MagicAtas<'_> {
         Ok(())
     }
 
+    /// Reconciles all overlay cases with the shared physical-supply and backing-claim oracle.
     async fn check_conservation(&self) -> Result<()> {
         let tokens = self.tokens;
         ensure!(amount(&tokens.er, &tokens.wallets[1].ata).await? == self.source_balance);

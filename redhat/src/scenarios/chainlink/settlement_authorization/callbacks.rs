@@ -21,6 +21,7 @@ use solana_instruction_error::InstructionError;
 use std::time::Duration;
 use transaction::Transaction;
 
+/// Routes a result callback through the protocol callback signer to a writable fixture cell.
 fn callback_args(cell: Pubkey, action_index: u8) -> Result<AddActionCallbackArgs> {
     Ok(AddActionCallbackArgs {
         action_index,
@@ -42,6 +43,7 @@ fn callback_args(cell: Pubkey, action_index: u8) -> Result<AddActionCallbackArgs
     })
 }
 
+/// Settlement contexts whose callback attachment and execution rules are compared.
 #[derive(Clone, Copy, Debug)]
 enum CallbackCategory {
     Commit,
@@ -49,6 +51,7 @@ enum CallbackCategory {
     Undelegate,
 }
 
+/// Independent fixture identities, hostile attachment order, and valid callback controls.
 pub(super) struct Plan {
     nonce: u64,
     cases: Vec<u8>,
@@ -104,6 +107,7 @@ pub(super) fn plan(seed: u64) -> Plan {
     }
 }
 
+/// Builds commit, undelegation, or standalone action intents with optional attached callbacks.
 fn scheduled(
     payer: Pubkey,
     validator: Pubkey,
@@ -155,6 +159,7 @@ fn scheduled(
 }
 
 impl SettlementAuthorization {
+    /// Captures already-materialized local images and their base counterparts for rollback checks.
     async fn callback_images(
         &self,
         keys: &[Pubkey],
@@ -167,6 +172,7 @@ impl SettlementAuthorization {
         Ok((local, self.base.accounts(keys).await?))
     }
 
+    /// Finds a new protocol callback transaction and checks agreement with its terminal status.
     async fn callback_record(
         &self,
         cell: Pubkey,
@@ -218,6 +224,7 @@ impl SettlementAuthorization {
         .await
     }
 
+    /// Checks attachment provenance and rejection isolation before exercising valid delivery.
     pub(super) async fn check_callbacks(&self) -> Result<()> {
         let seed = self.base.config().seed;
         let plan = &self.callback_plan;
@@ -407,6 +414,7 @@ impl SettlementAuthorization {
         .await
     }
 
+    /// Covers successful and failing callbacks across commit, standalone, and handoff contexts.
     async fn callback_control(
         &self,
         funder: &Keypair,
@@ -617,6 +625,7 @@ impl SettlementAuthorization {
         Ok(())
     }
 
+    /// Checks callback delivery effects, including a deliberately malformed payload when requested.
     async fn callback_delivery(
         &self,
         payer: &Keypair,
@@ -722,6 +731,7 @@ impl SettlementAuthorization {
         Ok(())
     }
 
+    /// Ensures attachment cannot reuse an intent outside its allowed transaction context.
     async fn callback_attachment_scope(
         &self,
         sender: &TxSender,

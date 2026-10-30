@@ -5,6 +5,8 @@ use redsuite_core::{
 };
 
 impl SchedulerContention {
+    /// Keeps causal send latency, background throughput, executor stalls,
+    /// and drain evidence distinct.
     pub(super) fn summarize(
         &self,
         batches: &[BatchOutcome],

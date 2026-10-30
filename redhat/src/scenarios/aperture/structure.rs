@@ -21,11 +21,16 @@ use transaction::versioned::VersionedTransaction;
 const ADMITTED: &str = "mbv_transaction_skip_preflight_count";
 const ADMISSION_WINDOW: Duration = Duration::from_secs(90);
 
+/// Checks wire decoding, sanitization, and resource bounds across Legacy, V0, and V1.
+///
+/// Each malformed transaction is paired with a repaired control. Rejections must
+/// leave protected accounts and ledger history untouched, even with preflight disabled.
 pub struct TransactionStructure {
     base: Rc<BaseCtx>,
     er: ErCtx,
 }
 
+/// Message envelopes sharing the same valid cell-update body.
 #[derive(Clone, Copy, Debug)]
 enum Format {
     Legacy,
@@ -81,6 +86,7 @@ fn instructions(message: &mut VersionedMessage) -> &mut Vec<CompiledInstruction>
     }
 }
 
+/// One structural defect applied without changing the other control inputs.
 #[derive(Clone, Copy, Debug)]
 enum Mutation {
     Duplicate,
@@ -112,6 +118,7 @@ impl Scenario for TransactionStructure {
         Ok(Self { base, er })
     }
 
+    /// Shuffles the mutation matrix, then checks the aggregate admission boundary.
     async fn run(self) -> Result<()> {
         let mut rng = random::rng(
             self.base.config().seed,
@@ -199,6 +206,7 @@ impl Scenario for TransactionStructure {
     }
 }
 
+/// Mutates a valid message or wire image, checks refusal, and executes its repaired control.
 async fn check_case(
     fixture: &mut Fixture,
     rng: &mut impl Rng,

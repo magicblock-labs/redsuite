@@ -3,9 +3,11 @@ mod group;
 use group::GroupEr;
 
 use std::{
+    cell::Cell,
     env,
     env::consts::{ARCH, OS},
     mem,
+    num::NonZeroUsize,
     process::Command,
     result, thread,
     time::Instant,
@@ -27,6 +29,7 @@ use crate::{args::Run, catalog};
 
 type LaneResult = (&'static str, f64, Vec<RunRecord>);
 
+/// Compatible ER-group scenarios, or fresh scenarios whose concurrency is bounded independently.
 struct Lane {
     label: &'static str,
     group: Option<&'static ErGroup>,
@@ -46,21 +49,20 @@ impl Lane {
             None => None,
         };
         let mut records = if suite.serial || self.group.is_none() {
-            let limit = if suite.serial { 1 } else { suite.fresh_concurrency };
+            let limit = if suite.serial { NonZeroUsize::MIN } else { suite.fresh_concurrency };
             suite.run_entries(self.entries, limit, er).await
         } else {
             let (shared, exclusive): (Vec<_>, Vec<_>) =
                 self.entries.into_iter().partition(|entry| matches!(entry.er, Er::Shared(_)));
             let mut records = suite.run_entries(shared, suite.shared_concurrency, er.clone()).await;
             if records.iter().all(RunRecord::passed) {
-                records.extend(suite.run_entries(exclusive, 1, er).await);
+                records.extend(suite.run_entries(exclusive, NonZeroUsize::MIN, er).await);
             } else {
-                records.extend(exclusive.into_iter().map(|entry| {
-                    RunRecord::not_run(
-                        entry.name(suite.family),
-                        "earlier scenario in this ER group failed",
-                    )
-                }));
+                records.extend(
+                    exclusive.into_iter().map(|entry| {
+                        suite.not_run(entry, "earlier scenario in this ER group failed")
+                    }),
+                );
             }
             records
         };
@@ -78,14 +80,19 @@ impl Lane {
     }
 }
 
+/// Selected scenarios and their scheduling/reporting policy for one run.
+/// Progress counts terminal scenario records, including skipped entries,
+/// but not group-cleanup records.
 pub struct Suite {
     family: Family,
     selection: String,
     entries: Vec<ScenarioEntry>,
+    total: usize,
+    finished: Cell<usize>,
     config: ExecutionConfig,
     serial: bool,
-    fresh_concurrency: usize,
-    shared_concurrency: usize,
+    fresh_concurrency: NonZeroUsize,
+    shared_concurrency: NonZeroUsize,
     cleanup: bool,
     report: Option<ScenarioReport>,
 }
@@ -96,18 +103,21 @@ impl Suite {
         args: Run,
         config: ExecutionConfig,
         serial: bool,
-        fresh_concurrency: usize,
-        shared_concurrency: usize,
+        fresh_concurrency: NonZeroUsize,
+        shared_concurrency: NonZeroUsize,
     ) -> Result<Self> {
         let selection = if args.selections.is_empty() {
             family.prefix().to_owned()
         } else {
             args.selections.join(" ")
         };
+        let entries = catalog::select(family, &args.selections)?;
         let mut suite = Self {
             family,
             selection,
-            entries: catalog::select(family, &args.selections)?,
+            total: entries.len(),
+            finished: Cell::new(0),
+            entries,
             config,
             serial: serial || family == Family::Redline,
             fresh_concurrency,
@@ -176,10 +186,31 @@ impl Suite {
         lanes
     }
 
+    /// Advances once per selected scenario; synthetic cleanup failures do
+    /// not consume progress slots.
+    fn scenario_finished(&self) {
+        let finished = self.finished.get() + 1;
+        self.finished.set(finished);
+        info!(
+            finished,
+            total = self.total,
+            remaining = self.total - finished,
+            "suite progress"
+        );
+    }
+
+    fn not_run(&self, entry: ScenarioEntry, reason: &str) -> RunRecord {
+        let record = RunRecord::not_run(entry.name(self.family), reason);
+        self.scenario_finished();
+        record
+    }
+
+    /// Drains started work before marking pending entries skipped after
+    /// interruption or group failure.
     async fn run_entries(
         &self,
         entries: Vec<ScenarioEntry>,
-        limit: usize,
+        limit: NonZeroUsize,
         er: Option<result::Result<ErCtx, String>>,
     ) -> Vec<RunRecord> {
         let stop_on_failure = er.is_some();
@@ -188,24 +219,21 @@ impl Suite {
         let mut records = Vec::new();
         let mut failed = false;
         loop {
-            while !failed && !self.config.stopped() && running.len() < limit.max(1) {
+            while !failed && !self.config.stopped() && running.len() < limit.get() {
                 let Some(entry) = pending.next() else { break };
                 running.push(entry.run(self.family, self.config.clone(), er.clone()));
             }
             let Some(record) = running.next().await else { break };
             failed |= stop_on_failure && !record.passed();
+            self.scenario_finished();
             records.push(record);
         }
-        records.extend(pending.map(|entry| {
-            RunRecord::not_run(
-                entry.name(self.family),
-                if self.config.stopped() {
-                    "run interrupted"
-                } else {
-                    "earlier scenario in this ER group failed"
-                },
-            )
-        }));
+        let reason = if self.config.stopped() {
+            "run interrupted"
+        } else {
+            "earlier scenario in this ER group failed"
+        };
+        records.extend(pending.map(|entry| self.not_run(entry, reason)));
         records
     }
 
@@ -225,7 +253,7 @@ impl Suite {
 
     pub async fn run(mut self) -> Result<()> {
         let started = Instant::now();
-        info!(selection = %self.selection, "suite started");
+        info!(selection = %self.selection, total = self.total, "suite started");
         let mut base = topology::base_only(self.config.clone()).await;
         if let Ok(ctx) = &base {
             if let Err(error) = prepare(self.entries.iter(), ctx).await {
@@ -245,7 +273,7 @@ impl Suite {
         if let Ok(base) = &base {
             base.reclaim(&self.selection);
         }
-        let mut outcome = finish(&records, self.cleanup && self.config.environment.is_none());
+        let mut outcome = self.finish(&records);
         if let Some(report) = self.report {
             let report = report.metric(
                 "wall seconds",
@@ -269,6 +297,27 @@ impl Suite {
         );
         outcome
     }
+
+    /// Runs requested cleanup while keeping synthetic records out of the selected-scenario count.
+    fn finish(&self, records: &[RunRecord]) -> Result<()> {
+        let cleanup = if self.cleanup && self.config.environment.is_none() {
+            topology::down()
+        } else {
+            Ok(())
+        }
+        .inspect_err(|error| error!(error = %format_args!("{error:#}"), "stack cleanup failed"));
+        let not_run = records.iter().filter(|record| record.phase == "not run").count();
+        let failed = records
+            .iter()
+            .filter(|record| record.phase != "not run" && !record.passed())
+            .count();
+        ensure!(
+            failed == 0 && not_run == 0,
+            "{failed} failed, {not_run} not run ({} scenarios selected)",
+            self.total
+        );
+        cleanup
+    }
 }
 
 async fn prepare<'a>(
@@ -284,20 +333,4 @@ async fn prepare<'a>(
         prepared.push(prepare);
     }
     Ok(())
-}
-
-pub fn finish(records: &[RunRecord], cleanup: bool) -> Result<()> {
-    let cleanup = if cleanup { topology::down() } else { Ok(()) }
-        .inspect_err(|error| error!(error = %format_args!("{error:#}"), "stack cleanup failed"));
-    let not_run = records.iter().filter(|record| record.phase == "not run").count();
-    let failed = records
-        .iter()
-        .filter(|record| record.phase != "not run" && !record.passed())
-        .count();
-    ensure!(
-        failed == 0 && not_run == 0,
-        "{failed} scenarios failed, {not_run} not run ({} selected)",
-        records.len()
-    );
-    cleanup
 }

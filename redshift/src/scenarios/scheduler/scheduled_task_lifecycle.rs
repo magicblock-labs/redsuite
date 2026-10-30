@@ -21,12 +21,14 @@ const TASK_INTERVAL_MS: i64 = 100;
 const CANCEL_INTERVAL_MS: i64 = 60_000;
 const SCHEDULER_PROGRAM: Pubkey = topology::HYDRA_EPHEMERAL_ID;
 
+/// Independent task authority and signed cell used to detect cross-authority task-ID collisions.
 struct Actor {
     payer: Rc<Keypair>,
     cell: Pubkey,
 }
 
 impl Actor {
+    /// Derives task identity from both authority and task ID, not from the ID alone.
     fn address(&self, task_id: i64) -> Pubkey {
         let mut seed = [0; 40];
         seed[..32].copy_from_slice(self.payer.pubkey().as_ref());
@@ -35,6 +37,7 @@ impl Actor {
         Pubkey::find_program_address(&[b"crank", seed.as_ref()], &SCHEDULER_PROGRAM).0
     }
 
+    /// Authorizes scheduling through the cell PDA; payload signers are still independently checked.
     fn schedule(&self, task: Task, instruction: Instruction) -> Instruction {
         let authority = self.payer.pubkey();
         REDSHIFT
@@ -65,6 +68,7 @@ impl Actor {
         Ok(er.cells(REDSHIFT, &self.payer).read(&self.cell).await?.value)
     }
 
+    /// Subscribes before creation so a fast scheduler cannot race the account observer.
     async fn submit_schedule(
         &self,
         er: &ErCtx,
@@ -93,6 +97,7 @@ impl Actor {
         .await
     }
 
+    /// Waits for task-account removal, not merely acceptance of the cancellation transaction.
     async fn cancel(&self, er: &ErCtx, task_id: i64) -> Result<()> {
         let mut task = er.api().watch_accounts(&[self.address(task_id)]).await?;
         er.submit_and_confirm(
@@ -132,6 +137,7 @@ impl Scenario for ScheduledTaskLifecycle {
         Ok(Self { base, er, funder, actor })
     }
 
+    /// Checks refund/reuse before signed-payload refusal and same-ID authority isolation.
     async fn run(self) -> Result<()> {
         self.test_sponsor_refund().await?;
         self.test_signed_refusal().await?;
@@ -141,6 +147,7 @@ impl Scenario for ScheduledTaskLifecycle {
 }
 
 impl ScheduledTaskLifecycle {
+    /// Ensures scheduling cannot smuggle a payer signature into a future task payload.
     async fn test_signed_refusal(&self) -> Result<()> {
         let signature = self
             .er
@@ -169,6 +176,7 @@ impl ScheduledTaskLifecycle {
         Ok(())
     }
 
+    /// Requires full validator-sponsor reimbursement and replacement of a cancelled task ID.
     async fn test_sponsor_refund(&self) -> Result<()> {
         self.er
             .submit_and_confirm(
@@ -202,6 +210,7 @@ impl ScheduledTaskLifecycle {
         Ok(())
     }
 
+    /// Cancels one authority's task without altering another authority's identically numbered task.
     async fn test_authority_isolation(&self) -> Result<()> {
         let other = Actor::prepare(self.base.as_ref(), &self.er, &self.funder).await?;
         self.actor.submit_schedule(&self.er, 106, TASK_INTERVAL_MS, i64::MAX).await?;

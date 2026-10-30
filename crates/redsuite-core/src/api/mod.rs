@@ -50,12 +50,26 @@ use crate::{
     Result,
 };
 
+/// A known execution failure, distinct from an unconfirmed or transport-failed submission.
 #[derive(Debug, Error, PartialEq, Eq)]
 #[error("transaction failed on-chain: {err:?}")]
 pub struct TxError {
     pub err: TransactionError,
 }
 
+/// Typed refusal outcomes available to negative scenarios without inspecting an erased error chain.
+/// Transport, decoding, and confirmation-timeout failures remain in the outer `Result`.
+#[derive(Debug, Error)]
+pub enum SendError {
+    /// The RPC server refused submission; no successful send acknowledgment was received.
+    #[error(transparent)]
+    Rejected(#[from] RpcError),
+    /// A signature notification reported execution failure after submission was accepted.
+    #[error(transparent)]
+    Execution(#[from] TxError),
+}
+
+/// Confirmation expired without establishing an outcome; it does not imply execution was rejected.
 #[derive(Debug, Error)]
 #[error("transaction unconfirmed after {NETWORK_TIMEOUT:?} (outcome unknown)")]
 pub struct ConfirmTimeout;

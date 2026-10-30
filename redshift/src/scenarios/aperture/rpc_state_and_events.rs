@@ -28,7 +28,7 @@ use redsuite_core::{
     transport::{
         clock::SendClock, events::EventSubscriptions, ws::SignatureConfirmations, wsraw::RawWs,
     },
-    BaseCtx, ChainCtx, ErCtx, Result, Scenario, TxSender,
+    wait, BaseCtx, ChainCtx, ErCtx, Result, Scenario, TxSender,
 };
 use serde::Deserialize;
 use signature::Signature;
@@ -60,6 +60,8 @@ const RAW_FIRST_TIMEOUT: Duration = Duration::from_secs(3);
 const RAW_DRAIN_TIMEOUT: Duration = Duration::from_millis(300);
 const RAW_SILENCE_TIMEOUT: Duration = Duration::from_millis(700);
 
+/// One distinct account update, linking its expected value to wire
+/// transaction and history evidence.
 struct Write {
     address: Pubkey,
     id: u64,
@@ -67,6 +69,7 @@ struct Write {
     signature: Signature,
 }
 
+/// Only the delegation-status field needed to contrast delegated cells with ordinary payers.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawDelegationStatus {
@@ -87,6 +90,7 @@ fn block_config() -> RpcBlockConfig {
     }
 }
 
+/// Transfer oracle shared by account, log, program, and signature subscription checks.
 struct WalletStream<'a> {
     er: &'a ErCtx,
     events: &'a EventSubscriptions,
@@ -99,6 +103,7 @@ struct WalletStream<'a> {
 }
 
 impl WalletStream<'_> {
+    /// Compares account-balance notifications with sequential and concurrent confirmed transfers.
     #[instrument(skip_all, err)]
     async fn account_stream(&mut self) -> Result<Vec<(Signature, u64)>> {
         let mut executions = Vec::new();
@@ -142,6 +147,7 @@ impl WalletStream<'_> {
         Ok(executions)
     }
 
+    /// Requires one transfer to appear in both address-mention streams and program-account updates.
     #[instrument(skip_all, err)]
     async fn check_notifications(&mut self) -> Result<()> {
         let mentions1_key = self.events.logs_subscribe_mentions(&self.account1_pubkey).await?;
@@ -178,6 +184,8 @@ impl WalletStream<'_> {
         Ok(())
     }
 
+    /// Covers subscriptions registered before delivery and after the
+    /// signature is already confirmed.
     #[instrument(skip_all, err)]
     async fn check_signatures(&self) -> Result<()> {
         let confirmations =
@@ -202,6 +210,8 @@ impl WalletStream<'_> {
         Ok(())
     }
 
+    /// Drains queued events before requiring silence
+    /// from cancelled account/log/program/slot streams.
     #[instrument(skip_all, err)]
     async fn check_unsubscribe(&self) -> Result<()> {
         let mut raw = RawWs::connect(self.er.ws_url()).await?;
@@ -271,7 +281,10 @@ impl WalletStream<'_> {
     }
 }
 
-/// Checks simulation isolation and agreement between executed state, history APIs, and subscriptions.
+/// Checks simulation isolation and agreement between executed state,
+/// history APIs, and subscriptions.
+/// Distinct account writes anchor block/history comparisons; wallet
+/// transfers anchor event payloads.
 pub struct RpcStateAndEvents {
     base: Rc<BaseCtx>,
     er: ErCtx,
@@ -280,12 +293,15 @@ pub struct RpcStateAndEvents {
 }
 
 impl Scenario for RpcStateAndEvents {
+    /// Registers the slot stream before starting any concurrent observation workloads.
     async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
         let events = EventSubscriptions::connect(er.ws_url()).await?;
         let slot_key = events.slot_subscribe().await?;
         Ok(Self { base, er, events, slot_key })
     }
 
+    /// Runs write/history, wallet-event, and slot-stream checks on
+    /// the shared subscription connection.
     async fn run(self) -> Result<()> {
         tokio::try_join!(self.burst(), self.wallet_stream(), self.slot_stream(),)?;
         ensure!(self.events.malformed_frames() == 0);
@@ -295,6 +311,8 @@ impl Scenario for RpcStateAndEvents {
 }
 
 impl RpcStateAndEvents {
+    /// Follows the same writes from non-publishing simulation through
+    /// execution, state, and history.
     async fn burst(&self) -> Result<()> {
         let (pdas, writes, payer) = self.prepare_writes().await?;
         self.check_simulation(&writes[0]).await?;
@@ -305,6 +323,7 @@ impl RpcStateAndEvents {
         self.check_delegation(&writes[0], payer).await
     }
 
+    /// Requires observed slots to advance strictly on the already-registered stream.
     #[instrument(skip_all, err)]
     async fn slot_stream(&self) -> Result<()> {
         self.events.await_events(self.slot_key, 2).await?;
@@ -317,6 +336,8 @@ impl RpcStateAndEvents {
         Ok(())
     }
 
+    /// Prepares distinct signed updates so every account has
+    /// an unambiguous transaction/value oracle.
     #[instrument(skip_all, err)]
     async fn prepare_writes(&self) -> Result<(Vec<Pubkey>, Vec<Write>, Pubkey)> {
         let client = self.er.api();
@@ -367,6 +388,7 @@ impl RpcStateAndEvents {
         Ok((pdas, writes, payers[0].pubkey()))
     }
 
+    /// Successful simulation must leave neither the probe's state update nor a signature status.
     #[instrument(skip_all, err)]
     async fn check_simulation(&self, probe: &Write) -> Result<()> {
         let client = self.er.api();
@@ -386,6 +408,7 @@ impl RpcStateAndEvents {
         Ok(())
     }
 
+    /// Delivers a bounded burst and returns confirmed execution slots in submission order.
     #[instrument(skip_all, err)]
     async fn send_writes(&self, writes: &[Write]) -> Result<Vec<u64>> {
         let client = self.er.api();
@@ -402,6 +425,8 @@ impl RpcStateAndEvents {
         self.await_statuses(&signatures).await
     }
 
+    /// Reconciles transaction lookups and block listings with the observed execution
+    /// slots/signatures.
     #[instrument(skip_all, err)]
     async fn check_blocks(&self, writes: &[Write], slots: &[u64]) -> Result<()> {
         let client = self.er.api();
@@ -472,6 +497,7 @@ impl RpcStateAndEvents {
         Ok(())
     }
 
+    /// Requires single/batched reads and balances to expose the same executed account images.
     #[instrument(skip_all, err)]
     async fn check_written_accounts(&self, pdas: &[Pubkey], writes: &[Write]) -> Result<()> {
         let client = self.er.api();
@@ -495,6 +521,8 @@ impl RpcStateAndEvents {
         Ok(())
     }
 
+    /// Checks address-history membership and execution slots for
+    /// each independently written account.
     #[instrument(skip_all, err)]
     async fn check_history(&self, writes: &[Write], slots: &[u64]) -> Result<()> {
         let client = self.er.api();
@@ -526,6 +554,8 @@ impl RpcStateAndEvents {
         Ok(())
     }
 
+    /// Contrasts a delegated written cell with an ordinary payer through
+    /// the raw delegation-status RPC.
     #[instrument(skip_all, err)]
     async fn check_delegation(&self, probe: &Write, payer: Pubkey) -> Result<()> {
         let delegated: RawDelegationStatus = self
@@ -561,6 +591,7 @@ impl RpcStateAndEvents {
             .await
     }
 
+    /// Retries publication/commitment lag, but treats a confirmed execution error as terminal.
     async fn await_statuses(&self, signatures: &[Signature]) -> Result<Vec<u64>> {
         futures_util::future::try_join_all(
             signatures.iter().map(|signature| self.er.api().confirm(signature)),
@@ -570,33 +601,43 @@ impl RpcStateAndEvents {
             .api()
             .await_query("confirmed signature statuses", async || {
                 let statuses = self.er.api().get_signature_statuses(signatures).await?;
-                statuses
+                for status in statuses.iter().flatten() {
+                    ensure!(
+                        status.err.is_none(),
+                        "confirmed transaction failed: {:?}",
+                        status.err
+                    );
+                }
+                let slots = statuses
                     .into_iter()
                     .map(|status| {
                         let status = status
                             .context("confirmed signature missing from getSignatureStatuses")?;
-                        ensure!(status.err == None);
                         ensure!(status.satisfies_commitment(confirmed()));
                         Ok(status.slot)
                     })
-                    .collect()
+                    .collect();
+                Ok(wait::check(slots))
             })
             .await
     }
 
+    /// Waits for block publication separately from signature confirmation.
     async fn await_publication(&self, slot: u64) -> Result<()> {
-        self.er
-            .api()
+        let client = self.er.api();
+        let params = (slot, block_config());
+        client
             .await_query("block publication", async || {
-                self.er
-                    .api()
-                    .call::<UiConfirmedBlock>(RpcRequest::GetBlock, &(slot, block_config()))
-                    .await?;
-                Ok(())
+                let block =
+                    client.call::<Option<UiConfirmedBlock>>(RpcRequest::GetBlock, &params).await?;
+                Ok(wait::check(block.context("block not published")))
             })
             .await
+            .map(|_| ())
     }
 
+    /// Establishes account-subscription delivery before testing related
+    /// stream types and timestamps.
     async fn wallet_stream(&self) -> Result<()> {
         let funder = self.base.funded_payer(crate::PAYER_LAMPORTS).await?;
         let account1 =
@@ -632,6 +673,7 @@ impl RpcStateAndEvents {
         Ok(())
     }
 
+    /// Requires settled block and transaction timestamps to agree with `getBlockTime`.
     #[instrument(skip_all, err)]
     async fn timestamps(&self, executions: Vec<(Signature, u64)>) -> Result<()> {
         let last_slot = executions.last().map_or(0, |(_, slot)| *slot);

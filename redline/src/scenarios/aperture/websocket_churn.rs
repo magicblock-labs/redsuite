@@ -17,6 +17,7 @@ use std::{
 const FD_TOLERANCE: usize = 64;
 
 /// Exercises connection churn; server FD reclamation is checked only for locally owned ERs.
+/// Keeps an idle connection population open while measuring subscribe/unsubscribe/close cycles.
 pub struct WebsocketChurn {
     base: Rc<BaseCtx>,
     er: ErCtx,
@@ -30,6 +31,8 @@ impl Scenario<(ScenarioReport, Result<()>)> for WebsocketChurn {
         };
         Ok(Self { base, er, connections })
     }
+    /// Measures churn, closes idle sockets, and allows asynchronous local FD
+    /// cleanup before checking it.
     async fn run(self) -> Result<(ScenarioReport, Result<()>)> {
         let options = RunControl::from_config(&self.base.config())?;
         let baseline = self
@@ -93,6 +96,7 @@ impl Scenario<(ScenarioReport, Result<()>)> for WebsocketChurn {
         for connection in idle {
             connection.close().await?;
         }
+        // Remote/attached ERs have no owned PID; absence of resource metrics is not a leak verdict.
         let cleanup: Result<()> = async {
             if let Some((pid, fds, rss)) = baseline {
                 let end = Instant::now() + Duration::from_secs(90);

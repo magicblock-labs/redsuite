@@ -1,6 +1,6 @@
 use super::ER_BLOCKHASH_TTL;
 use crate::{
-    api::Api,
+    api::{Api, SendError},
     runner::{Delivery, SendTransaction},
     Result,
 };
@@ -12,6 +12,7 @@ use signer::Signer;
 use std::{
     cell::RefCell,
     rc::Rc,
+    result,
     time::{Duration, Instant},
 };
 use transaction::Transaction;
@@ -41,18 +42,18 @@ impl BlockhashCache {
     }
 }
 
-pub(super) async fn submit_and_confirm(
+pub(super) async fn try_submit_and_confirm(
     api: &Api,
     blockhash: &BlockhashCache,
     payer: &Keypair,
     cosigners: &[&Keypair],
     ixs: &[Instruction],
-) -> Result<Signature> {
+) -> Result<result::Result<Signature, SendError>> {
     let hash = blockhash.get(api).await?;
     let mut signers = vec![payer];
     signers.extend_from_slice(cosigners);
     let tx = Transaction::new_signed_with_payer(ixs, Some(&payer.pubkey()), &signers, hash);
-    api.send_and_confirm(&tx).await
+    api.try_send_and_confirm(&tx).await
 }
 
 #[derive(Clone)]

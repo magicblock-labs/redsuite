@@ -2,14 +2,13 @@ mod args;
 mod catalog;
 mod suite;
 
-use std::process::ExitCode;
+use std::{num::NonZeroUsize, process::ExitCode, rc::Rc};
 
 use anyhow::Context;
 use args::{Benchmarks, Checks, Cli, Command};
 use clap::Parser;
 use redsuite_core::config::{Environment, ErEndpoints};
 use redsuite_core::{catalog::Family, config::ExecutionConfig, logging, Result};
-use std::rc::Rc;
 use suite::Suite;
 use tokio::{sync::watch, task::LocalSet};
 use tracing::{error, info};
@@ -91,8 +90,8 @@ async fn checks(family: Family, command: Checks) -> Result<()> {
                     ..ExecutionConfig::default()
                 },
                 args.serial,
-                args.fresh_concurrency.get(),
-                args.shared_concurrency.get(),
+                args.fresh_concurrency,
+                args.shared_concurrency,
             )?
             .run()
             .await
@@ -136,7 +135,16 @@ async fn dispatch(command: Command) -> Result<ExitCode> {
                         loop_mode: args.loop_mode,
                         ..ExecutionConfig::default()
                     };
-                    Suite::new(Family::Redline, args.run, config, true, 1, 1)?.run().await
+                    Suite::new(
+                        Family::Redline,
+                        args.run,
+                        config,
+                        true,
+                        NonZeroUsize::MIN,
+                        NonZeroUsize::MIN,
+                    )?
+                    .run()
+                    .await
                 })
                 .await;
             }

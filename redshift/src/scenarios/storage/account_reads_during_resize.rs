@@ -24,6 +24,7 @@ const GROW_INTERVAL: Duration = Duration::from_millis(40);
 const CHURN_BEFORE_RESTART: Duration = Duration::from_secs(6);
 const CHURN_AFTER_RESTART: Duration = Duration::from_secs(12);
 
+/// Repeated snapshot reads whose task result retains any failure witnessed during resize churn.
 struct Readers {
     stop: Rc<Cell<bool>>,
     task: JoinHandle<Result<()>>,
@@ -51,6 +52,7 @@ impl Readers {
         Self { stop, task }
     }
 
+    /// Stops between reads and joins the task so background failures cannot be discarded.
     async fn stop(self, phase: &str) -> Result<()> {
         self.stop.set(true);
         self.task
@@ -61,6 +63,7 @@ impl Readers {
 }
 
 /// Checks account reads and final sizes while resize traffic spans a restart.
+/// Readers run alongside growth on each side of the restart, not while the RPC server is down.
 pub struct AccountReadsDuringResize {
     base: Rc<BaseCtx>,
     er: ErCtx,
@@ -73,6 +76,8 @@ impl Scenario for AccountReadsDuringResize {
         Ok(Self { base, er, payer })
     }
 
+    /// Carries expected sizes across restart and resumes concurrent
+    /// reads against recovered accounts.
     async fn run(self) -> Result<()> {
         let mut sizes = [INITIAL_ACCOUNT_SPACE; ACCOUNTS];
         let er = &self.er;
@@ -117,6 +122,7 @@ impl Scenario for AccountReadsDuringResize {
 }
 
 impl AccountReadsDuringResize {
+    /// Grows accounts round-robin, updating expected sizes only after confirmed execution.
     async fn churn(
         &self,
         accounts: &[OwnedCell],

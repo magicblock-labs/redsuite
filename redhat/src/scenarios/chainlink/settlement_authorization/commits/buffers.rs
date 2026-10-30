@@ -26,6 +26,7 @@ fn outbox_intent_pda(intent_id: u64) -> Pubkey {
     .0
 }
 
+/// Buffer mutation order and a non-live intent ID for outbox-substitution probes.
 pub(super) struct Plan {
     markers: Vec<u64>,
     order: Vec<usize>,
@@ -48,6 +49,7 @@ pub(super) fn plan(seed: u64) -> Result<Plan> {
 }
 
 impl SettlementAuthorization {
+    /// Checks buffer authority, nonce/account binding, completeness, and rollback on failed use.
     pub(in super::super) async fn check_buffers(&self) -> Result<()> {
         let plan = &self.commit_plan.buffers;
         let markers = &plan.markers;
@@ -219,6 +221,8 @@ impl SettlementAuthorization {
         self.check_pending_outbox(&payer).await
     }
 
+    /// Holds real buffered delivery while attacking its accepted outbox and substituted rows.
+    /// The held work is resumed afterward to distinguish protection from a stuck pipeline.
     async fn check_pending_outbox(&self, attacker: &Keypair) -> Result<()> {
         let plan = &self.commit_plan.buffers;
         let faults = self.er.faults()?;
@@ -553,6 +557,7 @@ impl SettlementAuthorization {
         Ok(())
     }
 
+    /// Confirms that valid buffered settlement still succeeds after hostile buffer operations.
     async fn settle_control(
         &self,
         payer: &Keypair,

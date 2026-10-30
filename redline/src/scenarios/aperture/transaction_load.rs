@@ -24,6 +24,7 @@ use crate::{metrics, program::layout, RunControl, ACCOUNT_SPACE};
 
 const PAYER_LAMPORTS: u64 = 2_000_000_000;
 
+/// Workload scale and offered-load limits; warmup is separate from measured iterations.
 struct Profile {
     name: &'static str,
     payers: usize,
@@ -56,14 +57,19 @@ const FULL: Profile = Profile {
 
 const PROFILES: ProfileValues<Profile> = ProfileValues { lite: LITE, full: FULL };
 
+/// Independently registered load shapes sharing delivery and observation machinery.
 #[derive(Clone, Copy)]
 pub enum Shape {
+    /// Rotating direct writes, isolating delivery/observation costs from substantial compute.
     Write,
+    /// One source and two destinations per transaction, creating read/write overlap.
     Copy,
+    /// Fixed hash-chain work with an independently checked final hash.
     Compute,
 }
 
 /// Measures transaction delivery, confirmation, and updates on warmed accounts.
+/// Reports the measured window separately from warmup and preserves the report if validation fails.
 pub struct TransactionLoad {
     base: Rc<BaseCtx>,
     er: ErCtx,
@@ -74,6 +80,7 @@ pub struct TransactionLoad {
 }
 
 impl Scenario<(ScenarioReport, Result<()>), Shape> for TransactionLoad {
+    /// Materializes the workload-owned pool before opening any measured observation window.
     async fn setup(base: Rc<BaseCtx>, er: ErCtx, shape: Shape) -> Result<Self> {
         let profile = match shape {
             Shape::Write => &WRITE,
@@ -99,6 +106,7 @@ impl Scenario<(ScenarioReport, Result<()>), Shape> for TransactionLoad {
         })
     }
 
+    /// Warms the selected shape, then measures bounded windows with final-state reconciliation.
     async fn run(self) -> Result<(ScenarioReport, Result<()>)> {
         let compute_ratio = if matches!(self.shape, Shape::Compute) {
             let mut costs = Vec::new();
@@ -169,6 +177,7 @@ impl Scenario<(ScenarioReport, Result<()>), Shape> for TransactionLoad {
     }
 }
 
+/// One window's client delivery, signature/account observations, and validator metric delta.
 struct Measurement {
     outcome: RunOutcome,
     signatures: SignatureOutcome,
@@ -177,6 +186,7 @@ struct Measurement {
 }
 
 impl TransactionLoad {
+    /// Exercises the measured instruction shape without contributing warmup samples to the report.
     #[instrument(skip_all, err)]
     async fn warm_up(&self) -> Result<()> {
         let warmup = execute(
@@ -197,6 +207,8 @@ impl TransactionLoad {
         Ok(())
     }
 
+    /// Registers observers before sending and drains
+    /// delivered signatures/updates before finalizing.
     #[instrument(skip_all, err)]
     async fn measure(
         &self,
@@ -289,6 +301,7 @@ impl TransactionLoad {
         })
     }
 
+    /// Checks the last write touching each account, plus hash correctness for the compute shape.
     #[instrument(skip_all, err)]
     async fn check_final_state(&self, offset: u64, count: u64) -> Result<()> {
         for pda in self.pdas.iter() {
@@ -316,6 +329,7 @@ impl TransactionLoad {
 }
 
 impl Measurement {
+    /// Keeps delivery, confirmation, and update latency distinct rather than merging their samples.
     fn report(&self, profile: &Profile, mode: LoopMode) -> ScenarioReport {
         let mut report = ScenarioReport::ok()
             .setting("profile", profile.name)
@@ -387,6 +401,7 @@ const WRITE: Profile = Profile {
     concurrency: 1,
 };
 impl TransactionLoad {
+    /// Returns the write set; update latency samples one target, final-state checks cover both.
     fn targets(&self, id: u64) -> [Pubkey; 2] {
         match self.shape {
             Shape::Write | Shape::Compute => [self.pdas[((id - 1) as usize) % self.pdas.len()]; 2],

@@ -1,7 +1,7 @@
-use std::{rc::Rc, result};
+use std::{ops::ControlFlow, rc::Rc, result};
 
 use account::Account;
-use anyhow::{anyhow, ensure, Context};
+use anyhow::{anyhow, ensure, Context, Error};
 use futures_util::{stream, StreamExt, TryStreamExt};
 use pubkey::Pubkey;
 use signature::Signature;
@@ -12,13 +12,13 @@ use solana_transaction_status_client_types::EncodedConfirmedTransactionWithStatu
 use tokio::time;
 use transaction::Transaction;
 
-use super::{decode_account, Api, ConfirmTimeout, TxError};
+use super::{decode_account, Api, ConfirmTimeout, SendError, TxError};
 use crate::{
     transport::{
         events::{EventSubscriptions, Subscription},
         NETWORK_TIMEOUT,
     },
-    Result,
+    wait, Result,
 };
 
 /// Acknowledged account subscriptions and their latest observed images, in request order.
@@ -94,6 +94,8 @@ impl Api {
         .await
     }
 
+    /// Subscribes before reading the initial snapshot so updates cannot fall into a setup gap.
+    /// Read/decode errors are fatal; pure readiness-check failures wait for account notifications.
     pub async fn await_accounts<T>(
         &self,
         addresses: &[Pubkey],
@@ -122,7 +124,7 @@ impl Api {
                 time::timeout_at(deadline, events.account(address))
                     .await
                     .with_context(|| events.diagnostics())
-                    .and_then(|result| result)
+                    .flatten()
                     .with_context(|| {
                         format!(
                             "accountSubscribe not acknowledged: address={address}, malformed={}",
@@ -142,25 +144,30 @@ impl Api {
         })
     }
 
+    /// Probes immediately after subscription setup and again after each observed slot.
+    /// `Err` fails immediately, `Break(value)` completes, and `Continue(reason)` waits
+    /// for another slot while preserving the pending reason for timeout diagnostics.
+    /// Subscription setup and all probes share one network deadline.
     pub async fn await_query<T>(
         &self,
         what: &str,
-        observe: impl AsyncFnMut() -> Result<T>,
+        observe: impl AsyncFnMut() -> Result<ControlFlow<T, Error>>,
     ) -> Result<T> {
-        time::timeout(NETWORK_TIMEOUT, async {
+        let deadline = time::Instant::now() + NETWORK_TIMEOUT;
+        let mut slots = time::timeout_at(deadline, async {
             let events = self.events().await?;
-            events.slots().await?.query(what, observe).await
+            events.slots().await
         })
         .await
-        .with_context(|| format!("{what} after {NETWORK_TIMEOUT:?}"))?
+        .with_context(|| format!("{what}: slot subscription after {NETWORK_TIMEOUT:?}"))??;
+        slots.query_until(deadline, what, observe).await
     }
 
     pub async fn await_slot(&self, slot: u64) -> Result<u64> {
         // Slot notifications are processed; preserve the confirmed HTTP observation.
-        self.await_query("confirmed slot", async || {
+        self.await_query(&format!("confirmed slot >= {slot}"), async || {
             let current = self.get_slot().await?;
-            ensure!(current >= slot);
-            Ok(current)
+            Ok(wait::when(current >= slot, current))
         })
         .await
     }
@@ -169,6 +176,8 @@ impl Api {
         self.try_confirm(signature).await?.map_err(Into::into)
     }
 
+    /// Registers notifications before consulting HTTP status, covering already-executed signatures.
+    /// Execution failure is an inner error; transport failure or unknown outcome is an outer error.
     pub async fn try_confirm(&self, signature: &Signature) -> Result<result::Result<(), TxError>> {
         time::timeout(NETWORK_TIMEOUT, async {
             let events = self.events().await?;
@@ -195,6 +204,7 @@ impl Api {
         .map_err(|_| ConfirmTimeout)?
     }
 
+    /// Ignores received-signature notifications; completes only on a processed signature result.
     async fn signature_outcome(
         subscription: &mut Subscription<Response<RpcSignatureResult>>,
     ) -> Result<result::Result<(), TxError>> {
@@ -207,14 +217,24 @@ impl Api {
     }
 
     pub async fn send_and_confirm(&self, transaction: &Transaction) -> Result<Signature> {
+        self.try_send_and_confirm(transaction).await?.map_err(Into::into)
+    }
+
+    /// Separates RPC rejection and execution failure from transport and confirmation failures.
+    pub async fn try_send_and_confirm(
+        &self,
+        transaction: &Transaction,
+    ) -> Result<result::Result<Signature, SendError>> {
         let signature = transaction.signatures[0];
         time::timeout(NETWORK_TIMEOUT, async {
             let events = self.events().await?;
             let mut subscription =
                 events.signature(&signature, CommitmentConfig::confirmed()).await?;
-            self.send_transaction(transaction).await?;
-            Self::signature_outcome(&mut subscription).await??;
-            Ok(signature)
+            if let Err(error) = self.try_send_transaction(transaction).await? {
+                return Ok(Err(error.into()));
+            }
+            let outcome = Self::signature_outcome(&mut subscription).await?;
+            Ok(outcome.map(|()| signature).map_err(Into::into))
         })
         .await
         .map_err(|_| ConfirmTimeout)?
@@ -225,7 +245,10 @@ impl Api {
         signature: &Signature,
     ) -> Result<EncodedConfirmedTransactionWithStatusMeta> {
         self.await_query(&format!("transaction {signature} published"), async || {
-            self.get_transaction(signature).await?.context("transaction not published")
+            let transaction = self.get_transaction(signature).await?;
+            Ok(wait::check(
+                transaction.context("transaction not published"),
+            ))
         })
         .await
     }

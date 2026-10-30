@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, future::Future, rc::Rc, result, time::Duration};
+use std::{collections::BTreeSet, rc::Rc, time::Duration};
 
 use anyhow::{anyhow, ensure, Context};
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -13,8 +13,9 @@ use redsuite_core::{
         request::RpcRequest,
         response::RpcKeyedAccount,
     },
-    Api, BaseCtx, ChainCtx, DynError, ErCtx, Result, Scenario,
+    wait, Api, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
+use serde::Serialize;
 use serde_json::Value;
 use signer::Signer;
 use solana_account_decoder_client_types::{
@@ -38,6 +39,7 @@ const DELEGATED_AMOUNT_OFFSET: usize = 121;
 const BURST_DEADLINE: Duration = Duration::from_secs(20);
 const NEGATIVE_DEADLINE: Duration = Duration::from_secs(5);
 
+/// Two mints and independent owners/delegate, with unrelated accounts as filter-exclusion controls.
 struct Fixture {
     mint: Pubkey,
     other_mint: Pubkey,
@@ -51,6 +53,7 @@ struct Fixture {
     ata_unrelated: Pubkey,
 }
 
+/// Concurrent read shapes covering local projection visibility and owner/mint/delegate filtering.
 #[derive(Debug, Clone, Copy)]
 enum Query {
     ProgramAccountsByMint,
@@ -120,6 +123,7 @@ fn raw_data(account: &UiAccount) -> Result<Vec<u8>> {
     }
 }
 
+/// Common comparison fields for independently decoded base64 and `jsonParsed` responses.
 struct TokenView {
     encoding: &'static str,
     mint: Option<Pubkey>,
@@ -137,6 +141,7 @@ fn parsed_str(info: &Value, path: &[&str]) -> Option<String> {
     value.as_str().map(str::to_owned)
 }
 
+/// Normalizes either wire representation without deriving expected values from the response itself.
 fn token_view(account: &UiAccount) -> Result<TokenView> {
     match &account.data {
         UiAccountData::Json(parsed) => {
@@ -174,6 +179,7 @@ fn token_view(account: &UiAccount) -> Result<TokenView> {
     }
 }
 
+/// Checks identity, amount, and optional delegate allowance through the common token view.
 fn check_token_account(
     entry: &RpcKeyedAccount,
     mint: &Pubkey,
@@ -204,30 +210,15 @@ fn program_accounts_config(filters: Vec<RpcFilterType>) -> RpcProgramAccountsCon
     }
 }
 
-async fn expect_rejection<T, Call>(label: &str, needles: &[&str], call: Call) -> Result<()>
-where
-    Call: Future<Output = result::Result<T, DynError>>,
-{
-    let outcome = time::timeout(NEGATIVE_DEADLINE, call)
-        .await
-        .with_context(|| format!("{label} did not answer within {NEGATIVE_DEADLINE:?}"))?;
-    match outcome {
-        Ok(_) => Err(anyhow!("{label} must be rejected")),
-        Err(error) => {
-            let message = format!("{error:#}");
-            ensure!(needles.iter().any(|needle| message.contains(needle)));
-            Ok(())
-        }
-    }
-}
-
 /// Checks raw/parsed token views, ownership filters, and local projection visibility.
+/// Mixed mints, owners, and an approved delegate expose both missing matches and leaked results.
 pub struct TokenRpcViews {
     client: Api,
     fixture: Fixture,
 }
 
 impl Scenario for TokenRpcViews {
+    /// Builds contrasting token roles, then waits for the ER-local approval to become queryable.
     async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
         let client = er.api().clone();
         let fee_payer = base.funded_payer(AIRDROP).await?;
@@ -359,20 +350,24 @@ impl Scenario for TokenRpcViews {
             )],
         )
         .await?;
+        let filter = RpcTokenAccountsFilter::Mint(fixture.mint.to_string());
+        let params = (fixture.delegate.to_string(), filter, parsed_config());
         client
             .await_query("the er reports the approved delegate", async || {
-                let filter = RpcTokenAccountsFilter::Mint(fixture.mint.to_string());
-                let params = (fixture.delegate.to_string(), filter, parsed_config());
-                let accounts: Vec<RpcKeyedAccount> =
-                    client.call_value(RpcRequest::GetTokenAccountsByDelegate, &params).await?;
-                ensure!(accounts.len() == 1);
-                Ok(())
+                let accounts = client
+                    .call_value::<Vec<RpcKeyedAccount>>(
+                        RpcRequest::GetTokenAccountsByDelegate,
+                        &params,
+                    )
+                    .await?;
+                Ok(wait::when(accounts.len() == 1, accounts.len()))
             })
             .await?;
 
         Ok(Self { client, fixture })
     }
 
+    /// Checks a concurrent valid-read burst before malformed filter/account requests.
     async fn run(self) -> Result<()> {
         self.check_reads().await?;
         self.check_invalid_filters().await
@@ -380,6 +375,7 @@ impl Scenario for TokenRpcViews {
 }
 
 impl TokenRpcViews {
+    /// Exercises the full query matrix concurrently against one fixed token-state oracle.
     #[instrument(skip_all, err)]
     async fn check_reads(&self) -> Result<()> {
         let reads = join_all((0..READS).map(|index| self.run_query(CYCLE[index % CYCLE.len()])));
@@ -393,62 +389,80 @@ impl TokenRpcViews {
         Ok(())
     }
 
+    /// Requires specific invalid-parameter refusals, not transport errors
+    /// or empty successful results.
     #[instrument(skip_all, err)]
     async fn check_invalid_filters(&self) -> Result<()> {
         let missing_mint = Keypair::new().pubkey();
         let bogus_program = Keypair::new().pubkey();
-        expect_rejection(
+        self.expect_rejection(
             "getTokenAccountsByOwner with a missing mint",
             &["mint account not found"],
-            self.client.call_value::<Vec<RpcKeyedAccount>>(
-                RpcRequest::GetTokenAccountsByOwner,
-                &(
-                    self.fixture.owner_a.to_string(),
-                    RpcTokenAccountsFilter::Mint(missing_mint.to_string()),
-                    parsed_config(),
-                ),
+            RpcRequest::GetTokenAccountsByOwner,
+            &(
+                self.fixture.owner_a.to_string(),
+                RpcTokenAccountsFilter::Mint(missing_mint.to_string()),
+                parsed_config(),
             ),
         )
         .await?;
-        expect_rejection(
+        self.expect_rejection(
             "getTokenAccountsByOwner with an invalid token program",
             &["unknown token program id"],
-            self.client.call_value::<Vec<RpcKeyedAccount>>(
-                RpcRequest::GetTokenAccountsByOwner,
-                &(
-                    self.fixture.owner_a.to_string(),
-                    RpcTokenAccountsFilter::ProgramId(bogus_program.to_string()),
-                    parsed_config(),
-                ),
+            RpcRequest::GetTokenAccountsByOwner,
+            &(
+                self.fixture.owner_a.to_string(),
+                RpcTokenAccountsFilter::ProgramId(bogus_program.to_string()),
+                parsed_config(),
             ),
         )
         .await?;
-        expect_rejection(
+        self.expect_rejection(
             "getTokenAccountsByDelegate with a missing mint",
             &["mint account not found"],
-            self.client.call_value::<Vec<RpcKeyedAccount>>(
-                RpcRequest::GetTokenAccountsByDelegate,
-                &(
-                    self.fixture.delegate.to_string(),
-                    RpcTokenAccountsFilter::Mint(missing_mint.to_string()),
-                    parsed_config(),
-                ),
+            RpcRequest::GetTokenAccountsByDelegate,
+            &(
+                self.fixture.delegate.to_string(),
+                RpcTokenAccountsFilter::Mint(missing_mint.to_string()),
+                parsed_config(),
             ),
         )
         .await?;
-        expect_rejection(
+        self.expect_rejection(
             "getTokenAccountBalance on a missing account",
             &["token account not found", "not a token account"],
-            self.client.call_value::<UiTokenAmount>(
-                RpcRequest::GetTokenAccountBalance,
-                &(missing_mint.to_string(), confirmed()),
-            ),
+            RpcRequest::GetTokenAccountBalance,
+            &(missing_mint.to_string(), confirmed()),
         )
         .await?;
 
         Ok(())
     }
 
+    /// Checks a bounded RPC refusal while leaving transport/decoding errors as scenario failures.
+    async fn expect_rejection(
+        &self,
+        label: &str,
+        needles: &[&str],
+        method: RpcRequest,
+        params: &impl Serialize,
+    ) -> Result<()> {
+        let outcome = time::timeout(
+            NEGATIVE_DEADLINE,
+            self.client.try_call::<Value>(method, params),
+        )
+        .await
+        .with_context(|| format!("{label} did not answer within {NEGATIVE_DEADLINE:?}"))??;
+        let error = outcome.err().with_context(|| format!("{label} must be rejected"))?;
+        ensure!(
+            error.error.code.code() == -32602
+                && needles.iter().any(|needle| error.error.message.contains(needle)),
+            "{label}: {error}"
+        );
+        Ok(())
+    }
+
+    /// Checks exact result membership plus token fields where the query returns account images.
     async fn run_query(&self, query: Query) -> Result<()> {
         match query {
             Query::ProgramAccountsByMint | Query::ProgramAccountsByOwner => {

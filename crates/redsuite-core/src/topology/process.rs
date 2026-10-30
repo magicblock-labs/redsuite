@@ -11,14 +11,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{anyhow, ensure, Context};
+use anyhow::{anyhow, ensure, Context, Error};
 use rand::Rng;
 use tokio::{net::TcpStream, time};
 use tracing::warn;
 use url::Url;
 
 use super::config;
-use crate::{api::Api, host::proc_running, resources::ResourceRecord, DynError, Result};
+use crate::{api::Api, host::proc_running, resources::ResourceRecord, Result};
 
 pub(super) const KILL_GRACE: Duration = Duration::from_secs(5);
 pub(super) const POLL: Duration = Duration::from_millis(250);
@@ -516,7 +516,7 @@ impl PortLease {
         self.holders.clear();
     }
 
-    pub(super) fn failure(&self, error: DynError) -> DynError {
+    pub(super) fn failure(&self, error: Error) -> Error {
         let ports: Vec<_> = self.claims.iter().map(|(port, _)| *port).collect();
         error.context(format!("reserved ports: {ports:?}"))
     }
