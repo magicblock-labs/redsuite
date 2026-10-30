@@ -1,33 +1,27 @@
 mod http;
+mod rpc;
 mod ws;
 
-use std::{
-    cell::RefCell,
-    mem,
-    rc::Rc,
-    time::{Duration, Instant},
-};
-
 use crate::{
-    api::decode_transaction,
-    context::{BaseCtx, ChainCtx},
     topology::BaseEndpoints,
-    transport::http as rpc_http,
-    transport::NETWORK_TIMEOUT,
+    transport::{http as rpc_http, NETWORK_TIMEOUT},
     wait, Result,
 };
-use anyhow::{anyhow, Context};
-use json::{JsonContainerTrait, JsonValueTrait, Value};
+use anyhow::{ensure, Context};
 use pubkey::Pubkey;
 use signature::Signature;
+use std::{
+    cell::{Cell, RefCell},
+    mem,
+    rc::{Rc, Weak},
+    time::Duration,
+};
 use tokio::{
     net::TcpListener,
-    sync::{oneshot, Notify},
-    task,
-    task::JoinHandle,
+    sync::{oneshot, watch, Notify},
+    task::{self, JoinHandle},
+    time,
 };
-
-const REJECTION_CODE: i64 = -32000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Transport {
@@ -129,172 +123,155 @@ impl Selector {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Action {
-    Held,
-    Released,
-    Discarded,
-    Rejected,
-    ConnectionsClosed,
-    Restored,
-}
-
-#[derive(Clone, Debug)]
-pub struct FaultEvent {
-    pub action: Action,
-    pub operation: Option<Operation>,
-}
-
 enum Decision {
     Release,
     Discard,
     Reject(String),
 }
 
-struct Pending {
-    operation: Operation,
-    held_at: Duration,
-    decide: Option<oneshot::Sender<Decision>>,
-}
-
-struct TrapState {
+struct Interception {
     selector: Selector,
-    fired: RefCell<Option<Pending>>,
-    notify: Notify,
+    deliver: Option<oneshot::Sender<Held>>,
 }
 
-#[derive(Clone)]
+#[derive(Default)]
+struct Hits {
+    count: Cell<usize>,
+    changed: Notify,
+}
+
+impl Hits {
+    fn record(&self) {
+        self.count.set(self.count.get() + 1);
+        self.changed.notify_waiters();
+    }
+}
+
 enum Effect {
     Reject(String),
-    Stall,
+    Stall(watch::Sender<()>),
 }
 
 struct Rule {
-    id: u64,
     selector: Selector,
     effect: Effect,
+    hits: Rc<Hits>,
 }
+
+#[derive(Default)]
+struct Runtime {
+    active: Weak<RefCell<State>>,
+    connections: Vec<(Transport, JoinHandle<()>)>,
+}
+
+impl Runtime {
+    fn track(&mut self, transport: Transport, handle: JoinHandle<()>) {
+        self.connections.retain(|(_, handle)| !handle.is_finished());
+        self.connections.push((transport, handle));
+    }
+}
+
+type Shared = Rc<RefCell<Runtime>>;
 
 struct State {
-    observed: [usize; 3],
-    started: Instant,
-    changed: Rc<Notify>,
-    traps: Vec<Rc<TrapState>>,
-    unfired: Vec<String>,
-    holding: usize,
+    traps: Vec<Interception>,
     rules: Vec<Rule>,
-    stalled: Vec<(u64, oneshot::Sender<Decision>)>,
-    next_rule: u64,
-    events: Vec<FaultEvent>,
-    connections: Vec<JoinHandle<()>>,
+    unfired: Vec<String>,
+    observed: [usize; 3],
+    holding: usize,
+    sequence: u64,
+    reset: watch::Sender<()>,
+    drained: Rc<Notify>,
 }
-
-type Shared = Rc<RefCell<State>>;
 
 impl State {
-    fn record(&mut self, action: Action, operation: Option<Operation>) {
-        self.events.push(FaultEvent { action, operation });
-        self.changed.notify_waiters();
-    }
-
-    fn track(&mut self, handle: JoinHandle<()>) {
-        self.connections.retain(|handle| !handle.is_finished());
-        self.connections.push(handle);
+    fn restore(&mut self) {
+        self.rules.clear();
+        self.reset.send_replace(());
+        for trap in self.traps.drain(..) {
+            if trap.deliver.is_some() {
+                self.unfired.push(format!("{:?}", trap.selector));
+            }
+        }
     }
 }
 
-enum GateStart {
+enum Gate {
     Decided(Decision),
-    Pending(oneshot::Receiver<Decision>, Operation, Holding),
+    Held(oneshot::Receiver<Decision>, watch::Receiver<()>, Holding),
+    Stalled(watch::Receiver<()>, Holding),
 }
 
-fn gate_start(shared: &Shared, operation: Operation) -> GateStart {
-    let mut state = shared.borrow_mut();
-    let stage = match operation.stage {
-        Stage::Request => 0,
-        Stage::Response => 1,
-        Stage::Notification => 2,
-    };
-    state.observed[stage] += 1;
-    let rule = state
-        .rules
-        .iter()
-        .find(|rule| rule.selector.matches(&operation))
-        .map(|rule| (rule.id, rule.effect.clone()));
-    if let Some((id, effect)) = rule {
-        return match effect {
-            Effect::Reject(message) => {
-                state.record(Action::Rejected, Some(operation));
-                GateStart::Decided(Decision::Reject(message))
+impl Gate {
+    async fn resolve(self) -> (Decision, Option<Holding>) {
+        match self {
+            Self::Decided(decision) => (decision, None),
+            Self::Held(decision, mut reset, holding) => {
+                let decision = tokio::select! {
+                    biased;
+                    decision = decision => decision.unwrap_or(Decision::Release),
+                    _ = reset.changed() => Decision::Release,
+                };
+                (decision, Some(holding))
             }
-            Effect::Stall => {
-                let (sender, receiver) = oneshot::channel();
-                state.stalled.push((id, sender));
-                state.record(Action::Held, Some(operation.clone()));
-                state.holding += 1;
-                GateStart::Pending(receiver, operation, Holding(shared.clone()))
+            Self::Stalled(mut resume, holding) => {
+                let _ = resume.changed().await;
+                (Decision::Release, Some(holding))
             }
-        };
+        }
     }
-    let trap = state
-        .traps
-        .iter()
-        .find(|trap| trap.fired.borrow().is_none() && trap.selector.matches(&operation))
-        .cloned();
-    let Some(trap) = trap else {
-        return GateStart::Decided(Decision::Release);
-    };
-    let (sender, receiver) = oneshot::channel();
-    let held_at = state.started.elapsed();
-    *trap.fired.borrow_mut() = Some(Pending {
-        operation: operation.clone(),
-        held_at,
-        decide: Some(sender),
-    });
-    state.record(Action::Held, Some(operation.clone()));
-    state.holding += 1;
-    trap.notify.notify_waiters();
-    GateStart::Pending(receiver, operation, Holding(shared.clone()))
 }
 
-struct Holding(Shared);
+fn gate(shared: &Shared, operation: Operation) -> Gate {
+    let Some(scope) = shared.borrow().active.upgrade() else {
+        return Gate::Decided(Decision::Release);
+    };
+    let mut state = scope.borrow_mut();
+    state.observed[operation.stage as usize] += 1;
+    // Persistent faults take precedence over one-shot interceptions.
+    let pending =
+        if let Some(rule) = state.rules.iter().find(|rule| rule.selector.matches(&operation)) {
+            rule.hits.record();
+            match &rule.effect {
+                Effect::Reject(message) => return Gate::Decided(Decision::Reject(message.clone())),
+                Effect::Stall(resume) => Gate::Stalled(resume.subscribe(), Holding(scope.clone())),
+            }
+        } else {
+            let Some(index) = state
+                .traps
+                .iter()
+                .position(|trap| trap.deliver.is_some() && trap.selector.matches(&operation))
+            else {
+                return Gate::Decided(Decision::Release);
+            };
+            let (decide, decision) = oneshot::channel();
+            state.sequence += 1;
+            let held = Held {
+                operation,
+                sequence: state.sequence,
+                decide,
+            };
+            let _ = state.traps[index].deliver.take().unwrap().send(held);
+            Gate::Held(decision, state.reset.subscribe(), Holding(scope.clone()))
+        };
+    state.holding += 1;
+    pending
+}
+
+// Kept until the released operation has been forwarded, not merely unblocked.
+struct Holding(Rc<RefCell<State>>);
 
 impl Drop for Holding {
     fn drop(&mut self) {
         let mut state = self.0.borrow_mut();
         state.holding -= 1;
-        state.changed.notify_waiters();
-    }
-}
-
-async fn gate_finish(
-    shared: &Shared,
-    receiver: oneshot::Receiver<Decision>,
-    operation: Operation,
-) -> Decision {
-    let decision = receiver.await.unwrap_or(Decision::Release);
-    let action = match &decision {
-        Decision::Release => Action::Released,
-        Decision::Discard => Action::Discarded,
-        Decision::Reject(_) => Action::Rejected,
-    };
-    shared.borrow_mut().record(action, Some(operation));
-    decision
-}
-
-async fn gate(shared: &Shared, operation: Operation) -> (Decision, Option<Holding>) {
-    match gate_start(shared, operation) {
-        GateStart::Decided(decision) => (decision, None),
-        GateStart::Pending(receiver, operation, holding) => (
-            gate_finish(shared, receiver, operation).await,
-            Some(holding),
-        ),
+        state.drained.notify_waiters();
     }
 }
 
 pub struct Held {
     pub operation: Operation,
-    pub held_at: Duration,
+    pub sequence: u64,
     decide: oneshot::Sender<Decision>,
 }
 
@@ -313,106 +290,68 @@ impl Held {
 }
 
 pub struct Trap {
-    state: Rc<TrapState>,
-    shared: Shared,
+    receive: oneshot::Receiver<Held>,
+    selector: Selector,
+    state: Rc<RefCell<State>>,
 }
 
 impl Trap {
-    pub async fn wait(&self, timeout: Duration) -> Result<Held> {
-        wait::on_change(&self.state.notify, timeout, "interception", || {
-            let mut fired = self.state.fired.borrow_mut();
-            let Some(pending) = fired.as_mut() else { return Ok(None) };
-            let decide = pending.decide.take().context("interception was already taken")?;
-            Ok(Some(Held {
-                operation: pending.operation.clone(),
-                held_at: pending.held_at,
-                decide,
-            }))
-        })
-        .await
-        .with_context(|| {
-            let shared = self.shared.borrow();
-            let connections = shared.connections.iter().filter(|handle| !handle.is_finished()).count();
-            format!(
-                "interception {:?}: connections={connections}, held={}, observed [request, response, notification]={:?}",
-                self.state.selector, shared.holding, shared.observed
-            )
-        })
+    pub async fn wait(self, timeout: Duration) -> Result<Held> {
+        time::timeout(timeout, self.receive)
+            .await
+            .context("interception timed out")
+            .and_then(|held| held.context("interception restored before it arrived"))
+            .with_context(|| {
+                let state = self.state.borrow();
+                format!(
+                    "interception {:?}: held={}, observed [request, response, notification]={:?}",
+                    self.selector, state.holding, state.observed
+                )
+            })
     }
 }
 
 pub struct RuleHandle {
-    id: u64,
-    shared: Shared,
+    state: Weak<RefCell<State>>,
+    hits: Rc<Hits>,
 }
 
 impl RuleHandle {
+    pub fn hits(&self) -> usize {
+        self.hits.count.get()
+    }
+
+    pub async fn wait_hit(&self, timeout: Duration) -> Result<()> {
+        wait::on_change(&self.hits.changed, timeout, "fault hit", || {
+            Ok((self.hits() > 0).then_some(()))
+        })
+        .await
+    }
+
     pub fn remove(self) {
-        let mut state = self.shared.borrow_mut();
-        state.rules.retain(|rule| rule.id != self.id);
-        for (_, decide) in state.stalled.extract_if(.., |(rule, _)| *rule == self.id) {
-            let _ = decide.send(Decision::Release);
+        if let Some(state) = self.state.upgrade() {
+            state.borrow_mut().rules.retain(|rule| !Rc::ptr_eq(&rule.hits, &self.hits));
         }
     }
 }
 
-pub struct BaseProxies {
-    shared: Shared,
-    endpoints: BaseEndpoints,
-    listeners: Vec<JoinHandle<()>>,
+/// Scenario-owned faults; dropping the scope restores traffic.
+pub struct Faults {
+    state: Rc<RefCell<State>>,
+    runtime: Shared,
 }
 
-impl BaseProxies {
-    pub async fn spawn(base: &BaseCtx) -> Result<Self> {
-        let shared: Shared = Rc::new(RefCell::new(State {
-            observed: [0; 3],
-            started: Instant::now(),
-            changed: Rc::default(),
-            traps: Vec::new(),
-            unfired: Vec::new(),
-            holding: 0,
-            rules: Vec::new(),
-            stalled: Vec::new(),
-            next_rule: 1,
-            events: Vec::new(),
-            connections: Vec::new(),
-        }));
-        let http_listener = TcpListener::bind("127.0.0.1:0").await?;
-        let ws_listener = TcpListener::bind("127.0.0.1:0").await?;
-        let endpoints = BaseEndpoints {
-            rpc_url: format!("http://{}", http_listener.local_addr()?).parse()?,
-            ws_url: format!("ws://{}", ws_listener.local_addr()?).parse()?,
-            ..BaseEndpoints::from_base(base)?
-        };
-        let upstream_rpc = base.api().url().clone();
-        let upstream_ws = base.ws_url().clone();
-        let client = rpc_http::client();
-        let listeners = vec![
-            task::spawn_local(http::accept(
-                http_listener,
-                upstream_rpc,
-                client,
-                shared.clone(),
-            )),
-            task::spawn_local(ws::accept(ws_listener, upstream_ws, shared.clone())),
-        ];
-        Ok(Self { shared, endpoints, listeners })
-    }
-
-    pub fn endpoints(&self) -> BaseEndpoints {
-        self.endpoints.clone()
-    }
-
+impl Faults {
     pub fn intercept(&self, selector: Selector) -> Trap {
-        let state = Rc::new(TrapState {
-            selector,
-            fired: RefCell::new(None),
-            notify: Notify::new(),
+        let (deliver, receive) = oneshot::channel();
+        self.state.borrow_mut().traps.push(Interception {
+            selector: selector.clone(),
+            deliver: Some(deliver),
         });
-        self.shared.borrow_mut().traps.push(state.clone());
         Trap {
-            state,
-            shared: self.shared.clone(),
+            receive,
+            selector,
+            state: self.state.clone(),
         }
     }
 
@@ -421,213 +360,129 @@ impl BaseProxies {
     }
 
     pub fn stall(&self, selector: Selector) -> RuleHandle {
-        self.rule(selector, Effect::Stall)
+        self.rule(selector, Effect::Stall(watch::channel(()).0))
     }
 
     fn rule(&self, selector: Selector, effect: Effect) -> RuleHandle {
-        let mut state = self.shared.borrow_mut();
-        let id = state.next_rule;
-        state.next_rule += 1;
-        state.rules.push(Rule { id, selector, effect });
-        RuleHandle { id, shared: self.shared.clone() }
+        let mut state = self.state.borrow_mut();
+        let hits = Rc::new(Hits::default());
+        state.rules.push(Rule {
+            selector,
+            effect,
+            hits: hits.clone(),
+        });
+        RuleHandle {
+            state: Rc::downgrade(&self.state),
+            hits,
+        }
     }
 
-    pub fn close_connections(&self) {
-        let mut state = self.shared.borrow_mut();
-        for handle in state.connections.drain(..) {
+    pub fn disconnect(&self, transport: Transport) {
+        for (_, handle) in self
+            .runtime
+            .borrow_mut()
+            .connections
+            .extract_if(.., |(kind, _)| *kind == transport)
+        {
             handle.abort();
         }
-        state.record(Action::ConnectionsClosed, None);
     }
 
     pub fn restore(&self) {
-        let mut state = self.shared.borrow_mut();
-        state.rules.clear();
-        for (_, decide) in state.stalled.drain(..) {
-            let _ = decide.send(Decision::Release);
-        }
-        for trap in mem::take(&mut state.traps) {
-            let mut fired = trap.fired.borrow_mut();
-            match fired.as_mut() {
-                Some(pending) => {
-                    if let Some(decide) = pending.decide.take() {
-                        let _ = decide.send(Decision::Release);
-                    }
-                }
-                None => state.unfired.push(format!("{:?}", trap.selector)),
-            }
-        }
-        state.record(Action::Restored, None);
-    }
-
-    pub fn events(&self) -> Vec<FaultEvent> {
-        self.shared.borrow().events.clone()
-    }
-
-    pub fn held_count(&self, selector: &Selector) -> usize {
-        self.shared
-            .borrow()
-            .events
-            .iter()
-            .filter(|event| {
-                event.action == Action::Held
-                    && event.operation.as_ref().is_some_and(|operation| selector.matches(operation))
-            })
-            .count()
-    }
-
-    pub async fn await_held(&self, selector: Selector, timeout: Duration) -> Result<()> {
-        let changed = self.shared.borrow().changed.clone();
-        wait::on_change(&changed, timeout, "base operation held", || {
-            Ok((self.held_count(&selector) > 0).then_some(()))
-        })
-        .await
+        self.state.borrow_mut().restore();
     }
 
     pub async fn reset(&self) -> Result<()> {
         self.restore();
-        let changed = self.shared.borrow().changed.clone();
+        let drained = self.state.borrow().drained.clone();
         wait::on_change(
-            &changed,
+            &drained,
             NETWORK_TIMEOUT,
             "released interceptions resuming",
-            || Ok((self.shared.borrow().holding == 0).then_some(())),
+            || Ok((self.state.borrow().holding == 0).then_some(())),
         )
         .await?;
-        self.shared.borrow_mut().events.clear();
-        self.unfired()
-    }
-
-    pub fn finish(mut self) -> Result<()> {
-        self.shutdown();
-        self.unfired()
-    }
-
-    fn unfired(&self) -> Result<()> {
-        let unfired = mem::take(&mut self.shared.borrow_mut().unfired);
-        if unfired.is_empty() {
-            return Ok(());
-        }
-        Err(anyhow!(
+        let unfired = mem::take(&mut self.state.borrow_mut().unfired);
+        ensure!(
+            unfired.is_empty(),
             "requested interceptions never occurred: {}",
             unfired.join("; ")
-        ))
-    }
-
-    fn shutdown(&mut self) {
-        self.restore();
-        for handle in self.listeners.drain(..) {
-            handle.abort();
-        }
-        let mut state = self.shared.borrow_mut();
-        for handle in state.connections.drain(..) {
-            handle.abort();
-        }
+        );
+        Ok(())
     }
 }
 
-impl Drop for BaseProxies {
+impl Drop for Faults {
     fn drop(&mut self) {
-        self.shutdown();
+        self.restore();
+        self.runtime.borrow_mut().active = Weak::new();
     }
 }
 
-fn collect_strings(value: &Value, into: &mut Vec<String>) {
-    if let Some(text) = value.as_str() {
-        into.push(text.to_owned());
-    } else if let Some(items) = value.as_array() {
-        for item in items.iter() {
-            collect_strings(item, into);
+/// Owns the base-chain HTTP/WS listeners and their connection tasks.
+pub struct Proxy {
+    runtime: Shared,
+    endpoints: BaseEndpoints,
+    listeners: [JoinHandle<()>; 2],
+}
+
+impl Proxy {
+    pub async fn spawn(upstream: BaseEndpoints) -> Result<Self> {
+        let runtime = Rc::new(RefCell::new(Runtime::default()));
+        let http_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let ws_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let endpoints = BaseEndpoints {
+            rpc_url: format!("http://{}", http_listener.local_addr()?).parse()?,
+            ws_url: format!("ws://{}", ws_listener.local_addr()?).parse()?,
+            grpc_url: upstream.grpc_url,
+        };
+        let listeners = [
+            task::spawn_local(http::accept(
+                http_listener,
+                upstream.rpc_url,
+                rpc_http::client(),
+                runtime.clone(),
+            )),
+            task::spawn_local(ws::accept(ws_listener, upstream.ws_url, runtime.clone())),
+        ];
+        Ok(Self { runtime, endpoints, listeners })
+    }
+
+    pub fn endpoints(&self) -> BaseEndpoints {
+        self.endpoints.clone()
+    }
+
+    pub fn scope(&self) -> Result<Faults> {
+        let mut runtime = self.runtime.borrow_mut();
+        ensure!(
+            runtime.active.upgrade().is_none(),
+            "proxy already has an active fault scope"
+        );
+        let state = Rc::new(RefCell::new(State {
+            traps: Vec::new(),
+            rules: Vec::new(),
+            unfired: Vec::new(),
+            observed: [0; 3],
+            holding: 0,
+            sequence: 0,
+            reset: watch::channel(()).0,
+            drained: Rc::default(),
+        }));
+        runtime.active = Rc::downgrade(&state);
+        Ok(Faults {
+            state,
+            runtime: self.runtime.clone(),
+        })
+    }
+}
+
+impl Drop for Proxy {
+    fn drop(&mut self) {
+        for listener in &self.listeners {
+            listener.abort();
         }
-    } else if let Some(fields) = value.as_object() {
-        for (_, item) in fields.iter() {
-            collect_strings(item, into);
-        }
-    }
-}
-
-fn classify(strings: Vec<String>) -> (Vec<String>, Vec<String>) {
-    let mut signatures = Vec::new();
-    let mut accounts = Vec::new();
-    for text in strings {
-        if text.parse::<Signature>().is_ok() {
-            signatures.push(text);
-        } else if text.parse::<Pubkey>().is_ok() {
-            accounts.push(text);
-        } else if let Ok(tx) = decode_transaction(&text) {
-            signatures.extend(tx.signatures.iter().map(ToString::to_string));
-            accounts.extend(tx.message.static_account_keys().iter().map(ToString::to_string));
-        }
-    }
-    (signatures, accounts)
-}
-
-struct Parsed {
-    id: Option<Value>,
-    method: Option<String>,
-    subscription: Option<u64>,
-    result: Option<u64>,
-    strings: Vec<String>,
-}
-
-fn parse(text: &str) -> Option<Parsed> {
-    let value: Value = json::from_str(text).ok()?;
-    let method = value.get("method").and_then(|m| m.as_str()).map(str::to_owned);
-    let mut strings = Vec::new();
-    if let Some(params) = value.get("params") {
-        collect_strings(params, &mut strings);
-    }
-    if let Some(result) = value.get("result") {
-        collect_strings(result, &mut strings);
-    }
-    let subscription = value
-        .get("params")
-        .and_then(|params| params.get("subscription"))
-        .and_then(|sub| sub.as_u64());
-    Some(Parsed {
-        id: value.get("id").cloned(),
-        method,
-        subscription,
-        result: value.get("result").and_then(|result| result.as_u64()),
-        strings,
-    })
-}
-
-fn operation(transport: Transport, stage: Stage, method: &str, strings: Vec<String>) -> Operation {
-    let (signatures, accounts) = classify(strings);
-    Operation {
-        transport,
-        stage,
-        method: method.to_owned(),
-        signatures,
-        accounts,
-    }
-}
-
-fn merged(mut base: Operation, stage: Stage, extra: Vec<String>) -> Operation {
-    let (signatures, accounts) = classify(extra);
-    for signature in signatures {
-        if !base.signatures.contains(&signature) {
-            base.signatures.push(signature);
+        for (_, connection) in self.runtime.borrow_mut().connections.drain(..) {
+            connection.abort();
         }
     }
-    for account in accounts {
-        if !base.accounts.contains(&account) {
-            base.accounts.push(account);
-        }
-    }
-    base.stage = stage;
-    base
-}
-
-fn rejection(id: &Option<Value>, message: &str) -> String {
-    let id = id
-        .as_ref()
-        .and_then(|id| json::to_string(id).ok())
-        .unwrap_or_else(|| "null".to_owned());
-    let message = json::to_string(message).unwrap_or_default();
-    format!(
-        "{{\"jsonrpc\":\"2.0\",\"error\":{{\"code\":{REJECTION_CODE},\
-         \"message\":{message}}},\"id\":{id}}}"
-    )
 }

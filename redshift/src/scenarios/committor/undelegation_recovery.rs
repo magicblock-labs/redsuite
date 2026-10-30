@@ -5,7 +5,7 @@ use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
     expect_error,
-    netfault::{BaseProxies, Selector},
+    netfault::{Faults, Selector, Transport},
     programs::{CellHeader, CellId, SettlementMode, REDLINE},
     topology::RestartConfig,
     wait, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
@@ -13,7 +13,7 @@ use redsuite_core::{
 use signer::Signer;
 use tokio::time;
 
-use super::{write_snapshot, PROXIED_GROUP};
+use super::write_snapshot;
 use crate::{program::DELEGATION_PROGRAM_ID, ACCOUNT_SPACE, LOCKOUT_REJECTIONS, PAYER_LAMPORTS};
 
 const INTERCEPT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -49,16 +49,16 @@ fn value(case: u64, step: u64) -> u64 {
 
 impl Scenario for UndelegationRecovery {
     async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
-        er.proxies().context(PROXIED_GROUP)?;
+        er.faults()?;
         let payer = base.funded_payer(PAYER_LAMPORTS).await?;
 
         Ok(Self { base, er, payer })
     }
 
     async fn run(self) -> Result<()> {
-        let proxies = self.er.proxies().context(PROXIED_GROUP)?;
-        self.recover(proxies, 1, Recovery::Reconnect).await?;
-        self.recover(proxies, 2, Recovery::Restart).await?;
+        let faults = self.er.faults()?;
+        self.recover(&faults, 1, Recovery::Reconnect).await?;
+        self.recover(&faults, 2, Recovery::Restart).await?;
 
         Ok(())
     }
@@ -155,7 +155,7 @@ impl UndelegationRecovery {
         Ok(())
     }
 
-    async fn recover(&self, proxies: &BaseProxies, seed: u8, mode: Recovery) -> Result<()> {
+    async fn recover(&self, faults: &Faults, seed: u8, mode: Recovery) -> Result<()> {
         let case = u64::from(seed);
         let identity = self.er.identity();
         let account = self
@@ -166,7 +166,7 @@ impl UndelegationRecovery {
         self.er.await_clones(&[account], ACCOUNT_SPACE as usize).await?;
         let snapshot = write_snapshot(&self.er, &self.payer, value(case, 1), &account).await?;
 
-        let submission = proxies
+        let submission = faults
             .intercept(Selector::method("sendTransaction").http().request().account(&account));
         self.er
             .cells(REDLINE, &self.payer)
@@ -181,7 +181,7 @@ impl UndelegationRecovery {
         )
         .await?;
 
-        let resubmission = proxies
+        let resubmission = faults
             .intercept(Selector::method("sendTransaction").http().request().account(&account));
         held.discard();
         let held = resubmission.wait(INTERCEPT_TIMEOUT).await?;
@@ -199,18 +199,20 @@ impl UndelegationRecovery {
             .context("the account vanished from base while its submission was held")?;
         ensure!(on_base.owner == DELEGATION_PROGRAM_ID);
 
-        let blind = proxies.reject(
+        let blind = faults.reject(
             Selector::methods(&[]).ws().notification().account(&account),
             HIDDEN,
         );
-        proxies.close_connections();
+        faults.disconnect(Transport::Http);
+        faults.disconnect(Transport::Ws);
         held.release();
         self.await_ownership_return(&account, &crate::program::id(), &snapshot).await?;
 
         match mode {
             Recovery::Reconnect => {
                 blind.remove();
-                proxies.close_connections();
+                faults.disconnect(Transport::Http);
+                faults.disconnect(Transport::Ws);
             }
             Recovery::Restart => {
                 let timing = self.er.restart(RestartConfig::default()).await?;

@@ -39,24 +39,15 @@ impl Family {
 pub struct ErGroup {
     pub label: &'static str,
     pub settings: fn(&mut LeaderParams),
-    pub proxies: ProxyMode,
+    pub proxy: bool,
     /// Identities admitted at boot; followers are launched only by replication coverage.
     pub followers: usize,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub enum ProxyMode {
-    None,
-    /// HTTP and WebSocket traffic share one fault controller.
-    Shared,
-    /// HTTP and WebSocket faults are controlled independently.
-    Split,
 }
 
 pub static DEFAULT: ErGroup = ErGroup {
     label: "default",
     settings: |_| {},
-    proxies: ProxyMode::None,
+    proxy: false,
     followers: 0,
 };
 

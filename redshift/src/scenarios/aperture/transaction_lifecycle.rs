@@ -1,6 +1,6 @@
 use std::{rc::Rc, time::Duration};
 
-use anyhow::{anyhow, ensure, Context};
+use anyhow::{anyhow, ensure};
 use futures_util::future::join_all;
 use instruction::Instruction;
 use keypair::Keypair;
@@ -190,11 +190,8 @@ impl Mode {
                     .http()
                     .request()
                     .account(&cold);
-                let proxies = er.proxies().context(
-                    "the cold-fetch case needs the base-chain proxies of its \
-                     ER group",
-                )?;
-                let trap = proxies.intercept(selector);
+                let faults = er.faults()?;
+                let trap = faults.intercept(selector);
                 let tx = Signed::new(er, &payer, owner, 7, false, Some(cold)).await?;
                 let (failed, fault) = tokio::join!(tx.send(er), async {
                     trap.wait(TIMEOUT).await?.reject("retry-test cold fetch unavailable");

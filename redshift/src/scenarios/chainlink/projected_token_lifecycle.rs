@@ -8,7 +8,7 @@ use redsuite_core::{
     api::transaction_meta,
     dlp::{self, delegate_with_actions, DelegateArgs},
     expect_error,
-    netfault::{BaseProxies, Held, RuleHandle, Selector},
+    netfault::{Faults, Held, RuleHandle, Selector, Transport},
     programs::{SettlementMode, REDLINE},
     receipt, system, topology, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
@@ -115,7 +115,7 @@ pub enum Mode {
 /// Checks backing settlement or an independently prepared Magic ATA overlay lifecycle.
 pub struct ProjectedTokenLifecycle {
     base: Rc<BaseCtx>,
-    proxies: Rc<BaseProxies>,
+    faults: Rc<Faults>,
     er: ErCtx,
     mode: Mode,
     validator: Keypair,
@@ -127,7 +127,7 @@ pub struct ProjectedTokenLifecycle {
 
 impl Scenario<(), Mode> for ProjectedTokenLifecycle {
     async fn setup(base: Rc<BaseCtx>, er: ErCtx, mode: Mode) -> Result<Self> {
-        let proxies = er.http_proxy()?;
+        let faults = er.faults()?;
         let validator = topology::identity_keypair(&er.identity())?;
         let payer = base.funded_payer(PAYER_LAMPORTS).await?;
         let mint = Keypair::new();
@@ -140,7 +140,7 @@ impl Scenario<(), Mode> for ProjectedTokenLifecycle {
         ];
         Ok(Self {
             base,
-            proxies,
+            faults,
             er,
             mode,
             validator,
@@ -332,11 +332,10 @@ impl ProjectedTokenLifecycle {
     #[instrument(skip_all, err)]
     async fn commit_withheld(&self) -> Result<(Signature, Held, [RuleHandle; 2])> {
         let confirmations = [
-            self.proxies.stall(Selector::method("getSignatureStatuses").http().response()),
-            self.proxies
-                .stall(Selector::method("signatureNotification").ws().notification()),
+            self.faults.stall(Selector::method("getSignatureStatuses").http().response()),
+            self.faults.stall(Selector::method("signatureNotification").ws().notification()),
         ];
-        let submission = self.proxies.intercept(
+        let submission = self.faults.intercept(
             Selector::method("sendTransaction")
                 .http()
                 .response()
@@ -359,7 +358,8 @@ impl ProjectedTokenLifecycle {
         confirmations: [RuleHandle; 2],
     ) -> Result<()> {
         held.discard();
-        self.proxies.close_connections();
+        self.faults.disconnect(Transport::Http);
+        self.faults.disconnect(Transport::Ws);
         for rule in confirmations {
             rule.remove();
         }
@@ -473,7 +473,7 @@ impl ProjectedTokenLifecycle {
 
     #[instrument(skip_all, err)]
     async fn finish(self) -> Result<()> {
-        self.proxies.reset().await
+        self.faults.reset().await
     }
 
     async fn redelegate(&self) -> Result<()> {

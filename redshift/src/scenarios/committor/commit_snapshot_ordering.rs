@@ -5,7 +5,7 @@ use anyhow::{ensure, Context};
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    netfault::{BaseProxies, Held, Selector},
+    netfault::{Faults, Held, Selector},
     programs::{SettlementMode, REDLINE},
     receipt::{self, CommitReceipt},
     topology, BaseCtx, ChainCtx, Result, Scenario,
@@ -56,14 +56,14 @@ struct Bundle {
 /// Checks queued snapshot fidelity and progress of independent versus conflicting commits.
 pub struct CommitSnapshotOrdering {
     base: Rc<BaseCtx>,
-    proxies: Rc<BaseProxies>,
+    faults: Rc<Faults>,
     er: ErCtx,
 }
 
 impl Scenario for CommitSnapshotOrdering {
     async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
-        let proxies = er.http_proxy()?;
-        Ok(Self { base, proxies, er })
+        let faults = er.faults()?;
+        Ok(Self { base, faults, er })
     }
 
     async fn run(self) -> Result<()> {
@@ -71,7 +71,7 @@ impl Scenario for CommitSnapshotOrdering {
             self.run_variant(variant).await?;
         }
 
-        self.proxies.reset().await?;
+        self.faults.reset().await?;
         Ok(())
     }
 }
@@ -184,7 +184,7 @@ impl CommitSnapshotOrdering {
         let nonce_c = crate::last_commit_id(self.base.as_ref(), &c).await?;
         let nonce_d = crate::last_commit_id(self.base.as_ref(), &d).await?;
         let first_submission = self
-            .proxies
+            .faults
             .intercept(Selector::method("sendTransaction").http().request().account(&a));
         let first = self.schedule(&payer, 1, &[a, b]).await?;
         let held_first = first_submission.wait(INTERCEPT_TIMEOUT).await?;
@@ -193,7 +193,7 @@ impl CommitSnapshotOrdering {
         let b2 = write_snapshot(&self.er, &payer, value(3), &b).await?;
         let c1 = write_snapshot(&self.er, &payer, value(4), &c).await?;
         let second_submission = self
-            .proxies
+            .faults
             .intercept(Selector::method("sendTransaction").http().request().account(&c));
         let second = self.schedule(&payer, 2, &[b, c]).await?;
         let d1 = write_snapshot(&self.er, &payer, value(5), &d).await?;
@@ -226,11 +226,11 @@ impl CommitSnapshotOrdering {
         }
 
         let retry_submission = self
-            .proxies
+            .faults
             .intercept(Selector::method("sendTransaction").http().request().account(&a));
         held_first.discard();
         let held_retry = retry_submission.wait(INTERCEPT_TIMEOUT).await?;
-        let retry_held_at = held_retry.held_at;
+        let retry_sequence = held_retry.sequence;
         held_retry.release();
 
         let first_bundle = self.settled(&first, &[a, b], "delayed bundle").await?;
@@ -240,7 +240,7 @@ impl CommitSnapshotOrdering {
         ensure!(crate::last_commit_id(self.base.as_ref(), &b).await? == (nonce_b + 1));
 
         let held_second = second_submission.wait(INTERCEPT_TIMEOUT).await?;
-        ensure!(held_second.held_at > retry_held_at);
+        ensure!(held_second.sequence > retry_sequence);
         own_buffers.extend(self.referenced_buffers(&held_second).await?);
         held_second.release();
         let second_bundle = self.settled(&second, &[b, c], "conflicting bundle").await?;
@@ -261,7 +261,7 @@ impl CommitSnapshotOrdering {
                 .push(write_snapshot(&self.er, &payer, value(21 + offset as u64), account).await?);
         }
         let trap = self
-            .proxies
+            .faults
             .intercept(Selector::method("sendTransaction").http().request().account(&a));
         let fourth = self.schedule(&payer, 4, &accounts).await?;
         let held = trap.wait(INTERCEPT_TIMEOUT).await?;

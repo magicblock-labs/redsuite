@@ -9,7 +9,7 @@ use pubkey::Pubkey;
 use redsuite_core::{
     api::{custom_error_code, transaction_logs, transaction_meta},
     catalog::Fixture,
-    netfault::{BaseProxies, Selector},
+    netfault::{Faults, Proxy, Selector},
     programs::{CellHeader, UpgradeProbe},
     redline::Accounts,
     topology::{self, ErOptions, PrivateEr},
@@ -74,7 +74,8 @@ pub struct ProgramUpgradeConsistency {
     buffer: Pubkey,
     program_id: Pubkey,
     programdata: Pubkey,
-    proxies: BaseProxies,
+    proxy: Proxy,
+    faults: Faults,
     hot: PrivateEr,
     cold: PrivateEr,
 }
@@ -107,10 +108,11 @@ impl PrivateErScenario for ProgramUpgradeConsistency {
             )?,
         )
         .await?;
-        let proxies = BaseProxies::spawn(&base).await?;
+        let proxy = Proxy::spawn(topology::BaseEndpoints::from_base(&base)?).await?;
+        let faults = proxy.scope()?;
         let options = |label: &str| ErOptions {
             label: label.into(),
-            base_endpoints: Some(proxies.endpoints()),
+            base_endpoints: Some(proxy.endpoints()),
 
             ..ErOptions::default()
         };
@@ -127,7 +129,8 @@ impl PrivateErScenario for ProgramUpgradeConsistency {
             buffer: b_buffer.pubkey(),
             program_id,
             programdata,
-            proxies,
+            proxy,
+            faults,
             hot,
             cold,
         })
@@ -158,7 +161,7 @@ impl PrivateErScenario for ProgramUpgradeConsistency {
             keys: &keys,
             expected,
             program_id: self.program_id,
-            proxies: &self.proxies,
+            faults: &self.faults,
             progress: &progress,
         };
         time::timeout(
@@ -168,7 +171,8 @@ impl PrivateErScenario for ProgramUpgradeConsistency {
         .await??;
         ensure!(self.base.accounts(&keys).await? == base_state);
         try_join(self.hot.finish(), self.cold.finish()).await?;
-        self.proxies.finish()?;
+        self.faults.reset().await?;
+        drop(self.proxy);
         Ok(())
     }
 }
@@ -196,14 +200,14 @@ struct Invocations<'a> {
     keys: &'a [Pubkey; 2],
     expected: Vec<Account>,
     program_id: Pubkey,
-    proxies: &'a BaseProxies,
+    faults: &'a Faults,
     progress: &'a Progress,
 }
 
 impl Invocations<'_> {
     async fn run(mut self) -> Result<()> {
         let mut loading_failure = Some(
-            self.proxies.reject(
+            self.faults.reject(
                 Selector::methods(&["getAccountInfo", "getMultipleAccounts"])
                     .http()
                     .response()
@@ -319,17 +323,20 @@ impl ProgramUpgradeConsistency {
         progress.await_count(0, 4).await?;
         self.materialized(er, &self.a).await?;
         let holds = [self.program_id, self.programdata].map(|key| {
-            self.proxies.stall(
-                Selector::methods(&[
-                    "getAccountInfo",
-                    "getMultipleAccounts",
-                    "accountNotification",
-                    "programNotification",
-                ])
-                .response()
-                .notification()
-                .account(&key),
-            )
+            [
+                self.faults.stall(
+                    Selector::methods(&["accountNotification", "programNotification"])
+                        .ws()
+                        .notification()
+                        .account(&key),
+                ),
+                self.faults.stall(
+                    Selector::methods(&["getAccountInfo", "getMultipleAccounts"])
+                        .http()
+                        .response()
+                        .account(&key),
+                ),
+            ]
         });
         progress.phase.set(1);
         self.base
@@ -346,24 +353,14 @@ impl ProgramUpgradeConsistency {
             .data;
         let offset = UpgradeableLoaderState::size_of_programdata_metadata();
         ensure!(data.get(offset..) == Some(self.b.as_slice()));
-        self.proxies
-            .await_held(
-                Selector::default().notification().account(&self.programdata),
-                TIMEOUT,
-            )
-            .await?;
+        holds[1][0].wait_hit(TIMEOUT).await?;
         let after_upgrade = progress.counts.get()[1];
         let (clones, ()) = try_join(
             try_join_all((0..3).map(|_| self.cold.ctx().account(&self.program_id))),
             async {
-                self.proxies
-                    .await_held(
-                        Selector::default().response().account(&self.program_id),
-                        TIMEOUT,
-                    )
-                    .await?;
+                holds[0][1].wait_hit(TIMEOUT).await?;
                 progress.await_count(1, after_upgrade + 8).await?;
-                for hold in holds {
+                for hold in holds.into_iter().flatten() {
                     hold.remove();
                 }
                 progress.phase.set(2);
