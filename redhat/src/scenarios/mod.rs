@@ -8,7 +8,7 @@ use aperture::{
 use magicblock_config::types::Remote;
 use redshift::scenarios::replication::replication_recovery::{Coverage, ReplicationRecovery};
 use redsuite_core::{
-    catalog::{BasePreparation, ErGroup, Fixture, ProxyMode, ScenarioEntry, DEFAULT},
+    catalog::{BasePreparation, ErGroup, Fixture, ScenarioEntry, DEFAULT},
     scenario, topology, Scenario,
 };
 use std::time::Duration;
@@ -16,7 +16,7 @@ use std::time::Duration;
 static PREPARATION: ErGroup = ErGroup {
     label: "hostile-preparation",
     settings: |p| p.remotes.retain(|remote| !matches!(remote, Remote::Grpc(_))),
-    proxies: ProxyMode::Shared,
+    proxy: true,
     followers: 0,
 };
 
@@ -26,7 +26,7 @@ static EPHEMERAL: ErGroup = ErGroup {
         p.engine.accountsdb.lru_capacity =
             redshift::scenarios::chainlink::cache_lifecycle::CACHE_CAPACITY
     },
-    proxies: ProxyMode::None,
+    proxy: false,
     followers: 0,
 };
 
@@ -36,7 +36,7 @@ static REPLICATION: ErGroup = ErGroup {
         p.engine.blockstore.blocktime = Duration::from_millis(40);
         p.engine.blockstore.superblock = 512;
     },
-    proxies: ProxyMode::None,
+    proxy: false,
     followers: 2,
 };
 

@@ -454,7 +454,7 @@ impl SettlementAuthorization {
                     .api()
                     .get_program_accounts(&magic_api::OUTBOX_INTENT_PROGRAM_ID)
                     .await?;
-                let trap = self.er.http_proxy()?.intercept(
+                let trap = self.er.faults()?.intercept(
                     Selector::method("sendTransaction").http().request().account(&action_cell),
                 );
                 Some((trap, pending))

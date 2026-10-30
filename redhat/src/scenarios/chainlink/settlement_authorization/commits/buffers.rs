@@ -221,7 +221,7 @@ impl SettlementAuthorization {
 
     async fn check_pending_outbox(&self, attacker: &Keypair) -> Result<()> {
         let plan = &self.commit_plan.buffers;
-        let proxies = self.er.http_proxy()?;
+        let faults = self.er.faults()?;
         let mut large = Vec::new();
         for index in 0..8 {
             let id = CellId::new(attacker.pubkey(), 100 + index);
@@ -273,7 +273,7 @@ impl SettlementAuthorization {
             header.write(&mut image.data)?;
         }
         let old_outbox = self.er.api().get_program_accounts(&OUTBOX_INTENT_PROGRAM_ID).await?;
-        let trap = proxies.intercept(
+        let trap = faults.intercept(
             Selector::method("sendTransaction")
                 .http()
                 .response()
@@ -352,8 +352,8 @@ impl SettlementAuthorization {
             .iter()
             .position(|key| *key == prepared_cell)
             .context("prepared cell missing")?;
-        let write_trap = proxies
-            .intercept(Selector::method("sendTransaction").http().request().account(&buffer));
+        let write_trap =
+            faults.intercept(Selector::method("sendTransaction").http().request().account(&buffer));
         initialization.release();
         let held = write_trap.wait(Duration::from_secs(30)).await?;
         let write_signature = held.operation.signature()?;
@@ -549,7 +549,7 @@ impl SettlementAuthorization {
             .check_success("large buffer reuse recovery")?;
         ensure!(self.er.local_images(&large).await? == expected);
         ensure!(self.base.accounts(&large).await? == expected_base);
-        proxies.reset().await?;
+        faults.reset().await?;
         Ok(())
     }
 

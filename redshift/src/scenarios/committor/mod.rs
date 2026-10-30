@@ -19,8 +19,6 @@ use redsuite_core::{
 use signature::Signature;
 use tokio::time;
 
-pub(super) const PROXIED_GROUP: &str = "this scenario needs the base-chain proxies of its ER group";
-
 async fn write_and_commit(
     er: &ErCtx,
     payer: &Keypair,

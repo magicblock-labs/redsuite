@@ -23,7 +23,7 @@ use super::{
 use crate::{
     api::Api,
     context::{BaseCtx, ChainCtx, ErCtx},
-    netfault::BaseProxies,
+    netfault::Proxy,
     report,
     resources::LaunchRecord,
     Result,
@@ -53,13 +53,8 @@ impl PrivateEr {
         &self.ctx
     }
 
-    pub fn with_proxies(mut self, proxies: Rc<BaseProxies>) -> Self {
-        self.ctx.proxies = Some(proxies);
-        self
-    }
-
-    pub fn with_ws_proxy(mut self, proxies: Rc<BaseProxies>) -> Self {
-        self.ctx.ws_proxies = Some(proxies);
+    pub fn with_proxy(mut self, proxy: Rc<Proxy>) -> Self {
+        self.ctx.proxy = Some(proxy);
         self
     }
 

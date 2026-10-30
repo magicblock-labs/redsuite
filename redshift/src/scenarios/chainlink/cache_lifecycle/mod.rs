@@ -5,7 +5,7 @@ use crate::ACCOUNT_OWNERS;
 use anyhow::{ensure, Context};
 use pubkey::Pubkey;
 use redsuite_core::{
-    netfault::BaseProxies, programs::CellHeader, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
+    netfault::Faults, programs::CellHeader, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
 use std::{rc::Rc, time::Duration};
 
@@ -78,16 +78,14 @@ pub enum Mode {
 pub struct CacheLifecycle {
     base: Rc<BaseCtx>,
     mode: Mode,
-    http: Rc<BaseProxies>,
-    ws: Rc<BaseProxies>,
+    faults: Rc<Faults>,
     er: ErCtx,
 }
 
 impl Scenario<(), Mode> for CacheLifecycle {
     async fn setup(base: Rc<BaseCtx>, er: ErCtx, mode: Mode) -> Result<Self> {
-        let http = er.http_proxy()?;
-        let ws = er.ws_proxy()?;
-        Ok(Self { base, er, mode, http, ws })
+        let faults = er.faults()?;
+        Ok(Self { base, er, mode, faults })
     }
     async fn run(self) -> Result<()> {
         if matches!(self.mode, Mode::UndelegationReconnectGap) {

@@ -23,7 +23,7 @@ use crate::{
     api::{Api, Metrics, MetricsCollector},
     cells,
     config::{ErEndpoints, ExecutionConfig},
-    netfault::BaseProxies,
+    netfault::{Faults, Proxy},
     report::{self, ScenarioReport},
     resources::Resources,
     rpc_types::{request::RpcRequest, response::RpcIdentity},
@@ -154,15 +154,16 @@ pub struct ErCtx {
     identity: Pubkey,
     blockhash: Rc<BlockhashCache>,
     pub(crate) pid: u32,
-    pub(crate) proxies: Option<Rc<BaseProxies>>,
-    pub(crate) ws_proxies: Option<Rc<BaseProxies>>,
+    pub(crate) proxy: Option<Rc<Proxy>>,
+    faults: Option<Rc<Faults>>,
     pub(crate) owner: Option<Weak<Mutex<PrivateEr>>>,
 }
 
 impl ErCtx {
-    pub(crate) fn for_scenario(mut self) -> Self {
+    pub(crate) fn for_scenario(mut self) -> Result<Self> {
         self.api = self.api.scoped();
-        self
+        self.faults = self.proxy.as_ref().map(|proxy| proxy.scope().map(Rc::new)).transpose()?;
+        Ok(self)
     }
 
     /// Read only resident accounts; unlike account reads, this never triggers cloning.
@@ -207,33 +208,21 @@ impl ErCtx {
             identity,
             blockhash: Rc::new(BlockhashCache::new(ER_BLOCKHASH_TTL)),
             pid,
-            proxies: None,
-            ws_proxies: None,
+            proxy: None,
+            faults: None,
             owner: None,
         }
     }
 
-    pub fn http_proxy(&self) -> Result<Rc<BaseProxies>> {
-        self.proxies.clone().context("scenario requires an HTTP proxy")
-    }
-    pub fn ws_proxy(&self) -> Result<Rc<BaseProxies>> {
-        self.ws_proxies.clone().context("scenario requires a separate WS proxy")
-    }
-
-    pub fn proxies(&self) -> Option<&BaseProxies> {
-        self.proxies.as_deref()
+    pub fn faults(&self) -> Result<Rc<Faults>> {
+        self.faults.clone().context("scenario requires a fault proxy")
     }
 
     pub(crate) async fn reset_faults(&self) -> Result<()> {
-        let ws = match &self.ws_proxies {
-            Some(proxies) => proxies.reset().await,
+        match &self.faults {
+            Some(faults) => faults.reset().await,
             None => Ok(()),
-        };
-        let http = match &self.proxies {
-            Some(proxies) => proxies.reset().await,
-            None => Ok(()),
-        };
-        ws.and(http)
+        }
     }
 
     pub async fn restart(&self, config: RestartConfig) -> Result<RestartOutcome> {

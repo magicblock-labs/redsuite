@@ -8,7 +8,7 @@ use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
     api::transaction_meta,
-    netfault::{Held, RuleHandle, Selector, Trap},
+    netfault::{Held, RuleHandle, Selector, Transport, Trap},
     programs::{CellHeader, CellId, HashState, SettlementMode, REDLINE},
     rpc_types::response::TransactionError,
     system, wait, ChainCtx, Result, TxSender,
@@ -87,8 +87,8 @@ impl TrafficProgress {
 
 impl CacheLifecycle {
     fn observe(&self, method: &str, key: &Pubkey) -> Trap {
-        self.ws
-            .intercept(Selector::method(method).response().notification().account(key))
+        self.faults
+            .intercept(Selector::method(method).ws().response().notification().account(key))
     }
 
     #[instrument(skip_all, err)]
@@ -129,12 +129,12 @@ impl CacheLifecycle {
             })
             .collect();
         self.base.submit_and_confirm(&funder, &delegates).await?;
-        let stale = try_join_all(stale.iter().map(|trap| trap.wait(TIMEOUT))).await?;
+        let stale = try_join_all(stale.into_iter().map(|trap| trap.wait(TIMEOUT))).await?;
         er.accounts(protected_keys).await?;
         er.cells(REDLINE, &payer).write(ER_WRITE, er_written_keys).await?;
         let settlement = self
-            .http
-            .stall(Selector::method("sendTransaction").request().account(&pending[0]));
+            .faults
+            .stall(Selector::method("sendTransaction").http().request().account(&pending[0]));
         er.submit_and_confirm(
             &funder,
             &[REDLINE
@@ -144,7 +144,7 @@ impl CacheLifecycle {
                 .build()],
         )
         .await?;
-        self.http.await_held(Selector::default(), TIMEOUT).await?;
+        settlement.wait_hit(TIMEOUT).await?;
         let protected = er.local_accounts(&ACCOUNT_OWNERS, protected_keys).await?;
         ensure!(protected.iter().all(Option::is_some));
         let base_delegated = self.base.accounts(delegated).await?;
@@ -225,11 +225,11 @@ impl CacheLifecycle {
         let mut evictions = accounts.evictions;
         if matches!(self.mode, Mode::UndelegationReconnectGap) {
             churn_cache(&self.er, &accounts.pool, evictions).await?;
-            self.ws.stall(Selector::default().response().notification());
+            self.faults.stall(Selector::default().ws().response().notification());
             for key in protected_keys {
-                self.http.stall(Selector::methods(&FETCHES).response().account(key));
+                self.faults.stall(Selector::methods(&FETCHES).http().response().account(key));
             }
-            self.ws.close_connections();
+            self.faults.disconnect(Transport::Ws);
             return Ok(());
         }
         for (cycle, &target) in readonly.iter().enumerate() {
@@ -237,10 +237,12 @@ impl CacheLifecycle {
             let cold = er.local_accounts(&ACCOUNT_OWNERS, &[target]).await?;
             ensure!(cold[0].is_none());
             let reconnect = self.observe("accountSubscribe", &pending[0]);
-            self.ws.close_connections();
+            self.faults.disconnect(Transport::Ws);
             let reconnect = reconnect.wait(TIMEOUT).await?;
             let registered = self.observe("accountSubscribe", &target);
-            let old = self.http.intercept(Selector::methods(&FETCHES).response().account(&target));
+            let old = self
+                .faults
+                .intercept(Selector::methods(&FETCHES).http().response().account(&target));
             let latest = BASE_REFRESH + 1 + cycle as u64;
             let (read, ()) = try_join(er.account(&target), async {
                 registered.wait(TIMEOUT).await?.release();
@@ -355,8 +357,7 @@ impl CacheLifecycle {
 
     #[instrument(skip_all, err)]
     async fn finish(self) -> Result<()> {
-        self.http.reset().await?;
-        self.ws.reset().await?;
+        self.faults.reset().await?;
         Ok(())
     }
 }

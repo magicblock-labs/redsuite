@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use anyhow::{bail, ensure, Context};
 use redsuite_core::{
-    netfault::Selector,
+    netfault::{Selector, Transport},
     programs::{CellId, SettlementMode, REDLINE},
     ChainCtx, Result,
 };
@@ -55,8 +55,8 @@ impl CacheLifecycle {
             .all(|account| crate::account_id(account) == Some(ER_WRITE)));
 
         let settlement = self
-            .http
-            .stall(Selector::method("sendTransaction").request().account(&pending[0]));
+            .faults
+            .stall(Selector::method("sendTransaction").http().request().account(&pending[0]));
         er.submit_and_confirm(
             &funder,
             &[REDLINE
@@ -66,13 +66,13 @@ impl CacheLifecycle {
                 .build()],
         )
         .await?;
-        self.http.await_held(Selector::default(), TIMEOUT).await?;
+        settlement.wait_hit(TIMEOUT).await?;
 
-        self.ws.stall(Selector::default().response().notification());
+        let ws_blackout = self.faults.stall(Selector::default().ws().response().notification());
         for key in &keys {
-            self.http.stall(Selector::methods(&FETCHES).response().account(key));
+            self.faults.stall(Selector::methods(&FETCHES).http().response().account(key));
         }
-        self.ws.close_connections();
+        self.faults.disconnect(Transport::Ws);
         settlement.remove();
 
         self.base
@@ -114,18 +114,15 @@ impl CacheLifecycle {
             );
         }
 
-        let ws_held = self.ws.held_count(&Selector::default());
-        ensure!(ws_held > 0);
-        self.ws.restore();
-        self.http.restore();
+        ensure!(ws_blackout.hits() > 0);
+        self.faults.restore();
 
         ensure!(
             er.scrape_metrics().await?.get("engine_keeper_account_cache_evictions")
                 == Some(evictions_before),
             "transport baseline evicted accounts"
         );
-        self.http.reset().await?;
-        self.ws.reset().await?;
+        self.faults.reset().await?;
         Ok(())
     }
 }
