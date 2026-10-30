@@ -1,10 +1,4 @@
-use std::{
-    collections::BTreeMap,
-    fs,
-    fs::{File, OpenOptions},
-    path::Path,
-    time::Duration,
-};
+use std::{collections::BTreeMap, fs, fs::OpenOptions, path::Path, time::Duration};
 
 use anyhow::{ensure, Context};
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -64,7 +58,12 @@ pub fn identity_for_label(label: &str) -> Result<Keypair> {
                     `redsuite stack down` and boot it again"
     );
     let dir = state::stack_dir();
-    let _guard = PoolLock::acquire(&dir)?;
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(POOL_LOCK_FILE))?;
+    lock.lock()?;
     let map_path = dir.join(POOL_MAP_FILE);
     let mut assignments: BTreeMap<String, usize> = fs::read_to_string(&map_path)
         .ok()
@@ -88,20 +87,6 @@ pub fn identity_for_label(label: &str) -> Result<Keypair> {
     };
     Keypair::try_from(&state.er_identity_pool[slot][..])
         .with_context(|| format!("corrupt state.json: bad pool identity {slot}"))
-}
-
-struct PoolLock(#[allow(dead_code)] File);
-
-impl PoolLock {
-    fn acquire(dir: &Path) -> Result<Self> {
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(dir.join(POOL_LOCK_FILE))?;
-        file.lock()?;
-        Ok(Self(file))
-    }
 }
 
 // Identity initialization spends concurrently; wait for an absolute balance,

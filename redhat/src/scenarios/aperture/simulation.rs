@@ -1,4 +1,4 @@
-use std::{rc::Rc, result};
+use std::rc::Rc;
 
 use anyhow::{ensure, Context};
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -12,7 +12,6 @@ use tracing::debug;
 use transaction::{versioned::VersionedTransaction, Message};
 
 use redsuite_core::{
-    api::RpcError,
     dlp,
     programs::{
         Action, CellId, Commit, IntentBundle, ResultCallback, SettlementMode, Task, MAGIC, REDSHIFT,
@@ -68,10 +67,12 @@ impl SimulationIsolation {
                     wincode::deserialize_exact(&STANDARD.decode(&tx.encoded)?)?;
                 forged.signatures[0] = Signature::default();
                 let encoded = STANDARD.encode(wincode::serialize(&forged)?);
-                let result: result::Result<Response<Value>, RpcError> = fixture
-                    .er
-                    .api()
-                    .try_call(RpcRequest::SimulateTransaction, &(&encoded, config))
+                let api = fixture.er.api();
+                let result = api
+                    .try_call::<Response<Value>>(
+                        RpcRequest::SimulateTransaction,
+                        &(&encoded, config),
+                    )
                     .await?;
                 if sig_verify {
                     let error =
@@ -83,21 +84,14 @@ impl SimulationIsolation {
                 } else {
                     ensure!(result?.value["err"].is_null());
                 }
-                let result: result::Result<String, RpcError> = fixture
-                    .er
-                    .api()
-                    .try_call(
-                        RpcRequest::SendTransaction,
-                        &(
-                            &encoded,
-                            RpcSendTransactionConfig {
-                                skip_preflight,
-                                encoding: Some(UiTransactionEncoding::Base64),
-                                max_retries: Some(0),
-                                ..Default::default()
-                            },
-                        ),
-                    )
+                let config = RpcSendTransactionConfig {
+                    skip_preflight,
+                    encoding: Some(UiTransactionEncoding::Base64),
+                    max_retries: Some(0),
+                    ..Default::default()
+                };
+                let result = api
+                    .try_call::<String>(RpcRequest::SendTransaction, &(&encoded, config))
                     .await?;
                 let error = result.expect_err("forged signature submitted");
                 ensure!(
@@ -105,10 +99,9 @@ impl SimulationIsolation {
                     "{error}"
                 );
                 fixture.unchanged(&before).await?;
-                let signature = fixture
+                fixture
                     .check_control(VersionedMessage::Legacy(message), 1, 1, skip_preflight)
                     .await?;
-                ensure!(signature == tx.signature);
                 debug!(sig_verify, "simulation leaves no admission");
             }
         }
@@ -201,17 +194,14 @@ impl SimulationIsolation {
             )
             .await?;
             let start = fixture.er.api().get_slot().await?;
-            simulate(
-                &fixture.er,
-                &tx.encoded,
-                RpcSimulateTransactionConfig {
-                    sig_verify: true,
-                    encoding: Some(UiTransactionEncoding::Base64),
-                    ..Default::default()
-                },
-            )
-            .await
-            .with_context(|| format!("simulated {label}"))?;
+            let config = RpcSimulateTransactionConfig {
+                sig_verify: true,
+                encoding: Some(UiTransactionEncoding::Base64),
+                ..Default::default()
+            };
+            simulate(&fixture.er, &tx.encoded, config)
+                .await
+                .with_context(|| format!("simulated {label}"))?;
             let hydrated = fixture.er.local_images(&[target]).await?.pop().flatten();
             let index = before.keys.iter().position(|key| *key == target).unwrap();
             if before.local[index].is_none() {

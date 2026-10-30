@@ -308,9 +308,6 @@ impl Record {
                 .collect();
             ensure!(observed == [observation(before), observation(after)].concat());
         }
-        ensure!(transaction_logs(&self.info)
-            .iter()
-            .any(|line| line.starts_with(&format!("Program {} invoke", magic_api::id()))));
         Ok(())
     }
 

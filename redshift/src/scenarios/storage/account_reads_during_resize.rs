@@ -1,4 +1,3 @@
-use redsuite_core::ErCtx;
 use std::{
     cell::Cell,
     rc::Rc,
@@ -10,8 +9,8 @@ use keypair::Keypair;
 use pubkey::Pubkey;
 
 use redsuite_core::{
-    cells::OwnedCell, programs::REDSHIFT, topology::RestartConfig, Api, BaseCtx, ChainCtx, Result,
-    Scenario,
+    cells::OwnedCell, programs::REDSHIFT, topology::RestartConfig, Api, BaseCtx, ChainCtx, ErCtx,
+    Result, Scenario,
 };
 use signer::Signer;
 use tokio::{task::JoinHandle, time};
@@ -30,40 +29,25 @@ struct Readers {
     task: JoinHandle<Result<()>>,
 }
 
-struct AccountReader {
-    api: Api,
-    addresses: Vec<Pubkey>,
-    stop: Rc<Cell<bool>>,
-}
-
-impl AccountReader {
-    async fn run(self) -> Result<()> {
-        let mut reads = 0;
-        while !self.stop.get() {
-            self.read()
-                .await
-                .with_context(|| format!("snapshot account reads; completed={reads}"))?;
-            reads += 1;
-        }
-        Ok(())
-    }
-
-    async fn read(&self) -> Result<()> {
-        let accounts = self.api.get_multiple_accounts(&self.addresses).await?;
-        ensure!(accounts.iter().all(Option::is_some));
-        Ok(())
-    }
-}
-
 impl Readers {
     fn start(api: Api, addresses: Vec<Pubkey>) -> Self {
         let stop = Rc::new(Cell::new(false));
-        let reader = AccountReader {
-            api,
-            addresses,
-            stop: stop.clone(),
-        };
-        let task = tokio::task::spawn_local(reader.run());
+        let signal = stop.clone();
+        let task = tokio::task::spawn_local(async move {
+            let mut reads = 0;
+            while !signal.get() {
+                let accounts = api
+                    .get_multiple_accounts(&addresses)
+                    .await
+                    .with_context(|| format!("snapshot account reads; completed={reads}"))?;
+                ensure!(
+                    accounts.iter().all(Option::is_some),
+                    "snapshot account missing; completed={reads}"
+                );
+                reads += 1;
+            }
+            Ok(())
+        });
         Self { stop, task }
     }
 
@@ -90,7 +74,7 @@ impl Scenario for AccountReadsDuringResize {
     }
 
     async fn run(self) -> Result<()> {
-        let mut sizes = vec![INITIAL_ACCOUNT_SPACE; ACCOUNTS];
+        let mut sizes = [INITIAL_ACCOUNT_SPACE; ACCOUNTS];
         let er = &self.er;
         er.await_program_clone(&redshift_interface::id()).await?;
         let accounts = self
@@ -116,7 +100,6 @@ impl Scenario for AccountReadsDuringResize {
         let timing = self.er.restart(RestartConfig::default()).await?;
         ensure!(timing.exit_code == Some(0));
 
-        let er = &self.er;
         let readers = Readers::start(er.api().clone(), addresses.clone());
         self.churn(&accounts, &mut sizes, CHURN_AFTER_RESTART, "after restart").await?;
         readers.stop("after restart").await?;

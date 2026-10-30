@@ -32,10 +32,8 @@ impl BlockhashCache {
     }
 
     async fn get(&self, api: &Api) -> Result<Hash> {
-        if let Some((hash, at)) = *self.cached.borrow() {
-            if at.elapsed() < self.ttl {
-                return Ok(hash);
-            }
+        if let Some((hash, _)) = self.cached.borrow().filter(|(_, at)| at.elapsed() < self.ttl) {
+            return Ok(hash);
         }
         let hash = api.get_latest_blockhash().await?;
         *self.cached.borrow_mut() = Some((hash, Instant::now()));

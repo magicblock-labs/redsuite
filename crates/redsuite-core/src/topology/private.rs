@@ -177,8 +177,8 @@ async fn await_magic_fee_vault(base: &BaseCtx, identity: &Pubkey) -> Result<()> 
         ensure!(account.owner == crate::dlp::dlp_id());
         Ok(())
     })
-    .await?;
-    Ok(())
+    .await
+    .map(|_| ())
 }
 
 pub async fn private_er(base: &BaseCtx, options: ErOptions) -> Result<PrivateEr> {

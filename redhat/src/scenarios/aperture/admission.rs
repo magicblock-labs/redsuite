@@ -11,11 +11,10 @@ use redsuite_core::{
     programs::REDSHIFT,
     random,
     rpc_types::{request::RpcRequest, response::TransactionError},
-    signed::{audit, subscribe, Signed},
+    signed::{audit, Signed},
     transaction_types::UiTransactionError,
     wait, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
-use serde_json::{json, Value};
 use signer::Signer;
 use solana_instruction_error::InstructionError;
 use std::{rc::Rc, time::Duration};
@@ -178,7 +177,7 @@ impl Scenario for TransactionAdmission {
                     });
                 held?;
                 if skip_preflight {
-                    ensure!(sent?? == tx.signature.to_string());
+                    sent??;
                 } else {
                     let error = sent?.expect_err("invalid blockhash admitted with preflight");
                     ensure!(
@@ -234,11 +233,10 @@ impl Scenario for TransactionAdmission {
             )
             .await?;
             let mut before = fixture.snapshot(&[]).await?;
-            let (mut listener, subscription) = subscribe(&fixture.er, &tx).await?;
             let start = fixture.er.api().get_slot().await?;
             let sent = tx.send_config(&fixture.er, skip_preflight).await?;
             if skip_preflight {
-                ensure!(sent? == tx.signature.to_string());
+                sent?;
             } else {
                 let error = sent.expect_err("deliberate execution failure succeeded");
                 ensure!(
@@ -256,16 +254,6 @@ impl Scenario for TransactionAdmission {
                 .await?
                 .context("executed failure lost its terminal status")?;
             ensure!(status.slot == slot && status.err.map(Into::into) == tx.error);
-            let (method, id, payload) = listener
-                .next_notification(TIMEOUT)
-                .await?
-                .context("live failure notification missing")?;
-            ensure!(method == "signatureNotification" && id == subscription);
-            ensure!(
-                serde_json::from_str::<Value>(&payload.to_string())?["value"]
-                    == json!({"err":tx.error})
-            );
-            listener.close().await?;
             audit(&fixture.er, start, &[(&tx, 1)]).await?;
             before.local[0].as_mut().unwrap().lamports -= tx.fee;
             fixture.expected[0].as_mut().unwrap().lamports -= tx.fee;

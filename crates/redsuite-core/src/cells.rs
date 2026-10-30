@@ -71,17 +71,13 @@ impl<C: ChainCtx> Program<'_, C> {
         cells: &[Pubkey],
         mode: SettlementMode,
     ) -> Result<Signature> {
-        self.chain
-            .submit_and_confirm(
-                self.payer,
-                &[self
-                    .program
-                    .batch()
-                    .nonce(nonce)
-                    .settle(self.payer.pubkey(), cells, mode)
-                    .build()],
-            )
-            .await
+        let instruction = self
+            .program
+            .batch()
+            .nonce(nonce)
+            .settle(self.payer.pubkey(), cells, mode)
+            .build();
+        self.chain.submit_and_confirm(self.payer, &[instruction]).await
     }
 
     pub fn prepare_delegated(

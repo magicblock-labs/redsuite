@@ -56,7 +56,6 @@ const LEDGER_SETTLE_SLOTS: u64 = 10;
 const ACCOUNT_LAMPORTS: u64 = 1_000_000_000;
 const TRANSFER_LAMPORTS: u64 = 10_000;
 const SEQUENTIAL_TRANSFERS: u64 = 2;
-const LOGS_TRANSFERS: usize = 1;
 const RAW_FIRST_TIMEOUT: Duration = Duration::from_secs(3);
 const RAW_DRAIN_TIMEOUT: Duration = Duration::from_millis(300);
 const RAW_SILENCE_TIMEOUT: Duration = Duration::from_millis(700);
@@ -76,14 +75,6 @@ struct RawDelegationStatus {
 
 fn confirmed() -> CommitmentConfig {
     CommitmentConfig::confirmed()
-}
-
-fn transaction_config() -> RpcTransactionConfig {
-    RpcTransactionConfig {
-        encoding: Some(UiTransactionEncoding::Base64),
-        commitment: Some(confirmed()),
-        max_supported_transaction_version: Some(0),
-    }
 }
 
 fn block_config() -> RpcBlockConfig {
@@ -157,26 +148,20 @@ impl WalletStream<'_> {
         let mentions2_key = self.events.logs_subscribe_mentions(&self.account2).await?;
         let program_key = self.events.program_subscribe(&system::system_id()).await?;
         self.events.await_subscribed(6).await?;
-        let mut logs_signatures = Vec::with_capacity(LOGS_TRANSFERS);
-        for _ in 0..LOGS_TRANSFERS {
-            let (signature, _) = self.transfer(TRANSFER_LAMPORTS).await?;
-            logs_signatures.push(signature.to_string());
-            self.sent += 1;
-        }
-        for logs_signature in &logs_signatures {
-            for (key, what) in [
-                (mentions1_key, "logs mentions(account1) entry"),
-                (mentions2_key, "logs mentions(account2) entry"),
-            ] {
-                let event = self
-                    .await_event_where(key, what, |event: &Response<RpcLogsResponse>| {
-                        event.value.signature == *logs_signature
-                    })
-                    .await?;
-                ensure!(event.value.err == None);
-                let log_count = event.value.logs.len();
-                ensure!(log_count > 0);
-            }
+        let (signature, _) = self.transfer(TRANSFER_LAMPORTS).await?;
+        let signature = signature.to_string();
+        self.sent += 1;
+        for (key, what) in [
+            (mentions1_key, "logs mentions(account1) entry"),
+            (mentions2_key, "logs mentions(account2) entry"),
+        ] {
+            let event = self
+                .await_event_where(key, what, |event: &Response<RpcLogsResponse>| {
+                    event.value.signature == signature
+                })
+                .await?;
+            ensure!(event.value.err == None);
+            ensure!(!event.value.logs.is_empty());
         }
         let expected1 = ACCOUNT_LAMPORTS - self.sent * TRANSFER_LAMPORTS;
         let expected2 = ACCOUNT_LAMPORTS + self.sent * TRANSFER_LAMPORTS;
@@ -430,11 +415,16 @@ impl RpcStateAndEvents {
         }
 
         let mut block_times = Vec::with_capacity(writes.len());
+        let config = RpcTransactionConfig {
+            encoding: Some(UiTransactionEncoding::Base64),
+            commitment: Some(confirmed()),
+            max_supported_transaction_version: Some(0),
+        };
         for (write, slot) in writes.iter().zip(slots) {
             let transaction: EncodedConfirmedTransactionWithStatusMeta = client
                 .call(
                     RpcRequest::GetTransaction,
-                    &(write.signature.to_string(), transaction_config()),
+                    &(write.signature.to_string(), config),
                 )
                 .await?;
             ensure!(transaction.slot == *slot);

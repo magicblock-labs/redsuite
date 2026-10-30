@@ -93,8 +93,8 @@ impl BaseCtx {
                 &payer,
                 &[crate::system::transfer(&payer.pubkey(), pk, lamports)],
             )
-            .await?;
-            Ok(())
+            .await
+            .map(|_| ())
         } else {
             airdrop_and_confirm(&self.api, pk, lamports).await
         }
