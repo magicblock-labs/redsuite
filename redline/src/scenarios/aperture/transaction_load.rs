@@ -4,9 +4,10 @@ use anyhow::{ensure, Context};
 use instruction::Instruction;
 use pubkey::Pubkey;
 use redsuite_core::{
+    check,
     config::{LoopMode, ProfileValues},
     programs::{CellHeader, HashState, REDLINE},
-    redline::{causal, Accounts},
+    redline::{causal, check_ok, Accounts},
     report::Unit,
     runner::{execute, execute_and_sync, Pacing, RunConfig, RunOutcome},
     transport::{
@@ -110,7 +111,7 @@ impl Scenario<(ScenarioReport, Result<()>), Shape> for TransactionLoad {
                     .push(crate::probe_cus(&self.er, &signature, "compute contrast", iters).await?);
             }
             let ratio = costs[1] / costs[0];
-            ensure!(ratio >= 10.0, "compute contrast was not exercised");
+            check!(ratio >= 10.0, "compute contrast was not exercised");
             Some(ratio)
         } else {
             None
@@ -128,7 +129,10 @@ impl Scenario<(ScenarioReport, Result<()>), Shape> for TransactionLoad {
                 if measured.outcome.delivered == 0 {
                     break;
                 }
-                self.check_final_state(cursor, measured.outcome.delivered).await?;
+                check_ok(
+                    self.check_final_state(cursor, measured.outcome.delivered).await,
+                    "final account state missed the delivered writes",
+                );
                 remaining = remaining.saturating_sub(measured.outcome.admission_wall);
                 cursor += measured.outcome.delivered;
                 delivered += measured.outcome.delivered;
@@ -144,7 +148,7 @@ impl Scenario<(ScenarioReport, Result<()>), Shape> for TransactionLoad {
                     .report(self.profile, self.base.config().loop_mode)
                     .setting("scope", "last observation window");
             }
-            ensure!(
+            check!(
                 delivered > 0 || *options.stop.borrow(),
                 "no measured transactions completed"
             );
@@ -191,7 +195,7 @@ impl TransactionLoad {
             },
         )
         .await?;
-        ensure!(warmup.failed == 0);
+        warmup.check_failures();
 
         Ok(())
     }
@@ -260,23 +264,25 @@ impl TransactionLoad {
         } else {
             execute(cfg, request).await?
         };
-        ensure!(outcome.failed == 0);
+        outcome.check_failures();
 
         // open loop drains here; a closed loop has already settled per id
-        sigs.await_all().await?;
-        updates.await_settled().await?;
+        if outcome.failed == 0 {
+            sigs.await_all().await?;
+            updates.await_settled().await?;
+        }
         // window closes only once the fan-out settled — the after scrape
         // must cover everything the measured load caused
         let after = self.er.scrape_metrics().await?;
         let delta = MetricsDelta::new(before, after);
 
         let update_outcome = updates.finalize();
-        ensure!(
+        check!(
             (update_outcome.observed + update_outcome.superseded) == (outcome.delivered as usize)
         );
         let sig_outcome = sigs.finalize();
-        ensure!(sig_outcome.failed == 0);
-        ensure!(sig_outcome.confirmed == (outcome.delivered as usize));
+        check!(sig_outcome.failed == 0, "{:?}", sig_outcome.first_failure);
+        check!(sig_outcome.confirmed == (outcome.delivered as usize));
 
         Ok(Measurement {
             outcome,
@@ -286,7 +292,7 @@ impl TransactionLoad {
         })
     }
 
-    #[instrument(skip_all, err)]
+    #[instrument(skip_all)]
     async fn check_final_state(&self, offset: u64, count: u64) -> Result<()> {
         for pda in self.pdas.iter() {
             let last_id =

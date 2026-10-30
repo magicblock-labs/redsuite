@@ -1,7 +1,7 @@
 use anyhow::{anyhow, ensure, Context};
 use redsuite_core::api::{transaction_logs, transaction_meta};
 use redsuite_core::config::ExecutionConfig;
-use redsuite_core::{wait, ChainCtx, ErCtx, Result};
+use redsuite_core::{check, wait, ChainCtx, ErCtx, Result};
 use signature::Signature;
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
@@ -26,7 +26,7 @@ pub async fn probe_cus(er: &ErCtx, signature: &Signature, label: &str, _iters: u
     let probe = er.api().await_transaction(signature).await?;
     let meta = transaction_meta(&probe)?;
     let logs = transaction_logs(meta);
-    ensure!(meta.err == None);
+    check!(meta.err == None);
     consumed_cus(logs).ok_or_else(|| anyhow!("{label}: missing compute-unit consumption: {logs:?}"))
 }
 

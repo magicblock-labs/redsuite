@@ -11,10 +11,11 @@ use anyhow::{ensure, Context};
 use instruction::Instruction;
 use pubkey::Pubkey;
 use redsuite_core::{
+    check,
     config::{ExecutionConfig, ProfileValues},
     host, prep,
     programs::{CellHeader, HashState, REDLINE},
-    redline::{causal, Accounts},
+    redline::{causal, check_ok, Accounts},
     report::Unit,
     wait, BaseCtx, ChainCtx, ErCtx, Metrics, MetricsDelta, Result, Scenario, ScenarioReport,
 };
@@ -246,12 +247,11 @@ impl Scenario<(ScenarioReport, Result<()>)> for MixedSustainedLoad {
         let threads = self.profile.threads.min(rate as usize).min(concurrency);
 
         let metrics = er.scrape_metrics().await?;
-        let _engine_txs = metrics.get(metrics::ENGINE_TRANSACTIONS).with_context(|| {
-            format!(
-                "the ER exposes no {} metric for execution observations",
-                metrics::ENGINE_TRANSACTIONS
-            )
-        })?;
+        check!(
+            metrics.get(metrics::ENGINE_TRANSACTIONS).is_some(),
+            "the ER exposes no {} metric for execution observations",
+            metrics::ENGINE_TRANSACTIONS
+        );
         let baseline = Baseline {
             metrics,
             cpu: er.local_pid().map(host::cpu_sample).transpose()?,
@@ -357,13 +357,12 @@ impl Executed {
         let counts = self.counts;
         let total = outcome.delivered + outcome.failed;
 
-        ensure!(counts.iter().sum::<u64>() == total);
-        ensure!(total > 0, "no measured mixed work completed");
-        ensure!(outcome.failed == 0);
-        ensure!(outcome.delivered == total);
+        check!(counts.iter().sum::<u64>() == total);
+        check!(total > 0, "no measured mixed work completed");
+        outcome.check_failures();
 
         let state_started = Instant::now();
-        wait::retry("workload final state", SETTLE_TIMEOUT, async || {
+        let settled = wait::retry("workload final state", SETTLE_TIMEOUT, async || {
             verify_final_state(
                 er,
                 pool,
@@ -373,7 +372,8 @@ impl Executed {
             )
             .await
         })
-        .await?;
+        .await;
+        check_ok(settled, "workload final state did not settle");
         let metrics = er.scrape_metrics().await?;
         let drained = DrainState {
             elapsed: state_started.elapsed(),
@@ -442,7 +442,7 @@ impl Executed {
                 });
             }
         }
-        ensure!(engine_txs >= total as f64);
+        check!(engine_txs >= total as f64);
 
         if let Some(rpc_handled) = rpc_handled {
             debug!(rpc_handled, total, "RPC processing window");
@@ -451,14 +451,15 @@ impl Executed {
             debug!(rpc_accepted, total, "RPC acceptance window");
         }
 
-        verify_final_state(
+        let verified = verify_final_state(
             er,
             pool,
             &self.last_ids,
             profile.hash_iters,
             profile.read_span,
         )
-        .await?;
+        .await;
+        check_ok(verified, "workload final state changed after settling");
 
         debug!(
             total,

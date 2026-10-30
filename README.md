@@ -139,6 +139,7 @@ when finished with `redsuite stack down`.
 | Measure performance (Redline) | `redsuite redline run --duration 1m` |
 | Use the larger benchmark workloads | `redsuite redline run --profile full --duration 5m` |
 | Generate an hour of mixed load | `redsuite redline run mixed_sustained_load --profile full --duration 1h` |
+| Soak mixed scenarios on one ER | `redsuite continuous --duration 1m` |
 | Reduce concurrent storage use | `redsuite redshift run --serial` |
 | Stop the stack after a run | `redsuite redshift run --cleanup` |
 | Inspect processes, endpoints, and logs | `redsuite stack status` |
@@ -161,7 +162,25 @@ Redline requires `--duration` for each selected workload; there is no iteration
 limit. Setup and warmup are outside measurement. At expiry or Ctrl+C, admission
 stops, admitted work drains, and workload-specific state checks run. Ctrl+C
 returns 130 and marks reports interrupted. Performance is reported, not judged
-against machine-wide thresholds or saved baselines.
+against machine-wide thresholds or saved baselines. Redline assertions, including
+state checks, only log warnings; use Bencher metrics to catch regressions.
+Operational errors, such as failed RPC calls and confirmation timeouts, still
+fail the workload.
+
+`redsuite continuous` repeatedly runs the Redshift, Redhat, and Redline scenarios
+that use the default ER, all on one ER, until a scenario fails or Ctrl+C. Each
+round shuffles the scenarios and runs shared ones concurrently, bounded by
+`--shared-concurrency`. An exclusive scenario waits for running scenarios to
+finish, runs alone, and then shared scenarios resume. Scenarios that need another
+ER configuration or a fresh ER are skipped. The first failure stops admission and
+returns a nonzero status after running scenarios finish. Continuous runs do not
+write Redline reports, because concurrent load makes their measurements
+incomparable.
+
+Each round logs its order and a seed derived from the run seed. Pass the logged
+run seed to `--seed` on a fresh stack (`redsuite stack down`) to replay the same
+orders; a stack rejects seeded fixtures it has already created. Scenario timing
+and interleaving are not reproduced.
 
 The active workloads are transaction load (write/copy presets), compute load,
 scheduler contention, sustained mixed load, WebSocket fanout, and connection

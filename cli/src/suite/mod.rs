@@ -1,3 +1,4 @@
+pub mod continuous;
 mod group;
 use group::GroupEr;
 
@@ -187,10 +188,7 @@ impl Suite {
         let mut records = Vec::new();
         let mut failed = false;
         loop {
-            while !failed
-                && !self.config.stop.as_ref().is_some_and(|stop| *stop.borrow())
-                && running.len() < limit.max(1)
-            {
+            while !failed && !self.config.stopped() && running.len() < limit.max(1) {
                 let Some(entry) = pending.next() else { break };
                 running.push(entry.run(self.family, self.config.clone(), er.clone()));
             }
@@ -201,7 +199,7 @@ impl Suite {
         records.extend(pending.map(|entry| {
             RunRecord::not_run(
                 entry.name(self.family),
-                if self.config.stop.as_ref().is_some_and(|stop| *stop.borrow()) {
+                if self.config.stopped() {
                     "run interrupted"
                 } else {
                     "earlier scenario in this ER group failed"
@@ -229,17 +227,10 @@ impl Suite {
         let started = Instant::now();
         info!(selection = %self.selection, "suite started");
         let mut base = topology::base_only(self.config.clone()).await;
-        let mut prepared: Vec<&BasePreparation> = Vec::new();
-        for prepare in self.entries.iter().filter_map(|entry| entry.prepare) {
-            let Ok(ctx) = &base else { break };
-            if prepared.iter().any(|previous| std::ptr::eq(*previous, prepare)) {
-                continue;
-            }
-            if let Err(error) = (prepare.run)(ctx).await {
+        if let Ok(ctx) = &base {
+            if let Err(error) = prepare(self.entries.iter(), ctx).await {
                 base = Err(error);
-                break;
             }
-            prepared.push(prepare);
         }
         let lanes = self.execute(&base).await;
         let mut records = Vec::new();
@@ -278,6 +269,21 @@ impl Suite {
         );
         outcome
     }
+}
+
+async fn prepare<'a>(
+    entries: impl Iterator<Item = &'a ScenarioEntry>,
+    base: &BaseCtx,
+) -> Result<()> {
+    let mut prepared: Vec<&BasePreparation> = Vec::new();
+    for prepare in entries.filter_map(|entry| entry.prepare) {
+        if prepared.iter().any(|previous| std::ptr::eq(*previous, prepare)) {
+            continue;
+        }
+        (prepare.run)(base).await?;
+        prepared.push(prepare);
+    }
+    Ok(())
 }
 
 pub fn finish(records: &[RunRecord], cleanup: bool) -> Result<()> {

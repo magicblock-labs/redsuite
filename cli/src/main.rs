@@ -11,7 +11,7 @@ use redsuite_core::config::{Environment, ErEndpoints};
 use redsuite_core::{catalog::Family, config::ExecutionConfig, logging, Result};
 use std::rc::Rc;
 use suite::Suite;
-use tokio::task::LocalSet;
+use tokio::{sync::watch, task::LocalSet};
 use tracing::{error, info};
 
 #[tokio::main(flavor = "current_thread")]
@@ -48,15 +48,41 @@ fn list(family: Family, selections: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn run_seed(seed: Option<u64>) -> u64 {
+    let seed = seed.unwrap_or_else(rand::random);
+    let runner = std::env::current_exe()
+        .and_then(|path| redsuite_core::report::binary_hash(&path))
+        .unwrap_or_else(|_| "unavailable".into());
+    info!(seed, runner, "run seed");
+    seed
+}
+
+async fn interruptible(
+    run: impl AsyncFnOnce(watch::Receiver<bool>) -> Result<()>,
+) -> Result<ExitCode> {
+    let (stop, receiver) = watch::channel(false);
+    let interrupt = tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            stop.send_replace(true);
+        }
+    });
+    let outcome = run(receiver.clone()).await;
+    interrupt.abort();
+    if *receiver.borrow() {
+        if let Err(error) = outcome {
+            error!(error = %format_args!("{error:#}"), "interrupted workload failed");
+        }
+        return Ok(ExitCode::from(130));
+    }
+    outcome?;
+    Ok(ExitCode::SUCCESS)
+}
+
 async fn checks(family: Family, command: Checks) -> Result<()> {
     match command {
         Checks::List { selections } => list(family, &selections),
         Checks::Run(args) => {
-            let seed = args.seed.unwrap_or_else(rand::random);
-            let runner = std::env::current_exe()
-                .and_then(|path| redsuite_core::report::binary_hash(&path))
-                .unwrap_or_else(|_| "unavailable".into());
-            info!(seed, runner, "run seed");
+            let seed = run_seed(args.seed);
             Suite::new(
                 family,
                 args.run,
@@ -101,32 +127,35 @@ async fn dispatch(command: Command) -> Result<ExitCode> {
                 } else {
                     None
                 };
-                let (stop, receiver) = tokio::sync::watch::channel(false);
-                let interrupt = tokio::spawn(async move {
-                    if tokio::signal::ctrl_c().await.is_ok() {
-                        stop.send_replace(true);
-                    }
-                });
-                let config = ExecutionConfig {
-                    duration: Some(args.duration),
-                    stop: Some(receiver.clone()),
-                    environment,
-                    profile: args.profile,
-                    loop_mode: args.loop_mode,
-                    ..ExecutionConfig::default()
-                };
-                let outcome =
-                    Suite::new(Family::Redline, args.run, config, true, 1, 1)?.run().await;
-                interrupt.abort();
-                if *receiver.borrow() {
-                    if let Err(error) = outcome {
-                        error!(error = %format_args!("{error:#}"), "interrupted workload failed");
-                    }
-                    return Ok(ExitCode::from(130));
-                }
-                outcome?;
+                return interruptible(async move |stop| {
+                    let config = ExecutionConfig {
+                        duration: Some(args.duration),
+                        stop: Some(stop),
+                        environment,
+                        profile: args.profile,
+                        loop_mode: args.loop_mode,
+                        ..ExecutionConfig::default()
+                    };
+                    Suite::new(Family::Redline, args.run, config, true, 1, 1)?.run().await
+                })
+                .await;
             }
         },
+        Command::Continuous(args) => {
+            let seed = run_seed(args.seed);
+            return interruptible(async move |stop| {
+                let config = ExecutionConfig {
+                    seed,
+                    duration: Some(args.duration),
+                    stop: Some(stop),
+                    profile: args.profile,
+                    continuous: true,
+                    ..ExecutionConfig::default()
+                };
+                suite::continuous::run(config, args.shared_concurrency.get()).await
+            })
+            .await;
+        }
         Command::Shared(command) => command.run()?,
     }
     Ok(ExitCode::SUCCESS)

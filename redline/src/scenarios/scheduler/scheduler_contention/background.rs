@@ -1,9 +1,9 @@
 use super::{BUSY_EXECUTORS, WARM_IN_TIMEOUT};
-use anyhow::{anyhow, ensure, Context};
+use anyhow::{ensure, Context};
 use pubkey::Pubkey;
 use redsuite_core::{
     prep,
-    redline::causal::independent_ixs,
+    redline::{causal::independent_ixs, check_ok},
     runner::{
         execute_until_raw, merge_outcomes, spawn_workers, split_budget, Pacing, RawRunOutcome,
         RunOutcome, Worker, Workers, SEND_ORIGIN,
@@ -182,10 +182,7 @@ pub(super) async fn join_load(handles: Workers<RawRunOutcome>) -> Result<RunOutc
     Ok(merge_outcomes(handles.join().await?))
 }
 
-pub(super) async fn await_load_reaching_executors(
-    er: &ErCtx,
-    handles: &mut Option<Workers<RawRunOutcome>>,
-) -> Result<()> {
+pub(super) async fn await_load_reaching_executors(er: &ErCtx) {
     let reached = wait::retry(
         "the independent load reaches the executors",
         WARM_IN_TIMEOUT,
@@ -197,16 +194,5 @@ pub(super) async fn await_load_reaching_executors(
         },
     )
     .await;
-    if reached.is_err() {
-        if let Some(handles) = handles.take() {
-            let load = join_load(handles).await?;
-            if let Some(error) = load.first_error {
-                return Err(anyhow!(
-                    "independent load failed before reaching the executors: \
-                     {error:#}"
-                ));
-            }
-        }
-    }
-    reached
+    check_ok(reached, "independent load did not reach the executors");
 }

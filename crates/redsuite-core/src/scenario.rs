@@ -271,11 +271,12 @@ where
     if !V::REPORTS {
         Span::current().record("seed", config.seed);
     }
+    let persist = V::REPORTS && !config.continuous;
     let run = async {
         let mut record = RunRecord::new(name);
         info!("started");
         record.outcome = record.run(fixtures, config, state, body).await;
-        record.conclude(V::REPORTS);
+        record.conclude(persist);
         record
     };
     // Dropping the LocalSet cancels scenario-owned readers and background tasks.

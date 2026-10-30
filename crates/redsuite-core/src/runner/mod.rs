@@ -120,6 +120,16 @@ pub struct RunOutcome<S = ObservationsStats> {
 }
 
 impl RunOutcome {
+    #[track_caller]
+    pub fn check_failures(&self) {
+        crate::check!(
+            self.failed == 0,
+            "{} requests failed: {:?}",
+            self.failed,
+            self.first_error
+        );
+    }
+
     pub fn achieved_rps(&self) -> f64 {
         self.delivered as f64 / self.wall.as_secs_f64()
     }

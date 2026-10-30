@@ -39,6 +39,8 @@ pub use solana_rpc_client_types as rpc_types;
 pub use solana_transaction_status_client_types as transaction_types;
 
 #[doc(hidden)]
+pub use anyhow::ensure as __ensure;
+#[doc(hidden)]
 pub use const_str as __const_str;
 
 pub type Result<T> = anyhow::Result<T>;

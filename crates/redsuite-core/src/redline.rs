@@ -1,4 +1,4 @@
-use std::{ops::Range, sync::Arc};
+use std::{fmt::Display, ops::Range, panic::Location, sync::Arc};
 
 use anyhow::ensure;
 use instruction::Instruction;
@@ -6,6 +6,7 @@ use keypair::Keypair;
 use pubkey::Pubkey;
 
 use signer::Signer;
+use tracing::warn;
 use url::Url;
 
 use crate::{
@@ -17,6 +18,32 @@ use crate::{
 };
 
 pub mod causal;
+
+#[macro_export]
+macro_rules! check {
+    ($($condition:tt)+) => {
+        $crate::redline::check_that(|| {
+            $crate::__ensure!($($condition)+);
+            Ok(())
+        })
+    };
+}
+
+#[track_caller]
+pub fn check_that(condition: impl FnOnce() -> Result<()>) {
+    check_ok(condition(), "redline check missed");
+}
+
+#[track_caller]
+pub fn check_ok<T>(result: Result<T>, miss: impl Display) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(error) => {
+            warn!(location = %Location::caller(), error = %format_args!("{error:#}"), "{miss}");
+            None
+        }
+    }
+}
 
 pub async fn execute_kernel<K>(
     config: ThreadRunConfig,

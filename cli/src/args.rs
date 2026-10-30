@@ -35,6 +35,8 @@ pub enum Command {
     /// Security checks.
     #[command(subcommand)]
     Redhat(Checks),
+    #[command(about = "Run mixed scenarios on a shared ER until a failure or Ctrl+C.")]
+    Continuous(ContinuousRun),
     #[command(flatten)]
     Shared(frontend::Command),
 }
@@ -118,6 +120,29 @@ pub struct BenchmarkRun {
     /// Transaction observation loop mode.
     #[arg(long = "loop", env = "REDSUITE_LOOP", value_enum, default_value = "open")]
     pub loop_mode: LoopMode,
+}
+
+#[derive(Args)]
+pub struct ContinuousRun {
+    #[arg(long, value_name = "U64")]
+    pub seed: Option<u64>,
+    #[arg(long, help = "Measured load duration per Redline workload.", value_parser = duration)]
+    pub duration: Duration,
+    #[arg(
+        long,
+        help = "Maximum concurrent shared scenarios.",
+        default_value = "4",
+        value_name = "N"
+    )]
+    pub shared_concurrency: NonZeroUsize,
+    #[arg(
+        long,
+        help = "Redline workload preset.",
+        env = "REDSUITE_PROFILE",
+        value_enum,
+        default_value = "lite"
+    )]
+    pub profile: Profile,
 }
 
 fn duration(value: &str) -> Result<Duration, String> {

@@ -58,6 +58,13 @@ pub struct ExecutionConfig {
     pub duration: Option<Duration>,
     pub stop: Option<tokio::sync::watch::Receiver<bool>>,
     pub environment: Option<Rc<Environment>>,
+    pub continuous: bool,
+}
+
+impl ExecutionConfig {
+    pub fn stopped(&self) -> bool {
+        self.stop.as_ref().is_some_and(|stop| *stop.borrow())
+    }
 }
 
 pub struct ProfileValues<T> {

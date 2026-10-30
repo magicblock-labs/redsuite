@@ -1,8 +1,9 @@
 use crate::RunControl;
-use anyhow::{ensure, Context};
+use anyhow::Context;
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
+    check,
     config::Profile,
     programs::{CellHeader, REDLINE},
     redline::Accounts,
@@ -98,15 +99,17 @@ impl Scenario<(ScenarioReport, Result<()>)> for WebsocketFanout {
                     },
                 )
                 .await?;
-                ensure!(outcome.failed == 0);
+                outcome.check_failures();
                 if outcome.delivered == 0 {
                     break;
                 }
                 let mut window_p95 = 0;
                 for reader in &readers {
-                    reader.await_settled().await?;
+                    if outcome.failed == 0 {
+                        reader.await_settled().await?;
+                    }
                     let observed = reader.take_outcome();
-                    ensure!(
+                    check!(
                         observed.observed + observed.superseded == 2 * outcome.delivered as usize
                     );
                     received += observed.observed;
@@ -126,9 +129,10 @@ impl Scenario<(ScenarioReport, Result<()>)> for WebsocketFanout {
                         .rev()
                         .find(|id| REDLINE.copy_three(&self.keys, *id).1.contains(key));
                     if let Some(last) = last {
-                        let account =
-                            self.er.account(key).await?.context("fanout account missing")?;
-                        ensure!(CellHeader::written_id(&account.data) == Some(last));
+                        let account = self.er.account(key).await?;
+                        let written =
+                            account.and_then(|account| CellHeader::written_id(&account.data));
+                        check!(written == Some(last));
                     }
                 }
                 remaining = remaining.saturating_sub(outcome.admission_wall);
@@ -145,7 +149,7 @@ impl Scenario<(ScenarioReport, Result<()>)> for WebsocketFanout {
                     .setting("offered tps", self.rate)
                     .client_side(&outcome);
             }
-            ensure!(
+            check!(
                 cursor > 0 || *options.stop.borrow(),
                 "no measured fanout work completed"
             );
