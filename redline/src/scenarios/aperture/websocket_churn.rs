@@ -1,6 +1,6 @@
 use crate::RunControl;
-use anyhow::ensure;
 use redsuite_core::{
+    check,
     config::Profile,
     host,
     report::Unit,
@@ -32,10 +32,8 @@ impl Scenario<(ScenarioReport, Result<()>)> for WebsocketChurn {
     }
     async fn run(self) -> Result<(ScenarioReport, Result<()>)> {
         let options = RunControl::from_config(&self.base.config())?;
-        ensure!(
-            self.er.account(&self.er.identity()).await?.is_some(),
-            "validator identity missing"
-        );
+        let identity = self.er.account(&self.er.identity()).await?;
+        check!(identity.is_some(), "validator identity missing");
         let pid = self.er.local_pid();
         let baseline = pid.map(host::fd_count).transpose()?;
         let rss = pid.map(host::rss_kb).transpose()?;
@@ -45,8 +43,8 @@ impl Scenario<(ScenarioReport, Result<()>)> for WebsocketChurn {
         }
         if let Some(pid) = pid {
             let count = host::fd_count(pid)?;
-            ensure!(count + 8 >= baseline.unwrap() + self.connections);
-            ensure!(count <= baseline.unwrap() + self.connections + FD_TOLERANCE);
+            check!(count + 8 >= baseline.unwrap() + self.connections);
+            check!(count <= baseline.unwrap() + self.connections + FD_TOLERANCE);
         }
         let deadline = options.deadline()?;
         let mut report =
@@ -67,7 +65,8 @@ impl Scenario<(ScenarioReport, Result<()>)> for WebsocketChurn {
                         Ok(SendTransaction(move |_: Instant| async move {
                             let mut connection = RawWs::connect(&url).await?;
                             let subscription = connection.account_subscribe(&account).await?;
-                            ensure!(connection.account_unsubscribe(subscription).await?);
+                            let unsubscribed = connection.account_unsubscribe(subscription).await?;
+                            check!(unsubscribed);
                             connection.close().await
                         }))
                     }
@@ -79,11 +78,11 @@ impl Scenario<(ScenarioReport, Result<()>)> for WebsocketChurn {
                 .observe("connection lifecycle us", Unit::Micros, outcome.delivery)
                 .client_side(&outcome)
                 .metric("completed cycles", Unit::Count, outcome.delivered as f64);
-            ensure!(
+            check!(
                 outcome.delivered > 0 || *options.stop.borrow(),
                 "no measured churn completed"
             );
-            ensure!(outcome.failed == 0);
+            outcome.check_failures();
             Ok(())
         }
         .await;
@@ -106,7 +105,7 @@ impl Scenario<(ScenarioReport, Result<()>)> for WebsocketChurn {
                         Unit::Kilobytes,
                         host::rss_kb(pid)?.saturating_sub(rss.unwrap()) as f64,
                     );
-                ensure!(count <= baseline.unwrap() + FD_TOLERANCE);
+                check!(count <= baseline.unwrap() + FD_TOLERANCE);
             }
             Ok(())
         }

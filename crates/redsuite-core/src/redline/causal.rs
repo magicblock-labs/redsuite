@@ -1,5 +1,6 @@
 use std::time::{Duration, Instant};
 
+use account::Account;
 use anyhow::{ensure, Context};
 use instruction::Instruction;
 use pubkey::Pubkey;
@@ -78,8 +79,16 @@ impl CausalPair {
         Ok((signature, elapsed))
     }
 
+    pub async fn read(&self, ctx: &impl ChainCtx) -> Result<[Option<Account>; 2]> {
+        Ok([ctx.account(&self.a).await?, ctx.account(&self.b).await?])
+    }
+
+    pub fn compare(&self, accounts: &[Option<Account>; 2], scope: &str) -> Result<()> {
+        self.model.compare(accounts, scope)
+    }
+
     pub async fn verify(&self, ctx: &impl ChainCtx, scope: &str) -> Result<()> {
-        self.model.verify(ctx, [self.a, self.b], scope).await
+        self.compare(&self.read(ctx).await?, scope)
     }
 }
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
@@ -111,14 +120,12 @@ impl PairModel {
         }
     }
 
-    pub async fn verify(&self, ctx: &impl ChainCtx, keys: [Pubkey; 2], scope: &str) -> Result<()> {
-        for (label, address, expected_hash, expected_id) in
-            [("A", keys[0], self.a, self.a_id), ("B", keys[1], self.b, self.b_id)]
+    pub fn compare(&self, accounts: &[Option<Account>; 2], scope: &str) -> Result<()> {
+        for (label, account, expected_hash, expected_id) in
+            [("A", &accounts[0], self.a, self.a_id), ("B", &accounts[1], self.b, self.b_id)]
         {
-            let account = ctx
-                .account(&address)
-                .await?
-                .with_context(|| format!("{scope}: account {label} missing"))?;
+            let account =
+                account.as_ref().with_context(|| format!("{scope}: account {label} missing"))?;
             let id = CellHeader::try_decode(&account.data)?.value;
             let hash = CellHeader::payload(&account.data)?
                 .first_chunk::<{ layout::HASH_SIZE }>()

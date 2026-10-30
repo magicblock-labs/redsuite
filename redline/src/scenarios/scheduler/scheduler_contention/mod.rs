@@ -9,12 +9,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{anyhow, ensure, Context};
+use anyhow::ensure;
 use futures_util::future::join_all;
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
     api::transaction_meta,
+    check,
     config::ProfileValues,
     prep,
     programs::HashState,
@@ -30,7 +31,7 @@ use redsuite_core::{
 use signature::Signature;
 use signer::Signer;
 use tokio::time;
-use tracing::{debug, instrument};
+use tracing::{debug, instrument, warn};
 
 use crate::{metrics, program::layout, ACCOUNT_SPACE};
 
@@ -243,7 +244,7 @@ async fn run_phase(
     independent_payers: &Arc<Vec<[u8; 64]>>,
     plan: PhasePlan,
 ) -> Result<PhaseOutcome> {
-    let mut handles = Some(spawn_load(
+    let handles = spawn_load(
         er.api().url().clone(),
         er.ws_url().clone(),
         plan.mode,
@@ -251,11 +252,11 @@ async fn run_phase(
         independent.clone(),
         independent_payers.clone(),
         plan.independent_iters,
-    ));
-    await_load_reaching_executors(er, &mut handles).await?;
+    );
+    await_load_reaching_executors(er).await?;
     let sampler = spawn_sampler(er);
 
-    let stop_task = handles.as_ref().unwrap().stop_at(plan.deadline, plan.stop.clone());
+    let stop_task = handles.stop_at(plan.deadline, plan.stop.clone());
     let phase_started = time::Instant::now();
     let (first, last) = plan.range;
     let chains = last.saturating_sub(first);
@@ -274,10 +275,7 @@ async fn run_phase(
     .await;
     let chain_result: Result<()> = results.into_iter().collect();
     time::sleep_until(phase_started + plan.span).await;
-    let load = match handles.take() {
-        Some(handles) => join_load(handles).await?,
-        None => return Err(anyhow!("independent load driver already joined")),
-    };
+    let load = join_load(handles).await?;
     stop_task.abort();
     let samples = sampler.finish_complete("scheduler").await?;
     chain_result?;
@@ -313,13 +311,14 @@ async fn first_failed_step(er: &ErCtx, steps: &[(u64, Step, Signature)]) -> Opti
 
 async fn verify_pairs(er: &ErCtx, pairs: &mut [Pair], batch: usize) -> Result<()> {
     for (index, pair) in pairs.iter_mut().enumerate() {
+        let accounts = pair.chain.read(er).await?;
         if let Err(error) =
-            pair.chain.verify(er, &format!("batch {batch}: pair {index} on the ER")).await
+            pair.chain.compare(&accounts, &format!("batch {batch}: pair {index} on the ER"))
         {
             let step = first_failed_step(er, &pair.steps)
                 .await
                 .unwrap_or_else(|| "none — every step executed successfully".to_owned());
-            return Err(error.context(format!("first failed step of this batch: {step}")));
+            warn!(error = %format_args!("{error:#}"), step, "causal pair state diverged");
         }
         pair.steps.clear();
     }
@@ -329,12 +328,12 @@ async fn verify_pairs(er: &ErCtx, pairs: &mut [Pair], batch: usize) -> Result<()
 async fn verify_independent(er: &ErCtx, accounts: &[Pubkey], iters: u32) -> Result<()> {
     let expected = HashState::chain(causal::HASH_INIT.to_bytes(), iters);
     for (index, address) in accounts.iter().enumerate() {
-        let account = er
-            .account(address)
-            .await?
-            .with_context(|| format!("independent account {index} is not on the ER"))?;
+        let Some(account) = er.account(address).await? else {
+            warn!(index, "independent account is not on the ER");
+            continue;
+        };
         let hash = &account.data[layout::HASH_OFFSET..layout::HASH_OFFSET + layout::HASH_SIZE];
-        ensure!(hash == expected);
+        check!(hash == expected);
     }
     Ok(())
 }
@@ -378,7 +377,7 @@ impl Scenario<(ScenarioReport, Result<()>)> for SchedulerContention {
 
         let probe = er.scrape_metrics().await?;
         for name in REQUIRED_METRICS {
-            ensure!(probe.get(name).is_some());
+            check!(probe.get(name).is_some(), "the ER exposes no {name} metric");
         }
 
         let payers = base
@@ -474,7 +473,7 @@ impl SchedulerContention {
     #[instrument(skip_all, err)]
     async fn calibrate(&self) -> Result<(f64, usize)> {
         let calibration_before = self.er.scrape_metrics().await?;
-        let mut handles = Some(spawn_load(
+        let handles = spawn_load(
             self.er.api().url().clone(),
             self.er.ws_url().clone(),
             LoadMode::Open { concurrency: OPEN_CONCURRENCY },
@@ -482,18 +481,15 @@ impl SchedulerContention {
             self.independent.clone(),
             self.independent_payer_bytes.clone(),
             self.profile.independent_iters,
-        ));
-        await_load_reaching_executors(&self.er, &mut handles).await?;
+        );
+        await_load_reaching_executors(&self.er).await?;
         let sampler = spawn_sampler(&self.er);
         time::sleep(CALIBRATION).await;
-        let calibration = match handles.take() {
-            Some(handles) => join_load(handles).await?,
-            None => return Err(anyhow!("calibration load already joined")),
-        };
+        let calibration = join_load(handles).await?;
         let calibration_samples = sampler.finish_complete("scheduler").await?;
-        ensure!(calibration.failed == 0);
+        calibration.check_failures();
         let executors = calibration_samples.value.busy.max;
-        ensure!(executors >= MIN_EXECUTORS);
+        check!(executors >= MIN_EXECUTORS);
         let contention_lanes = (executors as usize * LANES_PER_EXECUTOR)
             .min(self.profile.independent_accounts)
             .max(1);
@@ -527,7 +523,7 @@ impl SchedulerContention {
         let ranges = phase_ranges(self.profile.chains);
 
         let before = self.er.scrape_metrics().await?;
-        ensure!(is_idle(&before));
+        check!(is_idle(&before));
         let txs_before = before.get(TX_COUNT).unwrap_or_default();
 
         let mut phases = Vec::with_capacity(modes.len());
@@ -558,7 +554,7 @@ impl SchedulerContention {
                 plan,
             )
             .await?;
-            ensure!(phase.load.failed == 0);
+            phase.load.check_failures();
             debug!(
                 batch,
                 phase.label, phase.chain_txs, "contention phase finished",
@@ -596,28 +592,28 @@ impl SchedulerContention {
             outcome.phases.iter().map(|phase| phase.chain_txs + phase.load.delivered).sum();
         for phase in &outcome.phases {
             let samples = &phase.samples.value;
-            ensure!(samples.busy.max >= MIN_EXECUTORS);
-            ensure!(samples.busy.mean() > 1.0);
-            ensure!(samples.max_stall <= STALL_BOUND);
+            check!(samples.busy.max >= MIN_EXECUTORS);
+            check!(samples.busy.mean() > 1.0);
+            check!(samples.max_stall <= STALL_BOUND);
         }
-        for (_label, value) in [
+        for (label, value) in [
             ("blocked", outcome.drained.blocked),
             ("busy", outcome.drained.busy),
             ("pending", outcome.drained.pending),
         ] {
-            ensure!(value == 0.0);
+            check!(value == 0.0, "{value} {label} after the drain");
         }
-        ensure!(outcome.engine_txs >= workload as f64);
+        check!(outcome.engine_txs >= workload as f64);
         if let Some(dropped) = outcome.dropped {
-            ensure!(dropped == 0.0);
+            check!(dropped == 0.0);
         }
         if let Some(execution_failed) = outcome.execution_failed {
-            ensure!(execution_failed == 0.0);
+            check!(execution_failed == 0.0);
         }
+        check!(!outcome.phases.is_empty(), "no contention phase observed");
         let contention_chains =
-            outcome.phases.first().context("no contention phase observed")?.chains
-                * self.profile.pairs as u64;
-        ensure!(outcome.dependencies >= contention_chains as f64);
+            outcome.phases.first().map_or(0, |phase| phase.chains) * self.profile.pairs as u64;
+        check!(outcome.dependencies >= contention_chains as f64);
         verify_pairs(&self.er, &mut self.pairs, batch).await?;
         debug!(
             batch,

@@ -139,6 +139,7 @@ when finished with `redsuite stack down`.
 | Measure performance (Redline) | `redsuite redline run --duration 1m` |
 | Use the larger benchmark workloads | `redsuite redline run --profile full --duration 5m` |
 | Generate an hour of mixed load | `redsuite redline run mixed_sustained_load --profile full --duration 1h` |
+| Soak mixed scenarios on one ER | `redsuite continuous --duration 1m` |
 | Reduce concurrent storage use | `redsuite redshift run --serial` |
 | Stop the stack after a run | `redsuite redshift run --cleanup` |
 | Inspect processes, endpoints, and logs | `redsuite stack status` |
@@ -148,8 +149,8 @@ chosen family. Multiple selections run together without repeating scenarios;
 an exact name takes precedence over prefix matches. Omit selections to run the
 whole family. Use the family's `list` command to preview selections.
 
-Redline defaults to the shorter `lite` workloads. Only `redline run` accepts
-`--profile` or reads `REDSUITE_PROFILE`. Correctness and
+Redline defaults to the shorter `lite` workloads. Only `redline run` and
+`continuous` accept `--profile` or read `REDSUITE_PROFILE`. Correctness and
 adversarial checks use fixed workloads. Redline benchmarks run sequentially;
 checks can use `--fresh-concurrency` to bound concurrent fresh scenarios.
 
@@ -161,7 +162,25 @@ Redline requires `--duration` for each selected workload; there is no iteration
 limit. Setup and warmup are outside measurement. At expiry or Ctrl+C, admission
 stops, admitted work drains, and workload-specific state checks run. Ctrl+C
 returns 130 and marks reports interrupted. Performance is reported, not judged
-against machine-wide thresholds or saved baselines.
+against machine-wide thresholds or saved baselines. Redline assertions, including
+state checks, only log warnings; use Bencher metrics to catch regressions.
+Operational errors, such as failed RPC calls and confirmation or execution-drain
+timeouts, still fail the workload.
+
+`redsuite continuous` repeatedly runs the Redshift, Redhat, and Redline scenarios
+that use the default ER, all on one ER, until a scenario fails or Ctrl+C. Each
+round shuffles the scenarios and runs shared ones concurrently, bounded by
+`--shared-concurrency`. An exclusive scenario waits for running scenarios to
+finish, runs alone, and then shared scenarios resume. Scenarios that need another
+ER configuration or a fresh ER are skipped. The first failure stops admission and
+returns a nonzero status after running scenarios finish. Continuous runs do not
+write Redline reports, because concurrent load makes their measurements
+incomparable.
+
+Each round logs its order and a seed derived from the run seed. Pass the logged
+run seed to `--seed` on a fresh stack (`redsuite stack down`) to replay the same
+orders; a stack rejects seeded fixtures it has already created. Scenario timing
+and interleaving are not reproduced.
 
 The active workloads are transaction load (write/copy presets), compute load,
 scheduler contention, sustained mixed load, WebSocket fanout, and connection
@@ -272,7 +291,7 @@ the campaign to export; older report layouts are not read.
 | `REDSUITE_STACK_DIR` | Place ledgers, stack state, and logs on another disk; defaults to `target/redsuite-stack` under the resource root. |
 | `REDSUITE_ACCOUNTSDB_DIR` | Place rollup and verifier accounts databases separately from their ledgers. |
 | `REDSUITE_CLONE_URL` | Choose the RPC endpoint used to acquire base-chain programs on a cold boot. |
-| `REDSUITE_PROFILE` | Set the Redline run/load preset to `lite` or `full`; `--profile` overrides it. Other commands do not read it. |
+| `REDSUITE_PROFILE` | Set the `redline run` and `continuous` preset to `lite` or `full`; `--profile` overrides it. Other commands do not read it. |
 | `RUST_LOG` | Log filter for RedSuite and launched validators; defaults to `info`. Use `debug` for passing-run details. |
 
 The compiled runner works without Cargo or a source checkout at runtime, but it

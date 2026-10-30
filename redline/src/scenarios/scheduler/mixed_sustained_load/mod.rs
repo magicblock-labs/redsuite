@@ -11,12 +11,14 @@ use anyhow::{ensure, Context};
 use instruction::Instruction;
 use pubkey::Pubkey;
 use redsuite_core::{
+    check,
     config::{ExecutionConfig, ProfileValues},
     host, prep,
     programs::{CellHeader, HashState, REDLINE},
-    redline::{causal, Accounts},
+    redline::{causal, check_ok, Accounts},
     report::Unit,
-    wait, BaseCtx, ChainCtx, ErCtx, Metrics, MetricsDelta, Result, Scenario, ScenarioReport,
+    wait, Account, BaseCtx, ChainCtx, ErCtx, Metrics, MetricsDelta, Result, Scenario,
+    ScenarioReport,
 };
 use tracing::{debug, info, instrument};
 
@@ -144,20 +146,31 @@ struct DrainState {
     pending: f64,
 }
 
-async fn verify_final_state(
+async fn read_final_state(
     er: &ErCtx,
     pool: &[Pubkey],
+    last_ids: &[Option<u64>],
+) -> Result<Vec<Option<Account>>> {
+    let mut accounts = Vec::with_capacity(pool.len());
+    for (pda, last_id) in pool.iter().zip(last_ids) {
+        accounts.push(if last_id.is_some() { er.account(pda).await? } else { None });
+    }
+    Ok(accounts)
+}
+
+fn verify_final_state(
+    accounts: &[Option<Account>],
     last_ids: &[Option<u64>],
     hash_iters: u32,
     read_span: usize,
 ) -> Result<()> {
     let expected_hash = HashState::chain(causal::HASH_INIT.to_bytes(), hash_iters);
     let expected_sum = (read_span as u64) * u64::from(ACCOUNT_SPACE);
-    for (index, pda) in pool.iter().enumerate() {
-        let Some(last_id) = last_ids[index] else {
+    for (account, last_id) in accounts.iter().zip(last_ids) {
+        let Some(last_id) = *last_id else {
             continue;
         };
-        let account = er.account(pda).await?.context("pda not on er")?;
+        let account = account.as_ref().context("pda not on er")?;
         let data = &account.data;
         let mode = mode_for(last_id);
         ensure!(CellHeader::written_id(data) == Some(last_id));
@@ -246,12 +259,11 @@ impl Scenario<(ScenarioReport, Result<()>)> for MixedSustainedLoad {
         let threads = self.profile.threads.min(rate as usize).min(concurrency);
 
         let metrics = er.scrape_metrics().await?;
-        let _engine_txs = metrics.get(metrics::ENGINE_TRANSACTIONS).with_context(|| {
-            format!(
-                "the ER exposes no {} metric for execution observations",
-                metrics::ENGINE_TRANSACTIONS
-            )
-        })?;
+        check!(
+            metrics.get(metrics::ENGINE_TRANSACTIONS).is_some(),
+            "the ER exposes no {} metric for execution observations",
+            metrics::ENGINE_TRANSACTIONS
+        );
         let baseline = Baseline {
             metrics,
             cpu: er.local_pid().map(host::cpu_sample).transpose()?,
@@ -357,23 +369,22 @@ impl Executed {
         let counts = self.counts;
         let total = outcome.delivered + outcome.failed;
 
-        ensure!(counts.iter().sum::<u64>() == total);
-        ensure!(total > 0, "no measured mixed work completed");
-        ensure!(outcome.failed == 0);
-        ensure!(outcome.delivered == total);
+        check!(counts.iter().sum::<u64>() == total);
+        check!(total > 0, "no measured mixed work completed");
+        outcome.check_failures();
 
         let state_started = Instant::now();
-        wait::retry("workload final state", SETTLE_TIMEOUT, async || {
+        let settled = wait::retry("workload final state", SETTLE_TIMEOUT, async || {
+            let accounts = read_final_state(er, pool, &self.last_ids).await?;
             verify_final_state(
-                er,
-                pool,
+                &accounts,
                 &self.last_ids,
                 profile.hash_iters,
                 profile.read_span,
             )
-            .await
         })
-        .await?;
+        .await;
+        check_ok(settled, "workload final state did not settle");
         let metrics = er.scrape_metrics().await?;
         let drained = DrainState {
             elapsed: state_started.elapsed(),
@@ -442,7 +453,7 @@ impl Executed {
                 });
             }
         }
-        ensure!(engine_txs >= total as f64);
+        check!(engine_txs >= total as f64);
 
         if let Some(rpc_handled) = rpc_handled {
             debug!(rpc_handled, total, "RPC processing window");
@@ -451,14 +462,14 @@ impl Executed {
             debug!(rpc_accepted, total, "RPC acceptance window");
         }
 
-        verify_final_state(
-            er,
-            pool,
+        let accounts = read_final_state(er, pool, &self.last_ids).await?;
+        let verified = verify_final_state(
+            &accounts,
             &self.last_ids,
             profile.hash_iters,
             profile.read_span,
-        )
-        .await?;
+        );
+        check_ok(verified, "workload final state changed after settling");
 
         debug!(
             total,

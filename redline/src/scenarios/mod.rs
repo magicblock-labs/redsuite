@@ -10,17 +10,17 @@ pub fn catalog() -> Vec<ScenarioEntry> {
     vec![
         scenario!(
             TransactionLoad,
-            exclusive(&DEFAULT, &[Fixture::RedlineProgram], Shape::Write)
+            shared(&DEFAULT, &[Fixture::RedlineProgram], Shape::Write)
         )
         .named("transaction_load_write"),
         scenario!(
             TransactionLoad,
-            exclusive(&DEFAULT, &[Fixture::RedlineProgram], Shape::Copy)
+            shared(&DEFAULT, &[Fixture::RedlineProgram], Shape::Copy)
         )
         .named("transaction_load_copy"),
         scenario!(
             TransactionLoad,
-            exclusive(&DEFAULT, &[Fixture::RedlineProgram], Shape::Compute)
+            shared(&DEFAULT, &[Fixture::RedlineProgram], Shape::Compute)
         )
         .named("compute_load"),
         scenario!(
@@ -29,15 +29,15 @@ pub fn catalog() -> Vec<ScenarioEntry> {
         ),
         scenario!(
             scheduler::mixed_sustained_load::MixedSustainedLoad,
-            exclusive(&DEFAULT, &[Fixture::RedlineProgram], ())
+            shared(&DEFAULT, &[Fixture::RedlineProgram], ())
         ),
         scenario!(
             aperture::websocket_fanout::WebsocketFanout,
-            exclusive(&DEFAULT, &[Fixture::RedlineProgram], ())
+            shared(&DEFAULT, &[Fixture::RedlineProgram], ())
         ),
         scenario!(
             aperture::websocket_churn::WebsocketChurn,
-            exclusive(&DEFAULT, &[], ())
+            shared(&DEFAULT, &[], ())
         ),
         scenario!(
             harness::load_generator_thread_scaling::LoadGeneratorThreadScaling,

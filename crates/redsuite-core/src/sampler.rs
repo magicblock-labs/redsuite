@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use anyhow::{ensure, Context};
+use anyhow::Context;
 use derive_more::Display;
 use tokio::{
     sync::watch,
@@ -101,7 +101,7 @@ where
 
     pub async fn finish_complete(self, what: &str) -> Result<Sampled<T>> {
         let sampled = self.finish().await?;
-        ensure!(
+        crate::check!(
             sampled.observations > 0 && sampled.observations == sampled.scrapes,
             "incomplete {what} sampling: {sampled}"
         );

@@ -1,8 +1,9 @@
 use std::{rc::Rc, sync::Arc, time::Instant};
 
-use anyhow::{ensure, Context};
+use anyhow::Context;
 use pubkey::Pubkey;
 use redsuite_core::{
+    check,
     config::ProfileValues,
     prep,
     programs::REDLINE,
@@ -118,7 +119,8 @@ impl Scenario<(ScenarioReport, Result<()>)> for LoadGeneratorThreadScaling {
                     );
                     last = Some(cell);
                 }
-                cells.push(last.context("diagnostic phase not observed")?);
+                check!(last.is_some(), "diagnostic phase not observed");
+                cells.extend(last);
             }
             Ok(())
         }
@@ -165,7 +167,7 @@ impl LoadGeneratorThreadScaling {
     #[instrument(skip_all, err)]
     async fn warm_up(&self) -> Result<()> {
         let warmup = self.execute(self.profile.threads, self.profile.warmup, 0, None).await?;
-        ensure!(warmup.failed == 0);
+        warmup.check_failures();
 
         Ok(())
     }
@@ -204,7 +206,7 @@ impl LoadGeneratorThreadScaling {
             cell.tx_processing_avg_us,
             "protocol boundary cell finished",
         );
-        ensure!(cell.outcome.failed == 0);
+        cell.outcome.check_failures();
 
         Ok(cell)
     }

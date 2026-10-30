@@ -1,9 +1,10 @@
 use std::{rc::Rc, sync::Arc, time::Instant};
 
-use anyhow::{ensure, Context};
+use anyhow::Context;
 use instruction::Instruction;
 use pubkey::Pubkey;
 use redsuite_core::{
+    check,
     config::{LoopMode, ProfileValues},
     programs::{CellHeader, HashState, REDLINE},
     redline::{causal, Accounts},
@@ -17,7 +18,7 @@ use redsuite_core::{
     BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport, TxSender,
 };
 use tokio::sync::watch::Receiver;
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
 
 use crate::{metrics, program::layout, RunControl, ACCOUNT_SPACE};
 
@@ -110,7 +111,7 @@ impl Scenario<(ScenarioReport, Result<()>), Shape> for TransactionLoad {
                     .push(crate::probe_cus(&self.er, &signature, "compute contrast", iters).await?);
             }
             let ratio = costs[1] / costs[0];
-            ensure!(ratio >= 10.0, "compute contrast was not exercised");
+            check!(ratio >= 10.0, "compute contrast was not exercised");
             Some(ratio)
         } else {
             None
@@ -144,7 +145,7 @@ impl Scenario<(ScenarioReport, Result<()>), Shape> for TransactionLoad {
                     .report(self.profile, self.base.config().loop_mode)
                     .setting("scope", "last observation window");
             }
-            ensure!(
+            check!(
                 delivered > 0 || *options.stop.borrow(),
                 "no measured transactions completed"
             );
@@ -191,7 +192,7 @@ impl TransactionLoad {
             },
         )
         .await?;
-        ensure!(warmup.failed == 0);
+        warmup.check_failures();
 
         Ok(())
     }
@@ -260,23 +261,25 @@ impl TransactionLoad {
         } else {
             execute(cfg, request).await?
         };
-        ensure!(outcome.failed == 0);
+        outcome.check_failures();
 
         // open loop drains here; a closed loop has already settled per id
-        sigs.await_all().await?;
-        updates.await_settled().await?;
+        if outcome.failed == 0 {
+            sigs.await_all().await?;
+            updates.await_settled().await?;
+        }
         // window closes only once the fan-out settled — the after scrape
         // must cover everything the measured load caused
         let after = self.er.scrape_metrics().await?;
         let delta = MetricsDelta::new(before, after);
 
         let update_outcome = updates.finalize();
-        ensure!(
+        check!(
             (update_outcome.observed + update_outcome.superseded) == (outcome.delivered as usize)
         );
         let sig_outcome = sigs.finalize();
-        ensure!(sig_outcome.failed == 0);
-        ensure!(sig_outcome.confirmed == (outcome.delivered as usize));
+        check!(sig_outcome.failed == 0, "{:?}", sig_outcome.first_failure);
+        check!(sig_outcome.confirmed == (outcome.delivered as usize));
 
         Ok(Measurement {
             outcome,
@@ -294,11 +297,14 @@ impl TransactionLoad {
             let Some(last_id) = last_id else {
                 continue;
             };
-            let on_er = self.er.account(pda).await?.context("pda not on er")?;
-            ensure!(CellHeader::written_id(&on_er.data) == Some(last_id));
+            let Some(on_er) = self.er.account(pda).await? else {
+                warn!(%pda, "pda not on er");
+                continue;
+            };
+            check!(CellHeader::written_id(&on_er.data) == Some(last_id));
             if matches!(self.shape, Shape::Compute) {
                 let expected = HashState::chain(causal::HASH_INIT.to_bytes(), 180);
-                ensure!(
+                check!(
                     on_er.data[layout::HASH_OFFSET..layout::HASH_OFFSET + layout::HASH_SIZE]
                         == expected
                 );
