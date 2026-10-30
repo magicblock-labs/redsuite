@@ -110,7 +110,7 @@ impl LedgerRetentionConsistency {
         let er = &self.er;
         let mut events = 0;
         let mut previous_pruned = 0;
-        let mut first_pruning_event = None;
+        let mut pruning_seen = false;
         let baseline = self.truncations().await?;
         let started = Instant::now();
         loop {
@@ -124,9 +124,7 @@ impl LedgerRetentionConsistency {
                 events = observed;
                 let view = history.observe(er).await?;
                 history.verify(er, &view, previous_pruned).await?;
-                if view.pruned.len() > previous_pruned && first_pruning_event.is_none() {
-                    first_pruning_event = Some(events);
-                }
+                pruning_seen |= view.pruned.len() > previous_pruned;
                 previous_pruned = view.pruned.len();
                 let superblocks = self.superblocks().await?;
                 debug!(
@@ -136,7 +134,7 @@ impl LedgerRetentionConsistency {
                     "retention advanced",
                 );
             }
-            if events >= RETENTION_EVENTS && first_pruning_event.is_some() {
+            if events >= RETENTION_EVENTS && pruning_seen {
                 break;
             }
             ensure!(started.elapsed() < RETENTION_TIMEOUT);

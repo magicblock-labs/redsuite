@@ -60,7 +60,6 @@ pub fn load() -> Result<Campaign> {
     let root = super::reports_dir();
     let run = fs::read_to_string(root.join("latest"))
         .context("cannot read latest report campaign; run a scenario first")?;
-    Ok(json::from_str(&fs::read_to_string(
-        root.join(run).join("campaign.json"),
-    )?)?)
+    let contents = fs::read_to_string(root.join(run).join("campaign.json"))?;
+    Ok(json::from_str(&contents)?)
 }

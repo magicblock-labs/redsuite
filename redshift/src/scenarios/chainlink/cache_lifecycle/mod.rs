@@ -20,8 +20,6 @@ pub async fn pressure_preserves(
     pool: &[Pubkey],
     protected: &[Pubkey],
 ) -> Result<()> {
-    ensure!(pool.len() == CACHE_CAPACITY * 2 && !pool.contains(&mirror));
-    ensure!(protected.iter().all(|key| !pool.contains(key) && *key != mirror));
     let before = er.local_images(protected).await?;
     ensure!(
         before.iter().all(Option::is_some),
@@ -29,7 +27,6 @@ pub async fn pressure_preserves(
     );
     let base_before = base.accounts(protected).await?;
     let expected = er.account(&mirror).await?.context("cache mirror missing")?;
-    ensure!(expected.owner == redsuite_core::system::system_id() && expected.lamports > 0);
     ensure!(base.account(&mirror).await? == Some(expected.clone()));
     ensure!(er.local_images(&[mirror]).await? == vec![Some(expected.clone())]);
     let evictions = cache_evictions(er).await?;

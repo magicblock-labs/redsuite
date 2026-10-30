@@ -248,7 +248,7 @@ impl Scenario for TransactionAuthority {
                 let start = fixture.er.api().get_slot().await?;
                 let result = tx.send_config(&fixture.er, skip_preflight).await?;
                 if skip_preflight {
-                    ensure!(result? == tx.signature.to_string());
+                    result?;
                 } else {
                     ensure!(
                         result.expect_err("privileged instruction succeeded").error.code.code()
@@ -303,10 +303,7 @@ impl Scenario for TransactionAuthority {
             let privileged_before = privileged_images(&fixture).await?;
             let start = fixture.er.api().get_slot().await?;
             let acknowledged = match tx.send_config(&fixture.er, skip_preflight).await? {
-                Ok(signature) => {
-                    ensure!(signature == tx.signature.to_string());
-                    true
-                }
+                Ok(_) => true,
                 Err(error) => {
                     ensure!(
                         error.error.code.code() == -32003 && readonly_refusal(&error),

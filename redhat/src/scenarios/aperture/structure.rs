@@ -7,7 +7,6 @@ use message::{
 };
 use pubkey::Pubkey;
 use redsuite_core::{
-    api::RpcError,
     random::{self, Rng},
     rpc_types::{config::RpcSendTransactionConfig, request::RpcRequest},
     transaction_types::UiTransactionEncoding,
@@ -15,7 +14,7 @@ use redsuite_core::{
 };
 use signature::Signature;
 use signer::Signer;
-use std::{rc::Rc, result, time::Duration};
+use std::{rc::Rc, time::Duration};
 use tracing::debug;
 use transaction::versioned::VersionedTransaction;
 
@@ -336,21 +335,16 @@ async fn check_case(
     }
     let before = fixture.snapshot(&extra).await?;
     let start = fixture.er.api().get_slot().await?;
-    let result: result::Result<String, RpcError> = fixture
+    let config = RpcSendTransactionConfig {
+        skip_preflight,
+        encoding: Some(UiTransactionEncoding::Base64),
+        max_retries: Some(0),
+        ..Default::default()
+    };
+    let result = fixture
         .er
         .api()
-        .try_call(
-            RpcRequest::SendTransaction,
-            &(
-                payload,
-                RpcSendTransactionConfig {
-                    skip_preflight,
-                    encoding: Some(UiTransactionEncoding::Base64),
-                    max_retries: Some(0),
-                    ..Default::default()
-                },
-            ),
-        )
+        .try_call::<String>(RpcRequest::SendTransaction, &(payload, config))
         .await?;
     let error = result.expect_err("malformed transaction acknowledged");
     let code = if matches!(mutation, Mutation::Encoding) { -32700 } else { -32602 };

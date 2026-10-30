@@ -1,6 +1,7 @@
 use std::result;
 
 use anyhow::{ensure, Context};
+use base64::{engine::general_purpose::STANDARD, Engine};
 use futures_util::future::join_all;
 use hash::Hash;
 use instruction::AccountMeta;
@@ -23,7 +24,7 @@ use crate::{
         UiTransactionEncoding, UiTransactionError,
     },
     transport::wsraw::RawWs,
-    ChainCtx, DynError, ErCtx, Result,
+    ChainCtx, ErCtx, Result,
 };
 
 pub struct Signed {
@@ -41,16 +42,10 @@ impl Signed {
         message: message::VersionedMessage,
         error: Option<UiTransactionError>,
     ) -> Result<Self> {
-        use base64::Engine;
         let transaction = transaction::versioned::VersionedTransaction::try_new(message, &[payer])?;
-        let quoted: result::Result<Response<Option<u64>>, RpcError> = er
-            .api()
-            .try_call(
-                RpcRequest::GetFeeForMessage,
-                &(base64::engine::general_purpose::STANDARD
-                    .encode(wincode::serialize(&transaction.message)?),),
-            )
-            .await?;
+        let encoded_message = STANDARD.encode(wincode::serialize(&transaction.message)?);
+        let quoted: result::Result<Response<Option<u64>>, RpcError> =
+            er.api().try_call(RpcRequest::GetFeeForMessage, &(encoded_message,)).await?;
         let fee = match quoted {
             Ok(response) => response.value.context("missing fee quote")?,
             Err(error) => {
@@ -63,8 +58,7 @@ impl Signed {
             }
         };
         Ok(Self {
-            encoded: base64::engine::general_purpose::STANDARD
-                .encode(wincode::serialize(&transaction)?),
+            encoded: STANDARD.encode(wincode::serialize(&transaction)?),
             signature: transaction.signatures[0],
             blockhash: *transaction.message.recent_blockhash(),
             fee,
@@ -130,11 +124,8 @@ impl Signed {
 
     pub async fn copies(&self, er: &ErCtx, count: usize) -> Result<()> {
         for result in join_all((0..count).map(|_| self.send(er))).await {
-            match result? {
-                Ok(_) => {}
-                Err(error) => {
-                    ensure!(error.error.code.code() == -32003);
-                }
+            if let Err(error) = result? {
+                ensure!(error.error.code.code() == -32003);
             }
         }
         Ok(())
@@ -155,7 +146,7 @@ impl Signed {
                         &(self.signature.to_string(), config),
                     )
                     .await?
-                    .ok_or_else(|| DynError::msg("transaction missing"))
+                    .context("transaction missing")
             })
             .await?;
         let meta = transaction_meta(&tx)?;
@@ -178,15 +169,11 @@ pub fn decode_state(accounts: &[Option<account::Account>]) -> Result<(u64, CellH
 }
 
 pub async fn audit(er: &ErCtx, start: u64, expected: &[(&Signed, usize)]) -> Result<u64> {
-    audit_signatures(
-        er,
-        start,
-        &expected
-            .iter()
-            .map(|(transaction, count)| (&transaction.signature, *count))
-            .collect::<Vec<_>>(),
-    )
-    .await
+    let signatures: Vec<_> = expected
+        .iter()
+        .map(|(transaction, count)| (&transaction.signature, *count))
+        .collect();
+    audit_signatures(er, start, &signatures).await
 }
 
 pub async fn audit_signatures(
@@ -203,7 +190,10 @@ pub async fn audit_signatures(
         })
         .await?;
     let blocks: Vec<u64> = er.api().call(RpcRequest::GetBlocks, &(start, end)).await?;
-    let mut counts = vec![0; expected.len()];
+    let mut counts: Vec<_> = expected
+        .iter()
+        .map(|(signature, count)| (signature.to_string(), *count, 0))
+        .collect();
     for slot in blocks {
         let config = RpcBlockConfig {
             transaction_details: Some(TransactionDetails::Signatures),
@@ -213,13 +203,16 @@ pub async fn audit_signatures(
         };
         let block: UiConfirmedBlock = er.api().call(RpcRequest::GetBlock, &(slot, config)).await?;
         let signatures = block.signatures.context("block signatures missing")?;
-        for (i, (signature, _)) in expected.iter().enumerate() {
-            let expected = signature.to_string();
-            counts[i] += signatures.iter().filter(|signature| **signature == expected).count();
+        for (signature, _, count) in &mut counts {
+            *count +=
+                signatures.iter().filter(|actual| actual.as_str() == signature.as_str()).count();
         }
     }
-    for ((_, expected), count) in expected.iter().zip(counts) {
-        ensure!(count == *expected);
+    for (signature, expected, count) in counts {
+        ensure!(
+            count == expected,
+            "{signature}: expected {expected} inclusions, got {count}"
+        );
     }
     Ok(end + 1)
 }

@@ -1,8 +1,6 @@
 use std::time::{Duration, Instant};
 
-use anyhow::ensure;
-
-use anyhow::anyhow;
+use anyhow::{anyhow, ensure};
 use tokio::time;
 
 use crate::{
