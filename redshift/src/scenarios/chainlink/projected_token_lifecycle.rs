@@ -497,20 +497,17 @@ impl ProjectedTokenLifecycle {
     }
 
     async fn await_projection(&self, expected: &[u64; 4]) -> Result<()> {
+        let atas = self.wallets.each_ref().map(|wallet| wallet.ata);
         self.er
             .api()
-            .await_accounts(
-                &self.wallets.iter().map(|wallet| wallet.ata).collect::<Vec<_>>(),
-                "projected balances converge",
-                |accounts| {
-                    for (account, expected) in accounts.iter().zip(expected) {
-                        let actual = spl::account_balance(account.as_ref().context("ATA missing")?)
-                            .context("token balance missing")?;
-                        ensure!(actual == *expected);
-                    }
-                    Ok(())
-                },
-            )
+            .await_accounts(&atas, "projected balances converge", |accounts| {
+                for (account, expected) in accounts.iter().zip(expected) {
+                    let actual = spl::account_balance(account.as_ref().context("ATA missing")?)
+                        .context("token balance missing")?;
+                    ensure!(actual == *expected);
+                }
+                Ok(())
+            })
             .await
     }
 

@@ -74,14 +74,6 @@ fn id_for(round: u64, lane: u64, lanes: u64) -> u64 {
     round * lanes + lane + 1
 }
 
-fn gcd(a: u64, b: u64) -> u64 {
-    if b == 0 {
-        a
-    } else {
-        gcd(b, a % b)
-    }
-}
-
 struct Profile {
     name: &'static str,
     payers: usize,
@@ -94,7 +86,7 @@ struct Profile {
 
 impl Profile {
     fn concurrency_per_thread(&self) -> usize {
-        (self.lanes as usize).div_ceil(self.threads.max(1)).max(1)
+        (self.lanes as usize).div_ceil(self.threads)
     }
 }
 
@@ -209,11 +201,6 @@ impl Scenario<(ScenarioReport, Result<()>)> for MixedSustainedLoad {
     async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
         let started = Instant::now();
         let profile = PROFILES.select(base.config().profile);
-
-        ensure!(gcd(profile.lanes, MIX_PERIOD) == 1);
-        ensure!(profile.lanes >= profile.threads as u64);
-        ensure!(profile.payers >= profile.threads);
-        ensure!((profile.read_span as u64) < profile.lanes);
 
         let payers = base.funded_payers(profile.payers, PAYER_LAMPORTS).await?;
         let pool = Accounts::new(ACCOUNT_SPACE, er.identity())

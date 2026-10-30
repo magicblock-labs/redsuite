@@ -127,15 +127,12 @@ pub fn mint_to(
 }
 
 pub(crate) async fn token_balance(ctx: &impl ChainCtx, account: &Pubkey) -> Result<Option<u64>> {
-    let Some(account) = ctx.account(account).await? else {
-        return Ok(None);
-    };
-    Ok(account_balance(&account))
+    Ok(ctx.account(account).await?.as_ref().and_then(account_balance))
 }
 
 pub fn account_balance(account: &account::Account) -> Option<u64> {
-    let bytes = account.data.get(TOKEN_AMOUNT_OFFSET..TOKEN_AMOUNT_OFFSET + 8)?;
-    Some(u64::from_le_bytes(bytes.try_into().ok()?))
+    let bytes = account.data.get(TOKEN_AMOUNT_OFFSET..)?.first_chunk()?;
+    Some(u64::from_le_bytes(*bytes))
 }
 
 pub(crate) fn transfer(

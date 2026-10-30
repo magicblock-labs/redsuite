@@ -187,16 +187,12 @@ impl<'a> IntentFixture<'a> {
                 )
                 .await?;
             if addition != 0 {
-                self.er
-                    .submit_and_confirm(
-                        &actor.payer,
-                        &[REDSHIFT
-                            .batch()
-                            .add(&[actor.cell], i64::from(addition))
-                            .require_signer(key)
-                            .build()],
-                    )
-                    .await?;
+                let instruction = REDSHIFT
+                    .batch()
+                    .add(&[actor.cell], i64::from(addition))
+                    .require_signer(key)
+                    .build();
+                self.er.submit_and_confirm(&actor.payer, &[instruction]).await?;
                 actor.expected.value += addition as u64;
                 actor.expected.revision += 1;
             }
@@ -204,13 +200,11 @@ impl<'a> IntentFixture<'a> {
         let actors = &self.actors[..n];
         let keys: [_; ACTORS] = std::array::from_fn(|i| self.actors[i].payer.pubkey());
         let cells: [_; ACTORS] = std::array::from_fn(|i| self.actors[i].cell);
+        let cosigners: Vec<_> = actors[1..].iter().map(|actor| &actor.payer).collect();
+        let instruction = intents(&keys[..n], self.er.identity(), destination, modes, actions);
         let signature = self
             .er
-            .submit_and_confirm_with(
-                &actors[0].payer,
-                &actors[1..].iter().map(|actor| &actor.payer).collect::<Vec<_>>(),
-                &[intents(&keys[..n], self.er.identity(), destination, modes, actions)],
-            )
+            .submit_and_confirm_with(&actors[0].payer, &cosigners, &[instruction])
             .await?;
         let undelegates = modes.iter().any(|mode| matches!(mode, Undelegate(_)));
         self.check_settled(&signature, &cells[..n], undelegates).await?;

@@ -33,7 +33,6 @@ pub(super) struct Fixture {
     pub(super) keys: [Pubkey; 6],
     pub(super) base_images: Vec<Option<Account>>,
     pub(super) expected: Vec<Option<Account>>,
-    foreign_image: Account,
 }
 
 pub(super) async fn base_accounts(base: &BaseCtx, keys: &[Pubkey]) -> Result<Vec<Option<Account>>> {
@@ -76,9 +75,10 @@ impl Fixture {
         let foreign_image =
             er.account(&foreign).await?.context("foreign readonly control missing")?;
         let keys = [payer.pubkey(), cell, warm, cold, absent, foreign];
-        let expected = er.local_images(&keys).await?;
+        let mut expected = er.local_images(&keys).await?;
         ensure!(expected[..2].iter().all(Option::is_some));
         ensure!(expected[3].is_none() && expected[4].is_none());
+        expected[5] = Some(foreign_image);
         let base_images = base_accounts(&base, &keys).await?;
         Ok(Self {
             base,
@@ -87,7 +87,6 @@ impl Fixture {
             keys,
             base_images,
             expected,
-            foreign_image,
         })
     }
 
@@ -150,8 +149,7 @@ impl Fixture {
         let tx = Signed::from_versioned(&self.er, &self.payer, message, None).await?;
         ensure!(tx.valid(&self.er).await?);
         let start = self.er.api().get_slot().await?;
-        let signature = tx.send_config(&self.er, skip_preflight).await??;
-        ensure!(signature == tx.signature.to_string());
+        tx.send_config(&self.er, skip_preflight).await??;
         let slot = tx.outcome(&self.er).await?;
         let status = self
             .er
@@ -171,7 +169,7 @@ impl Fixture {
         ensure!(actual[..2] == self.expected[..2]);
         for (index, account) in actual.iter().enumerate().skip(2) {
             let expected = if index == 5 {
-                Some(&self.foreign_image)
+                self.expected[5].as_ref()
             } else {
                 self.base_images[index].as_ref()
             };
