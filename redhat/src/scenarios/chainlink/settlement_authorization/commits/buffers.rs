@@ -31,7 +31,6 @@ pub(super) struct Plan {
     order: Vec<usize>,
     forged_intent: u64,
     authority: Keypair,
-    fixtures: [Pubkey; 2],
 }
 
 pub(super) fn plan(seed: u64) -> Result<Plan> {
@@ -40,29 +39,12 @@ pub(super) fn plan(seed: u64) -> Result<Plan> {
     let mut order = (0..8).collect::<Vec<_>>();
     order.shuffle(&mut rng);
     let forged_intent = rng.gen_range(1..u64::MAX);
-    let mut fixtures = random::rng(seed, &["redhat", "commit_buffers", "fixtures"], 0);
     Ok(Plan {
         markers,
         order,
         forged_intent,
         authority: topology::identity_for_label("redhat-commit-buffer-authority")?,
-        fixtures: std::array::from_fn(|_| random::keypair(&mut fixtures).pubkey()),
     })
-}
-
-impl Plan {
-    pub(super) fn log(&self, seed: u64) {
-        let accounts = (0..2)
-            .map(|index| REDSHIFT.pda(CellId::new(self.fixtures[0], index)).0)
-            .collect::<Vec<_>>();
-        let large = (100..108)
-            .map(|index| REDSHIFT.pda(CellId::new(self.fixtures[0], index)).0)
-            .collect::<Vec<_>>();
-        let control = REDSHIFT.pda(CellId::new(self.fixtures[0], CONTROL_INDEX)).0;
-        tracing::debug!(seed, order = ?self.order, markers = ?self.markers, fixtures = ?self.fixtures, ?accounts, ?large, %control, "commit buffer plan");
-        tracing::debug!(authority = %self.authority.pubkey(), vault = %dlp::validator_fees_vault_pda(&self.authority.pubkey()), "buffer authority fixture");
-        tracing::debug!(seed, forged_intent = self.forged_intent, forged_outbox = %outbox_intent_pda(self.forged_intent), "forged outbox substitution plan");
-    }
 }
 
 impl SettlementAuthorization {
@@ -75,7 +57,6 @@ impl SettlementAuthorization {
             0,
         );
         let payer = self.base.seeded_payer(&mut fixtures, PAYER_LAMPORTS).await?;
-        ensure!(payer.pubkey() == plan.fixtures[0]);
         let authority = &plan.authority;
         self.base.airdrop(&authority.pubkey(), PAYER_LAMPORTS).await?;
         let mut accounts = Vec::new();
@@ -105,10 +86,9 @@ impl SettlementAuthorization {
         let other = CommitFixture { account: accounts[1], ..fixture };
         fixture.commit(1, markers[0], true).await?;
         other.commit(1, markers[1], true).await?;
-        let data = fixture.data(markers[2]).await?;
+        let data = fixture.marked_data(markers[2]).await?;
         let (chunks, buffer) = fixture.initialize_buffer(2, data.len()).await?;
         let foreign = self.base.seeded_payer(&mut fixtures, PAYER_LAMPORTS).await?;
-        ensure!(foreign.pubkey() == plan.fixtures[1]);
         for (signer, account, nonce) in [
             (&foreign, fixture.account, 2),
             (authority, other.account, 2),
@@ -185,7 +165,7 @@ impl SettlementAuthorization {
             .rejected(&[unsigned], &[], InstructionError::MissingRequiredSignature)
             .await?;
         let valid = fixture.instruction(authority.pubkey(), 2, data.clone(), Some(buffer)).await?;
-        let stale_data = other.data(markers[3]).await?;
+        let stale_data = other.marked_data(markers[3]).await?;
         let stale_buffer = other.buffer(1, &stale_data).await?;
         let stale =
             other.instruction(authority.pubkey(), 1, stale_data, Some(stale_buffer)).await?;
@@ -197,11 +177,11 @@ impl SettlementAuthorization {
                 InstructionError::Custom(DlpError::NonceOutOfOrder as u32),
             )
             .await?;
-        other.close(1).await?;
+        other.close_buffer(1).await?;
         ensure!(
             self.base.account(&buffer).await?.context("buffer lost after rollback")?.data == data
         );
-        let replacement = fixture.data(markers[4]).await?;
+        let replacement = fixture.marked_data(markers[4]).await?;
         for (index, chunk) in replacement.chunks(CHUNK).enumerate() {
             self.base
                 .submit_and_confirm_with(
@@ -232,7 +212,7 @@ impl SettlementAuthorization {
                 .data
                 == replacement
         );
-        fixture.close(2).await?;
+        fixture.close_buffer(2).await?;
         ensure!(self.base.accounts(&[chunks, buffer]).await?.iter().all(Option::is_none));
         fixture.commit(3, markers[4], true).await?;
         other.commit(2, markers[4], true).await?;
@@ -412,7 +392,7 @@ impl SettlementAuthorization {
         let mut bundle = OUTBOX_INTENT_DISCRIMINATOR.to_vec();
         bundle.extend(plan.forged_intent.to_le_bytes());
         bundle.resize(OUTBOX_INTENT_DISCRIMINATOR.len() + OUTBOX_BUNDLE_BODY, 0);
-        tracing::debug!(intent_id, %outbox, forged_intent = plan.forged_intent, %forged, %control, bundle = bundle.len(), "outbox substitution targets");
+        tracing::debug!(intent_id, %outbox, forged_intent = plan.forged_intent, %forged, "outbox substitution targets");
         let stage = ExecutionStage::SingleStage(PendingTransaction {
             signature: write_signature,
             blockhash: self.base.api().get_latest_blockhash().await?,

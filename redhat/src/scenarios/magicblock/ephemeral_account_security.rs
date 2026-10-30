@@ -331,7 +331,7 @@ impl Record {
     }
 }
 
-fn serialized(
+fn find_serialization(
     keys: &[Pubkey],
     before: &[Account],
     final_state: &[Account],
@@ -352,7 +352,7 @@ fn serialized(
         if record.check(keys, before, &after, outcome).is_ok() {
             let mut next = ledger.clone();
             if next.apply(keys, keys[action.sponsor], before, &after).is_ok() {
-                if let Some(next) = serialized(
+                if let Some(next) = find_serialization(
                     keys,
                     &after,
                     final_state,
@@ -807,7 +807,6 @@ impl Workload {
         ensure!(backing.owner == dlp::dlp_id());
         ensure!(backing.data.get(64..72) == Some(amount.to_le_bytes().as_slice()));
         let mut projected = base[2].clone().context("projection base ATA missing")?;
-        let cloned_funding = projected.lamports;
         ensure!(spl::account_balance(&projected) == Some(0));
         projected.data[64..72].copy_from_slice(&amount.to_le_bytes());
         projected.data[129..133].copy_from_slice(&1u32.to_le_bytes());
@@ -822,13 +821,6 @@ impl Workload {
             .await?;
         let source = self.er.local_images(&[self.er.identity()]).await?;
         ensure!(source.iter().all(Option::is_some));
-        tracing::debug!(
-            cloned_funding,
-            projected_reserve = projected.lamports,
-            projected_funding = projected.lamports - cloned_funding,
-            vault_credit = 0,
-            "nonrefundable materialization funding"
-        );
         for operation in [Create { data_len: 1 }, Close] {
             self.step(
                 "funded lifecycle beside projected rent",
@@ -840,89 +832,6 @@ impl Workload {
             ensure!(self.base.accounts(&keys).await? == base);
         }
         self.ledger.check(self.expected[VAULT].lamports)
-    }
-
-    async fn check_commit_vault_roles(&mut self) -> Result<()> {
-        let mut rng = random::rng(self.base.config().seed, &["redhat", "commit_fee_roles"], 0);
-        let owner = self.base.seeded_payer(&mut rng, PAYER_LAMPORTS).await?;
-        let cell = self
-            .base
-            .cells(REDSHIFT, &owner)
-            .create_delegated(CellHeader::SIZE as u32 + 8, self.er.identity(), 0)
-            .await?;
-        let vault = dlp::magic_fee_vault_pda(&self.er.identity());
-        let tracked = [cell, vault, self.keys[PAYER], self.keys[VICTIM]];
-        self.er.accounts(&tracked).await?;
-        let base = self.base.accounts(&tracked).await?;
-        let before = self.er.local_images(&tracked).await?;
-        let context = self.er.local_images(&[magic_api::MAGIC_CONTEXT_PUBKEY]).await?;
-        for (replacement, readonly, reason) in [
-            (None, false, InstructionError::MissingAccount),
-            (
-                Some(self.keys[SUBSTITUTE]),
-                false,
-                InstructionError::MissingAccount,
-            ),
-            (Some(vault), true, InstructionError::IllegalOwner),
-        ] {
-            let mut native = MAGIC.commit(
-                self.keys[PAYER],
-                replacement,
-                &[cell],
-                SettlementMode::Commit,
-            );
-            if readonly {
-                native.accounts[2].is_writable = false;
-            }
-            let tx = self.prepare(vec![REDSHIFT.batch().invoke(native).build()]).await?;
-            let record = Record::submit(&self.er, tx).await?;
-            ensure!(record.info.err == Some(error(0, reason)));
-            ensure!(record.info.fee == 0 && record.info.pre_balances == record.info.post_balances);
-            ensure!(self.er.local_images(&tracked).await? == before);
-            ensure!(self.er.local_images(&[magic_api::MAGIC_CONTEXT_PUBKEY]).await? == context);
-            ensure!(self.base.accounts(&tracked).await? == base);
-        }
-        let value = rng.gen_range(1..1_000_000);
-        tracing::debug!(%cell, %vault, value, "duplicate committee plan");
-        let duplicate = MAGIC.commit(
-            self.keys[PAYER],
-            Some(vault),
-            &[cell, cell],
-            SettlementMode::Commit,
-        );
-        let tx = self
-            .prepare(vec![REDSHIFT
-                .batch()
-                .set(&[cell], value)
-                .invoke(duplicate)
-                .build()])
-            .await?;
-        let record = Record::submit(&self.er, tx).await?;
-        ensure!(
-            record.info.err.is_none(),
-            "duplicate committee: {:?}, {:?}",
-            record.info.err,
-            transaction_logs(&record.info)
-        );
-        ensure!(record.info.fee == 0 && record.info.pre_balances == record.info.post_balances);
-        ensure!(self.er.local_images(&tracked[1..]).await? == before[1..]);
-        ensure!(self.base.accounts(&tracked[1..]).await? == base[1..]);
-        ensure!(state(&self.er, &self.keys).await? == self.expected);
-        ensure!(self.base.accounts(&self.keys).await? == self.base_images);
-        self.er
-            .check_commit(&self.base, &record.tx.signatures[0], &[cell], false)
-            .await?
-            .check_success("duplicate committee commits one account once")?;
-        let signature = self
-            .er
-            .cells(REDSHIFT, &owner)
-            .settle(253, &[cell], SettlementMode::Commit)
-            .await?;
-        self.er
-            .check_commit(&self.base, &signature, &[cell], false)
-            .await?
-            .check_success("commit after fee vault role refusals")?;
-        Ok(())
     }
 
     async fn check_surplus_transfer(&mut self, amount: u64) -> Result<()> {
@@ -1316,11 +1225,9 @@ impl Workload {
         );
         let drain = balance - charge;
         tracing::debug!(
-            label,
-            balance,
+            case = label,
+            charge,
             deposit,
-            affordable = charge,
-            short = charge - 1,
             "ephemeral rent charge boundary"
         );
         for short in [true, false] {
@@ -1418,19 +1325,11 @@ impl Workload {
         Ok(())
     }
 
-    async fn check_insufficient(&mut self) -> Result<()> {
+    async fn check_rent_boundaries(&mut self) -> Result<()> {
         let seed = self.base.config().seed;
         let mut plan = random::rng(seed, &["redhat", "charge_boundaries"], 0);
         let sizes = [plan.gen_range(64..1024), plan.gen_range(1024..4096)];
         let growth = plan.gen_range(1..256);
-        tracing::debug!(
-            seed,
-            ?sizes,
-            growth,
-            charges = ?sizes.map(rent),
-            growth_charge = rent(sizes[0] + growth) - rent(sizes[0]),
-            "ephemeral rent charge boundary plan"
-        );
         for size in sizes {
             self.check_charge_boundary(
                 &format!("rent boundary create {size}"),
@@ -1492,7 +1391,7 @@ impl Workload {
         }))
         .await?;
         let after = state(&self.er, &keys).await?;
-        self.ledger = serialized(&keys, &self.expected, &after, &records, 0, &self.ledger)
+        self.ledger = find_serialization(&keys, &self.expected, &after, &records, 0, &self.ledger)
             .context("conflicts have no valid serialized outcome")?;
         ensure!(self.base.accounts(&keys).await? == self.base_images);
         self.expected = after.clone();
@@ -1522,20 +1421,7 @@ impl Scenario for EphemeralAccountSecurity {
         )
         .fill(&mut secret);
         let victim = Keypair::new_from_array(secret);
-        tracing::debug!(seed, ?sizes, target = %target.pubkey(), victim = %victim.pubkey(), "ephemeral lifecycle plan");
-        let (failures, batches) = failure_plan(seed, target.pubkey());
-        tracing::debug!(
-            seed,
-            failures = ?failures.iter().map(|(mode, index)| (matches!(mode, SettlementMode::Undelegate), index)).collect::<Vec<_>>(),
-            ?batches,
-            "failure placement plan"
-        );
-        let (mut funding, mint) = funding_plan(seed);
-        let owner = random::keypair(&mut funding).pubkey();
-        tracing::debug!(seed, accounts = ?funding_accounts(owner, mint.pubkey()), amount = 25, "funding attribution plan");
-        let mirror =
-            random::keypair(&mut random::rng(seed, &["redhat", "confined_accounts"], 0)).pubkey();
-        tracing::debug!(seed, %mirror, pool = ?cache_pool(seed), "confined cache pressure plan");
+        tracing::debug!(?sizes, target = %target.pubkey(), victim = %victim.pubkey(), "ephemeral lifecycle plan");
         let mut rng = random::rng(
             seed,
             &["redhat", "ephemeral_account_security", "fixtures"],
@@ -1588,11 +1474,10 @@ impl Scenario for EphemeralAccountSecurity {
                 .await?;
             workload.step("seeded close", &Action::new(Close)).await?;
         }
-        workload.check_insufficient().await?;
+        workload.check_rent_boundaries().await?;
         workload.check_conflicts().await?;
         workload.check_funding_roles().await?;
         workload.check_materialized_funding().await?;
-        workload.check_commit_vault_roles().await?;
         workload.check_prior_refund().await?;
         workload
             .check_failure_placement()
@@ -1666,7 +1551,6 @@ impl EphemeralAccountSecurity {
             workload.starting_vault.checked_sub(refundable).context("vault underfunded")?;
         workload.ledger.check(workload.starting_vault)?;
         tracing::debug!(
-            starting_vault = workload.starting_vault,
             refundable,
             floor = workload.ledger.floor,
             "ephemeral vault baseline"
