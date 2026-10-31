@@ -19,16 +19,21 @@ use redsuite_core::{
     rpc_types::{request::RpcRequest, response::TransactionError},
     signed::{audit, Signed},
     transaction_types::UiTransactionError,
-    BaseCtx, ChainCtx, ErCtx, Result, Scenario,
+    wait, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
 
 use super::fixture::Fixture;
 
+/// Checks that public submission cannot impersonate the validator or bypass write authority.
+///
+/// Protects privileged protocol accounts as well as foreign delegated state, allowing
+/// only the fee of a transaction that actually reached execution.
 pub struct TransactionAuthority {
     base: Rc<BaseCtx>,
     er: ErCtx,
 }
 
+/// Stable privilege-sensitive state, excluding the validator identity's changing balance.
 type Projection = Vec<Option<(Pubkey, bool, Vec<u8>, Option<u64>)>>;
 
 fn project(accounts: &[Option<Account>]) -> Projection {
@@ -48,6 +53,7 @@ fn project(accounts: &[Option<Account>]) -> Projection {
         .collect()
 }
 
+/// Captures protocol-account invariants on both chains without hydrating them via public RPC.
 async fn privileged_images(fixture: &Fixture) -> Result<(Projection, Projection)> {
     let keys = [
         magic_api::MAGIC_CONTEXT_PUBKEY,
@@ -69,23 +75,12 @@ async fn privileged_images(fixture: &Fixture) -> Result<(Projection, Projection)
     Ok((project(&local), project(&base)))
 }
 
-fn readonly_refusal(error: impl std::fmt::Debug) -> bool {
-    let error = format!("{error:?}").to_lowercase();
-    [
-        "invalidwritableaccount",
-        "readonlydatamodified",
-        "externalaccountdatamodified",
-        "immutable",
-    ]
-    .iter()
-    .any(|gate| error.contains(gate))
-}
-
 impl Scenario for TransactionAuthority {
     async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
         Ok(Self { base, er })
     }
 
+    /// Tries private-wire impersonation, privileged instructions, and foreign writes.
     async fn run(self) -> Result<()> {
         let mut rng = random::rng(
             self.base.config().seed,
@@ -305,8 +300,17 @@ impl Scenario for TransactionAuthority {
             let acknowledged = match tx.send_config(&fixture.er, skip_preflight).await? {
                 Ok(_) => true,
                 Err(error) => {
+                    let message = error.error.message.to_lowercase();
                     ensure!(
-                        error.error.code.code() == -32003 && readonly_refusal(&error),
+                        error.error.code.code() == -32003
+                            && [
+                                "invalidwritableaccount",
+                                "readonlydatamodified",
+                                "externalaccountdatamodified",
+                                "immutable",
+                            ]
+                            .iter()
+                            .any(|gate| message.contains(gate)),
                         "{error}"
                     );
                     false
@@ -318,19 +322,31 @@ impl Scenario for TransactionAuthority {
                 .er
                 .api()
                 .await_query("foreign-write ledger boundary published", async || {
-                    ensure!(fixture.er.api().get_block(end).await?.is_some());
-                    Ok(())
+                    let block = fixture.er.api().get_block(end).await?;
+                    Ok(wait::check(
+                        block.context("foreign-write ledger boundary not published"),
+                    ))
                 })
                 .await?;
             let record = fixture.er.api().get_transaction(&tx.signature).await?;
             if let Some(record) = &record {
                 let meta = transaction_meta(record)?;
-                let error = meta.err.as_ref().context("foreign write executed successfully")?;
+                let error: TransactionError =
+                    meta.err.clone().context("foreign write executed successfully")?.into();
                 ensure!(
-                    readonly_refusal(error),
+                    matches!(
+                        error,
+                        TransactionError::InvalidWritableAccount
+                            | TransactionError::InstructionError(
+                                _,
+                                InstructionError::ReadonlyDataModified
+                                    | InstructionError::ExternalAccountDataModified
+                                    | InstructionError::Immutable
+                            )
+                    ),
                     "unexpected foreign write error: {error:?}"
                 );
-                tx.error = meta.err.clone();
+                tx.error = Some(error.into());
                 let slot = tx.outcome(&fixture.er).await?;
                 let status = fixture
                     .er

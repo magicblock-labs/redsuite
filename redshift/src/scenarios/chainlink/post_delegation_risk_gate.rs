@@ -35,9 +35,8 @@ const MERGE_TIMEOUT: Duration = Duration::from_secs(30);
 // boolean verdict, so the mock computes isRisky from the seeded score here.
 const RISK_THRESHOLD: u64 = 5;
 
-// Stands in for the risk server the validator queries via
-// GET /risk?pubkey=<addr>, answering the camelCase {"isRisky":bool} shape
-// magicblock-aml deserializes.
+/// Loopback risk service implementing `GET /risk?pubkey=<addr>` with an `isRisky` verdict.
+/// Owns score-to-verdict policy and query evidence; the validator receives no numeric threshold.
 pub struct MockRiskServer {
     base_url: Url,
     worker: JoinHandle<()>,
@@ -45,6 +44,7 @@ pub struct MockRiskServer {
 }
 
 impl MockRiskServer {
+    /// Binds a free loopback port and owns the worker until the server is dropped.
     pub async fn start() -> Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
@@ -58,6 +58,7 @@ impl MockRiskServer {
         })
     }
 
+    /// Sets the score used for subsequent verdicts without resetting query evidence.
     pub fn set_risk(&self, address: Pubkey, risk_score: u64) {
         self.service.risks.borrow_mut().entry(address).or_default().score = risk_score;
     }
@@ -71,12 +72,14 @@ impl MockRiskServer {
     }
 }
 
+/// Per-owner verdict input and evidence that the validator actually consulted the gate.
 #[derive(Default)]
 struct Risk {
     score: u64,
     queries: usize,
 }
 
+/// Verdict state and a query notification used to synchronize checks with actual gate consultation.
 #[derive(Default)]
 struct RiskService {
     risks: RefCell<HashMap<Pubkey, Risk>>,
@@ -166,6 +169,8 @@ impl PrivateErScenario for PostDelegationRiskGate {
         Ok(Self { base, server, private })
     }
 
+    /// Compares high-risk rescue with a low-risk allowed-attempt control,
+    /// not guaranteed merge success.
     async fn run(self) -> Result<()> {
         // High-risk owner (score 9): the merge is blocked, no tokens move,
         // and the shuttle ATA is undelegated on base.
@@ -179,11 +184,8 @@ impl PrivateErScenario for PostDelegationRiskGate {
     }
 }
 
-// The merge attempt is the er transaction that references both the shuttle
-// ATA and the destination. Outer None = no attempt; Some(None) = the attempt
-// succeeded; Some(Some(text)) = the attempt failed with that error.
-
 impl PostDelegationRiskGate {
+    /// Requires a real risk query before checking either rescue or the allowed merge attempt.
     async fn run_risk_case(&self, owner_risk: u64, expect_allowed: bool) -> Result<()> {
         let er_identity = self.private.ctx().identity();
         let owner = Keypair::new();
@@ -284,8 +286,8 @@ impl PostDelegationRiskGate {
             self.base
                 .api()
                 .await_query("high-risk shuttle undelegates", async || {
-                    ensure!(!self.delegation_record_exists(&shuttle_ata).await?);
-                    Ok(())
+                    let exists = self.delegation_record_exists(&shuttle_ata).await?;
+                    Ok(wait::when(!exists, exists))
                 })
                 .await?;
             ensure!(self.merge_attempt(&shuttle_ata, &destination_ata).await?.is_none());
@@ -294,6 +296,8 @@ impl PostDelegationRiskGate {
         Ok(())
     }
 
+    /// Finds an ER transaction referencing both the shuttle and destination.
+    /// `None` means no attempt; `Some(None)` success; `Some(Some(error))` execution failure.
     async fn merge_attempt(
         &self,
         shuttle_ata: &Pubkey,

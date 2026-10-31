@@ -36,6 +36,7 @@ const MIX_PERIOD: u64 = 20;
 const HASH_COMPUTE_SLOTS: u64 = 2;
 const PATTERN_WRITE_SLOTS: u64 = 9;
 
+/// Deterministic transaction mix combining compute, direct writes, and neighboring readonly inputs.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum Mode {
     HashCompute,
@@ -55,6 +56,8 @@ impl Mode {
     }
 }
 
+/// Assigns a fixed periodic mix; coprime lane counts keep every lane
+/// visiting all instruction families.
 fn mode_for(id: u64) -> Mode {
     let slot = (id - 1) % MIX_PERIOD;
     if slot < HASH_COMPUTE_SLOTS {
@@ -70,10 +73,12 @@ fn lane_of(id: u64, lanes: u64) -> u64 {
     (id - 1) % lanes
 }
 
+/// Interleaves lane-local rounds into globally unique IDs used by the final-state oracle.
 fn id_for(round: u64, lane: u64, lanes: u64) -> u64 {
     round * lanes + lane + 1
 }
 
+/// Lane ownership and fixed mix costs shared by generation and final-state verification.
 struct Profile {
     name: &'static str,
     payers: usize,
@@ -131,6 +136,7 @@ fn build_ixs(id: u64, pool: &[Pubkey], read_span: usize, hash_iters: u32) -> Vec
     }
 }
 
+/// Post-generation pipeline sample; queue gauges are reported separately from state convergence.
 struct DrainState {
     elapsed: Duration,
     blocked: f64,
@@ -138,6 +144,7 @@ struct DrainState {
     pending: f64,
 }
 
+/// Reads workload-owned lanes without treating a failed state check as a transport failure.
 async fn read_final_state(
     er: &ErCtx,
     pool: &[Pubkey],
@@ -150,6 +157,7 @@ async fn read_final_state(
     Ok(accounts)
 }
 
+/// Checks each lane's final admitted ID and mode-specific payload independently of account reads.
 fn verify_final_state(
     accounts: &[Option<Account>],
     last_ids: &[Option<u64>],
@@ -188,6 +196,7 @@ fn verify_final_state(
 }
 
 /// Measures sustained mixed execution and verifies its final workload-owned state.
+/// Worker-local lane ordering makes each lane's last admitted ID an independent final-state oracle.
 pub struct MixedSustainedLoad {
     er: ErCtx,
     profile: &'static Profile,
@@ -198,6 +207,7 @@ pub struct MixedSustainedLoad {
 }
 
 impl Scenario<(ScenarioReport, Result<()>)> for MixedSustainedLoad {
+    /// Warms each instruction family with IDs outside the measured workload's namespace.
     async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
         let started = Instant::now();
         let profile = PROFILES.select(base.config().profile);
@@ -238,6 +248,7 @@ impl Scenario<(ScenarioReport, Result<()>)> for MixedSustainedLoad {
         })
     }
 
+    /// Measures generation separately from final-state convergence and local resource observations.
     async fn run(self) -> Result<(ScenarioReport, Result<()>)> {
         let load = RunControl::from_config(&self.base_config)?;
         let er = &self.er;
@@ -343,6 +354,7 @@ impl Executed {
         report
     }
 
+    /// Records delivery/state check misses and appends post-run metric/resource evidence.
     #[instrument(skip_all, err)]
     async fn check(
         &self,
@@ -469,6 +481,7 @@ impl Executed {
     }
 }
 
+/// Pre-generation metrics and optional local-process resources for the measured workload interval.
 struct Baseline {
     metrics: Metrics,
     cpu: Option<host::CpuSample>,

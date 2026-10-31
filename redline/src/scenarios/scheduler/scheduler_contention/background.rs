@@ -21,9 +21,12 @@ use std::{
 use tokio::sync::watch;
 use url::Url;
 
+/// Competing-load policies that stress scheduler dependencies versus intake backpressure.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum LoadMode {
+    /// At most one unconfirmed transaction per independent account lane.
     Bounded { lanes: usize },
+    /// Delivery-paced concurrency without waiting for each account's execution confirmation.
     Open { concurrency: usize },
 }
 
@@ -49,6 +52,7 @@ impl LoadMode {
     }
 }
 
+/// Partitions independent accounts/payers across workers using the selected admission policy.
 pub(super) fn spawn_load(
     er_rpc_url: Url,
     er_ws_url: Url,
@@ -107,6 +111,7 @@ async fn open_load(
     .await
 }
 
+/// Confirmation-gated lanes that keep competing execution active without an unbounded pending tail.
 struct BoundedLoad {
     sigs: SignatureConfirmations,
     tally: RefCell<RawRunOutcome>,
@@ -150,6 +155,7 @@ impl BoundedLoad {
         })
     }
 
+    /// Stops the lane at its first failure, retaining that error for the parent workload.
     async fn run_lane(self: Rc<Self>, account: Pubkey, sender: TxSender) {
         while !*self.stop.borrow() {
             let result = self.deliver(account, &sender).await;
@@ -165,6 +171,8 @@ impl BoundedLoad {
         }
     }
 
+    /// Registers confirmation before sending and does not reopen the lane
+    /// until that signature settles.
     async fn deliver(&self, account: Pubkey, sender: &TxSender) -> Result<()> {
         let id = self.next_id.get() + 1;
         self.next_id.set(id);
@@ -182,6 +190,7 @@ pub(super) async fn join_load(handles: Workers<RawRunOutcome>) -> Result<RunOutc
     Ok(merge_outcomes(handles.join().await?))
 }
 
+/// Records a missed executor warm-in check without ending continuous benchmark traffic.
 pub(super) async fn await_load_reaching_executors(er: &ErCtx) -> Result<()> {
     let reached = wait::retry(
         "the independent load reaches the executors",

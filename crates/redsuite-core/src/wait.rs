@@ -1,6 +1,10 @@
-use std::time::Duration;
+use std::{
+    fmt::Debug,
+    ops::ControlFlow::{self, Break, Continue},
+    time::Duration,
+};
 
-use anyhow::Context;
+use anyhow::{anyhow, Context, Error};
 use tokio::{
     sync::Notify,
     time::{self, Instant},
@@ -9,6 +13,23 @@ use tokio::{
 use crate::Result;
 
 const RETRY_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Marks a pure readiness-check failure as pending, retaining its reason on timeout.
+/// Apply this after fallible reads: wrapping a read error would incorrectly make it retryable.
+pub fn check<T>(result: Result<T>) -> ControlFlow<T, Error> {
+    result.map_or_else(Continue, Break)
+}
+
+/// Marks an observation ready when the predicate holds, retaining it
+/// in pending diagnostics otherwise.
+/// Prefer compact observed values such as counts or markers over full account payloads.
+pub fn when<T: Debug>(ready: bool, observed: T) -> ControlFlow<T, Error> {
+    if ready {
+        Break(observed)
+    } else {
+        Continue(anyhow!("not ready: {observed:?}"))
+    }
+}
 
 /// Retry failed attempts without cancelling an in-flight operation.
 pub async fn retry<T>(

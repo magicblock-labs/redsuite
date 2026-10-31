@@ -29,6 +29,7 @@ const TIMEOUT: Duration = Duration::from_secs(90);
 const FETCH_FAILURE: &str = "upgrade probe cold fetch unavailable";
 const PHASES: [&str; 4] = ["before upgrade", "held", "released", "converged"];
 
+/// Uploads loader-buffer bytes on base before the upgrade-observation race begins.
 async fn buffer(base: &BaseCtx, payer: &Keypair, bytes: &[u8]) -> Result<Keypair> {
     let buffer = Keypair::new();
     base.submit_and_confirm_with(
@@ -56,6 +57,7 @@ async fn buffer(base: &BaseCtx, payer: &Keypair, bytes: &[u8]) -> Result<Keypair
     Ok(buffer)
 }
 
+/// Observes cached code without warming the cold ER or masking a missing materialization.
 async fn local_program(er: &ErCtx, program: Pubkey) -> Result<Option<Account>> {
     Ok(er
         .api()
@@ -66,6 +68,8 @@ async fn local_program(er: &ErCtx, program: Pubkey) -> Result<Option<Account>> {
 }
 
 /// Checks warm/cold execution across a real upgrade and rollback of failed transactions.
+/// The warm ER runs through withheld upgrade observations; the cold ER provides an
+/// independent materialization check once the upgraded code is released.
 pub struct ProgramUpgradeConsistency {
     base: Rc<BaseCtx>,
     a: Vec<u8>,
@@ -81,6 +85,7 @@ pub struct ProgramUpgradeConsistency {
 }
 
 impl PrivateErScenario for ProgramUpgradeConsistency {
+    /// Deploys the initial program and prepares upgraded bytes without warming the cold ER.
     async fn setup(base: Rc<BaseCtx>, _: ()) -> Result<Self> {
         let mut a = fs::read(Fixture::UpgradeProbe.resolve()?)?;
         let mut b = fs::read(Fixture::UpgradeProbeUpgraded.resolve()?)?;
@@ -136,6 +141,7 @@ impl PrivateErScenario for ProgramUpgradeConsistency {
         })
     }
 
+    /// Runs version-marked traffic concurrently with the controlled upgrade-delivery phases.
     async fn run(self) -> Result<()> {
         let er = self.hot.ctx();
         let payer = self.base.delegated_payer(&self.funder, er.identity(), PAYER_LAMPORTS).await?;
@@ -177,8 +183,10 @@ impl PrivateErScenario for ProgramUpgradeConsistency {
     }
 }
 
+/// Coordinates upgrade delivery with witnessed invocations rather than fixed sleeps.
 #[derive(Default)]
 struct Progress {
+    /// 0: initial A; 1: upgrade observations held; 2: released; 3: B observed on the warm ER.
     phase: Cell<usize>,
     counts: Cell<[usize; 4]>,
     changed: Notify,
@@ -194,6 +202,7 @@ impl Progress {
     }
 }
 
+/// Version-aware two-account oracle that advances only for successful probe executions.
 struct Invocations<'a> {
     er: &'a ErCtx,
     sender: TxSender,
@@ -205,6 +214,7 @@ struct Invocations<'a> {
 }
 
 impl Invocations<'_> {
+    /// Starts with a loading failure, then keeps traffic active through all upgrade phases.
     async fn run(mut self) -> Result<()> {
         let mut loading_failure = Some(
             self.faults.reject(
@@ -226,6 +236,7 @@ impl Invocations<'_> {
         Ok(())
     }
 
+    /// Checks one invocation's version marker, rollback, and resulting account images.
     #[instrument(skip_all, level = "error", fields(phase))]
     async fn invoke(&mut self, id: u64, injecting: bool) -> Result<()> {
         let instruction =
@@ -270,6 +281,7 @@ impl Invocations<'_> {
         Ok(())
     }
 
+    /// Allows old/new code only in transition phases and rejects mixed version evidence.
     fn verify(&mut self, outcome: &TransactionInfo, id: u64, current: usize) -> Result<()> {
         let outcome = transaction_meta(outcome)?;
         let versions: Vec<_> = transaction_logs(outcome)
@@ -317,6 +329,7 @@ impl ProgramUpgradeConsistency {
         Ok(())
     }
 
+    /// Holds code-discovery paths around the base upgrade, then releases and checks both ERs.
     async fn upgrade(&self, progress: &Progress) -> Result<()> {
         let er = self.hot.ctx();
         let authority = self.funder.pubkey();

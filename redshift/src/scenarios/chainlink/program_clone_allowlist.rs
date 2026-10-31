@@ -11,13 +11,15 @@ use tokio::time;
 
 const BLOCKED_SETTLE: Duration = Duration::from_secs(2);
 
-/// An allowlisted program clones while an existing unlisted program stays absent.
-/// Checks allowed program execution and exclusion of an existing blocked executable.
+/// Checks that an allowlisted program materializes while an existing
+/// unlisted executable stays absent.
+/// Uses a private ER so the clone policy is exercised from startup, not after cache hydration.
 pub struct ProgramCloneAllowlist {
     private: PrivateEr,
 }
 
 impl PrivateErScenario for ProgramCloneAllowlist {
+    /// Proves the blocked executable exists on base before starting the restricted ER.
     async fn setup(base: Rc<BaseCtx>, _: ()) -> Result<Self> {
         ensure!(base
             .account(&topology::COMMITTOR_ID)
@@ -38,6 +40,8 @@ impl PrivateErScenario for ProgramCloneAllowlist {
         Ok(Self { private })
     }
 
+    /// Requires allowed cloning and sustained absence of the blocked program
+    /// after a settling window.
     async fn run(self) -> Result<()> {
         let er = self.private.ctx();
         er.await_program_clone(&redshift_interface::ID).await?;

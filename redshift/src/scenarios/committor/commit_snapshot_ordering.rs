@@ -1,4 +1,3 @@
-use redsuite_core::ErCtx;
 use std::{rc::Rc, slice, time::Duration};
 
 use anyhow::{ensure, Context};
@@ -8,7 +7,7 @@ use redsuite_core::{
     netfault::{Faults, Held, Selector},
     programs::{SettlementMode, REDLINE},
     receipt::{self, CommitReceipt},
-    topology, BaseCtx, ChainCtx, Result, Scenario,
+    topology, wait, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
 use signature::Signature;
 use tracing::instrument;
@@ -22,6 +21,7 @@ const HISTORY_LIMIT: usize = 32;
 const SMALL_SPACE: u32 = ACCOUNT_SPACE;
 const LARGE_SPACE: u32 = 2048;
 
+/// Equivalent ordering coverage for small inline snapshots and large buffered snapshots.
 #[derive(Clone, Copy)]
 struct Variant {
     name: &'static str,
@@ -48,12 +48,14 @@ const VARIANTS: [Variant; 2] = [
     },
 ];
 
+/// Settled receipt and execution slot used to compare the order of overlapping bundles.
 struct Bundle {
     receipt: CommitReceipt,
     slot: u64,
 }
 
 /// Checks queued snapshot fidelity and progress of independent versus conflicting commits.
+/// Holds `[a, b]`, queues overlapping `[b, c]`, and requires independent `[d]` to progress first.
 pub struct CommitSnapshotOrdering {
     base: Rc<BaseCtx>,
     faults: Rc<Faults>,
@@ -66,6 +68,7 @@ impl Scenario for CommitSnapshotOrdering {
         Ok(Self { base, faults, er })
     }
 
+    /// Applies the same dependency/snapshot oracle to inline and buffered delivery.
     async fn run(self) -> Result<()> {
         for variant in VARIANTS {
             self.run_variant(variant).await?;
@@ -77,6 +80,7 @@ impl Scenario for CommitSnapshotOrdering {
 }
 
 impl CommitSnapshotOrdering {
+    /// Tracks only buffers referenced by this held delivery, avoiding unrelated cleanup assertions.
     async fn referenced_buffers(&self, held: &Held) -> Result<Vec<Pubkey>> {
         let keys = held
             .operation
@@ -115,6 +119,7 @@ impl CommitSnapshotOrdering {
         Ok(())
     }
 
+    /// Locates one base signature in address history for an independent settlement-order witness.
     async fn history_position(&self, account: &Pubkey, signature: &Signature) -> Result<usize> {
         let history = self.base.api().get_signatures_for_address(account, HISTORY_LIMIT).await?;
         history
@@ -170,6 +175,8 @@ impl CommitSnapshotOrdering {
         Ok(keys)
     }
 
+    /// Holds a predecessor, mutates all accounts afterward, then checks
+    /// frozen snapshots and cleanup.
     #[instrument(skip_all, err, fields(variant = variant.name))]
     async fn run_variant(&self, variant: Variant) -> Result<()> {
         let payer = self.base.funded_payer(PAYER_LAMPORTS).await?;
@@ -190,6 +197,7 @@ impl CommitSnapshotOrdering {
         let held_first = first_submission.wait(INTERCEPT_TIMEOUT).await?;
         let mut own_buffers = self.referenced_buffers(&held_first).await?;
 
+        // The overlap freezes a newer B snapshot but must still wait for its held predecessor.
         let b2 = write_snapshot(&self.er, &payer, value(3), &b).await?;
         let c1 = write_snapshot(&self.er, &payer, value(4), &c).await?;
         let second_submission = self
@@ -199,6 +207,7 @@ impl CommitSnapshotOrdering {
         let d1 = write_snapshot(&self.er, &payer, value(5), &d).await?;
         let third = self.schedule(&payer, 3, &[d]).await?;
 
+        // Later writes must not leak into any already-scheduled snapshot.
         for (offset, account) in accounts.iter().enumerate() {
             write_snapshot(&self.er, &payer, value(11 + offset as u64), account).await?;
         }
@@ -274,8 +283,9 @@ impl CommitSnapshotOrdering {
         self.base
             .api()
             .await_query("commit buffers closed after settlement", async || {
-                ensure!(self.base.accounts(&own_buffers).await?.iter().all(Option::is_none));
-                Ok(())
+                let accounts = self.base.accounts(&own_buffers).await?;
+                let remaining = accounts.iter().filter(|account| account.is_some()).count();
+                Ok(wait::when(remaining == 0, remaining))
             })
             .await?;
         Ok(())

@@ -48,6 +48,7 @@ impl Scenario for SettlementCloneControls {
         Ok(Self { base, er, payer, identity })
     }
 
+    /// Separates selective data settlement from wallet balance continuity during redelegation.
     async fn run(self) -> Result<()> {
         let (accounts, snapshot) = self.write_delegated().await?;
 
@@ -60,6 +61,7 @@ impl Scenario for SettlementCloneControls {
 }
 
 impl SettlementCloneControls {
+    /// Creates a changed target and an untouched sibling to expose overly broad settlement.
     #[instrument(skip_all, err)]
     async fn write_delegated(&self) -> Result<([Pubkey; 2], Vec<u8>)> {
         let delegated = self
@@ -96,6 +98,7 @@ impl SettlementCloneControls {
         Ok((accounts, snapshot))
     }
 
+    /// Requires the selected snapshot to land while the sibling's base data remains untouched.
     #[instrument(skip_all, err)]
     async fn commit(&self, accounts: &[Pubkey; 2], snapshot: &[u8]) -> Result<()> {
         let [delegated, sibling] = *accounts;
@@ -117,6 +120,7 @@ impl SettlementCloneControls {
         Ok(())
     }
 
+    /// Cycles base ownership atomically while checking that ER-local wallet spend is preserved.
     #[instrument(skip_all, err)]
     async fn check_redelegation(&self, wallet: &Keypair) -> Result<()> {
         self.er

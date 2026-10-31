@@ -79,6 +79,7 @@ async fn await_base(
     Ok(())
 }
 
+/// New-session invariants that stale notifications or restarted old-validator work must not change.
 struct SessionB<'a> {
     er: &'a ErCtx,
     account: Pubkey,
@@ -87,6 +88,7 @@ struct SessionB<'a> {
     nonce: u64,
 }
 
+/// Watches both the base nonce/value and the new ER value for delayed cross-session effects.
 async fn hold_steady(base: &BaseCtx, session: &SessionB<'_>, window: Duration) -> Result<()> {
     let started = Instant::now();
     while started.elapsed() < window {
@@ -117,6 +119,7 @@ async fn schedule_commit(
     .await
 }
 
+/// Establishes a landed old-session snapshot even when its send response is discarded.
 async fn recover_session_a_commit_after_lost_response(
     base: &BaseCtx,
     er: &ErCtx,
@@ -147,6 +150,9 @@ async fn recover_session_a_commit_after_lost_response(
     Ok(())
 }
 
+/// Reassigns an account after undelegation, then releases old notifications and
+/// restarts the old ER.
+/// `er_b = None` exercises reuse of the same validator; otherwise ownership moves to another ER.
 async fn isolate(
     base: &BaseCtx,
     faults: &Faults,
@@ -280,6 +286,7 @@ async fn isolate(
 }
 
 /// Checks that stale work and notifications cannot mutate a new delegation session.
+/// Covers both same-validator session reuse and reassignment to a different validator.
 pub struct StaleDelegationSessionIsolation {
     base: Rc<BaseCtx>,
     er: ErCtx,
@@ -314,6 +321,7 @@ impl Scenario for StaleDelegationSessionIsolation {
         })
     }
 
+    /// Runs same-validator isolation before cross-validator reassignment using independent cells.
     async fn run(mut self) -> Result<()> {
         isolate(&self.base, &self.faults, &mut self.er_a, None, &self.payer).await?;
         isolate(

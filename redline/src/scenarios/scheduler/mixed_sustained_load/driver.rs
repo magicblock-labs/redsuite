@@ -25,12 +25,14 @@ impl LaneSpan {
     }
 }
 
+/// Merged client outcome plus exact admitted workload IDs reconstructed per worker-owned lane.
 pub(super) struct Executed {
     pub(super) outcome: RunOutcome,
     pub(super) last_ids: Vec<Option<u64>>,
     pub(super) counts: [u64; 3],
 }
 
+/// Shared deadline and total load budgets partitioned across worker-owned lanes.
 pub(super) struct ExecuteConfig {
     pub(super) lanes: u64,
     pub(super) until: (Instant, watch::Receiver<bool>),
@@ -41,6 +43,8 @@ pub(super) struct ExecuteConfig {
     pub(super) concurrency: usize,
 }
 
+/// Gives workers disjoint lanes and serializes each lane's deliveries
+/// while allowing cross-lane overlap.
 pub(super) async fn execute(
     er_rpc_url: Url,
     er_ws_url: Url,
@@ -98,8 +102,8 @@ pub(super) async fn execute(
     Ok(summarize(lanes, outcomes))
 }
 
-// Timed workers stop at different rounds, so their IDs are not one global prefix.
-// Count admitted IDs (including failed sends); delivery checks reject failures.
+/// Reconstructs per-lane tails because timed workers do not stop at one global ID prefix.
+/// Counts admitted IDs including failed sends; the caller's delivery checks reject failures.
 fn summarize(lanes: u64, outcomes: Vec<(LaneSpan, RawRunOutcome)>) -> Executed {
     let mut last_ids = vec![None; lanes as usize];
     let mut counts = [0; 3];

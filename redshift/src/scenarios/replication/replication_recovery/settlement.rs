@@ -18,6 +18,9 @@ use solana_instruction_error::InstructionError;
 use std::rc::Rc;
 
 impl ReplicationRecovery {
+    /// Replicates successful settlement/callback work and a rollback, then restarts the leader.
+    /// Retained records and account images must stay unchanged before a
+    /// fresh commit proves progress.
     pub(super) async fn check_settlement_replay(&mut self) -> Result<()> {
         let mut rng = random::rng(
             self.base.config().seed,
@@ -122,6 +125,7 @@ impl ReplicationRecovery {
                 && base_image.lamports == expected.lamports
                 && base_image.owner == dlp::dlp_id()
         );
+        // Keep the pre-restart evidence: re-fetching alone would miss altered execution metadata.
         let signatures = [scheduling, receipt.signature, failure, settled, final_receipt.signature];
         let mut records = Vec::with_capacity(signatures.len());
         for signature in signatures {

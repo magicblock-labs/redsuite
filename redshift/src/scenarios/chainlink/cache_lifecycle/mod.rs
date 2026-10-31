@@ -5,7 +5,7 @@ use crate::ACCOUNT_OWNERS;
 use anyhow::{ensure, Context};
 use pubkey::Pubkey;
 use redsuite_core::{
-    netfault::Faults, programs::CellHeader, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
+    netfault::Faults, programs::CellHeader, wait, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
 use std::{rc::Rc, time::Duration};
 
@@ -13,6 +13,8 @@ pub const CACHE_CAPACITY: usize = 256;
 const FETCH_BATCH: usize = 32;
 const EVICTIONS: &str = "engine_keeper_account_cache_evictions";
 
+/// Witnesses mirror eviction/refetch while requiring protected resident images to remain unchanged.
+/// Uses local-only reads for the eviction witness so observation cannot refill the cache entry.
 pub async fn pressure_preserves(
     base: &BaseCtx,
     er: &ErCtx,
@@ -36,8 +38,9 @@ pub async fn pressure_preserves(
         er.api().await_query(
             "resident mirror evicted under bounded cache pressure",
             async || {
-                ensure!(er.local_images(&[mirror]).await? == vec![None]);
-                Ok(())
+                let images = er.local_images(&[mirror]).await?;
+                let resident = images.iter().filter(|image| image.is_some()).count();
+                Ok(wait::when(images == vec![None], resident))
             },
         ),
     )
@@ -66,12 +69,17 @@ async fn churn_cache(er: &ErCtx, pool: &[Pubkey], previous: f64) -> Result<f64> 
     Ok(current)
 }
 
+/// Independent fault profiles registered as separate scenarios.
 pub enum Mode {
+    /// Releases stale fetches amid eviction and reconnect churn.
     Churn,
+    /// Completes undelegation while HTTP/WS discovery paths are unavailable.
     UndelegationReconnectGap,
 }
 
 /// Checks stale-fetch ordering or reconnect recovery while preserving pending/delegated residents.
+/// Runs warmed traffic throughout pressure so cache correctness is
+/// checked alongside execution progress.
 pub struct CacheLifecycle {
     base: Rc<BaseCtx>,
     mode: Mode,
@@ -84,6 +92,7 @@ impl Scenario<(), Mode> for CacheLifecycle {
         let faults = er.faults()?;
         Ok(Self { base, er, mode, faults })
     }
+    /// Runs a no-eviction transport baseline when requested, then the common pressure workload.
     async fn run(self) -> Result<()> {
         if matches!(self.mode, Mode::UndelegationReconnectGap) {
             self.transport_baseline().await?;
@@ -97,6 +106,7 @@ const BASE_REWRITE: u64 = 900;
 const BASE_REFRESH: u64 = 901;
 const FETCHES: [&str; 2] = ["getAccountInfo", "getMultipleAccounts"];
 
+/// Seeds from local state, then watches updates without a client fetch masking discovery failures.
 async fn await_local_value(er: &ErCtx, what: &str, keys: &[Pubkey], expected: u64) -> Result<()> {
     let mut watch = er.api().watch_accounts(keys).await?;
     watch.seed(er.local_accounts(&ACCOUNT_OWNERS, keys).await?)?;

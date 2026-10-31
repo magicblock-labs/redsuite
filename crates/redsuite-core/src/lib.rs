@@ -26,7 +26,6 @@ pub mod transport;
 pub mod wait;
 
 pub use account::Account;
-pub use anyhow::Error as DynError;
 pub use api::{Api, Metrics, MetricsDelta, SendBody};
 pub use context::{BaseCtx, ChainCtx, ErClient, ErCtx, TxSender};
 pub use report::ScenarioReport;
@@ -45,11 +44,3 @@ pub use anyhow::ensure as __ensure;
 pub use const_str as __const_str;
 
 pub type Result<T> = anyhow::Result<T>;
-
-/// Requires a failed operation and returns its original error for inspection.
-pub fn expect_error<T>(result: Result<T>, check: &str) -> Result<DynError> {
-    match result {
-        Err(error) => Ok(error),
-        Ok(_) => anyhow::bail!("{check}: unexpectedly succeeded"),
-    }
-}

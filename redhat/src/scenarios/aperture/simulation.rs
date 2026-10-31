@@ -30,13 +30,15 @@ use redsuite_core::{
 
 use super::fixture::{vacant, Fixture};
 
-/// Checks that simulation cannot admit transactions or publish account, task, or settlement effects.
+/// Checks that simulation cannot admit transactions or publish account,
+/// task, or settlement effects.
 pub struct SimulationIsolation {
     base: Rc<BaseCtx>,
     er: ErCtx,
 }
 
 impl SimulationIsolation {
+    /// Allows input hydration, but forbids simulation from publishing execution or fees.
     async fn check_transactions(fixture: &mut Fixture, rng: &mut impl Rng) -> Result<()> {
         for sig_verify in [false, true] {
             for skip_preflight in [false, true] {
@@ -108,6 +110,7 @@ impl SimulationIsolation {
         Ok(())
     }
 
+    /// Simulates settlement, ephemeral creation, and task bodies without live service effects.
     async fn check_services(fixture: &Fixture) -> Result<()> {
         let payer = fixture.payer.pubkey();
         let cell = fixture.keys[1];
@@ -248,6 +251,7 @@ impl Scenario for SimulationIsolation {
         Ok(Self { base, er })
     }
 
+    /// Separates ordinary simulation isolation from protocol-service side-effect isolation.
     async fn run(self) -> Result<()> {
         let mut rng = random::rng(
             self.base.config().seed,
@@ -260,6 +264,7 @@ impl Scenario for SimulationIsolation {
     }
 }
 
+/// Requires successful execution work, so isolation is not proved by a no-op simulation.
 async fn simulate(er: &ErCtx, encoded: &str, config: RpcSimulateTransactionConfig) -> Result<()> {
     let result: Value =
         er.api().call_value(RpcRequest::SimulateTransaction, &(encoded, config)).await?;

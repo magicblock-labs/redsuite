@@ -38,6 +38,7 @@ const ACTION_ESCROW_LAMPORTS: u64 = 500_000_000;
 const ACTION_COMPUTE_UNITS: u32 = 50_000;
 const ACTION_COUNT: u8 = 1;
 
+/// One landed commit whose confirmation is withheld, optionally across an ER restart.
 struct FaultedCommit<'a> {
     phase: &'a str,
     commit_id: u64,
@@ -45,6 +46,7 @@ struct FaultedCommit<'a> {
     restart: bool,
 }
 
+/// Blocks both HTTP status and WebSocket notification evidence for the same base signature.
 fn withhold_confirmations(faults: &Faults, signature: &Signature) -> [RuleHandle; 2] {
     [
         faults
@@ -59,6 +61,8 @@ fn withhold_confirmations(faults: &Faults, signature: &Signature) -> [RuleHandle
 }
 
 /// Preserves commit effects across response loss, confirmation loss, reconnect, and restart.
+/// Distinct snapshots and base nonces distinguish reconciliation of landed
+/// work from duplicate effects.
 pub struct CommitRecovery {
     base: Rc<BaseCtx>,
     er: ErCtx,
@@ -67,6 +71,8 @@ impl Scenario for CommitRecovery {
     async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
         Ok(Self { base, er })
     }
+    /// Uses independent fixtures for confirmation convergence
+    /// and exactly-once base-effect recovery.
     async fn run(self) -> Result<()> {
         CommitFixture::prepare(self.base.clone(), self.er.clone())
             .await?
@@ -76,6 +82,7 @@ impl Scenario for CommitRecovery {
     }
 }
 
+/// One delegated cell with isolated snapshots and nonce history for fault-recovery probes.
 struct CommitFixture {
     base: Rc<BaseCtx>,
     er: ErCtx,
@@ -96,6 +103,8 @@ impl CommitFixture {
         Ok(Self { base, er, payer, account })
     }
 
+    /// Loses send/confirmation responses while newer ER writes test
+    /// snapshot fidelity during recovery.
     async fn confirmation_loss(self) -> Result<()> {
         let faults = self.er.faults()?;
         let submission_trap = faults.intercept(
@@ -174,6 +183,8 @@ impl CommitFixture {
         Ok(())
     }
 
+    /// Checks landed commit/action effects during blackouts, then
+    /// requires fresh settlement progress.
     async fn effect_recovery(self) -> Result<()> {
         let faults = self.er.faults()?;
         self.commit_blackout(
@@ -203,6 +214,8 @@ impl CommitFixture {
         Ok(())
     }
 
+    /// Accepts the historical duplicate-refusal outcome only when the
+    /// intended base snapshot converges.
     async fn await_convergence(&self, snapshot: &[u8], signature: &Signature) -> Result<()> {
         let account = &self.account;
 
@@ -250,6 +263,8 @@ impl CommitFixture {
         }
     }
 
+    /// Requires successful settlement, using a durable intent ID when
+    /// restart invalidates log lookup.
     async fn settled_receipt(
         &self,
         commit_signature: &Signature,
@@ -268,6 +283,8 @@ impl CommitFixture {
         Ok(receipt)
     }
 
+    /// Proves a commit landed before hiding confirmation, then checks its
+    /// nonce cannot advance twice.
     async fn commit_blackout(&self, faults: &Faults, faulted: FaultedCommit<'_>) -> Result<()> {
         let FaultedCommit { phase, commit_id, write, restart } = faulted;
         let nonce_before = crate::last_commit_id(self.base.as_ref(), &self.account).await?;
@@ -323,6 +340,7 @@ impl CommitFixture {
         Ok(())
     }
 
+    /// Requires the next snapshot and exactly one nonce advance after fault recovery.
     async fn follow_up_commit(&self, commit_id: u64, write: u64, phase: &str) -> Result<()> {
         let account = self.account;
 
@@ -347,6 +365,8 @@ impl CommitFixture {
         Ok(())
     }
 
+    /// Hides a landed standalone action's confirmation while checking
+    /// its increment remains singular.
     async fn action_blackout(&self, faults: &Faults) -> Result<()> {
         let payer = self.base.funded_payer(PAYER_LAMPORTS).await?;
         let (init, cell) = REDSHIFT.create(

@@ -1,5 +1,5 @@
 mod transaction;
-use transaction::{submit_and_confirm, BlockhashCache};
+use transaction::{try_submit_and_confirm, BlockhashCache};
 pub use transaction::{ErClient, TxSender};
 
 use std::{
@@ -7,11 +7,12 @@ use std::{
     future::Future,
     path::PathBuf,
     rc::{Rc, Weak},
+    result,
     time::Duration,
 };
 
 use account::Account;
-use anyhow::Context;
+use anyhow::{Context, Error};
 use instruction::Instruction;
 use keypair::Keypair;
 use pubkey::Pubkey;
@@ -20,7 +21,7 @@ use tokio::{sync::Mutex, time};
 use url::Url;
 
 use crate::{
-    api::{Api, Metrics, MetricsCollector},
+    api::{Api, Metrics, MetricsCollector, SendError},
     cells,
     config::{ErEndpoints, ExecutionConfig},
     netfault::{Faults, Proxy},
@@ -58,7 +59,30 @@ pub trait ChainCtx: Sized {
         payer: &Keypair,
         cosigners: &[&Keypair],
         ixs: &[Instruction],
-    ) -> impl Future<Output = Result<Signature>>;
+    ) -> impl Future<Output = Result<Signature>> {
+        async move {
+            self.try_submit_and_confirm_with(payer, cosigners, ixs)
+                .await?
+                .map_err(Into::into)
+        }
+    }
+    /// Keeps RPC/execution refusals typed so negative scenarios cannot mistake
+    /// transport failure for success.
+    fn try_submit_and_confirm(
+        &self,
+        payer: &Keypair,
+        ixs: &[Instruction],
+    ) -> impl Future<Output = Result<result::Result<Signature, SendError>>> {
+        self.try_submit_and_confirm_with(payer, &[], ixs)
+    }
+    /// Typed submission with explicit cosigners; blockhash, transport, and
+    /// timeout errors stay outer.
+    fn try_submit_and_confirm_with(
+        &self,
+        payer: &Keypair,
+        cosigners: &[&Keypair],
+        ixs: &[Instruction],
+    ) -> impl Future<Output = Result<result::Result<Signature, SendError>>>;
     fn await_account(
         &self,
         address: &Pubkey,
@@ -87,8 +111,8 @@ impl BaseCtx {
     pub async fn airdrop(&self, pk: &Pubkey, lamports: u64) -> Result<()> {
         if let Some(environment) = &self.config.environment {
             use signer::{EncodableKey, Signer};
-            let payer = keypair::Keypair::read_from_file(&environment.payer)
-                .map_err(|error| crate::DynError::msg(format!("reading setup payer: {error}")))?;
+            let payer = Keypair::read_from_file(&environment.payer)
+                .map_err(|error| Error::msg(format!("reading setup payer: {error}")))?;
             self.submit_and_confirm(
                 &payer,
                 &[crate::system::transfer(&payer.pubkey(), pk, lamports)],
@@ -325,13 +349,13 @@ impl ChainCtx for BaseCtx {
     fn api(&self) -> &Api {
         &self.api
     }
-    fn submit_and_confirm_with(
+    fn try_submit_and_confirm_with(
         &self,
         payer: &Keypair,
         cosigners: &[&Keypair],
         ixs: &[Instruction],
-    ) -> impl Future<Output = Result<Signature>> {
-        submit_and_confirm(&self.api, &self.blockhash, payer, cosigners, ixs)
+    ) -> impl Future<Output = Result<result::Result<Signature, SendError>>> {
+        try_submit_and_confirm(&self.api, &self.blockhash, payer, cosigners, ixs)
     }
 }
 
@@ -339,12 +363,12 @@ impl ChainCtx for ErCtx {
     fn api(&self) -> &Api {
         &self.api
     }
-    fn submit_and_confirm_with(
+    fn try_submit_and_confirm_with(
         &self,
         payer: &Keypair,
         cosigners: &[&Keypair],
         ixs: &[Instruction],
-    ) -> impl Future<Output = Result<Signature>> {
-        submit_and_confirm(&self.api, &self.blockhash, payer, cosigners, ixs)
+    ) -> impl Future<Output = Result<result::Result<Signature, SendError>>> {
+        try_submit_and_confirm(&self.api, &self.blockhash, payer, cosigners, ixs)
     }
 }

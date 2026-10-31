@@ -12,7 +12,7 @@ use redsuite_core::{
     prep,
     programs::{CellHeader, REDSHIFT},
     topology::RestartConfig,
-    BaseCtx, ChainCtx, ErCtx, Result, Scenario,
+    wait, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
 use signature::Signature;
 use signer::Signer;
@@ -29,12 +29,14 @@ const BLOCK_SETTLE_SLOTS: u64 = 2;
 const TRUNCATIONS: &str = r#"engine_ledger_operation_duration_micros_count{op="truncate"}"#;
 const SUPERBLOCKS: &str = "engine_ledger_superblocks";
 
+/// A known published transaction and its original slot, retained beyond ledger pruning.
 #[derive(Clone)]
 struct Sent {
     signature: Signature,
     slot: u64,
 }
 
+/// Observed retention split used to compare transaction, block, and address-history RPCs.
 struct HistoryView {
     pruned: Vec<Sent>,
     retained: Vec<Sent>,
@@ -55,6 +57,8 @@ fn add_count(adds: u64) -> u8 {
 }
 
 /// Checks retained/pruned history and current state across restart and new writes.
+/// Pruned records must form an older prefix; pruning history must not roll
+/// back current account state.
 pub struct LedgerRetentionConsistency {
     base: Rc<BaseCtx>,
     er: ErCtx,
@@ -67,6 +71,8 @@ impl Scenario for LedgerRetentionConsistency {
         Ok(Self { base, er, payer })
     }
 
+    /// Forces actual pruning, restarts the ER, and checks that the
+    /// retention boundary stays coherent.
     async fn run(self) -> Result<()> {
         let mut history = self.prepare_history().await?;
         let before = self.prune(&mut history).await?;
@@ -87,6 +93,7 @@ impl Scenario for LedgerRetentionConsistency {
     }
 }
 
+/// Complete submitted-history oracle, including transactions no longer available through RPC.
 struct History {
     cell: Pubkey,
     sent: Vec<Sent>,
@@ -105,6 +112,7 @@ impl LedgerRetentionConsistency {
         Ok(History { cell, sent, adds: 0, total: 0 })
     }
 
+    /// Drives writes until multiple truncations include observable transaction removal.
     #[instrument(skip_all, err)]
     async fn prune(&self, history: &mut History) -> Result<HistoryView> {
         let er = &self.er;
@@ -179,18 +187,20 @@ impl LedgerRetentionConsistency {
         Ok(cell)
     }
 
+    /// Includes the clone transaction so address-history comparisons cover
+    /// the full fixture history.
     async fn seed_history(&self, cell: &Pubkey, sent: &mut Vec<Sent>) -> Result<()> {
-        let listed = self
+        let (_, listed) = self
             .er
             .api()
             .await_query(
                 "the er records the clone of the delegated cell",
                 async || {
-                    ensure!(self.er.account(cell).await?.is_some());
+                    let cloned = self.er.account(cell).await?.is_some();
                     let signatures =
                         self.er.api().get_signatures_for_address(cell, SIGNATURE_WINDOW).await?;
-                    ensure!(!signatures.is_empty());
-                    Ok(signatures)
+                    let ready = cloned && !signatures.is_empty();
+                    Ok(wait::when(ready, (cloned, signatures)))
                 },
             )
             .await?;
@@ -228,6 +238,8 @@ impl LedgerRetentionConsistency {
 }
 
 impl History {
+    /// Classifies known submissions by current transaction availability
+    /// without changing the oracle.
     async fn observe(&self, er: &ErCtx) -> Result<HistoryView> {
         let mut view = HistoryView {
             pruned: Vec::new(),
@@ -245,6 +257,7 @@ impl History {
         Ok(view)
     }
 
+    /// Checks monotonic prefix pruning, cross-RPC agreement, and the sum of all executed updates.
     async fn verify(&self, er: &ErCtx, view: &HistoryView, previous_pruned: usize) -> Result<()> {
         ensure!(view.pruned.len() >= previous_pruned);
         if let (Some(max_pruned), Some(min_retained)) =

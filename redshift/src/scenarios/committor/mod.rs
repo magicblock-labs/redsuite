@@ -1,24 +1,59 @@
 use anyhow::{ensure, Context};
-use std::slice;
+use std::{
+    slice,
+    time::{Duration, Instant},
+};
 
+pub mod commit_recovery;
 pub mod commit_snapshot_ordering;
 pub mod intent_execution_and_accounting;
 pub mod settlement_lifecycle;
 pub mod stale_delegation_session_isolation;
 pub mod undelegation_recovery;
 
-use std::time::{Duration, Instant};
-
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    api::transaction_meta,
+    api::{transaction_meta, SendError},
     programs::{CellHeader, SettlementMode, REDLINE},
+    rpc_types::response::TransactionError,
     BaseCtx, ChainCtx, ErCtx, Result,
 };
 use signature::Signature;
+use solana_instruction_error::InstructionError;
 use tokio::time;
 
+/// Accepts write-lockout enforcement at admission or execution, not an infrastructure failure.
+fn check_lockout(error: &SendError) -> Result<()> {
+    let locked = match error {
+        SendError::Rejected(error) => {
+            error.error.code.code() == -32003
+                && [
+                    "InvalidWritableAccount",
+                    "ExternalAccountDataModified",
+                    "ProgramFailedToComplete",
+                    "Immutable",
+                ]
+                .iter()
+                .any(|code| error.error.message.contains(code))
+        }
+        SendError::Execution(error) => matches!(
+            error.err,
+            TransactionError::InvalidWritableAccount
+                | TransactionError::InstructionError(
+                    _,
+                    InstructionError::ExternalAccountDataModified
+                        | InstructionError::ProgramFailedToComplete
+                        | InstructionError::Immutable
+                )
+        ),
+    };
+    ensure!(locked, "expected write lockout, got {error}");
+    Ok(())
+}
+
+/// Captures the exact ER image before scheduling its commit, keeping later writes
+/// out of the oracle.
 async fn write_and_commit(
     er: &ErCtx,
     payer: &Keypair,
@@ -34,6 +69,7 @@ async fn write_and_commit(
     Ok((snapshot, commit_signature))
 }
 
+/// Confirms the write marker before returning its full account-data snapshot.
 async fn write_snapshot(
     er: &ErCtx,
     payer: &Keypair,
@@ -46,6 +82,7 @@ async fn write_snapshot(
     Ok(snapshot)
 }
 
+/// Establishes successful base execution and the expected image before a response is discarded.
 async fn prove_landed(
     base: &BaseCtx,
     base_signature: &Signature,
@@ -69,6 +106,7 @@ async fn prove_landed(
     Ok(())
 }
 
+/// Watches a negative progress boundary: held or recovered work must not advance these nonces.
 async fn hold_nonces(
     base: &BaseCtx,
     accounts: &[Pubkey],
@@ -87,5 +125,3 @@ async fn hold_nonces(
         time::sleep(Duration::from_millis(250)).await;
     }
 }
-
-pub mod commit_recovery;

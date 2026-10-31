@@ -14,6 +14,8 @@ use solana_instruction_error::InstructionError;
 use transaction::Transaction;
 
 impl SettlementAuthorization {
+    /// Rejects absent/substituted/readonly fee vaults, then checks duplicate committee keys.
+    /// Neither refusal nor duplicate membership may introduce extra balance effects.
     pub(super) async fn check_fee_roles(&self) -> Result<()> {
         let mut rng = random::rng(self.base.config().seed, &["redhat", "commit_fee_roles"], 0);
         let owner = self.base.seeded_payer(&mut rng, PAYER_LAMPORTS).await?;
@@ -91,7 +93,8 @@ impl SettlementAuthorization {
         let record = self.er.api().await_transaction(&signature).await?;
         let meta = transaction_meta(&record)?;
         ensure!(meta.fee == 0 && meta.pre_balances == meta.post_balances);
-        ensure!(self.er.local_images(&tracked[1..]).await? == before[1..]);
+        // Successful scheduling changes Magic Context, unlike the refused cases above.
+        ensure!(self.er.local_images(&tracked[1..4]).await? == before[1..4]);
         ensure!(self.base.accounts(&tracked[1..]).await? == base[1..]);
         self.er
             .check_commit(&self.base, &signature, &[cell], false)
