@@ -61,7 +61,8 @@ pub fn catalog() -> Vec<ScenarioEntry> {
             committor::dlp_v2_lifecycle::DlpV2Lifecycle,
             shared(&DEFAULT, &[Fixture::RedshiftProgram], ())
         )
-        .named("dlp_v2_lifecycle"),
+        .named("dlp_v2_lifecycle")
+        .explicit_only(),
         scenario!(
             lifecycle::restart_under_load::RestartUnderLoad,
             exclusive(&STORAGE, &[Fixture::RedlineProgram], ())
