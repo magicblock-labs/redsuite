@@ -26,6 +26,10 @@ identity; the same executor also works at dynamically deployed addresses.
 Fixture-owned messages use Wincode. External calls and callbacks retain the
 formats required by their protocols.
 
+`delegate` creates legacy delegation records; `delegate_v2` creates a cluster-bound
+DelegationState. Both require the cell authority to sign and preserve the cell's
+data during the owner-program handoff. Settlement uses the same scheduling APIs.
+
 The upgrade probe keeps its single payload alongside its implementation. It is
 built twice; the upgrade scenario deploys both versions under the same address.
 
