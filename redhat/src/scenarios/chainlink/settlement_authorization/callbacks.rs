@@ -104,12 +104,6 @@ pub(super) fn plan(seed: u64) -> Plan {
     }
 }
 
-impl Plan {
-    pub(super) fn log(&self, seed: u64) {
-        tracing::debug!(seed, cases = ?self.cases, nonce = self.nonce, controls = ?self.controls, leads = ?self.leads, gap = self.gap, padding = self.padding, funder = %self.funder.pubkey(), payer = %self.payer.pubkey(), alternate = %self.alternate.pubkey(), cells = ?self.cells, handoff = %self.handoff, "callback plan");
-    }
-}
-
 fn scheduled(
     payer: Pubkey,
     validator: Pubkey,
@@ -386,7 +380,7 @@ impl SettlementAuthorization {
         }
         self.callback_control(funder, payer, &cells, handoff, nonce + 200, &plan.controls)
             .await?;
-        self.callback_freshness(
+        self.callback_attachment_scope(
             &sender,
             payer,
             cells[0],
@@ -395,19 +389,12 @@ impl SettlementAuthorization {
             (plan.leads, plan.gap),
         )
         .await?;
-        let accepted = callback_args(cells[0], 0)?.payload.len();
-        tracing::debug!(
-            accepted,
-            rejected = accepted + 1,
-            padding = plan.padding,
-            "callback payload boundary"
-        );
         self.callback_delivery(
             payer,
             cells[0],
             nonce + 400,
             Some(plan.padding),
-            "oversized callback payload",
+            "malformed callback delivery",
         )
         .await?;
         self.callback_delivery(
@@ -415,7 +402,7 @@ impl SettlementAuthorization {
             cells[0],
             nonce + 410,
             None,
-            "accepted callback payload",
+            "callback delivery after malformed payload",
         )
         .await
     }
@@ -735,7 +722,7 @@ impl SettlementAuthorization {
         Ok(())
     }
 
-    async fn callback_freshness(
+    async fn callback_attachment_scope(
         &self,
         sender: &TxSender,
         payer: &Keypair,
@@ -768,9 +755,8 @@ impl SettlementAuthorization {
             if index == 0 {
                 instructions.extend([attach, schedule]);
                 tracing::debug!(
-                    lead,
-                    slot = self.er.api().get_slot().await?,
-                    "callback attached ahead of its intent"
+                    instruction = lead,
+                    "probing callback attachment before scheduling"
                 );
             } else {
                 let scheduled_slot = self.er.api().get_slot().await?;
@@ -778,10 +764,10 @@ impl SettlementAuthorization {
                 self.er
                     .check_commit(&self.base, &accepted, &[], false)
                     .await?
-                    .check_success("callback freshness intent")?;
+                    .check_success("callback scope intent")?;
                 let deadline = scheduled_slot + gap;
                 wait::retry(
-                    "expired callback attachment slot",
+                    "callback attachment in a later slot",
                     Duration::from_secs(30),
                     async || {
                         let slot = self.er.api().get_slot().await?;
@@ -792,11 +778,8 @@ impl SettlementAuthorization {
                 .await?;
                 instructions.push(attach);
                 tracing::debug!(
-                    lead,
-                    gap,
-                    scheduled_slot,
-                    slot = self.er.api().get_slot().await?,
-                    "callback attached after its intent row expired"
+                    instruction = lead,
+                    "probing callback attachment in a later transaction"
                 );
             }
             let before = self.callback_images(keys).await?;
@@ -812,18 +795,18 @@ impl SettlementAuthorization {
                         )
                         .into()
                     ),
-                "callback freshness {index}: {:?}",
+                "callback attachment scope {index}: {:?}",
                 meta.err
             );
             ensure!(
                 transaction_logs(meta)
                     .iter()
                     .any(|line| line.contains("no scheduled intents found")),
-                "callback freshness {index} did not reach the latest-intent gate"
+                "callback attachment scope {index} did not reach the missing-intent gate"
             );
             ensure!(
                 self.callback_images(keys).await? == before,
-                "callback freshness {index} changed protected state or retained a charge"
+                "callback attachment scope {index} changed protected state or retained a charge"
             );
         }
         self.callback_delivery(payer, cell, nonce + 40, None, "fresh callback attachment")

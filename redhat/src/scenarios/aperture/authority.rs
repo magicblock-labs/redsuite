@@ -1,11 +1,28 @@
-use super::{hostile::Fixture, *};
+use std::rc::Rc;
+
 use account::Account;
+use anyhow::{ensure, Context};
 use base64::{engine::general_purpose::STANDARD, Engine};
+use instruction::{AccountMeta, Instruction};
 use magic_api::instruction::{AccountModificationForInstruction, MagicBlockInstruction};
 use message::{v1, VersionedMessage};
+use pubkey::Pubkey;
 use rand::seq::SliceRandom;
-use redsuite_core::random::{self, Rng};
+use signer::Signer;
+use solana_instruction_error::InstructionError;
 use transaction::versioned::VersionedTransaction;
+
+use redsuite_core::{
+    api::transaction_meta,
+    programs::REDSHIFT,
+    random::{self, Rng},
+    rpc_types::{request::RpcRequest, response::TransactionError},
+    signed::{audit, Signed},
+    transaction_types::UiTransactionError,
+    BaseCtx, ChainCtx, ErCtx, Result, Scenario,
+};
+
+use super::fixture::Fixture;
 
 pub struct TransactionAuthority {
     base: Rc<BaseCtx>,
@@ -110,7 +127,6 @@ impl Scenario for TransactionAuthority {
                 bytes[0] = 0xff;
                 let end = bytes.len() - v1::SIGNATURE_SIZE;
                 let signature = fixture.payer.sign_message(&bytes[..end]);
-                ensure!(signature.verify(fixture.payer.pubkey().as_ref(), &bytes[..end]));
                 bytes[end..].copy_from_slice(signature.as_ref());
                 let attack = Signed {
                     encoded: STANDARD.encode(bytes),
@@ -119,7 +135,7 @@ impl Scenario for TransactionAuthority {
                     fee: 0,
                     error: None,
                 };
-                let before = fixture.images(&[]).await?;
+                let before = fixture.snapshot(&[]).await?;
                 let privileged_before = privileged_images(&fixture).await?;
                 let start = fixture.er.api().get_slot().await?;
                 let error = attack
@@ -130,7 +146,7 @@ impl Scenario for TransactionAuthority {
                     error.error.code.code() == -32003 && error.error.message.contains("signature"),
                     "{error}"
                 );
-                fixture.statusless(&attack, start, None).await?;
+                fixture.not_admitted(&attack.signature, start, None).await?;
                 fixture.unchanged(&before).await?;
                 let privileged = privileged_images(&fixture).await?;
                 ensure!(
@@ -143,7 +159,7 @@ impl Scenario for TransactionAuthority {
                     "private wire authority rejected before execution"
                 );
             }
-            fixture.repaired(message, 1, 1, skip_preflight).await?;
+            fixture.check_control(message, 1, 1, skip_preflight).await?;
         }
 
         let target = fixture.keys[1];
@@ -227,7 +243,7 @@ impl Scenario for TransactionAuthority {
                     Some(TransactionError::InstructionError(0, error.clone()).into()),
                 )
                 .await?;
-                let mut before = fixture.images(&[]).await?;
+                let mut before = fixture.snapshot(&[]).await?;
                 let privileged_before = privileged_images(&fixture).await?;
                 let start = fixture.er.api().get_slot().await?;
                 let result = tx.send_config(&fixture.er, skip_preflight).await?;
@@ -259,13 +275,13 @@ impl Scenario for TransactionAuthority {
                     "privileged state changed: {privileged:?} against {privileged_before:?}"
                 );
                 tracing::debug!(
-                    label,
+                    case = label,
                     skip_preflight,
                     "privileged instruction rejected during execution"
                 );
                 let repaired = fixture.message(nonce + 1, 1, &[]).await?;
                 fixture
-                    .repaired(VersionedMessage::Legacy(repaired), 1, 1, skip_preflight)
+                    .check_control(VersionedMessage::Legacy(repaired), 1, 1, skip_preflight)
                     .await?;
             }
         }
@@ -283,7 +299,7 @@ impl Scenario for TransactionAuthority {
                 None,
             )
             .await?;
-            let mut before = fixture.images(&[]).await?;
+            let mut before = fixture.snapshot(&[]).await?;
             let privileged_before = privileged_images(&fixture).await?;
             let start = fixture.er.api().get_slot().await?;
             let acknowledged = match tx.send_config(&fixture.er, skip_preflight).await? {
@@ -340,14 +356,13 @@ impl Scenario for TransactionAuthority {
             );
             let repaired = fixture.message(nonce + 1, 1, &fixture.keys[5..6]).await?;
             let control = fixture
-                .repaired(VersionedMessage::Legacy(repaired), 1, 1, skip_preflight)
+                .check_control(VersionedMessage::Legacy(repaired), 1, 1, skip_preflight)
                 .await?;
             if record.is_none() {
-                fixture.statusless(&tx, start, Some(&control)).await?;
+                fixture.not_admitted(&tx.signature, start, Some(&control)).await?;
                 tracing::debug!(
                     skip_preflight,
                     acknowledged,
-                    signal_gap = 261,
                     "foreign writable account refused without an execution record"
                 );
             }

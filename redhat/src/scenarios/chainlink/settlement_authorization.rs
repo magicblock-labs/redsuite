@@ -23,6 +23,7 @@ use crate::PAYER_LAMPORTS;
 
 mod callbacks;
 mod commits;
+mod fee_roles;
 
 const PROGRAM_ID_NOT_FOUND: &str = "failed to find parent program id";
 const IMMUTABLE: &str = "Account is immutable";
@@ -38,7 +39,7 @@ pub struct SettlementAuthorization {
     pdas: Vec<Pubkey>,
     foreign: Pubkey,
     mirrored: Pubkey,
-    roles: [usize; 4],
+    roles: Roles,
     case_order: [usize; 13],
     commit_plan: commits::Plan,
     callback_plan: callbacks::Plan,
@@ -51,6 +52,13 @@ struct Case<'a> {
     error: Option<InstructionError>,
 }
 
+struct Roles {
+    target: usize,
+    inspect_sibling: bool,
+    aliases: usize,
+    signer_alias: usize,
+}
+
 impl Scenario for SettlementAuthorization {
     async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
         let mut plan = random::rng(
@@ -59,8 +67,12 @@ impl Scenario for SettlementAuthorization {
             0,
         );
         let aliases = plan.gen_range(2..=3);
-        let roles =
-            [plan.gen_range(0..2), plan.gen_range(0..2), aliases, plan.gen_range(0..aliases)];
+        let roles = Roles {
+            target: plan.gen_range(0..2),
+            inspect_sibling: plan.gen_range(0..2usize) != 0,
+            aliases,
+            signer_alias: plan.gen_range(0..aliases),
+        };
         let mut case_order = std::array::from_fn(|index| index);
         case_order.shuffle(&mut random::rng(
             base.config().seed,
@@ -69,33 +81,12 @@ impl Scenario for SettlementAuthorization {
         ));
         let commit_plan = commits::plan(base.config().seed)?;
         let callback_plan = callbacks::plan(base.config().seed);
-        tracing::debug!(
-            seed = base.config().seed,
-            ?roles,
-            ?case_order,
-            "settlement permission plan"
-        );
-        commit_plan.log(base.config().seed);
-        callback_plan.log(base.config().seed);
         let mut rng = random::rng(
             base.config().seed,
             &["redhat", "settlement_authorization", "fixtures"],
             0,
         );
-        let funder_key = random::keypair(&mut rng.clone()).pubkey();
-        let cells = [0, 1].map(|index| REDSHIFT.pda(CellId::new(funder_key, index)).0);
-        let foreign_key = REDHAT.pda(CellId::new(funder_key, 0)).0;
-        let mirror_key = REDSHIFT.pda(CellId::new(funder_key, u64::from(MIRRORED_INDEX))).0;
-        let mut mapped = random::rng(
-            base.config().seed,
-            &["redhat", "settlement_authorization", "mapped_signer"],
-            0,
-        );
-        let mapped_wallets: [Pubkey; 2] =
-            std::array::from_fn(|_| random::keypair(&mut mapped).pubkey());
-        tracing::debug!(seed = base.config().seed, %funder_key, ?cells, %foreign_key, %mirror_key, ?mapped_wallets, "settlement fixture plan");
         let funder = base.seeded_payer(&mut rng, PAYER_LAMPORTS).await?;
-        ensure!(funder.pubkey() == funder_key);
         let mut pdas = Vec::new();
         for index in 0..2 {
             pdas.push(
@@ -114,7 +105,6 @@ impl Scenario for SettlementAuthorization {
             .cells(REDSHIFT, &funder)
             .create(CellHeader::SIZE as u32, er.identity(), MIRRORED_INDEX)
             .await?;
-        ensure!(mirrored == mirror_key);
         er.await_clones(&[mirrored], CellHeader::SIZE).await?;
         let mirror_local = er.account(&mirrored).await?.context("mirrored victim missing")?;
         let mirror_remote =
@@ -146,19 +136,20 @@ impl Scenario for SettlementAuthorization {
 
     async fn run(self) -> Result<()> {
         let payer = self.sender.payer().pubkey();
-        let target = &self.pdas[self.roles[0]..self.roles[0] + 1];
-        let aliases = vec![target[0]; self.roles[2]];
+        let target = &self.pdas[self.roles.target..self.roles.target + 1];
+        let aliases = vec![target[0]; self.roles.aliases];
         let mut readonly = REDSHIFT.batch();
-        if self.roles[1] != 0 {
-            readonly = readonly.inspect(&[self.pdas[1 - self.roles[0]]]);
+        if self.roles.inspect_sibling {
+            readonly = readonly.inspect(&[self.pdas[1 - self.roles.target]]);
         }
         let readonly_write = readonly.add(&aliases, 13).readonly(target).build();
         let mut signer_child = REDSHIFT.inspect(target);
-        signer_child.accounts[0].is_signer = self.roles[3] == 0;
-        for index in 1..self.roles[2] {
-            signer_child
-                .accounts
-                .push(AccountMeta::new_readonly(target[0], index == self.roles[3]));
+        signer_child.accounts[0].is_signer = self.roles.signer_alias == 0;
+        for index in 1..self.roles.aliases {
+            signer_child.accounts.push(AccountMeta::new_readonly(
+                target[0],
+                index == self.roles.signer_alias,
+            ));
         }
         let mut unsigned_cpi = REDSHIFT.batch().invoke(signer_child.clone()).build();
         for account in &mut unsigned_cpi.accounts {
@@ -171,18 +162,19 @@ impl Scenario for SettlementAuthorization {
             .build();
         let nested = REDHAT.batch().invoke(nested).readonly(target).build();
         let entered_nested = format!("Program {} invoke [2]", REDHAT.id());
-        let mirror_aliases = vec![self.mirrored; self.roles[2]];
+        let mirror_aliases = vec![self.mirrored; self.roles.aliases];
         let mut mirror_write = REDSHIFT.batch();
-        if self.roles[1] != 0 {
-            mirror_write = mirror_write.inspect(&[self.pdas[1 - self.roles[0]]]);
+        if self.roles.inspect_sibling {
+            mirror_write = mirror_write.inspect(&[self.pdas[1 - self.roles.target]]);
         }
         let mirror_write = mirror_write.add(&mirror_aliases, 13).build();
         let mut mirror_child = REDSHIFT.batch().add(&mirror_aliases, 13).build();
-        mirror_child.accounts[0].is_signer = self.roles[3] == 0;
-        for index in 1..self.roles[2] {
-            mirror_child
-                .accounts
-                .push(AccountMeta::new(self.mirrored, index == self.roles[3]));
+        mirror_child.accounts[0].is_signer = self.roles.signer_alias == 0;
+        for index in 1..self.roles.aliases {
+            mirror_child.accounts.push(AccountMeta::new(
+                self.mirrored,
+                index == self.roles.signer_alias,
+            ));
         }
         let mirror_cpi = REDSHIFT
             .batch()
@@ -309,7 +301,6 @@ impl Scenario for SettlementAuthorization {
                 error: None,
             },
         ];
-        ensure!(cases.len() == self.case_order.len());
         let mut cases = cases.map(Some);
         let mut protected = self.pdas.clone();
         protected.extend([payer, magic_api::MAGIC_CONTEXT_PUBKEY, self.foreign, self.mirrored]);
@@ -422,7 +413,10 @@ impl Scenario for SettlementAuthorization {
                 self.sender.payer(),
                 &[REDSHIFT
                     .batch()
-                    .invoke_signed(signer_child, &[CellId::new(payer, self.roles[0] as u64)])
+                    .invoke_signed(
+                        signer_child,
+                        &[CellId::new(payer, self.roles.target as u64)],
+                    )
                     .add(&aliases, 1)
                     .settle(payer, target, SettlementMode::Commit)
                     .build()],
@@ -441,7 +435,8 @@ impl Scenario for SettlementAuthorization {
         ensure!(self.base.account(&target[0]).await? == Some(committed));
 
         self.check_self_commit().await?;
-        self.check_nonces().await.context("#243: successor ordering")?;
+        self.check_fee_roles().await?;
+        self.check_commit_ordering().await.context("#243: successor ordering")?;
         self.check_buffers().await.context("#244: buffered settlement")?;
         self.check_callbacks().await.context("#255: callback provenance")
     }

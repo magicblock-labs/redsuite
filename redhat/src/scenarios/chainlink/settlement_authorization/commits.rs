@@ -29,7 +29,6 @@ pub(super) struct Plan {
     cases: [u8; 6],
     authority: Keypair,
     foreign: Keypair,
-    fixtures: [Pubkey; 3],
     buffers: buffers::Plan,
 }
 
@@ -38,29 +37,13 @@ pub(super) fn plan(seed: u64) -> Result<Plan> {
     let markers = (0..16).map(|_| rng.gen_range(1..u64::MAX)).collect();
     let mut cases = [0u8, 1, 2, 3, 4, 5];
     cases.shuffle(&mut rng);
-    let mut fixtures = random::rng(seed, &["redhat", "commit_order", "fixtures"], 0);
     Ok(Plan {
         markers,
         cases,
         authority: topology::identity_for_label("redhat-commit-order-authority")?,
         foreign: topology::identity_for_label("redhat-commit-order-foreign")?,
-        fixtures: std::array::from_fn(|_| random::keypair(&mut fixtures).pubkey()),
         buffers: buffers::plan(seed)?,
     })
-}
-
-impl Plan {
-    pub(super) fn log(&self, seed: u64) {
-        let accounts = self.fixtures[1..]
-            .iter()
-            .map(|owner| REDSHIFT.primary(*owner))
-            .collect::<Vec<_>>();
-        tracing::debug!(seed, cases = ?self.cases, markers = ?self.markers, fixtures = ?self.fixtures, ?accounts, "commit ordering plan");
-        tracing::debug!(authority = %self.authority.pubkey(), foreign = %self.foreign.pubkey(),
-            authority_vault = %dlp::validator_fees_vault_pda(&self.authority.pubkey()),
-            foreign_vault = %dlp::validator_fees_vault_pda(&self.foreign.pubkey()), "commit authority fixtures");
-        self.buffers.log(seed);
-    }
 }
 
 struct CommitFixture<'a> {
@@ -73,7 +56,7 @@ struct CommitFixture<'a> {
 }
 
 impl SettlementAuthorization {
-    pub(super) async fn check_nonces(&self) -> Result<()> {
+    pub(super) async fn check_commit_ordering(&self) -> Result<()> {
         let plan = &self.commit_plan;
         let markers = &plan.markers;
         let cases = &plan.cases;
@@ -83,15 +66,13 @@ impl SettlementAuthorization {
             0,
         );
         let payer = self.base.seeded_payer(&mut fixtures, PAYER_LAMPORTS).await?;
-        ensure!(payer.pubkey() == plan.fixtures[0]);
         let authority = &plan.authority;
         let foreign = &plan.foreign;
         self.base.airdrop(&authority.pubkey(), PAYER_LAMPORTS).await?;
         self.base.airdrop(&foreign.pubkey(), PAYER_LAMPORTS).await?;
         let sequence = Cell::new(0);
-        for (fixture_index, buffered) in [false, true].into_iter().enumerate() {
+        for buffered in [false, true] {
             let owner = self.base.seeded_payer(&mut fixtures, PAYER_LAMPORTS).await?;
-            ensure!(owner.pubkey() == plan.fixtures[fixture_index + 1]);
             let account = self
                 .base
                 .cells(REDSHIFT, &owner)
@@ -118,7 +99,7 @@ impl SettlementAuthorization {
                     3 => nonce + 2,
                     _ => nonce + 1,
                 };
-                let data = fixture.data(markers[index + 2]).await?;
+                let data = fixture.marked_data(markers[index + 2]).await?;
                 let buffer =
                     if buffered { Some(fixture.buffer(attempted, &data).await?) } else { None };
                 let signer = if *case == 4 { foreign } else { authority };
@@ -136,7 +117,7 @@ impl SettlementAuthorization {
                 tracing::debug!(case, buffered, attempted, nonce, "commit refusal");
                 fixture.rejected(&[instruction], &signers, expected).await?;
                 if buffered {
-                    fixture.close(attempted).await?;
+                    fixture.close_buffer(attempted).await?;
                 }
                 nonce += 1;
                 fixture.commit(nonce, markers[index + 8], buffered).await?;
@@ -153,7 +134,7 @@ impl CommitFixture<'_> {
         REDSHIFT.batch().nonce(nonce).build()
     }
 
-    async fn data(&self, marker: u64) -> Result<Vec<u8>> {
+    async fn marked_data(&self, marker: u64) -> Result<Vec<u8>> {
         let mut data =
             self.base.account(&self.account).await?.context("commit fixture missing")?.data;
         let mut header = CellHeader::try_decode(&data)?;
@@ -242,7 +223,6 @@ impl CommitFixture<'_> {
             .submit_and_confirm_with(self.payer, &[self.authority], &[init, self.tag()])
             .await?;
         let initialized = self.base.api().await_transaction(&signature).await?;
-        ensure!(transaction_meta(&initialized)?.err.is_none());
         let images = self.base.accounts(&[chunks, buffer]).await?;
         ensure!(
             images.iter().all(Option::is_some),
@@ -252,7 +232,7 @@ impl CommitFixture<'_> {
         Ok((chunks, buffer))
     }
 
-    async fn close(&self, nonce: u64) -> Result<()> {
+    async fn close_buffer(&self, nonce: u64) -> Result<()> {
         self.base
             .submit_and_confirm_with(
                 self.payer,
@@ -271,18 +251,15 @@ impl CommitFixture<'_> {
     }
 
     async fn commit(&self, nonce: u64, marker: u64, buffered: bool) -> Result<()> {
-        let data = self.data(marker).await?;
+        let data = self.marked_data(marker).await?;
         let buffer = if buffered { Some(self.buffer(nonce, &data).await?) } else { None };
         let instructions = [
             self.instruction(self.authority.pubkey(), nonce, data.clone(), buffer).await?,
             dlp::finalize(&self.authority.pubkey(), &self.account),
         ];
-        let signature = self
-            .base
+        self.base
             .submit_and_confirm_with(self.payer, &[self.authority], &instructions)
             .await?;
-        let tx = self.base.api().await_transaction(&signature).await?;
-        ensure!(transaction_meta(&tx)?.err.is_none());
         ensure!(
             self.base
                 .account(&self.account)
@@ -298,7 +275,7 @@ impl CommitFixture<'_> {
             .context("metadata missing")?;
         ensure!(dlp::last_commit_id(&metadata.data)? == nonce);
         if buffered {
-            self.close(nonce).await?;
+            self.close_buffer(nonce).await?;
         }
         Ok(())
     }

@@ -1,7 +1,10 @@
 pub mod aperture;
 pub mod chainlink;
 pub mod magicblock;
-use aperture::{ProtocolInputs, TransactionAdmission, TransactionAuthority, TransactionStructure};
+use aperture::{
+    ProtocolInputs, SimulationIsolation, TransactionAdmission, TransactionAuthority,
+    TransactionStructure,
+};
 use magicblock_config::types::Remote;
 use redshift::scenarios::replication::replication_recovery::{Coverage, ReplicationRecovery};
 use redsuite_core::{
@@ -32,7 +35,6 @@ static REPLICATION: ErGroup = ErGroup {
     settings: |p| {
         p.engine.blockstore.blocktime = Duration::from_millis(40);
         p.engine.blockstore.superblock = 512;
-        p.engine.ledger.size_limit = 1;
     },
     proxies: ProxyMode::None,
     followers: 2,
@@ -55,7 +57,7 @@ pub fn catalog() -> Vec<ScenarioEntry> {
             ReplicationRecovery,
             exclusive(
                 &REPLICATION,
-                &[Fixture::RedlineProgram, Fixture::RedshiftProgram],
+                &[Fixture::RedshiftProgram],
                 Coverage::Settlement
             )
         )
@@ -71,6 +73,10 @@ pub fn catalog() -> Vec<ScenarioEntry> {
         scenario!(
             TransactionAdmission,
             exclusive(&PREPARATION, &[Fixture::RedshiftProgram], ())
+        ),
+        scenario!(
+            SimulationIsolation,
+            exclusive(&DEFAULT, &[Fixture::RedshiftProgram], ())
         ),
         scenario!(
             ProtocolInputs,
