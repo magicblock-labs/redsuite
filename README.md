@@ -189,6 +189,8 @@ export REDSUITE_DLP_SO=/path/to/delegation-program/target/deploy/delegation_prog
 ./scripts/with-runtime cargo run --locked -p redsuite -- redshift run dlp_v2_lifecycle
 ```
 
+The same setup runs `dlp_v2_buffered_settlement` and `dlp_mixed_settlement`.
+
 The override only replaces the base-chain DLP program. V2 scenarios still require
 a validator that discovers v2 delegations and settles them through the committor.
 
