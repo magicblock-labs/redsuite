@@ -4,7 +4,7 @@ use anyhow::ensure;
 use delegation_program_interface::{self as dpi, DlpV2Instruction};
 use redsuite_core::{
     programs::{SettlementMode, REDSHIFT},
-    BaseCtx, ChainCtx, ErCtx, Result, Scenario,
+    wait, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
 
 use super::v2::Fixture;
@@ -58,19 +58,21 @@ impl Scenario for DlpV2BufferedSettlement {
                     let signatures =
                         fixture.base.api().get_signatures_for_address(&buffer, 64).await?;
                     let instructions = fixture.dlp_instructions(&signatures).await?;
-                    for instruction in
-                        [DlpV2Instruction::WriteStateBuffer, DlpV2Instruction::CloseStateBuffer]
-                    {
-                        ensure!(
-                            instructions.iter().any(|data| data.starts_with(&instruction.to_vec())),
-                            "missing {instruction:?}"
-                        );
-                    }
-                    ensure!(
-                        fixture.base.account(&buffer).await?.is_none(),
-                        "StateBuffer was not closed"
-                    );
-                    Ok(())
+                    let closed = fixture.base.account(&buffer).await?.is_none();
+                    Ok(wait::check((|| {
+                        for instruction in
+                            [DlpV2Instruction::WriteStateBuffer, DlpV2Instruction::CloseStateBuffer]
+                        {
+                            ensure!(
+                                instructions
+                                    .iter()
+                                    .any(|data| data.starts_with(&instruction.to_vec())),
+                                "missing {instruction:?}"
+                            );
+                        }
+                        ensure!(closed, "StateBuffer was not closed");
+                        Ok(())
+                    })()))
                 })
                 .await?;
         }
