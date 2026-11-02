@@ -15,8 +15,8 @@ use redshift::scenarios::chainlink::{cache_lifecycle, spl};
 use solana_instruction_error::InstructionError;
 
 use redsuite_core::{
-    api::transaction_logs,
-    dlp, expect_error,
+    api::{transaction_logs, SendError},
+    dlp,
     programs::{
         content_hash, CellHeader, Commit, IntentBundle, Redshift, SettlementMode, Task, MAGIC,
         REDSHIFT,
@@ -48,6 +48,7 @@ const VAULT: usize = 3;
 const SUBSTITUTE: usize = 4;
 const VICTIM: usize = 5;
 
+/// Keeps funding-case identities reproducible independently of lifecycle-case order.
 fn funding_plan(seed: u64) -> (impl Rng, Keypair) {
     let keys = &["redhat", "funding_attribution"];
     (
@@ -56,6 +57,7 @@ fn funding_plan(seed: u64) -> (impl Rng, Keypair) {
     )
 }
 
+/// Accounts whose base/local rent attribution is compared during token materialization.
 fn funding_accounts(wallet: Pubkey, mint: Pubkey) -> [Pubkey; 10] {
     let eata = spl::derive_eata(&wallet, &mint);
     let global = spl::derive_global_vault(&mint);
@@ -89,6 +91,8 @@ fn cache_pool(seed: u64) -> Vec<Pubkey> {
         .collect()
 }
 
+/// Varies failure position and duplicate/mixed settlement targets
+/// independently of fixture creation.
 fn failure_plan(seed: u64, target: Pubkey) -> (Vec<(SettlementMode, usize)>, [[Pubkey; 2]; 2]) {
     let owner = random::keypair(&mut random::rng(
         seed,
@@ -113,6 +117,10 @@ fn failure_plan(seed: u64, target: Pubkey) -> (Vec<(SettlementMode, usize)>, [[P
 }
 
 /// Checks ephemeral lifecycle authorization, rollback, rent, zeroing, and serializability.
+///
+/// An independent state/rent oracle tracks create, resize, and close effects. Hostile
+/// CPI, failed transactions, and conflicting operations are checked against that oracle
+/// rather than merely against an RPC success or failure response.
 pub struct EphemeralAccountSecurity {
     base: Rc<BaseCtx>,
     er: ErCtx,
@@ -123,6 +131,7 @@ pub struct EphemeralAccountSecurity {
     sizes: [u32; 4],
 }
 
+/// One native ephemeral operation, its invoking program, and its rent sponsor.
 #[derive(Clone)]
 struct Action {
     operation: MagicBlockInstruction,
@@ -157,6 +166,7 @@ impl Action {
         }
     }
 
+    /// Observes state on either side of CPI; direct native calls intentionally bypass the wrapper.
     fn wrap(&self, native: Instruction, keys: &[Pubkey]) -> Instruction {
         if self.caller == magic_api::id() {
             return native;
@@ -169,6 +179,7 @@ impl Action {
         batch.observe(&observed).build()
     }
 
+    /// Predicts authorization, rent movement, and zeroing without consulting execution results.
     fn apply(&self, state: &mut [Account], deposit: u64) -> Option<InstructionError> {
         let account = &state[TARGET];
         let exists = account.owner != system::system_id();
@@ -258,6 +269,7 @@ fn empty() -> Account {
     }
 }
 
+/// Reads local state without hydrating missing targets, normalizing absence to an empty account.
 async fn state(er: &ErCtx, keys: &[Pubkey]) -> Result<Vec<Account>> {
     let images = er.local_images(keys).await?;
     for index in [PAYER, SPONSOR, VAULT, SUBSTITUTE] {
@@ -270,12 +282,14 @@ async fn state(er: &ErCtx, keys: &[Pubkey]) -> Result<Vec<Account>> {
     Ok(images.into_iter().map(|account| account.unwrap_or_else(empty)).collect())
 }
 
+/// Submitted wire transaction paired with its retained execution metadata.
 struct Record {
     tx: Transaction,
     info: UiTransactionStatusMeta,
 }
 
 impl Record {
+    /// Retains execution failures as observations so the oracle can check their rollback effects.
     async fn submit(ctx: &impl ChainCtx, tx: Transaction) -> Result<Self> {
         let api = ctx.api();
         api.send_transaction(&tx).await?;
@@ -288,6 +302,7 @@ impl Record {
         Ok(Self { tx, info })
     }
 
+    /// Reconciles the expected error, balance metadata, and successful CPI observations.
     fn check(
         &self,
         keys: &[Pubkey],
@@ -311,6 +326,7 @@ impl Record {
         Ok(())
     }
 
+    /// Accounts for every transaction key, including the fee and untracked-account invariance.
     fn check_balances(&self, keys: &[Pubkey], before: &[Account], after: &[Account]) -> Result<()> {
         let pre: u128 = self.info.pre_balances.iter().copied().map(u128::from).sum();
         let post: u128 = self.info.post_balances.iter().copied().map(u128::from).sum();
@@ -328,6 +344,8 @@ impl Record {
     }
 }
 
+/// Searches for a serial order explaining both retained records and the final account images.
+/// `used` tracks consumed records; each branch carries its own rent-attribution ledger.
 fn find_serialization(
     keys: &[Pubkey],
     before: &[Account],
@@ -365,6 +383,7 @@ fn find_serialization(
     None
 }
 
+/// Tracks refundable deposits per target and charges/refunds per sponsor above a vault floor.
 #[derive(Clone, Default)]
 struct RentLedger {
     deposits: BTreeMap<Pubkey, u64>,
@@ -375,6 +394,7 @@ struct RentLedger {
 }
 
 impl RentLedger {
+    /// Attributes only observed vault movement; unrelated surplus is not a refundable deposit.
     fn apply(
         &mut self,
         keys: &[Pubkey],
@@ -405,6 +425,7 @@ impl RentLedger {
         self.check_sponsors(keys, after)
     }
 
+    /// Reconciles each sponsor's net charges/refunds, keeping unassigned vault surplus separate.
     fn check_sponsors(&self, keys: &[Pubkey], images: &[Account]) -> Result<()> {
         for (key, (paid, refunded)) in &self.sponsors {
             let index =
@@ -427,6 +448,7 @@ impl RentLedger {
         Ok(())
     }
 
+    /// Requires all tracked deposits and surplus to remain backed above the protected vault floor.
     fn check(&self, vault: u64) -> Result<()> {
         ensure!(vault >= self.floor, "ephemeral vault crossed its floor");
         ensure!(
@@ -438,6 +460,7 @@ impl RentLedger {
     }
 }
 
+/// Evolving account oracle and rent ledger shared by the lifecycle and adversarial stages.
 struct Workload {
     base: Rc<BaseCtx>,
     er: ErCtx,
@@ -455,6 +478,7 @@ impl Workload {
         self.run(label, vec![action.instruction(&self.keys)], Ok(action)).await
     }
 
+    /// Runs the same oracle against a separate victim without losing the active target's deposit.
     async fn step_victim(&mut self, label: &str, action: &Action) -> Result<()> {
         self.keys.swap(TARGET, VICTIM);
         self.expected.swap(TARGET, VICTIM);
@@ -466,6 +490,7 @@ impl Workload {
         result
     }
 
+    /// Signs a fresh nonce-tagged transaction with all actors used by hostile role substitutions.
     async fn prepare(&mut self, mut instructions: Vec<Instruction>) -> Result<Transaction> {
         self.nonce += 1;
         instructions.push(REDSHIFT.batch().nonce(self.nonce as u64).build());
@@ -478,6 +503,7 @@ impl Workload {
         Ok(tx)
     }
 
+    /// Executes one probe and advances the oracle only after state, metadata, and rent agree.
     async fn run(
         &mut self,
         label: &str,
@@ -521,6 +547,7 @@ impl Workload {
         Ok(())
     }
 
+    /// Varies signer, owner, vault, and privilege roles around one valid lifecycle operation.
     #[instrument(skip_all, err, fields(case = label))]
     async fn check_operation(
         &mut self,
@@ -621,6 +648,7 @@ impl Workload {
         Ok(())
     }
 
+    /// Ensures a recreated account belongs to its current invoker, not a previous owner.
     #[instrument(skip_all, err)]
     async fn check_recreation(&mut self, caller: Pubkey) -> Result<()> {
         let keys = self.keys;
@@ -643,6 +671,7 @@ impl Workload {
         Ok(())
     }
 
+    /// Rejects direct reallocations while allowing same-length data writes by the owner.
     async fn check_raw_resize(&mut self) -> Result<()> {
         let length = self.expected[TARGET].data.len() as u32;
         for resized in [length.checked_sub(1), length.checked_add(1)].into_iter().flatten() {
@@ -668,6 +697,7 @@ impl Workload {
         Ok(())
     }
 
+    /// Checks mandatory writable vault access and legitimate sponsor substitution.
     async fn check_funding_roles(&mut self) -> Result<()> {
         for operation in [Create { data_len: 32 }, Resize { new_data_len: 33 }, Close] {
             let action = Action::new(operation);
@@ -708,6 +738,7 @@ impl Workload {
         self.step("funding role recovery close", &Action::new(Close)).await
     }
 
+    /// Compares rent attribution for token accounts materialized through the base/ER lifecycle.
     #[instrument(skip_all, err)]
     async fn check_materialized_funding(&mut self) -> Result<()> {
         let (mut fixtures, mint) = funding_plan(self.base.config().seed);
@@ -831,6 +862,7 @@ impl Workload {
         self.ledger.check(self.expected[VAULT].lamports)
     }
 
+    /// Adds vault surplus without crediting it to any target's refundable deposit.
     async fn check_surplus_transfer(&mut self, amount: u64) -> Result<()> {
         ensure!(state(&self.er, &self.keys).await? == self.expected);
         let before = self.expected.clone();
@@ -858,6 +890,7 @@ impl Workload {
         Ok(())
     }
 
+    /// Refunds the opening victim deposit without consuming deposits from subsequent operations.
     async fn check_prior_refund(&mut self) -> Result<()> {
         self.check_surplus_transfer(1).await?;
         self.step_victim("prior refundable deposit close", &Action::new(Close)).await?;
@@ -867,6 +900,8 @@ impl Workload {
         Ok(())
     }
 
+    /// Fails at different transaction positions around lifecycle and settlement side effects.
+    /// No failed attempt may publish task/outbox work or prevent a same-address continuation.
     async fn check_failure_placement(&mut self) -> Result<()> {
         let mut rng = random::rng(
             self.base.config().seed,
@@ -973,6 +1008,8 @@ impl Workload {
         Ok(())
     }
 
+    /// Separates confined/delegated accounts from refundable ephemeral
+    /// rent, including after eviction.
     async fn check_confined(&mut self) -> Result<()> {
         let mut rng = random::rng(self.base.config().seed, &["redhat", "confined_accounts"], 0);
         let owner = self.base.seeded_payer(&mut rng, PAYER_LAMPORTS).await?;
@@ -1189,6 +1226,7 @@ impl Workload {
         self.step_victim("confined victim close", &Action::new(Close)).await
     }
 
+    /// Tests a sponsor immediately below, at, and above the required rent charge.
     async fn check_charge_boundary(
         &mut self,
         label: &str,
@@ -1322,6 +1360,7 @@ impl Workload {
         Ok(())
     }
 
+    /// Covers exact funding thresholds and recovery after insufficient create/resize funding.
     async fn check_rent_boundaries(&mut self) -> Result<()> {
         let seed = self.base.config().seed;
         let mut plan = random::rng(seed, &["redhat", "charge_boundaries"], 0);
@@ -1363,6 +1402,7 @@ impl Workload {
         Ok(())
     }
 
+    /// Requires concurrent lifecycle results to admit a serial order under the same rent oracle.
     #[instrument(skip_all, err)]
     async fn check_conflicts(&mut self) -> Result<()> {
         let keys = self.keys;
@@ -1399,6 +1439,7 @@ impl Workload {
 }
 
 impl Scenario for EphemeralAccountSecurity {
+    /// Seeds independent actors and sizes so case-order changes do not change fixture identities.
     async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
         let seed = base.config().seed;
         let mut plan = random::rng(seed, &["redhat", "ephemeral_account_security", "plan"], 0);
@@ -1443,6 +1484,7 @@ impl Scenario for EphemeralAccountSecurity {
         })
     }
 
+    /// Establishes the lifecycle oracle before adding funding, rollback, and confinement probes.
     async fn run(self) -> Result<()> {
         self.check_readonly_payer().await?;
 
@@ -1486,24 +1528,38 @@ impl Scenario for EphemeralAccountSecurity {
 }
 
 impl EphemeralAccountSecurity {
+    /// Proves a non-delegated payer cannot spend its mirrored base balance on the ER.
     #[instrument(skip_all, err)]
     async fn check_readonly_payer(&self) -> Result<()> {
         let accounts = [self.funder.pubkey(), self.signers[0].pubkey()];
         let before = self.er.accounts(&accounts).await?;
-        let attempt = self
+        let error = self
             .er
-            .submit_and_confirm(
+            .try_submit_and_confirm(
                 &self.funder,
                 &[system::transfer(&accounts[0], &accounts[1], 1)],
             )
-            .await;
-        let error = expect_error(attempt, "non-delegated payer cannot spend")?;
-        let error = format!("{error:#}");
-        ensure!(error.contains("InvalidAccountForFee") || error.contains("Immutable"));
+            .await?
+            .err()
+            .context("non-delegated payer spent funds")?;
+        let readonly = match &error {
+            SendError::Rejected(error) => {
+                error.error.code.code() == -32003
+                    && (error.error.message.contains("InvalidAccountForFee")
+                        || error.error.message.contains("Immutable"))
+            }
+            SendError::Execution(error) => matches!(
+                error.err,
+                TransactionError::InvalidAccountForFee
+                    | TransactionError::InstructionError(_, InstructionError::Immutable)
+            ),
+        };
+        ensure!(readonly, "unexpected payer refusal: {error}");
         ensure!(self.er.accounts(&accounts).await? == before);
         Ok(())
     }
 
+    /// Seeds an older refundable victim deposit and excludes it from the protected vault floor.
     async fn into_workload(mut self) -> Result<Workload> {
         let target = self.target;
         let keys = [

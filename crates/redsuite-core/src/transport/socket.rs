@@ -31,7 +31,7 @@ pub(super) enum CloseReason {
     #[error("server error: {0:?}")]
     ServerError(#[from] jsonrpc_core::Error),
     #[error("invalid reply: {0:#}")]
-    InvalidReply(#[source] anyhow::Error),
+    InvalidReply(#[from] json::Error),
 }
 
 #[derive(Deserialize)]
@@ -138,7 +138,7 @@ where
 
 pub(super) async fn drive<S>(
     stream: &mut S,
-    mut dispatch: impl FnMut(Frame<'_>) -> Result<()>,
+    mut dispatch: impl FnMut(Frame<'_>) -> result::Result<(), CloseReason>,
 ) -> CloseReason
 where
     S: Stream<Item = result::Result<Message, WsError>> + Unpin,
@@ -148,14 +148,13 @@ where
             Ok(text) => text,
             Err(reason) => return reason,
         };
-        match parse(&text) {
-            Ok(Some(frame)) => {
-                if let Err(error) = dispatch(frame) {
-                    return CloseReason::InvalidReply(error);
-                }
-            }
-            Ok(None) => {}
+        let frame = match parse(&text) {
+            Ok(Some(frame)) => frame,
+            Ok(None) => continue,
             Err(reason) => return reason,
+        };
+        if let Err(reason) = dispatch(frame) {
+            return reason;
         }
     }
 }

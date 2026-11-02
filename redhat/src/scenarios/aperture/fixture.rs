@@ -20,16 +20,22 @@ use std::{
 
 const OBSERVE: Duration = Duration::from_millis(250);
 
+/// Local-only and base images of the same ordered keys, taken before a hostile probe.
 pub(super) struct Snapshot {
     pub(super) keys: Vec<Pubkey>,
     pub(super) local: Vec<Option<Account>>,
     pub(super) base: Vec<Option<Account>>,
 }
 
+/// A delegated payer and cell surrounded by warm, cold, absent, and foreign controls.
+///
+/// Local snapshots deliberately avoid account-fetch RPCs: observing a rejected probe
+/// must not hydrate the cold accounts whose admission effects are under test.
 pub(super) struct Fixture {
     pub(super) base: Rc<BaseCtx>,
     pub(super) er: ErCtx,
     pub(super) payer: Keypair,
+    /// Payer, writable cell, warm input, cold input, absent input, foreign delegated cell.
     pub(super) keys: [Pubkey; 6],
     pub(super) base_images: Vec<Option<Account>>,
     pub(super) expected: Vec<Option<Account>>,
@@ -43,6 +49,7 @@ pub(super) async fn base_accounts(base: &BaseCtx, keys: &[Pubkey]) -> Result<Vec
     Ok(images)
 }
 
+/// Recognizes an unresolved system-account placeholder rather than a materialized account.
 pub(super) fn vacant(account: &Account) -> bool {
     account.lamports == 0
         && account.data.is_empty()
@@ -51,6 +58,7 @@ pub(super) fn vacant(account: &Account) -> bool {
 }
 
 impl Fixture {
+    /// Materializes only the warm controls and preserves the cold/absent cache boundary.
     pub(super) async fn new(base: Rc<BaseCtx>, er: ErCtx, rng: &mut impl Rng) -> Result<Self> {
         let owner = base.seeded_payer(rng, PAYER_LAMPORTS).await?;
         let cell = base.cells(REDSHIFT, &owner).create_primary(er.identity(), u32::MAX).await?;
@@ -90,6 +98,7 @@ impl Fixture {
         })
     }
 
+    /// Extends the protected key set without fetching missing local images.
     pub(super) async fn snapshot(&self, extra: &[Pubkey]) -> Result<Snapshot> {
         let mut keys = self.keys.to_vec();
         for key in extra {
@@ -102,6 +111,7 @@ impl Fixture {
         Ok(Snapshot { keys, local, base })
     }
 
+    /// Watches for delayed effects as well as immediate mutation after a refused probe.
     pub(super) async fn unchanged(&self, before: &Snapshot) -> Result<()> {
         let until = Instant::now() + OBSERVE;
         loop {
@@ -122,6 +132,7 @@ impl Fixture {
         }
     }
 
+    /// Builds a valid cell update with optional readonly inputs for one-variable mutations.
     pub(super) async fn message(
         &self,
         nonce: u64,
@@ -139,6 +150,8 @@ impl Fixture {
         ))
     }
 
+    /// Executes a repaired probe and advances the fee/value oracle exactly once.
+    /// Readonly inputs may stay cold or mirror base, but must never diverge from it.
     pub(super) async fn check_control(
         &mut self,
         message: VersionedMessage,
@@ -188,6 +201,8 @@ impl Fixture {
         Ok(tx.signature)
     }
 
+    /// Requires absence from blocks, transaction lookup, and signature status.
+    /// An optional accepted control anchors the same observed ledger interval.
     pub(super) async fn not_admitted(
         &self,
         signature: &Signature,

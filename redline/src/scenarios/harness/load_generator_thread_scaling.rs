@@ -20,6 +20,7 @@ const PREP_PAYER_LAMPORTS: u64 = 4_000_000_000;
 
 const TX_PROCESSING_HISTOGRAM: &str = "mbv_transaction_processing_time";
 
+/// Fixed workload offered to both driver-thread configurations so only the client boundary varies.
 struct Profile {
     name: &'static str,
     payers: usize,
@@ -55,6 +56,7 @@ const FULL: Profile = Profile {
 
 const PROFILES: ProfileValues<Profile> = ProfileValues { lite: LITE, full: FULL };
 
+/// One thread-count measurement with optional validator-side execution timing.
 struct CellOutcome {
     threads: usize,
     outcome: RunOutcome,
@@ -62,6 +64,7 @@ struct CellOutcome {
 }
 
 /// Measures one versus multiple driver threads without requiring a particular latency gap.
+/// Reports client scaling as an observation, not a validator performance pass/fail threshold.
 pub struct LoadGeneratorThreadScaling {
     base: Rc<BaseCtx>,
     er: ErCtx,
@@ -91,6 +94,7 @@ impl Scenario<(ScenarioReport, Result<()>)> for LoadGeneratorThreadScaling {
         })
     }
 
+    /// Splits the requested duration between single- and multi-thread driver phases after warmup.
     async fn run(self) -> Result<(ScenarioReport, Result<()>)> {
         self.warm_up().await?;
         let options = crate::RunControl::from_config(&self.base.config())?;
@@ -138,6 +142,7 @@ impl Scenario<(ScenarioReport, Result<()>)> for LoadGeneratorThreadScaling {
 }
 
 impl LoadGeneratorThreadScaling {
+    /// Uses the same copy workload and total offered-load budget for each worker-count comparison.
     async fn execute(
         &self,
         threads: usize,
@@ -164,6 +169,7 @@ impl LoadGeneratorThreadScaling {
         .await
     }
 
+    /// Exercises the load path before either compared phase contributes measurements.
     #[instrument(skip_all, err)]
     async fn warm_up(&self) -> Result<()> {
         let warmup = self.execute(self.profile.threads, self.profile.warmup, 0, None).await?;
@@ -172,6 +178,7 @@ impl LoadGeneratorThreadScaling {
         Ok(())
     }
 
+    /// Captures client samples and validator metric deltas with disjoint IDs for each window.
     #[instrument(skip_all, err)]
     async fn measure_cell(
         &self,
@@ -211,6 +218,7 @@ impl LoadGeneratorThreadScaling {
         Ok(cell)
     }
 
+    /// Reports latency/throughput ratios without asserting that more driver threads must win.
     fn summarize(&self, cells: &[CellOutcome]) -> ScenarioReport {
         let single = &cells[0];
         let multi = &cells[1];

@@ -6,7 +6,7 @@ use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
     api::{transaction_logs, transaction_meta, TxError},
-    expect_error, prep,
+    prep,
     programs::{CellHeader, CellId, SettlementMode, UndelegationOutcome, MAGIC, REDSHIFT},
     receipt::{self, CommitReceipt},
     rpc_types::response::TransactionError,
@@ -18,7 +18,8 @@ use solana_instruction_error::InstructionError;
 use tokio::time;
 use tracing::instrument;
 
-use crate::{program::DELEGATION_PROGRAM_ID, LOCKOUT_REJECTIONS, PAYER_LAMPORTS};
+use super::check_lockout;
+use crate::{program::DELEGATION_PROGRAM_ID, PAYER_LAMPORTS};
 
 const LARGE_ACCOUNT_SPACE: u32 = 2 * 1024;
 const ER_WRITE_TIMEOUT: Duration = Duration::from_secs(20);
@@ -28,6 +29,8 @@ const MOD_AFTER_REFUSAL: &str = "instruction modified data of an account it does
 const TWICE_REFUSAL: &str = "is required to be writable and delegated in order to be undelegated";
 
 /// Checks settlement snapshots, ownership transitions, lockout, and transaction rollback.
+/// Independent fixtures cover normal lifecycles, large payloads, foreign
+/// validators, and refused intents.
 pub struct SettlementLifecycle {
     base: Rc<BaseCtx>,
     er: ErCtx,
@@ -42,6 +45,8 @@ impl Scenario for SettlementLifecycle {
         Ok(Self { base, er })
     }
 
+    /// Checks base-requested undelegation, then runs independent lifecycle
+    /// and rejection fixtures together.
     async fn run(self) -> Result<()> {
         crate::scenarios::chainlink::settlement_clone_controls::run(
             self.base.clone(),
@@ -63,6 +68,7 @@ impl Scenario for SettlementLifecycle {
 }
 
 impl SettlementLifecycle {
+    /// Requires a base request to return the latest ER snapshot and remove its request PDA.
     #[instrument(skip_all, err)]
     async fn base_requested_undelegation(&self) -> Result<()> {
         let payer = self.base.funded_payer(PAYER_LAMPORTS).await?;
@@ -140,6 +146,8 @@ impl SettlementLifecycle {
         Ok(commit_receipt)
     }
 
+    /// Exercises commit, immediate pending lockout, ownership return, and
+    /// a fresh delegation session.
     async fn commit_undelegate_lifecycle(
         &self,
         payer: &Keypair,
@@ -157,12 +165,13 @@ impl SettlementLifecycle {
         let signature = self.commit(payer, &pdas, SettlementMode::Undelegate).await?;
 
         for &pda in &pdas {
-            let attempt = self
+            let error = self
                 .er
-                .submit_and_confirm(er_fee_payer, &[REDSHIFT.batch().add(&[pda], 1).build()])
-                .await;
-            let error = expect_error(attempt, "ER write rejected after undelegation request")?;
-            crate::rejection_code("the write", &LOCKOUT_REJECTIONS, &format!("{error:#}"))?;
+                .try_submit_and_confirm(er_fee_payer, &[REDSHIFT.batch().add(&[pda], 1).build()])
+                .await?
+                .err()
+                .context("ER write accepted after undelegation request")?;
+            check_lockout(&error)?;
         }
 
         self.settled(&pdas, &signature, SettlementMode::Undelegate, 2).await?;
@@ -205,15 +214,16 @@ impl SettlementLifecycle {
         }
 
         for &pda in &pdas {
-            let attempt = self
+            let error = self
                 .base
-                .submit_and_confirm(
+                .try_submit_and_confirm(
                     base_negative_payer,
                     &[REDSHIFT.batch().add(&[pda], 1).build()],
                 )
-                .await;
-            let error = expect_error(attempt, "base write rejected after redelegation")?;
-            crate::rejection_code("the write", &LOCKOUT_REJECTIONS, &format!("{error:#}"))?;
+                .await?
+                .err()
+                .context("base write accepted after redelegation")?;
+            check_lockout(&error)?;
         }
 
         for cell in &cells {
@@ -242,6 +252,8 @@ impl SettlementLifecycle {
         Ok(())
     }
 
+    /// Checks full payload fidelity through buffered commit or undelegation, not
+    /// just the cell header.
     #[instrument(skip_all, err)]
     async fn large_account_cell(&self, commit_type: SettlementMode) -> Result<()> {
         let undelegates = matches!(commit_type, SettlementMode::Undelegate);
@@ -309,6 +321,7 @@ impl SettlementLifecycle {
             .await
     }
 
+    /// Refuses settlement of cells delegated to another validator without applying their snapshots.
     async fn test_foreign_ownership(&self) -> Result<()> {
         let payer = self.base.funded_payer(PAYER_LAMPORTS).await?;
         let outsider =
@@ -346,6 +359,8 @@ impl SettlementLifecycle {
         Ok(())
     }
 
+    /// A write after scheduling undelegation must roll back both the write
+    /// and scheduled service work.
     async fn test_mod_after_rejection(&self, count: usize) -> Result<()> {
         let payer = Rc::new(self.base.funded_payer(PAYER_LAMPORTS).await?);
         let cells = self
@@ -376,6 +391,7 @@ impl SettlementLifecycle {
         Ok(())
     }
 
+    /// Repeated undelegation within one transaction must not publish a partially accepted intent.
     async fn test_twice_rejection(&self) -> Result<()> {
         let payer = Rc::new(self.base.funded_payer(PAYER_LAMPORTS).await?);
         let cells = self.base.cells(REDSHIFT, &payer).create_owned(self.er.identity(), 2).await?;
@@ -396,6 +412,7 @@ impl SettlementLifecycle {
         self.rejected_intent_cell(&payer, instruction, TWICE_REFUSAL).await
     }
 
+    /// Base-side undelegation refusal must not restore ER write authority for the pending account.
     async fn test_failed_undelegation_lockout(&self) -> Result<()> {
         let payer = self.base.funded_payer(PAYER_LAMPORTS).await?;
         let er_fee_payer =
@@ -449,16 +466,13 @@ impl SettlementLifecycle {
             .context("the pda is not on base after the patched commit")?;
         ensure!(on_base.owner == DELEGATION_PROGRAM_ID);
 
-        let attempt = self
+        let error = self
             .er
-            .submit_and_confirm(&er_fee_payer, &[REDSHIFT.batch().set(&[pda], 2222).build()])
-            .await;
-        let error = expect_error(attempt, "ER lockout survives failed base undelegation")?;
-        crate::rejection_code(
-            "the write after the failed undelegation",
-            &LOCKOUT_REJECTIONS,
-            &format!("{error:#}"),
-        )?;
+            .try_submit_and_confirm(&er_fee_payer, &[REDSHIFT.batch().set(&[pda], 2222).build()])
+            .await?
+            .err()
+            .context("ER write accepted after failed base undelegation")?;
+        check_lockout(&error)?;
         Ok(())
     }
 
@@ -476,6 +490,8 @@ impl SettlementLifecycle {
             .await
     }
 
+    /// Requires the refusal and absence of the service transaction named
+    /// in rolled-back program logs.
     async fn rejected_intent_cell(
         &self,
         payer: &Rc<Keypair>,

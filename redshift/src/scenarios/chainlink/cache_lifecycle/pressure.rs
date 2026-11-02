@@ -34,6 +34,8 @@ const TIMEOUT: Duration = Duration::from_secs(20);
 const SCENARIO_TIMEOUT: Duration = Duration::from_secs(180);
 
 impl CacheLifecycle {
+    /// Runs traffic and fault stages together, retaining discovery
+    /// failures until teardown completes.
     pub(super) async fn pressure(self) -> Result<()> {
         let (accounts, stale, settlement) = self.prepare_accounts().await?;
         let progress = TrafficProgress::default();
@@ -58,6 +60,7 @@ impl CacheLifecycle {
     }
 }
 
+/// Ordered readonly/delegated/pending residents, their protected images, and an eviction pool.
 struct CacheAccounts {
     funder: Keypair,
     keys: Vec<Pubkey>,
@@ -68,6 +71,7 @@ struct CacheAccounts {
     evictions: f64,
 }
 
+/// Coordinates pressure against successful traffic, settlement release, and final drain.
 #[derive(Default)]
 struct TrafficProgress {
     sent: Cell<u64>,
@@ -91,6 +95,7 @@ impl CacheLifecycle {
             .intercept(Selector::method(method).ws().response().notification().account(key))
     }
 
+    /// Holds stale reads and undelegation delivery before exposing the residents to pressure.
     #[instrument(skip_all, err)]
     async fn prepare_accounts(&self) -> Result<(CacheAccounts, Vec<Held>, RuleHandle)> {
         let er = &self.er;
@@ -172,6 +177,7 @@ impl CacheLifecycle {
         ))
     }
 
+    /// Checks hash evolution and protected images on each warmed transaction during faults.
     #[instrument(skip_all, err)]
     async fn traffic(&self, accounts: &CacheAccounts, progress: &TrafficProgress) -> Result<()> {
         let er = &self.er;
@@ -217,6 +223,7 @@ impl CacheLifecycle {
         Ok(())
     }
 
+    /// Forces eviction plus controlled reconnect/fetch races, or installs the discovery blackout.
     #[instrument(skip_all, err)]
     async fn churn(&self, accounts: &CacheAccounts, progress: &TrafficProgress) -> Result<()> {
         let er = &self.er;
@@ -271,6 +278,8 @@ impl CacheLifecycle {
         Ok(())
     }
 
+    /// Releases settlement, rewrites base state, and distinguishes passive discovery from refetch.
+    /// The inner result defers reconnect-gap failures until traffic and teardown finish.
     #[instrument(skip_all, err)]
     async fn complete_settlement(
         &self,

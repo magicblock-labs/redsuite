@@ -17,6 +17,8 @@ const CLONED_COUNT: usize = 1;
 const PENDING_COUNT: usize = 2;
 
 impl CacheLifecycle {
+    /// Tests gRPC discovery of base rewrites and completed undelegation without cache eviction.
+    /// HTTP fetch responses and WebSocket notifications are withheld to expose that path alone.
     pub(super) async fn transport_baseline(&self) -> Result<()> {
         let er = &self.er;
         let evictions_before = er

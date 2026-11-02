@@ -35,6 +35,7 @@ const METHOD_NOT_FOUND: i64 = -32601;
 const UNKNOWN_METHOD: &str = "getSomethingThatDoesNotExist";
 const NO_PARAMS: [u8; 0] = [];
 
+/// Supported RPC surface sampled for decodable responses and selected runtime-linked invariants.
 #[derive(Clone, Copy, Debug)]
 enum Method {
     BlockCommitment,
@@ -89,6 +90,7 @@ async fn bounded<T>(label: &str, call: impl Future<Output = T>) -> Result<T> {
 }
 
 /// Checks supported RPC response shapes, runtime-linked metadata, and explicit refusals.
+/// This is a compatibility smoke check, not an exact-content oracle for every metadata method.
 pub struct RpcCompatSmoke {
     client: Api,
     identity: Pubkey,
@@ -108,6 +110,8 @@ impl Scenario for RpcCompatSmoke {
         })
     }
 
+    /// Bounds slot-bearing responses by the burst interval, then
+    /// checks explicit unsupported requests.
     async fn run(self) -> Result<()> {
         let requests = join_all(METHODS.into_iter().map(|method| self.run_method(method)));
         let outcomes = time::timeout(BURST_DEADLINE, requests)
@@ -155,6 +159,8 @@ impl Scenario for RpcCompatSmoke {
 }
 
 impl RpcCompatSmoke {
+    /// Returns a slot only for responses whose runtime context can be checked
+    /// against the burst window.
     async fn run_method(&self, method: Method) -> Result<Option<u64>> {
         let client = &self.client;
         let commitment = CommitmentConfig::confirmed();

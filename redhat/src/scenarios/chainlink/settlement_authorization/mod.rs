@@ -32,6 +32,10 @@ const NEEDS_TO_BE_OWNED: &str = "needs to be owned by the invoking program";
 const MIRRORED_INDEX: u8 = 2;
 
 /// Checks settlement entrypoint authorization and the mapped-signing self-commit exception.
+///
+/// Covers CPI privilege aliases, fee-vault roles, ordered/buffered base commits, and
+/// callback provenance. Refused operations must leave protected state unchanged;
+/// successful controls prove that the intended settlement path remains usable.
 pub struct SettlementAuthorization {
     base: Rc<BaseCtx>,
     er: ErCtx,
@@ -45,6 +49,7 @@ pub struct SettlementAuthorization {
     callback_plan: callbacks::Plan,
 }
 
+/// Expected execution error and log evidence for a single authorization probe.
 struct Case<'a> {
     name: &'a str,
     instructions: &'a [Instruction],
@@ -52,6 +57,7 @@ struct Case<'a> {
     error: Option<InstructionError>,
 }
 
+/// Seeded alias positions that vary privilege propagation without changing the oracle.
 struct Roles {
     target: usize,
     inspect_sibling: bool,
@@ -60,6 +66,7 @@ struct Roles {
 }
 
 impl Scenario for SettlementAuthorization {
+    /// Separates delegated, foreign-owned, and readonly-mirrored victims before probing.
     async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
         let mut plan = random::rng(
             base.config().seed,
@@ -134,6 +141,7 @@ impl Scenario for SettlementAuthorization {
         })
     }
 
+    /// Checks invocation privileges first, then settlement delivery and callback authority.
     async fn run(self) -> Result<()> {
         let payer = self.sender.payer().pubkey();
         let target = &self.pdas[self.roles.target..self.roles.target + 1];
@@ -443,9 +451,8 @@ impl Scenario for SettlementAuthorization {
 }
 
 impl SettlementAuthorization {
+    /// Proves the delegated-payer self-commit exception with the validator's fee vault.
     async fn check_self_commit(&self) -> Result<()> {
-        // A delegated fee payer can commit itself through mapped signing;
-        // its delegation requires the validator's fee vault.
         let mut rng = random::rng(
             self.base.config().seed,
             &["redhat", "settlement_authorization", "mapped_signer"],

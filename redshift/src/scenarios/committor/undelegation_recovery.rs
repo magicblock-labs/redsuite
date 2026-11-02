@@ -4,7 +4,6 @@ use anyhow::{ensure, Context};
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
-    expect_error,
     netfault::{Faults, Selector, Transport},
     programs::{CellHeader, CellId, SettlementMode, REDLINE},
     topology::RestartConfig,
@@ -13,8 +12,8 @@ use redsuite_core::{
 use signer::Signer;
 use tokio::time;
 
-use super::write_snapshot;
-use crate::{program::DELEGATION_PROGRAM_ID, ACCOUNT_SPACE, LOCKOUT_REJECTIONS, PAYER_LAMPORTS};
+use super::{check_lockout, write_snapshot};
+use crate::{program::DELEGATION_PROGRAM_ID, ACCOUNT_SPACE, PAYER_LAMPORTS};
 
 const INTERCEPT_TIMEOUT: Duration = Duration::from_secs(60);
 const COMPLETION_TIMEOUT: Duration = Duration::from_secs(90);
@@ -22,12 +21,15 @@ const REDELEGATE_TIMEOUT: Duration = Duration::from_secs(60);
 const HIDDEN: &str = "notification hidden by redsuite";
 
 /// Checks pending lockout and discovery of completed undelegation after transport recovery.
+/// The account is rewritten on base after ownership returns, then redelegated
+/// to prove new-session progress.
 pub struct UndelegationRecovery {
     base: Rc<BaseCtx>,
     er: ErCtx,
     payer: Keypair,
 }
 
+/// Ways to invalidate stale pending-undelegation knowledge after hidden base completion.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Recovery {
     Reconnect,
@@ -55,6 +57,7 @@ impl Scenario for UndelegationRecovery {
         Ok(Self { base, er, payer })
     }
 
+    /// Applies the same lockout/discovery oracle to reconnect and restart recovery.
     async fn run(self) -> Result<()> {
         let faults = self.er.faults()?;
         self.recover(&faults, 1, Recovery::Reconnect).await?;
@@ -65,6 +68,7 @@ impl Scenario for UndelegationRecovery {
 }
 
 impl UndelegationRecovery {
+    /// Requires a write-lockout refusal and unchanged ER snapshot while settlement is pending.
     async fn rejected_write(
         &self,
         id: u64,
@@ -72,10 +76,13 @@ impl UndelegationRecovery {
         snapshot: &[u8],
         when: &str,
     ) -> Result<()> {
-        let attempt = self.er.cells(REDLINE, &self.payer).write(id, &[*account]).await;
-        let error = expect_error(attempt, &format!("ER write rejected {when}"))?;
-        let error = format!("{error:#}");
-        crate::rejection_code(&format!("the er write {when}"), &LOCKOUT_REJECTIONS, &error)?;
+        let error = self
+            .er
+            .try_submit_and_confirm(&self.payer, &[REDLINE.write(id, &[*account])])
+            .await?
+            .err()
+            .with_context(|| format!("ER write accepted {when}"))?;
+        check_lockout(&error)?;
         let on_er =
             self.er.account(account).await?.context("er copy vanished during the lockout")?;
         ensure!(on_er.data == snapshot);
@@ -122,6 +129,7 @@ impl UndelegationRecovery {
         Ok(())
     }
 
+    /// Starts a fresh session and proves recovered state is writable on the ER again.
     async fn redelegate_and_write(&self, account: &Pubkey, seed: u8, id: u64) -> Result<()> {
         self.base
             .submit_and_confirm(
@@ -155,6 +163,8 @@ impl UndelegationRecovery {
         Ok(())
     }
 
+    /// Drops a base submission, hides eventual completion, then tests
+    /// the selected recovery boundary.
     async fn recover(&self, faults: &Faults, seed: u8, mode: Recovery) -> Result<()> {
         let case = u64::from(seed);
         let identity = self.er.identity();

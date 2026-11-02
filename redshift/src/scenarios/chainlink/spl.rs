@@ -46,6 +46,7 @@ pub fn derive_ata(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
     .0
 }
 
+/// Builds the eSPL instruction that exposes a temporary ER-local ATA overlay.
 pub(crate) fn ensure_magic_ata(payer: Pubkey, owner: Pubkey, mint: Pubkey) -> Instruction {
     Instruction {
         program_id: eata_program(),
@@ -61,6 +62,7 @@ pub(crate) fn ensure_magic_ata(payer: Pubkey, owner: Pubkey, mint: Pubkey) -> In
     }
 }
 
+/// Closes the Magic ATA overlay through the native protocol, not the physical SPL token account.
 pub(crate) fn close_magic_ata(owner: Pubkey, mint: Pubkey) -> Instruction {
     Instruction {
         program_id: MAGIC_PROGRAM_ID,
@@ -72,6 +74,7 @@ pub(crate) fn close_magic_ata(owner: Pubkey, mint: Pubkey) -> Instruction {
     }
 }
 
+/// Recognizes the overlay's rent-sysvar delegate marker in its SPL-compatible account layout.
 pub(crate) fn is_magic_ata(data: &[u8]) -> bool {
     data.get(129..133) == Some(1u32.to_le_bytes().as_slice())
         && data.get(133..165) == Some(sdk_ids::sysvar::rent::ID.as_ref())

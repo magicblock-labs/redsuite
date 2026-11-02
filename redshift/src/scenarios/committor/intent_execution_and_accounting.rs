@@ -28,6 +28,7 @@ const TRANSFER_LAMPORTS: u64 = 1_000_000;
 const ACTION_COMPUTE_UNITS: u32 = 100_000;
 const ACTORS: usize = 3;
 
+/// Commit-stage combinations used to compare ownership transitions and after-settlement actions.
 #[derive(Clone, Copy)]
 enum Mode {
     Commit,
@@ -35,6 +36,7 @@ enum Mode {
     Finalize,
 }
 
+/// Builds a multi-authority intent with optional actions tied to each cell's settlement stage.
 fn intents(
     authorities: &[Pubkey],
     validator: Pubkey,
@@ -92,6 +94,8 @@ fn intents(
     REDSHIFT.batch().intents(bundle).build()
 }
 
+/// Attaches a result callback to a transfer action so success and failure
+/// have distinct refund oracles.
 fn transfer_with_refund(
     authority: Pubkey,
     validator: Pubkey,
@@ -124,6 +128,7 @@ fn transfer_with_refund(
         .build()
 }
 
+/// Shared funded actors whose expected headers persist across settlement and redelegation cases.
 struct IntentFixture<'a> {
     base: &'a BaseCtx,
     er: &'a ErCtx,
@@ -131,6 +136,7 @@ struct IntentFixture<'a> {
     actors: Vec<Actor>,
 }
 
+/// Independent payer/session and its expected cell state for mixed-authority bundles.
 struct Actor {
     payer: Keypair,
     cell: Pubkey,
@@ -153,6 +159,7 @@ impl<'a> IntentFixture<'a> {
         let receipt = self.er.check_commit(self.base, signature, accounts, undelegates).await?;
         receipt.check_success("scheduled intent")
     }
+    /// Checks per-cell snapshots, ownership, and base action transfers for one mixed-mode bundle.
     #[instrument(skip_all, err, fields(case = label))]
     async fn check_bundle(
         &mut self,
@@ -236,6 +243,8 @@ impl<'a> IntentFixture<'a> {
         Ok(())
     }
 
+    /// Exhausts a sponsored session, requires rollback at its limit, then
+    /// proves undelegation remains usable.
     #[instrument(skip_all, err)]
     async fn check_sponsored_quota(&self) -> Result<()> {
         use Mode::{Commit, Undelegate};
@@ -286,6 +295,8 @@ impl<'a> IntentFixture<'a> {
         Ok(())
     }
 
+    /// Crosses the paid-commit boundary and reconciles payer debits, vault
+    /// credits, and action fees.
     #[instrument(skip_all, err)]
     async fn check_paid_threshold(&self) -> Result<()> {
         let actor = &self.actors[0];
@@ -342,6 +353,8 @@ impl<'a> IntentFixture<'a> {
             .await
     }
 
+    /// Requires one result callback and the corresponding refund/fee effects
+    /// for each action outcome.
     #[instrument(skip_all, err, fields(fail = fail))]
     async fn check_callback(&self, fail: bool) -> Result<()> {
         let actor = &self.actors[1];
@@ -413,6 +426,8 @@ impl<'a> IntentFixture<'a> {
         Ok(Self { base, er, funder, actors })
     }
 
+    /// Starts a new delegation session with its quota state checked
+    /// by subsequent accounting stages.
     async fn redelegate(&self, payer: &Keypair, phase: &str) -> Result<()> {
         self.base
             .submit_and_confirm(
@@ -433,6 +448,8 @@ impl<'a> IntentFixture<'a> {
 }
 
 /// Verifies action execution, session quotas, fees, and callback outcomes.
+/// Contrasting actors and commit stages expose incorrect cross-session
+/// charging or action attribution.
 pub struct IntentExecutionAndAccounting {
     base: Rc<BaseCtx>,
     er: ErCtx,
@@ -441,6 +458,8 @@ impl Scenario for IntentExecutionAndAccounting {
     async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
         Ok(Self { base, er })
     }
+    /// Checks mixed bundles before session limits, paid fees,
+    /// and successful/failed callback outcomes.
     async fn run(self) -> Result<()> {
         let mut suite = IntentFixture::prepare(&self.base, &self.er).await?;
         use Mode::{Commit, Finalize, Undelegate};

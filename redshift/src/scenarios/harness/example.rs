@@ -10,6 +10,7 @@ const TRANSFERS: u64 = 10;
 const LAMPORTS_PER_TRANSFER: u64 = 1_000_000;
 const PAYER_LAMPORTS: u64 = 1_000_000_000;
 
+/// Minimal base-to-ER observation example: distinct transfers accumulate in one mirrored balance.
 pub struct Example {
     base: Rc<BaseCtx>,
     er: ErCtx,
@@ -25,6 +26,7 @@ impl Scenario for Example {
         Ok(Self { base, er, payer, recipient })
     }
 
+    /// Checks the accumulated base result before waiting for the ER mirror to agree.
     async fn run(self) -> Result<()> {
         let mut expected = 0;
         // identical transactions share a signature and get deduplicated —

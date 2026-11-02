@@ -27,17 +27,25 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 const BLOCKHASH_EXPIRY_TIMEOUT: Duration = Duration::from_secs(180);
 const COPIES: usize = 32;
 
+/// Checks retryable admission, duplicate delivery, subscription timing,
+/// and durable replay protection.
+/// State, fee, and ledger-occurrence oracles distinguish a retry from a second execution.
 pub struct TransactionLifecycle {
     base: Rc<BaseCtx>,
     er: ErCtx,
     coverage: Coverage,
 }
 
+/// Separately scheduled transaction-lifecycle workloads.
 pub enum Coverage {
+    /// Covers cold-fetch retry, concurrent duplicates,
+    /// and early/racing/late signature subscriptions.
     Admission,
+    /// Replays successful and failed signatures after blockhash expiry and restart.
     Replay,
 }
 
+/// Fault or timing boundary exercised against a fresh payer/cell fixture.
 #[derive(Debug)]
 enum Mode {
     ColdFetch,
@@ -51,6 +59,7 @@ async fn state(er: &ErCtx, keys: &[Pubkey; 2]) -> Result<(u64, CellHeader)> {
     decode_state(&accounts)
 }
 
+/// Queues expensive readonly work to expose subscription registration while execution is pending.
 async fn queue_readers(
     er: &ErCtx,
     payer: &Keypair,
@@ -85,6 +94,8 @@ async fn queue_readers(
         .collect()
 }
 
+/// Sends identical copies while registering listeners before, during, and after execution.
+/// Returns whether the queued-load probe actually witnessed a pending signature status.
 async fn execute(
     er: &ErCtx,
     tx: &Signed,
@@ -136,6 +147,7 @@ impl Scenario<(), Coverage> for TransactionLifecycle {
         Ok(Self { base, er, coverage })
     }
 
+    /// Runs the selected coverage with independent state/fee expectations for each timing mode.
     async fn run(self) -> Result<()> {
         let modes: &[Mode] = match self.coverage {
             Coverage::Admission => &[
@@ -154,6 +166,7 @@ impl Scenario<(), Coverage> for TransactionLifecycle {
 }
 
 impl Mode {
+    /// Reconciles admitted occurrences and fees, including failed executions and refused replays.
     #[instrument(skip_all, err, fields(mode = ?self))]
     async fn run_case(&self, base: &BaseCtx, er: &ErCtx) -> Result<()> {
         let owner = base.funded_payer(PAYER_LAMPORTS).await?;

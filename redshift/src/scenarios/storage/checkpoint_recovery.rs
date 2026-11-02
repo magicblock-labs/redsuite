@@ -22,6 +22,7 @@ use crate::PAYER_LAMPORTS;
 const ROUNDS: usize = 2;
 const CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Fee-aware state oracle: failed transactions charge fees without applying cell updates.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct State {
     payer_lamports: u64,
@@ -57,6 +58,7 @@ impl State {
     }
 }
 
+/// Submission identity with optional pre-crash evidence that must remain byte-for-byte stable.
 #[derive(Debug)]
 struct Record {
     id: u8,
@@ -69,6 +71,7 @@ impl Record {
         id.is_multiple_of(2)
     }
 
+    /// Checks the planned execution outcome, fee-only balance movement, and any prior evidence.
     fn check(&self, evidence: &TransactionInfo) -> Result<()> {
         let meta = transaction_meta(evidence)?;
         let error = Self::fails(self.id)
@@ -85,6 +88,7 @@ impl Record {
     }
 }
 
+/// Alternating successful/failed updates whose recovered subset reconstructs expected state.
 struct Workload {
     payer: Keypair,
     owner: Pubkey,
@@ -99,6 +103,8 @@ impl Workload {
         Ok(())
     }
 
+    /// Optionally captures confirmed evidence; unconfirmed submissions
+    /// remain candidates for recovery.
     async fn submit(&mut self, er: &ErCtx, confirm: bool) -> Result<Record> {
         self.next_id = self.next_id.checked_add(1).context("transaction ids exhausted")?;
         let id = self.next_id;
@@ -132,6 +138,8 @@ impl Workload {
 }
 
 /// Checks state recovery through two checkpoint/crash cycles.
+/// Checkpoint-protected records must survive unchanged; the post-checkpoint tail is
+/// reconstructed from retained transactions rather than assumed to survive in full.
 pub struct CheckpointRecovery {
     er: ErCtx,
     storage_dir: std::path::PathBuf,
@@ -158,6 +166,7 @@ impl Scenario for CheckpointRecovery {
         Ok(Self { er, storage_dir, workload })
     }
 
+    /// Separates archived evidence from the crash tail, then resumes writes after recovery.
     async fn run(mut self) -> Result<()> {
         let mut protected = Vec::new();
         let mut previous_boundary = 0;
@@ -189,6 +198,7 @@ impl Scenario for CheckpointRecovery {
             ensure!(timing.exit_signal == Some(9));
             let er = &self.er;
             self.verify(&protected).await?;
+            // Rebuild from the checkpoint boundary; only retained tail records contribute effects.
             self.workload.expected = baseline;
             for mut record in tail {
                 let found = er.api().get_transaction(&record.signature).await?;
@@ -219,6 +229,7 @@ impl CheckpointRecovery {
             .context("missing ledger head metric")? as u64)
     }
 
+    /// Waits for a sealed boundary and a nonempty accounts archive, not just a metric increment.
     async fn checkpoint(&self) -> Result<u64> {
         let sealed = self.head().await?;
         let archive = self
@@ -239,6 +250,7 @@ impl CheckpointRecovery {
         Ok(sealed)
     }
 
+    /// Requires previously protected transaction evidence to remain unchanged across recovery.
     async fn verify(&self, protected: &[Record]) -> Result<()> {
         for record in protected {
             ensure!(self.er.api().get_transaction(&record.signature).await? == record.evidence);
