@@ -191,12 +191,7 @@ impl Suite {
     fn scenario_finished(&self) {
         let finished = self.finished.get() + 1;
         self.finished.set(finished);
-        info!(
-            finished,
-            total = self.total,
-            remaining = self.total - finished,
-            "suite progress"
-        );
+        info!("suite progress {finished}/{}", self.total);
     }
 
     fn not_run(&self, entry: ScenarioEntry, reason: &str) -> RunRecord {
