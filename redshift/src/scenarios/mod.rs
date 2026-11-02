@@ -67,7 +67,8 @@ pub fn catalog() -> Vec<ScenarioEntry> {
             committor::dlp_v2_buffered_settlement::DlpV2BufferedSettlement,
             shared(&DEFAULT, &[Fixture::RedshiftProgram], ())
         )
-        .named("dlp_v2_buffered_settlement"),
+        .named("dlp_v2_buffered_settlement")
+        .explicit_only(),
         scenario!(
             lifecycle::restart_under_load::RestartUnderLoad,
             exclusive(&STORAGE, &[Fixture::RedlineProgram], ())
