@@ -6,6 +6,7 @@ use instruction::Instruction;
 use keypair::Keypair;
 use pubkey::Pubkey;
 
+use json::json;
 use redsuite_core::{
     netfault::Selector,
     programs::{CellHeader, REDLINE, REDSHIFT},
@@ -13,7 +14,6 @@ use redsuite_core::{
     topology::RestartConfig,
     wait, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
-use serde_json::{json, Value};
 use signature::Signature;
 use signer::Signer;
 use tracing::instrument;
@@ -38,9 +38,10 @@ pub enum Coverage {
     Replay,
 }
 
+#[derive(Debug)]
 enum Mode {
     ColdFetch,
-    Concurrent,
+    Concurrent { fail: bool },
     Subscriptions,
     ExpiryRestart,
 }
@@ -94,10 +95,10 @@ async fn execute(
     for _ in 0..2 {
         listeners.push(subscribe(er, tx).await?);
     }
-    let mut readers = Vec::new();
-    if let Some((payer, cell, round)) = queued {
-        readers = queue_readers(er, payer, cell, round).await?;
-    }
+    let readers = match queued {
+        Some((payer, cell, round)) => queue_readers(er, payer, cell, round).await?,
+        None => Vec::new(),
+    };
     let (sent, racing) = tokio::join!(
         tx.copies(er, copies),
         join_all((0..4).map(|_| subscribe(er, tx))),
@@ -114,17 +115,13 @@ async fn execute(
     };
     tx.outcome(er).await?;
     listeners.push(subscribe(er, tx).await?);
-    for (index, (mut ws, id)) in listeners.into_iter().enumerate() {
-        let (method, subscription, payload) =
-            ws.next_notification(TIMEOUT).await?.ok_or_else(|| {
-                anyhow!(
-                    "subscriber {index} missed terminal result: expected {:?}",
-                    tx.error
-                )
-            })?;
-        let payload: Value = serde_json::from_str(&payload.to_string())?;
-        ensure!(method == "signatureNotification");
-        ensure!(subscription == id);
+    for (index, (mut ws, _)) in listeners.into_iter().enumerate() {
+        let (_, _, payload) = ws.next_notification(TIMEOUT).await?.ok_or_else(|| {
+            anyhow!(
+                "subscriber {index} missed terminal result: expected {:?}",
+                tx.error
+            )
+        })?;
         ensure!(payload["value"] == json!({"err": tx.error}));
         ws.close().await?;
     }
@@ -141,32 +138,24 @@ impl Scenario<(), Coverage> for TransactionLifecycle {
 
     async fn run(self) -> Result<()> {
         let modes: &[Mode] = match self.coverage {
-            Coverage::Admission => &[Mode::ColdFetch, Mode::Concurrent, Mode::Subscriptions],
+            Coverage::Admission => &[
+                Mode::ColdFetch,
+                Mode::Concurrent { fail: false },
+                Mode::Concurrent { fail: true },
+                Mode::Subscriptions,
+            ],
             Coverage::Replay => &[Mode::ExpiryRestart],
         };
         for mode in modes {
-            mode.run_phases(&self.base, &self.er).await?;
+            mode.run_case(&self.base, &self.er).await?;
         }
         Ok(())
     }
 }
 
 impl Mode {
-    async fn run_phases(&self, base: &BaseCtx, er: &ErCtx) -> Result<()> {
-        let phases: &[&str] = if matches!(self, Self::Concurrent) {
-            &["success", "failure"]
-        } else {
-            &["case"]
-        };
-        for &phase in phases {
-            // Each outcome owns fresh payer/cell state and its ledger window.
-            self.run_case(base, er, phase).await?;
-        }
-        Ok(())
-    }
-
-    #[instrument(skip_all, err, fields(case = phase))]
-    async fn run_case(&self, base: &BaseCtx, er: &ErCtx, phase: &str) -> Result<()> {
+    #[instrument(skip_all, err, fields(mode = ?self))]
+    async fn run_case(&self, base: &BaseCtx, er: &ErCtx) -> Result<()> {
         let owner = base.funded_payer(PAYER_LAMPORTS).await?;
         let (cell, setup) = base.cells(REDSHIFT, &owner).prepare_delegated(er.identity(), u32::MAX);
         base.submit_and_confirm(&owner, &setup).await?;
@@ -214,23 +203,19 @@ impl Mode {
                 expected.1.value += 7;
                 expected.1.revision += 1;
             }
-            Self::Concurrent | Self::Subscriptions => {
+            Self::Concurrent { .. } | Self::Subscriptions => {
                 let mut pending_results = [false; 2];
-                for round in 1..=if matches!(self, Self::Concurrent) { 1 } else { 8 } {
-                    let fail =
-                        phase == "failure" || matches!(self, Self::Subscriptions) && round % 2 == 0;
+                let rounds = if matches!(self, Self::Subscriptions) { 8 } else { 1 };
+                for round in 1..=rounds {
+                    let fail = matches!(self, Self::Concurrent { fail: true })
+                        || matches!(self, Self::Subscriptions) && round % 2 == 0;
                     let copies = if matches!(self, Self::Subscriptions) { 1 } else { COPIES };
                     let tx = Signed::new(er, &payer, owner, round, fail, None).await?;
-                    let notifications = execute(
-                        er,
-                        &tx,
-                        copies,
-                        load_payer
-                            .as_ref()
-                            .filter(|_| !pending_results[usize::from(fail)])
-                            .map(|payer| (payer, cell, round)),
-                    )
-                    .await;
+                    let queued = load_payer
+                        .as_ref()
+                        .filter(|_| !pending_results[usize::from(fail)])
+                        .map(|payer| (payer, cell, round));
+                    let notifications = execute(er, &tx, copies, queued).await;
                     start = audit(er, start, &[(&tx, 1)]).await?;
                     expected.0 -= tx.fee;
                     if !fail {

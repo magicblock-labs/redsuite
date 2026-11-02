@@ -160,19 +160,16 @@ impl ErCtx {
     }
 
     pub async fn await_cloned_payers(&self, payers: &[Pubkey]) -> Result<()> {
-        bounded(payers.len(), "cloned payer", |index| {
-            let payer = payers[index];
-            async move {
-                self.await_account(&payer, |account| {
-                    ensure!(account.lamports > 0);
-                    Ok(())
-                })
-                .await?;
+        bounded(payers.len(), "cloned payer", |index| async move {
+            self.await_account(&payers[index], |account| {
+                ensure!(account.lamports > 0);
                 Ok(())
-            }
+            })
+            .await
+            .map(|_| ())
         })
-        .await?;
-        Ok(())
+        .await
+        .map(|_| ())
     }
 
     pub async fn await_program_clone(&self, program: &Pubkey) -> Result<()> {
@@ -180,7 +177,7 @@ impl ErCtx {
             ensure!(account.executable);
             Ok(())
         })
-        .await?;
-        Ok(())
+        .await
+        .map(|_| ())
     }
 }
