@@ -11,7 +11,7 @@ use pubkey::Pubkey;
 use redsuite_core::{
     api::transaction_meta,
     dlp,
-    netfault::{BaseProxies, Selector},
+    netfault::{Faults, Proxy, Selector},
     prep,
     programs::{CellHeader, CellId, SettlementMode, REDSHIFT},
     receipt,
@@ -120,13 +120,13 @@ async fn schedule_commit(
 async fn recover_session_a_commit_after_lost_response(
     base: &BaseCtx,
     er: &ErCtx,
-    proxies: &BaseProxies,
+    faults: &Faults,
     payer: &Keypair,
     account: &Pubkey,
     expected_id: u64,
 ) -> Result<()> {
     let submission =
-        proxies.intercept(Selector::method("sendTransaction").http().response().account(account));
+        faults.intercept(Selector::method("sendTransaction").http().response().account(account));
     let signature = schedule_commit(er, payer, account, SettlementMode::Commit).await?;
     let held = submission.wait(INTERCEPT_TIMEOUT).await?;
     let base_signature = held.operation.signature()?;
@@ -149,7 +149,7 @@ async fn recover_session_a_commit_after_lost_response(
 
 async fn isolate(
     base: &BaseCtx,
-    proxies: &BaseProxies,
+    faults: &Faults,
     er_a: &mut PrivateEr,
     er_b: Option<&ErCtx>,
     payer: &Keypair,
@@ -167,17 +167,10 @@ async fn isolate(
 
     let staged = value(case, 1);
     write(er_a.ctx(), payer, &account, staged).await?;
-    recover_session_a_commit_after_lost_response(
-        base,
-        er_a.ctx(),
-        proxies,
-        payer,
-        &account,
-        staged,
-    )
-    .await?;
+    recover_session_a_commit_after_lost_response(base, er_a.ctx(), faults, payer, &account, staged)
+        .await?;
 
-    let delayed = proxies.intercept(Selector::methods(&[]).ws().notification().account(&account));
+    let delayed = faults.intercept(Selector::methods(&[]).ws().notification().account(&account));
     let undelegate =
         schedule_commit(er_a.ctx(), payer, &account, SettlementMode::Undelegate).await?;
     let undelegated = receipt::fetch_commit_receipt(er_a.ctx().api(), &undelegate).await?;
@@ -290,40 +283,50 @@ async fn isolate(
 pub struct StaleDelegationSessionIsolation {
     base: Rc<BaseCtx>,
     er: ErCtx,
-    proxies: BaseProxies,
+    proxy: Proxy,
+    faults: Faults,
     er_a: PrivateEr,
     payer: Keypair,
 }
 
 impl Scenario for StaleDelegationSessionIsolation {
     async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
-        let proxies = BaseProxies::spawn(&base).await?;
+        let proxy = Proxy::spawn(topology::BaseEndpoints::from_base(&base)?).await?;
+        let faults = proxy.scope()?;
         let er_a = topology::private_er(
             &base,
             ErOptions {
                 label: LABEL_A.to_owned(),
-                base_endpoints: Some(proxies.endpoints()),
+                base_endpoints: Some(proxy.endpoints()),
                 ..Default::default()
             },
         )
         .await?;
         let payer = base.funded_payer(PAYER_LAMPORTS).await?;
 
-        Ok(Self { base, er, proxies, er_a, payer })
+        Ok(Self {
+            base,
+            er,
+            proxy,
+            faults,
+            er_a,
+            payer,
+        })
     }
 
     async fn run(mut self) -> Result<()> {
-        isolate(&self.base, &self.proxies, &mut self.er_a, None, &self.payer).await?;
+        isolate(&self.base, &self.faults, &mut self.er_a, None, &self.payer).await?;
         isolate(
             &self.base,
-            &self.proxies,
+            &self.faults,
             &mut self.er_a,
             Some(&self.er),
             &self.payer,
         )
         .await?;
 
-        self.proxies.finish()?;
+        self.faults.reset().await?;
+        drop(self.proxy);
         self.er_a.finish().await?;
         Ok(())
     }

@@ -508,7 +508,7 @@ pub struct BaseEndpoints {
 }
 
 impl BaseEndpoints {
-    pub(crate) fn from_base(base: &BaseCtx) -> Result<Self> {
+    pub fn from_base(base: &BaseCtx) -> Result<Self> {
         let (grpc_url, _) = base.grpc().context("base L1 Yellowstone gRPC endpoint missing")?;
         Ok(Self {
             rpc_url: base.api().url().clone(),

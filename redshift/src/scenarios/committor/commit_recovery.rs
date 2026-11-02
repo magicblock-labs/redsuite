@@ -1,4 +1,4 @@
-use super::{hold_nonces, prove_landed, write_and_commit, PROXIED_GROUP};
+use super::{hold_nonces, prove_landed, write_and_commit};
 use crate::{ACCOUNT_SPACE, PAYER_LAMPORTS};
 use anyhow::{anyhow, ensure, Context};
 use keypair::Keypair;
@@ -6,7 +6,7 @@ use pubkey::Pubkey;
 use redsuite_core::{
     api::transaction_meta,
     dlp,
-    netfault::{BaseProxies, RuleHandle, Selector},
+    netfault::{Faults, RuleHandle, Selector, Transport},
     programs::{Action, CellHeader, CellId, IntentBundle, REDLINE, REDSHIFT},
     receipt::{self, CommitReceipt},
     topology::RestartConfig,
@@ -45,11 +45,11 @@ struct FaultedCommit<'a> {
     restart: bool,
 }
 
-fn withhold_confirmations(proxies: &BaseProxies, signature: &Signature) -> [RuleHandle; 2] {
+fn withhold_confirmations(faults: &Faults, signature: &Signature) -> [RuleHandle; 2] {
     [
-        proxies
+        faults
             .stall(Selector::method("getSignatureStatuses").http().response().signature(signature)),
-        proxies.stall(
+        faults.stall(
             Selector::method("signatureNotification")
                 .ws()
                 .notification()
@@ -85,7 +85,7 @@ struct CommitFixture {
 
 impl CommitFixture {
     async fn prepare(base: Rc<BaseCtx>, er: ErCtx) -> Result<Self> {
-        er.proxies().context(PROXIED_GROUP)?;
+        er.faults()?;
         let payer = base.funded_payer(PAYER_LAMPORTS).await?;
         let account = base
             .cells(REDLINE, &payer)
@@ -97,8 +97,8 @@ impl CommitFixture {
     }
 
     async fn confirmation_loss(self) -> Result<()> {
-        let proxies = self.er.proxies().context(PROXIED_GROUP)?;
-        let submission_trap = proxies.intercept(
+        let faults = self.er.faults()?;
+        let submission_trap = faults.intercept(
             Selector::method("sendTransaction").http().response().account(&self.account),
         );
         let (snapshot, commit_signature) =
@@ -109,7 +109,7 @@ impl CommitFixture {
         held.discard();
         self.await_convergence(&snapshot, &commit_signature).await?;
 
-        let submission_probe = proxies.intercept(
+        let submission_probe = faults.intercept(
             Selector::method("sendTransaction").http().response().account(&self.account),
         );
         let (snapshot, commit_signature) =
@@ -118,13 +118,13 @@ impl CommitFixture {
             receipt::scheduled_receipt_signature(self.er.api(), &commit_signature).await?;
         let probe = submission_probe.wait(INTERCEPT_TIMEOUT).await?;
         let base_signature = probe.operation.signature()?;
-        let status_blackout = proxies.stall(
+        let status_blackout = faults.stall(
             Selector::method("getSignatureStatuses")
                 .http()
                 .response()
                 .signature(&base_signature),
         );
-        let notification_trap = proxies.intercept(
+        let notification_trap = faults.intercept(
             Selector::method("signatureNotification")
                 .ws()
                 .notification()
@@ -145,7 +145,8 @@ impl CommitFixture {
         status_blackout.remove();
         self.await_convergence(&snapshot, &commit_signature).await?;
 
-        proxies.close_connections();
+        faults.disconnect(Transport::Http);
+        faults.disconnect(Transport::Ws);
         let fresh = self
             .base
             .cells(REDLINE, &self.payer)
@@ -174,9 +175,9 @@ impl CommitFixture {
     }
 
     async fn effect_recovery(self) -> Result<()> {
-        let proxies = self.er.proxies().context(PROXIED_GROUP)?;
+        let faults = self.er.faults()?;
         self.commit_blackout(
-            proxies,
+            &faults,
             FaultedCommit {
                 phase: "blackout",
                 commit_id: 2,
@@ -186,9 +187,9 @@ impl CommitFixture {
         )
         .await?;
         self.follow_up_commit(3, RECOVERY_WRITE, "post-blackout").await?;
-        self.action_blackout(proxies).await?;
+        self.action_blackout(&faults).await?;
         self.commit_blackout(
-            proxies,
+            &faults,
             FaultedCommit {
                 phase: "restart",
                 commit_id: 4,
@@ -267,14 +268,10 @@ impl CommitFixture {
         Ok(receipt)
     }
 
-    async fn commit_blackout(
-        &self,
-        proxies: &BaseProxies,
-        faulted: FaultedCommit<'_>,
-    ) -> Result<()> {
+    async fn commit_blackout(&self, faults: &Faults, faulted: FaultedCommit<'_>) -> Result<()> {
         let FaultedCommit { phase, commit_id, write, restart } = faulted;
         let nonce_before = crate::last_commit_id(self.base.as_ref(), &self.account).await?;
-        let submission = proxies.intercept(
+        let submission = faults.intercept(
             Selector::method("sendTransaction").http().response().account(&self.account),
         );
         let (snapshot, commit_signature) =
@@ -289,7 +286,7 @@ impl CommitFixture {
         } else {
             None
         };
-        let confirmations = withhold_confirmations(proxies, &landed);
+        let confirmations = withhold_confirmations(faults, &landed);
         if restart {
             self.er.restart(RestartConfig::default()).await?;
         }
@@ -350,7 +347,7 @@ impl CommitFixture {
         Ok(())
     }
 
-    async fn action_blackout(&self, proxies: &BaseProxies) -> Result<()> {
+    async fn action_blackout(&self, faults: &Faults) -> Result<()> {
         let payer = self.base.funded_payer(PAYER_LAMPORTS).await?;
         let (init, cell) = REDSHIFT.create(
             payer.pubkey(),
@@ -365,7 +362,7 @@ impl CommitFixture {
             .await?;
         ensure!(self.base_count(&cell).await? == 0);
         let submission =
-            proxies.intercept(Selector::method("sendTransaction").http().response().account(&cell));
+            faults.intercept(Selector::method("sendTransaction").http().response().account(&cell));
         let action = REDSHIFT
             .batch()
             .add(&[cell], i64::from(ACTION_COUNT))
@@ -393,7 +390,7 @@ impl CommitFixture {
                 },
             )
             .await?;
-        let confirmations = withhold_confirmations(proxies, &landed);
+        let confirmations = withhold_confirmations(faults, &landed);
         held.discard();
         self.hold_count(&cell, 1, BLACKOUT_WINDOW).await?;
         for rule in confirmations {

@@ -9,7 +9,7 @@ pub mod storage;
 
 use chainlink::projected_token_lifecycle::Mode as TokenMode;
 use redsuite_core::{
-    catalog::{BasePreparation, ErGroup, Fixture, ProxyMode, ScenarioEntry, DEFAULT},
+    catalog::{BasePreparation, ErGroup, Fixture, ScenarioEntry, DEFAULT},
     scenario, ChainCtx, PrivateErScenario, Scenario,
 };
 use signer::Signer;
@@ -18,13 +18,13 @@ use std::time::Duration;
 static RETRIES: ErGroup = ErGroup {
     label: "transaction-retries",
     settings: |_| {},
-    proxies: ProxyMode::Shared,
+    proxy: true,
     followers: 0,
 };
 static COMMITTOR: ErGroup = ErGroup {
     label: "committor-faults",
     settings: |_| {},
-    proxies: ProxyMode::Shared,
+    proxy: true,
     followers: 0,
 };
 static CACHE: ErGroup = ErGroup {
@@ -32,7 +32,7 @@ static CACHE: ErGroup = ErGroup {
     settings: |p| {
         p.engine.accountsdb.lru_capacity = 256;
     },
-    proxies: ProxyMode::Split,
+    proxy: true,
     followers: 0,
 };
 static STORAGE: ErGroup = ErGroup {
@@ -41,7 +41,7 @@ static STORAGE: ErGroup = ErGroup {
         p.engine.blockstore.blocktime = Duration::from_millis(50);
         p.engine.blockstore.superblock = 20;
     },
-    proxies: ProxyMode::None,
+    proxy: false,
     followers: 0,
 };
 static RETENTION: ErGroup = ErGroup {
@@ -51,7 +51,7 @@ static RETENTION: ErGroup = ErGroup {
         p.engine.blockstore.superblock = 512;
         p.engine.ledger.size_limit = 1;
     },
-    proxies: ProxyMode::None,
+    proxy: false,
     followers: 2,
 };
 
