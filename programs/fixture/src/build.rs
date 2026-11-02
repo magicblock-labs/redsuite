@@ -1,3 +1,4 @@
+use delegation_program_interface as dpi;
 use instruction::{AccountMeta, Instruction as SolanaInstruction};
 use pubkey::Pubkey;
 use sdk::{
@@ -80,6 +81,27 @@ impl Program {
                 metas.delegation_metadata,
                 metas.delegation_program,
                 metas.system_program,
+                AccountMeta::new_readonly(id.authority, true),
+            ],
+        )
+    }
+
+    pub fn delegate_v2(self, payer: Pubkey, id: CellId, cluster: Pubkey) -> SolanaInstruction {
+        let cell = self.pda(id).0;
+        let buffer = dpi::legacy::pda::delegate_buffer_pda_from_delegated_account_and_owner_program(
+            &cell, &self.id,
+        );
+        self.encode(
+            Instruction::DelegateV2 { id },
+            vec![
+                AccountMeta::new(payer, true),
+                AccountMeta::new(cell, false),
+                AccountMeta::new_readonly(self.id, false),
+                AccountMeta::new(buffer, false),
+                AccountMeta::new(dpi::delegation_state_pda(&cell), false),
+                AccountMeta::new_readonly(cluster, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+                AccountMeta::new_readonly(dpi::id(), false),
                 AccountMeta::new_readonly(id.authority, true),
             ],
         )

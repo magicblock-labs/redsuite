@@ -58,6 +58,12 @@ static RETENTION: ErGroup = ErGroup {
 pub fn catalog() -> Vec<ScenarioEntry> {
     vec![
         scenario!(
+            committor::dlp_v2_lifecycle::DlpV2Lifecycle,
+            shared(&DEFAULT, &[Fixture::RedshiftProgram], ())
+        )
+        .named("dlp_v2_lifecycle")
+        .explicit_only(),
+        scenario!(
             lifecycle::restart_under_load::RestartUnderLoad,
             exclusive(&STORAGE, &[Fixture::RedlineProgram], ())
         ),

@@ -11,8 +11,8 @@ mod yellowstone;
 pub use config::{
     er_bin_path, local_account_owners, redline_alias_ids, redline_loader_v3_pair,
     redshift_loader_v3_target, BaseEndpoints, ErOptions, RestartConfig, CLONE_URL_ENV,
-    COMMITTOR_ID, DLP_ID, ER_BIN_ENV, ER_READY_TIMEOUT, HYDRA_EPHEMERAL_ID, OUTBOX_INTENT_ID,
-    SERVICE_OWNERS, VERIFIER_BIN_ENV,
+    COMMITTOR_ID, DLP_ID, DLP_SO_ENV, ER_BIN_ENV, ER_READY_TIMEOUT, HYDRA_EPHEMERAL_ID,
+    OUTBOX_INTENT_ID, SERVICE_OWNERS, VERIFIER_BIN_ENV,
 };
 pub use identity::{identity_for_label, identity_keypair};
 pub use private::{leader_er, private_er, PrivateEr, RestartOutcome};
