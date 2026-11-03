@@ -6,7 +6,7 @@ use redsuite_core::{
     check,
     config::Profile,
     programs::{CellHeader, REDLINE},
-    redline::Accounts,
+    redline::{check_ok, Accounts},
     report::Unit,
     runner::{execute, Pacing, RunConfig},
     transport::{clock::SendClock, ws::AccountUpdates},
@@ -108,9 +108,13 @@ impl Scenario<(ScenarioReport, Result<()>)> for WebsocketFanout {
                     break;
                 }
                 let mut window_p95 = 0;
+                let mut stalled = false;
                 for reader in &readers {
-                    if outcome.failed == 0 {
-                        reader.await_settled().await?;
+                    if outcome.failed == 0
+                        && check_ok(reader.await_settled().await, "fanout subscriber stalled")
+                            .is_none()
+                    {
+                        stalled = true;
                     }
                     let observed = reader.take_outcome();
                     check!(
@@ -152,6 +156,9 @@ impl Scenario<(ScenarioReport, Result<()>)> for WebsocketFanout {
                     .setting("subscribers", self.connections)
                     .setting("offered tps", self.rate)
                     .client_side(&outcome);
+                if stalled {
+                    break;
+                }
             }
             check!(
                 cursor > 0 || *options.stop.borrow(),
