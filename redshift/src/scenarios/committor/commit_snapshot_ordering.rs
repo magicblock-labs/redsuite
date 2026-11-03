@@ -4,6 +4,7 @@ use anyhow::{ensure, Context};
 use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
+    api::{transaction_logs, transaction_meta},
     netfault::{Faults, Held, Selector},
     programs::{SettlementMode, REDLINE},
     receipt::{self, CommitReceipt},
@@ -148,7 +149,20 @@ impl CommitSnapshotOrdering {
     ) -> Result<Bundle> {
         let receipt = receipt::fetch_commit_receipt(self.er.api(), commit_signature).await?;
         receipt.check_success(phase)?;
-        receipt.check_included(expected)?;
+        if let Err(error) = receipt.check_included(expected) {
+            let scheduled = self.er.api().await_transaction(commit_signature).await?;
+            let targets: Vec<_> = transaction_logs(transaction_meta(&scheduled)?)
+                .iter()
+                .filter(|line| {
+                    line.contains("Scheduled commit with ID:")
+                        || line.contains("ScheduledCommitSent outbox:")
+                })
+                .collect();
+            return Err(error).context(format!(
+                "schedule {commit_signature}, receipt intent {:?}, scheduling targets {targets:?}",
+                receipt.commit_id
+            ));
+        }
         receipt.confirm(self.base.api()).await?;
         let last = receipt.base_signatures[receipt.base_signatures.len() - 1];
         let slot = self.base.api().await_transaction(&last).await?.slot;

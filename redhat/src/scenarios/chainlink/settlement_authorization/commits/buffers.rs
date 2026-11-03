@@ -4,7 +4,7 @@ use committor_interface::instruction::CommittorInstruction;
 use instruction::AccountMeta;
 use magic_api::{
     instruction::OutboxIntentInstruction,
-    outbox::{ExecutionStage, PendingTransaction},
+    outbox::{ExecutionStage, PendingTransaction, SentCommit},
     OUTBOX_INTENT_PROGRAM_ID,
 };
 use message::{Message, VersionedMessage};
@@ -411,7 +411,10 @@ impl SettlementAuthorization {
                 InstructionError::IncorrectAuthority,
             ),
             (
-                OutboxIntentInstruction::ScheduledCommitSent((intent_id, 0)),
+                OutboxIntentInstruction::ScheduledCommitSent(SentCommit {
+                    message_id: intent_id,
+                    ..SentCommit::default()
+                }),
                 InstructionError::IncorrectAuthority,
             ),
             (

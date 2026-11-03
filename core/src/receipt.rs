@@ -424,7 +424,9 @@ pub async fn fetch_commit_receipt_by_intent(
     match result {
         Ok(result) => result,
         Err(timeout_error) => Err(last_fetch_error.unwrap_or_else(|| timeout_error.into()))
-            .context("commit receipt not published"),
+            .with_context(|| {
+                format!("commit receipt for intent {intent_id} at {validator} not published")
+            }),
     }
 }
 
