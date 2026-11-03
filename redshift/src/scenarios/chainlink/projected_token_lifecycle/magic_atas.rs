@@ -1,14 +1,23 @@
+use std::{slice, time::Duration};
+
 use account::Account;
 use anyhow::{ensure, Context};
+use pubkey::Pubkey;
 use redsuite_core::{dlp, system, wait, ChainCtx, Result};
 use sdk::spl::{builders::WithdrawThroughDelegatedShuttleWithMergeBuilder, find_rent_pda};
 use signer::Signer;
+use tokio::time;
 use tracing::instrument;
 
 use super::{amount, check_readonly, spl, ProjectedTokenLifecycle, Wallet, SUPPLY};
 
 const RECEIVE: u64 = 60;
 const DEPOSIT: u64 = 45;
+const ALLOWANCE: u64 = 25;
+const RETURNED: u64 = 10;
+const DELEGATE: Pubkey = Pubkey::new_from_array([1; 32]);
+const OTHER_DELEGATE: Pubkey = Pubkey::new_from_array([2; 32]);
+const SETTLE: Duration = Duration::from_secs(2);
 
 /// Distinct ways a temporary token overlay can drain, close, be replaced, or
 /// settle through a shuttle.
@@ -17,15 +26,27 @@ enum Case {
     Drain,
     Readonly,
     Projection,
+    Funded,
+    Shared,
+    Conflict,
+    FrozenOverlay,
+    FrozenBase,
+    Overlap,
     FullShuttle,
     TransparentShuttle,
 }
 
 impl Case {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 11] = [
         Self::Drain,
         Self::Readonly,
         Self::Projection,
+        Self::Funded,
+        Self::Shared,
+        Self::Conflict,
+        Self::FrozenOverlay,
+        Self::FrozenBase,
+        Self::Overlap,
         Self::FullShuttle,
         Self::TransparentShuttle,
     ];
@@ -35,8 +56,25 @@ impl Case {
             Self::Drain => "receive/drain/close",
             Self::Readonly => "readonly overlay",
             Self::Projection => "automatic projection over empty overlay",
+            Self::Funded => "funded takeover with a sole approval",
+            Self::Shared => "takeover merging a shared approval",
+            Self::Conflict => "takeover refused for conflicting approvals",
+            Self::FrozenOverlay => "funded takeover refused for a frozen overlay",
+            Self::FrozenBase => "funded takeover refused for a frozen base ATA",
+            Self::Overlap => "transfer and revoke overlapping takeover",
             Self::FullShuttle => "full shuttle withdrawal",
             Self::TransparentShuttle => "transparent shuttle withdrawal",
+        }
+    }
+
+    fn merged(self) -> Option<(u64, Option<(Pubkey, u64)>)> {
+        let funded = RECEIVE + DEPOSIT;
+        match self {
+            Self::Projection => Some((DEPOSIT, None)),
+            Self::Funded => Some((funded, Some((DELEGATE, ALLOWANCE)))),
+            Self::Shared => Some((funded, Some((DELEGATE, ALLOWANCE + DEPOSIT)))),
+            Self::Overlap => Some((funded - RETURNED, None)),
+            _ => None,
         }
     }
 }
@@ -96,16 +134,13 @@ impl MagicAtas<'_> {
         self.receive(destination, readonly.as_ref().map(|_| DEPOSIT)).await?;
         match case {
             Case::Drain | Case::Readonly => {
-                self.drain(destination).await?;
+                self.drain(destination, RECEIVE).await?;
                 self.close(destination, readonly.as_ref()).await?;
-            }
-            Case::Projection => {
-                self.drain(destination).await?;
-                self.project(destination).await?;
             }
             Case::FullShuttle | Case::TransparentShuttle => {
                 self.withdraw(destination, case == Case::TransparentShuttle).await?;
             }
+            _ => self.take_over(destination, case).await?,
         }
         self.check_conservation().await
     }
@@ -170,57 +205,86 @@ impl MagicAtas<'_> {
         Ok(())
     }
 
-    async fn drain(&self, destination: &Wallet) -> Result<()> {
+    async fn drain(&self, destination: &Wallet, drained: u64) -> Result<()> {
         let tokens = self.tokens;
         let er = &tokens.er;
         let source = &tokens.wallets[1];
         er.submit_and_confirm_with(
             &tokens.payer,
             &[&destination.owner],
-            &[destination.transfer_to(source, RECEIVE)],
+            &[destination.transfer_to(source, drained)],
         )
         .await?;
         ensure!(amount(er, &source.ata).await? == self.source_balance);
         Ok(())
     }
 
-    /// Requires delegated backing to replace an empty overlay without an explicit close.
-    async fn project(&mut self, destination: &Wallet) -> Result<()> {
+    async fn take_over(&mut self, destination: &Wallet, case: Case) -> Result<()> {
         let tokens = self.tokens;
         let er = &tokens.er;
-        tokens
-            .base
-            .submit_and_confirm_with(
-                &tokens.payer,
-                &[&destination.owner],
-                &[
-                    destination.create(tokens.payer.pubkey()),
-                    destination.mint_to(tokens.payer.pubkey(), DEPOSIT),
-                    destination.initialize(tokens.payer.pubkey()),
-                    destination.deposit(DEPOSIT),
-                    destination.delegate(tokens.payer.pubkey(), er.identity()),
-                ],
-            )
-            .await?;
+        let payer = tokens.payer.pubkey();
+        let owner = [&destination.owner];
+        if case == Case::Projection {
+            self.drain(destination, RECEIVE).await?;
+        } else {
+            let mut local = vec![destination.approve(DELEGATE, ALLOWANCE)];
+            local.extend((case == Case::FrozenOverlay).then(|| destination.freeze(payer)));
+            er.submit_and_confirm_with(&tokens.payer, &owner, &local).await?;
+        }
+        let overlay = er.account(&destination.ata).await?;
+        let mut backing = vec![destination.create(payer), destination.mint_to(payer, DEPOSIT)];
+        backing.extend([destination.initialize(payer), destination.deposit(DEPOSIT)]);
+        backing.extend(match case {
+            Case::Shared => Some(destination.approve(DELEGATE, 2 * DEPOSIT)),
+            Case::Conflict => Some(destination.approve(OTHER_DELEGATE, ALLOWANCE)),
+            Case::FrozenBase => Some(destination.freeze(payer)),
+            _ => None,
+        });
+        backing.push(destination.delegate(payer, er.identity()));
+        let delegation = tokens.base.submit_and_confirm_with(&tokens.payer, &owner, &backing);
+        if case == Case::Overlap {
+            let returned = [destination.transfer_to(&tokens.wallets[1], RETURNED)];
+            let transfer = er.submit_and_confirm_with(&tokens.payer, &owner, &returned);
+            tokio::try_join!(delegation, transfer)?;
+            er.submit_and_confirm_with(&tokens.payer, &owner, &[destination.revoke()])
+                .await?;
+        } else {
+            delegation.await?;
+        }
         self.supply += DEPOSIT;
-        self.extra_claims += DEPOSIT;
+        let Some((balance, approval)) = case.merged() else {
+            time::sleep(SETTLE).await;
+            ensure!(er.account(&destination.ata).await? == overlay);
+            self.source_balance -= RECEIVE;
+            self.extra_claims += RECEIVE + DEPOSIT;
+            return Ok(());
+        };
         let base_ata = tokens.base.account(&destination.ata).await?.context("base ATA missing")?;
         er.api()
             .await_accounts(
                 &[destination.ata],
-                "delegation replaces the empty Magic ATA without closing it",
+                "delegation takes over the Magic ATA without closing it",
                 |accounts| {
                     let account = accounts[0].as_ref().context("projection missing")?;
                     ensure!(!spl::is_magic_ata(&account.data));
                     ensure!(account.owner == spl::token_program());
                     ensure!(account.data.len() == spl::TOKEN_ACCOUNT_LEN);
                     ensure!(account.lamports == base_ata.lamports);
-                    ensure!(spl::account_balance(account) == Some(DEPOSIT));
+                    ensure!(spl::account_balance(account) == Some(balance));
+                    ensure!(spl::approval(&account.data) == approval);
                     Ok(())
                 },
             )
             .await?;
-        Ok(())
+        if case == Case::Funded {
+            let signature = tokens.commit(1, slice::from_ref(destination)).await?;
+            tokens.settled(&signature, &[destination.eata], false).await?;
+            ensure!(amount(tokens.base.as_ref(), &destination.eata).await? == balance);
+            time::sleep(SETTLE).await;
+            ensure!(amount(er, &destination.ata).await? == balance);
+        }
+        self.source_balance += DEPOSIT;
+        self.drain(destination, balance).await
     }
 
     /// Observes overlay closure before checking that the original base ATA becomes visible again.
