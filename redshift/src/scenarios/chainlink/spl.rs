@@ -17,6 +17,8 @@ pub(crate) const TOKEN_ACCOUNT_LEN: usize = 165;
 pub(crate) const MINT_OFFSET: usize = 0;
 pub(crate) const OWNER_OFFSET: usize = 32;
 const TOKEN_AMOUNT_OFFSET: usize = 64;
+const DELEGATE_OFFSET: usize = 72;
+const DELEGATED_AMOUNT_OFFSET: usize = 121;
 
 pub(crate) fn token_program() -> Pubkey {
     TOKEN_PROGRAM_ID
@@ -80,6 +82,15 @@ pub(crate) fn is_magic_ata(data: &[u8]) -> bool {
         && data.get(133..165) == Some(sdk_ids::sysvar::rent::ID.as_ref())
 }
 
+pub(crate) fn approval(data: &[u8]) -> Option<(Pubkey, u64)> {
+    if data.get(DELEGATE_OFFSET..DELEGATE_OFFSET + 4) != Some(1u32.to_le_bytes().as_slice()) {
+        return None;
+    }
+    let delegate = Pubkey::new_from_array(*data.get(DELEGATE_OFFSET + 4..)?.first_chunk()?);
+    let amount = u64::from_le_bytes(*data.get(DELEGATED_AMOUNT_OFFSET..)?.first_chunk()?);
+    Some((delegate, amount))
+}
+
 pub fn allocate_mint(payer: &Pubkey, mint: &Pubkey) -> Instruction {
     system::create_account(payer, mint, MINT_RENT, MINT_LEN, &token_program())
 }
@@ -87,7 +98,8 @@ pub fn allocate_mint(payer: &Pubkey, mint: &Pubkey) -> Instruction {
 pub fn initialize_mint(mint: &Pubkey, authority: &Pubkey) -> Instruction {
     let mut data = vec![20u8, 0u8];
     data.extend_from_slice(authority.as_ref());
-    data.push(0);
+    data.push(1);
+    data.extend_from_slice(authority.as_ref());
     Instruction {
         program_id: token_program(),
         accounts: vec![AccountMeta::new(*mint, false)],
@@ -173,6 +185,26 @@ pub(crate) fn approve(
             AccountMeta::new_readonly(*owner, true),
         ],
         data,
+    }
+}
+
+pub(crate) fn revoke(source: &Pubkey, owner: &Pubkey) -> Instruction {
+    Instruction {
+        program_id: token_program(),
+        accounts: vec![AccountMeta::new(*source, false), AccountMeta::new_readonly(*owner, true)],
+        data: vec![5],
+    }
+}
+
+pub(crate) fn freeze_account(account: &Pubkey, mint: &Pubkey, authority: &Pubkey) -> Instruction {
+    Instruction {
+        program_id: token_program(),
+        accounts: vec![
+            AccountMeta::new(*account, false),
+            AccountMeta::new_readonly(*mint, false),
+            AccountMeta::new_readonly(*authority, true),
+        ],
+        data: vec![10],
     }
 }
 

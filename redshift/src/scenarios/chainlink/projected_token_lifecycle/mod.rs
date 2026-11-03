@@ -108,6 +108,18 @@ impl Wallet {
         spl::deposit_spl_tokens(&self.owner.pubkey(), &self.mint, amount)
     }
 
+    fn approve(&self, delegate: Pubkey, amount: u64) -> Instruction {
+        spl::approve(&self.ata, &delegate, &self.owner.pubkey(), amount)
+    }
+
+    fn revoke(&self) -> Instruction {
+        spl::revoke(&self.ata, &self.owner.pubkey())
+    }
+
+    fn freeze(&self, authority: Pubkey) -> Instruction {
+        spl::freeze_account(&self.ata, &self.mint, &authority)
+    }
+
     fn ensure(&self, payer: Pubkey) -> Instruction {
         spl::ensure_magic_ata(payer, self.owner.pubkey(), self.mint)
     }
@@ -246,7 +258,7 @@ impl Scenario<(), Mode> for ProjectedTokenLifecycle {
         self.check_controls(2).await?;
         self.check_balances(&expected).await?;
         let eatas = [self.wallets[0].eata, self.wallets[1].eata];
-        self.settled(&self.commit(2).await?, &eatas, false).await?;
+        self.settled(&self.commit(2, &self.wallets[..2]).await?, &eatas, false).await?;
         expected.eatas[..2].copy_from_slice(&[Some(52), Some(248)]);
         self.check_balances(&expected).await?;
 
@@ -271,7 +283,7 @@ impl Scenario<(), Mode> for ProjectedTokenLifecycle {
         self.wallets[0].transfer(er, &self.wallets[1], 7).await?;
         expected.projected = [25, 255, 70, 5];
         self.check_balances(&expected).await?;
-        let signature = self.commit(3).await?;
+        let signature = self.commit(3, &self.wallets[..2]).await?;
         self.settled(&signature, &eatas, false).await?;
         expected.eatas[..2].copy_from_slice(&[Some(25), Some(255)]);
         self.check_balances(&expected).await?;
@@ -383,7 +395,7 @@ impl ProjectedTokenLifecycle {
                 .response()
                 .account(&self.wallets[0].eata),
         );
-        let signature = self.commit(1).await?;
+        let signature = self.commit(1, &self.wallets[..2]).await?;
         let held = submission.wait(TIMEOUT).await?;
         let landed = held.operation.signature()?;
         let tx = self.base.api().await_transaction(&landed).await?;
@@ -452,18 +464,15 @@ impl ProjectedTokenLifecycle {
         Ok(())
     }
 
-    async fn commit(&self, id: u64) -> Result<Signature> {
+    async fn commit(&self, id: u64, wallets: &[Wallet]) -> Result<Signature> {
+        let atas: Vec<_> = wallets.iter().map(|wallet| wallet.ata).collect();
         self.er
             .submit_and_confirm(
                 &self.validator,
                 &[REDLINE
                     .batch()
                     .nonce(id)
-                    .settle(
-                        self.validator.pubkey(),
-                        &[self.wallets[0].ata, self.wallets[1].ata],
-                        SettlementMode::Commit,
-                    )
+                    .settle(self.validator.pubkey(), &atas, SettlementMode::Commit)
                     .build()],
             )
             .await

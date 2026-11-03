@@ -34,8 +34,6 @@ const OWNER_B_BALANCE: u64 = 300;
 const OTHER_MINT_BALANCE: u64 = 70;
 const UNRELATED_BALANCE: u64 = 40;
 const DELEGATED_AMOUNT: u64 = 200;
-const DELEGATE_OFFSET: usize = 72;
-const DELEGATED_AMOUNT_OFFSET: usize = 121;
 const BURST_DEADLINE: Duration = Duration::from_secs(20);
 const NEGATIVE_DEADLINE: Duration = Duration::from_secs(5);
 
@@ -111,11 +109,6 @@ fn read_u64(data: &[u8], offset: usize) -> Option<u64> {
     ))
 }
 
-fn read_delegate(data: &[u8]) -> Option<Pubkey> {
-    let tag = u32::from_le_bytes(data.get(DELEGATE_OFFSET..DELEGATE_OFFSET + 4)?.try_into().ok()?);
-    (tag == 1).then(|| read_pubkey(data, DELEGATE_OFFSET + 4)).flatten()
-}
-
 fn raw_data(account: &UiAccount) -> Result<Vec<u8>> {
     match &account.data {
         UiAccountData::Binary(data, UiAccountEncoding::Base64) => Ok(STANDARD.decode(data)?),
@@ -165,14 +158,14 @@ fn token_view(account: &UiAccount) -> Result<TokenView> {
         UiAccountData::Binary(_, UiAccountEncoding::Base64) => {
             let data = raw_data(account)?;
             ensure!(data.len() == spl::TOKEN_ACCOUNT_LEN);
-            let delegate = read_delegate(&data);
+            let approval = spl::approval(&data);
             Ok(TokenView {
                 encoding: "base64",
                 mint: read_pubkey(&data, spl::MINT_OFFSET),
                 owner: read_pubkey(&data, spl::OWNER_OFFSET),
                 amount: read_u64(&data, 64),
-                delegate,
-                delegated_amount: delegate.and_then(|_| read_u64(&data, DELEGATED_AMOUNT_OFFSET)),
+                delegate: approval.map(|(delegate, _)| delegate),
+                delegated_amount: approval.map(|(_, amount)| amount),
             })
         }
         _ => Err(anyhow!("unsupported token account encoding")),
