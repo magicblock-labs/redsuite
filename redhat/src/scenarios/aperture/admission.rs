@@ -3,7 +3,6 @@ use super::{
     TIMEOUT,
 };
 use anyhow::{ensure, Context};
-use base64::{engine::general_purpose::STANDARD, Engine};
 use hash::Hash;
 use message::{Message, VersionedMessage};
 use redsuite_core::{
@@ -19,7 +18,6 @@ use signer::Signer;
 use solana_instruction_error::InstructionError;
 use std::{rc::Rc, time::Duration};
 use tracing::debug;
-use transaction::versioned::VersionedTransaction;
 
 /// Checks admission boundaries when account preparation fails or blockhashes are invalid.
 ///
@@ -153,18 +151,7 @@ impl Scenario for TransactionAdmission {
                         &[cold],
                     )
                     .await?;
-                message.recent_blockhash = hash;
-                let transaction = VersionedTransaction::try_new(
-                    VersionedMessage::Legacy(message.clone()),
-                    &[&fixture.payer],
-                )?;
-                let tx = Signed {
-                    encoded: STANDARD.encode(wincode::serialize(&transaction)?),
-                    signature: transaction.signatures[0],
-                    blockhash: hash,
-                    fee: 0,
-                    error: None,
-                };
+                let tx = fixture.signed_with(message.clone(), hash)?;
                 let before = fixture.snapshot(&[]).await?;
                 let trap = faults.intercept(
                     Selector::methods(&["getAccountInfo", "getMultipleAccounts"])

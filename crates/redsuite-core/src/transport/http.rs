@@ -2,7 +2,7 @@ use std::result;
 
 use anyhow::Context;
 use jsonrpc_core::Output;
-use reqwest::{Body, Client, RequestBuilder, StatusCode};
+use reqwest::{header::HeaderMap, Body, Client, RequestBuilder, StatusCode};
 use serde::{de::DeserializeOwned, Serialize};
 use solana_rpc_client_types::request::RpcRequest;
 use thiserror::Error;
@@ -13,6 +13,8 @@ use super::{
     NETWORK_TIMEOUT,
 };
 use crate::Result;
+
+const REMOTE_ACCOUNT_CLAIMS: &str = "x-mb-remote-account-claims";
 
 #[derive(Debug, Error)]
 pub enum TransportError {
@@ -34,22 +36,31 @@ pub async fn post_json(
     url: &Url,
     body: impl Into<Body>,
 ) -> result::Result<String, TransportError> {
+    Ok(post_headed(client, url, body).await?.1)
+}
+
+async fn post_headed(
+    client: &Client,
+    url: &Url,
+    body: impl Into<Body>,
+) -> result::Result<(HeaderMap, String), TransportError> {
     let request = client.post(url.clone()).header("content-type", "application/json").body(body);
     send(request).await
 }
 
 pub async fn get(client: &Client, url: &Url) -> result::Result<String, TransportError> {
-    send(client.get(url.clone())).await
+    Ok(send(client.get(url.clone())).await?.1)
 }
 
-async fn send(request: RequestBuilder) -> result::Result<String, TransportError> {
+async fn send(request: RequestBuilder) -> result::Result<(HeaderMap, String), TransportError> {
     let response = request.send().await?;
     let status = response.status();
+    let headers = response.headers().clone();
     let text = response.text().await?;
     if !status.is_success() {
         return Err(TransportError::Status { status, body: text });
     }
-    Ok(text)
+    Ok((headers, text))
 }
 
 #[derive(Clone)]
@@ -76,10 +87,18 @@ impl RpcClient {
         method: RpcRequest,
         body: impl Into<Body>,
     ) -> Result<T> {
-        let text = post_json(&self.client, &self.url, body)
+        Ok(self.post_headed(method, body).await?.1)
+    }
+
+    async fn post_headed<T: DeserializeOwned>(
+        &self,
+        method: RpcRequest,
+        body: impl Into<Body>,
+    ) -> Result<(HeaderMap, T)> {
+        let (headers, text) = post_headed(&self.client, &self.url, body)
             .await
             .with_context(|| method.to_string())?;
-        Ok(json::from_str(&text)?)
+        Ok((headers, json::from_str(&text)?))
     }
 
     pub async fn try_call<T: DeserializeOwned>(
@@ -87,13 +106,34 @@ impl RpcClient {
         method: RpcRequest,
         params: &impl Serialize,
     ) -> Result<result::Result<T, RpcError>> {
+        Ok(self.try_call_headed(method, params).await?.1)
+    }
+
+    pub async fn try_call_claimed<T: DeserializeOwned>(
+        &self,
+        method: RpcRequest,
+        params: &impl Serialize,
+    ) -> Result<(u64, result::Result<T, RpcError>)> {
+        let (headers, result) = self.try_call_headed(method, params).await?;
+        let claims = headers
+            .get(REMOTE_ACCOUNT_CLAIMS)
+            .context("remote account claims header missing")?
+            .to_str()?
+            .parse()?;
+        Ok((claims, result))
+    }
+
+    async fn try_call_headed<T: DeserializeOwned>(
+        &self,
+        method: RpcRequest,
+        params: &impl Serialize,
+    ) -> Result<(HeaderMap, result::Result<T, RpcError>)> {
         let body = rpc::encode_request(1, method, params)?;
-        match self.post(method, body).await? {
-            Output::Success(reply) => {
-                let result = serde_json::from_value(reply.result)?;
-                Ok(Ok(result))
-            }
-            Output::Failure(reply) => Ok(Err(RpcError { error: reply.error, method })),
-        }
+        let (headers, output) = self.post_headed(method, body).await?;
+        let result = match output {
+            Output::Success(reply) => Ok(serde_json::from_value(reply.result)?),
+            Output::Failure(reply) => Err(RpcError { error: reply.error, method }),
+        };
+        Ok((headers, result))
     }
 }

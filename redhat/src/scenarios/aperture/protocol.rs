@@ -2,8 +2,6 @@ use std::{io, rc::Rc, result, time::Duration};
 
 use anyhow::{ensure, Context};
 use base64::{engine::general_purpose::STANDARD, Engine};
-use json::JsonValueTrait;
-use message::VersionedMessage;
 use serde_json::{json, Value};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -21,12 +19,13 @@ use redsuite_core::{
     wait, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
 
-use super::{fixture::Fixture, TIMEOUT};
+use super::{
+    fixture::{notified_data, Fixture},
+    BODY_LIMIT, QUERY_LIMIT, TIMEOUT,
+};
 
 const FLOOD: usize = 64;
 const NESTING: usize = 256;
-const BODY_LIMIT: usize = 1024 * 1024;
-const QUERY_LIMIT: usize = 100;
 const FRAME_ID: u64 = 9_001;
 const FRAME_WAIT: Duration = Duration::from_secs(3);
 
@@ -100,11 +99,6 @@ fn slot_reply(reply: Option<&str>) -> Result<bool> {
 
 fn slot_request(id: u64) -> String {
     format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"getSlot","params":[]}}"#)
-}
-
-fn notified_data(payload: &json::Value) -> Result<Vec<u8>> {
-    let encoded = payload["value"]["data"][0].as_str().context("notification data missing")?;
-    Ok(STANDARD.decode(encoded)?)
 }
 
 impl ProtocolInputs {
@@ -347,7 +341,7 @@ impl ProtocolInputs {
             }
         }
 
-        let expected = self.write(fixture, 7_100, 3).await?;
+        let expected = fixture.write(7_100, 3).await?;
         let mut pending = ids[..4].to_vec();
         time::timeout(TIMEOUT, async {
             while !pending.is_empty() {
@@ -373,39 +367,6 @@ impl ProtocolInputs {
         victim.close().await?;
         self.healthy().await
     }
-
-    async fn write(&self, fixture: &mut Fixture, nonce: u64, amount: u64) -> Result<Vec<u8>> {
-        let message = fixture.message(nonce, amount as i64, &[]).await?;
-        fixture
-            .check_control(VersionedMessage::Legacy(message), amount, 1, false)
-            .await?;
-        Ok(fixture.expected[1].as_ref().context("cell expectation missing")?.data.clone())
-    }
-
-    /// Proves that an established subscription still observes a newly confirmed write.
-    async fn confirmed_write(
-        &self,
-        fixture: &mut Fixture,
-        control: &mut RawWs,
-        subscription: u64,
-        nonce: u64,
-    ) -> Result<()> {
-        time::timeout(TIMEOUT, async {
-            let expected = self.write(fixture, nonce, 5).await?;
-            loop {
-                let (method, id, payload) = control
-                    .next_notification(TIMEOUT)
-                    .await?
-                    .context("control notification lost during hostile protocol inputs")?;
-                ensure!(method == "accountNotification" && id == subscription);
-                if notified_data(&payload)? == expected {
-                    return Ok(());
-                }
-            }
-        })
-        .await
-        .context("control write exceeded the confirmation deadline")?
-    }
 }
 
 impl Scenario for ProtocolInputs {
@@ -421,17 +382,17 @@ impl Scenario for ProtocolInputs {
         let subscription = control.account_subscribe(&fixture.keys[1]).await?;
 
         self.http_cases().await?;
-        self.confirmed_write(&mut fixture, &mut control, subscription, 7_001).await?;
+        fixture.confirmed_write(&mut control, subscription, 7_001).await?;
 
         self.size_cases().await?;
-        self.confirmed_write(&mut fixture, &mut control, subscription, 7_002).await?;
+        fixture.confirmed_write(&mut control, subscription, 7_002).await?;
 
         self.request_cases(&mut rng).await?;
-        self.confirmed_write(&mut fixture, &mut control, subscription, 7_003).await?;
+        fixture.confirmed_write(&mut control, subscription, 7_003).await?;
 
         self.frame_cases(&fixture).await?;
         self.socket_cases(&mut fixture).await?;
-        self.confirmed_write(&mut fixture, &mut control, subscription, 7_004).await?;
+        fixture.confirmed_write(&mut control, subscription, 7_004).await?;
 
         self.query_cases(&fixture)
             .await

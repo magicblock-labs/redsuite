@@ -22,6 +22,7 @@ use solana_instruction_error::InstructionError;
 use crate::PAYER_LAMPORTS;
 
 mod callbacks;
+mod capacity;
 mod commits;
 mod fee_roles;
 
@@ -446,7 +447,8 @@ impl Scenario for SettlementAuthorization {
         self.check_fee_roles().await?;
         self.check_commit_ordering().await.context("#243: successor ordering")?;
         self.check_buffers().await.context("#244: buffered settlement")?;
-        self.check_callbacks().await.context("#255: callback provenance")
+        self.check_callbacks().await.context("#255: callback provenance")?;
+        self.check_capacity().await.context("#260: shared settlement capacity")
     }
 }
 

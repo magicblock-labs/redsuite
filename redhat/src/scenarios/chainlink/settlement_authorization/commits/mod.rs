@@ -22,7 +22,7 @@ use transaction::Transaction;
 
 const CHUNK: usize = 256;
 
-mod buffers;
+pub(super) mod buffers;
 
 /// Seeded successor-nonce probes shared by inline and buffered commit paths.
 pub(super) struct Plan {

@@ -107,13 +107,29 @@ impl Signed {
         er: &ErCtx,
         skip_preflight: bool,
     ) -> Result<result::Result<String, RpcError>> {
+        er.api()
+            .try_call(RpcRequest::SendTransaction, &self.params(skip_preflight))
+            .await
+    }
+
+    pub async fn send_claimed(
+        &self,
+        er: &ErCtx,
+        skip_preflight: bool,
+    ) -> Result<(u64, result::Result<String, RpcError>)> {
+        er.api()
+            .try_call_claimed(RpcRequest::SendTransaction, &self.params(skip_preflight))
+            .await
+    }
+
+    fn params(&self, skip_preflight: bool) -> (&str, RpcSendTransactionConfig) {
         let config = RpcSendTransactionConfig {
             encoding: Some(UiTransactionEncoding::Base64),
             skip_preflight,
             max_retries: Some(0),
             ..RpcSendTransactionConfig::default()
         };
-        er.api().try_call(RpcRequest::SendTransaction, &(&self.encoded, config)).await
+        (&self.encoded, config)
     }
 
     pub async fn valid(&self, er: &ErCtx) -> Result<bool> {

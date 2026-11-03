@@ -22,7 +22,7 @@ use std::time::Duration;
 use transaction::Transaction;
 
 /// Routes a result callback through the protocol callback signer to a writable fixture cell.
-fn callback_args(cell: Pubkey, action_index: u8) -> Result<AddActionCallbackArgs> {
+pub(super) fn callback_args(cell: Pubkey, action_index: u8) -> Result<AddActionCallbackArgs> {
     Ok(AddActionCallbackArgs {
         action_index,
         destination_program: REDSHIFT.id(),
@@ -45,7 +45,7 @@ fn callback_args(cell: Pubkey, action_index: u8) -> Result<AddActionCallbackArgs
 
 /// Settlement contexts whose callback attachment and execution rules are compared.
 #[derive(Clone, Copy, Debug)]
-enum CallbackCategory {
+pub(super) enum CallbackCategory {
     Commit,
     Standalone,
     Undelegate,
@@ -59,10 +59,10 @@ pub(super) struct Plan {
     leads: [u8; 2],
     gap: u64,
     padding: u8,
-    funder: Keypair,
-    payer: Keypair,
+    pub(super) funder: Keypair,
+    pub(super) payer: Keypair,
     alternate: Keypair,
-    cells: [Pubkey; 2],
+    pub(super) cells: [Pubkey; 2],
     handoff: Pubkey,
 }
 
@@ -108,7 +108,7 @@ pub(super) fn plan(seed: u64) -> Plan {
 }
 
 /// Builds commit, undelegation, or standalone action intents with optional attached callbacks.
-fn scheduled(
+pub(super) fn scheduled(
     payer: Pubkey,
     validator: Pubkey,
     cells: &[Pubkey],

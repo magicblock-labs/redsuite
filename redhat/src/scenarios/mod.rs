@@ -3,7 +3,7 @@ pub mod chainlink;
 pub mod magicblock;
 use aperture::{
     ProtocolInputs, SimulationIsolation, TransactionAdmission, TransactionAuthority,
-    TransactionStructure,
+    TransactionStructure, UnpaidWork,
 };
 use magicblock_config::types::Remote;
 use redshift::scenarios::replication::replication_recovery::{Coverage, ReplicationRecovery};
@@ -72,6 +72,10 @@ pub fn catalog() -> Vec<ScenarioEntry> {
         ),
         scenario!(
             TransactionAdmission,
+            exclusive(&PREPARATION, &[Fixture::RedshiftProgram], ())
+        ),
+        scenario!(
+            UnpaidWork,
             exclusive(&PREPARATION, &[Fixture::RedshiftProgram], ())
         ),
         scenario!(
