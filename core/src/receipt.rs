@@ -26,6 +26,8 @@ const LOG_MARKER: &str = "ScheduledCommitSent ";
 
 const SCHEDULE_MARKER: &str = "Scheduled commit with ID: ";
 
+const OUTBOX_MARKER: &str = "ScheduledCommitSent outbox: ";
+
 const RECEIPT_HISTORY_LIMIT: usize = 64;
 
 #[derive(Debug)]
@@ -42,8 +44,15 @@ pub struct CommitReceipt {
     pub receipt_err_code: Option<u32>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReceiptTarget {
+    Signature(Signature),
+    Outbox { address: Pubkey, intent_id: u64 },
+}
+
 /// Live scheduling and receipt observations armed before submitting a commit.
 pub struct CommitWatch {
+    api: Api,
     scheduling: Subscription<Response<RpcLogsResponse>>,
     receipts: Subscription<Response<RpcLogsResponse>>,
     deadline: time::Instant,
@@ -55,7 +64,12 @@ impl CommitWatch {
         let events = er.api().events().await?;
         let scheduling = events.logs(payer).await?;
         let receipts = events.logs(&er.identity()).await?;
-        Ok(Self { scheduling, receipts, deadline })
+        Ok(Self {
+            api: er.api().clone(),
+            scheduling,
+            receipts,
+            deadline,
+        })
     }
 
     pub async fn check(
@@ -72,14 +86,21 @@ impl CommitWatch {
                 "scheduling failed: {:?}",
                 scheduling.err
             );
-            let receipt_signature = receipt_signature_in_logs(&scheduling.logs)
-                .context("missing ScheduledCommitSent signature")?;
-            let receipt = self.receipts.for_signature(&receipt_signature).await?;
-            let receipt = parse_logs(
-                receipt_signature,
-                &receipt.logs,
-                receipt.err.and_then(custom_error_code),
-            );
+            let target = receipt_target_in_logs(&scheduling.logs)
+                .context("scheduling logs carry no receipt target")?;
+            let receipt = match target {
+                ReceiptTarget::Signature(receipt_signature) => {
+                    let receipt = self.receipts.for_signature(&receipt_signature).await?;
+                    parse_logs(
+                        receipt_signature,
+                        &receipt.logs,
+                        receipt.err.and_then(custom_error_code),
+                    )
+                }
+                ReceiptTarget::Outbox { address, intent_id } => {
+                    fetch_commit_receipt_by_intent(&self.api, &address, intent_id).await?
+                }
+            };
             receipt.verify(base, expected, undelegate).await?;
             Ok(receipt)
         })
@@ -179,8 +200,21 @@ fn strip_program_prefix(line: &str) -> &str {
     line.strip_prefix("Program log: ").unwrap_or(line)
 }
 
-// From the SCHEDULING tx's logs: the receipt signature announced at CPI time.
-pub fn receipt_signature_in_logs(logs: &[String]) -> Option<Signature> {
+// The old protocol announces a receipt signature; the new protocol announces
+// the outbox account whose history will contain the completion transaction.
+pub fn receipt_target_in_logs(logs: &[String]) -> Option<ReceiptTarget> {
+    if let Some(address) = logs.iter().find_map(|line| {
+        strip_program_prefix(line).strip_prefix(OUTBOX_MARKER)?.trim().parse().ok()
+    }) {
+        return Some(ReceiptTarget::Outbox {
+            address,
+            intent_id: intent_id_in_logs(logs)?,
+        });
+    }
+    receipt_signature_in_logs(logs).map(ReceiptTarget::Signature)
+}
+
+fn receipt_signature_in_logs(logs: &[String]) -> Option<Signature> {
     logs.iter().find_map(|line| {
         let rest = strip_program_prefix(line).strip_prefix("ScheduledCommitSent signature: ")?;
         rest.trim().parse().ok()
@@ -255,24 +289,57 @@ fn parse_logs(
     receipt
 }
 
-pub async fn scheduled_receipt_signature(
+pub async fn scheduled_receipt_target(
     er: &Api,
     commit_signature: &Signature,
-) -> Result<Signature> {
+) -> Result<ReceiptTarget> {
     let commit_tx = er.await_transaction(commit_signature).await?;
     let meta = transaction_meta(&commit_tx)?;
     ensure!(meta.err == None);
-    receipt_signature_in_logs(transaction_logs(meta))
-        .ok_or_else(|| anyhow!("missing ScheduledCommitSent signature"))
+    receipt_target_in_logs(transaction_logs(meta))
+        .ok_or_else(|| anyhow!("missing scheduled receipt target"))
 }
 
 pub async fn fetch_commit_receipt(er: &Api, commit_signature: &Signature) -> Result<CommitReceipt> {
-    let receipt_signature = scheduled_receipt_signature(er, commit_signature).await?;
-    let receipt_tx = er.await_transaction(&receipt_signature).await?;
-    Ok(parse_receipt(
-        receipt_signature,
-        transaction_meta(&receipt_tx)?,
-    ))
+    let target = scheduled_receipt_target(er, commit_signature).await?;
+    fetch_receipt_for_target(er, target).await
+}
+
+pub async fn fetch_receipt_for_target(er: &Api, target: ReceiptTarget) -> Result<CommitReceipt> {
+    match target {
+        ReceiptTarget::Signature(signature) => {
+            let tx = er.await_transaction(&signature).await?;
+            Ok(parse_receipt(signature, transaction_meta(&tx)?))
+        }
+        ReceiptTarget::Outbox { address, intent_id } => {
+            fetch_commit_receipt_by_intent(er, &address, intent_id).await
+        }
+    }
+}
+
+/// Returns a receipt only if the completion transaction is already visible.
+pub async fn receipt_for_target_if_present(
+    er: &Api,
+    target: ReceiptTarget,
+) -> Result<Option<CommitReceipt>> {
+    match target {
+        ReceiptTarget::Signature(signature) => er
+            .get_transaction(&signature)
+            .await?
+            .map(|tx| Ok(parse_receipt(signature, transaction_meta(&tx)?)))
+            .transpose(),
+        ReceiptTarget::Outbox { address, intent_id } => {
+            for signature in er.get_signatures_for_address(&address, RECEIPT_HISTORY_LIMIT).await? {
+                if let Some(tx) = er.get_transaction(&signature).await? {
+                    let receipt = parse_receipt(signature, transaction_meta(&tx)?);
+                    if receipt.commit_id == Some(intent_id) {
+                        return Ok(Some(receipt));
+                    }
+                }
+            }
+            Ok(None)
+        }
+    }
 }
 
 pub async fn scheduled_intent_id(er: &Api, commit_signature: &Signature) -> Result<u64> {
@@ -323,5 +390,39 @@ pub async fn fetch_commit_receipt_by_intent(
         Ok(result) => result,
         Err(timeout_error) => Err(last_fetch_error.unwrap_or_else(|| timeout_error.into()))
             .context("commit receipt not published"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{receipt_target_in_logs, ReceiptTarget};
+    use pubkey::Pubkey;
+    use signature::Signature;
+
+    #[test]
+    fn scheduling_logs_identify_legacy_and_outbox_receipts() {
+        let signature = Signature::default();
+        let legacy = [format!("Program log: ScheduledCommitSent signature: {signature}")];
+        assert_eq!(
+            receipt_target_in_logs(&legacy),
+            Some(ReceiptTarget::Signature(signature))
+        );
+
+        let address = Pubkey::default();
+        let outbox = [
+            "Scheduled commit with ID: 42".to_owned(),
+            format!("Program log: ScheduledCommitSent outbox: {address}"),
+        ];
+        assert_eq!(
+            receipt_target_in_logs(&outbox),
+            Some(ReceiptTarget::Outbox { address, intent_id: 42 })
+        );
+    }
+
+    #[test]
+    fn outbox_receipt_requires_scheduled_intent_id() {
+        let address = Pubkey::default();
+        let logs = [format!("ScheduledCommitSent outbox: {address}")];
+        assert_eq!(receipt_target_in_logs(&logs), None);
     }
 }
