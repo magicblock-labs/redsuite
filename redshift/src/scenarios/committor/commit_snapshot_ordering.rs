@@ -151,6 +151,7 @@ impl CommitSnapshotOrdering {
         receipt.check_success(phase)?;
         if let Err(error) = receipt.check_included(expected) {
             let scheduled = self.er.api().await_transaction(commit_signature).await?;
+            let completed = self.er.api().await_transaction(&receipt.signature).await?;
             let targets: Vec<_> = transaction_logs(transaction_meta(&scheduled)?)
                 .iter()
                 .filter(|line| {
@@ -159,8 +160,8 @@ impl CommitSnapshotOrdering {
                 })
                 .collect();
             return Err(error).context(format!(
-                "schedule {commit_signature}, receipt intent {:?}, scheduling targets {targets:?}",
-                receipt.commit_id
+                "schedule {commit_signature} at slot {}, receipt {} at slot {} for intent {:?}, scheduling targets {targets:?}",
+                scheduled.slot, receipt.signature, completed.slot, receipt.commit_id
             ));
         }
         receipt.confirm(self.base.api()).await?;
