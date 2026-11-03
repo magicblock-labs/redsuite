@@ -304,8 +304,7 @@ impl ProtocolInputs {
         for (label, frame, expected) in frames {
             let mut socket = RawWs::connect(self.er.ws_url()).await?;
             let bytes = frame.len();
-            socket.send_text(frame).await?;
-            let survived = socket.responsive(&cell).await;
+            let survived = socket.send_text(frame).await.is_ok() && socket.responsive(&cell).await;
             debug!(case = label, bytes, survived, "hostile socket frame");
             if let Some(expected) = expected {
                 ensure!(
