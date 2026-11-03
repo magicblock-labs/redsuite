@@ -4,12 +4,15 @@ use anyhow::{anyhow, ensure, Context};
 use pubkey::Pubkey;
 use signature::Signature;
 use solana_rpc_client_types::response::{Response, RpcLogsResponse};
-use solana_transaction_status_client_types::UiTransactionStatusMeta;
+use solana_transaction_status_client_types::{
+    EncodedConfirmedTransactionWithStatusMeta, UiTransactionStatusMeta,
+};
 use tokio::time;
 use tracing::warn;
 
 use crate::{
     api::{custom_error_code, transaction_logs, transaction_meta, Api},
+    topology,
     transport::{events::Subscription, NETWORK_TIMEOUT},
     BaseCtx, ChainCtx, ErCtx, Result,
 };
@@ -249,6 +252,29 @@ pub fn parse_receipt(signature: Signature, receipt_tx: &UiTransactionStatusMeta)
     )
 }
 
+// Address history also contains acceptance, progress, and failed transactions.
+// Only a successful outbox-program transaction with receipt logs is a completion.
+fn parse_outbox_completion(
+    signature: Signature,
+    transaction: &EncodedConfirmedTransactionWithStatusMeta,
+) -> Result<Option<CommitReceipt>> {
+    let meta = transaction_meta(transaction)?;
+    if meta.err.is_some() {
+        return Ok(None);
+    }
+    let Some(decoded) = transaction.transaction.transaction.decode() else {
+        return Ok(None);
+    };
+    let keys = decoded.message.static_account_keys();
+    if !decoded.message.instructions().iter().any(|instruction| {
+        keys.get(instruction.program_id_index as usize) == Some(&topology::OUTBOX_INTENT_ID)
+    }) {
+        return Ok(None);
+    }
+    let receipt = parse_receipt(signature, meta);
+    Ok(receipt.commit_id.map(|_| receipt))
+}
+
 fn parse_logs(
     signature: Signature,
     logs: &[String],
@@ -335,7 +361,9 @@ pub async fn receipt_for_target_if_present(
         ReceiptTarget::Outbox { address, intent_id } => {
             for signature in er.get_signatures_for_address(&address, RECEIPT_HISTORY_LIMIT).await? {
                 if let Some(tx) = er.get_transaction(&signature).await? {
-                    let receipt = parse_receipt(signature, transaction_meta(&tx)?);
+                    let Some(receipt) = parse_outbox_completion(signature, &tx)? else {
+                        continue;
+                    };
                     if receipt.commit_id == Some(intent_id) {
                         return Ok(Some(receipt));
                     }
@@ -368,7 +396,10 @@ pub async fn fetch_commit_receipt_by_intent(
             for signature in mem::take(&mut pending) {
                 match er.get_transaction(&signature).await {
                     Ok(Some(transaction)) => {
-                        let receipt = parse_receipt(signature, transaction_meta(&transaction)?);
+                        let Some(receipt) = parse_outbox_completion(signature, &transaction)?
+                        else {
+                            continue;
+                        };
                         if receipt.commit_id == Some(intent_id) {
                             return Ok(receipt);
                         }
