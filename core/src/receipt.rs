@@ -144,7 +144,11 @@ impl CommitReceipt {
         included.sort();
         let mut expected = expected.to_vec();
         expected.sort();
-        ensure!(included == expected);
+        ensure!(
+            included == expected,
+            "receipt {} included {included:?}, expected {expected:?}",
+            self.signature
+        );
         Ok(())
     }
 
