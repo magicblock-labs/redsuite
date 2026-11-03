@@ -511,7 +511,8 @@ impl SettlementLifecycle {
         );
 
         let receipt_target = receipt::receipt_target_in_logs(logs)
-            .context("the failed tx logs carry no receipt target")?;
+            .context("the failed tx logs carry no receipt target")?
+            .after_slot(tx.slot);
         time::sleep(ROLLBACK_SETTLE).await;
         ensure!(
             receipt::receipt_for_target_if_present(self.er.api(), receipt_target)

@@ -50,7 +50,19 @@ pub struct CommitReceipt {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReceiptTarget {
     Signature(Signature),
-    Outbox { address: Pubkey, intent_id: u64 },
+    Outbox { address: Pubkey, intent_id: u64, min_slot: u64 },
+}
+
+impl ReceiptTarget {
+    /// Ignore receipts completed before this scheduling transaction.
+    pub fn after_slot(self, min_slot: u64) -> Self {
+        match self {
+            Self::Outbox { address, intent_id, .. } => {
+                Self::Outbox { address, intent_id, min_slot }
+            }
+            signature => signature,
+        }
+    }
 }
 
 /// Live scheduling and receipt observations armed before submitting a commit.
@@ -91,6 +103,11 @@ impl CommitWatch {
             );
             let target = receipt_target_in_logs(&scheduling.logs)
                 .context("scheduling logs carry no receipt target")?;
+            let target = if matches!(target, ReceiptTarget::Outbox { .. }) {
+                target.after_slot(self.api.await_transaction(signature).await?.slot)
+            } else {
+                target
+            };
             let receipt = match target {
                 ReceiptTarget::Signature(receipt_signature) => {
                     let receipt = self.receipts.for_signature(&receipt_signature).await?;
@@ -100,8 +117,8 @@ impl CommitWatch {
                         receipt.err.and_then(custom_error_code),
                     )
                 }
-                ReceiptTarget::Outbox { address, intent_id } => {
-                    fetch_commit_receipt_by_intent(&self.api, &address, intent_id).await?
+                ReceiptTarget::Outbox { address, intent_id, min_slot } => {
+                    fetch_commit_receipt_by_intent(&self.api, &address, intent_id, min_slot).await?
                 }
             };
             receipt.verify(base, expected, undelegate).await?;
@@ -216,6 +233,7 @@ pub fn receipt_target_in_logs(logs: &[String]) -> Option<ReceiptTarget> {
         return Some(ReceiptTarget::Outbox {
             address,
             intent_id: intent_id_in_logs(logs)?,
+            min_slot: 0,
         });
     }
     receipt_signature_in_logs(logs).map(ReceiptTarget::Signature)
@@ -327,6 +345,7 @@ pub async fn scheduled_receipt_target(
     let meta = transaction_meta(&commit_tx)?;
     ensure!(meta.err == None);
     receipt_target_in_logs(transaction_logs(meta))
+        .map(|target| target.after_slot(commit_tx.slot))
         .ok_or_else(|| anyhow!("missing scheduled receipt target"))
 }
 
@@ -341,8 +360,8 @@ pub async fn fetch_receipt_for_target(er: &Api, target: ReceiptTarget) -> Result
             let tx = er.await_transaction(&signature).await?;
             Ok(parse_receipt(signature, transaction_meta(&tx)?))
         }
-        ReceiptTarget::Outbox { address, intent_id } => {
-            fetch_commit_receipt_by_intent(er, &address, intent_id).await
+        ReceiptTarget::Outbox { address, intent_id, min_slot } => {
+            fetch_commit_receipt_by_intent(er, &address, intent_id, min_slot).await
         }
     }
 }
@@ -358,9 +377,12 @@ pub async fn receipt_for_target_if_present(
             .await?
             .map(|tx| Ok(parse_receipt(signature, transaction_meta(&tx)?)))
             .transpose(),
-        ReceiptTarget::Outbox { address, intent_id } => {
+        ReceiptTarget::Outbox { address, intent_id, min_slot } => {
             for signature in er.get_signatures_for_address(&address, RECEIPT_HISTORY_LIMIT).await? {
                 if let Some(tx) = er.get_transaction(&signature).await? {
+                    if tx.slot < min_slot {
+                        continue;
+                    }
                     let Some(receipt) = parse_outbox_completion(signature, &tx)? else {
                         continue;
                     };
@@ -384,6 +406,7 @@ pub async fn fetch_commit_receipt_by_intent(
     er: &Api,
     validator: &Pubkey,
     intent_id: u64,
+    min_slot: u64,
 ) -> Result<CommitReceipt> {
     let mut last_fetch_error = None;
     let result = time::timeout(NETWORK_TIMEOUT, async {
@@ -396,6 +419,9 @@ pub async fn fetch_commit_receipt_by_intent(
             for signature in mem::take(&mut pending) {
                 match er.get_transaction(&signature).await {
                     Ok(Some(transaction)) => {
+                        if transaction.slot < min_slot {
+                            continue;
+                        }
                         let Some(receipt) = parse_outbox_completion(signature, &transaction)?
                         else {
                             continue;
@@ -425,7 +451,7 @@ pub async fn fetch_commit_receipt_by_intent(
         Ok(result) => result,
         Err(timeout_error) => Err(last_fetch_error.unwrap_or_else(|| timeout_error.into()))
             .with_context(|| {
-                format!("commit receipt for intent {intent_id} at {validator} not published")
+                format!("commit receipt for intent {intent_id} at {validator} after slot {min_slot} not published")
             }),
     }
 }
@@ -452,7 +478,11 @@ mod tests {
         ];
         assert_eq!(
             receipt_target_in_logs(&outbox),
-            Some(ReceiptTarget::Outbox { address, intent_id: 42 })
+            Some(ReceiptTarget::Outbox {
+                address,
+                intent_id: 42,
+                min_slot: 0
+            })
         );
     }
 

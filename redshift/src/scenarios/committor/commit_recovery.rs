@@ -282,6 +282,7 @@ impl CommitFixture {
                         self.er.api(),
                         &self.er.identity(),
                         intent_id,
+                        0,
                     )
                     .await?
                 }
