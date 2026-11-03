@@ -351,6 +351,12 @@ pub(super) fn config_path(dir: &Path, label: &str) -> PathBuf {
     dir.join(format!("er-{label}.toml"))
 }
 
+pub(super) fn er_rust_log(label: &str) -> Option<String> {
+    let value = env::var("REDSUITE_ER_RUST_LOG").ok()?;
+    let (labels, filter) = value.split_once(':')?;
+    labels.split(',').any(|target| target == label).then(|| filter.to_owned())
+}
+
 pub(super) struct ErPorts {
     pub(super) rpc: u16,
     pub(super) metrics: u16,
@@ -422,6 +428,7 @@ pub(super) struct Plan<P> {
     pub(super) bin: PathBuf,
     pub(super) config_path: PathBuf,
     pub(super) params: P,
+    pub(super) rust_log: Option<String>,
 }
 
 pub(super) type ErPlan = Plan<LeaderParams>;
@@ -436,7 +443,9 @@ impl<P: Serialize> Plan<P> {
                 cmd.env_remove(&key);
             }
         }
-        if env::var_os("RUST_LOG").is_none() {
+        if let Some(filter) = &self.rust_log {
+            cmd.env("RUST_LOG", filter);
+        } else if env::var_os("RUST_LOG").is_none() {
             cmd.env("RUST_LOG", "info");
         }
         cmd

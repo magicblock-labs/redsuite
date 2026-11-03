@@ -21,6 +21,7 @@ use redsuite_core::{
 use signature::Signature;
 use signer::Signer;
 use tokio::time;
+use tracing::{info, warn};
 
 use crate::PAYER_LAMPORTS;
 
@@ -150,6 +151,29 @@ async fn recover_session_a_commit_after_lost_response(
     Ok(())
 }
 
+async fn report_inactive_delegation(
+    base: &BaseCtx,
+    er: &ErCtx,
+    account: &Pubkey,
+    delegation: &Signature,
+    case: u64,
+) {
+    let delegation_slot = base.api().await_transaction(delegation).await.map(|tx| tx.slot).ok();
+    let on_base = base.account(account).await.ok().flatten();
+    let on_er = er.account(account).await.ok().flatten();
+    warn!(
+        case,
+        cell = %account,
+        delegated_to = %er.identity(),
+        delegation_slot = ?delegation_slot,
+        base_owner = ?on_base.as_ref().map(|account| account.owner),
+        base_value = ?on_base.as_ref().and_then(|account| count(&account.data).ok()),
+        er_owner = ?on_er.as_ref().map(|account| account.owner),
+        er_value = ?on_er.as_ref().and_then(|account| count(&account.data).ok()),
+        "session-b er did not activate the delegation"
+    );
+}
+
 /// Reassigns an account after undelegation, then releases old notifications and
 /// restarts the old ER.
 /// `er_b = None` exercises reuse of the same validator; otherwise ownership moves to another ER.
@@ -169,6 +193,7 @@ async fn isolate(
         .context("no cell was created")?;
     let authority = cell.authority.pubkey();
     let account = cell.address;
+    info!(case, cell = %account, er_a = %er_a.identity(), "isolation cell created");
     er_a.ctx().await_cells(slice::from_ref(&cell)).await?;
 
     let staged = value(case, 1);
@@ -194,17 +219,18 @@ async fn isolate(
     let base_value = value(case, 2);
     write(base, payer, &account, base_value).await?;
     let session_b = er_b.unwrap_or_else(|| er_a.ctx());
-    base.submit_and_confirm_with(
-        payer,
-        &[&cell.authority],
-        &[REDSHIFT.delegate(
-            payer.pubkey(),
-            CellId::new(authority, 0),
-            Some(session_b.identity()),
-            prep::COMMIT_FREQUENCY_MS,
-        )],
-    )
-    .await?;
+    let delegation = base
+        .submit_and_confirm_with(
+            payer,
+            &[&cell.authority],
+            &[REDSHIFT.delegate(
+                payer.pubkey(),
+                CellId::new(authority, 0),
+                Some(session_b.identity()),
+                prep::COMMIT_FREQUENCY_MS,
+            )],
+        )
+        .await?;
     await_base(
         base,
         &account,
@@ -214,9 +240,13 @@ async fn isolate(
     )
     .await?;
     await_clone_count(session_b, &account, base_value).await?;
-    session_b
+    if let Err(error) = session_b
         .await_delegated(&account, "session-b er activates the cell as delegated")
-        .await?;
+        .await
+    {
+        report_inactive_delegation(base, session_b, &account, &delegation, case).await;
+        return Err(error);
+    }
     let er_value = value(case, 3);
     write(session_b, payer, &account, er_value).await?;
     let nonce = crate::last_commit_id(base, &account).await?;

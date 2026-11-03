@@ -287,6 +287,7 @@ pub async fn replicated(
             bin: verifier_bin.clone(),
             config_path: config::config_path(&dir, &label),
             params: config::verifier_params(&leader_params, identity, metrics_port, storage_dir),
+            rust_log: config::er_rust_log(&label),
         };
         let log = dir.join(format!("er-{label}.log"));
         debug!(%label, "starting verifier");

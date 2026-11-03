@@ -8,7 +8,7 @@ use std::{
     process::{Child, Command, ExitStatus, Stdio},
     rc::Rc,
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{anyhow, ensure, Context, Error};
@@ -26,12 +26,12 @@ pub(super) const POLL: Duration = Duration::from_millis(250);
 pub(super) const RESTART_POLL: Duration = Duration::from_millis(5);
 const LIVENESS_INTERVAL: Duration = Duration::from_millis(250);
 
-// Fresh process group so test-runner group signals don't reap the validator;
-// the prior boot's log is rotated to .log.prev.
+// Fresh process group so test-runner group signals don't reap the validator.
 pub(super) fn spawn_child(mut cmd: Command, log: &Path) -> Result<Child> {
     use std::os::unix::process::CommandExt;
     if log.exists() {
-        let _ = fs::rename(log, log.with_extension("log.prev"));
+        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis();
+        let _ = fs::rename(log, log.with_extension(format!("log.{stamp}")));
     }
     let logfile = File::create(log)?;
     cmd.stdout(logfile.try_clone()?)

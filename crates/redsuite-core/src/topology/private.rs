@@ -85,8 +85,6 @@ impl PrivateEr {
         self.plan.storage_dir()
     }
 
-    // Current boot's log. After a restart the prior boot's log (with the
-    // shutdown timing lines) is at log().with_extension("log.prev").
     pub fn log(&self) -> &Path {
         &self.log
     }
@@ -233,6 +231,7 @@ async fn launch(
             allowed_followers,
             options.settings,
         )?,
+        rust_log: config::er_rust_log(&options.label),
     };
     debug!(%options.label, "starting rollup");
     ports.release();
