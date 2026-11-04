@@ -2,7 +2,7 @@
 resolver = "2"
 members = [
     "programs/fixture",
-    "crates/redsuite-core",
+    "core",
     "redline",
     "redshift",
     "redhat",
@@ -18,7 +18,7 @@ members = [
 ]
 
 [workspace.package]
-version = "2.0.0"
+version = "3.3.0"
 edition = "2021"
 license = "MIT"
 authors = ["Magicblock Labs <dev@magicblock.gg>"]
@@ -28,7 +28,7 @@ anyhow = "1"
 fixture = { path = "programs/fixture" }
 clap = { version = "4", features = ["derive", "env"] }
 humantime = "2"
-redsuite-core = { path = "crates/redsuite-core" }
+redsuite-core = { path = "core" }
 redline = { path = "redline" }
 redshift = { path = "redshift" }
 redhat = { path = "redhat" }

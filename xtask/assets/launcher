@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source "$here/runtime-env"
+plugins=("$here/../runtime/yellowstone/"libyellowstone_grpc_geyser.*)
+if [[ ${#plugins[@]} != 1 || ! -f "${plugins[0]}" ]]; then
+    echo 'Expected one packaged Yellowstone plugin' >&2
+    exit 1
+fi
+redsuite_environment "$here/../runtime" "$here/../fixtures" "${plugins[0]##*/}"
+exec "$here/redsuite-bin" "$@"

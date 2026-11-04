@@ -274,7 +274,7 @@ impl BasePlan {
         grpc_port: u16,
     ) -> Result<Self> {
         let clone_url = clone_url()?;
-        let yellowstone = super::yellowstone::ensure(&bin).await?;
+        let yellowstone = super::yellowstone::ensure().await?;
         let geyser_plugin_config = stack_dir.join("geyser.json");
         yellowstone.write_config(&geyser_plugin_config, ([127, 0, 0, 1], grpc_port).into())?;
         let mut upgradeable_v3 = Vec::new();

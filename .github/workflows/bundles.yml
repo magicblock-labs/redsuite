@@ -1,0 +1,149 @@
+name: Native bundles
+
+on:
+  push:
+    tags: ['[0-9]*.[0-9]*.[0-9]*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  RUSTFLAGS: ''
+  CARGO_INCREMENTAL: '0'
+
+jobs:
+  runtime:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-22.04, macos-15]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: recipe
+        shell: bash
+        run: cargo xtask package metadata >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        id: runtime-cache
+        with:
+          path: target/runtime-assets
+          key: runtime-${{ steps.recipe.outputs.platform }}-${{ steps.recipe.outputs.runtime_id }}
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/package-cache
+          key: runtime-build-${{ steps.recipe.outputs.platform }}-${{ steps.recipe.outputs.runtime_id }}
+      - if: steps.runtime-cache.outputs.cache-hit != 'true'
+        run: cargo xtask package runtime target/runtime-assets
+      - uses: actions/upload-artifact@v4
+        with:
+          name: runtime-${{ steps.recipe.outputs.platform }}
+          path: target/runtime-assets/*
+          if-no-files-found: error
+
+  fixtures:
+    needs: runtime
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - id: recipe
+        shell: bash
+        run: cargo xtask package metadata >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@v4
+        with:
+          name: runtime-${{ steps.recipe.outputs.platform }}
+          path: target/assets
+      - uses: actions/cache@v4
+        id: fixture-cache
+        with:
+          path: target/fixture-assets
+          key: fixtures-${{ github.sha }}-${{ steps.recipe.outputs.fixture_id }}
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/solana
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: sbf-${{ steps.recipe.outputs.fixture_id }}
+      - if: steps.fixture-cache.outputs.cache-hit != 'true'
+        name: Build release fixtures once
+        shell: bash
+        run: |
+          REDSUITE_ASSETS_DIR="$PWD/target/assets" \
+            cargo xtask package fixtures "$PWD" target/fixture-assets
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fixtures
+          path: target/fixture-assets/*
+          if-no-files-found: error
+
+  bundle:
+    needs: [runtime, fixtures]
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-22.04, macos-15]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: recipe
+        shell: bash
+        run: cargo xtask package metadata >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@v4
+        with:
+          name: runtime-${{ steps.recipe.outputs.platform }}
+          path: target/assets
+      - uses: actions/download-artifact@v4
+        with:
+          name: fixtures
+          path: target/assets
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/debug
+            target/release
+          key: redsuite-${{ steps.recipe.outputs.platform }}-${{ github.sha }}
+          restore-keys: redsuite-${{ steps.recipe.outputs.platform }}-
+      - run: cargo build --release --locked -p redsuite
+      - name: Assemble and inspect relocated bundle
+        shell: bash
+        run: |
+          cargo xtask package bundle target/assets/redsuite-runtime-*.tar.gz \
+            target/assets/redsuite-fixtures-*.tar.gz target/release/redsuite target/bundles
+          mkdir -p "$RUNNER_TEMP/relocated bundle"
+          tar -xzf target/bundles/redsuite-*.tar.gz -C "$RUNNER_TEMP/relocated bundle"
+          cargo xtask package verify "$RUNNER_TEMP/relocated bundle"/* | tee target/qualification.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bundle-${{ steps.recipe.outputs.platform }}-unqualified
+          path: |
+            target/bundles/*
+            target/qualification.txt
+          if-no-files-found: error
+
+  release:
+    if: github.event_name == 'push'
+    needs: bundle
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+      - name: Attach archives to the release
+        shell: bash
+        run: |
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --verify-tag --draft --title "$RELEASE_TAG" --notes ""
+          fi
+          gh release upload "$RELEASE_TAG" assets/*/*.tar.gz assets/*/*.tar.gz.sha256 --clobber

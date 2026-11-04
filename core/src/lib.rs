@@ -4,8 +4,11 @@ pub mod cells;
 pub mod config;
 pub mod context;
 pub mod dlp;
+#[path = "../../shared/fixtures.rs"]
+mod fixtures;
 pub mod frontend;
 pub mod host;
+#[path = "../../shared/logging.rs"]
 pub mod logging;
 pub mod netfault;
 pub mod prep;

@@ -1,0 +1,7 @@
+[agave]
+revision = "c9c6f3287e26f24e3476e13e751aebe710191e89"
+version = "4.2.2"
+
+[yellowstone]
+version = "15.2.1"
+revision = "2531a8798164d5dd56e9c85664d08056ef7bf645"

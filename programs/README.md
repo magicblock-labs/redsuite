@@ -20,7 +20,7 @@ without introducing an implicit CPI boundary. Tasks and settlement actions reuse
 these batches instead of dedicated scenario instructions.
 
 Scenarios discover builders through the harness's
-[central program APIs](../crates/redsuite-core/src/programs.rs), which own encoding,
+[central program APIs](../core/src/programs.rs), which own encoding,
 account order and PDA derivation. Each family interface supplies its program
 identity; the same executor also works at dynamically deployed addresses.
 Fixture-owned messages use Wincode. External calls and callbacks retain the
@@ -31,11 +31,9 @@ built twice; the upgrade scenario deploys both versions under the same address.
 
 ## Building and running
 
-Run `cargo xtask programs` to build and stage all five SBF artifacts. Redline,
-Redshift and Redhat load when the base stack starts; upgrade probes are deployed
-by their scenario.
+Use the [fixture rebuild workflow](../README.md#rebuild-fixture-programs) to build,
+select, and load local programs. Redline, Redshift, and Redhat load when the base
+stack starts; upgrade probes are deployed by their scenario.
 
-Host interfaces and fixtures must be rebuilt together after schema changes.
-Stop an existing stack with `cargo xtask stack down` before running the rebuilt
-fixtures. Fixture ABIs are internal to RedSuite and are not versioned for
-backward compatibility.
+Fixture ABIs are internal to RedSuite and are not versioned for backward
+compatibility. Rebuild host interfaces and fixtures together after schema changes.

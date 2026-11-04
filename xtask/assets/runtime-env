@@ -1,0 +1,24 @@
+# Shared by the packaged runner and with-runtime. Paths must be absolute.
+redsuite_environment() {
+    export REDSUITE_ROOT="${REDSUITE_ROOT:-$PWD}"
+    if [[ -n "${REDSUITE_FIXTURES_DIR:-$2}" ]]; then
+        export REDSUITE_FIXTURES_DIR="${REDSUITE_FIXTURES_DIR:-$2}"
+    fi
+    export REDSUITE_YELLOWSTONE_PLUGIN="${REDSUITE_YELLOWSTONE_PLUGIN:-$1/yellowstone/$3}"
+    export PATH="$1/agave/bin:$PATH"
+    if [[ ! -f "$REDSUITE_YELLOWSTONE_PLUGIN" ]]; then
+        echo "Missing Yellowstone plugin: $REDSUITE_YELLOWSTONE_PLUGIN" >&2
+        return 1
+    fi
+    if [[ ! -x "$1/agave/bin/solana-test-validator" ]]; then
+        echo "Missing Agave validator in $1/agave/bin" >&2
+        return 1
+    fi
+}
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    set -euo pipefail
+    runtime=$1 fixtures=$2 plugin=$3
+    shift 3
+    redsuite_environment "$runtime" "$fixtures" "$plugin"
+    exec "$@"
+fi
