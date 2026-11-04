@@ -137,7 +137,10 @@ impl UnpaidWork {
             let observed = unique.iter().map(|key| faults.observe(reads(key))).collect();
             let (claims, result) = query(&fixture.er, &keys).await?;
             match result {
-                Ok(reply) => ensure!(admitted, "{label} served: {reply}"),
+                Ok(reply) => ensure!(
+                    admitted && reply["value"].as_array().map(Vec::len) == Some(keys.len()),
+                    "{label} served: {reply}"
+                ),
                 Err(error) => ensure!(!admitted && error.error.code.code() == -32602, "{error}"),
             }
             charged(
@@ -187,8 +190,8 @@ impl UnpaidWork {
         let mut flooded = RawWs::connect(fixture.er.ws_url()).await?;
         let mut accepted = 0;
         for key in &keys {
-            if let Err(error) = flooded.account_subscribe(key).await {
-                debug!(accepted, error = %format_args!("{error:#}"), "subscription limit refused");
+            if let Err(error) = flooded.try_account_subscribe(key).await? {
+                debug!(accepted, %error, "subscription limit refused");
                 break;
             }
             accepted += 1;
@@ -197,7 +200,7 @@ impl UnpaidWork {
         let (fetched, _) = tally(observed);
         debug!(accepted, fetched, "per-connection subscription flood");
         ensure!(fetched == 0, "{fetched} local subscriptions reached base");
-        flooded.close().await?;
+        let _ = flooded.close().await;
         fixture.confirmed_write(&mut control, subscription, 8_101).await?;
         control.close().await
     }

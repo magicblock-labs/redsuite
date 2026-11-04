@@ -3,7 +3,7 @@ use super::{
     commits::buffers::outbox_intent_pda,
     *,
 };
-use futures_util::future::try_join_all;
+use futures_util::future::join_all;
 use magic_api::MAGIC_CONTEXT_PUBKEY;
 use redsuite_core::wait;
 use std::time::Duration;
@@ -66,7 +66,7 @@ impl SettlementAuthorization {
             .pop()
             .flatten()
             .context("burst cell missing")?;
-        let signatures = try_join_all((nonce..).step_by(2).take(BURST as usize).map(|nonce| {
+        let signatures = join_all((nonce..).step_by(2).take(BURST as usize).map(|nonce| {
             let instructions = callback_args(cell, 0).map(|args| {
                 [
                     scheduled(
@@ -87,7 +87,9 @@ impl SettlementAuthorization {
             });
             async move { self.er.submit_and_confirm(payer, &instructions?).await }
         }))
-        .await?;
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?;
         let (_, peak) = self.staged().await?;
         for signature in &signatures {
             self.er
