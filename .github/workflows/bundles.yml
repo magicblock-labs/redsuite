@@ -2,6 +2,7 @@ name: Native bundles
 
 on:
   push:
+    branches: [main]
     tags: ['[0-9]*.[0-9]*.[0-9]*']
   workflow_dispatch:
 
@@ -21,6 +22,17 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/debug
+            target/package-cache
+          key: runtime-build-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'shared/components.toml') }}-${{ github.sha }}
+          restore-keys: |
+            runtime-build-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'shared/components.toml') }}-
+            runtime-build-${{ runner.os }}-${{ runner.arch }}-
       - id: recipe
         shell: bash
         run: cargo xtask package metadata >> "$GITHUB_OUTPUT"
@@ -29,13 +41,6 @@ jobs:
         with:
           path: target/runtime-assets
           key: runtime-${{ steps.recipe.outputs.platform }}-${{ steps.recipe.outputs.runtime_id }}
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target/package-cache
-          key: runtime-build-${{ steps.recipe.outputs.platform }}-${{ steps.recipe.outputs.runtime_id }}
       - if: steps.runtime-cache.outputs.cache-hit != 'true'
         run: cargo xtask package runtime target/runtime-assets
       - uses: actions/upload-artifact@v4
@@ -49,6 +54,17 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/solana
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/debug
+          key: sbf-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'shared/components.toml') }}-${{ github.sha }}
+          restore-keys: |
+            sbf-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'shared/components.toml') }}-
+            sbf-${{ runner.os }}-${{ runner.arch }}-
       - id: recipe
         shell: bash
         run: cargo xtask package metadata >> "$GITHUB_OUTPUT"
@@ -61,13 +77,6 @@ jobs:
         with:
           path: target/fixture-assets
           key: fixtures-${{ github.sha }}-${{ steps.recipe.outputs.fixture_id }}
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/solana
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: sbf-${{ steps.recipe.outputs.fixture_id }}
       - if: steps.fixture-cache.outputs.cache-hit != 'true'
         name: Build release fixtures once
         shell: bash
@@ -89,6 +98,17 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/debug
+            target/release
+          key: redsuite-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            redsuite-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}-
+            redsuite-${{ runner.os }}-${{ runner.arch }}-
       - id: recipe
         shell: bash
         run: cargo xtask package metadata >> "$GITHUB_OUTPUT"
@@ -100,15 +120,6 @@ jobs:
         with:
           name: fixtures
           path: target/assets
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target/debug
-            target/release
-          key: redsuite-${{ steps.recipe.outputs.platform }}-${{ github.sha }}
-          restore-keys: redsuite-${{ steps.recipe.outputs.platform }}-
       - run: cargo build --release --locked -p redsuite
       - name: Assemble and inspect relocated bundle
         shell: bash
@@ -127,7 +138,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' && github.ref_type == 'tag'
     needs: bundle
     runs-on: ubuntu-22.04
     permissions:
