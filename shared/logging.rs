@@ -3,7 +3,7 @@ use std::io::{self, IsTerminal};
 use tracing::Level;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-use crate::Result;
+use anyhow::Result;
 
 /// Installs the host binary's stderr subscriber; libraries leave this to callers.
 /// Uses `RUST_LOG`, defaulting to info when no valid directive is supplied.

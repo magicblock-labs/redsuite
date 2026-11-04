@@ -1,4 +1,4 @@
-use std::{path::PathBuf, result};
+use std::{env, path::PathBuf, result};
 
 use anyhow::ensure;
 
@@ -87,42 +87,23 @@ impl Er {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Fixture {
-    RedlineProgram,
-    RedshiftProgram,
-    RedhatProgram,
-    UpgradeProbe,
-    UpgradeProbeUpgraded,
-}
+pub use crate::fixtures::Fixture;
+
+pub const FIXTURES_DIR_ENV: &str = "REDSUITE_FIXTURES_DIR";
 
 impl Fixture {
     pub fn resolve(self) -> Result<PathBuf> {
-        let path = crate::topology::workspace_root().join("target/deploy").join(self.so_name());
+        let dir = env::var_os(FIXTURES_DIR_ENV)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| crate::topology::workspace_root().join("target/deploy"));
+        let path = dir.join(self.so_name());
         ensure!(
             path.is_file(),
-            "fixture {} is missing; run `cargo xtask programs`",
+            "fixture {} is missing; run `cargo xtask programs` and select target/deploy \
+             with {FIXTURES_DIR_ENV}, or use the matching release fixtures",
             path.display()
         );
         Ok(path)
-    }
-
-    pub const ALL: [Fixture; 5] = [
-        Fixture::RedlineProgram,
-        Fixture::RedshiftProgram,
-        Fixture::RedhatProgram,
-        Fixture::UpgradeProbe,
-        Fixture::UpgradeProbeUpgraded,
-    ];
-
-    pub const fn so_name(self) -> &'static str {
-        match self {
-            Fixture::RedlineProgram => "redline_program.so",
-            Fixture::RedshiftProgram => "redshift_program.so",
-            Fixture::RedhatProgram => "redhat_program.so",
-            Fixture::UpgradeProbe => "upgrade_probe.so",
-            Fixture::UpgradeProbeUpgraded => "upgrade_probe_upgraded.so",
-        }
     }
 
     /// Fixed address for base-startup fixtures; dynamically deployed probes have none.

@@ -1,102 +1,89 @@
+#[path = "../../shared/components.rs"]
+mod components;
+mod fixtures;
+#[path = "../../shared/fixtures.rs"]
+mod fixtures_catalog;
+#[path = "../../shared/logging.rs"]
+mod logging;
+mod package;
+mod runtime;
+use anyhow::{ensure, Context, Result};
+use clap::{Parser, Subcommand};
 use std::{
-    fs,
+    ffi::OsString,
     path::Path,
     process::{Command, ExitCode},
 };
 
-use anyhow::{ensure, Context};
-use clap::Parser;
-use redsuite_core::{catalog::Fixture, frontend, logging, Result};
-use tracing::error;
-
 #[derive(Parser)]
-#[command(
-    name = "xtask",
-    bin_name = "cargo xtask",
-    version,
-    about = "RedSuite development tools",
-    after_long_help = frontend::env_help()
-)]
+#[command(about = "RedSuite build tools")]
+struct Cli {
+    #[command(subcommand)]
+    task: Task,
+}
+
+#[derive(Subcommand)]
 enum Task {
-    /// Build and stage the SBF programs.
+    /// Build and stage the SBF fixtures.
     Programs,
-    /// Format the workspace using the pinned Rust toolchain.
+    /// Format the workspace with its pinned toolchain.
     Fmt {
-        /// Check formatting without rewriting files.
         #[arg(long)]
         check: bool,
     },
-    #[command(flatten)]
-    Shared(frontend::Command),
+    #[command(subcommand)]
+    Package(package::Task),
+    #[command(subcommand)]
+    Runtime(Runtime),
 }
 
-fn main() -> ExitCode {
-    let task = Task::parse();
-    if let Err(error) = logging::init() {
-        eprintln!("cannot initialize logging: {error:#}");
-        return ExitCode::FAILURE;
-    }
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-    let outcome = match task {
-        Task::Programs => programs(root),
+#[derive(Subcommand)]
+enum Runtime {
+    /// Run a command with the pinned dependencies on PATH.
+    Exec {
+        /// Skip RedSuite fixtures when building MagicBlock programs or using SBF tools.
+        #[arg(long)]
+        runtime_only: bool,
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<OsString>,
+    },
+}
+fn root() -> &'static Path {
+    Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap()
+}
+fn run(command: &mut Command) -> Result<()> {
+    let status = command.status().with_context(|| format!("starting {command:?}"))?;
+    ensure!(status.success(), "{command:?} failed: {status}");
+    Ok(())
+}
+fn dispatch(task: Task) -> Result<()> {
+    match task {
+        Task::Programs => {
+            fixtures::build(root(), &root().join("target/deploy"), None)?;
+        }
         Task::Fmt { check } => {
             let mut command = Command::new("cargo");
-            command.args(["fmt", "--all"]).current_dir(root);
+            command.args(["fmt", "--all"]).current_dir(root());
             if check {
                 command.arg("--check");
             }
-            run(&mut command)
+            run(&mut command)?;
         }
-        Task::Shared(command) => command.run(),
-    };
-    if let Err(error) = outcome {
-        error!(error = %format_args!("{error:#}"), "command failed");
-        return ExitCode::FAILURE;
-    }
-    ExitCode::SUCCESS
-}
-
-fn run(command: &mut Command) -> Result<()> {
-    let status = command.status().with_context(|| format!("{command:?}: failed to spawn"))?;
-    ensure!(status.success(), "{command:?} failed ({status})");
-    Ok(())
-}
-
-fn programs(root: &Path) -> Result<()> {
-    let deploy = root.join("target/deploy");
-    for fixture in Fixture::ALL {
-        let (family, variant) = match fixture {
-            Fixture::RedlineProgram => ("redline", None),
-            Fixture::RedshiftProgram => ("redshift", None),
-            Fixture::RedhatProgram => ("redhat", None),
-            Fixture::UpgradeProbe => ("upgrade", Some("v1")),
-            Fixture::UpgradeProbeUpgraded => ("upgrade", Some("v2")),
-        };
-        let out = match variant {
-            Some(label) => deploy.join(format!("{family}-{label}")),
-            None => deploy.clone(),
-        };
-        let mut command = Command::new("cargo");
-        command
-            .args(["build-sbf", "--manifest-path"])
-            .arg(root.join(format!("programs/{family}/program/Cargo.toml")))
-            .arg("--sbf-out-dir")
-            .arg(&out);
-        if variant.is_some() {
-            command.args(["--arch", "v3"]);
-            if fixture == Fixture::UpgradeProbeUpgraded {
-                command.args(["--features", "upgraded"]);
-            }
-        }
-        command.args(["--", "--config", "profile.release.lto=\"fat\""]);
-        run(&mut command)?;
-        if variant.is_some() {
-            let staged = deploy.join(fixture.so_name());
-            // fs::copy can fail with ENOENT on virtiofs bind mounts.
-            fs::read(out.join("upgrade_probe.so"))
-                .and_then(|bytes| fs::write(&staged, bytes))
-                .with_context(|| format!("staging {}", staged.display()))?;
+        Task::Package(task) => package::dispatch(task)?,
+        Task::Runtime(Runtime::Exec { runtime_only, command }) => {
+            runtime::exec(command, runtime_only)?
         }
     }
     Ok(())
+}
+
+fn main() -> ExitCode {
+    let result = logging::init().and_then(|()| dispatch(Cli::parse().task));
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            tracing::error!("{e:#}");
+            ExitCode::FAILURE
+        }
+    }
 }

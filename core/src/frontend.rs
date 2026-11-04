@@ -14,13 +14,17 @@ pub const ENV_VARS: &[(&str, &str)] = &[
     ),
     (
         topology::YELLOWSTONE_PLUGIN_ENV,
-        "a prebuilt libyellowstone_grpc_geyser.so to load instead of the \
+        "a prebuilt Yellowstone Geyser plugin to load instead of the \
          cached upstream release",
     ),
     (
         topology::YELLOWSTONE_CACHE_ENV,
         "where cached Yellowstone releases live (default target/yellowstone \
          under the workspace root)",
+    ),
+    (
+        crate::catalog::FIXTURES_DIR_ENV,
+        "compiled fixtures (default target/deploy under the workspace root)",
     ),
     (
         topology::ROOT_ENV,

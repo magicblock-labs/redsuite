@@ -40,9 +40,8 @@ pub fn workspace_root() -> PathBuf {
         return PathBuf::from(root);
     }
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("crate lives two levels under the workspace root")
+        .parent()
+        .expect("core lives under the workspace root")
         .to_path_buf()
 }
 

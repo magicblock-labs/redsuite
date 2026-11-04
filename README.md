@@ -83,26 +83,43 @@ to succeed. Proxy faults are cleared between scenarios.
 
 ## 🚀 Get started
 
-RedSuite runs on **Linux and macOS**. Install Rust through `rustup` and
-Agave 4.2.2, with `solana-test-validator` and `cargo-build-sbf` on your `PATH`.
-Use this Agave version with Engine 0.14.3; Agave 4.1.1's RPC size limit rejects
-larger native v1 commits. Each checkout uses its pinned Rust toolchain.
+Choose a native bundle for **macOS Apple Silicon** or **Linux x86-64 (GNU)**,
+or run from a source checkout with cached dependencies. Bundles provide RedSuite,
+its fixture programs, Agave, and Yellowstone. Each RedSuite version uses one
+pinned Agave/Yellowstone pair. The MagicBlock leader, verifier,
+and committor remain user-supplied.
+
+Use the selected release's assets and requirements together. A source-only
+release cannot be used as a binary installation. Component pins are recorded in
+[the component manifest](shared/components.toml); build and qualification
+instructions are in [bundle assembly](packaging/README.md).
 
 ### Prepare the validator under test
 
-In a [MagicBlock Validator checkout](https://github.com/magicblock-labs/magicblock-validator),
-build the leader, verifier, and committor program:
+Use a [MagicBlock Validator checkout](https://github.com/magicblock-labs/magicblock-validator)
+for the build under test. Existing binaries can be reused when they match that
+checkout's changes. To build them using RedSuite's pinned SBF tools, run from
+the RedSuite checkout (adjust `../mbv` if needed):
 
 ```bash
-cargo build --release --locked -p magicblock-validator -p magicblock-verifier
-cargo build-sbf --manifest-path programs/committor-program/Cargo.toml \
-  --sbf-out-dir target/deploy
-export MAGICBLOCK_VALIDATOR_BIN="$PWD/target/release/magicblock-validator"
+cargo build --locked -p xtask
+redsuite_dir="$PWD"
+validator_dir=$(cd ../mbv && pwd)
+(
+  cd "$validator_dir"
+  cargo build --release --locked -p magicblock-validator -p magicblock-verifier
+  "$redsuite_dir/target/debug/xtask" runtime exec --runtime-only -- \
+    cargo build-sbf --manifest-path programs/committor-program/Cargo.toml \
+    --sbf-out-dir target/deploy
+)
+export MAGICBLOCK_VALIDATOR_BIN="$validator_dir/target/release/magicblock-validator"
 ```
 
 The verifier is needed for replication checks and is discovered beside the
-leader binary. The harness loads `magicblock_committor_program.so` from that
-build tree's `target/deploy`; a host build alone does not produce it.
+leader binary, then on `PATH`; `MAGICBLOCK_VERIFIER_BIN` overrides discovery.
+The harness loads `magicblock_committor_program.so` from `../deploy` relative
+to the leader binary's directory (normally `target/deploy`). Preserve that
+layout when moving a build; a host build alone does not produce the committor.
 
 On macOS, the validator's open-file limit requires these settings before a run:
 
@@ -111,18 +128,66 @@ sudo launchctl limit maxfiles 1000000 1000000  # once per boot
 ulimit -n 1000000                             # in the shell running RedSuite
 ```
 
-### Build and run RedSuite
+### Run a native bundle
 
-In the RedSuite checkout, using the same shell:
+Choose an archive for your platform from [GitHub Releases](https://github.com/magicblock-labs/redsuite/releases)
+and set `bundle` to the downloaded filename, then extract and run it:
 
 ```bash
-cargo xtask programs
-cargo build --release --locked -p redsuite
-export PATH="$PWD/target/release:$PATH"
-
+bundle=redsuite-REVISION-PLATFORM.tar.gz
+tar -xzf "$bundle"
+export PATH="$PWD/${bundle%.tar.gz}/bin:$PATH"
 redsuite redshift list
 redsuite redshift run
 ```
+
+The wrapper needs Bash but not Cargo. Run it from a writable working directory;
+state, logs, and reports use that directory's `target` layout, not the bundle.
+
+### Develop RedSuite using cached dependencies
+
+Install Rust through `rustup`. In the RedSuite checkout, using the same shell:
+
+```bash
+./scripts/with-runtime cargo run --locked -p redsuite -- redshift list
+./scripts/with-runtime cargo run --locked -p redsuite -- redshift run
+```
+
+The wrapper caches the pinned runtime and release fixtures separately, then
+executes your command unchanged. It logs the selected runtime and fixture paths
+once per invocation and neither builds nor substitutes MagicBlock.
+Dependencies come from the pinned release's bundles. When developing packaging
+recipes before their assets are published, use `REDSUITE_ASSETS_DIR` with
+[locally assembled archives](packaging/README.md#assemble-locally); ordinary
+scenario work does not need archive assembly. Missing assets fail with the exact
+pinned name rather than substituting another release.
+
+Commands in the rest of this guide use the installed `redsuite` launcher. For a
+source run, use `./scripts/with-runtime cargo run --locked -p redsuite --` in its
+place.
+
+### Rebuild fixture programs
+
+After editing fixture programs, build and explicitly select your local artifacts:
+
+```bash
+export REDSUITE_FIXTURES_DIR="$PWD/target/deploy"
+./scripts/with-runtime cargo xtask programs
+./scripts/with-runtime cargo run --locked -p redsuite -- stack down
+./scripts/with-runtime cargo run --locked -p redsuite -- redshift run
+```
+
+The explicit directory avoids downloading release fixtures while rebuilding
+your own; unset `REDSUITE_FIXTURES_DIR` to return to cached release fixtures.
+The stop step discards the running stack so its next boot loads the rebuilt
+programs. Host interfaces and fixtures must be rebuilt together after schema
+changes. SBF platform-tools download only for fixture builds; ordinary runner
+changes retain Cargo's incremental caching. See the [fixture reference](programs/README.md)
+for program contracts.
+
+For a manual source setup without the runtime wrapper, install the components
+selected by the manifest, put `solana-test-validator` and `cargo-build-sbf` on
+`PATH`, and select the pinned plugin as described in [gRPC setup](#grpc-setup).
 
 The first base-chain boot needs access to an RPC endpoint to clone its programs;
 this defaults to mainnet-beta. Later runs reuse the local base. Stop the stack
@@ -182,9 +247,6 @@ run seed to `--seed` on a fresh stack (`redsuite stack down`) to replay the same
 orders; a stack rejects seeded fixtures it has already created. Scenario timing
 and interleaving are not reproduced.
 
-The active workloads are transaction load (write/copy presets), compute load,
-scheduler contention, sustained mixed load, WebSocket fanout, and connection
-churn. `load_generator_thread_scaling` is an explicit-only diagnostic.
 Periodic logs retain interval observations without keeping every request in memory.
 The [coverage limits](docs/scenario-gaps.md) distinguish existing proofs from
 deferred scenarios and oracle improvements.
@@ -281,32 +343,43 @@ Each invocation writes one `campaign.json` under `target/redsuite-reports`,
 including cells recorded before a scenario finishes. The `latest` file selects
 the campaign to export; older report layouts are not read.
 
+### Troubleshooting a managed run
+
+Start with `redsuite stack status` to locate processes, endpoints, and logs.
+Use the error and the relevant process log together; `RUST_LOG=debug` adds
+progress details without changing the run's checks.
+
+| Symptom | Action |
+| :-- | :-- |
+| A fixture is missing or an edited program is not loaded | Follow the [rebuild workflow](#rebuild-fixture-programs), select the intended fixture directory, and stop the old stack before rerunning. |
+| The committor is missing | Build its SBF artifact as described in [validator preparation](#prepare-the-validator-under-test), preserving its location relative to the leader. |
+| Yellowstone fails to load or the base does not become ready | Inspect the base log and [plugin selection](#grpc-setup). Use the Agave/Yellowstone pair pinned by this RedSuite checkout. |
+| A pinned archive is unavailable or fails checksum verification | Use the exact release asset named by the error, or [assemble local assets](packaging/README.md#assemble-locally). |
+| Concurrent validators exhaust disk space | Check the [storage guidance](#host-and-storage-considerations), reduce concurrency with `--serial`, and use `stack down` when the stack is no longer needed. |
+
 ## ⚙️ Configure the environment
 
 | Variable | Use |
 | :-- | :-- |
 | `MAGICBLOCK_VALIDATOR_BIN` | Select the validator under test; otherwise discover `magicblock-validator` on `PATH`. |
 | `MAGICBLOCK_VERIFIER_BIN` | Select a verifier; otherwise discover it beside the leader binary, then on `PATH`. |
-| `REDSUITE_ROOT` | Set the resource root when running outside the original checkout. |
+| `REDSUITE_ROOT` | Set the resource/output root; the bundle and runtime wrappers default to the working directory. |
+| `REDSUITE_FIXTURES_DIR` | Select compiled fixtures independently; defaults to the resource root's `target/deploy`. |
 | `REDSUITE_STACK_DIR` | Place ledgers, stack state, and logs on another disk; defaults to `target/redsuite-stack` under the resource root. |
 | `REDSUITE_ACCOUNTSDB_DIR` | Place rollup and verifier accounts databases separately from their ledgers. |
 | `REDSUITE_CLONE_URL` | Choose the RPC endpoint used to acquire base-chain programs on a cold boot. |
 | `REDSUITE_PROFILE` | Set the `redline run` and `continuous` preset to `lite` or `full`; `--profile` overrides it. Other commands do not read it. |
 | `RUST_LOG` | Log filter for RedSuite and launched validators; defaults to `info`. Use `debug` for passing-run details. |
 
-The compiled runner works without Cargo or a source checkout at runtime, but it
-still needs the validator binaries, `solana-test-validator`, and staged fixture
-artifacts under the resource root's `target/deploy`. Preserve the committor
-artifact's location relative to the validator binary when moving a build to
-another host.
-
 ### gRPC setup
 
-The base chain requires a compatible Yellowstone Geyser plugin. Plugin setup or
-startup failures stop the run; the harness does not retry without gRPC.
+Bundles and `with-runtime` select the packaged Yellowstone plugin automatically.
+Manual setups must use the same pinned pair; RedSuite does not negotiate
+versions. Plugin setup or startup failures stop the run; the harness does not
+retry without gRPC.
 
 Automatic acquisition uses upstream binaries for **x86_64 Linux**. On other
-hosts, set `REDSUITE_YELLOWSTONE_PLUGIN` to a compatible locally built plugin.
+hosts, set `REDSUITE_YELLOWSTONE_PLUGIN` to a local build of the pinned plugin.
 `REDSUITE_YELLOWSTONE_DIR` controls the download cache. Rollups receive the feed
 only when their scenario explicitly requests it.
 
@@ -324,5 +397,5 @@ according to the state and topology the check needs. The CLI runs scenarios;
 Cargo tests do not run the suite.
 
 For on-chain fixture instructions and compatibility contracts, see the
-[fixture reference](programs/README.md). After changing fixtures, rebuild with
-`cargo xtask programs` and stop the old stack so the next base boot loads them.
+[fixture reference](programs/README.md). Use the [rebuild workflow](#rebuild-fixture-programs)
+when changing fixture code or its host interfaces.
