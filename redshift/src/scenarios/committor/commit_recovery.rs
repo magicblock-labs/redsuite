@@ -8,7 +8,7 @@ use redsuite_core::{
     dlp,
     netfault::{Faults, RuleHandle, Selector, Transport},
     programs::{Action, CellHeader, CellId, IntentBundle, REDLINE, REDSHIFT},
-    receipt::{self, CommitReceipt},
+    receipt::{self, CommitReceipt, ReceiptTarget},
     topology::RestartConfig,
     BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
@@ -123,8 +123,8 @@ impl CommitFixture {
         );
         let (snapshot, commit_signature) =
             write_and_commit(&self.er, &self.payer, 2, CONFIRMATION_WRITE, &self.account).await?;
-        let receipt_signature =
-            receipt::scheduled_receipt_signature(self.er.api(), &commit_signature).await?;
+        let receipt_target =
+            receipt::scheduled_receipt_target(self.er.api(), &commit_signature).await?;
         let probe = submission_probe.wait(INTERCEPT_TIMEOUT).await?;
         let base_signature = probe.operation.signature()?;
         let status_blackout = faults.stall(
@@ -144,7 +144,11 @@ impl CommitFixture {
         let held = notification_trap.wait(INTERCEPT_TIMEOUT).await?;
         let blackout_end = Instant::now() + BLACKOUT_WINDOW;
         loop {
-            ensure!(self.er.api().get_transaction(&receipt_signature).await?.is_none());
+            ensure!(
+                receipt::receipt_for_target_if_present(self.er.api(), receipt_target)
+                    .await?
+                    .is_none()
+            );
             if Instant::now() >= blackout_end {
                 break;
             }
@@ -268,12 +272,24 @@ impl CommitFixture {
     async fn settled_receipt(
         &self,
         commit_signature: &Signature,
-        restart_intent_id: Option<u64>,
+        restart_lookup: Option<(ReceiptTarget, u64)>,
         phase: &str,
     ) -> Result<CommitReceipt> {
-        let receipt = if let Some(intent_id) = restart_intent_id {
-            receipt::fetch_commit_receipt_by_intent(self.er.api(), &self.er.identity(), intent_id)
-                .await?
+        let receipt = if let Some((target, intent_id)) = restart_lookup {
+            match target {
+                ReceiptTarget::Signature(_) => {
+                    receipt::fetch_commit_receipt_by_intent(
+                        self.er.api(),
+                        &self.er.identity(),
+                        intent_id,
+                        0,
+                    )
+                    .await?
+                }
+                ReceiptTarget::Outbox { .. } => {
+                    receipt::fetch_receipt_for_target(self.er.api(), target).await?
+                }
+            }
         } else {
             receipt::fetch_commit_receipt(self.er.api(), commit_signature).await?
         };
@@ -298,8 +314,11 @@ impl CommitFixture {
         prove_landed(self.base.as_ref(), &landed, &self.account, &snapshot).await?;
         let nonce = crate::last_commit_id(self.base.as_ref(), &self.account).await?;
         ensure!(nonce == (nonce_before + 1));
-        let restart_intent_id = if restart {
-            Some(receipt::scheduled_intent_id(self.er.api(), &commit_signature).await?)
+        let restart_lookup = if restart {
+            Some((
+                receipt::scheduled_receipt_target(self.er.api(), &commit_signature).await?,
+                receipt::scheduled_intent_id(self.er.api(), &commit_signature).await?,
+            ))
         } else {
             None
         };
@@ -322,7 +341,7 @@ impl CommitFixture {
         for rule in confirmations {
             rule.remove();
         }
-        let receipt = self.settled_receipt(&commit_signature, restart_intent_id, phase).await?;
+        let receipt = self.settled_receipt(&commit_signature, restart_lookup, phase).await?;
         ensure!(receipt.base_signatures.contains(&landed));
         hold_nonces(
             self.base.as_ref(),

@@ -167,7 +167,13 @@ impl Signed {
             })
             .await?;
         let meta = transaction_meta(&tx)?;
-        ensure!(meta.err == self.error);
+        ensure!(
+            meta.err == self.error,
+            "transaction {} returned {:?}, expected {:?}",
+            self.signature,
+            meta.err,
+            self.error
+        );
         ensure!(meta.fee == self.fee);
         Ok(tx.slot)
     }

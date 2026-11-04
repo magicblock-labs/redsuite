@@ -490,8 +490,8 @@ impl SettlementLifecycle {
             .await
     }
 
-    /// Requires the refusal and absence of the service transaction named
-    /// in rolled-back program logs.
+    /// Requires the refusal and absence of a completion transaction for the
+    /// receipt target named in rolled-back program logs.
     async fn rejected_intent_cell(
         &self,
         payer: &Rc<Keypair>,
@@ -510,10 +510,11 @@ impl SettlementLifecycle {
             "expected {refusal:?}, observed: {observed}"
         );
 
-        let sent_signature = receipt::receipt_signature_in_logs(logs)
-            .context("the failed tx logs carry no ScheduledCommitSent signature")?;
+        let receipt_target = receipt::receipt_target_in_logs(logs)
+            .context("the failed tx logs carry no receipt target")?
+            .after_slot(tx.slot);
         time::sleep(ROLLBACK_SETTLE).await;
-        ensure!(self.er.api().get_transaction(&sent_signature).await?.is_none());
+        receipt::ensure_receipt_absent(self.er.api(), receipt_target).await?;
         Ok(())
     }
 }
