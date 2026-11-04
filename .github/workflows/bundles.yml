@@ -146,4 +146,5 @@ jobs:
           if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release create "$RELEASE_TAG" --verify-tag --draft --title "$RELEASE_TAG" --notes ""
           fi
-          gh release upload "$RELEASE_TAG" assets/*/*.tar.gz assets/*/*.tar.gz.sha256 --clobber
+          find assets -type f \( -name '*.tar.gz' -o -name '*.tar.gz.sha256' \) \
+            -exec gh release upload "$RELEASE_TAG" --clobber {} +

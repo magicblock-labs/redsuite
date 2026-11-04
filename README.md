@@ -134,7 +134,7 @@ Choose an archive for your platform from [GitHub Releases](https://github.com/ma
 and set `bundle` to the downloaded filename, then extract and run it:
 
 ```bash
-bundle=redsuite-REVISION-PLATFORM.tar.gz
+bundle=redsuite-VERSION-PLATFORM.tar.gz
 tar -xzf "$bundle"
 export PATH="$PWD/${bundle%.tar.gz}/bin:$PATH"
 redsuite redshift list
