@@ -276,7 +276,9 @@ fn parse_outbox_completion(
     signature: Signature,
     transaction: &EncodedConfirmedTransactionWithStatusMeta,
 ) -> Result<Option<CommitReceipt>> {
-    let meta = transaction_meta(transaction)?;
+    let Some(meta) = transaction.transaction.meta.as_ref() else {
+        return Ok(None);
+    };
     if meta.err.is_some() {
         return Ok(None);
     }
@@ -394,6 +396,55 @@ pub async fn receipt_for_target_if_present(
             Ok(None)
         }
     }
+}
+
+/// Confirms no completion for `target` is visible in outbox history.
+/// Listed signatures with unreadable transaction bodies are retried a bounded number of times.
+pub async fn ensure_receipt_absent(er: &Api, target: ReceiptTarget) -> Result<()> {
+    let ReceiptTarget::Outbox { address, intent_id, min_slot } = target else {
+        ensure!(
+            receipt_for_target_if_present(er, target).await?.is_none(),
+            "receipt is visible for the rejected target"
+        );
+        return Ok(());
+    };
+
+    const ATTEMPTS: usize = 5;
+    const RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+    for attempt in 0..ATTEMPTS {
+        let signatures = er.get_signatures_for_address(&address, RECEIPT_HISTORY_LIMIT).await?;
+        let mut unreadable_body = false;
+
+        for signature in signatures {
+            match er.get_transaction(&signature).await? {
+                Some(transaction) => {
+                    if transaction.slot < min_slot {
+                        continue;
+                    }
+                    let Some(receipt) = parse_outbox_completion(signature, &transaction)? else {
+                        continue;
+                    };
+                    ensure!(
+                        receipt.commit_id != Some(intent_id),
+                        "completion for intent {intent_id} is visible"
+                    );
+                }
+                None => unreadable_body = true,
+            }
+        }
+
+        if !unreadable_body {
+            return Ok(());
+        }
+        if attempt + 1 < ATTEMPTS {
+            time::sleep(RETRY_INTERVAL).await;
+        }
+    }
+
+    anyhow::bail!(
+        "outbox history lists a signature whose transaction body is unreadable; receipt absence is unresolved"
+    )
 }
 
 pub async fn scheduled_intent_id(er: &Api, commit_signature: &Signature) -> Result<u64> {
