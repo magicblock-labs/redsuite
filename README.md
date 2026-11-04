@@ -121,13 +121,6 @@ The harness loads `magicblock_committor_program.so` from `../deploy` relative
 to the leader binary's directory (normally `target/deploy`). Preserve that
 layout when moving a build; a host build alone does not produce the committor.
 
-On macOS, the validator's open-file limit requires these settings before a run:
-
-```bash
-sudo launchctl limit maxfiles 1000000 1000000  # once per boot
-ulimit -n 1000000                             # in the shell running RedSuite
-```
-
 ### Run a native bundle
 
 Choose an archive for your platform from [GitHub Releases](https://github.com/magicblock-labs/redsuite/releases)
