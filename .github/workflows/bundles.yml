@@ -1,4 +1,4 @@
-name: Native bundles
+name: Native runners
 
 on:
   push:
@@ -13,86 +13,7 @@ env:
   CARGO_INCREMENTAL: '0'
 
 jobs:
-  runtime:
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [ubuntu-22.04, macos-15]
-    runs-on: ${{ matrix.runner }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target/debug
-            target/package-cache
-          key: runtime-build-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'shared/components.toml') }}-${{ github.sha }}
-          restore-keys: |
-            runtime-build-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'shared/components.toml') }}-
-            runtime-build-${{ runner.os }}-${{ runner.arch }}-
-      - id: recipe
-        shell: bash
-        run: cargo xtask package metadata >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@v4
-        id: runtime-cache
-        with:
-          path: target/runtime-assets
-          key: runtime-${{ steps.recipe.outputs.platform }}-${{ steps.recipe.outputs.runtime_id }}
-      - if: steps.runtime-cache.outputs.cache-hit != 'true'
-        run: cargo xtask package runtime target/runtime-assets
-      - uses: actions/upload-artifact@v4
-        with:
-          name: runtime-${{ steps.recipe.outputs.platform }}
-          path: target/runtime-assets/*
-          if-no-files-found: error
-
-  fixtures:
-    needs: runtime
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/solana
-            ~/.cargo/registry
-            ~/.cargo/git
-            target/debug
-            target/sbf
-          key: sbf-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'shared/components.toml') }}-${{ github.sha }}
-          restore-keys: |
-            sbf-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'shared/components.toml') }}-
-            sbf-${{ runner.os }}-${{ runner.arch }}-
-      - id: recipe
-        shell: bash
-        run: cargo xtask package metadata >> "$GITHUB_OUTPUT"
-      - uses: actions/download-artifact@v4
-        with:
-          name: runtime-${{ steps.recipe.outputs.platform }}
-          path: target/assets
-      - uses: actions/cache@v4
-        id: fixture-cache
-        with:
-          path: target/fixture-assets
-          key: fixtures-${{ github.sha }}-${{ steps.recipe.outputs.fixture_id }}
-      - if: steps.fixture-cache.outputs.cache-hit != 'true'
-        name: Build release fixtures once
-        shell: bash
-        env:
-          CARGO_TARGET_DIR: ${{ github.workspace }}/target/sbf
-        run: |
-          REDSUITE_ASSETS_DIR="$PWD/target/assets" \
-            cargo xtask package fixtures "$PWD" target/fixture-assets
-      - uses: actions/upload-artifact@v4
-        with:
-          name: fixtures
-          path: target/fixture-assets/*
-          if-no-files-found: error
-
-  bundle:
-    needs: [runtime, fixtures]
+  runner:
     strategy:
       fail-fast: false
       matrix:
@@ -112,36 +33,18 @@ jobs:
             redsuite-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}-
             redsuite-${{ runner.os }}-${{ runner.arch }}-
       - id: recipe
-        shell: bash
         run: cargo xtask package metadata >> "$GITHUB_OUTPUT"
-      - uses: actions/download-artifact@v4
-        with:
-          name: runtime-${{ steps.recipe.outputs.platform }}
-          path: target/assets
-      - uses: actions/download-artifact@v4
-        with:
-          name: fixtures
-          path: target/assets
       - run: cargo build --release --locked -p redsuite
-      - name: Assemble and inspect relocated bundle
-        shell: bash
-        run: |
-          cargo xtask package bundle target/assets/redsuite-runtime-*.tar.gz \
-            target/assets/redsuite-fixtures-*.tar.gz target/release/redsuite target/bundles
-          mkdir -p "$RUNNER_TEMP/relocated bundle"
-          tar -xzf target/bundles/redsuite-*.tar.gz -C "$RUNNER_TEMP/relocated bundle"
-          cargo xtask package verify "$RUNNER_TEMP/relocated bundle"/* | tee target/qualification.txt
+      - run: cargo xtask package runner target/release/redsuite target/runners
       - uses: actions/upload-artifact@v4
         with:
-          name: bundle-${{ steps.recipe.outputs.platform }}-unqualified
-          path: |
-            target/bundles/*
-            target/qualification.txt
+          name: runner-${{ steps.recipe.outputs.platform }}
+          path: target/runners/*
           if-no-files-found: error
 
   release:
     if: github.event_name == 'push' && github.ref_type == 'tag'
-    needs: bundle
+    needs: runner
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -153,8 +56,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: assets
-      - name: Attach archives to the release
-        shell: bash
+      - name: Attach runners
         run: |
           if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release create "$RELEASE_TAG" --verify-tag --draft --title "$RELEASE_TAG" --notes ""

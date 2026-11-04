@@ -39,6 +39,11 @@ enum Task {
 
 #[derive(Subcommand)]
 enum Runtime {
+    /// Run the published runner, acquiring only missing components.
+    Run {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<OsString>,
+    },
     /// Run a command with the pinned dependencies on PATH.
     Exec {
         /// Skip RedSuite fixtures when building MagicBlock programs or using SBF tools.
@@ -70,6 +75,7 @@ fn dispatch(task: Task) -> Result<()> {
             run(&mut command)?;
         }
         Task::Package(task) => package::dispatch(task)?,
+        Task::Runtime(Runtime::Run { args }) => runtime::runner(args)?,
         Task::Runtime(Runtime::Exec { runtime_only, command }) => {
             runtime::exec(command, runtime_only)?
         }

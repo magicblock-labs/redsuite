@@ -1,0 +1,73 @@
+name: Native runtimes
+
+on:
+  push:
+    tags: ['runtime-*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  RUSTFLAGS: ''
+  CARGO_INCREMENTAL: '0'
+
+jobs:
+  runtime:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-22.04, macos-15]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/debug
+            target/package-cache
+          key: runtime-build-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'shared/components.toml') }}-${{ github.sha }}
+          restore-keys: |
+            runtime-build-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'shared/components.toml') }}-
+            runtime-build-${{ runner.os }}-${{ runner.arch }}-
+      - id: recipe
+        shell: bash
+        run: cargo xtask package metadata >> "$GITHUB_OUTPUT"
+      - name: Build runtime
+        shell: bash
+        run: |
+          if [[ "${{ github.ref_type }}" == tag ]]; then
+            test "${{ github.ref_name }}" = "${{ steps.recipe.outputs.runtime_tag }}"
+          fi
+          cargo xtask package runtime target/runtime-assets
+      - uses: actions/upload-artifact@v4
+        with:
+          name: runtime-${{ steps.recipe.outputs.platform }}
+          path: target/runtime-assets/*
+          if-no-files-found: error
+
+  release:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: runtime
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+      - name: Attach runtime archives
+        shell: bash
+        run: |
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --verify-tag --draft --latest=false \
+              --title "$RELEASE_TAG" --notes "Pinned Agave/Yellowstone runtime."
+          fi
+          find assets -type f \( -name '*.tar.gz' -o -name '*.tar.gz.sha256' \) \
+            -exec gh release upload "$RELEASE_TAG" {} +

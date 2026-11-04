@@ -1,11 +1,11 @@
 use crate::{root, run, runtime};
 use anyhow::{ensure, Context, Result};
 use clap::Subcommand;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
-    fs,
+    env, fs,
     io::Read,
     path::{Path, PathBuf},
     process::Command,
@@ -13,34 +13,19 @@ use std::{
 #[derive(Subcommand)]
 pub enum Task {
     Metadata,
-    Runtime {
-        out: PathBuf,
-    },
-    Fixtures {
-        source: PathBuf,
-        out: PathBuf,
-    },
-    Bundle {
-        runtime: PathBuf,
-        fixtures: PathBuf,
-        binary: PathBuf,
-        out: PathBuf,
-    },
-    Verify {
-        bundle: PathBuf,
-        #[arg(long)]
-        live: bool,
-    },
+    Runtime { out: PathBuf },
+    Fixtures { source: PathBuf, out: PathBuf },
+    Runner { binary: PathBuf, out: PathBuf },
 }
 
-#[derive(Default, Deserialize, Serialize)]
-pub struct Manifest {
-    pub kind: String,
-    pub revision: String,
-    pub platform: String,
-    pub inputs: BTreeMap<String, String>,
+#[derive(Default, Serialize)]
+struct Manifest {
+    kind: String,
+    revision: String,
+    platform: String,
+    inputs: BTreeMap<String, String>,
 }
-pub fn output(c: &mut Command) -> Result<String> {
+fn output(c: &mut Command) -> Result<String> {
     let o = c.output().with_context(|| format!("starting {c:?}"))?;
     ensure!(
         o.status.success(),
@@ -49,10 +34,10 @@ pub fn output(c: &mut Command) -> Result<String> {
     );
     Ok(String::from_utf8(o.stdout)?.trim().into())
 }
-pub fn revision(source: &Path) -> Result<String> {
+fn revision(source: &Path) -> Result<String> {
     output(Command::new("git").arg("-C").arg(source).args(["rev-parse", "HEAD"]))
 }
-pub fn sha(path: &Path) -> Result<String> {
+fn sha(path: &Path) -> Result<String> {
     let mut f = fs::File::open(path).with_context(|| format!("reading {}", path.display()))?;
     let mut h = Sha256::new();
     let mut b = [0; 65536];
@@ -84,30 +69,14 @@ pub fn download(url: &str, path: &Path) -> Result<()> {
     fs::rename(tmp, path)?;
     Ok(())
 }
-fn checksum_path(file: &Path) -> PathBuf {
-    let mut path = file.as_os_str().to_os_string();
-    path.push(".sha256");
-    path.into()
-}
-pub fn extract_verified(file: &Path, to: &Path) -> Result<()> {
-    let sidecar = checksum_path(file);
-    let expected =
-        fs::read_to_string(&sidecar).with_context(|| format!("reading {}", sidecar.display()))?;
-    ensure!(
-        expected.split_whitespace().next() == Some(sha(file)?.as_str()),
-        "archive checksum mismatch: {}",
-        file.display()
-    );
-    extract(file, to)
-}
 pub fn extract(file: &Path, to: &Path) -> Result<()> {
     run(Command::new("tar").arg("-xf").arg(file).arg("-C").arg(to))
 }
-pub fn seal(dir: &Path, m: &Manifest) -> Result<()> {
-    fs::write(dir.join("manifest.json"), serde_json::to_vec_pretty(m)?)?;
-    Ok(())
-}
-pub fn archive(dir: &Path, out: &Path) -> Result<()> {
+fn archive(dir: &Path, out: &Path, manifest: &Manifest) -> Result<()> {
+    fs::write(
+        dir.join("manifest.json"),
+        serde_json::to_vec_pretty(manifest)?,
+    )?;
     fs::create_dir_all(out)?;
     let dest = out.join(format!(
         "{}.tar.gz",
@@ -122,7 +91,7 @@ pub fn archive(dir: &Path, out: &Path) -> Result<()> {
         .arg(dir.file_name().unwrap()))?;
     fs::rename(tmp, &dest)?;
     fs::write(
-        checksum_path(&dest),
+        dest.with_extension("gz.sha256"),
         format!(
             "{}  {}\n",
             sha(&dest)?,
@@ -137,53 +106,114 @@ pub fn dispatch(task: Task) -> Result<()> {
     match task {
         Task::Metadata => {
             println!(
-                "platform={}\nruntime_id={}\nfixture_id={}",
+                "platform={}\nruntime_tag={}\nfixture_tag={}",
                 runtime::platform()?.0,
-                config.runtime_id(),
-                config.fixture_id()
+                config.runtime_tag(),
+                config.fixture_tag()
             );
         }
-        Task::Runtime { out } => runtime::assemble(&config, &out)?,
-        Task::Fixtures { source, out } => assemble_fixtures(config, source, out)?,
-        Task::Bundle { runtime, fixtures, binary, out } => {
-            assemble_bundle(config, runtime, fixtures, binary, out)?
-        }
-        Task::Verify { bundle, live } => verify(&fs::canonicalize(bundle)?, live)?,
+        Task::Runtime { out } => assemble_runtime(&config, &out)?,
+        Task::Fixtures { source, out } => assemble_fixtures(&config, &source, &out)?,
+        Task::Runner { binary, out } => assemble_runner(&binary, &out)?,
     }
     Ok(())
 }
-fn verify(bundle: &Path, live: bool) -> Result<()> {
-    let work = tempfile::Builder::new().prefix("rs qualification ").tempdir_in("/tmp")?;
-    let bin = bundle.join("bin/redsuite");
-    for args in [&["--help"][..], &["redshift", "list"], &["stack", "status"]] {
-        run(Command::new(&bin)
-            .args(args)
-            .current_dir(work.path())
-            .env_remove("REDSUITE_ROOT")
-            .env_remove("REDSUITE_FIXTURES_DIR")
-            .env_remove("REDSUITE_YELLOWSTONE_PLUGIN"))?;
-    }
-    let mut deps = Command::new(if cfg!(target_os = "macos") { "otool" } else { "ldd" });
-    if cfg!(target_os = "macos") {
-        deps.arg("-L");
-    }
-    run(deps
-        .arg(bundle.join("bin/redsuite-bin"))
-        .arg(bundle.join("runtime/agave/bin/solana-test-validator"))
-        .arg(bundle.join("runtime/yellowstone").join(runtime::platform()?.1)))?;
-    if live {
-        let result = run(Command::new(&bin)
-            .args(["redshift", "run", "cache_transport_recovery", "--cleanup"])
-            .env("REDSUITE_ROOT", work.path()));
-        let cleanup =
-            run(Command::new(&bin).args(["stack", "down"]).env("REDSUITE_ROOT", work.path()));
-        result?;
-        cleanup?;
-    }
-    Ok(())
+fn assemble_runtime(config: &runtime::Config, out: &Path) -> Result<()> {
+    let (target, lib) = runtime::platform()?;
+    let cache = env::var_os("REDSUITE_BUILD_CACHE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root().join("target/package-cache"));
+    fs::create_dir_all(&cache)?;
+    let temp = tempfile::tempdir()?;
+    let dir = temp.path().join(config.runtime_name()?);
+    fs::create_dir(&dir)?;
+    let url = format!(
+        "https://github.com/anza-xyz/agave/releases/download/v{}/solana-release-{target}.tar.bz2",
+        config.pins.agave.version
+    );
+    let agave = cache.join(format!(
+        "agave-{}-{target}.tar.bz2",
+        config.pins.agave.revision
+    ));
+    download(&url, &agave)?;
+    extract(&agave, &dir)?;
+    fs::rename(dir.join("solana-release"), dir.join("agave"))?;
+    let rev = &config.pins.yellowstone.revision;
+    let srcurl = format!("https://github.com/rpcpool/yellowstone-grpc/archive/{rev}.tar.gz");
+    let src = cache.join(format!("{rev}.tar.gz"));
+    download(&srcurl, &src)?;
+    extract(&src, temp.path())?;
+    let source = temp.path().join(format!("yellowstone-grpc-{rev}"));
+    let plugin = if cfg!(target_os = "macos") {
+        // Upstream's build script uses git describe; an archive can otherwise
+        // inherit this checkout's Git identity or fail outside a repository.
+        let build_source = temp.path().join("yellowstone-build");
+        run(Command::new("git")
+            .args(["clone", "--depth", "1", "--branch"])
+            .arg(config.pins.yellowstone_tag())
+            .arg("https://github.com/rpcpool/yellowstone-grpc.git")
+            .arg(&build_source))?;
+        ensure!(
+            revision(&build_source)? == *rev,
+            "Yellowstone release tag no longer matches the pinned revision"
+        );
+        let build = cache.join(format!("yellowstone-{rev}"));
+        run(Command::new("cargo")
+            .args([
+                "build",
+                "--release",
+                "--locked",
+                "--target",
+                target,
+                "-p",
+                "yellowstone-grpc-geyser",
+            ])
+            .current_dir(&build_source)
+            .env_remove("RUSTUP_TOOLCHAIN")
+            .env("RUSTFLAGS", "")
+            .env("CARGO_TARGET_DIR", &build))?;
+        build.join(target).join("release").join(lib)
+    } else {
+        let file = cache.join(format!("yellowstone-{rev}.so"));
+        download(
+            &format!(
+                "https://github.com/rpcpool/yellowstone-grpc/releases/download/{}/{lib}",
+                config.pins.yellowstone_tag()
+            ),
+            &file,
+        )?;
+        file
+    };
+    copy(&plugin, &dir.join("yellowstone").join(lib))?;
+    copy(&src, &dir.join("sources/yellowstone.tar.gz"))?;
+    copy(
+        &source.join("LICENSE"),
+        &dir.join("licenses/Yellowstone-LICENSE"),
+    )?;
+    download(
+        &format!(
+            "https://raw.githubusercontent.com/anza-xyz/agave/{}/LICENSE",
+            config.pins.agave.revision
+        ),
+        &dir.join("licenses/Agave-LICENSE"),
+    )?;
+    copy(
+        &root().join("LICENSE"),
+        &dir.join("licenses/RedSuite-LICENSE"),
+    )?;
+    let manifest = Manifest {
+        kind: "runtime".into(),
+        platform: target.into(),
+        inputs: BTreeMap::from([
+            ("components".into(), toml::to_string(&config.pins)?),
+            ("agave_url".into(), url),
+            ("yellowstone_source".into(), srcurl),
+        ]),
+        ..Default::default()
+    };
+    archive(&dir, out, &manifest)
 }
-
-fn assemble_fixtures(config: runtime::Config, source: PathBuf, out: PathBuf) -> Result<()> {
+fn assemble_fixtures(config: &runtime::Config, source: &Path, out: &Path) -> Result<()> {
     let source = fs::canonicalize(source)?;
     ensure!(
         output(Command::new("git").arg("-C").arg(&source).args([
@@ -196,85 +226,53 @@ fn assemble_fixtures(config: runtime::Config, source: PathBuf, out: PathBuf) -> 
     );
     let rev = revision(&source)?;
     let tmp = tempfile::tempdir()?;
-    let snapshot = tmp.path().join("source.tar.gz");
+    let snapshot = tmp.path().join("source.tar");
     run(Command::new("git")
         .arg("-C")
         .arg(&source)
-        .args(["archive", "--format=tar.gz"])
+        .args(["archive", "--format=tar"])
         .arg(format!("--output={}", snapshot.display()))
         .arg(&rev))?;
     let build = tmp.path().join("build");
     fs::create_dir(&build)?;
     extract(&snapshot, &build)?;
-    let runtime = runtime::acquire_runtime(&config)?;
+    let runtime = runtime::acquire_runtime(config)?;
     let built = crate::fixtures::build(&build, &build.join("target/deploy"), Some(&runtime))?;
     let dir = tmp.path().join(config.fixture_name());
     fs::create_dir(&dir)?;
-    let mut m = Manifest {
-        kind: "fixtures".into(),
-        revision: rev,
-        ..Default::default()
-    };
     for file in built {
         copy(&file, &dir.join(file.file_name().unwrap()))?;
     }
-    m.inputs.insert(
-        "sbf".into(),
-        output(Command::new(runtime.join("agave/bin/cargo-build-sbf")).arg("--version"))?,
-    );
-    copy(&snapshot, &dir.join("source.tar.gz"))?;
-    copy(&root().join("LICENSE"), &dir.join("LICENSE"))?;
-    seal(&dir, &m)?;
-    archive(&dir, &out)?;
-    Ok(())
-}
-
-fn assemble_bundle(
-    config: runtime::Config,
-    rt: PathBuf,
-    fixtures: PathBuf,
-    binary: PathBuf,
-    out: PathBuf,
-) -> Result<()> {
-    let tmp = tempfile::tempdir()?;
-    extract_verified(&rt, tmp.path())?;
-    extract_verified(&fixtures, tmp.path())?;
-    let rev = revision(root())?;
-    let r = tmp.path().join(config.runtime_name()?);
-    let f = tmp.path().join(config.fixture_name());
-    let manifest: Manifest = serde_json::from_slice(&fs::read(f.join("manifest.json"))?)?;
-    ensure!(
-        manifest.revision == rev,
-        "fixtures must match the runner's source commit"
-    );
-    let dir = tmp.path().join(format!(
-        "redsuite-{}-{}",
-        env!("CARGO_PKG_VERSION"),
-        runtime::platform()?.0
-    ));
-    fs::create_dir(&dir)?;
-    fs::rename(r, dir.join("runtime"))?;
-    fs::rename(f, dir.join("fixtures"))?;
-    copy(&binary, &dir.join("bin/redsuite-bin"))?;
-    for (a, b) in [("launcher", "redsuite"), ("runtime-env", "runtime-env")] {
-        copy(
-            &root().join("xtask/assets").join(a),
-            &dir.join("bin").join(b),
-        )?;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(dir.join("bin/redsuite"), fs::Permissions::from_mode(0o755))?;
-    }
-    copy(&root().join("LICENSE"), &dir.join("LICENSE"))?;
-    let m = Manifest {
-        kind: "bundle".into(),
+    let manifest = Manifest {
+        kind: "fixtures".into(),
         revision: rev,
-        platform: runtime::platform()?.0.into(),
+        inputs: BTreeMap::from([(
+            "sbf".into(),
+            output(Command::new(runtime.join("agave/bin/cargo-build-sbf")).arg("--version"))?,
+        )]),
         ..Default::default()
     };
-    seal(&dir, &m)?;
-    archive(&dir, &out)?;
-    Ok(())
+    copy(&root().join("LICENSE"), &dir.join("LICENSE"))?;
+    archive(&dir, out, &manifest)
+}
+
+fn assemble_runner(binary: &Path, out: &Path) -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path().join(runtime::runner_name()?);
+    copy(binary, &dir.join("bin/redsuite"))?;
+    copy(
+        &root().join("shared/components.toml"),
+        &dir.join("components.toml"),
+    )?;
+    copy(&root().join("LICENSE"), &dir.join("LICENSE"))?;
+    archive(
+        &dir,
+        out,
+        &Manifest {
+            kind: "runner".into(),
+            revision: revision(root())?,
+            platform: runtime::platform()?.0.into(),
+            ..Default::default()
+        },
+    )
 }

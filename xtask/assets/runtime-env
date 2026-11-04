@@ -1,4 +1,4 @@
-# Shared by the packaged runner and with-runtime. Paths must be absolute.
+# Paths must be absolute.
 redsuite_environment() {
     export REDSUITE_ROOT="${REDSUITE_ROOT:-$PWD}"
     if [[ -n "${REDSUITE_FIXTURES_DIR:-$2}" ]]; then

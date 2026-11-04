@@ -1,99 +1,79 @@
-# Native bundle assembly
+# Component releases
 
-The xtask commands prepare archives for Apple Silicon macOS and x86-64 GNU/Linux.
-They do not create tags or publish releases.
+RedSuite runners, Agave/Yellowstone runtimes, and fixtures are separate archives.
+A runner release does not rebuild or upload runtime or fixture archives.
+There are no self-contained bundles.
 
-Pushing a version tag (`N.N.N`) runs the [bundle workflow](../.github/workflows/bundles.yml).
-It builds both native runtimes and runners, builds shared fixtures once, and
-inspects the extracted bundles. After both platforms pass, it attaches the runtime,
-fixture, and full bundle archives with their checksum sidecars to the tag's GitHub
-Release, creating a draft if needed. Reruns replace assets with matching names.
-Manual workflow runs only upload Actions artifacts; they do not change releases.
+`shared/components.toml` selects runtime and fixture releases explicitly. Their
+pins stay unchanged across runner releases until a maintainer updates them.
+The initial pins reuse assets already published with RedSuite 3.4.0.
 
-`shared/components.toml` defines the single Agave/Yellowstone pair used by this
-RedSuite version, including its source revisions. Cache identities use pinned component revisions and one recipe
-version in xtask; bump it when archive layout or build instructions change.
-Archive names use versions and the platform or recipe, not source SHAs.
-Fixture names include the workspace version and Agave recipe, not Yellowstone.
-The workspace version also selects the release used by `with-runtime`.
-Archive manifests record exact source revisions.
+## Release a runner
+
+Pushing a version tag (`N.N.N`) runs the [runner workflow](../.github/workflows/bundles.yml).
+It builds only the macOS Apple Silicon and Linux x86-64 runners and attaches
+`redsuite-runner-VERSION-PLATFORM.tar.gz` and checksum sidecars to the tag's
+GitHub Release, creating a draft if needed. Each archive includes the CLI,
+component pins, license, and source revision. Reruns replace matching assets.
+Manual workflow runs only upload Actions artifacts.
+
+## Update shared components
+
+Build new components only when explicitly changing them:
+
+- For Agave/Yellowstone changes, update the pins and bump `runtime.version`.
+  Bump that version for build-recipe changes too. The [runtime workflow](../.github/workflows/runtimes.yml)
+  builds both platforms for a `runtime-VERSION` tag.
+- For fixture changes, bump `fixtures.version`. The
+  [fixture workflow](../.github/workflows/fixtures.yml) builds shared SBF programs
+  for a `fixtures-VERSION` tag. Its runtime must already be published.
+
+Both workflows also support manual builds without release writes. Tag runs attach
+archives to a draft, without replacing existing assets. Publish the component
+release before selecting it in `runtime.release` or `fixtures.release` for the
+next runner release. Never overwrite an existing component version.
+
+Fixture archives contain compiled programs, a license, and build provenance, not
+the source snapshot. They need not match the runner's commit. Maintainers must
+bump the fixture version when programs or their host interfaces change together.
 
 ## Assemble locally
 
-Install the checkout's pinned Rust toolchain, curl, tar, and native build tools.
-macOS assembly builds Yellowstone from its exact upstream source using that
-source's toolchain; Linux reuses the upstream plugin. Both include the complete
-Agave distribution. SBF platform-tools download only when rebuilding fixtures.
-
 ```bash
-cargo xtask package runtime target/assets
-git worktree add --detach /tmp/redsuite-fixture-source HEAD
-REDSUITE_ASSETS_DIR="$PWD/target/assets" \
-  cargo xtask package fixtures /tmp/redsuite-fixture-source target/assets
 cargo build --release --locked -p redsuite
-cargo xtask package bundle target/assets/redsuite-runtime-*.tar.gz \
-  target/assets/redsuite-fixtures-*.tar.gz target/release/redsuite target/bundles
+cargo xtask package runner target/release/redsuite target/assets
 ```
 
-Fixture assembly builds a fresh copy of a clean source checkout, not existing
-`target/deploy` files. A bundle requires fixtures from the runner's source
-commit. Manifests record source revisions and component build inputs. Assembly alone is not release qualification.
+For a new runtime, `cargo xtask package runtime target/assets` assembles Agave and
+Yellowstone. macOS builds the pinned Yellowstone source; Linux uses the upstream
+plugin. `REDSUITE_BUILD_CACHE` controls downloads and Yellowstone build outputs.
 
-Archives have SHA-256 sidecars and include license notices. The runtime also
-includes the corresponding Yellowstone source. Preserve these when redistributing.
-
-To check a downloaded archive manually, place its `.sha256` sidecar from the
-same release beside it and run:
+To package fixtures, build from a clean checkout:
 
 ```bash
-bundle=redsuite-VERSION-PLATFORM.tar.gz
-shasum -a 256 -c "$bundle.sha256"
+git worktree add --detach /tmp/redsuite-fixture-source HEAD
+cargo xtask package fixtures /tmp/redsuite-fixture-source target/assets
 ```
 
-For local development before the version's release assets are published, assemble
-local assets or explicitly select local fixtures:
+This uses the pinned published runtime. To use locally assembled archives instead,
+set `REDSUITE_ASSETS_DIR` to their directory.
 
-```bash
-REDSUITE_ASSETS_DIR="$PWD/target/assets" REDSUITE_FIXTURES_DIR="$PWD/target/deploy" \
-  scripts/with-runtime cargo run --locked -p redsuite -- redshift list
-```
+## Run and reuse
 
-`with-runtime` verifies archives before atomically installing cache entries.
-`REDSUITE_CACHE_DIR` overrides the dependency cache, which defaults to
-`${XDG_CACHE_HOME:-$HOME/.cache}/redsuite`. Complete entries work offline.
-To build the MagicBlock committor with pinned SBF tools, use
-`cargo xtask runtime exec --runtime-only -- COMMAND ...`. It prepares Agave and
-Yellowstone without downloading RedSuite fixtures.
-`REDSUITE_BUILD_CACHE` separately controls assembly downloads and Yellowstone
-build outputs. Workload state, logs, and reports stay outside both caches.
+`./scripts/redsuite` acquires the published runner for the checkout's workspace
+version and its pinned runtime/fixtures, then executes the CLI. For a modified
+source runner, use `./scripts/with-runtime cargo run --locked -p redsuite --`.
+Both wrappers leave MagicBlock binaries and the committor user-supplied.
 
-## Qualification before release
+`REDSUITE_CACHE_DIR` overrides the component cache, which defaults to
+`${XDG_CACHE_HOME:-$HOME/.cache}/redsuite`. Existing component directories are
+reused without verification or network access. Remove a component's directory
+if it needs to be downloaded again. Missing published assets fail; there is no
+fallback release or automatic build.
 
-Extract the bundle outside the checkout, including into a path containing spaces:
+`REDSUITE_FIXTURES_DIR` selects locally rebuilt fixtures instead of a download.
+`cargo xtask runtime exec --runtime-only -- COMMAND ...` prepares only Agave and
+Yellowstone, for example when building the MagicBlock committor.
 
-```bash
-mkdir -p '/tmp/relocated redsuite'
-tar -xzf target/bundles/redsuite-*.tar.gz -C '/tmp/relocated redsuite'
-cargo xtask package verify '/tmp/relocated redsuite'/redsuite-*
-MAGICBLOCK_VALIDATOR_BIN=/absolute/path/to/target/release/magicblock-validator \
-  cargo xtask package verify '/tmp/relocated redsuite'/redsuite-* --live
-```
-
-Live verification runs `cache_transport_recovery`, which observes gRPC refresh
-while HTTP fetch and WebSocket update paths are withheld. Supply a compatible
-MagicBlock build using the [operator setup](../README.md#prepare-the-validator-under-test),
-including the committor and host prerequisites. Cold startup needs RPC access.
-Replication scenarios additionally need a verifier.
-Static CLI and dependency inspection does not establish a live pass.
-
-Also exercise a modified local runner, the [fixture rebuild workflow](../README.md#rebuild-fixture-programs),
-and cache reuse with network access disabled. Establish minimum macOS,
-glibc, and CPU requirements on target hosts. CI's macOS 15 and Ubuntu 22.04 images
-are build environments, not portability guarantees. Keep bundles unqualified
-until the required checks pass with a compatible supplied MagicBlock build.
-
-The workflow does not publish its draft. Complete live qualification and review
-the release notes before approving publication; wait for all assets to finish
-uploading. The development wrapper never selects `latest` or substitutes another
-release. Preparing a RedSuite release does not update consumer pins in other
-projects.
+Release builds do not run live qualification. CI's macOS 15 and Ubuntu 22.04
+images are build environments, not minimum OS or CPU guarantees.

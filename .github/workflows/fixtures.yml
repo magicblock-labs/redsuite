@@ -1,0 +1,69 @@
+name: Shared fixtures
+
+on:
+  push:
+    tags: ['fixtures-*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  RUSTFLAGS: ''
+  CARGO_INCREMENTAL: '0'
+
+jobs:
+  fixtures:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/solana
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/debug
+            target/sbf
+          key: sbf-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'shared/components.toml') }}-${{ github.sha }}
+          restore-keys: |
+            sbf-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'shared/components.toml') }}-
+            sbf-${{ runner.os }}-${{ runner.arch }}-
+      - id: recipe
+        run: cargo xtask package metadata >> "$GITHUB_OUTPUT"
+      - name: Build fixtures
+        shell: bash
+        run: |
+          if [[ "${{ github.ref_type }}" == tag ]]; then
+            test "${{ github.ref_name }}" = "${{ steps.recipe.outputs.fixture_tag }}"
+          fi
+          CARGO_TARGET_DIR="$PWD/target/sbf" \
+            target/debug/xtask package fixtures "$PWD" target/fixture-assets
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fixtures
+          path: target/fixture-assets/*
+          if-no-files-found: error
+
+  release:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: fixtures
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+      - name: Attach fixtures
+        run: |
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --verify-tag --draft --latest=false \
+              --title "$RELEASE_TAG" --notes "Shared RedSuite fixtures."
+          fi
+          find assets -type f \( -name '*.tar.gz' -o -name '*.tar.gz.sha256' \) \
+            -exec gh release upload "$RELEASE_TAG" {} +

@@ -5,3 +5,11 @@ version = "4.2.2"
 [yellowstone]
 version = "15.2.1"
 revision = "2531a8798164d5dd56e9c85664d08056ef7bf645"
+
+[runtime]
+release = "3.4.0"
+version = "4.2.2-15.2.1-r2"
+
+[fixtures]
+release = "3.4.0"
+version = "3.4.0-4.2.2-r2"

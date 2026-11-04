@@ -83,16 +83,14 @@ to succeed. Proxy faults are cleared between scenarios.
 
 ## 🚀 Get started
 
-Choose a native bundle for **macOS Apple Silicon** or **Linux x86-64 (GNU)**,
-or run from a source checkout with cached dependencies. Bundles provide RedSuite,
-its fixture programs, Agave, and Yellowstone. Each RedSuite version uses one
-pinned Agave/Yellowstone pair. The MagicBlock leader, verifier,
+Use a prebuilt runner for **macOS Apple Silicon** or **Linux x86-64 (GNU)**,
+or build the runner from source. The wrappers fetch missing components and cache
+the runner, fixtures, and Agave/Yellowstone runtime independently. The MagicBlock leader, verifier,
 and committor remain user-supplied.
 
-Use the selected release's assets and requirements together. A source-only
-release cannot be used as a binary installation. Component pins are recorded in
-[the component manifest](shared/components.toml); build and qualification
-instructions are in [bundle assembly](packaging/README.md).
+Runtime and fixture releases are pinned in [the component manifest](shared/components.toml).
+They are reused across runner releases until explicitly updated; see
+[component releases](packaging/README.md).
 
 ### Prepare the validator under test
 
@@ -121,21 +119,19 @@ The harness loads `magicblock_committor_program.so` from `../deploy` relative
 to the leader binary's directory (normally `target/deploy`). Preserve that
 layout when moving a build; a host build alone does not produce the committor.
 
-### Run a native bundle
+### Run a prebuilt runner
 
-Choose an archive for your platform from [GitHub Releases](https://github.com/magicblock-labs/redsuite/releases)
-and set `bundle` to the downloaded filename, then extract and run it:
+Install Rust through `rustup`, then run from the RedSuite checkout:
 
 ```bash
-bundle=redsuite-VERSION-PLATFORM.tar.gz
-tar -xzf "$bundle"
-export PATH="$PWD/${bundle%.tar.gz}/bin:$PATH"
-redsuite redshift list
-redsuite redshift run
+./scripts/redsuite redshift list
+./scripts/redsuite redshift run
 ```
 
-The wrapper needs Bash but not Cargo. Run it from a writable working directory;
-state, logs, and reports use that directory's `target` layout, not the bundle.
+Only the small bootstrap tool is compiled locally. The runner is downloaded for
+the checkout's workspace version; Agave/Yellowstone and fixtures come from their
+independently pinned releases. Installed components are reused without hashing
+or redownloading them. State, logs, and reports use the working directory.
 
 ### Develop RedSuite using cached dependencies
 
@@ -149,14 +145,14 @@ Install Rust through `rustup`. In the RedSuite checkout, using the same shell:
 The wrapper caches the pinned runtime and release fixtures separately, then
 executes your command unchanged. It logs the selected runtime and fixture paths
 once per invocation and neither builds nor substitutes MagicBlock.
-Dependencies come from the pinned release's bundles. When developing packaging
+Runtime and fixture archives come from their independently pinned releases. When developing packaging
 recipes before their assets are published, use `REDSUITE_ASSETS_DIR` with
 [locally assembled archives](packaging/README.md#assemble-locally); ordinary
 scenario work does not need archive assembly. Missing assets fail with the exact
 pinned name rather than substituting another release.
 
-Commands in the rest of this guide use the installed `redsuite` launcher. For a
-source run, use `./scripts/with-runtime cargo run --locked -p redsuite --` in its
+Commands in the rest of this guide use `redsuite` as shorthand for
+`./scripts/redsuite`. For a source run, use `./scripts/with-runtime cargo run --locked -p redsuite --` in its
 place.
 
 ### Rebuild fixture programs
@@ -347,7 +343,7 @@ progress details without changing the run's checks.
 | A fixture is missing or an edited program is not loaded | Follow the [rebuild workflow](#rebuild-fixture-programs), select the intended fixture directory, and stop the old stack before rerunning. |
 | The committor is missing | Build its SBF artifact as described in [validator preparation](#prepare-the-validator-under-test), preserving its location relative to the leader. |
 | Yellowstone fails to load or the base does not become ready | Inspect the base log and [plugin selection](#grpc-setup). Use the Agave/Yellowstone pair pinned by this RedSuite checkout. |
-| A pinned archive is unavailable or fails checksum verification | Use the exact release asset named by the error, or [assemble local assets](packaging/README.md#assemble-locally). |
+| A pinned archive is unavailable | Use the exact release asset named by the error, or [assemble local assets](packaging/README.md#assemble-locally). |
 | Concurrent validators exhaust disk space | Check the [storage guidance](#host-and-storage-considerations), reduce concurrency with `--serial`, and use `stack down` when the stack is no longer needed. |
 
 ## ⚙️ Configure the environment
@@ -356,7 +352,7 @@ progress details without changing the run's checks.
 | :-- | :-- |
 | `MAGICBLOCK_VALIDATOR_BIN` | Select the validator under test; otherwise discover `magicblock-validator` on `PATH`. |
 | `MAGICBLOCK_VERIFIER_BIN` | Select a verifier; otherwise discover it beside the leader binary, then on `PATH`. |
-| `REDSUITE_ROOT` | Set the resource/output root; the bundle and runtime wrappers default to the working directory. |
+| `REDSUITE_ROOT` | Set the resource/output root; the runner and runtime wrappers default to the working directory. |
 | `REDSUITE_FIXTURES_DIR` | Select compiled fixtures independently; defaults to the resource root's `target/deploy`. |
 | `REDSUITE_STACK_DIR` | Place ledgers, stack state, and logs on another disk; defaults to `target/redsuite-stack` under the resource root. |
 | `REDSUITE_ACCOUNTSDB_DIR` | Place rollup and verifier accounts databases separately from their ledgers. |
@@ -366,7 +362,7 @@ progress details without changing the run's checks.
 
 ### gRPC setup
 
-Bundles and `with-runtime` select the packaged Yellowstone plugin automatically.
+The wrappers select the packaged Yellowstone plugin automatically.
 Manual setups must use the same pinned pair; RedSuite does not negotiate
 versions. Plugin setup or startup failures stop the run; the harness does not
 retry without gRPC.
