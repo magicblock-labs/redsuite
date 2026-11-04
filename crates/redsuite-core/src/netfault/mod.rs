@@ -148,6 +148,7 @@ impl Hits {
 }
 
 enum Effect {
+    Observe,
     Reject(String),
     Stall(watch::Sender<()>),
 }
@@ -228,11 +229,19 @@ fn gate(shared: &Shared, operation: Operation) -> Gate {
     };
     let mut state = scope.borrow_mut();
     state.observed[operation.stage as usize] += 1;
+    for rule in &state.rules {
+        if matches!(rule.effect, Effect::Observe) && rule.selector.matches(&operation) {
+            rule.hits.record();
+        }
+    }
     // Persistent faults take precedence over one-shot interceptions.
     let pending =
-        if let Some(rule) = state.rules.iter().find(|rule| rule.selector.matches(&operation)) {
+        if let Some(rule) = state.rules.iter().find(|rule| {
+            !matches!(rule.effect, Effect::Observe) && rule.selector.matches(&operation)
+        }) {
             rule.hits.record();
             match &rule.effect {
+                Effect::Observe => unreachable!("observers never decide"),
                 Effect::Reject(message) => return Gate::Decided(Decision::Reject(message.clone())),
                 Effect::Stall(resume) => Gate::Stalled(resume.subscribe(), Holding(scope.clone())),
             }
@@ -353,6 +362,10 @@ impl Faults {
             selector,
             state: self.state.clone(),
         }
+    }
+
+    pub fn observe(&self, selector: Selector) -> RuleHandle {
+        self.rule(selector, Effect::Observe)
     }
 
     pub fn reject(&self, selector: Selector, message: &str) -> RuleHandle {

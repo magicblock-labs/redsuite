@@ -153,6 +153,14 @@ impl Api {
         self.rpc.try_call(method, params).await
     }
 
+    pub async fn try_call_claimed<T: DeserializeOwned>(
+        &self,
+        method: RpcRequest,
+        params: &impl Serialize,
+    ) -> Result<(u64, result::Result<T, RpcError>)> {
+        self.rpc.try_call_claimed(method, params).await
+    }
+
     pub async fn get_health(&self) -> Result<String> {
         self.call(RpcRequest::GetHealth, &NO_PARAMS).await
     }

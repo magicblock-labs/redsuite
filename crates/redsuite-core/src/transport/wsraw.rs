@@ -88,6 +88,14 @@ impl RawWs {
         self.subscribe(Topic::Account, &subscription::account_params(account)).await
     }
 
+    pub async fn try_account_subscribe(
+        &mut self,
+        account: &Pubkey,
+    ) -> Result<result::Result<u64, RpcError>> {
+        let params = subscription::account_params(account);
+        self.try_request(Topic::Account.subscribe(), &params).await
+    }
+
     pub async fn account_unsubscribe(&mut self, subscription: u64) -> Result<bool> {
         self.unsubscribe(Topic::Account, subscription).await
     }

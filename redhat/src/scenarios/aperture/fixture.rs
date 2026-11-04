@@ -1,7 +1,11 @@
+use super::TIMEOUT;
 use crate::PAYER_LAMPORTS;
 use account::Account;
 use anyhow::{ensure, Context};
+use base64::{engine::general_purpose::STANDARD, Engine};
+use hash::Hash;
 use instruction::AccountMeta;
+use json::JsonValueTrait;
 use keypair::Keypair;
 use message::{Message, VersionedMessage};
 use pubkey::Pubkey;
@@ -9,6 +13,7 @@ use redsuite_core::{
     programs::{CellHeader, REDSHIFT},
     random::{self, Rng},
     signed::{audit, audit_signatures, decode_state, Signed},
+    transport::wsraw::RawWs,
     BaseCtx, ChainCtx, ErCtx, Result,
 };
 use signature::Signature;
@@ -17,6 +22,8 @@ use std::{
     rc::Rc,
     time::{Duration, Instant},
 };
+use tokio::time;
+use transaction::versioned::VersionedTransaction;
 
 const OBSERVE: Duration = Duration::from_millis(250);
 
@@ -39,6 +46,11 @@ pub(super) struct Fixture {
     pub(super) keys: [Pubkey; 6],
     pub(super) base_images: Vec<Option<Account>>,
     pub(super) expected: Vec<Option<Account>>,
+}
+
+pub(super) fn notified_data(payload: &json::Value) -> Result<Vec<u8>> {
+    let encoded = payload["value"]["data"][0].as_str().context("notification data missing")?;
+    Ok(STANDARD.decode(encoded)?)
 }
 
 pub(super) async fn base_accounts(base: &BaseCtx, keys: &[Pubkey]) -> Result<Vec<Option<Account>>> {
@@ -150,6 +162,19 @@ impl Fixture {
         ))
     }
 
+    pub(super) fn signed_with(&self, mut message: Message, hash: Hash) -> Result<Signed> {
+        message.recent_blockhash = hash;
+        let transaction =
+            VersionedTransaction::try_new(VersionedMessage::Legacy(message), &[&self.payer])?;
+        Ok(Signed {
+            encoded: STANDARD.encode(wincode::serialize(&transaction)?),
+            signature: transaction.signatures[0],
+            blockhash: hash,
+            fee: 0,
+            error: None,
+        })
+    }
+
     /// Executes a repaired probe and advances the fee/value oracle exactly once.
     /// Readonly inputs may stay cold or mirror base, but must never diverge from it.
     pub(super) async fn check_control(
@@ -199,6 +224,36 @@ impl Fixture {
         }
         ensure!(base_accounts(&self.base, &self.keys).await? == self.base_images);
         Ok(tx.signature)
+    }
+
+    pub(super) async fn write(&mut self, nonce: u64, amount: u64) -> Result<Vec<u8>> {
+        let message = self.message(nonce, amount as i64, &[]).await?;
+        self.check_control(VersionedMessage::Legacy(message), amount, 1, false).await?;
+        Ok(self.expected[1].as_ref().context("cell expectation missing")?.data.clone())
+    }
+
+    /// Proves that an established subscription still observes a newly confirmed write.
+    pub(super) async fn confirmed_write(
+        &mut self,
+        control: &mut RawWs,
+        subscription: u64,
+        nonce: u64,
+    ) -> Result<()> {
+        time::timeout(TIMEOUT, async {
+            let expected = self.write(nonce, 5).await?;
+            loop {
+                let (method, id, payload) = control
+                    .next_notification(TIMEOUT)
+                    .await?
+                    .context("control notification lost during hostile inputs")?;
+                ensure!(method == "accountNotification" && id == subscription);
+                if notified_data(&payload)? == expected {
+                    return Ok(());
+                }
+            }
+        })
+        .await
+        .context("control write exceeded the confirmation deadline")?
     }
 
     /// Requires absence from blocks, transaction lookup, and signature status.

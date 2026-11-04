@@ -18,7 +18,7 @@ const OUTBOX_INTENT_DISCRIMINATOR: &[u8] = b"obintent";
 const OUTBOX_BUNDLE_BODY: usize = 256;
 const CONTROL_INDEX: u64 = 108;
 
-fn outbox_intent_pda(intent_id: u64) -> Pubkey {
+pub(in super::super) fn outbox_intent_pda(intent_id: u64) -> Pubkey {
     Pubkey::find_program_address(
         &[OUTBOX_INTENT_SEED, &intent_id.to_le_bytes()],
         &OUTBOX_INTENT_PROGRAM_ID,
