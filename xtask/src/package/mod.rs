@@ -247,7 +247,11 @@ fn assemble_bundle(
         manifest.revision == rev,
         "fixtures must match the runner's source commit"
     );
-    let dir = tmp.path().join(format!("redsuite-{rev}-{}", runtime::platform()?.0));
+    let dir = tmp.path().join(format!(
+        "redsuite-{}-{}",
+        env!("CARGO_PKG_VERSION"),
+        runtime::platform()?.0
+    ));
     fs::create_dir(&dir)?;
     fs::rename(r, dir.join("runtime"))?;
     fs::rename(f, dir.join("fixtures"))?;

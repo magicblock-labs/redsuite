@@ -12,7 +12,7 @@ use std::{
     process::Command,
 };
 // Bump when the archive layout or build recipe changes.
-const RECIPE: &str = "1";
+const RECIPE: &str = "2";
 
 pub struct Config {
     pins: crate::components::Runtime,
@@ -34,16 +34,17 @@ impl Config {
     }
     pub fn runtime_name(&self) -> Result<String> {
         Ok(format!(
-            "redsuite-runtime-{}-{}",
-            platform()?.0,
-            self.runtime_id()
+            "redsuite-runtime-{}-{}-r{RECIPE}-{}",
+            self.pins.agave.version,
+            self.pins.yellowstone.version,
+            platform()?.0
         ))
     }
     pub fn fixture_name(&self) -> String {
         format!(
-            "redsuite-fixtures-{}-{}",
+            "redsuite-fixtures-{}-{}-r{RECIPE}",
             env!("CARGO_PKG_VERSION"),
-            self.fixture_id()
+            self.pins.agave.version
         )
     }
 }

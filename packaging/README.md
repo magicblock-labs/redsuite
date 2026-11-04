@@ -13,6 +13,7 @@ Manual workflow runs only upload Actions artifacts; they do not change releases.
 `shared/components.toml` defines the single Agave/Yellowstone pair used by this
 RedSuite version, including its source revisions. Cache identities use pinned component revisions and one recipe
 version in xtask; bump it when archive layout or build instructions change.
+Archive names use versions and the platform or recipe, not source SHAs.
 Fixture names include the workspace version and Agave recipe, not Yellowstone.
 The workspace version also selects the release used by `with-runtime`.
 Archive manifests record exact source revisions.
@@ -45,7 +46,7 @@ To check a downloaded archive manually, place its `.sha256` sidecar from the
 same release beside it and run:
 
 ```bash
-bundle=redsuite-REVISION-PLATFORM.tar.gz
+bundle=redsuite-VERSION-PLATFORM.tar.gz
 shasum -a 256 -c "$bundle.sha256"
 ```
 
