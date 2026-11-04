@@ -61,6 +61,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target/debug
+            target/sbf
           key: sbf-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'shared/components.toml') }}-${{ github.sha }}
           restore-keys: |
             sbf-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'shared/components.toml') }}-
@@ -80,6 +81,8 @@ jobs:
       - if: steps.fixture-cache.outputs.cache-hit != 'true'
         name: Build release fixtures once
         shell: bash
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target/sbf
         run: |
           REDSUITE_ASSETS_DIR="$PWD/target/assets" \
             cargo xtask package fixtures "$PWD" target/fixture-assets
