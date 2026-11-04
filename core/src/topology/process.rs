@@ -58,6 +58,9 @@ pub(super) async fn terminate(
     pid: u32,
     hard_kill: bool,
 ) -> Result<(ExitStatus, bool)> {
+    if let Some(status) = child.try_wait()? {
+        return Ok((status, false));
+    }
     send_signal(pid, if hard_kill { "-KILL" } else { "-TERM" });
     let grace_deadline = Instant::now() + KILL_GRACE;
     let hard_deadline = if hard_kill { grace_deadline } else { grace_deadline + KILL_GRACE };
@@ -388,6 +391,15 @@ impl Owned {
 
     pub(super) fn is_running(&self) -> bool {
         self.has_child() && proc_running(self.pid)
+    }
+
+    pub(super) fn exit_status(&mut self) -> Result<Option<ExitStatus>> {
+        self.child
+            .as_mut()
+            .map(Child::try_wait)
+            .transpose()
+            .map(Option::flatten)
+            .map_err(Into::into)
     }
 
     pub(super) async fn terminate(

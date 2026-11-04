@@ -63,12 +63,20 @@ impl Verifier {
         self.plan.storage_dir()
     }
 
+    pub fn accountsdb_dir(&self) -> &Path {
+        &self.plan.params.engine.accountsdb.directory
+    }
+
     pub fn log(&self) -> &Path {
         &self.log
     }
 
     pub fn is_running(&self) -> bool {
         self.proc.is_running()
+    }
+
+    pub fn exit_status(&mut self) -> Result<Option<std::process::ExitStatus>> {
+        self.proc.exit_status()
     }
 
     pub async fn scrape_metrics(&self) -> Result<Metrics> {

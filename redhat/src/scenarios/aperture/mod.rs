@@ -9,6 +9,7 @@ mod amplification;
 mod authority;
 mod fixture;
 mod protocol;
+mod signals;
 mod simulation;
 mod structure;
 
@@ -16,5 +17,8 @@ pub use admission::TransactionAdmission;
 pub use amplification::UnpaidWork;
 pub use authority::TransactionAuthority;
 pub use protocol::ProtocolInputs;
+pub use signals::{
+    DivergenceSignals, LedgerIndexSignals, OutcomeSignals, PrunedReadSignals, SlowSubscriberSignals,
+};
 pub use simulation::SimulationIsolation;
 pub use structure::TransactionStructure;

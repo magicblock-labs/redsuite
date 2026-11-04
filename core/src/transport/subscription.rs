@@ -41,6 +41,7 @@ use crate::{wait, Result};
 #[derive(Clone, Copy, PartialEq)]
 pub(super) enum Topic {
     Account,
+    Failure,
     Logs,
     Program,
     Signature,
@@ -51,6 +52,10 @@ impl Topic {
     fn methods(self) -> (&'static str, &'static str) {
         match self {
             Self::Account => ("accountSubscribe", "accountUnsubscribe"),
+            Self::Failure => (
+                "transactionFailureSubscribe",
+                "transactionFailureUnsubscribe",
+            ),
             Self::Logs => ("logsSubscribe", "logsUnsubscribe"),
             Self::Program => ("programSubscribe", "programUnsubscribe"),
             Self::Signature => ("signatureSubscribe", "signatureUnsubscribe"),

@@ -4,7 +4,7 @@ use account::Account;
 use anyhow::{ensure, Context};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use hash::Hash;
-use instruction::AccountMeta;
+use instruction::{AccountMeta, Instruction};
 use json::JsonValueTrait;
 use keypair::Keypair;
 use message::{Message, VersionedMessage};
@@ -12,12 +12,14 @@ use pubkey::Pubkey;
 use redsuite_core::{
     programs::{CellHeader, REDSHIFT},
     random::{self, Rng},
+    rpc_types::response::TransactionError,
     signed::{audit, audit_signatures, decode_state, Signed},
     transport::wsraw::RawWs,
     BaseCtx, ChainCtx, ErCtx, Result,
 };
 use signature::Signature;
 use signer::Signer;
+use solana_instruction_error::InstructionError;
 use std::{
     rc::Rc,
     time::{Duration, Instant},
@@ -175,6 +177,21 @@ impl Fixture {
         })
     }
 
+    pub(super) fn failed_write(
+        &self,
+        nonce: u64,
+        amount: i64,
+        code: u32,
+    ) -> (Vec<Instruction>, TransactionError) {
+        (
+            vec![
+                REDSHIFT.batch().nonce(nonce).add(&self.keys[1..2], amount).build(),
+                REDSHIFT.batch().writable(&self.keys[1..2]).fail(code).build(),
+            ],
+            TransactionError::InstructionError(1, InstructionError::Custom(code)),
+        )
+    }
+
     /// Executes a repaired probe and advances the fee/value oracle exactly once.
     /// Readonly inputs may stay cold or mirror base, but must never diverge from it.
     pub(super) async fn check_control(
@@ -185,6 +202,16 @@ impl Fixture {
         skip_preflight: bool,
     ) -> Result<Signature> {
         let tx = Signed::from_versioned(&self.er, &self.payer, message, None).await?;
+        self.check_signed_control(&tx, amount, revisions, skip_preflight).await
+    }
+
+    pub(super) async fn check_signed_control(
+        &mut self,
+        tx: &Signed,
+        amount: u64,
+        revisions: u64,
+        skip_preflight: bool,
+    ) -> Result<Signature> {
         ensure!(tx.valid(&self.er).await?);
         let start = self.er.api().get_slot().await?;
         tx.send_config(&self.er, skip_preflight).await??;
@@ -196,7 +223,7 @@ impl Fixture {
             .await?
             .context("control terminal status missing")?;
         ensure!(status.slot == slot && status.err.is_none());
-        audit(&self.er, start, &[(&tx, 1)]).await?;
+        audit(&self.er, start, &[(tx, 1)]).await?;
         self.expected[0].as_mut().unwrap().lamports -= tx.fee;
         let cell = self.expected[1].as_mut().unwrap();
         let mut header = CellHeader::try_decode(&cell.data)?;
