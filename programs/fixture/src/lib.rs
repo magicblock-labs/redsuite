@@ -47,6 +47,9 @@ pub enum Instruction {
     },
     // Magic appends its externally encoded response after this discriminator.
     HandleResult,
+    DelegateV2 {
+        id: CellId,
+    },
 }
 
 impl Instruction {

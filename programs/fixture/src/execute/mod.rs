@@ -1,3 +1,4 @@
+use delegation_program_interface as dpi;
 use instruction::Instruction as SolanaInstruction;
 use pubkey::Pubkey;
 use sdk::{
@@ -71,6 +72,7 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
             run(program_id, accounts, &operations)
         }
         Instruction::HandleResult => settlement::handle_result(accounts, remaining),
+        Instruction::DelegateV2 { id } => delegate_v2(program_id, accounts, id),
     }
 }
 
@@ -352,6 +354,65 @@ fn delegate(
         &[CellId::SEED, id.authority.as_ref(), &id.index.to_le_bytes()],
         config,
     )
+}
+
+fn delegate_v2(program_id: &Pubkey, accounts: &[AccountInfo], id: CellId) -> ProgramResult {
+    let [payer, cell, owner, buffer, _state, cluster, system, dlp, authority] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+    if authority.key != &id.authority || !authority.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if owner.key != program_id
+        || cell.owner != program_id
+        || dlp.key != &dpi::id()
+        || system.key != &sdk_ids::system_program::ID
+    {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    let (address, bump) = id.pda(program_id);
+    if cell.key != &address {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    if CellHeader::try_decode(&cell.try_borrow_data()?)
+        .map_err(|_| ProgramError::InvalidAccountData)?
+        .id
+        != id
+    {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    let index = id.index.to_le_bytes();
+    let seeds: &[&[u8]] = &[CellId::SEED, id.authority.as_ref(), &index];
+    let cell_seeds = &[CellId::SEED, id.authority.as_ref(), &index, &[bump]];
+    let buffer_seeds = &[dpi::legacy::pda::DELEGATE_BUFFER_TAG, cell.key.as_ref()];
+    let (_, buffer_bump) = Pubkey::find_program_address(buffer_seeds, program_id);
+    let buffer_seeds = &[buffer_seeds[0], buffer_seeds[1], &[buffer_bump]];
+    create_pda(
+        buffer,
+        program_id,
+        cell.data_len(),
+        &[buffer_seeds],
+        system,
+        payer,
+        false,
+    )?;
+    buffer.try_borrow_mut_data()?.copy_from_slice(&cell.try_borrow_data()?);
+    cell.try_borrow_mut_data()?.fill(0);
+    cell.assign(system.key);
+    invoke_signed(
+        &system_instruction::assign(cell.key, dlp.key),
+        &[cell.clone(), system.clone()],
+        &[cell_seeds],
+    )?;
+    let args = dpi::DelegateArgs::new(
+        bump,
+        seeds.iter().map(|seed| dpi::DelegationSeed { value: seed.to_vec() }).collect(),
+    );
+    let instruction =
+        dpi::instruction_builder::delegate(*payer.key, *cell.key, *program_id, *cluster.key, args)
+            .map_err(|_| ProgramError::InvalidInstructionData)?;
+    invoke_signed(&instruction, accounts, &[cell_seeds])?;
+    sdk::utils::close_pda_with_system_transfer(buffer, &[buffer_seeds], payer, system)
 }
 
 fn resize(program_id: &Pubkey, accounts: &[AccountInfo], space: usize) -> ProgramResult {

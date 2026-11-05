@@ -6,10 +6,12 @@ use std::{
 
 pub mod commit_recovery;
 pub mod commit_snapshot_ordering;
+pub mod dlp_v2_lifecycle;
 pub mod intent_execution_and_accounting;
 pub mod settlement_lifecycle;
 pub mod stale_delegation_session_isolation;
 pub mod undelegation_recovery;
+mod v2;
 
 use keypair::Keypair;
 use pubkey::Pubkey;
