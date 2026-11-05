@@ -9,11 +9,19 @@ use redsuite_core::{
     topology::{self, ReplicatedOptions, ReplicatedTopology},
     wait,
 };
-use std::{os::unix::process::ExitStatusExt, process::ExitStatus, rc::Rc, time::Duration};
+use std::{
+    os::unix::process::ExitStatusExt, path::Path, process::ExitStatus, rc::Rc, time::Duration,
+};
 use tokio::time::{self, Instant};
 use tracing::info;
 
 const TRUNCATIONS: &str = r#"engine_ledger_operation_duration_micros_count{op="truncate"}"#;
+const INTEGRITY: [&str; 3] = ["state mismatch", "checksum mismatch", "checkpoint mismatch"];
+
+fn integrity_diagnostic(log: &Path) -> Result<Option<String>> {
+    Ok(log_mentions_mismatch(log)?
+        .filter(|line| INTEGRITY.iter().any(|needle| line.contains(needle))))
+}
 
 fn fail_stop(status: ExitStatus, diagnostic: Option<&str>) -> Result<()> {
     ensure!(
@@ -90,10 +98,10 @@ impl DivergenceSignals {
         let deadline = Instant::now() + TIMEOUT;
         let mut detected = false;
         loop {
-            let diagnostic = log_mentions_mismatch(&log)?;
+            let diagnostic = integrity_diagnostic(&log)?;
             detected |= diagnostic.is_some();
             if let Some(status) = self.topology.verifier_mut(0).exit_status()? {
-                fail_stop(status, log_mentions_mismatch(&log)?.as_deref())?;
+                fail_stop(status, integrity_diagnostic(&log)?.as_deref())?;
                 detected = true;
                 break;
             }
@@ -102,7 +110,7 @@ impl DivergenceSignals {
             }
             match self.topology.verifier(0).scrape_metrics().await {
                 Ok(_) => {}
-                Err(_) if log_mentions_mismatch(&log)?.is_some() => detected = true,
+                Err(_) if integrity_diagnostic(&log)?.is_some() => detected = true,
                 Err(error) => {
                     return Err(
                         error.context("verifier lost metrics without an integrity diagnostic")
@@ -117,7 +125,7 @@ impl DivergenceSignals {
         fault.restore()?;
         fixture.unchanged(&before).await?;
         if let Some(status) = self.topology.verifier_mut(0).exit_status()? {
-            fail_stop(status, log_mentions_mismatch(&log)?.as_deref())?;
+            fail_stop(status, integrity_diagnostic(&log)?.as_deref())?;
         }
         let stop = self.topology.verifier_mut(0).stop(false).await?;
         ensure!(

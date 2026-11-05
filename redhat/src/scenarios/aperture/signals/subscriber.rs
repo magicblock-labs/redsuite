@@ -1,6 +1,6 @@
 use super::{
     channels::{account_image, Channels},
-    finish, fixture, BaseCtx, ErCtx, Result, Scenario, OBSERVE, TIMEOUT,
+    finish, fixture, BaseCtx, ErCtx, Result, Scenario, TIMEOUT,
 };
 use anyhow::{ensure, Context};
 use redsuite_core::transport::wsraw::RawWs;
@@ -67,14 +67,12 @@ async fn slow_subscriber(base: Rc<BaseCtx>, er: ErCtx) -> Result<()> {
     }
     let mut delivered: BTreeMap<u64, BTreeSet<usize>> = BTreeMap::new();
     let mut explicit_limit = false;
+    let mut received = 0;
+    let expected = committed.len() * subscriptions.len();
     let drain = Instant::now() + TIMEOUT;
-    loop {
+    while received < expected {
         let remaining = drain.saturating_duration_since(Instant::now());
-        ensure!(
-            !remaining.is_zero(),
-            "slow-subscriber backlog did not drain within {TIMEOUT:?}"
-        );
-        let frame = match slow.next_notification(remaining.min(OBSERVE)).await {
+        let frame = match slow.next_notification(remaining).await {
             Ok(frame) => frame,
             Err(error) => {
                 let message = format!("{error:#}").to_ascii_lowercase();
@@ -93,14 +91,13 @@ async fn slow_subscriber(base: Rc<BaseCtx>, er: ErCtx) -> Result<()> {
             .get(image.data.as_slice())
             .and_then(|indices| indices.iter().copied().find(|index| committed[*index] == image))
             .context("slow subscriber reported an image that never committed (#261)")?;
-        delivered.entry(id).or_default().insert(index);
+        received += usize::from(delivered.entry(id).or_default().insert(index));
     }
     ensure!(
         slow.malformed_frames() == 0,
         "slow subscriber received malformed frames (#261)"
     );
-    let received: usize = delivered.values().map(BTreeSet::len).sum();
-    let missing = committed.len() * subscriptions.len() - received;
+    let missing = expected - received;
     ensure!(disconnected > 0.0 || missing > 0 || explicit_limit,
         "slow-subscriber overrun not reached after {} committed writes; no eviction or missing update witnessed", committed.len());
     let findings = if missing > 0 && !explicit_limit {

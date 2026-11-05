@@ -48,7 +48,8 @@ async fn ledger_index(base: Rc<BaseCtx>, er: ErCtx) -> Result<()> {
     ];
     let mut findings = Vec::new();
     for (index, (label, instructions, error)) in cases.into_iter().enumerate() {
-        let (tx, probe, slot) = channels.submit_failure(&fixture, &instructions, &error).await?;
+        let (tx, probe, slot) =
+            channels.submit_failure(&mut fixture, &instructions, &error).await?;
         match fixture.er.api().get_transaction(&tx.signature).await? {
             Some(record) => {
                 let meta = transaction_meta(&record)?;
@@ -183,7 +184,8 @@ async fn pruned_reads(base: Rc<BaseCtx>, er: ErCtx) -> Result<()> {
             Err(error) if retention_error(&error.error.message) => {},
             Ok(value) if !value.is_null() => findings.push(format!("{channel}: served a record below the witnessed pruned boundary")),
             result if !advertised => findings.push(format!("validator#1888: {channel}: silently omitted known pruned slot {} without a retention diagnostic: {result:?}", landmark.slot)),
-            _ => {},
+            Err(error) => findings.push(format!("{channel}: rejected known pruned slot {} without a retention diagnostic: {error}", landmark.slot)),
+            Ok(_) => {},
         }
     }
     let slots: Vec<u64> =

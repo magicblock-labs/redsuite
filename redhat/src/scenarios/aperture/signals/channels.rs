@@ -123,11 +123,11 @@ impl Channels {
 
     pub(super) async fn submit_failure(
         &mut self,
-        fixture: &Fixture,
+        fixture: &mut Fixture,
         instructions: &[Instruction],
         error: &TransactionError,
     ) -> Result<(Signed, Probe, u64)> {
-        let before = fixture.snapshot(&[]).await?;
+        let mut before = fixture.snapshot(&[]).await?;
         let hash = fixture.er.api().get_latest_blockhash().await?;
         let message =
             Message::new_with_blockhash(instructions, Some(&fixture.payer.pubkey()), &hash);
@@ -156,6 +156,8 @@ impl Channels {
             status.err
         );
         audit(&fixture.er, start, &[(&tx, 1)]).await?;
+        before.local[0].as_mut().context("payer missing")?.lamports -= tx.fee;
+        fixture.expected[0].as_mut().context("payer missing")?.lamports -= tx.fee;
         fixture.unchanged(&before).await?;
         let probe = Probe::new(&tx, watch, Some(error.clone()));
         Ok((tx, probe, status.slot))
@@ -258,6 +260,12 @@ impl Channels {
                         true
                     } else if let Some(probe) = probe.filter(|probe| probe.signature == signature) {
                         failure(&value["err"], probe.error.as_ref())?;
+                        if matches!(probe.error, Some(TransactionError::InstructionError(..))) {
+                            ensure!(
+                                value["logs"].as_array().is_some_and(|logs| !logs.is_empty()),
+                                "logs channel omitted failed execution logs (#261)"
+                            );
+                        }
                         false
                     } else {
                         bail!("logs channel reported an unrelated/uncommitted outcome (#261): {payload}");

@@ -106,7 +106,8 @@ async fn outcomes(base: Rc<BaseCtx>, er: ErCtx) -> Result<()> {
     channels.control(&mut fixture, 9_102, &[cold]).await?;
 
     let (instructions, error) = fixture.failed_write(9_002, 11, 7);
-    let (failed, probe, slot) = channels.submit_failure(&fixture, &instructions, &error).await?;
+    let (failed, probe, slot) =
+        channels.submit_failure(&mut fixture, &instructions, &error).await?;
     ensure!(failed.outcome(&fixture.er).await? == slot);
     let observed = channels.control_with_probe(&mut fixture, 9_103, &[], Some(&probe)).await?;
     let findings = [("signature", ""), ("logs", "validator#1889: "), ("failures", "")]
