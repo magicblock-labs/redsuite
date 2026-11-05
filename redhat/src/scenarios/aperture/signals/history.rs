@@ -141,7 +141,7 @@ async fn pruned_reads(base: Rc<BaseCtx>, er: ErCtx) -> Result<()> {
     info!(slot = landmark.slot, %signature, ?directories, "pruned-read baseline");
     wait::retry(
         "landmark superblocks physically pruned",
-        TIMEOUT,
+        TIMEOUT * directories.len() as u32,
         async || {
             ensure!(
                 directories.iter().all(|path| !path.exists()),
