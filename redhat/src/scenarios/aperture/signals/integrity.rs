@@ -7,6 +7,7 @@ use redshift::scenarios::replication::replication_recovery::{
 };
 use redsuite_core::{
     topology::{self, ReplicatedOptions, ReplicatedTopology},
+    transport::NETWORK_TIMEOUT,
     wait,
 };
 use std::{
@@ -44,7 +45,7 @@ impl Scenario for DivergenceSignals {
     async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
         wait::retry(
             "leader pruned the genesis cursor before verifier snapshot bootstrap",
-            TIMEOUT,
+            NETWORK_TIMEOUT,
             async || {
                 let metrics = er.scrape_metrics().await?;
                 ensure!(metrics.get(TRUNCATIONS).unwrap_or(0.0) >= 1.0);
