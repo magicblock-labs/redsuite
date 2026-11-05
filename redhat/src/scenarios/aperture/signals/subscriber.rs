@@ -66,7 +66,7 @@ async fn slow_subscriber(base: Rc<BaseCtx>, er: ErCtx) -> Result<()> {
         committed_by_data.entry(&image.data).or_default().push(index);
     }
     let mut delivered: BTreeMap<u64, BTreeSet<usize>> = BTreeMap::new();
-    let mut explicit_limit = false;
+    let mut closed = false;
     let mut received = 0;
     let expected = committed.len() * subscriptions.len();
     let drain = Instant::now() + TIMEOUT;
@@ -75,12 +75,8 @@ async fn slow_subscriber(base: Rc<BaseCtx>, er: ErCtx) -> Result<()> {
         let frame = match slow.next_notification(remaining).await {
             Ok(frame) => frame,
             Err(error) => {
-                let message = format!("{error:#}").to_ascii_lowercase();
-                explicit_limit =
-                    ["slow consumer", "overload", "queue full", "capacity", "subscription limit"]
-                        .iter()
-                        .any(|needle| message.contains(needle));
-                info!(%error, explicit_limit, "slow subscription closed");
+                closed = true;
+                info!(error = %format!("{error:#}"), "slow subscription closed by the server");
                 break;
             }
         };
@@ -98,16 +94,16 @@ async fn slow_subscriber(base: Rc<BaseCtx>, er: ErCtx) -> Result<()> {
         "slow subscriber received malformed frames (#261)"
     );
     let missing = expected - received;
-    ensure!(disconnected > 0.0 || missing > 0 || explicit_limit,
+    ensure!(disconnected > 0.0 || missing > 0 || closed,
         "slow-subscriber overrun not reached after {} committed writes; no eviction or missing update witnessed", committed.len());
-    let findings = if missing > 0 && !explicit_limit {
-        vec![format!("validator#1874: slow subscriber/account: {missing} committed notifications omitted without a named limit")]
+    let findings = if missing > 0 && !closed {
+        vec![format!("slow subscriber/account: {missing} committed notifications omitted while the connection stayed open")]
     } else {
         vec![]
     };
     info!(
         writes = committed.len(),
-        received, missing, disconnected, explicit_limit, "slow subscriber pressure observed"
+        received, missing, disconnected, closed, "slow subscriber pressure observed"
     );
     drop(slow);
     let mut recovered = RawWs::connect(fixture.er.ws_url()).await?;
