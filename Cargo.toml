@@ -79,7 +79,7 @@ signer = { package = "solana-signer", version = "3" }
 sdk-ids = { package = "solana-sdk-ids", version = "3" }
 solana-program-error = "3"
 dlp-api = { package = "magicblock-delegation-program-api", version = "4.0.0", default-features = false }
-magicblock-delegation-program-interface = { git = "https://github.com/magicblock-labs/delegation-program", rev = "3fb00596169d5963fbada0bf90e099e731fbacb4", default-features = false, features = ["instruction"] }
+magicblock-delegation-program-interface = { git = "https://github.com/magicblock-labs/delegation-program", branch = "dlp-v2", default-features = false, features = ["instruction"] }
 wheels = { git = "https://github.com/magicblock-labs/magicblock-wheels", branch = "snawaz/nested-layout-options" }
 magic-api = { package = "magicblock-magic-program-api", git = "https://github.com/magicblock-labs/magicblock-validator.git", rev = "d911a611966fa9ec5b8287c3f6bf48aa8810cdb9", default-features = false }
 solana-rpc-client-types = { version = "4.2.2", features = ["agave-unstable-api"] }
