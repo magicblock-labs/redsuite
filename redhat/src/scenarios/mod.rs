@@ -2,7 +2,8 @@ pub mod aperture;
 pub mod chainlink;
 pub mod magicblock;
 use aperture::{
-    ProtocolInputs, SimulationIsolation, TransactionAdmission, TransactionAuthority,
+    DivergenceSignals, LedgerIndexSignals, OutcomeSignals, ProtocolInputs, PrunedReadSignals,
+    SimulationIsolation, SlowSubscriberSignals, TransactionAdmission, TransactionAuthority,
     TransactionStructure, UnpaidWork,
 };
 use magicblock_config::types::Remote;
@@ -40,10 +41,48 @@ static REPLICATION: ErGroup = ErGroup {
     followers: 2,
 };
 
+static SIGNAL_INTEGRITY: ErGroup = ErGroup {
+    label: "signal-integrity",
+    settings: |p| {
+        p.engine.blockstore.blocktime = Duration::from_millis(20);
+        p.engine.blockstore.superblock = 64;
+        p.engine.blockstore.checkpoint = 8;
+        p.engine.ledger.size_limit = 0;
+    },
+    proxy: false,
+    followers: 1,
+};
+
+static SIGNAL_RETENTION: ErGroup = ErGroup {
+    label: "signal-retention",
+    settings: |p| {
+        p.engine.blockstore.blocktime = Duration::from_millis(8);
+        p.engine.blockstore.superblock = 256;
+        p.engine.ledger.size_limit = 0;
+    },
+    proxy: false,
+    followers: 0,
+};
+
+static SIGNAL_PRESSURE: ErGroup = ErGroup {
+    label: "signal-pressure",
+    settings: |p| p.engine.blockstore.blocktime = Duration::from_millis(20),
+    proxy: false,
+    followers: 0,
+};
+
 static IDENTITIES: BasePreparation = BasePreparation {
     run: |_| {
         Box::pin(async {
-            for group in [&DEFAULT, &PREPARATION, &EPHEMERAL, &REPLICATION] {
+            for group in [
+                &DEFAULT,
+                &PREPARATION,
+                &EPHEMERAL,
+                &REPLICATION,
+                &SIGNAL_INTEGRITY,
+                &SIGNAL_RETENTION,
+                &SIGNAL_PRESSURE,
+            ] {
                 topology::identity_for_label(group.label)?;
             }
             Ok(())
@@ -77,6 +116,26 @@ pub fn catalog() -> Vec<ScenarioEntry> {
         scenario!(
             UnpaidWork,
             exclusive(&PREPARATION, &[Fixture::RedshiftProgram], ())
+        ),
+        scenario!(
+            OutcomeSignals,
+            exclusive(&PREPARATION, &[Fixture::RedshiftProgram], ())
+        ),
+        scenario!(
+            DivergenceSignals,
+            exclusive(&SIGNAL_INTEGRITY, &[Fixture::RedshiftProgram], ())
+        ),
+        scenario!(
+            PrunedReadSignals,
+            exclusive(&SIGNAL_RETENTION, &[Fixture::RedshiftProgram], ())
+        ),
+        scenario!(
+            SlowSubscriberSignals,
+            exclusive(&SIGNAL_PRESSURE, &[Fixture::RedshiftProgram], ())
+        ),
+        scenario!(
+            LedgerIndexSignals,
+            exclusive(&DEFAULT, &[Fixture::RedshiftProgram], ())
         ),
         scenario!(
             SimulationIsolation,

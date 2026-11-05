@@ -50,7 +50,7 @@ const LAG_SAMPLE: Duration = Duration::from_millis(500);
 const RESTART_BUDGET: Duration = Duration::from_secs(16);
 const RECOVERY_TIMEOUT: Duration = Duration::from_secs(60);
 
-const TRANSACTIONS: &str = "engine_ledger_transactions";
+pub const TRANSACTIONS: &str = "engine_ledger_transactions";
 const BLOCKS: &str = "engine_ledger_blocks";
 const SUPERBLOCKS: &str = "engine_ledger_superblocks";
 const STATE_MISMATCHES: &str = "engine_replicator_client_state_mismatches";
@@ -135,7 +135,7 @@ impl Workload {
     }
 }
 
-async fn leader_metric(topology: &ReplicatedTopology, name: &str) -> Result<f64> {
+pub async fn leader_metric(topology: &ReplicatedTopology, name: &str) -> Result<f64> {
     let metrics = topology.leader().scrape_metrics().await?;
     metrics
         .get(name)
@@ -160,7 +160,7 @@ async fn verifier_count(verifier: &Verifier, name: &str) -> Result<f64> {
 }
 
 /// Waits for a fixed leader cutoff, surfacing mismatch log evidence if the verifier exits first.
-async fn await_catch_up(verifier: &Verifier, name: &str, target: f64) -> Result<Duration> {
+pub async fn await_catch_up(verifier: &Verifier, name: &str, target: f64) -> Result<Duration> {
     let started = Instant::now();
     let caught = wait::retry(
         &format!(
@@ -254,7 +254,7 @@ fn strip_ansi(line: &str) -> String {
 }
 
 /// Preserves the first mismatch diagnostic, including when verifier shutdown prevents metric reads.
-fn log_mentions_mismatch(log: &Path) -> Result<Option<String>> {
+pub fn log_mentions_mismatch(log: &Path) -> Result<Option<String>> {
     let text = fs::read_to_string(log)?;
     Ok(text
         .lines()

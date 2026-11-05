@@ -146,6 +146,10 @@ impl RawWs {
         self.unsubscribe(Topic::Slot, subscription).await
     }
 
+    pub async fn transaction_failure_subscribe(&mut self) -> Result<u64> {
+        self.subscribe(Topic::Failure, &NO_PARAMS).await
+    }
+
     pub async fn signature_subscribe(&mut self, signature: &Signature) -> Result<u64> {
         self.subscribe(Topic::Signature, &subscription::signature_params(signature))
             .await
