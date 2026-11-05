@@ -50,6 +50,8 @@ use crate::{
     Result,
 };
 
+pub const BLOCK_CLEANED_UP: i64 = -32001;
+
 /// A known execution failure, distinct from an unconfirmed or transport-failed submission.
 #[derive(Debug, Error, PartialEq, Eq)]
 #[error("transaction failed on-chain: {err:?}")]
@@ -354,6 +356,13 @@ impl Api {
     }
 
     pub async fn get_block(&self, slot: u64) -> Result<Option<UiConfirmedBlock>> {
+        self.try_get_block(slot).await?.map_err(Into::into)
+    }
+
+    pub async fn try_get_block(
+        &self,
+        slot: u64,
+    ) -> Result<result::Result<Option<UiConfirmedBlock>, RpcError>> {
         let config = RpcBlockConfig {
             transaction_details: Some(TransactionDetails::None),
             rewards: Some(false),
@@ -361,7 +370,7 @@ impl Api {
             max_supported_transaction_version: Some(1),
             ..RpcBlockConfig::default()
         };
-        self.call(RpcRequest::GetBlock, &(slot, config)).await
+        self.try_call(RpcRequest::GetBlock, &(slot, config)).await
     }
 
     pub async fn get_signatures_for_address(

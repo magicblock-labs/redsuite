@@ -1,4 +1,4 @@
-use std::{collections::HashSet, mem};
+use std::{collections::HashSet, mem, time::Duration};
 
 use anyhow::{anyhow, ensure, Context};
 use pubkey::Pubkey;
@@ -7,7 +7,7 @@ use solana_rpc_client_types::response::{Response, RpcLogsResponse};
 use solana_transaction_status_client_types::{
     EncodedConfirmedTransactionWithStatusMeta, UiTransactionStatusMeta,
 };
-use tokio::time;
+use tokio::time::{self, MissedTickBehavior};
 use tracing::warn;
 
 use crate::{
@@ -32,6 +32,8 @@ const SCHEDULE_MARKER: &str = "Scheduled commit with ID: ";
 const OUTBOX_MARKER: &str = "ScheduledCommitSent outbox: ";
 
 const RECEIPT_HISTORY_LIMIT: usize = 64;
+
+const RECEIPT_HISTORY_REFRESH: Duration = Duration::from_millis(250);
 
 #[derive(Debug)]
 pub struct CommitReceipt {
@@ -464,8 +466,10 @@ pub async fn fetch_commit_receipt_by_intent(
         let events = er.events().await?;
         let mut logs = events.logs(validator).await?;
         let mut slots = events.slots().await?;
-        let mut pending = er.get_signatures_for_address(validator, RECEIPT_HISTORY_LIMIT).await?;
-        let mut seen: HashSet<_> = pending.iter().copied().collect();
+        let mut history = time::interval(RECEIPT_HISTORY_REFRESH);
+        history.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut seen = HashSet::new();
+        let mut pending = Vec::new();
         loop {
             for signature in mem::take(&mut pending) {
                 match er.get_transaction(&signature).await {
@@ -494,6 +498,13 @@ pub async fn fetch_commit_receipt_by_intent(
                     if seen.insert(signature) { pending.push(signature); }
                 }
                 update = slots.next() => { update?; }
+                _ = history.tick() => {
+                    match er.get_signatures_for_address(validator, RECEIPT_HISTORY_LIMIT).await {
+                        Ok(signatures) => pending
+                            .extend(signatures.into_iter().filter(|signature| seen.insert(*signature))),
+                        Err(error) => last_fetch_error = Some(error),
+                    }
+                }
             }
         }
     })

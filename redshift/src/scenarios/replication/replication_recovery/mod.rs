@@ -11,7 +11,7 @@ use pubkey::Pubkey;
 use signer::Signer;
 
 use redsuite_core::{
-    api::transaction_meta,
+    api::{transaction_meta, BLOCK_CLEANED_UP},
     redline::{
         causal,
         causal::{CausalPair, Step},
@@ -434,7 +434,13 @@ impl ReplicationRecovery {
                         ),
                         async || {
                             let present =
-                                self.topology.leader().api().get_block(slot).await?.is_some();
+                                match self.topology.leader().api().try_get_block(slot).await? {
+                                    Ok(block) => block.is_some(),
+                                    Err(error) if error.error.code.code() == BLOCK_CLEANED_UP => {
+                                        false
+                                    }
+                                    Err(error) => return Err(error.into()),
+                                };
                             Ok(wait::when(present == retained, present))
                         },
                     )
