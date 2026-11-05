@@ -71,7 +71,7 @@ impl Fixture {
         ensure!(*state.delegated_account() == cell);
         ensure!(*state.delegation_cluster() == self.cluster);
         ensure!(*state.original_owner() == REDSHIFT.id());
-        ensure!(state.last_commit_id() == 0);
+        ensure!(state.last_commit_seq() == 0);
         let legacy = self
             .base
             .accounts(&[
@@ -94,7 +94,9 @@ impl Fixture {
             .account(&dpi::delegation_state_pda(cell))
             .await?
             .context("v2 DelegationState missing")?;
-        Ok(DelegationState::decode(&account.data)?.last_commit_id())
+        Ok(u64::from(
+            DelegationState::decode(&account.data)?.last_commit_seq(),
+        ))
     }
 
     pub async fn write(&self, cell: Pubkey, value: u64) -> Result<Vec<u8>> {
