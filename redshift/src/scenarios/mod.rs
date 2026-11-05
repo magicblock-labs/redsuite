@@ -70,6 +70,12 @@ pub fn catalog() -> Vec<ScenarioEntry> {
         .named("dlp_v2_buffered_settlement")
         .explicit_only(),
         scenario!(
+            committor::dlp_mixed_settlement::DlpMixedSettlement,
+            shared(&DEFAULT, &[Fixture::RedshiftProgram], ())
+        )
+        .named("dlp_mixed_settlement")
+        .explicit_only(),
+        scenario!(
             lifecycle::restart_under_load::RestartUnderLoad,
             exclusive(&STORAGE, &[Fixture::RedlineProgram], ())
         ),
