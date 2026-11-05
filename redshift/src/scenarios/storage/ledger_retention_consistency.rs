@@ -8,7 +8,7 @@ use keypair::Keypair;
 use pubkey::Pubkey;
 
 use redsuite_core::{
-    api::transaction_meta,
+    api::{transaction_meta, BLOCK_CLEANED_UP},
     prep,
     programs::{CellHeader, REDSHIFT},
     topology::RestartConfig,
@@ -268,8 +268,14 @@ impl History {
 
         let tip = er.api().get_slot().await?;
         for entry in &view.pruned {
-            let block = er.api().get_block(entry.slot).await?;
-            ensure!(block.is_none());
+            let error = er.api().try_get_block(entry.slot).await?.err().with_context(|| {
+                format!("pruned block {} is not reported as cleaned up", entry.slot)
+            })?;
+            ensure!(
+                error.error.code.code() == BLOCK_CLEANED_UP,
+                "pruned block {}: {error}",
+                entry.slot
+            );
         }
         for entry in &view.retained {
             if entry.slot + BLOCK_SETTLE_SLOTS > tip {
