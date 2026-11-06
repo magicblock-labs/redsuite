@@ -1,4 +1,5 @@
 use std::{
+    fs,
     os::unix::process::ExitStatusExt,
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -15,7 +16,7 @@ use crate::{
     context::{BaseCtx, ErCtx},
     report,
     resources::LaunchRecord,
-    Result,
+    wait, Result,
 };
 
 pub const STREAM_CONNECTED: &str = "engine_replicator_client_stream_connected";
@@ -23,6 +24,8 @@ pub const SERVER_CONNECTIONS: &str = "engine_replicator_server_connections";
 
 const VERIFIER_READY_TIMEOUT: Duration = Duration::from_secs(60);
 const CONNECT_POLL: Duration = Duration::from_millis(100);
+const SNAPSHOT_ARCHIVE: &str = "accountsdb.tar.zst";
+const SNAPSHOT_GRACE: Duration = Duration::from_secs(30);
 
 #[derive(Default)]
 pub struct ReplicatedOptions {
@@ -279,7 +282,25 @@ pub async fn replicated(
         .as_ref()
         .and_then(std::rc::Weak::upgrade)
         .context("replication requires a group-owned leader")?;
-    let leader_params = owner.lock().await.params().clone();
+    let (leader_params, leader_storage) = {
+        let owner = owner.lock().await;
+        (owner.params().clone(), owner.storage_dir().to_owned())
+    };
+    let blockstore = &leader_params.engine.blockstore;
+    let interval = blockstore.blocktime * blockstore.superblock as u32;
+    wait::retry(
+        "the leader archiving a replication snapshot",
+        interval + SNAPSHOT_GRACE,
+        async || {
+            ensure!(
+                has_snapshot(&leader_storage)?,
+                "no complete snapshot archive in {}",
+                leader_storage.display()
+            );
+            Ok(())
+        },
+    )
+    .await?;
 
     let dir = state::stack_dir();
     let (bin_version, bin_fingerprint) = report::binary_provenance(&verifier_bin);
@@ -331,4 +352,18 @@ pub async fn replicated(
     }
 
     Ok(ReplicatedTopology { verifiers, leader })
+}
+
+fn has_snapshot(storage: &Path) -> Result<bool> {
+    for entry in fs::read_dir(storage)? {
+        let path = entry?.path();
+        let superblock = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("superblock-"));
+        if superblock && path.join(SNAPSHOT_ARCHIVE).is_file() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
