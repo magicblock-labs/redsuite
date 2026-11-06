@@ -35,7 +35,7 @@ static REPLICATION: ErGroup = ErGroup {
     label: "replication-security",
     settings: |p| {
         p.engine.blockstore.blocktime = Duration::from_millis(40);
-        p.engine.blockstore.superblock = 512;
+        p.engine.blockstore.superblock = 128;
     },
     proxy: false,
     followers: 2,
