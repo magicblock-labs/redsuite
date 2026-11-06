@@ -400,9 +400,9 @@ pub async fn receipt_for_target_if_present(
     }
 }
 
-/// Confirms no completion for `target` is visible in outbox history.
+/// Confirms no completion for `target` paid by `payer` is visible in outbox history.
 /// Listed signatures with unreadable transaction bodies are retried a bounded number of times.
-pub async fn ensure_receipt_absent(er: &Api, target: ReceiptTarget) -> Result<()> {
+pub async fn ensure_receipt_absent(er: &Api, target: ReceiptTarget, payer: &Pubkey) -> Result<()> {
     let ReceiptTarget::Outbox { address, intent_id, min_slot } = target else {
         ensure!(
             receipt_for_target_if_present(er, target).await?.is_none(),
@@ -428,7 +428,7 @@ pub async fn ensure_receipt_absent(er: &Api, target: ReceiptTarget) -> Result<()
                         continue;
                     };
                     ensure!(
-                        receipt.commit_id != Some(intent_id),
+                        receipt.commit_id != Some(intent_id) || receipt.payer != Some(*payer),
                         "completion for intent {intent_id} is visible"
                     );
                 }
