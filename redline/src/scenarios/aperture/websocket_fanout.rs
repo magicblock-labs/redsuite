@@ -56,6 +56,7 @@ impl Scenario<(ScenarioReport, Result<()>)> for WebsocketFanout {
         let mut superseded = 0;
         let mut peak = 0;
         let mut worst_p95 = 0;
+        let mut refetch = None;
         let mut report = ScenarioReport::ok()
             .setting("subscribers", self.connections)
             .setting("offered tps", self.rate);
@@ -110,7 +111,13 @@ impl Scenario<(ScenarioReport, Result<()>)> for WebsocketFanout {
                 let mut window_p95 = 0;
                 for reader in &readers {
                     if outcome.failed == 0 {
-                        reader.await_settled().await?;
+                        if let Err(error) = reader.await_settled().await {
+                            if reader.refetch_requested() {
+                                refetch = Some(error);
+                                return Ok(());
+                            }
+                            return Err(error);
+                        }
                     }
                     let observed = reader.take_outcome();
                     check!(
@@ -163,6 +170,15 @@ impl Scenario<(ScenarioReport, Result<()>)> for WebsocketFanout {
         for reader in &readers {
             reader.finalize();
         }
+        let completion = match refetch {
+            Some(error) => {
+                let reason = format!("{error:#}");
+                tracing::warn!(%reason, "fanout incomplete; server requested reconnect and refetch");
+                report = report.setting("subscription reset", reason);
+                "incomplete"
+            }
+            None => options.completion(&result),
+        };
         report = report
             .metric("delivered transactions", Unit::Count, cursor as f64)
             .metric("notifications observed", Unit::Count, received as f64)
@@ -173,7 +189,7 @@ impl Scenario<(ScenarioReport, Result<()>)> for WebsocketFanout {
                 Unit::Micros,
                 worst_p95 as f64,
             )
-            .setting("completion", options.completion(&result));
+            .setting("completion", completion);
         Ok((report, result))
     }
 }
