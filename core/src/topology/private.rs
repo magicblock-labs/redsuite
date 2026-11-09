@@ -111,6 +111,7 @@ impl PrivateEr {
     // Stop the ER without a relaunch. hard_kill=true is the crash path the
     // ledger-restore scenarios use so nothing flushes on the way down.
     pub async fn stop(&mut self, hard_kill: bool) -> Result<()> {
+        let _ = self.wait_for_shutdown_slot(hard_kill).await?;
         self.proc
             .terminate(hard_kill)
             .await?
@@ -120,6 +121,7 @@ impl PrivateEr {
 
     // Explicit teardown reports errors; Drop remains the process-killing fallback.
     pub async fn finish(mut self) -> Result<()> {
+        let _ = self.wait_for_shutdown_slot(false).await?;
         self.proc.terminate(false).await?;
         self.remove_storage()
     }
@@ -133,7 +135,10 @@ impl PrivateEr {
     // same storage dir, identity and ports, so ctx() stays valid across the restart.
     pub async fn restart(&mut self, config: RestartConfig) -> Result<RestartOutcome> {
         let api = self.rpc_api();
-        let slot_before = api.get_slot().await.ok();
+        let slot_before = match self.wait_for_shutdown_slot(config.hard_kill).await? {
+            Some(slot) => Some(slot),
+            None => api.get_slot().await.ok(),
+        };
         let (exit_status, needed_sigkill) = self
             .proc
             .terminate(config.hard_kill)
@@ -165,6 +170,35 @@ impl PrivateEr {
             slot_before,
             slot_after,
         })
+    }
+
+    async fn wait_for_shutdown_slot(&self, hard_kill: bool) -> Result<Option<u64>> {
+        let superblock = self.plan.params.engine.blockstore.superblock;
+        if hard_kill || superblock == 0 || !self.proc.is_running() {
+            return Ok(None);
+        }
+        ensure!(
+            superblock > 2,
+            "no slot between superblock snapshots for graceful shutdown"
+        );
+        let api = self.rpc_api();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                ensure!(
+                    self.proc.is_running(),
+                    "private ER exited while waiting to shut down"
+                );
+                if let Ok(slot) = api.get_slot().await {
+                    let offset = slot % superblock;
+                    if offset != 0 && offset != superblock - 1 {
+                        return Ok(Some(slot));
+                    }
+                }
+                tokio::time::sleep(process::RESTART_POLL).await;
+            }
+        })
+        .await
+        .context("timed out waiting for private ER to finish its superblock snapshot")?
     }
 }
 
