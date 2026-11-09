@@ -13,12 +13,10 @@ use crate::{
 };
 
 fn run_gate(run: &ScenarioRun) -> Option<String> {
-    if run
-        .config
-        .iter()
-        .any(|(key, value)| key == "completion" && value == "interrupted")
-    {
-        return Some("load interrupted".to_owned());
+    if let Some((_, completion)) = run.config.iter().find(|(key, value)| {
+        key == "completion" && matches!(value.as_str(), "interrupted" | "incomplete")
+    }) {
+        return Some(format!("load {completion}"));
     }
     if !run.passed {
         return Some(match run.failures.first() {
@@ -146,6 +144,10 @@ fn bmf_document(campaign: &Campaign) -> Document {
         }
         export_run(&mut doc, run);
         for cell in &scenario.cells {
+            if let Some(reason) = run_gate(cell) {
+                warn!(scenario = %cell.scenario, reason, "BMF cell excluded");
+                continue;
+            }
             export_run(&mut doc, cell);
         }
     }

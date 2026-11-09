@@ -11,6 +11,7 @@ use pubkey::Pubkey;
 use signature::Signature;
 use solana_rpc_client_types::response::{Response, RpcSignatureResult};
 use tokio::{sync::oneshot, time};
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use url::Url;
 
 use super::{
@@ -40,12 +41,19 @@ struct AccountState {
     lag: StreamingStats,
     observed: usize,
     superseded: usize,
+    refetch_requested: bool,
 }
 
 impl SubscriptionState for AccountState {
     type Key = Pubkey;
 
-    fn on_close(&mut self, _reason: &CloseReason) {
+    fn on_close(&mut self, reason: &CloseReason) {
+        self.refetch_requested |= matches!(
+            reason,
+            CloseReason::ServerClose(Some(frame))
+                if frame.code == CloseCode::Away
+                    && frame.reason == "connection closing; reconnect and refetch"
+        );
         // Dropping the senders errors every parked waiter.
         self.waiters.clear();
     }
@@ -123,6 +131,14 @@ impl AccountUpdates {
 
     pub async fn await_subscribed(&self, count: usize) -> Result<()> {
         self.connection.await_subscribed(count).await
+    }
+
+    pub fn refetch_requested(&self) -> bool {
+        self.connection.state().refetch_requested
+    }
+
+    pub fn check_error(&self) -> Result<()> {
+        self.connection.check_error().with_context(|| self.connection.diagnostics())
     }
 
     pub fn track(&self, id: u64, account: Pubkey) {
