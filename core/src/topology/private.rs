@@ -108,10 +108,10 @@ impl PrivateEr {
         .map_err(|error| self.ports.failure(error))
     }
 
-    // Stop the ER without a relaunch. hard_kill=true is the crash path the
-    // ledger-restore scenarios use so nothing flushes on the way down.
+    /// Stops the ER without relaunching, checking for a snapshot gap before SIGTERM.
+    /// `hard_kill` skips the check and sends SIGKILL without flushing.
     pub async fn stop(&mut self, hard_kill: bool) -> Result<()> {
-        let _ = self.wait_for_shutdown_slot(hard_kill).await?;
+        let _ = self.prepare_shutdown(hard_kill).await?;
         self.proc
             .terminate(hard_kill)
             .await?
@@ -119,11 +119,12 @@ impl PrivateEr {
         Ok(())
     }
 
-    // Explicit teardown reports errors; Drop remains the process-killing fallback.
+    /// Stops the ER and removes its storage once the child is reaped.
+    /// Storage cleanup also runs after a failed snapshot wait; the wait error is retained.
     pub async fn finish(mut self) -> Result<()> {
-        let _ = self.wait_for_shutdown_slot(false).await?;
-        self.proc.terminate(false).await?;
-        self.remove_storage()
+        let stopped = if self.proc.has_child() { self.stop(false).await } else { Ok(()) };
+        let removed = if self.proc.has_child() { Ok(()) } else { self.remove_storage() };
+        stopped.and(removed)
     }
 
     fn remove_storage(&self) -> Result<()> {
@@ -131,11 +132,11 @@ impl PrivateEr {
             .with_context(|| format!("removing the storage of private ER `{}`", self.proc.label()))
     }
 
-    // Stop the ER (SIGTERM, or SIGKILL if hard_kill), then relaunch it on the
-    // same storage dir, identity and ports, so ctx() stays valid across the restart.
+    /// Stops and relaunches the ER on the same storage, identity and ports.
+    /// A failed snapshot wait terminates the old process and aborts the restart.
     pub async fn restart(&mut self, config: RestartConfig) -> Result<RestartOutcome> {
         let api = self.rpc_api();
-        let slot_before = match self.wait_for_shutdown_slot(config.hard_kill).await? {
+        let slot_before = match self.prepare_shutdown(config.hard_kill).await? {
             Some(slot) => Some(slot),
             None => api.get_slot().await.ok(),
         };
@@ -172,17 +173,16 @@ impl PrivateEr {
         })
     }
 
-    async fn wait_for_shutdown_slot(&self, hard_kill: bool) -> Result<Option<u64>> {
+    /// Checks for a slot away from snapshot boundaries, terminating on failure.
+    /// Superblock intervals of 1 or 2 have no eligible gap and use normal termination.
+    /// This RPC check cannot synchronize with Engine's process-local snapshot barrier.
+    async fn prepare_shutdown(&mut self, hard_kill: bool) -> Result<Option<u64>> {
         let superblock = self.plan.params.engine.blockstore.superblock;
-        if hard_kill || superblock == 0 || !self.proc.is_running() {
+        if hard_kill || superblock <= 2 || !self.proc.is_running() {
             return Ok(None);
         }
-        ensure!(
-            superblock > 2,
-            "no slot between superblock snapshots for graceful shutdown"
-        );
         let api = self.rpc_api();
-        tokio::time::timeout(Duration::from_secs(30), async {
+        let result = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 ensure!(
                     self.proc.is_running(),
@@ -198,7 +198,19 @@ impl PrivateEr {
             }
         })
         .await
-        .context("timed out waiting for private ER to finish its superblock snapshot")?
+        .context("timed out waiting for private ER to finish its superblock snapshot")
+        .and_then(|result| result);
+        match result {
+            Ok(slot) => Ok(slot),
+            Err(error) => {
+                if let Err(termination) = self.proc.terminate(false).await {
+                    return Err(error.context(format!(
+                        "terminating private ER after snapshot wait failed: {termination:#}"
+                    )));
+                }
+                Err(error)
+            }
+        }
     }
 }
 
