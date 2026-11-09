@@ -62,18 +62,32 @@ impl Scenario<(ScenarioReport, Result<()>)> for WebsocketFanout {
             .setting("offered tps", self.rate);
         let clock = Arc::new(SendClock::new(1, 1024));
         let mut readers = Vec::with_capacity(self.connections);
-        for _ in 0..self.connections {
-            let reader = Rc::new(
-                AccountUpdates::connect(self.er.ws_url(), CellHeader::written_id, clock.clone())
+        let mut result: Result<()> = async {
+            for _ in 0..self.connections {
+                let reader = Rc::new(
+                    AccountUpdates::connect(
+                        self.er.ws_url(),
+                        CellHeader::written_id,
+                        clock.clone(),
+                    )
                     .await?,
-            );
-            for key in &self.keys {
-                reader.account_subscribe(key).await?;
+                );
+                readers.push(reader.clone());
+                let subscribed: Result<()> = async {
+                    for key in &self.keys {
+                        reader.account_subscribe(key).await?;
+                    }
+                    reader.await_subscribed(self.keys.len()).await
+                }
+                .await;
+                if let Err(error) = subscribed {
+                    if reader.refetch_requested() {
+                        refetch = Some(error);
+                        return Ok(());
+                    }
+                    return Err(error);
+                }
             }
-            reader.await_subscribed(self.keys.len()).await?;
-            readers.push(reader);
-        }
-        let result: Result<()> = async {
             while !remaining.is_zero() && !*options.stop.borrow() {
                 clock.reset(cursor + 1);
                 let deadline = Instant::now()
@@ -168,16 +182,23 @@ impl Scenario<(ScenarioReport, Result<()>)> for WebsocketFanout {
         }
         .await;
         for reader in &readers {
+            if let Err(error) = reader.check_error() {
+                if reader.refetch_requested() {
+                    refetch.get_or_insert(error);
+                } else if result.is_ok() {
+                    result = Err(error);
+                }
+            }
             reader.finalize();
         }
         let completion = match refetch {
-            Some(error) => {
+            Some(error) if result.is_ok() => {
                 let reason = format!("{error:#}");
                 tracing::warn!(%reason, "fanout incomplete; server requested reconnect and refetch");
                 report = report.setting("subscription reset", reason);
                 "incomplete"
             }
-            None => options.completion(&result),
+            _ => options.completion(&result),
         };
         report = report
             .metric("delivered transactions", Unit::Count, cursor as f64)

@@ -137,6 +137,10 @@ impl AccountUpdates {
         self.connection.state().refetch_requested
     }
 
+    pub fn check_error(&self) -> Result<()> {
+        self.connection.check_error().with_context(|| self.connection.diagnostics())
+    }
+
     pub fn track(&self, id: u64, account: Pubkey) {
         let mut state = self.connection.state_mut();
         state.pending.entry(id).or_default().insert(account);

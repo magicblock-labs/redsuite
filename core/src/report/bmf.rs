@@ -144,6 +144,10 @@ fn bmf_document(campaign: &Campaign) -> Document {
         }
         export_run(&mut doc, run);
         for cell in &scenario.cells {
+            if let Some(reason) = run_gate(cell) {
+                warn!(scenario = %cell.scenario, reason, "BMF cell excluded");
+                continue;
+            }
             export_run(&mut doc, cell);
         }
     }
