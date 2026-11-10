@@ -20,7 +20,7 @@ use redsuite_core::{
     wait, Account, BaseCtx, ChainCtx, ErCtx, Metrics, MetricsDelta, Result, Scenario,
     ScenarioReport,
 };
-use tracing::{debug, info, instrument};
+use tracing::{debug, instrument};
 
 use crate::{metrics, program::layout, RunControl, ACCOUNT_SPACE};
 
@@ -270,7 +270,7 @@ impl Scenario<(ScenarioReport, Result<()>)> for MixedSustainedLoad {
 
         let setup = self.started.elapsed();
         let deadline = load.deadline()?;
-        info!(rate, concurrency, ?load.duration, "load generation started");
+        debug!(rate, concurrency, ?load.duration, "load generation started");
         let executed = execute(
             er.api().url().clone(),
             er.ws_url().clone(),
@@ -289,7 +289,7 @@ impl Scenario<(ScenarioReport, Result<()>)> for MixedSustainedLoad {
         .await?;
 
         let outcome = &executed.outcome;
-        info!(
+        debug!(
             outcome.delivered,
             outcome.failed,
             delivered_tps = outcome.achieved_rps(),

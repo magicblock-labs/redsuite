@@ -11,7 +11,7 @@ use redsuite_core::config::{Environment, ErEndpoints};
 use redsuite_core::{catalog::Family, config::ExecutionConfig, logging, Result};
 use suite::Suite;
 use tokio::{sync::watch, task::LocalSet};
-use tracing::{error, info};
+use tracing::{debug, error};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
@@ -52,7 +52,7 @@ fn run_seed(seed: Option<u64>) -> u64 {
     let runner = std::env::current_exe()
         .and_then(|path| redsuite_core::report::binary_hash(&path))
         .unwrap_or_else(|_| "unavailable".into());
-    info!(seed, runner, "run seed");
+    debug!(seed, runner, "run seed");
     seed
 }
 

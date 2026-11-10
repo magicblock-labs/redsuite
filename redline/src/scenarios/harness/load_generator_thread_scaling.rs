@@ -115,7 +115,7 @@ impl Scenario<(ScenarioReport, Result<()>)> for LoadGeneratorThreadScaling {
                         break;
                     }
                     remaining = remaining.saturating_sub(cell.outcome.admission_wall);
-                    tracing::info!(
+                    tracing::debug!(
                         threads,
                         delivered = cell.outcome.delivered,
                         p95_us = cell.outcome.delivery.quantile95,

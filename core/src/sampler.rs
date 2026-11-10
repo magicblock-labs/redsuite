@@ -7,7 +7,7 @@ use tokio::{
     task::{self, JoinHandle},
     time,
 };
-use tracing::{info, warn, Instrument};
+use tracing::{debug, warn, Instrument};
 
 use crate::{
     api::{Metrics, MetricsCollector},
@@ -56,7 +56,7 @@ where
                 match collector.scrape().await {
                     Ok(metrics) => {
                         if consecutive_failures != 0 {
-                            info!(consecutive_failures, "metrics scraping recovered");
+                            debug!(consecutive_failures, "metrics scraping recovered");
                             consecutive_failures = 0;
                         }
                         samples.observations +=

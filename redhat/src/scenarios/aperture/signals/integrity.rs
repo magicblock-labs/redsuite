@@ -14,7 +14,7 @@ use std::{
     os::unix::process::ExitStatusExt, path::Path, process::ExitStatus, rc::Rc, time::Duration,
 };
 use tokio::time::{self, Instant};
-use tracing::info;
+use tracing::debug;
 
 const TRUNCATIONS: &str = r#"engine_ledger_operation_duration_micros_count{op="truncate"}"#;
 const INTEGRITY: [&str; 3] = ["state mismatch", "checksum mismatch", "checkpoint mismatch"];
@@ -95,7 +95,7 @@ impl DivergenceSignals {
         let bit = (fixture.base.config().seed % 8) as u8;
         let mut fault =
             PayloadFault::inject(self.topology.verifier(0).accountsdb_dir(), &image.data, bit)?;
-        info!(bit, "divergence injected into a caught-up verifier");
+        debug!(bit, "divergence injected into a caught-up verifier");
         let deadline = Instant::now() + TIMEOUT;
         let mut detected = false;
         loop {

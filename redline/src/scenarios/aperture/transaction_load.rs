@@ -18,7 +18,7 @@ use redsuite_core::{
     BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport, TxSender,
 };
 use tokio::sync::watch::Receiver;
-use tracing::{info, instrument, warn};
+use tracing::{debug, instrument, warn};
 
 use crate::{metrics, program::layout, RunControl, ACCOUNT_SPACE};
 
@@ -142,7 +142,7 @@ impl Scenario<(ScenarioReport, Result<()>), Shape> for TransactionLoad {
                 cursor += measured.outcome.delivered;
                 delivered += measured.outcome.delivered;
                 peak = peak.max(measured.outcome.delivery.max);
-                info!(
+                debug!(
                     delivered,
                     p50_us = measured.outcome.delivery.median,
                     p95_us = measured.outcome.delivery.quantile95,

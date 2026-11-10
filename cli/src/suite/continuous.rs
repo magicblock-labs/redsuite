@@ -9,7 +9,7 @@ use redsuite_core::{
     random::{self, Rng},
     topology, ErCtx, Result,
 };
-use tracing::info;
+use tracing::debug;
 
 use super::{group::GroupEr, prepare};
 use crate::catalog;
@@ -73,7 +73,7 @@ async fn run_rounds(config: &ExecutionConfig, er: &ErCtx, limit: usize) -> Resul
         cases.shuffle(&mut random::rng(config.seed, &[OWNER, "order"], round));
         let round_seed = random::rng(config.seed, &[OWNER, "seed"], round).gen();
         let order: Vec<_> = cases.iter().map(|(family, entry)| entry.name(*family)).collect();
-        info!(
+        debug!(
             seed = config.seed,
             round,
             round_seed,

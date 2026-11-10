@@ -15,7 +15,7 @@ use redsuite_core::{
 use signer::Signer;
 use std::{collections::BTreeSet, time::Duration};
 use tokio::time::Instant;
-use tracing::info;
+use tracing::debug;
 
 pub(super) struct Probe {
     signature: String,
@@ -320,7 +320,7 @@ impl Channels {
                 && self.failures.ws.malformed_frames() == 0,
             "malformed public notification (#261)"
         );
-        info!(signature = control, channels = ?evidence.recovered, diagnostics = ?evidence.probe, "live control delivered");
+        debug!(signature = control, channels = ?evidence.recovered, diagnostics = ?evidence.probe, "live control delivered");
         Ok(evidence.probe)
     }
 }

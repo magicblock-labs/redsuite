@@ -9,7 +9,7 @@ use std::{
     rc::Rc,
 };
 use tokio::time::Instant;
-use tracing::info;
+use tracing::debug;
 
 const SUBSCRIPTIONS: usize = 256;
 const MAX_WRITES: usize = 256;
@@ -76,7 +76,7 @@ async fn slow_subscriber(base: Rc<BaseCtx>, er: ErCtx) -> Result<()> {
             Ok(frame) => frame,
             Err(error) => {
                 closed = true;
-                info!(error = %format!("{error:#}"), "slow subscription closed by the server");
+                debug!(error = %format!("{error:#}"), "slow subscription closed by the server");
                 break;
             }
         };
@@ -101,7 +101,7 @@ async fn slow_subscriber(base: Rc<BaseCtx>, er: ErCtx) -> Result<()> {
     } else {
         vec![]
     };
-    info!(
+    debug!(
         writes = committed.len(),
         received, missing, disconnected, closed, "slow subscriber pressure observed"
     );

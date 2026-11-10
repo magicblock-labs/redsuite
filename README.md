@@ -210,7 +210,8 @@ checks can use `--fresh-concurrency` to bound concurrent fresh scenarios.
 
 `redshift run` and `redhat run` accept `--seed <U64>` to set the run seed,
 for example `redsuite redhat run --seed 12345`. When omitted, a random seed
-is generated. The chosen seed is logged at `info` before stack startup.
+is generated. The chosen seed is logged at `debug` before stack startup and
+included in scenario failure logs.
 
 Redline requires `--duration` for each selected workload; there is no iteration
 limit. Setup and warmup are outside measurement. At expiry or Ctrl+C, admission
@@ -230,12 +231,13 @@ configuration or a fresh ER are skipped. The first failure stops admission and
 returns a nonzero status after running scenarios finish. Continuous runs do not
 write Redline reports.
 
-Each round logs its order and a seed derived from the run seed. Pass the logged
-run seed to `--seed` on a fresh stack (`redsuite stack down`) to replay the same
-orders; a stack rejects seeded fixtures it has already created. Scenario timing
-and interleaving are not reproduced.
+Each round logs its order and a seed derived from the run seed at `debug`. Pass
+the logged run seed to `--seed` on a fresh stack (`redsuite stack down`) to replay
+the same orders; a stack rejects seeded fixtures it has already created. Scenario
+timing and interleaving are not reproduced.
 
-Periodic logs retain interval observations without keeping every request in memory.
+At `debug`, periodic logs retain interval observations without keeping every
+request in memory.
 The [coverage limits](docs/scenario-gaps.md) distinguish existing proofs from
 deferred scenarios and oracle improvements.
 
@@ -276,11 +278,15 @@ harness also reclaims private rollups left behind by failed scenarios.
 
 ## 📊 Results and diagnostics
 
-Redshift and Redhat return verdicts in the console without persisting benchmark
-reports. Stage errors are logged with method context; set `RUST_LOG=debug`
-to include workload progress. Logging defaults
-to `info`; `RUST_LOG` also applies to launched validators. A failed run
-returns a nonzero exit status.
+At the default `info` level, scenarios log their start and pass verdict. Set
+`RUST_LOG=debug` for probe details, workload progress, seeds, and scheduling.
+Redshift and Redhat return console verdicts without persisting benchmark reports.
+Stage errors retain method context and scenario failures include their replay seed.
+Failures also print up to 20 recent WARN/ERROR lines per locally managed validator,
+scoped to the scenario's execution window. Excerpts read at most 1 MiB from each
+current or previous-boot log; full log paths are included for further inspection.
+`RUST_LOG` also applies to launched validators. A failed run returns a nonzero
+exit status.
 
 Redline writes reports under `target/redsuite-reports/`. Reports include workload
 settings, measurements, and process-launch details. Benchmark runs also record

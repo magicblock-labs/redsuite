@@ -163,7 +163,7 @@ impl Scenario<(ScenarioReport, Result<()>)> for WebsocketFanout {
                 remaining = remaining.saturating_sub(outcome.admission_wall);
                 cursor += outcome.delivered;
                 worst_p95 = worst_p95.max(window_p95);
-                tracing::info!(
+                tracing::debug!(
                     delivered = outcome.delivered,
                     worst_subscriber_p95_us = window_p95,
                     peak_lag_us = peak,
