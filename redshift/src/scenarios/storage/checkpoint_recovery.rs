@@ -193,6 +193,7 @@ impl Scenario for CheckpointRecovery {
                     hard_kill: true,
                     reset: false,
                     ready_timeout: CHECKPOINT_TIMEOUT,
+                    ..Default::default()
                 })
                 .await?;
             ensure!(timing.exit_signal == Some(9));

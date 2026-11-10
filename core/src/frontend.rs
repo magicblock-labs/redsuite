@@ -12,6 +12,11 @@ pub const ENV_VARS: &[(&str, &str)] = &[
         "the verifier binary for replicated topologies (else beside the ER \
          binary, else on PATH)",
     ),
+    ("MAGICBLOCK_BIN", "the healthcheck CLI (else beside the ER binary)"),
+    (
+        "MAGICBLOCK_CALCULATOR_SO",
+        "the calculator ELF (else ../deploy/v42_calculator_program.so beside the ER binary)",
+    ),
     (
         topology::YELLOWSTONE_PLUGIN_ENV,
         "a prebuilt Yellowstone Geyser plugin to load instead of the \

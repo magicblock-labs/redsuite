@@ -194,7 +194,7 @@ pub async fn await_catch_up(verifier: &Verifier, name: &str, target: f64) -> Res
     Ok(started.elapsed())
 }
 
-async fn await_leader_advance(
+pub(super) async fn await_leader_advance(
     topology: &ReplicatedTopology,
     name: &str,
     by: f64,

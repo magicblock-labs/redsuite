@@ -111,7 +111,7 @@ redsuite_dir="$PWD"
 validator_dir=$(cd ../mbv && pwd)
 (
   cd "$validator_dir"
-  cargo build --release --locked -p magicblock-validator -p magicblock-verifier
+  cargo build --release --locked -p magicblock-validator -p magicblock-verifier -p magicblock
   "$redsuite_dir/target/debug/xtask" runtime exec --runtime-only -- \
     cargo build-sbf --manifest-path programs/committor-program/Cargo.toml \
     --sbf-out-dir target/deploy
@@ -124,6 +124,13 @@ leader binary, then on `PATH`; `MAGICBLOCK_VERIFIER_BIN` overrides discovery.
 The harness loads `magicblock_committor_program.so` from `../deploy` relative
 to the leader binary's directory (normally `target/deploy`). Preserve that
 layout when moving a build; a host build alone does not produce the committor.
+
+`snapshot_bootstrap` also requires the `magicblock` CLI beside the leader and
+`v42_calculator_program.so` in `target/deploy`. Build
+`programs/v42-calculator-program` in the matching Engine checkout with
+`cargo build-sbf --arch v3` and place its ELF there. `MAGICBLOCK_BIN` and
+`MAGICBLOCK_CALCULATOR_SO` override these paths. The scenario runs normally and
+fails when either artifact is missing.
 
 ### Run a prebuilt runner
 
@@ -363,6 +370,8 @@ progress details without changing the run's checks.
 | :-- | :-- |
 | `MAGICBLOCK_VALIDATOR_BIN` | Select the validator under test; otherwise discover `magicblock-validator` on `PATH`. |
 | `MAGICBLOCK_VERIFIER_BIN` | Select a verifier; otherwise discover it beside the leader binary, then on `PATH`. |
+| `MAGICBLOCK_BIN` | Select the healthcheck CLI; defaults to `magicblock` beside the leader binary. |
+| `MAGICBLOCK_CALCULATOR_SO` | Select the calculator ELF; defaults to `../deploy/v42_calculator_program.so` relative to the leader binary. |
 | `REDSUITE_ROOT` | Set the resource/output root; the runner and runtime wrappers default to the working directory. |
 | `REDSUITE_FIXTURES_DIR` | Select compiled fixtures independently; defaults to the resource root's `target/deploy`. |
 | `REDSUITE_STACK_DIR` | Place ledgers, stack state, and logs on another disk; defaults to `target/redsuite-stack` under the resource root. |

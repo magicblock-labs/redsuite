@@ -148,6 +148,7 @@ impl PrivateEr {
         let exit_code = exit_status.code();
         let exit_signal = ExitStatusExt::signal(&exit_status);
 
+        (config.before_start)(&mut self.plan.params)?;
         self.plan.params.ledger.reset = config.reset;
         self.proc.relaunch(self.plan.spawn(&self.log)?);
         process::wait_until_every(

@@ -59,6 +59,7 @@ impl Mode {
             hard_kill: self.hard_kill(),
             reset: false,
             ready_timeout: READY_TIMEOUT,
+            ..Default::default()
         }
     }
 }

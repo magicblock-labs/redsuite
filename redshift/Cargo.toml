@@ -13,10 +13,14 @@ nucleus = { package = "magicblock-engine-nucleus", git = "https://github.com/mag
 solana-rent = { version = "4.3", features = ["serde"] }
 tempfile = "3"
 clonetree = "0.0.2"
+tar = "0.4"
+zstd = "0.13"
+solana-slot-hashes = { version = "3.1", features = ["serde"] }
+v42-calculator-interface = { git = "https://github.com/magicblock-labs/magicblock-engine.git", tag = "0.23.1", features = ["builder"] }
 anyhow.workspace = true
 magic-api.workspace = true
 tracing = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["process"] }
 futures-util = { workspace = true }
 serde = { workspace = true }
 magicblock-config = { workspace = true }
