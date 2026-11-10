@@ -1,10 +1,9 @@
 use std::{
     borrow::Cow,
     collections::{BTreeMap, VecDeque},
-    fs::{File, Metadata},
+    fs::File,
     io::{self, Read, Seek, SeekFrom},
-    os::unix::fs::MetadataExt,
-    path::{Path, PathBuf},
+    path::Path,
 };
 
 use tracing::{error, warn, Level};
@@ -15,168 +14,71 @@ const MAX_BYTES: u64 = 1024 * 1024;
 const MAX_LINES: usize = 20;
 const MAX_LINE_BYTES: usize = 2048;
 
-/// Checkpoints existing logs without taking ownership of their validators.
-pub(super) struct ValidatorLogs {
-    checkpoints: [Option<Checkpoint>; 2],
-    shared: Option<PathBuf>,
-}
-
-struct Checkpoint {
-    identity: (u64, u64),
-    offset: u64,
-    // Keep the inode alive if a restart replaces the file during this scenario.
-    _file: File,
-}
-
-struct Entry {
-    source: PathBuf,
-    level: Level,
-    text: String,
-}
-
-#[derive(Default)]
-struct Excerpt {
-    entries: VecDeque<Entry>,
-    omitted: usize,
-    truncated: bool,
-    found: bool,
-}
-
-impl ValidatorLogs {
-    pub(super) fn new(shared: Option<PathBuf>) -> Self {
-        let checkpoints = shared.as_ref().map_or([None, None], |path| {
-            [path.with_extension("log.prev"), path.to_owned()].map(|source| {
-                let file = File::open(source).ok()?;
-                let meta = file.metadata().ok()?;
-                Some(Checkpoint {
-                    identity: identity(&meta),
-                    offset: meta.len(),
-                    _file: file,
-                })
-            })
-        });
-        Self { checkpoints, shared }
+/// Recent context for a failure; shared logs may include earlier scenarios.
+pub(super) fn emit(shared: Option<&Path>, launches: &[LaunchRecord]) {
+    let mut sources = BTreeMap::new();
+    if let Some(path) = shared {
+        let label = path.file_stem().unwrap_or_default().to_string_lossy();
+        sources.insert(path, label.trim_start_matches("er-").to_owned());
     }
-
-    pub(super) fn emit(&self, launches: &[LaunchRecord]) {
-        let mut sources = BTreeMap::new();
-        if let Some(path) = &self.shared {
-            let label = path.file_stem().unwrap_or_default().to_string_lossy();
-            sources.insert(
-                path.as_path(),
-                (label.trim_start_matches("er-").to_owned(), true),
-            );
-        }
-        for launch in launches {
-            let source = sources
-                .entry(Path::new(&launch.log))
-                .or_insert_with(|| (launch.label.clone(), false));
-            // For a newly launched validator, .prev belongs to this scenario
-            // only after that validator has restarted at least once.
-            source.1 |= launch.relaunches != 0;
-        }
-        for (path, (node, previous_boot)) in sources {
-            self.excerpt(path, previous_boot).emit(&node, path);
-        }
+    for launch in launches {
+        sources.entry(Path::new(&launch.log)).or_insert_with(|| launch.label.clone());
     }
-
-    fn excerpt(&self, path: &Path, previous_boot: bool) -> Excerpt {
-        let mut excerpt = Excerpt::default();
-        for source in
-            [previous_boot.then(|| path.with_extension("log.prev")), Some(path.to_owned())]
-                .into_iter()
-                .flatten()
-        {
-            match self.read(&source, &mut excerpt) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+    for (path, node) in sources {
+        let mut entries = VecDeque::new();
+        for source in [path.with_extension("log.prev"), path.to_owned()] {
+            let content = match tail(&source) {
+                Ok(content) => content,
                 Err(error) => {
-                    warn!(log = %source.display(), %error, "cannot read validator diagnostics");
+                    if error.kind() != io::ErrorKind::NotFound {
+                        warn!(%node, log = %source.display(), %error,
+                            "cannot read recent validator logs");
+                    }
+                    continue;
                 }
-            }
-        }
-        excerpt
-    }
-
-    fn read(&self, path: &Path, excerpt: &mut Excerpt) -> io::Result<()> {
-        let mut file = File::open(path)?;
-        let meta = file.metadata()?;
-        excerpt.found = true;
-        let offset = self
-            .checkpoints
-            .iter()
-            .flatten()
-            .rfind(|checkpoint| checkpoint.identity == identity(&meta))
-            .map_or(0, |checkpoint| checkpoint.offset);
-        // A truncated file belongs to a new boot, so read it from the start.
-        let offset = if offset <= meta.len() { offset } else { 0 };
-        if offset == meta.len() {
-            return Ok(());
-        }
-        let start = offset.max(meta.len().saturating_sub(MAX_BYTES));
-        excerpt.truncated |= start > offset;
-        let mut boundary = [b'\n'];
-        if start != 0 {
-            file.seek(SeekFrom::Start(start - 1))?;
-            file.read_exact(&mut boundary)?;
-        }
-        let mut bytes = Vec::new();
-        file.take(meta.len() - start).read_to_end(&mut bytes)?;
-        let bytes = if boundary[0] != b'\n' {
-            &bytes[bytes.iter().position(|byte| *byte == b'\n').map_or(bytes.len(), |i| i + 1)..]
-        } else {
-            &bytes[..]
-        };
-        for line in String::from_utf8_lossy(bytes).lines() {
-            let text = strip_ansi(line);
-            let Some(level) = severity(&text) else { continue };
-            let mut text = text.into_owned();
-            if text.len() > MAX_LINE_BYTES {
-                text.truncate(text.floor_char_boundary(MAX_LINE_BYTES));
-                text.push_str(" ... [truncated]");
-            }
-            if excerpt.entries.len() == MAX_LINES {
-                excerpt.entries.pop_front();
-                excerpt.omitted += 1;
-            }
-            excerpt.entries.push_back(Entry {
-                source: path.to_owned(),
-                level,
-                text,
-            });
-        }
-        Ok(())
-    }
-}
-
-impl Excerpt {
-    fn emit(self, node: &str, path: &Path) {
-        if self.truncated || self.omitted != 0 {
-            warn!(%node, log = %path.display(), omitted = self.omitted,
-                "validator diagnostics truncated; full logs retained");
-        }
-        if self.entries.is_empty() {
-            let message = if self.found {
-                "no validator WARN/ERROR entries captured during this scenario"
-            } else {
-                "validator log unavailable"
             };
-            warn!(%node, log = %path.display(), "{message}");
+            for line in content.lines() {
+                let text = strip_ansi(line);
+                let Some(level) = severity(&text) else { continue };
+                let mut text = text.into_owned();
+                if text.len() > MAX_LINE_BYTES {
+                    text.truncate(text.floor_char_boundary(MAX_LINE_BYTES));
+                    text.push_str(" ... [truncated]");
+                }
+                if entries.len() == MAX_LINES {
+                    entries.pop_front();
+                }
+                entries.push_back((source.clone(), level, text));
+            }
         }
-        for entry in self.entries {
-            if entry.level == Level::ERROR {
-                error!(%node, log = %entry.source.display(), validator_line = %entry.text,
-                    "validator log");
+        if entries.is_empty() {
+            warn!(%node, log = %path.display(), "no recent validator WARN/ERROR entries available");
+        }
+        for (source, level, text) in entries {
+            if level == Level::ERROR {
+                error!(%node, log = %source.display(), validator_line = %text,
+                    "recent validator logs");
             } else {
-                warn!(%node, log = %entry.source.display(), validator_line = %entry.text,
-                    "validator log");
+                warn!(%node, log = %source.display(), validator_line = %text,
+                    "recent validator logs");
             }
         }
     }
 }
 
-fn identity(meta: &Metadata) -> (u64, u64) {
-    (meta.dev(), meta.ino())
+fn tail(path: &Path) -> io::Result<String> {
+    let mut file = File::open(path)?;
+    let start = file.metadata()?.len().saturating_sub(MAX_BYTES);
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_BYTES).read_to_end(&mut bytes)?;
+    // The byte limit may cut through a line; discard that first fragment.
+    let first = if start == 0 {
+        0
+    } else {
+        bytes.iter().position(|byte| *byte == b'\n').map_or(bytes.len(), |i| i + 1)
+    };
+    Ok(String::from_utf8_lossy(&bytes[first..]).into_owned())
 }
 
 fn severity(line: &str) -> Option<Level> {

@@ -283,8 +283,8 @@ At the default `info` level, scenarios log their start and pass verdict. Set
 Redshift and Redhat return console verdicts without persisting benchmark reports.
 Stage errors retain method context and scenario failures include their replay seed.
 Failures also print up to 20 recent WARN/ERROR lines per locally managed validator,
-scoped to the scenario's execution window. Excerpts read at most 1 MiB from each
-current or previous-boot log; full log paths are included for further inspection.
+reading at most 1 MiB from each current or previous-boot log. These excerpts can
+include earlier scenarios; full log paths are included for further inspection.
 `RUST_LOG` also applies to launched validators. A failed run returns a nonzero
 exit status.
 

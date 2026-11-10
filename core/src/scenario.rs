@@ -1,4 +1,11 @@
-use std::{future::Future, panic::AssertUnwindSafe, path::PathBuf, rc::Rc, result, time::Instant};
+use std::{
+    future::Future,
+    panic::AssertUnwindSafe,
+    path::{Path, PathBuf},
+    rc::Rc,
+    result,
+    time::Instant,
+};
 
 use anyhow::{ensure, Error};
 
@@ -17,7 +24,6 @@ use crate::{
 };
 
 mod diagnostics;
-use diagnostics::ValidatorLogs;
 
 /// A scenario may return measurements even when its validation fails.
 pub trait Verdict {
@@ -186,7 +192,7 @@ impl RunRecord {
         outcome
     }
 
-    fn conclude(&mut self, reports: bool, seed: u64, logs: &ValidatorLogs) {
+    fn conclude(&mut self, reports: bool, seed: u64, shared_log: Option<&Path>) {
         if reports {
             if let Err(error) = crate::report::persist_run(self) {
                 if self.outcome.is_ok() {
@@ -212,7 +218,7 @@ impl RunRecord {
                 binary_hash = %crate::report::binary_hash(std::path::Path::new(&launch.bin)).unwrap_or_else(|_| "unavailable".into()),
                 "node log");
         }
-        logs.emit(&self.launches);
+        diagnostics::emit(shared_log, &self.launches);
     }
 }
 
@@ -289,10 +295,9 @@ where
     let seed = config.seed;
     let run = async {
         let mut record = RunRecord::new(name);
-        let logs = ValidatorLogs::new(shared_log);
         info!("started");
         record.outcome = record.run(fixtures, config, state, body).await;
-        record.conclude(persist, seed, &logs);
+        record.conclude(persist, seed, shared_log.as_deref());
         record
     };
     // Dropping the LocalSet cancels scenario-owned readers and background tasks.
