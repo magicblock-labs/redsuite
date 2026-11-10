@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::ensure;
-use tracing::info;
+use tracing::debug;
 
 use super::state;
 use crate::Result;
@@ -87,7 +87,7 @@ async fn cached(tag: &str) -> Result<PathBuf> {
     }
 
     fs::create_dir_all(&dir)?;
-    info!(tag, ?dir, "downloading Yellowstone geyser plugin");
+    debug!(tag, ?dir, "downloading Yellowstone geyser plugin");
     let bytes = reqwest::get(format!("{DOWNLOADS}/{tag}/{LIB}"))
         .await?
         .error_for_status()?

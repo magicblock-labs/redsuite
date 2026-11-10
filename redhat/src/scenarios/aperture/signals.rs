@@ -3,7 +3,7 @@ use anyhow::{ensure, Context};
 use redsuite_core::{netfault::Selector, random, BaseCtx, ChainCtx, ErCtx, Result, Scenario};
 use signer::Signer;
 use std::{rc::Rc, time::Duration};
-use tracing::info;
+use tracing::debug;
 
 macro_rules! signal_scenario {
     ($name:ident, $run:ident) => {
@@ -99,7 +99,7 @@ async fn outcomes(base: Rc<BaseCtx>, er: ErCtx) -> Result<()> {
     let probe = Probe::new(&refused, watch, None);
     channels.control_with_probe(&mut fixture, 9_101, &[], Some(&probe)).await?;
     fixture.not_admitted(&refused.signature, start, None).await?;
-    info!(signature = %refused.signature, %error, hits = rule.hits(), channel = "rpc", "refused write attributed");
+    debug!(signature = %refused.signature, %error, hits = rule.hits(), channel = "rpc", "refused write attributed");
 
     rule.remove();
     faults.reset().await?;

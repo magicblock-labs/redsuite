@@ -184,6 +184,12 @@ pub struct ErCtx {
 }
 
 impl ErCtx {
+    pub(crate) async fn log_path(&self) -> Option<PathBuf> {
+        let owner = self.owner.as_ref()?.upgrade()?;
+        let path = owner.lock().await.log().to_owned();
+        Some(path)
+    }
+
     pub(crate) fn for_scenario(mut self) -> Result<Self> {
         self.api = self.api.scoped();
         self.faults = self.proxy.as_ref().map(|proxy| proxy.scope().map(Rc::new)).transpose()?;

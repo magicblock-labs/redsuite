@@ -1,4 +1,11 @@
-use std::{future::Future, panic::AssertUnwindSafe, rc::Rc, result, time::Instant};
+use std::{
+    future::Future,
+    panic::AssertUnwindSafe,
+    path::{Path, PathBuf},
+    rc::Rc,
+    result,
+    time::Instant,
+};
 
 use anyhow::{ensure, Error};
 
@@ -15,6 +22,8 @@ use crate::{
     runner::panic_message,
     topology, Result,
 };
+
+mod diagnostics;
 
 /// A scenario may return measurements even when its validation fails.
 pub trait Verdict {
@@ -183,7 +192,7 @@ impl RunRecord {
         outcome
     }
 
-    fn conclude(&mut self, reports: bool) {
+    fn conclude(&mut self, reports: bool, seed: u64, shared_log: Option<&Path>) {
         if reports {
             if let Err(error) = crate::report::persist_run(self) {
                 if self.outcome.is_ok() {
@@ -200,8 +209,8 @@ impl RunRecord {
         }
         Span::current().record("phase", self.phase);
         match &self.outcome {
-            Err(error) => error!(error = %format_args!("{error:#}"), "failed"),
-            Ok(()) => error!("verdict failed"),
+            Err(error) => error!(seed, error = %format_args!("{error:#}"), "failed"),
+            Ok(()) => error!(seed, "verdict failed"),
         }
         for launch in &self.launches {
             info!(node = %launch.label, log = %launch.log,
@@ -209,6 +218,7 @@ impl RunRecord {
                 binary_hash = %crate::report::binary_hash(std::path::Path::new(&launch.bin)).unwrap_or_else(|_| "unavailable".into()),
                 "node log");
         }
+        diagnostics::emit(shared_log, &self.launches);
     }
 }
 
@@ -223,15 +233,26 @@ where
     V: Verdict,
     Body: AsyncFnOnce(Rc<BaseCtx>, ErCtx, &mut &'static str) -> Result<V>,
 {
-    execute(name, fixtures, config, er, async move |base, er, stage| {
-        let er = er.for_scenario()?;
-        let outcome = AssertUnwindSafe(body(base, er.clone(), stage)).catch_unwind().await;
-        let reset = er.reset_faults().await;
-        match outcome {
-            Ok(outcome) => outcome.and_then(|verdict| reset.map(|()| verdict)),
-            Err(panic) => std::panic::resume_unwind(panic),
-        }
-    })
+    let log = match &er {
+        Ok(er) => er.log_path().await,
+        Err(_) => None,
+    };
+    execute(
+        name,
+        fixtures,
+        config,
+        er,
+        log,
+        async move |base, er, stage| {
+            let er = er.for_scenario()?;
+            let outcome = AssertUnwindSafe(body(base, er.clone(), stage)).catch_unwind().await;
+            let reset = er.reset_faults().await;
+            match outcome {
+                Ok(outcome) => outcome.and_then(|verdict| reset.map(|()| verdict)),
+                Err(panic) => std::panic::resume_unwind(panic),
+            }
+        },
+    )
     .await
 }
 
@@ -250,6 +271,7 @@ where
         fixtures,
         config,
         Ok(()),
+        None,
         async move |base, (), stage| body(base, stage).await,
     )
     .await
@@ -262,6 +284,7 @@ async fn execute<V, State, Body>(
     fixtures: &[Fixture],
     config: ExecutionConfig,
     state: result::Result<State, String>,
+    shared_log: Option<PathBuf>,
     body: Body,
 ) -> RunRecord
 where
@@ -269,11 +292,12 @@ where
     Body: AsyncFnOnce(Rc<BaseCtx>, State, &mut &'static str) -> Result<V>,
 {
     let persist = V::REPORTS && !config.continuous;
+    let seed = config.seed;
     let run = async {
         let mut record = RunRecord::new(name);
         info!("started");
         record.outcome = record.run(fixtures, config, state, body).await;
-        record.conclude(persist);
+        record.conclude(persist, seed, shared_log.as_deref());
         record
     };
     // Dropping the LocalSet cancels scenario-owned readers and background tasks.

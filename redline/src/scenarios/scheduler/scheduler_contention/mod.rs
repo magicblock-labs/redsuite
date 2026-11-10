@@ -469,7 +469,7 @@ impl Scenario<(ScenarioReport, Result<()>)> for SchedulerContention {
                     .measure_batch(batch, contention_lanes, deadline, options.stop.clone())
                     .await?;
                 self.check_batch(batch, &outcome).await?;
-                tracing::info!(
+                tracing::debug!(
                     batch,
                     chain_txs = outcome.phases.iter().map(|phase| phase.chain_txs).sum::<u64>(),
                     "verified scheduler window"

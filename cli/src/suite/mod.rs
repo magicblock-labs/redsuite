@@ -23,7 +23,7 @@ use redsuite_core::{
     report::{ScenarioReport, Unit},
     topology, BaseCtx, ErCtx, Result, RunRecord,
 };
-use tracing::{error, info};
+use tracing::{debug, error};
 
 use crate::{args::Run, catalog};
 
@@ -191,7 +191,7 @@ impl Suite {
     fn scenario_finished(&self) {
         let finished = self.finished.get() + 1;
         self.finished.set(finished);
-        info!("suite progress {finished}/{}", self.total);
+        debug!("suite progress {finished}/{}", self.total);
     }
 
     fn not_run(&self, entry: ScenarioEntry, reason: &str) -> RunRecord {
@@ -248,7 +248,7 @@ impl Suite {
 
     pub async fn run(mut self) -> Result<()> {
         let started = Instant::now();
-        info!(selection = %self.selection, total = self.total, "suite started");
+        debug!(selection = %self.selection, total = self.total, "suite started");
         let mut base = topology::base_only(self.config.clone()).await;
         if let Ok(ctx) = &base {
             if let Err(error) = prepare(self.entries.iter(), ctx).await {
@@ -285,7 +285,7 @@ impl Suite {
             );
             outcome = outcome.and(persisted);
         }
-        info!(
+        debug!(
             selection = %self.selection,
             passed = outcome.is_ok(),
             "suite finished"

@@ -18,7 +18,7 @@ use std::{
     path::{Path, PathBuf},
     rc::Rc,
 };
-use tracing::info;
+use tracing::debug;
 
 signal_scenario!(LedgerIndexSignals, ledger_index);
 
@@ -138,7 +138,7 @@ async fn pruned_reads(base: Rc<BaseCtx>, er: ErCtx) -> Result<()> {
     ensure!(transaction_meta(&landmark)?.err.is_none());
     let before = fixture.snapshot(&[]).await?;
     let directories = superblocks(&fixture.er.storage_dir().await?)?;
-    info!(slot = landmark.slot, %signature, ?directories, "pruned-read baseline");
+    debug!(slot = landmark.slot, %signature, ?directories, "pruned-read baseline");
     wait::retry(
         "landmark superblocks physically pruned",
         TIMEOUT * directories.len() as u32,

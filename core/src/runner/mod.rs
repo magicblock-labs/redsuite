@@ -340,7 +340,7 @@ where
                 },
                 _ = interval.tick() => {
                     let stats = std::mem::take(&mut window).finalize(false);
-                    tracing::info!(admitted, delivered = tally.delivered, failed = tally.failed, outstanding = jobs.len(), count = stats.count, p50_us = stats.median, p95_us = stats.quantile95, max_us = stats.max, "load interval");
+                    tracing::debug!(admitted, delivered = tally.delivered, failed = tally.failed, outstanding = jobs.len(), count = stats.count, p50_us = stats.median, p95_us = stats.quantile95, max_us = stats.max, "load interval");
                     if !jobs.is_empty() && last_completion.elapsed() >= crate::transport::NETWORK_TIMEOUT { stalled = true; break 'admit; }
                 },
                 _ = &mut tick, if jobs.len() < concurrency => break,
