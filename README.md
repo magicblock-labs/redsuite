@@ -223,13 +223,12 @@ timeouts, still fail the workload.
 
 `redsuite continuous` repeatedly runs the Redshift, Redhat, and Redline scenarios
 that use the default ER, all on one ER, until a scenario fails or Ctrl+C. Each
-round shuffles the scenarios and runs shared ones concurrently, bounded by
-`--shared-concurrency`. An exclusive scenario waits for running scenarios to
-finish, runs alone, and then shared scenarios resume. Scenarios that need another
-ER configuration or a fresh ER are skipped. The first failure stops admission and
+round shuffles the scenarios. Redline workloads and checks marked exclusive wait
+for running scenarios to finish, then run alone. Shared checks can run
+concurrently, bounded by `--shared-concurrency`. Scenarios that need another ER
+configuration or a fresh ER are skipped. The first failure stops admission and
 returns a nonzero status after running scenarios finish. Continuous runs do not
-write Redline reports, because concurrent load makes their measurements
-incomparable.
+write Redline reports.
 
 Each round logs its order and a seed derived from the run seed. Pass the logged
 run seed to `--seed` on a fresh stack (`redsuite stack down`) to replay the same
