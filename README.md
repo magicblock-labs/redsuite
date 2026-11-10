@@ -73,6 +73,11 @@ Group rollups are reused for the run without automatic recovery after failures.
 The runner stops the rollups it owns when their lane finishes.
 The base chain normally remains available for later runs.
 
+`replicated_runtime` uses controlled HTTP fixtures for lower rent and account
+funding, then checks real base updates. It compares account images, modes and
+transaction results using copies of stopped follower storage. Storage inspection
+uses Engine 0.23.1 codecs.
+
 ### Controlled failures, real traffic
 
 Fault scenarios can delay, drop, reject, or disconnect the rollup's base-chain

@@ -101,7 +101,7 @@ async fn serve_http(mut socket: TcpStream, upstream: Url, client: Client, shared
         let (status, text, _response_hold) = match decision {
             Decision::Discard => return,
             Decision::Reject(message) => (StatusCode::OK, rpc::rejection(&parsed, &message), None),
-            Decision::Release => {
+            Decision::Release | Decision::Rewrite(..) => {
                 let (status, text) = match http::post_json(&client, &upstream, body).await {
                     Ok(text) => (StatusCode::OK, text),
                     Err(TransportError::Status { status, body }) => (status, body),
@@ -111,6 +111,9 @@ async fn serve_http(mut socket: TcpStream, upstream: Url, client: Client, shared
                 let (decision, holding) = gate(&shared, operation).resolve().await;
                 match decision {
                     Decision::Discard => return,
+                    Decision::Rewrite(operation, edit) => {
+                        (status, rpc::rewritten(&text, &operation, &edit), holding)
+                    }
                     Decision::Reject(message) => {
                         (StatusCode::OK, rpc::rejection(&parsed, &message), holding)
                     }

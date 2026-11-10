@@ -11,6 +11,7 @@ pub use dlp_api::{
         magic_fee_vault_pda_from_validator as magic_fee_vault_pda,
         validator_fees_vault_pda_from_validator as validator_fees_vault_pda,
     },
+    state::DelegationRecord,
     ID as DELEGATION_PROGRAM_ID,
 };
 use dlp_api::{
