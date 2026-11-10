@@ -51,7 +51,7 @@ async fn run_round(
     let mut running = FuturesUnordered::new();
     let mut failed = Vec::new();
     for (family, entry) in cases {
-        let exclusive = matches!(entry.er, Er::Exclusive(_));
+        let exclusive = family == Family::Redline || matches!(entry.er, Er::Exclusive(_));
         let keep = if exclusive { 0 } else { limit - 1 };
         settle(&mut running, keep, &mut failed).await;
         if !failed.is_empty() || config.stopped() {
