@@ -49,10 +49,13 @@ fn list(family: Family, selections: &[String]) -> Result<()> {
 
 fn run_seed(seed: Option<u64>) -> u64 {
     let seed = seed.unwrap_or_else(rand::random);
-    let runner = std::env::current_exe()
-        .and_then(|path| redsuite_core::report::binary_hash(&path))
-        .unwrap_or_else(|_| "unavailable".into());
-    debug!(seed, runner, "run seed");
+    debug!(
+        seed,
+        runner = std::env::current_exe()
+            .and_then(|path| redsuite_core::report::binary_hash(&path))
+            .unwrap_or_else(|_| "unavailable".into()),
+        "run seed"
+    );
     seed
 }
 

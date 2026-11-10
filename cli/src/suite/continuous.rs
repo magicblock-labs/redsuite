@@ -72,12 +72,11 @@ async fn run_rounds(config: &ExecutionConfig, er: &ErCtx, limit: usize) -> Resul
         let mut cases = cases()?;
         cases.shuffle(&mut random::rng(config.seed, &[OWNER, "order"], round));
         let round_seed = random::rng(config.seed, &[OWNER, "seed"], round).gen();
-        let order: Vec<_> = cases.iter().map(|(family, entry)| entry.name(*family)).collect();
         debug!(
             seed = config.seed,
             round,
             round_seed,
-            ?order,
+            order = ?cases.iter().map(|(family, entry)| entry.name(*family)).collect::<Vec<_>>(),
             "continuous round"
         );
         let round_config = ExecutionConfig {
