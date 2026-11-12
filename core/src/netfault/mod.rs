@@ -379,7 +379,7 @@ impl Faults {
         self.rule(selector, Effect::Reject(message.to_owned()))
     }
 
-    /// Edits matched replies while preserving their request ids and response slots.
+    /// Edits matched JSON replies. The editor must preserve request ids and response slots.
     pub fn rewrite(
         &self,
         mut selector: Selector,

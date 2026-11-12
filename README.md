@@ -81,10 +81,11 @@ uses Engine 0.24.0 codecs.
 ### Controlled failures, real traffic
 
 Fault scenarios can delay, drop, reject, or disconnect the rollup's base-chain
-HTTP and WebSocket traffic. The proxies forward real traffic and do not invent
-account contents or slots. A separate base-chain client lets the scenario check
-what actually executed, and a requested interception must fire for its check
-to succeed. Proxy faults are cleared between scenarios.
+HTTP and WebSocket traffic. The proxies forward real traffic; controlled response
+rewrites let scenario fixtures replace account contents, including Rent data.
+A separate base-chain client lets the scenario check what actually executed, and
+a requested interception must fire for its check to succeed. Proxy faults are
+cleared between scenarios.
 
 ## 🚀 Get started
 
