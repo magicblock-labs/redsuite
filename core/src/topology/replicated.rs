@@ -16,7 +16,7 @@ use crate::{
     context::{BaseCtx, ErCtx},
     report,
     resources::LaunchRecord,
-    wait, Result,
+    Result,
 };
 
 pub const STREAM_CONNECTED: &str = "engine_replicator_client_stream_connected";
@@ -25,7 +25,6 @@ pub const SERVER_CONNECTIONS: &str = "engine_replicator_server_connections";
 const VERIFIER_READY_TIMEOUT: Duration = Duration::from_secs(60);
 const CONNECT_POLL: Duration = Duration::from_millis(100);
 const SNAPSHOT_ARCHIVE: &str = "accountsdb.tar.zst";
-const SNAPSHOT_GRACE: Duration = Duration::from_secs(30);
 
 #[derive(Default)]
 pub struct ReplicatedOptions {
@@ -264,6 +263,8 @@ impl ReplicatedTopology {
     }
 }
 
+/// Starts fresh followers immediately. Callers with imported or different initial
+/// account state must first wait for a leader snapshot that includes that state.
 pub async fn replicated(
     base: &BaseCtx,
     leader: ErCtx,
@@ -282,25 +283,7 @@ pub async fn replicated(
         .as_ref()
         .and_then(std::rc::Weak::upgrade)
         .context("replication requires a group-owned leader")?;
-    let (leader_params, leader_storage) = {
-        let owner = owner.lock().await;
-        (owner.params().clone(), owner.storage_dir().to_owned())
-    };
-    let blockstore = &leader_params.engine.blockstore;
-    let interval = blockstore.blocktime * blockstore.superblock as u32;
-    wait::retry(
-        "the leader archiving a replication snapshot",
-        interval + SNAPSHOT_GRACE,
-        async || {
-            ensure!(
-                latest_snapshot(&leader_storage)?.is_some(),
-                "no complete snapshot archive in {}",
-                leader_storage.display()
-            );
-            Ok(())
-        },
-    )
-    .await?;
+    let leader_params = owner.lock().await.params().clone();
 
     let dir = state::stack_dir();
     let (bin_version, bin_fingerprint) = report::binary_provenance(&verifier_bin);

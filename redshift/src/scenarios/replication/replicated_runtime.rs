@@ -19,7 +19,10 @@ use redsuite_core::{
 use signature::Signature;
 use signer::Signer;
 
-use super::runtime::{self, Runtime, TIMEOUT};
+use super::{
+    replication_recovery::await_leader_advance,
+    runtime::{self, Runtime, TIMEOUT},
+};
 
 pub(crate) const LABEL: &str = "replicated-runtime";
 
@@ -122,6 +125,14 @@ impl ReplicatedRuntime {
         let accounts = [(plain, AccountMode::Mirrored), (delegated, AccountMode::Delegated)];
         let signatures = fixture.signatures(&[plain, delegated]).await?;
         let images = fixture.images(&accounts).await?;
+        // First-segment resumes prefer snapshots; test warm recovery after a seal.
+        await_leader_advance(
+            &self.topology,
+            "engine_ledger_superblocks",
+            1.0,
+            "leaving genesis before retained-cursor recovery",
+        )
+        .await?;
         runtime::fence(&self.topology).await?;
         for verifier in 0..2 {
             runtime::inspect(self.topology.verifier_mut(verifier), &images, &signatures).await?;
