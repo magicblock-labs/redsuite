@@ -121,6 +121,9 @@ export MAGICBLOCK_VALIDATOR_BIN="$validator_dir/target/release/magicblock-valida
 
 The verifier is needed for replication checks and is discovered beside the
 leader binary, then on `PATH`; `MAGICBLOCK_VERIFIER_BIN` overrides discovery.
+Replication checks require Engine 0.24.0 or newer so fresh verifiers can replay
+from genesis before the first snapshot. Imported leader state still requires a
+snapshot before verifiers start.
 The harness loads `magicblock_committor_program.so` from `../deploy` relative
 to the leader binary's directory (normally `target/deploy`). Preserve that
 layout when moving a build; a host build alone does not produce the committor.
