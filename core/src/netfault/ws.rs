@@ -32,6 +32,9 @@ fn deliver(
             Message::Text(rpc::rejection(parsed, &message).into())
         }
         Decision::Release => Message::Text(text),
+        Decision::Rewrite(operation, edit) => {
+            Message::Text(rpc::rewritten(&text, &operation, &edit).into())
+        }
     };
     outbound.send((message, holding)).map_err(|_| ())
 }
@@ -72,7 +75,7 @@ impl WsRelay {
                     None,
                 ))
                 .map_err(|_| ()),
-            Decision::Release => {
+            Decision::Release | Decision::Rewrite(..) => {
                 if let Some(id) = rpc::id(&parsed) {
                     let unsubscribe = if request.method.ends_with("Unsubscribe") {
                         parsed["params"][0].as_u64()

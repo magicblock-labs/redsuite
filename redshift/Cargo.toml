@@ -6,6 +6,13 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+accountsdb = { package = "magicblock-accountsdb", git = "https://github.com/magicblock-labs/magicblock-engine.git", tag = "0.24.0" }
+engine-account = { package = "solana-account", git = "https://github.com/magicblock-labs/magicblock-engine.git", tag = "0.24.0" }
+ledger = { package = "magicblock-ledger", git = "https://github.com/magicblock-labs/magicblock-engine.git", tag = "0.24.0", features = ["testkit"] }
+nucleus = { package = "magicblock-engine-nucleus", git = "https://github.com/magicblock-labs/magicblock-engine.git", tag = "0.24.0" }
+solana-rent = { version = "4.3", features = ["serde"] }
+tempfile = "3"
+clonetree = "0.0.2"
 anyhow.workspace = true
 magic-api.workspace = true
 tracing = { workspace = true }

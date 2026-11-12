@@ -127,7 +127,10 @@ enum Decision {
     Release,
     Discard,
     Reject(String),
+    Rewrite(Operation, Rewrite),
 }
+
+type Rewrite = Rc<dyn Fn(&Operation, &mut json::Value)>;
 
 struct Interception {
     selector: Selector,
@@ -150,6 +153,7 @@ impl Hits {
 enum Effect {
     Observe,
     Reject(String),
+    Rewrite(Rewrite),
     Stall(watch::Sender<()>),
 }
 
@@ -243,6 +247,9 @@ fn gate(shared: &Shared, operation: Operation) -> Gate {
             match &rule.effect {
                 Effect::Observe => unreachable!("observers never decide"),
                 Effect::Reject(message) => return Gate::Decided(Decision::Reject(message.clone())),
+                Effect::Rewrite(rewrite) => {
+                    return Gate::Decided(Decision::Rewrite(operation, rewrite.clone()));
+                }
                 Effect::Stall(resume) => Gate::Stalled(resume.subscribe(), Holding(scope.clone())),
             }
         } else {
@@ -370,6 +377,16 @@ impl Faults {
 
     pub fn reject(&self, selector: Selector, message: &str) -> RuleHandle {
         self.rule(selector, Effect::Reject(message.to_owned()))
+    }
+
+    /// Edits matched JSON replies. The editor must preserve request ids and response slots.
+    pub fn rewrite(
+        &self,
+        mut selector: Selector,
+        edit: impl Fn(&Operation, &mut json::Value) + 'static,
+    ) -> RuleHandle {
+        selector.stages = vec![Stage::Response];
+        self.rule(selector, Effect::Rewrite(Rc::new(edit)))
     }
 
     pub fn stall(&self, selector: Selector) -> RuleHandle {

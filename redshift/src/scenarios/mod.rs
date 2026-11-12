@@ -55,8 +55,20 @@ static RETENTION: ErGroup = ErGroup {
     followers: 2,
 };
 
+static RUNTIME: ErGroup = ErGroup {
+    label: replication::replicated_runtime::LABEL,
+    settings: replication::settings,
+    proxy: true,
+    followers: 2,
+};
+
 pub fn catalog() -> Vec<ScenarioEntry> {
     vec![
+        scenario!(
+            replication::replicated_runtime::ReplicatedRuntime,
+            exclusive(&RUNTIME, &[Fixture::RedlineProgram], ())
+        )
+        .prepare_with(&replication::replicated_runtime::PREPARE),
         scenario!(
             lifecycle::restart_under_load::RestartUnderLoad,
             exclusive(&STORAGE, &[Fixture::RedlineProgram], ())

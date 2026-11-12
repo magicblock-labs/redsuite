@@ -73,13 +73,19 @@ Group rollups are reused for the run without automatic recovery after failures.
 The runner stops the rollups it owns when their lane finishes.
 The base chain normally remains available for later runs.
 
+`replicated_runtime` uses controlled HTTP fixtures for lower rent and account
+funding, then checks real base updates. It compares account images, modes and
+transaction results using copies of stopped follower storage. Storage inspection
+uses Engine 0.24.0 codecs.
+
 ### Controlled failures, real traffic
 
 Fault scenarios can delay, drop, reject, or disconnect the rollup's base-chain
-HTTP and WebSocket traffic. The proxies forward real traffic and do not invent
-account contents or slots. A separate base-chain client lets the scenario check
-what actually executed, and a requested interception must fire for its check
-to succeed. Proxy faults are cleared between scenarios.
+HTTP and WebSocket traffic. The proxies forward real traffic; controlled response
+rewrites let scenario fixtures replace account contents, including Rent data.
+A separate base-chain client lets the scenario check what actually executed, and
+a requested interception must fire for its check to succeed. Proxy faults are
+cleared between scenarios.
 
 ## 🚀 Get started
 

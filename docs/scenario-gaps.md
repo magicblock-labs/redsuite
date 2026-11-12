@@ -10,7 +10,7 @@ covered by performance measurements or successful process startup.
 | Replay after restart | A blockhash checked before restart is not proven still valid afterward. |
 | Activation contention | Joining contenders does not establish that each entered the intended race. |
 | Crash recovery | A missing indexed transaction is not proof its effect was unapplied; a wholly dropped confirmed lane can evade the existing suffix oracle. |
-| Replication | Final causal verification uses the leader; seal progress is not direct follower-state comparison. Ordinary replay does not cover forged streams, storage corruption, duplicate-work identity or materialization leases. |
+| Replication | Runtime materialization checks inspect follower images and transaction results; causal-load recovery still checks final state on the leader. Forged streams, storage corruption, duplicate-work identity and materialization leases remain uncovered. |
 | Resize/read overlap | Background readers and final lengths do not establish that reads overlapped relocation or snapshot boundaries. |
 | Scheduler cancellation | Canceling a fast task does not establish it executed first or that cancellation stopped an executing task. |
 | Signature unsubscribe | The RPC lifecycle performs the requests but does not prove notification suppression after signature unsubscribe. |

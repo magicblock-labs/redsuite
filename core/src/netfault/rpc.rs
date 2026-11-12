@@ -71,3 +71,9 @@ pub(super) fn rejection(value: &Value, message: &str) -> String {
     })
     .to_string()
 }
+
+pub(super) fn rewritten(text: &str, operation: &Operation, edit: &super::Rewrite) -> String {
+    let Ok(mut value) = json::from_str(text) else { return text.to_owned() };
+    edit(operation, &mut value);
+    value.to_string()
+}
