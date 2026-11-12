@@ -293,7 +293,7 @@ pub async fn replicated(
         interval + SNAPSHOT_GRACE,
         async || {
             ensure!(
-                has_snapshot(&leader_storage)?,
+                latest_snapshot(&leader_storage)?.is_some(),
                 "no complete snapshot archive in {}",
                 leader_storage.display()
             );
@@ -354,16 +354,23 @@ pub async fn replicated(
     Ok(ReplicatedTopology { verifiers, leader })
 }
 
-fn has_snapshot(storage: &Path) -> Result<bool> {
+/// Returns the highest completed snapshot's superblock ID and archive path.
+pub fn latest_snapshot(storage: &Path) -> Result<Option<(u64, PathBuf)>> {
+    let mut latest = None;
     for entry in fs::read_dir(storage)? {
         let path = entry?.path();
-        let superblock = path
+        let Some(id) = path
             .file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with("superblock-"));
-        if superblock && path.join(SNAPSHOT_ARCHIVE).is_file() {
-            return Ok(true);
+            .and_then(|name| name.strip_prefix("superblock-"))
+            .and_then(|id| id.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        let archive = path.join(SNAPSHOT_ARCHIVE);
+        if archive.is_file() {
+            latest = latest.max(Some((id, archive)));
         }
     }
-    Ok(false)
+    Ok(latest)
 }

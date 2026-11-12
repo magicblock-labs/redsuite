@@ -341,7 +341,7 @@ impl BasePlan {
     }
 }
 
-pub type Settings = Box<dyn FnOnce(&mut LeaderParams)>;
+pub type Settings<R = ()> = Box<dyn FnOnce(&mut LeaderParams) -> R>;
 
 fn local(port: u16) -> BindAddress {
     BindAddress(SocketAddr::from(([127, 0, 0, 1], port)))
@@ -524,6 +524,8 @@ pub struct RestartConfig {
     // reset=false relaunches in place; true wipes the ledger and skips replay.
     pub reset: bool,
     pub ready_timeout: Duration,
+    /// Runs on owned storage/configuration after the old process has stopped.
+    pub before_start: Settings<Result<()>>,
 }
 
 impl Default for RestartConfig {
@@ -532,6 +534,7 @@ impl Default for RestartConfig {
             hard_kill: false,
             reset: false,
             ready_timeout: ER_READY_TIMEOUT,
+            before_start: Box::new(|_| Ok(())),
         }
     }
 }

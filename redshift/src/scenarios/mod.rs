@@ -62,8 +62,19 @@ static RUNTIME: ErGroup = ErGroup {
     followers: 2,
 };
 
+static BOOTSTRAP: ErGroup = ErGroup {
+    label: replication::snapshot_bootstrap::LABEL,
+    settings: replication::snapshot_bootstrap::settings,
+    proxy: true,
+    followers: 1,
+};
+
 pub fn catalog() -> Vec<ScenarioEntry> {
     vec![
+        scenario!(
+            replication::snapshot_bootstrap::SnapshotBootstrap,
+            exclusive(&BOOTSTRAP, &[], ())
+        ),
         scenario!(
             replication::replicated_runtime::ReplicatedRuntime,
             exclusive(&RUNTIME, &[Fixture::RedlineProgram], ())

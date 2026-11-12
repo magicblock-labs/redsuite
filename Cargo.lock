@@ -3613,13 +3613,17 @@ dependencies = [
  "solana-sdk-ids 3.1.0",
  "solana-signature",
  "solana-signer",
+ "solana-slot-hashes 3.1.0",
  "solana-transaction 4.1.6",
  "solana-transaction-status-client-types",
  "sonic-rs",
+ "tar",
  "tempfile",
  "tokio",
  "tracing",
  "url",
+ "v42-calculator-interface",
+ "zstd",
 ]
 
 [[package]]
@@ -7249,6 +7253,15 @@ checksum = "bf80a72845275afea99e7f2b434723d3bc7e38470fcd1c7ed39a599c73319a53"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "v42-calculator-interface"
+version = "0.23.1"
+source = "git+https://github.com/magicblock-labs/magicblock-engine.git?tag=0.23.1#3a5bf0c9e0582f42608f43e35c3399be9683b4e1"
+dependencies = [
+ "solana-instruction 3.4.0",
+ "solana-pubkey 4.2.0",
 ]
 
 [[package]]

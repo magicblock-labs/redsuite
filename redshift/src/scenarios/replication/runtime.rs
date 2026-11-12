@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
     rc::Rc,
     time::Duration,
 };
@@ -7,7 +8,7 @@ use std::{
 use account::Account;
 use anyhow::{ensure, Context};
 use base64::{engine::general_purpose::STANDARD, Engine};
-use engine_account::{AccountMode, OwnedAccount};
+use engine_account::AccountMode;
 use json::{json, JsonValueTrait, Value};
 use pubkey::Pubkey;
 use redsuite_core::{
@@ -21,7 +22,8 @@ use solana_rent::Rent;
 use tracing::instrument::WithSubscriber;
 
 pub(super) const TIMEOUT: Duration = Duration::from_secs(60);
-const SUPERBLOCKS: &str = "engine_ledger_superblocks";
+pub(super) const CHECKPOINT: u64 = 16;
+const BLOCKS: &str = "engine_ledger_blocks";
 const SNAPSHOTS: &str =
     r#"engine_replicator_operation_duration_micros_count{op="client_stage_snapshot"}"#;
 pub(super) const RENT: Pubkey = sdk_ids::sysvar::rent::ID;
@@ -181,16 +183,19 @@ pub(super) async fn snapshots(verifier: &Verifier) -> Result<f64> {
 }
 
 pub(super) async fn fence(topology: &ReplicatedTopology) -> Result<()> {
-    use super::replication_recovery::{await_catch_up, leader_metric};
-    let previous = leader_metric(topology, SUPERBLOCKS).await?;
-    let target = wait::retry("a checkpoint after runtime changes", TIMEOUT, async || {
-        let current = leader_metric(topology, SUPERBLOCKS).await?;
-        ensure!(current > previous);
-        Ok(current)
-    })
-    .await?;
+    use super::replication_recovery::{
+        await_catch_up, await_leader_advance, leader_metric, TRANSACTIONS,
+    };
+    await_leader_advance(topology, BLOCKS, 1.0, "runtime writes entering the ledger").await?;
+    let target = leader_metric(topology, TRANSACTIONS).await?;
     for verifier in topology.verifiers().iter().filter(|verifier| verifier.is_running()) {
-        await_catch_up(verifier, SUPERBLOCKS, target).await?;
+        await_catch_up(verifier, TRANSACTIONS, target).await?;
+        let before = verifier
+            .scrape_metrics()
+            .await?
+            .get(BLOCKS)
+            .context("verifier block metric missing")?;
+        await_catch_up(verifier, BLOCKS, before + (CHECKPOINT + 1) as f64).await?;
         ensure!(
             verifier
                 .scrape_metrics()
@@ -201,6 +206,26 @@ pub(super) async fn fence(topology: &ReplicatedTopology) -> Result<()> {
         );
     }
     Ok(())
+}
+
+pub(super) async fn next_snapshot(er: &ErCtx) -> Result<PathBuf> {
+    let storage = er.storage_dir().await?;
+    let head = er
+        .scrape_metrics()
+        .await?
+        .get("engine_ledger_superblocks")
+        .context("leader superblock metric missing")?;
+    wait::retry(
+        "the next complete replication snapshot",
+        TIMEOUT,
+        async || {
+            let (id, archive) = redsuite_core::topology::latest_snapshot(&storage)?
+                .context("snapshot unavailable")?;
+            ensure!(id as f64 >= head);
+            Ok(archive)
+        },
+    )
+    .await
 }
 
 /// Inspection opens copies only; graceful shutdown preserves volatile mirrors too.
@@ -216,24 +241,7 @@ pub(super) async fn inspect(
         let accounts = temp.path().join("accounts");
         clonetree::clone_tree(verifier.accountsdb_dir(), &accounts, &Default::default())?;
         let db = accountsdb::AccountsDB::new(accounts)?;
-        for (key, (account, mode)) in expected {
-            let image = db
-                .loader()
-                .read(key, |account| account.owned())?
-                .context("follower account missing")?;
-            check_image(*key, &image, account, *mode)?;
-        }
-        let features =
-            db.program(&FEATURES, |_, _| ())?.map(|(key, _)| key).collect::<BTreeSet<_>>();
-        ensure!(
-            features
-                == expected
-                    .iter()
-                    .filter(|(_, (account, _))| account.owner == FEATURES)
-                    .map(|(key, _)| *key)
-                    .collect::<BTreeSet<_>>(),
-            "follower feature membership differs"
-        );
+        check_images(&db, expected)?;
         let storage = temp.path().join("ledger");
         clonetree::clone_tree(verifier.storage_dir(), &storage, &Default::default())?;
         let mut shutdown = nucleus::shutdown::ShutdownManager::default();
@@ -262,20 +270,31 @@ pub(super) async fn inspect(
     .await
 }
 
-fn check_image(
-    key: Pubkey,
-    image: &OwnedAccount,
-    expected: &Account,
-    mode: AccountMode,
-) -> Result<()> {
+pub(super) fn check_images(db: &accountsdb::AccountsDB, expected: &Images) -> Result<()> {
+    for (key, (account, mode)) in expected {
+        let image = db
+            .loader()
+            .read(key, |account| account.owned())?
+            .context("follower account missing")?;
+        ensure!(
+            image.mode() == *mode
+                && image.owner() == account.owner
+                && image.lamports() == account.lamports
+                && image.data() == account.data
+                && image.flags().contains(engine_account::StateFlags::EXECUTABLE)
+                    == account.executable,
+            "account image or mode differs for {key}"
+        );
+    }
+    let features = db.program(&FEATURES, |_, _| ())?.map(|(key, _)| key).collect::<BTreeSet<_>>();
     ensure!(
-        image.mode() == mode
-            && image.owner() == expected.owner
-            && image.lamports() == expected.lamports
-            && image.data() == expected.data
-            && image.flags().contains(engine_account::StateFlags::EXECUTABLE)
-                == expected.executable,
-        "follower image or mode differs for {key}"
+        features
+            == expected
+                .iter()
+                .filter(|(_, (account, _))| account.owner == FEATURES)
+                .map(|(key, _)| *key)
+                .collect::<BTreeSet<_>>(),
+        "follower feature membership differs"
     );
     Ok(())
 }
