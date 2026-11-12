@@ -76,7 +76,7 @@ The base chain normally remains available for later runs.
 `replicated_runtime` uses controlled HTTP fixtures for lower rent and account
 funding, then checks real base updates. It compares account images, modes and
 transaction results using copies of stopped follower storage. Storage inspection
-uses Engine 0.23.1 codecs.
+uses Engine 0.24.0 codecs.
 
 ### Controlled failures, real traffic
 

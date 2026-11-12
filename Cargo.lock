@@ -2505,8 +2505,8 @@ dependencies = [
 
 [[package]]
 name = "magicblock-accountsdb"
-version = "0.23.1"
-source = "git+https://github.com/magicblock-labs/magicblock-engine.git?tag=0.23.1#3a5bf0c9e0582f42608f43e35c3399be9683b4e1"
+version = "0.24.0"
+source = "git+https://github.com/magicblock-labs/magicblock-engine.git?tag=0.24.0#4c6e2457a6d7d7930f832e8e748a7e55bbfbef73"
 dependencies = [
  "ahash 0.8.12",
  "bincode",
@@ -2514,12 +2514,12 @@ dependencies = [
  "clonetree",
  "derive_more",
  "heed",
- "magicblock-engine-nucleus 0.23.1",
+ "magicblock-engine-nucleus 0.24.0",
  "memmap2",
  "parking_lot",
  "rustix",
  "scc",
- "solana-account 4.3.1 (git+https://github.com/magicblock-labs/magicblock-engine.git?tag=0.23.1)",
+ "solana-account 4.3.1 (git+https://github.com/magicblock-labs/magicblock-engine.git?tag=0.24.0)",
  "solana-pubkey 4.2.0",
  "thiserror 2.0.21",
  "thread_local",
@@ -2639,8 +2639,8 @@ dependencies = [
 
 [[package]]
 name = "magicblock-engine-nucleus"
-version = "0.23.1"
-source = "git+https://github.com/magicblock-labs/magicblock-engine.git?tag=0.23.1#3a5bf0c9e0582f42608f43e35c3399be9683b4e1"
+version = "0.24.0"
+source = "git+https://github.com/magicblock-labs/magicblock-engine.git?tag=0.24.0#4c6e2457a6d7d7930f832e8e748a7e55bbfbef73"
 dependencies = [
  "derive_more",
  "futures",
@@ -2658,15 +2658,15 @@ dependencies = [
 
 [[package]]
 name = "magicblock-ledger"
-version = "0.23.1"
-source = "git+https://github.com/magicblock-labs/magicblock-engine.git?tag=0.23.1#3a5bf0c9e0582f42608f43e35c3399be9683b4e1"
+version = "0.24.0"
+source = "git+https://github.com/magicblock-labs/magicblock-engine.git?tag=0.24.0#4c6e2457a6d7d7930f832e8e748a7e55bbfbef73"
 dependencies = [
  "agave-transaction-view",
  "bitcode",
  "derive_more",
  "fjall",
  "flume",
- "magicblock-engine-nucleus 0.23.1",
+ "magicblock-engine-nucleus 0.24.0",
  "memmap2",
  "num_cpus",
  "oneshot",
@@ -3587,7 +3587,7 @@ dependencies = [
  "futures-util",
  "magicblock-accountsdb",
  "magicblock-config",
- "magicblock-engine-nucleus 0.23.1",
+ "magicblock-engine-nucleus 0.24.0",
  "magicblock-ledger",
  "magicblock-magic-program-api 1.1.1",
  "rand 0.8.6",
@@ -3597,7 +3597,7 @@ dependencies = [
  "serde",
  "serde_json",
  "solana-account 4.3.1 (registry+https://github.com/rust-lang/crates.io-index)",
- "solana-account 4.3.1 (git+https://github.com/magicblock-labs/magicblock-engine.git?tag=0.23.1)",
+ "solana-account 4.3.1 (git+https://github.com/magicblock-labs/magicblock-engine.git?tag=0.24.0)",
  "solana-account-decoder-client-types",
  "solana-address-lookup-table-interface 3.1.0",
  "solana-commitment-config",
@@ -4406,7 +4406,7 @@ dependencies = [
 [[package]]
 name = "solana-account"
 version = "4.3.1"
-source = "git+https://github.com/magicblock-labs/magicblock-engine.git?tag=0.23.1#3a5bf0c9e0582f42608f43e35c3399be9683b4e1"
+source = "git+https://github.com/magicblock-labs/magicblock-engine.git?tag=0.24.0#4c6e2457a6d7d7930f832e8e748a7e55bbfbef73"
 dependencies = [
  "bitflags 2.13.2",
  "serde",
