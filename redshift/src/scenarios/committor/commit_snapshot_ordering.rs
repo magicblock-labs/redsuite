@@ -157,6 +157,8 @@ impl CommitSnapshotOrdering {
                 .filter(|line| {
                     line.contains("Scheduled commit with ID:")
                         || line.contains("ScheduledCommitSent outbox:")
+                        || line.contains("Scheduled intent id:")
+                        || line.contains("Outbox for scheduled intent:")
                 })
                 .collect();
             return Err(error).context(format!(

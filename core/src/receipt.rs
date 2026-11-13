@@ -27,9 +27,9 @@ pub const SPONSORED_COMMIT_LIMIT: u64 = 10;
 
 const LOG_MARKER: &str = "ScheduledCommitSent ";
 
-const SCHEDULE_MARKER: &str = "Scheduled commit with ID: ";
+const SCHEDULE_MARKERS: &[&str] = &["Scheduled commit with ID: ", "Scheduled intent id: "];
 
-const OUTBOX_MARKER: &str = "ScheduledCommitSent outbox: ";
+const OUTBOX_MARKERS: &[&str] = &["ScheduledCommitSent outbox: ", "Outbox for scheduled intent: "];
 
 const RECEIPT_HISTORY_LIMIT: usize = 64;
 
@@ -229,9 +229,10 @@ fn strip_program_prefix(line: &str) -> &str {
 // The old protocol announces a receipt signature; the new protocol announces
 // the outbox account whose history will contain the completion transaction.
 pub fn receipt_target_in_logs(logs: &[String]) -> Option<ReceiptTarget> {
-    if let Some(address) = logs.iter().find_map(|line| {
-        strip_program_prefix(line).strip_prefix(OUTBOX_MARKER)?.trim().parse().ok()
-    }) {
+    if let Some(address) = logs
+        .iter()
+        .find_map(|line| strip_any_prefix(line, OUTBOX_MARKERS)?.trim().parse().ok())
+    {
         return Some(ReceiptTarget::Outbox {
             address,
             intent_id: intent_id_in_logs(logs)?,
@@ -249,9 +250,13 @@ fn receipt_signature_in_logs(logs: &[String]) -> Option<Signature> {
 }
 
 pub fn intent_id_in_logs(logs: &[String]) -> Option<u64> {
-    logs.iter().find_map(|line| {
-        strip_program_prefix(line).strip_prefix(SCHEDULE_MARKER)?.trim().parse().ok()
-    })
+    logs.iter()
+        .find_map(|line| strip_any_prefix(line, SCHEDULE_MARKERS)?.trim().parse().ok())
+}
+
+fn strip_any_prefix<'a>(line: &'a str, prefixes: &[&str]) -> Option<&'a str> {
+    let line = strip_program_prefix(line);
+    prefixes.iter().find_map(|prefix| line.strip_prefix(*prefix))
 }
 
 // `[pk, pk]`, joined with ", "
@@ -540,6 +545,19 @@ mod tests {
         ];
         assert_eq!(
             receipt_target_in_logs(&outbox),
+            Some(ReceiptTarget::Outbox {
+                address,
+                intent_id: 42,
+                min_slot: 0
+            })
+        );
+
+        let current_outbox = [
+            "Scheduled intent id: 42".to_owned(),
+            format!("Program log: Outbox for scheduled intent: {address}"),
+        ];
+        assert_eq!(
+            receipt_target_in_logs(&current_outbox),
             Some(ReceiptTarget::Outbox {
                 address,
                 intent_id: 42,
