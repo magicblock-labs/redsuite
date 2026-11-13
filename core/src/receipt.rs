@@ -25,7 +25,7 @@ pub const INTENT_TOO_LARGE_ERR: u32 = 0xA000_0002;
 
 pub const SPONSORED_COMMIT_LIMIT: u64 = 10;
 
-const LOG_MARKER: &str = "ScheduledCommitSent ";
+const LOG_MARKER: &str = "Settlement receipt ";
 
 const SCHEDULE_MARKER: &str = "Scheduled intent id: ";
 
@@ -317,7 +317,7 @@ fn parse_logs(
         let Some(rest) = strip_program_prefix(line).strip_prefix(LOG_MARKER) else {
             continue;
         };
-        if let Some(id_part) = rest.strip_prefix("id: ") {
+        if let Some(id_part) = rest.strip_prefix("intent id: ") {
             receipt.commit_id =
                 id_part.split(',').next().and_then(|token| token.trim().parse().ok());
         } else if let Some(payer) = rest.strip_prefix("payer: ") {
@@ -553,5 +553,19 @@ mod tests {
         let address = Pubkey::default();
         let logs = [format!("Outbox for scheduled intent: {address}")];
         assert_eq!(receipt_target_in_logs(&logs), None);
+    }
+
+    #[test]
+    fn settlement_receipt_logs_identify_the_intent_and_base_signature() {
+        let receipt_signature = Signature::default();
+        let logs = [
+            "Program log: Settlement receipt intent id: 42, slot: 10, blockhash: hash".to_owned(),
+            format!("Program log: Settlement receipt signature[0]: {receipt_signature}"),
+        ];
+
+        let receipt = super::parse_logs(receipt_signature, &logs, None);
+
+        assert_eq!(receipt.commit_id, Some(42));
+        assert_eq!(receipt.base_signatures, vec![receipt_signature]);
     }
 }
