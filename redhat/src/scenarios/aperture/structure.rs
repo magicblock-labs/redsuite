@@ -105,7 +105,9 @@ enum Mutation {
     Size,
     Heap,
     Encoding,
-    Signatures,
+    SignatureCount,
+    MissingSignature,
+    ExtraSignature,
 }
 
 fn wire(message: VersionedMessage, payer: &Keypair) -> Result<(Vec<u8>, Signature)> {
@@ -141,12 +143,15 @@ impl Scenario for TransactionStructure {
                 Mutation::Accounts,
                 Mutation::Instructions,
                 Mutation::Size,
-                Mutation::Signatures,
+                Mutation::MissingSignature,
             ] {
                 cases.push((format, mutation));
             }
         }
         cases.extend([
+            (Format::Legacy, Mutation::SignatureCount),
+            (Format::V0, Mutation::SignatureCount),
+            (Format::V1, Mutation::ExtraSignature),
             (Format::Legacy, Mutation::Encoding),
             (Format::V0, Mutation::LookupWritable),
             (Format::V0, Mutation::LookupReadonly),
@@ -307,12 +312,30 @@ async fn check_case(
             "SanitizeError"
         }
         Mutation::Encoding => "error parsing request body",
-        Mutation::Signatures => "ParseError",
-        Mutation::Truncated | Mutation::Trailing | Mutation::Unsupported => "ParseError",
+        Mutation::SignatureCount => "SanitizeError",
+        Mutation::MissingSignature
+        | Mutation::ExtraSignature
+        | Mutation::Truncated
+        | Mutation::Trailing
+        | Mutation::Unsupported => "ParseError",
     };
     let (mut bytes, mut signature) = wire(malformed, &fixture.payer)?;
     match mutation {
-        Mutation::Signatures => bytes[0] = 2,
+        Mutation::SignatureCount => {
+            bytes.splice(65..65, [0; 64]);
+            bytes[0] = 2;
+            let tx: VersionedTransaction = wincode::deserialize(&bytes)?;
+            ensure!(tx.sanitize().is_err(), "signature count mismatch sanitized");
+        }
+        Mutation::MissingSignature => {
+            if matches!(format, Format::V1) {
+                bytes.truncate(bytes.len() - 64);
+            } else {
+                bytes[0] = 2;
+                bytes.truncate(65 + 32);
+            }
+        }
+        Mutation::ExtraSignature => bytes.extend_from_slice(&[0; 64]),
         Mutation::Truncated => {
             bytes.pop();
         }
