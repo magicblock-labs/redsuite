@@ -155,8 +155,8 @@ impl CommitSnapshotOrdering {
             let targets: Vec<_> = transaction_logs(transaction_meta(&scheduled)?)
                 .iter()
                 .filter(|line| {
-                    line.contains("Scheduled commit with ID:")
-                        || line.contains("ScheduledCommitSent outbox:")
+                    line.contains("Scheduled intent id:")
+                        || line.contains("Outbox for scheduled intent:")
                 })
                 .collect();
             return Err(error).context(format!(

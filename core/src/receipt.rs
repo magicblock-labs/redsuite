@@ -27,9 +27,9 @@ pub const SPONSORED_COMMIT_LIMIT: u64 = 10;
 
 const LOG_MARKER: &str = "ScheduledCommitSent ";
 
-const SCHEDULE_MARKER: &str = "Scheduled commit with ID: ";
+const SCHEDULE_MARKER: &str = "Scheduled intent id: ";
 
-const OUTBOX_MARKER: &str = "ScheduledCommitSent outbox: ";
+const OUTBOX_MARKER: &str = "Outbox for scheduled intent: ";
 
 const RECEIPT_HISTORY_LIMIT: usize = 64;
 
@@ -535,8 +535,8 @@ mod tests {
 
         let address = Pubkey::default();
         let outbox = [
-            "Scheduled commit with ID: 42".to_owned(),
-            format!("Program log: ScheduledCommitSent outbox: {address}"),
+            "Scheduled intent id: 42".to_owned(),
+            format!("Program log: Outbox for scheduled intent: {address}"),
         ];
         assert_eq!(
             receipt_target_in_logs(&outbox),
@@ -551,7 +551,7 @@ mod tests {
     #[test]
     fn outbox_receipt_requires_scheduled_intent_id() {
         let address = Pubkey::default();
-        let logs = [format!("ScheduledCommitSent outbox: {address}")];
+        let logs = [format!("Outbox for scheduled intent: {address}")];
         assert_eq!(receipt_target_in_logs(&logs), None);
     }
 }
