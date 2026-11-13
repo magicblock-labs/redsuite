@@ -10,7 +10,7 @@ use keypair::Keypair;
 use tokio::time;
 use tracing::debug;
 
-use super::{config, config::VerifierPlan, process, process::PortLease, state};
+use super::{config, config::VerifierPlan, process, process::PortLease, state, RestartConfig};
 use crate::{
     api::{Metrics, MetricsCollector},
     context::{BaseCtx, ErCtx},
@@ -219,6 +219,40 @@ impl ReplicatedTopology {
         self.verifiers.iter().filter(|verifier| verifier.is_running()).count()
     }
 
+    pub async fn stop_leader(&self) -> Result<()> {
+        self.leader
+            .owner()
+            .context("replication requires a group-owned leader")?
+            .lock()
+            .await
+            .stop(false)
+            .await
+    }
+
+    pub async fn promote(&mut self, index: usize) -> Result<()> {
+        ensure!(
+            !self.verifier(index).proc.has_child(),
+            "verifier must be stopped before promotion"
+        );
+        let verifier = self.verifiers.remove(index);
+        let storage = verifier.storage_dir().to_owned();
+        let accounts = verifier.accountsdb_dir().to_owned();
+        self.leader
+            .owner()
+            .context("replication requires a group-owned leader")?
+            .lock()
+            .await
+            .start(RestartConfig {
+                before_start: Box::new(move |params| {
+                    params.engine.ledger.directory = storage.clone();
+                    params.engine.accountsdb.directory = accounts.clone();
+                    Ok(())
+                }),
+                ..Default::default()
+            })
+            .await
+    }
+
     pub async fn leader_connections(&self) -> Result<f64> {
         let metrics = self.leader.scrape_metrics().await?;
         metrics
@@ -278,11 +312,7 @@ pub async fn replicated(
     let identities: Vec<Keypair> = (0..options.verifiers)
         .map(|index| super::identity_for_label(&format!("{}-verifier{index}", options.label)))
         .collect::<Result<_>>()?;
-    let owner = leader
-        .owner
-        .as_ref()
-        .and_then(std::rc::Weak::upgrade)
-        .context("replication requires a group-owned leader")?;
+    let owner = leader.owner().context("replication requires a group-owned leader")?;
     let leader_params = owner.lock().await.params().clone();
 
     let dir = state::stack_dir();

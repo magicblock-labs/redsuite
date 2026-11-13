@@ -69,6 +69,13 @@ static BOOTSTRAP: ErGroup = ErGroup {
     followers: 1,
 };
 
+static PROMOTION: ErGroup = ErGroup {
+    label: replication::replication_promotion::LABEL,
+    settings: replication::settings,
+    proxy: true,
+    followers: 1,
+};
+
 pub fn catalog() -> Vec<ScenarioEntry> {
     vec![
         scenario!(
@@ -80,6 +87,11 @@ pub fn catalog() -> Vec<ScenarioEntry> {
             exclusive(&RUNTIME, &[Fixture::RedlineProgram], ())
         )
         .prepare_with(&replication::replicated_runtime::PREPARE),
+        scenario!(
+            replication::replication_promotion::ReplicationPromotion,
+            exclusive(&PROMOTION, &[Fixture::RedlineProgram], ())
+        )
+        .prepare_with(&replication::replication_promotion::PREPARE),
         scenario!(
             lifecycle::restart_under_load::RestartUnderLoad,
             exclusive(&STORAGE, &[Fixture::RedlineProgram], ())

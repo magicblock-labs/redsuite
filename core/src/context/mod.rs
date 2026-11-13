@@ -184,8 +184,12 @@ pub struct ErCtx {
 }
 
 impl ErCtx {
-    pub(crate) async fn log_path(&self) -> Option<PathBuf> {
-        let owner = self.owner.as_ref()?.upgrade()?;
+    pub(crate) fn owner(&self) -> Option<Rc<Mutex<PrivateEr>>> {
+        self.owner.as_ref().and_then(Weak::upgrade)
+    }
+
+    pub async fn log_path(&self) -> Option<PathBuf> {
+        let owner = self.owner()?;
         let path = owner.lock().await.log().to_owned();
         Some(path)
     }
@@ -256,9 +260,7 @@ impl ErCtx {
     }
 
     pub async fn restart(&self, config: RestartConfig) -> Result<RestartOutcome> {
-        self.owner
-            .as_ref()
-            .and_then(Weak::upgrade)
+        self.owner()
             .context("only a group ER is restartable through its context")?
             .lock()
             .await
@@ -267,9 +269,7 @@ impl ErCtx {
     }
 
     pub fn pid(&self) -> u32 {
-        self.owner
-            .as_ref()
-            .and_then(Weak::upgrade)
+        self.owner()
             .and_then(|owner| owner.try_lock().ok().map(|er| er.pid()))
             .unwrap_or(self.pid)
     }
@@ -281,11 +281,7 @@ impl ErCtx {
     }
 
     pub async fn storage_dir(&self) -> Result<PathBuf> {
-        let owner = self
-            .owner
-            .as_ref()
-            .and_then(Weak::upgrade)
-            .context("attached ER storage is not locally owned")?;
+        let owner = self.owner().context("attached ER storage is not locally owned")?;
         let path = owner.lock().await.storage_dir().to_owned();
         Ok(path)
     }
