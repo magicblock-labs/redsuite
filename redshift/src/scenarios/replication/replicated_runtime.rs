@@ -8,7 +8,6 @@ use redsuite_core::{
     api::{decode_account, encode},
     catalog::BasePreparation,
     programs::{CellId, REDLINE},
-    random,
     rpc_types::{
         request::RpcRequest,
         response::{Response, RpcSimulateTransactionResult},
@@ -21,37 +20,14 @@ use signer::Signer;
 
 use super::{
     replication_recovery::await_leader_advance,
-    runtime::{self, Runtime, TIMEOUT},
+    runtime::{self, prepare, signers, Runtime, TIMEOUT},
 };
 
 pub(crate) const LABEL: &str = "replicated-runtime";
 
 pub static PREPARE: BasePreparation = BasePreparation {
-    run: |base| Box::pin(prepare(base)),
+    run: |base| Box::pin(prepare(base, LABEL)),
 };
-
-fn signers(base: &BaseCtx) -> [Keypair; 2] {
-    let mut rng = random::rng(base.config().seed, &[LABEL], 0);
-    std::array::from_fn(|_| random::keypair(&mut rng))
-}
-
-async fn prepare(base: &BaseCtx) -> Result<()> {
-    let [funder, payer] = signers(base);
-    for payer in [&funder, &payer] {
-        ensure!(
-            base.account(&payer.pubkey()).await?.is_none(),
-            "runtime fixture already exists; use a fresh stack"
-        );
-        base.airdrop(&payer.pubkey(), crate::PAYER_LAMPORTS).await?;
-    }
-    let identity = topology::identity_for_label(LABEL)?.pubkey();
-    base.delegate_payer(&funder, &payer, identity).await?;
-    let cells = base.cells(REDLINE, &funder);
-    let plain = cells.create(crate::ACCOUNT_SPACE, identity, 0).await?;
-    cells.write(11, &[plain]).await?;
-    cells.create_delegated(crate::ACCOUNT_SPACE, identity, 1).await?;
-    Ok(())
-}
 
 pub struct ReplicatedRuntime {
     fixture: Runtime,
@@ -83,7 +59,7 @@ impl Scenario for ReplicatedRuntime {
 impl ReplicatedRuntime {
     async fn verify(&mut self) -> Result<()> {
         let fixture = &self.fixture;
-        let [funder, payer] = signers(&fixture.base);
+        let [funder, payer] = signers(&fixture.base, LABEL);
         let cells = fixture.base.cells(REDLINE, &funder);
         let [plain, delegated] =
             [0, 1].map(|index| REDLINE.pda(CellId::new(funder.pubkey(), index)).0);

@@ -112,10 +112,15 @@ impl PrivateEr {
     /// `hard_kill` skips the check and sends SIGKILL without flushing.
     pub async fn stop(&mut self, hard_kill: bool) -> Result<()> {
         let _ = self.prepare_shutdown(hard_kill).await?;
-        self.proc
+        let (status, needed_sigkill) = self
+            .proc
             .terminate(hard_kill)
             .await?
             .context("private ER has no running process to stop")?;
+        ensure!(
+            hard_kill || (status.success() && !needed_sigkill),
+            "private ER shutdown failed: {status}, needed_sigkill={needed_sigkill}"
+        );
         Ok(())
     }
 
@@ -148,21 +153,7 @@ impl PrivateEr {
         let exit_code = exit_status.code();
         let exit_signal = ExitStatusExt::signal(&exit_status);
 
-        (config.before_start)(&mut self.plan.params)?;
-        self.plan.params.ledger.reset = config.reset;
-        self.proc.relaunch(self.plan.spawn(&self.log)?);
-        process::wait_until_every(
-            process::RESTART_POLL,
-            config.ready_timeout,
-            "restarted ER reaching /health/primary",
-            &self.log,
-            self.proc.pid(),
-            || api.primary_ready(),
-        )
-        .await
-        .map_err(|error| self.ports.failure(error))?;
-        self.ctx.pid = self.proc.pid();
-        self.ctx.reset_blockhash();
+        self.start(config).await?;
         let slot_after = api.get_slot().await.ok();
 
         Ok(RestartOutcome {
@@ -172,6 +163,30 @@ impl PrivateEr {
             slot_before,
             slot_after,
         })
+    }
+
+    pub(super) async fn start(&mut self, config: RestartConfig) -> Result<()> {
+        ensure!(
+            !self.proc.has_child(),
+            "private ER must be stopped before starting"
+        );
+        (config.before_start)(&mut self.plan.params)?;
+        self.plan.params.ledger.reset = config.reset;
+        self.proc.relaunch(self.plan.spawn(&self.log)?);
+        let api = self.rpc_api();
+        process::wait_until_every(
+            process::RESTART_POLL,
+            config.ready_timeout,
+            "started ER reaching /health/primary",
+            &self.log,
+            self.proc.pid(),
+            || api.primary_ready(),
+        )
+        .await
+        .map_err(|error| self.ports.failure(error))?;
+        self.ctx.pid = self.proc.pid();
+        self.ctx.reset_blockhash();
+        Ok(())
     }
 
     /// Checks for a slot away from snapshot boundaries, terminating on failure.

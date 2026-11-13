@@ -1,4 +1,5 @@
 pub mod replicated_runtime;
+pub mod replication_promotion;
 pub mod replication_recovery;
 mod runtime;
 pub mod snapshot_bootstrap;

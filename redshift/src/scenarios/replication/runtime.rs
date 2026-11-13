@@ -10,14 +10,18 @@ use anyhow::{ensure, Context};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use engine_account::AccountMode;
 use json::{json, JsonValueTrait, Value};
+use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
     api::transaction_meta,
     netfault::{Faults, RuleHandle, Selector},
+    programs::REDLINE,
+    random,
     topology::{ReplicatedTopology, RestartConfig, Verifier},
     wait, BaseCtx, ChainCtx, ErCtx, Result,
 };
 use signature::Signature;
+use signer::Signer;
 use solana_rent::Rent;
 use tracing::instrument::WithSubscriber;
 
@@ -30,6 +34,29 @@ pub(super) const RENT: Pubkey = sdk_ids::sysvar::rent::ID;
 pub(super) const FEATURES: Pubkey =
     Pubkey::from_str_const("Feature111111111111111111111111111111111111");
 pub(super) type Images = BTreeMap<Pubkey, (Account, AccountMode)>;
+
+pub(super) fn signers(base: &BaseCtx, label: &str) -> [Keypair; 2] {
+    let mut rng = random::rng(base.config().seed, &[label], 0);
+    std::array::from_fn(|_| random::keypair(&mut rng))
+}
+
+pub(super) async fn prepare(base: &BaseCtx, label: &str) -> Result<()> {
+    let [funder, payer] = signers(base, label);
+    for payer in [&funder, &payer] {
+        ensure!(
+            base.account(&payer.pubkey()).await?.is_none(),
+            "runtime fixture already exists; use a fresh stack"
+        );
+        base.airdrop(&payer.pubkey(), crate::PAYER_LAMPORTS).await?;
+    }
+    let identity = redsuite_core::topology::identity_for_label(label)?.pubkey();
+    base.delegate_payer(&funder, &payer, identity).await?;
+    let cells = base.cells(REDLINE, &funder);
+    let plain = cells.create(crate::ACCOUNT_SPACE, identity, 0).await?;
+    cells.write(11, &[plain]).await?;
+    cells.create_delegated(crate::ACCOUNT_SPACE, identity, 1).await?;
+    Ok(())
+}
 
 pub(super) struct Runtime {
     pub base: Rc<BaseCtx>,
@@ -241,6 +268,7 @@ pub(super) async fn inspect(
         let accounts = temp.path().join("accounts");
         clonetree::clone_tree(verifier.accountsdb_dir(), &accounts, &Default::default())?;
         let db = accountsdb::AccountsDB::new(accounts)?;
+        db.validate()?;
         check_images(&db, expected)?;
         let storage = temp.path().join("ledger");
         clonetree::clone_tree(verifier.storage_dir(), &storage, &Default::default())?;
