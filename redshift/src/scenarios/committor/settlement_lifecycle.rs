@@ -7,7 +7,10 @@ use pubkey::Pubkey;
 use redsuite_core::{
     api::{transaction_logs, transaction_meta, TxError},
     prep,
-    programs::{CellHeader, CellId, SettlementMode, UndelegationOutcome, MAGIC, REDSHIFT},
+    programs::{
+        CellHeader, CellId, Commit, IntentBundle, SettlementMode, UndelegationOutcome, MAGIC,
+        REDSHIFT,
+    },
     receipt::{self, CommitReceipt},
     rpc_types::response::TransactionError,
     wait, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
@@ -334,12 +337,11 @@ impl SettlementLifecycle {
         {
             let cells = self.base.cells(REDSHIFT, &payer).create_owned(validator, 1).await?;
             self.er.await_cells(&cells).await?;
-            let tx = sender
-                .prepare(&[REDSHIFT
-                    .batch()
-                    .settle(outsider, &[cells[0].address, outsider], commit_type)
-                    .build()])
-                .await?;
+            // Supply the fee vault so rejection tests foreign delegation alone.
+            let mut bundle = IntentBundle::new(outsider);
+            bundle.validator = Some(self.er.identity());
+            bundle.commits.push(Commit::new(commit_type, &[cells[0].address, outsider]));
+            let tx = sender.prepare(&[REDSHIFT.batch().intents(bundle).build()]).await?;
             let before = self.er.account(&cells[0].address).await?;
             let signature = self.er.api().send_transaction(&tx).await?;
             let outcome = self.er.api().try_confirm(&signature).await?;
