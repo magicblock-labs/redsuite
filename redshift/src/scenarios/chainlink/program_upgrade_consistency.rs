@@ -78,8 +78,10 @@ pub struct ProgramUpgradeConsistency {
     buffer: Pubkey,
     program_id: Pubkey,
     programdata: Pubkey,
-    proxy: Proxy,
-    faults: Faults,
+    hot_proxy: Proxy,
+    cold_proxy: Proxy,
+    hot_faults: Faults,
+    cold_faults: Faults,
     hot: PrivateEr,
     cold: PrivateEr,
 }
@@ -113,17 +115,20 @@ impl PrivateErScenario for ProgramUpgradeConsistency {
             )?,
         )
         .await?;
-        let proxy = Proxy::spawn(topology::BaseEndpoints::from_base(&base)?).await?;
-        let faults = proxy.scope()?;
-        let options = |label: &str| ErOptions {
+        let upstream = topology::BaseEndpoints::from_base(&base)?;
+        let (hot_proxy, cold_proxy) =
+            try_join(Proxy::spawn(upstream.clone()), Proxy::spawn(upstream)).await?;
+        let hot_faults = hot_proxy.scope()?;
+        let cold_faults = cold_proxy.scope()?;
+        let options = |label: &str, proxy: &Proxy| ErOptions {
             label: label.into(),
             base_endpoints: Some(proxy.endpoints()),
 
             ..ErOptions::default()
         };
         let (hot, cold) = try_join(
-            topology::private_er(&base, options("upgrade-hot")),
-            topology::private_er(&base, options("upgrade-cold")),
+            topology::private_er(&base, options("upgrade-hot", &hot_proxy)),
+            topology::private_er(&base, options("upgrade-cold", &cold_proxy)),
         )
         .await?;
         Ok(Self {
@@ -134,8 +139,10 @@ impl PrivateErScenario for ProgramUpgradeConsistency {
             buffer: b_buffer.pubkey(),
             program_id,
             programdata,
-            proxy,
-            faults,
+            hot_proxy,
+            cold_proxy,
+            hot_faults,
+            cold_faults,
             hot,
             cold,
         })
@@ -167,7 +174,7 @@ impl PrivateErScenario for ProgramUpgradeConsistency {
             keys: &keys,
             expected,
             program_id: self.program_id,
-            faults: &self.faults,
+            faults: &self.hot_faults,
             progress: &progress,
         };
         time::timeout(
@@ -177,8 +184,8 @@ impl PrivateErScenario for ProgramUpgradeConsistency {
         .await??;
         ensure!(self.base.accounts(&keys).await? == base_state);
         try_join(self.hot.finish(), self.cold.finish()).await?;
-        self.faults.reset().await?;
-        drop(self.proxy);
+        try_join(self.hot_faults.reset(), self.cold_faults.reset()).await?;
+        drop((self.hot_proxy, self.cold_proxy));
         Ok(())
     }
 }
@@ -337,13 +344,13 @@ impl ProgramUpgradeConsistency {
         self.materialized(er, &self.a).await?;
         let holds = [self.program_id, self.programdata].map(|key| {
             [
-                self.faults.stall(
+                self.hot_faults.stall(
                     Selector::methods(&["accountNotification", "programNotification"])
                         .ws()
                         .notification()
                         .account(&key),
                 ),
-                self.faults.stall(
+                self.hot_faults.stall(
                     Selector::methods(&["getAccountInfo", "getMultipleAccounts"])
                         .http()
                         .response()
@@ -366,16 +373,27 @@ impl ProgramUpgradeConsistency {
             .data;
         let offset = UpgradeableLoaderState::size_of_programdata_metadata();
         ensure!(data.get(offset..) == Some(self.b.as_slice()));
-        holds[1][0].wait_hit(TIMEOUT).await?;
         let after_upgrade = progress.counts.get()[1];
+        progress.await_count(1, after_upgrade + 8).await?;
+
+        ensure!(
+            local_program(self.cold.ctx(), self.program_id).await?.is_none(),
+            "cold validator materialized the probe before its explicit fetch"
+        );
+        let cold_fetch = self.cold_faults.stall(
+            Selector::methods(&["getAccountInfo", "getMultipleAccounts"])
+                .http()
+                .response()
+                .account(&self.program_id),
+        );
         let (clones, ()) = try_join(
             try_join_all((0..3).map(|_| self.cold.ctx().account(&self.program_id))),
             async {
-                holds[0][1].wait_hit(TIMEOUT).await?;
-                progress.await_count(1, after_upgrade + 8).await?;
+                cold_fetch.wait_hit(TIMEOUT).await.context("cold program HTTP response")?;
                 for hold in holds.into_iter().flatten() {
                     hold.remove();
                 }
+                cold_fetch.remove();
                 progress.phase.set(2);
                 Result::Ok(())
             },
