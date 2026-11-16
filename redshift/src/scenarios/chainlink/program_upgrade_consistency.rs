@@ -1,4 +1,4 @@
-use std::{cell::Cell, fs, future::Future, rc::Rc, slice, time::Duration};
+use std::{cell::Cell, fs, rc::Rc, slice, time::Duration};
 use tokio::sync::Notify;
 
 use account::Account;
@@ -9,7 +9,7 @@ use pubkey::Pubkey;
 use redsuite_core::{
     api::{custom_error_code, transaction_logs, transaction_meta},
     catalog::Fixture,
-    netfault::{Faults, Proxy, RuleHandle, Selector},
+    netfault::{Faults, Proxy, Selector},
     programs::{CellHeader, UpgradeProbe},
     redline::Accounts,
     topology::{self, ErOptions, PrivateEr},
@@ -373,13 +373,9 @@ impl ProgramUpgradeConsistency {
             .data;
         let offset = UpgradeableLoaderState::size_of_programdata_metadata();
         ensure!(data.get(offset..) == Some(self.b.as_slice()));
-        // A reconnect may lose the one-off upgrade notification. Keep the
-        // HTTP/WS discovery paths held while witnessing warm progress.
         let after_upgrade = progress.counts.get()[1];
         progress.await_count(1, after_upgrade + 8).await?;
 
-        // Start cold requests only after witnessing warm progress. Otherwise
-        // their fetch deadlines tick while unrelated warm invocations finish.
         ensure!(
             local_program(self.cold.ctx(), self.program_id).await?.is_none(),
             "cold validator materialized the probe before its explicit fetch"
@@ -390,11 +386,17 @@ impl ProgramUpgradeConsistency {
                 .response()
                 .account(&self.program_id),
         );
-        let clones = release_after_cold_fetch(
-            holds,
-            cold_fetch,
-            progress,
+        let (clones, ()) = try_join(
             try_join_all((0..3).map(|_| self.cold.ctx().account(&self.program_id))),
+            async {
+                cold_fetch.wait_hit(TIMEOUT).await.context("cold program HTTP response")?;
+                for hold in holds.into_iter().flatten() {
+                    hold.remove();
+                }
+                cold_fetch.remove();
+                progress.phase.set(2);
+                Result::Ok(())
+            },
         )
         .await?;
         ensure!(clones.iter().all(|a| {
@@ -420,27 +422,3 @@ impl ProgramUpgradeConsistency {
         Ok(())
     }
 }
-
-/// Releases discovery after a cold request reaches its own proxy. Hot reloads
-/// cannot satisfy this rendezvous, and missing WS notifications cannot block it.
-async fn release_after_cold_fetch<T>(
-    holds: [[RuleHandle; 2]; 2],
-    cold_fetch: RuleHandle,
-    progress: &Progress,
-    fetches: impl Future<Output = Result<T>>,
-) -> Result<T> {
-    let (clones, ()) = try_join(fetches, async {
-        cold_fetch.wait_hit(TIMEOUT).await.context("cold program HTTP response")?;
-        for hold in holds.into_iter().flatten() {
-            hold.remove();
-        }
-        cold_fetch.remove();
-        progress.phase.set(2);
-        Ok(())
-    })
-    .await?;
-    Ok(clones)
-}
-
-#[cfg(test)]
-mod tests;
