@@ -412,7 +412,7 @@ impl SettlementAuthorization {
             ),
             (
                 OutboxIntentInstruction::ScheduledCommitSent(SentCommit {
-                    message_id: intent_id,
+                    intent_id,
                     ..SentCommit::default()
                 }),
                 InstructionError::IncorrectAuthority,

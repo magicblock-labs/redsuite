@@ -13,7 +13,6 @@ use redsuite_core::{
     rpc_types::response::TransactionError,
     system, topology, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
-use sdk::spl::builders::UndelegateEphemeralAtaBuilder;
 use signature::Signature;
 use signer::Signer;
 use solana_instruction_error::InstructionError;
@@ -22,7 +21,7 @@ use tracing::instrument;
 mod magic_atas;
 use magic_atas::MagicAtas;
 
-use super::spl;
+use super::{await_mirror_recovery, spl};
 use crate::PAYER_LAMPORTS;
 
 const NAMES: [&str; 4] = ["source", "destination", "unbacked", "foreign"];
@@ -419,6 +418,7 @@ impl ProjectedTokenLifecycle {
         for rule in confirmations {
             rule.remove();
         }
+        await_mirror_recovery(&self.base, &self.er).await?;
         self.settled(
             &signature,
             &[self.wallets[0].eata, self.wallets[1].eata],
@@ -430,17 +430,20 @@ impl ProjectedTokenLifecycle {
     /// Waits for backing ownership to return before testing base withdrawals.
     #[instrument(skip_all, err)]
     async fn undelegate_wallets(&self) -> Result<()> {
-        for wallet in &self.wallets[..2] {
+        for (index, wallet) in self.wallets[..2].iter().enumerate() {
             let signature = self
                 .er
                 .submit_and_confirm(
-                    &wallet.owner,
-                    &[UndelegateEphemeralAtaBuilder {
-                        payer: wallet.owner.pubkey(),
-                        user: wallet.owner.pubkey(),
-                        mint: self.mint.pubkey(),
-                    }
-                    .instruction()],
+                    &self.validator,
+                    &[REDLINE
+                        .batch()
+                        .nonce(3 + index as u64)
+                        .settle(
+                            self.validator.pubkey(),
+                            &[wallet.ata],
+                            SettlementMode::Undelegate,
+                        )
+                        .build()],
                 )
                 .await?;
             self.settled(&signature, &[wallet.eata], true).await?;

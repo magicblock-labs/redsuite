@@ -1,15 +1,17 @@
 use std::time::Duration;
 
-use anyhow::{bail, ensure, Context};
+use anyhow::{ensure, Context};
 use redsuite_core::{
     netfault::{Selector, Transport},
     programs::{CellId, SettlementMode, REDLINE},
-    ChainCtx, Result,
+    wait, ChainCtx, Result,
 };
 use signer::Signer;
-use tokio::time::Instant;
 
-use super::{await_local_value, CacheLifecycle, BASE_REFRESH, BASE_REWRITE, ER_WRITE, FETCHES};
+use super::{
+    await_fetched_value, await_local_value, CacheLifecycle, BASE_REFRESH, BASE_REWRITE, ER_WRITE,
+    FETCHES,
+};
 use crate::{program, ACCOUNT_OWNERS, ACCOUNT_SPACE, PAYER_LAMPORTS};
 
 const TIMEOUT: Duration = Duration::from_secs(30);
@@ -17,8 +19,8 @@ const CLONED_COUNT: usize = 1;
 const PENDING_COUNT: usize = 2;
 
 impl CacheLifecycle {
-    /// Tests gRPC discovery of base rewrites and completed undelegation without cache eviction.
-    /// HTTP fetch responses and WebSocket notifications are withheld to expose that path alone.
+    /// Tests gRPC mirror updates and undelegation discovery without WebSocket delivery.
+    /// Subscription failure evicts released images; requests reacquire them after recovery.
     pub(super) async fn transport_baseline(&self) -> Result<()> {
         let er = &self.er;
         let evictions_before = er
@@ -70,8 +72,27 @@ impl CacheLifecycle {
         .await?;
         settlement.wait_hit(TIMEOUT).await?;
 
+        wait::retry(
+            "gRPC mirror coverage before WebSocket loss",
+            TIMEOUT,
+            || async {
+                let metrics = er.scrape_metrics().await?;
+                ensure!(
+                    metrics.get("engine_chainsync_coverage{coverage=\"both\"}").unwrap_or_default()
+                        >= cloned.len() as f64
+                );
+                ensure!(
+                    metrics
+                        .get("engine_chainsync_coverage{coverage=\"ws_only\"}")
+                        .unwrap_or_default()
+                        == 0.0
+                );
+                Ok(())
+            },
+        )
+        .await?;
         let ws_blackout = self.faults.stall(Selector::default().ws().response().notification());
-        for key in &keys {
+        for key in cloned {
             self.faults.stall(Selector::methods(&FETCHES).http().response().account(key));
         }
         self.faults.disconnect(Transport::Ws);
@@ -90,7 +111,6 @@ impl CacheLifecycle {
         self.base.cells(REDLINE, &funder).write(BASE_REWRITE, pending).await?;
         self.base.cells(REDLINE, &funder).write(BASE_REFRESH, cloned).await?;
 
-        let refresh_started = Instant::now();
         await_local_value(
             er,
             "the er observes a base write to a cloned account while websocket \
@@ -99,25 +119,18 @@ impl CacheLifecycle {
             BASE_REFRESH,
         )
         .await?;
-        let refresh = refresh_started.elapsed();
-        if let Err(error) = await_local_value(
-            er,
-            "undelegation discovered without WebSocket",
-            pending,
-            BASE_REWRITE,
-        )
-        .await
-        {
-            let served: Vec<_> =
-                er.accounts(pending).await?.into_iter().map(crate::account_id).collect();
-            bail!(
-                "{error:#}; the cloned account did refresh over grpc after \
-                 {refresh:.1?}, and a direct client read returns {served:?}"
-            );
-        }
+        self.await_released(pending).await?;
 
         ensure!(ws_blackout.hits() > 0);
         self.faults.restore();
+
+        await_fetched_value(
+            er,
+            "requests reacquire released accounts after recovery",
+            pending,
+            BASE_REWRITE,
+        )
+        .await?;
 
         ensure!(
             er.scrape_metrics().await?.get("engine_keeper_account_cache_evictions")

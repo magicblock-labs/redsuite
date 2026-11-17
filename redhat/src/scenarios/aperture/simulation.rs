@@ -116,7 +116,8 @@ impl SimulationIsolation {
         let cell = fixture.keys[1];
         let vault = dlp::magic_fee_vault_pda(&fixture.er.identity());
         fixture.er.account(&vault).await?.context("simulation fee vault missing")?;
-        let protected = [magic_api::MAGIC_CONTEXT_PUBKEY, magic_api::EPHEMERAL_VAULT_PUBKEY, vault];
+        let protected =
+            [magic_api::MAGIC_CONTEXT_PUBKEY, magic_api::MAGIC_ACCOUNT_VAULT_PUBKEY, vault];
         fixture.er.accounts(&protected).await?;
         let id = CellId::new(payer, 777);
         let target = REDSHIFT.pda(id).0;
@@ -125,9 +126,9 @@ impl SimulationIsolation {
             accounts: vec![
                 AccountMeta::new(payer, true),
                 AccountMeta::new(target, true),
-                AccountMeta::new(magic_api::EPHEMERAL_VAULT_PUBKEY, false),
+                AccountMeta::new(magic_api::MAGIC_ACCOUNT_VAULT_PUBKEY, false),
             ],
-            data: MagicBlockInstruction::CreateEphemeralAccount { data_len: 32 }.try_to_vec()?,
+            data: MagicBlockInstruction::CreateMagicAccount { data_len: 32 }.try_to_vec()?,
         };
         let mut commit = Commit::new(SettlementMode::Commit, &[cell]);
         commit.after_commit.push(

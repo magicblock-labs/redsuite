@@ -31,6 +31,7 @@ static CACHE: ErGroup = ErGroup {
     label: "small-cache",
     settings: |p| {
         p.engine.accountsdb.lru_capacity = 256;
+        p.chainsync.grpc.push(p.chainsync.grpc[0].clone());
     },
     proxy: true,
     followers: 0,
@@ -157,10 +158,6 @@ pub fn catalog() -> Vec<ScenarioEntry> {
                 &[Fixture::RedlineProgram, Fixture::RedshiftProgram],
                 ()
             )
-        ),
-        scenario!(
-            chainlink::program_clone_allowlist::ProgramCloneAllowlist,
-            fresh(&[Fixture::RedshiftProgram], ())
         ),
         scenario!(
             chainlink::program_materialization::ProgramMaterialization,

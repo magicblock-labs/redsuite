@@ -101,10 +101,41 @@ impl Scenario<(), Mode> for CacheLifecycle {
     }
 }
 
+impl CacheLifecycle {
+    /// Local-only probes cannot refill released images while transport is unavailable.
+    async fn await_released(&self, keys: &[Pubkey]) -> Result<()> {
+        self.er
+            .api()
+            .await_query(
+                "released images disappear during the subscription outage",
+                async || {
+                    let accounts = self.er.local_accounts(&ACCOUNT_OWNERS, keys).await?;
+                    let absent = accounts.iter().all(Option::is_none);
+                    Ok(wait::when(absent, absent))
+                },
+            )
+            .await?;
+        Ok(())
+    }
+}
+
 const ER_WRITE: u64 = 700;
 const BASE_REWRITE: u64 = 900;
 const BASE_REFRESH: u64 = 901;
 const FETCHES: [&str; 2] = ["getAccountInfo", "getMultipleAccounts"];
+
+/// Reissues acquisition after each slot because an earlier failed read cannot create a subscription.
+async fn await_fetched_value(er: &ErCtx, what: &str, keys: &[Pubkey], expected: u64) -> Result<()> {
+    er.api()
+        .await_query(what, async || {
+            let values: Vec<_> =
+                er.accounts(keys).await?.into_iter().map(crate::account_id).collect();
+            let current = values.iter().all(|value| *value == Some(expected));
+            Ok(wait::when(current, values))
+        })
+        .await?;
+    Ok(())
+}
 
 /// Seeds from local state, then watches updates without a client fetch masking discovery failures.
 async fn await_local_value(er: &ErCtx, what: &str, keys: &[Pubkey], expected: u64) -> Result<()> {

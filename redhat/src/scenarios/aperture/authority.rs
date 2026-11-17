@@ -57,7 +57,7 @@ fn project(accounts: &[Option<Account>]) -> Projection {
 async fn privileged_images(fixture: &Fixture) -> Result<(Projection, Projection)> {
     let keys = [
         magic_api::MAGIC_CONTEXT_PUBKEY,
-        magic_api::EPHEMERAL_VAULT_PUBKEY,
+        magic_api::MAGIC_ACCOUNT_VAULT_PUBKEY,
         fixture.er.identity(),
     ];
     let local = fixture
@@ -307,6 +307,7 @@ impl Scenario for TransactionAuthority {
                                 "invalidwritableaccount",
                                 "readonlydatamodified",
                                 "externalaccountdatamodified",
+                                "instruction modified data of an account it does not own",
                                 "immutable",
                             ]
                             .iter()

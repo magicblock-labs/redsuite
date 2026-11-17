@@ -81,8 +81,13 @@ impl Fixture {
         er.api()
             .await_accounts(
                 &[payer.pubkey(), cell],
-                "hostile transaction fixtures cloned",
-                decode_state,
+                "hostile transaction fixtures activated",
+                |accounts| {
+                    let state = decode_state(accounts)?;
+                    ensure!(accounts[0].as_ref().unwrap().owner == sdk_ids::system_program::ID);
+                    ensure!(accounts[1].as_ref().unwrap().owner == REDSHIFT.id());
+                    Ok(state)
+                },
             )
             .await?;
         let warm = base.seeded_payer(rng, 1_000_000).await?.pubkey();

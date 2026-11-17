@@ -6,7 +6,6 @@ use aperture::{
     SimulationIsolation, SlowSubscriberSignals, TransactionAdmission, TransactionAuthority,
     TransactionStructure, UnpaidWork,
 };
-use magicblock_config::types::Remote;
 use redshift::scenarios::replication::replication_recovery::{Coverage, ReplicationRecovery};
 use redsuite_core::{
     catalog::{BasePreparation, ErGroup, Fixture, ScenarioEntry, DEFAULT},
@@ -16,7 +15,11 @@ use std::time::Duration;
 
 static PREPARATION: ErGroup = ErGroup {
     label: "hostile-preparation",
-    settings: |p| p.remotes.retain(|remote| !matches!(remote, Remote::Grpc(_))),
+    settings: |p| {
+        for stream in &mut p.chainsync.grpc {
+            stream.duplication_delay = Duration::from_secs(3600);
+        }
+    },
     proxy: true,
     followers: 0,
 };
