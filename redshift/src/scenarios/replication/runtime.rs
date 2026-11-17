@@ -113,8 +113,8 @@ impl Runtime {
         }
         let values: BTreeMap<_, _> = accounts
             .into_iter()
-            .map(|(key, account)| (key.to_string(), account_value(&account)))
-            .collect();
+            .map(|(key, account)| Ok((key.to_string(), account_value(&account)?)))
+            .collect::<Result<_>>()?;
         let rule = self.faults.rewrite(
             Selector::methods(&["getAccountInfo", "getMultipleAccounts"]).http(),
             move |operation, reply| {
@@ -187,12 +187,12 @@ impl Runtime {
     }
 }
 
-fn account_value(account: &Account) -> Value {
-    json!({
+fn account_value(account: &Account) -> Result<Value> {
+    Ok(json!({
         "lamports": account.lamports, "owner": account.owner.to_string(),
-        "data": [STANDARD.encode(&account.data), "base64"],
+        "data": [STANDARD.encode(zstd::stream::encode_all(account.data.as_slice(), 0)?), "base64+zstd"],
         "executable": account.executable, "rentEpoch": account.rent_epoch,
-    })
+    }))
 }
 
 fn rent_rule(faults: &Faults, rent: &Rent) -> Result<RuleHandle> {

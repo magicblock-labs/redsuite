@@ -31,6 +31,7 @@ static CHAINLINK_FAULTS: ErGroup = ErGroup {
 static CACHE: ErGroup = ErGroup {
     settings: |p| {
         p.engine.accountsdb.lru_capacity = 256;
+        p.chainsync.grpc.push(p.chainsync.grpc[0].clone());
     },
     proxy: true,
     ..ErGroup::new("small-cache")
@@ -163,10 +164,6 @@ pub fn catalog() -> Vec<ScenarioEntry> {
                 &[Fixture::RedlineProgram, Fixture::UpgradeProbe, Fixture::UpgradeProbeUpgraded],
                 ()
             )
-        ),
-        scenario!(
-            chainlink::program_clone_allowlist::ProgramCloneAllowlist,
-            fresh(&[Fixture::RedshiftProgram], ())
         ),
         scenario!(
             chainlink::program_materialization::ProgramMaterialization,

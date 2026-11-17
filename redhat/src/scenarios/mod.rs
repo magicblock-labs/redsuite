@@ -6,7 +6,6 @@ use aperture::{
     SlowSubscriberSignals, TransactionAdmission, TransactionAuthority, TransactionStructure,
     UnpaidWork,
 };
-use magicblock_config::types::Remote;
 use redshift::scenarios::replication::{
     observations::CHECKPOINT_SLOTS, replication_settlement_recovery::ReplicationSettlementRecovery,
 };
@@ -17,7 +16,11 @@ use redsuite_core::{
 use std::time::Duration;
 
 static PREPARATION: ErGroup = ErGroup {
-    settings: |p| p.remotes.retain(|remote| !matches!(remote, Remote::Grpc(_))),
+    settings: |p| {
+        for stream in &mut p.chainsync.grpc {
+            stream.duplication_delay = Duration::from_secs(3600);
+        }
+    },
     proxy: true,
     ..ErGroup::new("hostile-preparation")
 };

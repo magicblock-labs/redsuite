@@ -10,8 +10,8 @@ use std::{
 use anyhow::{ensure, Context};
 use keypair::Keypair;
 use magicblock_config::{
-    config::EngineConfig,
-    types::{network::ResolvedUrl, BindAddress, Remote, SerdePubkey},
+    config::{ChainSyncConfig, EngineConfig, GrpcStreamConfig, WebSocketConfig, WebSocketProvider},
+    types::{BindAddress, SerdePubkey},
     LeaderParams, VerifierParams,
 };
 use pubkey::Pubkey;
@@ -370,11 +370,20 @@ pub(super) fn leader_params(
     settings: Settings,
 ) -> Result<LeaderParams> {
     let mut params = LeaderParams {
-        remotes: vec![
-            Remote::Http(ResolvedUrl(endpoints.rpc_url.clone())),
-            Remote::Websocket(ResolvedUrl(endpoints.ws_url.clone()), None),
-            Remote::Grpc(ResolvedUrl(with_api_key(endpoints.grpc_url.clone()))),
-        ],
+        chainsync: ChainSyncConfig {
+            http: vec![endpoints.rpc_url.clone()],
+            websocket: WebSocketConfig(vec![WebSocketProvider {
+                url: endpoints.ws_url.clone(),
+                max_connections: 4,
+                subs_per_connection: 1024,
+            }]),
+            grpc: vec![GrpcStreamConfig {
+                endpoint: endpoints.grpc_url.clone(),
+                token: Some(GRPC_API_KEY.to_owned()),
+                duplication_delay: Duration::from_secs(1),
+            }],
+            ..Default::default()
+        },
         ..LeaderParams::default()
     };
     params.aperture.listen = local(ports.rpc);
@@ -477,13 +486,6 @@ impl VerifierPlan {
 }
 
 const GRPC_API_KEY: &str = "redsuite";
-
-fn with_api_key(mut grpc_url: Url) -> Url {
-    if grpc_url.query().is_none() {
-        grpc_url.query_pairs_mut().append_pair("api-key", GRPC_API_KEY);
-    }
-    grpc_url
-}
 
 pub struct ErOptions {
     pub label: String,

@@ -6,8 +6,7 @@ use futures_util::{future::try_join_all, TryFutureExt};
 use instruction::{AccountMeta, Instruction};
 use keypair::Keypair;
 use magic_api::instruction::MagicBlockInstruction::{
-    self, CloseEphemeralAccount as Close, CreateEphemeralAccount as Create,
-    ResizeEphemeralAccount as Resize,
+    self, CloseMagicAccount as Close, CreateMagicAccount as Create, ResizeMagicAccount as Resize,
 };
 use pubkey::Pubkey;
 use rand::seq::SliceRandom;

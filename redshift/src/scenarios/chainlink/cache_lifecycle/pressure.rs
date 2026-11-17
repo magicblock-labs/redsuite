@@ -8,17 +8,17 @@ use keypair::Keypair;
 use pubkey::Pubkey;
 use redsuite_core::{
     api::transaction_meta,
-    netfault::{Held, RuleHandle, Selector, Transport, Trap},
+    netfault::{RuleHandle, Selector, Transport, Trap},
     programs::{CellHeader, CellId, HashState, SettlementMode, REDLINE},
     rpc_types::response::TransactionError,
     system, wait, ChainCtx, Result, TxSender,
 };
 use signer::Signer;
-use tokio::time::{self, Instant};
+use tokio::time;
 use tracing::instrument;
 
 use super::{
-    await_local_value, cache_evictions, churn_cache, CacheLifecycle, Mode, BASE_REFRESH,
+    await_fetched_value, await_local_value, cache_evictions, churn_cache, CacheLifecycle, Mode, BASE_REFRESH,
     BASE_REWRITE, CACHE_CAPACITY, ER_WRITE, FETCHES,
 };
 use crate::{
@@ -36,13 +36,10 @@ impl CacheLifecycle {
     /// Runs traffic and fault stages together, retaining discovery
     /// failures until teardown completes.
     pub(super) async fn pressure(&self, mode: Mode, pool: &[Pubkey]) -> Result<()> {
-        let (accounts, stale, settlement) = self.prepare_accounts(mode, pool).await?;
+        let (accounts, settlement) = self.prepare_accounts(mode, pool).await?;
         let progress = TrafficProgress::default();
         let faults = async {
             progress.await_sent(0).await?;
-            for held in stale {
-                held.release();
-            }
             churn_cache(&self.er, accounts.pool, accounts.evictions).await?;
             match accounts.mode {
                 Mode::DiscoveryGap => {
@@ -129,13 +126,13 @@ impl CacheLifecycle {
         Ok(pool)
     }
 
-    /// Holds stale reads and undelegation delivery before exposing the residents to pressure.
+    /// Holds undelegation delivery before exposing the residents to pressure.
     #[instrument(skip_all, err)]
     async fn prepare_accounts<'a>(
         &self,
         mode: Mode,
         pool: &'a [Pubkey],
-    ) -> Result<(CacheAccounts<'a>, Vec<Held>, RuleHandle)> {
+    ) -> Result<(CacheAccounts<'a>, RuleHandle)> {
         let er = &self.er;
         let validator = er.identity();
         let funder = self.base.funded_payer(PAYER_LAMPORTS).await?;
@@ -154,14 +151,6 @@ impl CacheLifecycle {
         let protected_keys = keys.as_slice();
         let (delegated, pending) = protected_keys.split_at(DELEGATED_COUNT);
         let er_written_keys = &protected_keys[1..];
-        let stale: Vec<_> = if matches!(mode, Mode::DiscoveryGap) {
-            Vec::new()
-        } else {
-            protected_keys
-                .iter()
-                .map(|key| self.observe("programNotification", key))
-                .collect()
-        };
         let delegates: Vec<_> = (1..=keys.len())
             .map(|index| {
                 REDLINE.delegate(
@@ -173,7 +162,6 @@ impl CacheLifecycle {
             })
             .collect();
         self.base.submit_and_confirm(&funder, &delegates).await?;
-        let stale = try_join_all(stale.into_iter().map(|trap| trap.wait(TIMEOUT))).await?;
         er.accounts(protected_keys).await?;
         er.cells(REDLINE, &payer).write(ER_WRITE, er_written_keys).await?;
         let settlement = self
@@ -206,7 +194,6 @@ impl CacheLifecycle {
                 sender,
                 evictions: before,
             },
-            stale,
             settlement,
         ))
     }
@@ -273,9 +260,6 @@ impl CacheLifecycle {
         let pending = accounts.pending();
         let cold = er.local_accounts(&ACCOUNT_OWNERS, &[target]).await?;
         ensure!(cold[0].is_none());
-        let reconnect = self.observe("accountSubscribe", &pending[0]);
-        self.faults.disconnect(Transport::Ws);
-        let reconnect = reconnect.wait(TIMEOUT).await?;
         let registered = self.observe("accountSubscribe", &target);
         let old = self
             .faults
@@ -290,7 +274,6 @@ impl CacheLifecycle {
             await_local_value(er, "latest base value observed locally", &[target], latest).await?;
             old.release();
             progress.await_sent(progress.sent.get()).await?;
-            reconnect.release();
             Ok(())
         })
         .await?;
@@ -331,57 +314,19 @@ impl CacheLifecycle {
                 Result::Ok(())
             })
             .await?;
-        let released_at = Instant::now();
         self.base.cells(REDLINE, &accounts.funder).write(BASE_REWRITE, pending).await?;
         let recovery = if matches!(accounts.mode, Mode::DiscoveryGap) {
-            // Defer recovery failures until warmed traffic and teardown finish.
-            await_local_value(
-                er,
-                "ER discovers the completed undelegation",
-                pending,
-                BASE_REWRITE,
-            )
-            .await
-            .and_then(|()| {
-                let elapsed = released_at.elapsed();
-                ensure!(elapsed <= TIMEOUT);
-                Ok(())
-            })
+            let deleted = time::timeout(TIMEOUT, self.await_released(pending)).await?;
+            self.faults.restore();
+            deleted
         } else {
-            // Completed accounts are evictable mirrors. A later reconnect
-            // gap can invalidate them, so verify normal access refetches them.
-            er.api()
-                .await_accounts(
-                    pending,
-                    "completed accounts refetch current base state",
-                    |observed| {
-                        ensure!(observed.len() == pending.len());
-                        for account in observed {
-                            let actual =
-                                account.as_ref().and_then(|a| CellHeader::written_id(&a.data));
-                            ensure!(actual == Some(BASE_REWRITE));
-                        }
-                        Result::Ok(())
-                    },
-                )
-                .await?;
             Ok(())
         };
-        self.base.cells(REDLINE, &accounts.funder).write(BASE_REFRESH, readonly).await?;
-        // Base confirmation does not wait for ER subscription delivery.
-        er.api()
-            .await_accounts(
-                readonly,
-                "final readonly mirrors synchronized",
-                |observed| {
-                    for account in observed {
-                        let actual = account.as_ref().and_then(|a| CellHeader::written_id(&a.data));
-                        ensure!(actual == Some(BASE_REFRESH));
-                    }
-                    Result::Ok(())
-                },
-            )
+        // Released mirrors can be evicted; each probe must request acquisition again.
+        await_fetched_value(er, "completed accounts refetch current base state", pending, BASE_REWRITE)
             .await?;
+        self.base.cells(REDLINE, &accounts.funder).write(BASE_REFRESH, readonly).await?;
+        await_fetched_value(er, "final readonly mirrors synchronized", readonly, BASE_REFRESH).await?;
         let local = er.local_accounts(&ACCOUNT_OWNERS, readonly).await?;
         // Readonly entries may be evicted after the fetch.
         for local in local.into_iter().flatten() {

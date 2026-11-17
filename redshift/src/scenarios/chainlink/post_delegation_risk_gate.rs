@@ -1,3 +1,4 @@
+use magicblock_config::config::AmlConfig;
 use std::{cell::RefCell, collections::HashMap, rc::Rc, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -147,18 +148,18 @@ pub struct PostDelegationRiskGate {
 impl PrivateErScenario for PostDelegationRiskGate {
     async fn setup(base: Rc<BaseCtx>, _: ()) -> Result<Self> {
         let server = MockRiskServer::start().await?;
+        let endpoint = server.base_url().join("risk")?;
         // No api key or threshold: both belong to the risk server now; loopback
         // http is the one plaintext scheme magicblock-aml accepts.
         let private = topology::private_er(
             &base,
             ErOptions {
                 label: "aml-gate".to_owned(),
-                settings: Box::new({
-                    let url = server.base_url().clone();
-                    move |params| {
-                        params.chainlink.risk.enabled = true;
-                        params.chainlink.risk.risk_server_url = url.to_string();
-                    }
+                settings: Box::new(move |params| {
+                    params.chainsync.aml = Some(AmlConfig {
+                        endpoint: endpoint.clone(),
+                        timeout: Duration::from_secs(5),
+                    });
                 }),
                 ..Default::default()
             },
