@@ -197,7 +197,7 @@ pub fn run_id() -> &'static str {
     RUN_ID.get_or_init(|| format!("{}-{}", utc_stamp(), std::process::id()))
 }
 
-fn campaign_dir() -> PathBuf {
+pub fn campaign_dir() -> PathBuf {
     reports_dir().join(run_id())
 }
 

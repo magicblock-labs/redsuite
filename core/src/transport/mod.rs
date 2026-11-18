@@ -6,6 +6,7 @@ pub const NETWORK_TIMEOUT: Duration = Duration::from_secs(60);
 pub mod clock;
 pub mod events;
 pub mod http;
+pub mod observations;
 pub mod rate;
 pub(crate) mod rpc;
 mod socket;
