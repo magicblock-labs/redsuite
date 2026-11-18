@@ -18,7 +18,7 @@ use std::{rc::Rc, time::Duration};
 use tracing::debug;
 use transaction::versioned::VersionedTransaction;
 
-const ADMITTED: &str = "mbv_transaction_skip_preflight_count";
+const ADMITTED: &str = "aperture_transactions_skip_preflight_total";
 const ADMISSION_WINDOW: Duration = Duration::from_secs(90);
 
 /// Checks wire decoding, sanitization, and resource bounds across Legacy, V0, and V1.

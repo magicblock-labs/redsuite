@@ -32,8 +32,11 @@ pub async fn probe_cus(er: &ErCtx, signature: &Signature, label: &str, _iters: u
 
 pub mod metrics {
     pub const ENGINE_TRANSACTIONS: &str = "engine_ledger_transactions";
-    pub const RPC_HANDLED_TRANSACTIONS: &str = "mbv_transaction_processing_time_count";
-    pub const RPC_ACCEPTED_TRANSACTIONS: &str = "mbv_transaction_skip_preflight_count";
+    pub const RPC_HANDLED_TRANSACTIONS: &str =
+        r#"aperture_rpc_request_duration_seconds_count{method="sendTransaction"}"#;
+    pub const RPC_ACCEPTED_TRANSACTIONS: &str = "aperture_transactions_skip_preflight_total";
+    pub const RPC_TRANSACTION_DURATION: &str =
+        r#"aperture_rpc_request_duration_seconds{method="sendTransaction"}"#;
     pub const FAILED_TRANSACTIONS: &str = "engine_processor_failed_transactions";
 }
 

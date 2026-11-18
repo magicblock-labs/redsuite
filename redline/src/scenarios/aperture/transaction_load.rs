@@ -362,7 +362,7 @@ impl Measurement {
                 "validator tx processing avg us",
                 Unit::Micros,
                 self.delta
-                    .histogram_avg("mbv_transaction_processing_time")
+                    .histogram_avg(metrics::RPC_TRANSACTION_DURATION)
                     .map(|seconds| seconds * 1e6),
             )
             .metric_if(

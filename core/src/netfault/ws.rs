@@ -1,7 +1,7 @@
 use super::{gate, rpc, Decision, Gate, Holding, Operation, Shared, Stage, Transport};
 use futures_util::{stream::SplitSink, SinkExt, StreamExt};
-use json::{JsonValueTrait, Value};
-use std::{collections::HashMap, result};
+use json::{JsonContainerTrait, JsonValueTrait, Value};
+use std::{collections::HashMap, result, slice};
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::mpsc,
@@ -64,28 +64,45 @@ impl WsRelay {
             other => return self.server.send(other).await.map_err(|_| ()),
         };
         let parsed: Value = json::from_str(&text).unwrap_or_default();
-        let request = rpc::request(Transport::Ws, &parsed);
-        let (decision, _hold) = gate(&self.shared, request.clone()).resolve().await;
-        match decision {
-            Decision::Discard => Err(()),
-            Decision::Reject(message) => self
-                .outbound
-                .send((
-                    Message::Text(rpc::rejection(&parsed, &message).into()),
-                    None,
-                ))
-                .map_err(|_| ()),
-            Decision::Release | Decision::Rewrite(..) => {
-                if let Some(id) = rpc::id(&parsed) {
-                    let unsubscribe = if request.method.ends_with("Unsubscribe") {
-                        parsed["params"][0].as_u64()
-                    } else {
-                        None
-                    };
-                    self.pending.insert(id, (request, unsubscribe));
+        let requests = parsed
+            .as_array()
+            .map(|batch| batch.as_slice())
+            .unwrap_or(slice::from_ref(&parsed));
+        let mut forwarded = Vec::new();
+        let mut holds = Vec::new();
+        for parsed in requests {
+            let request = rpc::request(Transport::Ws, parsed);
+            let (decision, holding) = gate(&self.shared, request.clone()).resolve().await;
+            match decision {
+                Decision::Discard => return Err(()),
+                Decision::Reject(message) => self
+                    .outbound
+                    .send((
+                        Message::Text(rpc::rejection(parsed, &message).into()),
+                        holding,
+                    ))
+                    .map_err(|_| ())?,
+                Decision::Release | Decision::Rewrite(..) => {
+                    if let Some(id) = rpc::id(parsed) {
+                        let unsubscribe = if request.method.ends_with("Unsubscribe") {
+                            parsed["params"][0].as_u64()
+                        } else {
+                            None
+                        };
+                        self.pending.insert(id, (request, unsubscribe));
+                    }
+                    forwarded.push(parsed);
+                    holds.extend(holding);
                 }
-                self.server.send(Message::Text(text)).await.map_err(|_| ())
             }
+        }
+        if forwarded.len() == requests.len() {
+            self.server.send(Message::Text(text)).await.map_err(|_| ())
+        } else if forwarded.is_empty() {
+            Ok(())
+        } else {
+            let text = json::to_string(&forwarded).map_err(|_| ())?;
+            self.server.send(Message::Text(text.into())).await.map_err(|_| ())
         }
     }
 
@@ -119,8 +136,29 @@ impl WsRelay {
         let Ok(parsed) = json::from_str::<Value>(&text) else {
             return self.outbound.send((Message::Text(text), None)).map_err(|_| ());
         };
+        if let Some(batch) = parsed.as_array() {
+            let gates: Vec<_> = batch
+                .iter()
+                .map(|parsed| {
+                    let operation = self.response_operation(parsed);
+                    gate(&self.shared, operation)
+                })
+                .collect();
+            if gates.iter().all(|gate| matches!(gate, Gate::Decided(Decision::Release))) {
+                return self.outbound.send((Message::Text(text), None)).map_err(|_| ());
+            }
+            // Faulted members are delivered independently; a hold must not stall the batch.
+            for (parsed, gate) in batch.iter().zip(gates) {
+                self.reply(parsed.to_string().into(), parsed.clone(), gate)?;
+            }
+            return Ok(());
+        }
         let operation = self.response_operation(&parsed);
-        match gate(&self.shared, operation) {
+        self.reply(text, parsed, gate(&self.shared, operation))
+    }
+
+    fn reply(&mut self, text: Utf8Bytes, parsed: Value, gate: Gate) -> result::Result<(), ()> {
+        match gate {
             Gate::Decided(decision) => deliver(&self.outbound, decision, text, &parsed, None),
             pending => {
                 let outbound = self.outbound.clone();
