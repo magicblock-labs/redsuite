@@ -1,5 +1,10 @@
 use clap::ValueEnum;
-use std::{path::PathBuf, rc::Rc, time::Duration};
+use std::{
+    path::PathBuf,
+    rc::Rc,
+    sync::{Arc, OnceLock},
+    time::{Duration, Instant},
+};
 use url::Url;
 
 /// An existing devnet-backed environment whose processes are not owned by RedSuite.
@@ -57,6 +62,7 @@ pub struct ExecutionConfig {
     pub seed: u64,
     pub duration: Option<Duration>,
     pub stop: Option<tokio::sync::watch::Receiver<bool>>,
+    pub stop_requested_at: Option<Arc<OnceLock<Instant>>>,
     pub environment: Option<Rc<Environment>>,
     pub continuous: bool,
 }

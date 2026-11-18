@@ -2,7 +2,13 @@ mod args;
 mod catalog;
 mod suite;
 
-use std::{num::NonZeroUsize, process::ExitCode, rc::Rc};
+use std::{
+    num::NonZeroUsize,
+    process::ExitCode,
+    rc::Rc,
+    sync::{Arc, OnceLock},
+    time::Instant,
+};
 
 use anyhow::Context;
 use args::{Benchmarks, Checks, Cli, Command};
@@ -60,15 +66,18 @@ fn run_seed(seed: Option<u64>) -> u64 {
 }
 
 async fn interruptible(
-    run: impl AsyncFnOnce(watch::Receiver<bool>) -> Result<()>,
+    run: impl AsyncFnOnce(watch::Receiver<bool>, Arc<OnceLock<Instant>>) -> Result<()>,
 ) -> Result<ExitCode> {
     let (stop, receiver) = watch::channel(false);
+    let stop_requested_at = Arc::new(OnceLock::new());
+    let interrupted_at = stop_requested_at.clone();
     let interrupt = tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
+            interrupted_at.get_or_init(Instant::now);
             stop.send_replace(true);
         }
     });
-    let outcome = run(receiver.clone()).await;
+    let outcome = run(receiver.clone(), stop_requested_at).await;
     interrupt.abort();
     if *receiver.borrow() {
         if let Err(error) = outcome {
@@ -129,10 +138,11 @@ async fn dispatch(command: Command) -> Result<ExitCode> {
                 } else {
                     None
                 };
-                return interruptible(async move |stop| {
+                return interruptible(async move |stop, stop_requested_at| {
                     let config = ExecutionConfig {
                         duration: Some(args.duration),
                         stop: Some(stop),
+                        stop_requested_at: Some(stop_requested_at),
                         environment,
                         profile: args.profile,
                         loop_mode: args.loop_mode,
@@ -154,11 +164,12 @@ async fn dispatch(command: Command) -> Result<ExitCode> {
         },
         Command::Continuous(args) => {
             let seed = run_seed(args.seed);
-            return interruptible(async move |stop| {
+            return interruptible(async move |stop, stop_requested_at| {
                 let config = ExecutionConfig {
                     seed,
                     duration: Some(args.duration),
                     stop: Some(stop),
+                    stop_requested_at: Some(stop_requested_at),
                     profile: args.profile,
                     continuous: true,
                     ..ExecutionConfig::default()

@@ -279,8 +279,7 @@ impl EventSubscriptions {
             topic,
             payload: PhantomData,
         };
-        self.connection.subscribe(topic, params, (key, topic)).await?;
-        self.connection.await_ack((key, topic)).await?;
+        self.connection.subscribe_and_wait(topic, params, (key, topic)).await?;
         Ok(subscription)
     }
 

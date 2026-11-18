@@ -17,7 +17,8 @@ use solana_instruction_error::InstructionError;
 use solana_rpc_client_types::{
     config::{
         RpcBlockConfig, RpcProgramAccountsConfig, RpcSendTransactionConfig,
-        RpcSignaturesForAddressConfig, RpcSimulateTransactionConfig, RpcTransactionConfig,
+        RpcSignatureStatusConfig, RpcSignaturesForAddressConfig, RpcSimulateTransactionConfig,
+        RpcTransactionConfig,
     },
     request::RpcRequest,
     response::{
@@ -333,8 +334,31 @@ impl Api {
         &self,
         signatures: &[Signature],
     ) -> Result<Vec<Option<TransactionStatus>>> {
+        self.signature_statuses(signatures, None).await
+    }
+
+    pub async fn get_signature_statuses_with_history(
+        &self,
+        signatures: &[Signature],
+    ) -> Result<Vec<Option<TransactionStatus>>> {
+        self.signature_statuses(
+            signatures,
+            Some(RpcSignatureStatusConfig { search_transaction_history: true }),
+        )
+        .await
+    }
+
+    async fn signature_statuses(
+        &self,
+        signatures: &[Signature],
+        config: Option<RpcSignatureStatusConfig>,
+    ) -> Result<Vec<Option<TransactionStatus>>> {
         let signatures: Vec<_> = signatures.iter().map(ToString::to_string).collect();
-        self.call_value(RpcRequest::GetSignatureStatuses, &(signatures,)).await
+        let method = RpcRequest::GetSignatureStatuses;
+        match config {
+            Some(config) => self.call_value(method, &(signatures, config)).await,
+            None => self.call_value(method, &(signatures,)).await,
+        }
     }
 
     /// Reads receipts without JSON's per-instruction base58 encoding, which is

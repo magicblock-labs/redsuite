@@ -9,7 +9,6 @@ use anyhow::Context;
 use json::LazyValue;
 use pubkey::Pubkey;
 use signature::Signature;
-use solana_rpc_client_types::response::{Response, RpcSignatureResult};
 use tokio::{sync::oneshot, time};
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use url::Url;
@@ -224,11 +223,7 @@ impl SubscriptionState for SignatureState {
 
 impl SignatureState {
     fn observe(&mut self, id: u64, payload: &LazyValue<'_>, clock: &SendClock) -> ControlFlow<()> {
-        let Ok(Response {
-            value: RpcSignatureResult::ProcessedSignature(result),
-            ..
-        }) = json::from_str::<Response<RpcSignatureResult>>(payload.as_raw_str())
-        else {
+        let Some(result) = subscription::processed_signature(payload) else {
             return Continue(());
         };
         if !self.pending.remove(&id) {
@@ -273,13 +268,12 @@ impl SignatureConfirmations {
         self.connection.check_error()?;
         self.connection.state_mut().pending.insert(id);
         self.connection
-            .subscribe(
+            .subscribe_and_wait(
                 Topic::Signature,
                 &subscription::signature_params(signature),
                 id,
             )
-            .await?;
-        self.connection.await_ack(id).await
+            .await
     }
 
     pub async fn await_id(&self, id: u64) -> Result<()> {

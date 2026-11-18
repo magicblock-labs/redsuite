@@ -3,11 +3,28 @@ pub mod harness;
 pub mod scheduler;
 use aperture::transaction_load::{Shape, TransactionLoad};
 use redsuite_core::{
-    catalog::{Fixture, ScenarioEntry, DEFAULT},
+    catalog::{ErGroup, Fixture, ScenarioEntry, DEFAULT},
     scenario, Scenario,
 };
+
+static FIXED_POOL: ErGroup = ErGroup {
+    label: "fixed_pool",
+    settings: |params| {
+        params.engine.blockstore.blocktime = std::time::Duration::from_millis(50);
+        params.engine.blockstore.superblock = 24_000;
+        params.engine.ledger.size_limit = 50_000_000_000;
+    },
+    proxy: false,
+    followers: 0,
+};
+
 pub fn catalog() -> Vec<ScenarioEntry> {
     vec![
+        scenario!(
+            aperture::fixed_pool::FixedPool,
+            exclusive(&FIXED_POOL, &[Fixture::RedlineProgram], ())
+        )
+        .explicit_only(),
         scenario!(
             TransactionLoad,
             shared(&DEFAULT, &[Fixture::RedlineProgram], Shape::Write)

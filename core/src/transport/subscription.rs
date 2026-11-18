@@ -20,7 +20,7 @@ use solana_rpc_client_types::{
         RpcTransactionLogsConfig, RpcTransactionLogsFilter,
     },
     request::RpcRequest,
-    response::Response,
+    response::{ProcessedSignatureResult, Response, RpcSignatureResult},
 };
 use tokio::{
     sync::{Mutex, Notify},
@@ -221,6 +221,19 @@ impl<S: SubscriptionState + 'static> Connection<S> {
         Ok(())
     }
 
+    pub(super) async fn subscribe_and_wait(
+        &self,
+        topic: Topic,
+        params: &impl Serialize,
+        key: S::Key,
+    ) -> Result<()>
+    where
+        S::Key: PartialEq,
+    {
+        self.subscribe(topic, params, key).await?;
+        self.await_ack(key).await
+    }
+
     pub(super) fn state(&self) -> Ref<'_, S> {
         Ref::map(self.router.borrow(), |router| &router.state)
     }
@@ -282,7 +295,7 @@ impl<S: SubscriptionState + 'static> Connection<S> {
         )
     }
 
-    pub(super) async fn await_ack(&self, key: S::Key) -> Result<()>
+    async fn await_ack(&self, key: S::Key) -> Result<()>
     where
         S::Key: PartialEq,
     {
@@ -336,6 +349,14 @@ impl<S: SubscriptionState + 'static> Connection<S> {
 impl<S: SubscriptionState> Drop for Connection<S> {
     fn drop(&mut self) {
         self.reader.abort();
+    }
+}
+
+pub(super) fn processed_signature(payload: &LazyValue<'_>) -> Option<ProcessedSignatureResult> {
+    let response: Response<RpcSignatureResult> = json::from_str(payload.as_raw_str()).ok()?;
+    match response.value {
+        RpcSignatureResult::ProcessedSignature(result) => Some(result),
+        RpcSignatureResult::ReceivedSignature(_) => None,
     }
 }
 
