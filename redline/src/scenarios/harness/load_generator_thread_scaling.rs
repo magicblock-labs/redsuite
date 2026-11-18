@@ -14,11 +14,9 @@ use redsuite_core::{
 };
 use tracing::instrument;
 
-use crate::ACCOUNT_SPACE;
+use crate::{metrics, ACCOUNT_SPACE};
 
 const PREP_PAYER_LAMPORTS: u64 = 4_000_000_000;
-
-const TX_PROCESSING_HISTOGRAM: &str = "mbv_transaction_processing_time";
 
 /// Fixed workload offered to both driver-thread configurations so only the client boundary varies.
 struct Profile {
@@ -202,7 +200,7 @@ impl LoadGeneratorThreadScaling {
         let cell = CellOutcome {
             outcome,
             tx_processing_avg_us: delta
-                .histogram_avg(TX_PROCESSING_HISTOGRAM)
+                .histogram_avg(metrics::RPC_TRANSACTION_DURATION)
                 .map(|seconds| seconds * 1e6),
         };
         cell.outcome.check_failures();
