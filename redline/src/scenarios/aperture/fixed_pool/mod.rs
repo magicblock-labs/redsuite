@@ -5,12 +5,11 @@ use std::{
     collections::BTreeMap,
     fs::{self, File},
     io::{BufWriter, Write},
-    path::Path,
     rc::Rc,
     time::{Duration, Instant},
 };
 
-use anyhow::{ensure, Context};
+use anyhow::{anyhow, ensure, Context};
 use redsuite_core::{
     config::{LoopMode, ProfileValues},
     prep,
@@ -31,6 +30,7 @@ const WRITABLE: usize = 16;
 const SEED: u64 = 20_261_112;
 const ACCOUNT_SPACE: u32 = 128;
 const PAYER_LAMPORTS: u64 = 4_000_000_000;
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Copy)]
 pub(super) struct Profile {
@@ -100,7 +100,20 @@ impl Scenario<(ScenarioReport, Result<()>)> for FixedPool {
 
     async fn run(self) -> Result<(ScenarioReport, Result<()>)> {
         let profile = self.config.profile;
+        let directory = report::campaign_dir();
+        fs::create_dir_all(&directory)?;
+        let api_path = directory.join("fixed_pool-api.jsonl");
+        let validator_path = directory.join("fixed_pool-validator.jsonl");
+        let api = BufWriter::new(
+            File::create(&api_path).with_context(|| format!("creating {}", api_path.display()))?,
+        );
+        let mut validator = BufWriter::new(
+            File::create(&validator_path)
+                .with_context(|| format!("creating {}", validator_path.display()))?,
+        );
+
         let (ready, mut workers_ready) = mpsc::channel(profile.workers);
+        let (stop, worker_stop) = watch::channel(false);
         let (start, clock) = watch::channel(None);
         let workers = spawn_workers(profile.workers, move |worker| {
             worker::run(
@@ -108,40 +121,54 @@ impl Scenario<(ScenarioReport, Result<()>)> for FixedPool {
                 self.config.clone(),
                 ready.clone(),
                 clock.clone(),
+                worker_stop.clone(),
             )
         });
-        for _ in 0..profile.workers {
-            if workers_ready.recv().await.is_none() {
-                drop(start);
-                workers.join().await?;
-                anyhow::bail!("benchmark workers failed to initialize");
+        let mut requested_stop = self.run.stop.clone();
+        let startup = time::timeout(STARTUP_TIMEOUT, async {
+            for _ in 0..profile.workers {
+                ensure!(
+                    workers_ready.recv().await == Some(true),
+                    "benchmark workers failed to initialize"
+                );
             }
+            Ok(())
+        });
+        let readiness = tokio::select! {
+            biased;
+            _ = requested_stop.wait_for(|stop| *stop) => Err(anyhow!("benchmark startup cancelled")),
+            result = startup => result.context("benchmark worker startup timed out").and_then(|result| result),
+        };
+        if let Err(error) = readiness {
+            drop(start);
+            workers.join().await?;
+            return Err(error);
         }
+        drop(workers_ready);
+
         let clock = Clock::new(profile.warmup, self.run.duration);
         start.send_replace(Some(clock));
-        let directory = report::campaign_dir();
-        fs::create_dir_all(&directory)?;
-        let api_path = directory.join("fixed_pool-api.jsonl");
-        let validator_path = directory.join("fixed_pool-validator.jsonl");
-        let mut validator = BufWriter::new(File::create(&validator_path)?);
-        let mut joined = std::pin::pin!(workers.join());
-        let mut samples = time::interval(Duration::from_secs(1));
-        samples.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        let mut metrics_enabled = true;
-        let mut stop = self.run.stop.clone();
-        let mut interrupted_at = None;
-        let outcomes = loop {
-            tokio::select! {
-                result = &mut joined => break result?,
-                _ = stop.wait_for(|stop| *stop), if interrupted_at.is_none() => {
-                    interrupted_at = Some(Instant::now());
-                }
-                _ = samples.tick(), if metrics_enabled => {
-                    let now = Instant::now();
-                    let row = scrape(&self.er, clock, now).await;
-                    if let Err(error) = write_line(&mut validator, &row) {
-                        tracing::warn!(%error, "could not persist benchmark validator sample");
-                        metrics_enabled = false;
+        let mut first_measured_sample = None;
+        let mut observed_stop_at = None;
+        let outcomes = {
+            let mut joined = std::pin::pin!(workers.join());
+            let mut collecting = std::pin::pin!(collect_validator(
+                &self.er,
+                clock,
+                &mut validator,
+                &mut first_measured_sample,
+            ));
+            loop {
+                tokio::select! {
+                    result = &mut joined => break result?,
+                    _ = requested_stop.wait_for(|stop| *stop), if observed_stop_at.is_none() => {
+                        observed_stop_at = Some(Instant::now());
+                        stop.send_replace(true);
+                    }
+                    error = &mut collecting => {
+                        stop.send_replace(true);
+                        joined.await?;
+                        return Err(error);
                     }
                 }
             }
@@ -150,7 +177,7 @@ impl Scenario<(ScenarioReport, Result<()>)> for FixedPool {
 
         let mut by_second = Vec::<Sample>::new();
         let mut worker_failures = Vec::new();
-        for outcome in outcomes {
+        for outcome in outcomes.into_iter().flatten() {
             if let Err(error) = outcome.result {
                 worker_failures.push(format!("{error:#}"));
             }
@@ -161,28 +188,48 @@ impl Scenario<(ScenarioReport, Result<()>)> for FixedPool {
                 total.merge(sample);
             }
         }
-        let measured_seconds = interrupted_at
-            .unwrap_or_else(Instant::now)
-            .min(clock.end)
-            .saturating_duration_since(clock.begin)
-            .as_secs_f64();
-        let total = write_api_samples(&api_path, clock, measured_seconds, by_second)?;
+        let interrupted = *self.run.stop.borrow();
+        let cutoff = self
+            .base
+            .config()
+            .stop_requested_at
+            .as_ref()
+            .and_then(|stop| stop.get().copied())
+            .or(observed_stop_at)
+            .or_else(|| interrupted.then(Instant::now))
+            .unwrap_or(clock.end)
+            .min(clock.end);
+        let measured_seconds = cutoff.saturating_duration_since(clock.begin).as_secs_f64();
+        let total = write_api_samples(api, clock, measured_seconds, by_second)?;
 
-        let result = check_accounting(
-            &total,
-            &worker_failures,
-            metrics_enabled,
-            *self.run.stop.borrow(),
-        );
+        let metrics_captured = first_measured_sample.is_some_and(|at| at < cutoff);
+        let accounting = check_accounting(&total, &worker_failures, interrupted);
+        let completion = if accounting.is_ok() && !interrupted && !metrics_captured {
+            "incomplete"
+        } else {
+            self.run.completion(&accounting)
+        };
+        let result = accounting.and_then(|()| {
+            ensure!(
+                interrupted || metrics_captured,
+                "benchmark captured no validator metrics during measurement"
+            );
+            Ok(())
+        });
         let mut report = ScenarioReport::ok()
             .setting("profile", self.base.config().profile.name())
-            .setting("completion", self.run.completion(&result))
+            .setting("completion", completion)
             .setting("seed", SEED)
             .setting("workers", profile.workers)
             .setting("payers", profile.payers)
             .setting("accounts", profile.accounts)
             .setting("writable accounts per transaction", WRITABLE)
             .setting("request mix", "80% writes / 20% getAccountInfo")
+            .setting(
+                "write submission policy",
+                "require signature subscription ACK and open socket",
+            )
+            .setting("validator metrics captured", metrics_captured)
             .setting(
                 "WebSockets per worker per subscription type",
                 profile.sockets,
@@ -218,12 +265,11 @@ impl Scenario<(ScenarioReport, Result<()>)> for FixedPool {
 }
 
 fn write_api_samples(
-    path: &Path,
+    mut api: BufWriter<File>,
     clock: Clock,
     measured_seconds: f64,
     mut samples: Vec<Sample>,
 ) -> Result<Sample> {
-    let mut api = BufWriter::new(File::create(path)?);
     let windows = (measured_seconds.ceil() as usize).max(samples.len()).max(1);
     samples.resize_with(windows, Sample::default);
     let mut total = Sample::default();
@@ -252,18 +298,12 @@ fn write_api_samples(
     Ok(total)
 }
 
-fn check_accounting(
-    total: &Sample,
-    worker_failures: &[String],
-    metrics_saved: bool,
-    interrupted: bool,
-) -> Result<()> {
+fn check_accounting(total: &Sample, worker_failures: &[String], interrupted: bool) -> Result<()> {
     ensure!(
         worker_failures.is_empty(),
         "benchmark workers failed: {}",
         worker_failures.join("; ")
     );
-    ensure!(metrics_saved, "benchmark validator samples were not saved");
     let count = |counter| total.count(counter);
     let submitted = count(Count::Submitted);
     ensure!(
@@ -292,19 +332,48 @@ fn check_accounting(
     Ok(())
 }
 
-async fn scrape(er: &ErCtx, clock: Clock, now: Instant) -> json::Value {
-    let elapsed = if now < clock.begin {
-        -clock.begin.duration_since(now).as_secs_f64()
-    } else {
-        now.duration_since(clock.begin).as_secs_f64()
-    };
-    let metrics = time::timeout(Duration::from_millis(500), er.scrape_metrics()).await;
-    let values: Option<BTreeMap<_, _>> = metrics.ok().and_then(Result::ok).map(|metrics| {
-        metrics
-            .0
-            .into_iter()
-            .filter(|(name, _)| {
-                name.starts_with("engine_keeper_subscription_slow_consumer_disconnects")
+async fn collect_validator(
+    er: &ErCtx,
+    clock: Clock,
+    out: &mut BufWriter<File>,
+    first_measured_sample: &mut Option<Instant>,
+) -> anyhow::Error {
+    let mut samples = time::interval(Duration::from_secs(1));
+    samples.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        samples.tick().await;
+        let now = Instant::now();
+        let values = scrape(er).await;
+        if values.is_some() && clock.measured(now) {
+            first_measured_sample.get_or_insert(now);
+        }
+        let elapsed = if now < clock.begin {
+            -clock.begin.duration_since(now).as_secs_f64()
+        } else {
+            now.duration_since(clock.begin).as_secs_f64()
+        };
+        let row = json::json!({
+            "elapsed_seconds": elapsed,
+            "unix_seconds": clock.unix + elapsed,
+            "values": values,
+        });
+        if let Err(error) = write_line(out, &row) {
+            return error.context("saving benchmark validator samples");
+        }
+    }
+}
+
+async fn scrape(er: &ErCtx) -> Option<BTreeMap<String, f64>> {
+    let metrics = time::timeout(Duration::from_millis(500), er.scrape_metrics())
+        .await
+        .ok()?
+        .ok()?;
+    let values: BTreeMap<_, _> = metrics
+        .0
+        .into_iter()
+        .filter(|(name, value)| {
+            value.is_finite()
+                && (name.starts_with("engine_keeper_subscription_slow_consumer_disconnects")
                     || name.starts_with("engine_ledger_operation_duration_micros_count")
                     || name.starts_with("engine_ledger_operation_duration_micros_sum")
                     || name.starts_with("engine_keeper_operation_duration_micros_count")
@@ -316,11 +385,10 @@ async fn scrape(er: &ErCtx, clock: Clock, now: Instant) -> json::Value {
                             | "engine_ledger_blocks"
                             | "engine_ledger_superblocks"
                             | "engine_ledger_pending_transactions"
-                    )
-            })
-            .collect()
-    });
-    json::json!({ "elapsed_seconds": elapsed, "unix_seconds": clock.unix + elapsed, "values": values })
+                    ))
+        })
+        .collect();
+    (!values.is_empty()).then_some(values)
 }
 
 fn write_line(out: &mut impl Write, value: &json::Value) -> Result<()> {

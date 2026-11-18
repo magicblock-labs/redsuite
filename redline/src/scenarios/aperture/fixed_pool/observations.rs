@@ -51,6 +51,7 @@ pub(super) enum Count {
     AccountExpired,
     AccountDuplicate,
     AckError,
+    WriteSkipped,
     Disconnect,
     GoingAway,
     TransportDisconnected,
@@ -76,6 +77,7 @@ const COUNTERS: [&str; Count::Length as usize] = [
     "account update timeouts",
     "duplicate account updates",
     "signature ACK errors",
+    "writes skipped by signature gate",
     "WebSocket disconnects",
     "WebSocket Going Away closes",
     "WebSocket transport errors",
@@ -331,8 +333,7 @@ impl Tracker {
         self.pending
             .iter()
             .filter_map(|(&id, tx)| {
-                (tx.http_done.is_some() && tx.status_pending && !tx.status_expired(now))
-                    .then_some((id, tx.signature))
+                (tx.status_pending && !tx.status_expired(now)).then_some((id, tx.signature))
             })
             .collect()
     }

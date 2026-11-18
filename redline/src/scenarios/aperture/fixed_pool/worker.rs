@@ -6,7 +6,10 @@ use std::{
 };
 
 use anyhow::{anyhow, Context};
-use futures_util::{future::try_join_all, stream, StreamExt};
+use futures_util::{
+    future::{self, try_join_all},
+    stream, StreamExt, TryStreamExt,
+};
 use pubkey::Pubkey;
 use redsuite_core::{
     prep,
@@ -55,9 +58,10 @@ pub(super) struct Outcome {
 pub(super) async fn run(
     index: usize,
     config: Config,
-    ready: mpsc::Sender<()>,
+    ready: mpsc::Sender<bool>,
     mut start: watch::Receiver<Option<Clock>>,
-) -> Result<Outcome> {
+    worker_stop: watch::Receiver<bool>,
+) -> Result<Option<Outcome>> {
     let profile = config.profile;
     let pool_size = profile.accounts / profile.workers;
     let accounts: Rc<[Pubkey]> = config.accounts[index * pool_size..(index + 1) * pool_size].into();
@@ -81,10 +85,21 @@ pub(super) async fn run(
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
-    let (accounts_ws, signature_ws) = tokio::try_join!(
-        try_join_all(routes.iter().map(|accounts| account_socket(&config.ws, accounts, &tracker))),
-        try_join_all((0..profile.sockets).map(|_| connect(&config.ws, &tracker))),
-    )?;
+    let initialize = async {
+        tokio::try_join!(
+            try_join_all(
+                routes.iter().map(|accounts| account_socket(&config.ws, accounts, &tracker))
+            ),
+            try_join_all((0..profile.sockets).map(|_| connect(&config.ws, &tracker))),
+        )
+    };
+    let initialized = tokio::select! {
+        _ = start.changed() => return Ok(None),
+        result = initialize => result.with_context(|| format!("initializing benchmark worker {index}")),
+    };
+    let _ = ready.send(initialized.is_ok()).await;
+    drop(ready);
+    let (accounts_ws, signature_ws) = initialized?;
     let mut tasks = JoinSet::new();
     for (socket, route) in accounts_ws.into_iter().zip(routes) {
         tasks.spawn_local(restore_accounts(
@@ -115,24 +130,21 @@ pub(super) async fn run(
         tracker.clone(),
     ));
     tasks.spawn_local(expire(tracker.clone(), signatures.clone()));
-    ready.send(()).await.context("benchmark coordinator went away")?;
-    drop(ready);
-    let clock = start
-        .wait_for(Option::is_some)
-        .await
-        .context("benchmark start cancelled")?
-        .expect("the coordinator published a measurement clock");
+    let Ok(clock) = start.wait_for(Option::is_some).await else {
+        return Ok(None);
+    };
+    let clock = clock.expect("the coordinator published a measurement clock");
     tracker.borrow_mut().data.clock = Some(clock);
 
     let request_slots = Arc::new(Semaphore::new(profile.http_concurrency));
     let mut rng = random::rng(SEED, &["benchmark"], index as u64);
     let mut indices: Vec<_> = (0..pool_size).collect();
-    let stop = config.stop.clone();
+    let stop = worker_stop.clone();
     let requests = execute_for_raw(
         Pacing::PerSecond(profile.rate_per_worker),
         profile.concurrency,
         clock.end,
-        config.stop,
+        worker_stop,
         |id| {
             let account = accounts[rng.gen_range(0..pool_size)];
             let targets = rng.gen_ratio(4, 5).then(|| {
@@ -152,6 +164,7 @@ pub(super) async fn run(
             let api = api.clone();
             let request_slots = request_slots.clone();
             let stop = stop.clone();
+            let requested_stop = config.stop.clone();
             async move {
                 let transaction = if let Some((targets, mask)) = targets {
                     let transaction =
@@ -168,11 +181,9 @@ pub(super) async fn run(
                     request_slots.acquire_owned().await.context("benchmark HTTP pool closed")?;
                 Ok(SendTransaction(move |sent: Instant| async move {
                     let _permit = permit;
-                    if sent >= clock.end || *stop.borrow() {
+                    if sent >= clock.end || *stop.borrow() || *requested_stop.borrow() {
                         if let Some((_, _, connection, _)) = transaction {
-                            let _ =
-                                time::timeout(RPC_TIMEOUT, connection.unsubscribe_signature(id))
-                                    .await;
+                            unsubscribe_signature(connection, id).await;
                         }
                         return Ok(());
                     }
@@ -181,7 +192,7 @@ pub(super) async fn run(
                             Rc::ptr_eq(current, &connection) && connection.is_open()
                         });
                         if !current {
-                            tracker.borrow_mut().data.count(Count::AckError, sent, sent, 1);
+                            tracker.borrow_mut().data.count(Count::WriteSkipped, sent, sent, 1);
                             return Err(anyhow!("signature connection closed before submission"));
                         }
                         tracker.borrow_mut().submitted(id, signature, sent, mask);
@@ -222,7 +233,7 @@ pub(super) async fn run(
     tasks.shutdown().await;
     let result = requests.and_then(|_| drain.context("benchmark observations did not drain"));
     let samples = std::mem::take(&mut tracker.borrow_mut().data.samples);
-    Ok(Outcome { result, samples })
+    Ok(Some(Outcome { result, samples }))
 }
 
 async fn subscribe_signature(
@@ -234,16 +245,16 @@ async fn subscribe_signature(
     let started = Instant::now();
     let connection = slot.borrow().clone();
     let Some(connection) = connection else {
-        tracker.borrow_mut().data.count(Count::AckError, started, started, 1);
+        tracker.borrow_mut().data.count(Count::WriteSkipped, started, started, 1);
         return Err(anyhow!("signature connection is reconnecting"));
     };
     let ack = time::timeout(RPC_TIMEOUT, connection.signature(id, signature)).await;
     let now = Instant::now();
     if !matches!(ack, Ok(Ok(()))) {
-        tracker.borrow_mut().data.count(Count::AckError, started, now, 1);
-        tokio::task::spawn_local(async move {
-            let _ = connection.unsubscribe_signature(id).await;
-        });
+        let data = &mut tracker.borrow_mut().data;
+        data.count(Count::AckError, started, now, 1);
+        data.count(Count::WriteSkipped, started, now, 1);
+        tokio::task::spawn_local(unsubscribe_signature(connection, id));
         return Err(anyhow!("signature subscription ACK failed: {ack:?}"));
     }
     tracker.borrow_mut().data.record(started, now, None, Some(Latency::Ack));
@@ -299,19 +310,26 @@ async fn restore_signatures(
     tracker: SharedTracker,
 ) {
     let mut socket = slot.borrow().clone().expect("initial signature socket");
+    let mut cleanup = JoinSet::new();
     loop {
         let reason = socket.closed().await;
         slot.borrow_mut().take();
         disconnected(&tracker, reason);
-        socket = reconnect(async || signature_socket(&ws, index, sockets, &tracker).await).await;
+        let (replacement, restored) =
+            reconnect(async || signature_socket(&ws, index, sockets, &tracker).await).await;
+        socket = replacement;
+        while cleanup.try_join_next().is_some() {}
+        for id in restored {
+            if !tracker.borrow().signature_pending(id) {
+                cleanup.spawn_local(unsubscribe_signature(socket.clone(), id));
+            }
+        }
         slot.borrow_mut().replace(socket.clone());
         event(&tracker, Count::Reconnect);
     }
 }
 
-async fn reconnect(
-    mut connect: impl AsyncFnMut() -> Result<Rc<ObservationSocket>>,
-) -> Rc<ObservationSocket> {
+async fn reconnect<T>(mut connect: impl AsyncFnMut() -> Result<T>) -> T {
     loop {
         if let Ok(socket) = connect().await {
             return socket;
@@ -325,27 +343,25 @@ async fn signature_socket(
     index: usize,
     sockets: usize,
     tracker: &SharedTracker,
-) -> Result<Rc<ObservationSocket>> {
+) -> Result<(Rc<ObservationSocket>, Vec<u64>)> {
     let socket = connect(ws, tracker).await?;
     let pending = tracker.borrow().restore(index, sockets);
     let connection = &socket;
     let restored = stream::iter(pending)
         .map(|(id, signature)| async move {
-            if tracker.borrow().signature_pending(id) {
-                time::timeout(RPC_TIMEOUT, connection.signature(id, &signature))
-                    .await
-                    .context("signature restore ACK timed out")??;
+            if !tracker.borrow().signature_pending(id) {
+                return Ok(None);
             }
-            Ok::<_, anyhow::Error>(())
+            time::timeout(RPC_TIMEOUT, connection.signature(id, &signature))
+                .await
+                .context("signature restore ACK timed out")??;
+            Ok::<_, anyhow::Error>(Some(id))
         })
         .buffer_unordered(128)
-        .fold(
-            Ok(()),
-            |restored, result| async move { restored.and(result) },
-        )
-        .await;
-    restored?;
-    Ok(socket)
+        .try_filter_map(future::ok)
+        .try_collect()
+        .await?;
+    Ok((socket, restored))
 }
 
 fn disconnected(tracker: &SharedTracker, reason: ObservationClose) {
@@ -411,10 +427,12 @@ async fn expire(tracker: SharedTracker, slots: Rc<Vec<SocketSlot>>) {
         for id in tracker.borrow_mut().reap(Instant::now()) {
             let socket = slots[id as usize % slots.len()].borrow().clone();
             if let Some(socket) = socket {
-                cleanup.spawn_local(async move {
-                    let _ = time::timeout(RPC_TIMEOUT, socket.unsubscribe_signature(id)).await;
-                });
+                cleanup.spawn_local(unsubscribe_signature(socket, id));
             }
         }
     }
+}
+
+async fn unsubscribe_signature(socket: Rc<ObservationSocket>, id: u64) {
+    let _ = time::timeout(RPC_TIMEOUT, socket.unsubscribe_signature(id)).await;
 }
