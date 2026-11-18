@@ -1,4 +1,4 @@
-use std::{rc::Rc, slice, time::Duration};
+use std::{rc::Rc, time::Duration};
 
 use anyhow::{ensure, Context};
 use keypair::Keypair;
@@ -117,12 +117,17 @@ impl UndelegationRecovery {
     }
 
     async fn await_er_value(&self, account: &Pubkey, id: u64, what: &str) -> Result<()> {
+        // Recovery may delete the released image; notifications alone cannot reacquire it.
         self.er
             .api()
-            .await_accounts(slice::from_ref(account), what, |accounts| {
-                let account = accounts[0].as_ref().context("ER cell absent")?;
-                ensure!(CellHeader::try_decode(&account.data)?.value == id);
-                Ok(())
+            .await_query(what, async || {
+                let value = self
+                    .er
+                    .account(account)
+                    .await?
+                    .map(|account| CellHeader::try_decode(&account.data).map(|header| header.value))
+                    .transpose()?;
+                Ok(wait::when(value == Some(id), value))
             })
             .await
             .with_context(|| format!("written id {id}"))?;
