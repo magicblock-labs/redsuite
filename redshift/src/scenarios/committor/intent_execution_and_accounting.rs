@@ -246,7 +246,7 @@ impl<'a> IntentFixture<'a> {
     /// Exhausts a sponsored session, requires rollback at its limit, then
     /// proves undelegation remains usable.
     #[instrument(skip_all, err)]
-    async fn check_sponsored_quota(&self) -> Result<()> {
+    async fn check_sponsored_quota(&mut self) -> Result<()> {
         use Mode::{Commit, Undelegate};
         let actor = &self.actors[0];
         let key = actor.payer.pubkey();
@@ -292,6 +292,7 @@ impl<'a> IntentFixture<'a> {
         ensure!(account.owner == redshift_interface::ID);
         ensure!(account.data == before.context("ER cell missing")?.data);
         self.redelegate(payer, "after sponsored quota").await?;
+        self.actors[0].expected = CellHeader::try_decode(&account.data)?;
         Ok(())
     }
 
@@ -430,11 +431,12 @@ impl<'a> IntentFixture<'a> {
     /// by subsequent accounting stages.
     async fn redelegate(&self, payer: &Keypair, phase: &str) -> Result<()> {
         self.base
-            .submit_and_confirm(
-                payer,
+            .submit_and_confirm_with(
+                &self.funder,
+                &[payer],
                 &[
                     REDSHIFT.delegate(
-                        payer.pubkey(),
+                        self.funder.pubkey(),
                         CellId::new(payer.pubkey(), 0),
                         Some(self.er.identity()),
                         prep::COMMIT_FREQUENCY_MS,
@@ -458,10 +460,12 @@ impl Scenario for IntentExecutionAndAccounting {
     async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
         Ok(Self { base, er })
     }
-    /// Checks mixed bundles before session limits, paid fees,
-    /// and successful/failed callback outcomes.
+    /// Checks sponsored limits before delegating the payer for mixed bundles,
+    /// paid fees, and successful/failed callback outcomes.
     async fn run(self) -> Result<()> {
         let mut suite = IntentFixture::prepare(&self.base, &self.er).await?;
+        suite.check_sponsored_quota().await?;
+        suite.delegate_payer(&suite.actors[0].payer).await?;
         use Mode::{Commit, Finalize, Undelegate};
         for (label, modes, additions, actions) in [
             (
@@ -493,8 +497,6 @@ impl Scenario for IntentExecutionAndAccounting {
             suite.check_bundle(label, modes, additions, actions).await?;
         }
 
-        suite.check_sponsored_quota().await?;
-        suite.delegate_payer(&suite.actors[0].payer).await?;
         self.er.await_delegated(&suite.actors[0].cell, "local delegation").await?;
         suite.check_paid_threshold().await?;
 
