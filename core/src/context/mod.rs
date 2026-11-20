@@ -3,7 +3,8 @@ use transaction::{try_submit_and_confirm, BlockhashCache};
 pub use transaction::{ErClient, TxSender};
 
 use std::{
-    collections::BTreeMap,
+    cell::OnceCell,
+    collections::{BTreeMap, BTreeSet},
     future::Future,
     path::PathBuf,
     rc::{Rc, Weak},
@@ -99,7 +100,7 @@ pub trait ChainCtx: Sized {
 }
 
 pub struct BaseCtx {
-    pub(crate) scenario: Option<String>,
+    scenario: Option<String>,
     api: Api,
     grpc: Option<(Url, String)>,
     blockhash: Rc<BlockhashCache>,
@@ -139,6 +140,17 @@ impl BaseCtx {
         }
     }
 
+    pub(crate) fn for_scenario(&self, name: String, config: ExecutionConfig) -> Self {
+        Self {
+            scenario: Some(name),
+            api: self.api.clone().scoped(),
+            grpc: self.grpc.clone(),
+            blockhash: Rc::new(BlockhashCache::new(BASE_BLOCKHASH_TTL)),
+            resources: Rc::new(Resources::default()),
+            config,
+        }
+    }
+
     pub(crate) fn resources(&self) -> Rc<Resources> {
         self.resources.clone()
     }
@@ -158,8 +170,8 @@ impl BaseCtx {
         self.grpc.as_ref().map(|(url, plugin)| (url, plugin.as_str()))
     }
 
-    pub fn config(&self) -> ExecutionConfig {
-        self.config.clone()
+    pub fn config(&self) -> &ExecutionConfig {
+        &self.config
     }
 
     pub fn ws_url(&self) -> &Url {
@@ -179,7 +191,7 @@ pub struct ErCtx {
     blockhash: Rc<BlockhashCache>,
     pub(crate) pid: u32,
     pub(crate) proxy: Option<Rc<Proxy>>,
-    faults: Option<Rc<Faults>>,
+    faults: Option<Rc<OnceCell<Rc<Faults>>>>,
     pub(crate) owner: Option<Weak<Mutex<PrivateEr>>>,
 }
 
@@ -194,10 +206,11 @@ impl ErCtx {
         Some(path)
     }
 
-    pub(crate) fn for_scenario(mut self) -> Result<Self> {
+    pub(crate) fn for_scenario(mut self) -> Self {
         self.api = self.api.scoped();
-        self.faults = self.proxy.as_ref().map(|proxy| proxy.scope().map(Rc::new)).transpose()?;
-        Ok(self)
+        // A proxied scenario that never injects faults need not take the proxy's sole scope.
+        self.faults = self.proxy.as_ref().map(|_| Rc::default());
+        self
     }
 
     /// Read only resident accounts; unlike account reads, this never triggers cloning.
@@ -206,7 +219,8 @@ impl ErCtx {
         owners: &[Pubkey],
         keys: &[Pubkey],
     ) -> Result<Vec<Option<Account>>> {
-        let accounts = self.local_program_accounts(owners).await?;
+        let wanted: BTreeSet<_> = keys.iter().copied().collect();
+        let accounts = self.scan_local_accounts(owners, |key| wanted.contains(key)).await?;
         Ok(keys.iter().map(|key| accounts.get(key).cloned()).collect())
     }
 
@@ -215,16 +229,25 @@ impl ErCtx {
     /// Accounts with other owners return `None` even when resident. Use
     /// [`Self::local_accounts`] with explicit owners to include them.
     pub async fn local_images(&self, keys: &[Pubkey]) -> Result<Vec<Option<Account>>> {
-        self.local_accounts(&crate::topology::local_account_owners(), keys).await
+        self.local_accounts(crate::topology::local_account_owners(), keys).await
     }
 
     pub async fn local_program_accounts(
         &self,
         owners: &[Pubkey],
     ) -> Result<BTreeMap<Pubkey, Account>> {
+        self.scan_local_accounts(owners, |_| true).await
+    }
+
+    async fn scan_local_accounts(
+        &self,
+        owners: &[Pubkey],
+        keep: impl Fn(&Pubkey) -> bool,
+    ) -> Result<BTreeMap<Pubkey, Account>> {
         let mut accounts = BTreeMap::new();
         for owner in owners {
-            accounts.extend(self.api.get_program_accounts(owner).await?);
+            let rows = self.api.get_program_accounts(owner).await?;
+            accounts.extend(rows.into_iter().filter(|(key, _)| keep(key)));
         }
         Ok(accounts)
     }
@@ -249,11 +272,20 @@ impl ErCtx {
     }
 
     pub fn faults(&self) -> Result<Rc<Faults>> {
-        self.faults.clone().context("scenario requires a fault proxy")
+        let (proxy, slot) = self
+            .proxy
+            .as_ref()
+            .zip(self.faults.as_ref())
+            .context("scenario requires a fault proxy")?;
+        if let Some(faults) = slot.get() {
+            return Ok(faults.clone());
+        }
+        let faults = Rc::new(proxy.scope()?);
+        Ok(slot.get_or_init(|| faults).clone())
     }
 
     pub(crate) async fn reset_faults(&self) -> Result<()> {
-        match &self.faults {
+        match self.faults.as_deref().and_then(OnceCell::get) {
             Some(faults) => faults.reset().await,
             None => Ok(()),
         }

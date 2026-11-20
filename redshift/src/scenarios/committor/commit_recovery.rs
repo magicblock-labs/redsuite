@@ -226,11 +226,11 @@ impl CommitFixture {
         let receipt = receipt::fetch_commit_receipt(self.er.api(), signature).await?;
         match &receipt.error_message {
             Some(message) if receipt.failure_is_duplicate_rejection() => {
-                receipt::warn_duplicate_rejection(message);
+                receipt::log_duplicate_rejection(&receipt.signature, message);
             }
             Some(message) => {
                 return Err(anyhow!(
-                    "the commit intent converges after the fault is lifted: {message}"
+                    "commit for {account} did not converge after the fault was lifted (ER transaction {signature}): {message}"
                 ));
             }
             None => {}

@@ -125,7 +125,7 @@ impl Scenario<(ScenarioReport, Result<()>), Shape> for TransactionLoad {
             None
         };
         self.warm_up().await?;
-        let options = RunControl::from_config(&self.base.config())?;
+        let options = RunControl::from_config(self.base.config())?;
         let mut remaining = options.duration;
         let mut cursor = self.profile.warmup;
         let mut delivered = 0;
@@ -304,6 +304,8 @@ impl TransactionLoad {
     /// Checks the last write touching each account, plus hash correctness for the compute shape.
     #[instrument(skip_all, err)]
     async fn check_final_state(&self, offset: u64, count: u64) -> Result<()> {
+        let mut missing = 0;
+        let mut first_missing = None;
         for pda in self.pdas.iter() {
             let last_id =
                 (offset + 1..=offset + count).rev().find(|&id| self.targets(id).contains(pda));
@@ -311,10 +313,15 @@ impl TransactionLoad {
                 continue;
             };
             let Some(on_er) = self.er.account(pda).await? else {
-                warn!(%pda, "pda not on er");
+                missing += 1;
+                first_missing.get_or_insert((pda, last_id));
                 continue;
             };
-            check!(CellHeader::written_id(&on_er.data) == Some(last_id));
+            let written_id = CellHeader::written_id(&on_er.data);
+            check!(
+                written_id == Some(last_id),
+                "ER account {pda}: expected last write {last_id}, observed {written_id:?}"
+            );
             if matches!(self.shape, Shape::Compute) {
                 let expected = HashState::chain(causal::HASH_INIT.to_bytes(), 180);
                 check!(
@@ -324,6 +331,10 @@ impl TransactionLoad {
             }
         }
 
+        if let Some((pda, last_id)) = first_missing {
+            warn!(missing, first_account = %pda, expected_write = last_id,
+                "ER accounts missing during final workload state check");
+        }
         Ok(())
     }
 }

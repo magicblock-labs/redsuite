@@ -194,6 +194,7 @@ impl CommitSnapshotOrdering {
     /// frozen snapshots and cleanup.
     #[instrument(skip_all, err, fields(variant = variant.name))]
     async fn run_variant(&self, variant: Variant) -> Result<()> {
+        // Plain sponsored commits never charge the vault checked by intent accounting.
         let payer = self.base.funded_payer(PAYER_LAMPORTS).await?;
         let accounts = self.prepare_accounts(&payer, variant).await?;
         let [a, b, c, d] = accounts;

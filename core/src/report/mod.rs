@@ -14,8 +14,8 @@ use sha2::{Digest, Sha256};
 use tracing::warn;
 
 use crate::{
-    resources::LaunchRecord, runner::RunOutcome, scenario::RunRecord, stats::ObservationsStats,
-    topology, Result,
+    logging::strip_ansi, resources::LaunchRecord, runner::RunOutcome, scenario::RunRecord,
+    stats::ObservationsStats, topology, Result,
 };
 
 pub const SCHEMA_VERSION: u32 = 3;
@@ -313,22 +313,7 @@ fn binary_version(path: &Path) -> String {
 
 fn version_line(output: &str) -> Option<String> {
     let line = output.lines().map(str::trim).find(|line| !line.is_empty())?;
-    let mut cleaned = String::with_capacity(line.len());
-    let mut chars = line.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\u{1b}' {
-            if chars.peek() == Some(&'[') {
-                for next in chars.by_ref() {
-                    if next.is_ascii_alphabetic() {
-                        break;
-                    }
-                }
-            }
-            continue;
-        }
-        cleaned.push(ch);
-    }
-    Some(cleaned)
+    Some(strip_ansi(line).into_owned())
 }
 
 fn fingerprint(path: &Path) -> String {

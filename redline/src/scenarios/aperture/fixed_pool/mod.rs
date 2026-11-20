@@ -80,7 +80,7 @@ impl Scenario<(ScenarioReport, Result<()>)> for FixedPool {
             base.config().loop_mode == LoopMode::Open,
             "fixed_pool requires --loop open"
         );
-        let run = RunControl::from_config(&base.config())?;
+        let run = RunControl::from_config(base.config())?;
         let profile = *PROFILES.select(base.config().profile);
         let payers = base.funded_payers(profile.payers, PAYER_LAMPORTS).await?;
         let accounts = Accounts::new(ACCOUNT_SPACE, er.identity())

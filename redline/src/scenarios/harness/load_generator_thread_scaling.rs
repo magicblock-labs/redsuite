@@ -97,7 +97,7 @@ impl Scenario<(ScenarioReport, Result<()>)> for LoadGeneratorThreadScaling {
     /// Splits the requested duration between single- and multi-thread driver phases after warmup.
     async fn run(self) -> Result<(ScenarioReport, Result<()>)> {
         self.warm_up().await?;
-        let options = crate::RunControl::from_config(&self.base.config())?;
+        let options = crate::RunControl::from_config(self.base.config())?;
         let mut cursor = self.profile.warmup;
         let mut cells = Vec::new();
         let result: Result<()> = async {

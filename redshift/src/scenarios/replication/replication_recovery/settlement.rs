@@ -1,4 +1,4 @@
-use super::{ReplicationRecovery, CONNECT_TIMEOUT};
+use super::{super::observations::fence, ReplicationRecovery, CONNECT_TIMEOUT};
 use crate::PAYER_LAMPORTS;
 use anyhow::{ensure, Context};
 use redsuite_core::{
@@ -133,11 +133,11 @@ impl ReplicationRecovery {
                 er.api().await_transaction(&signature).await?,
             )?);
         }
-        self.check_final_boundary(&[]).await?;
+        fence(&self.topology).await?;
         let restart = er.restart(RestartConfig::default()).await?;
         ensure!(restart.exit_code == Some(0) && !restart.needed_sigkill);
         self.topology.wait_verifiers_connected(CONNECT_TIMEOUT).await?;
-        self.check_final_boundary(&[]).await?;
+        fence(&self.topology).await?;
         ensure!(
             er.local_accounts(&[REDSHIFT.id()], &[cell]).await? == vec![Some(expected.clone())]
         );

@@ -31,7 +31,7 @@ mod storage;
 mod subscriber;
 
 use channels::{Channels, Probe};
-pub use history::{LedgerIndexSignals, PrunedReadSignals};
+pub use history::LedgerIndexSignals;
 pub use integrity::DivergenceSignals;
 pub use subscriber::SlowSubscriberSignals;
 

@@ -243,7 +243,7 @@ impl Scenario<(ScenarioReport, Result<()>)> for MixedSustainedLoad {
             profile,
             pool,
             payer_bytes,
-            base_config: base.config(),
+            base_config: base.config().clone(),
             started,
         })
     }

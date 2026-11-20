@@ -26,7 +26,6 @@ use crate::{
     ACCOUNT_OWNERS, ACCOUNT_SPACE, PAYER_LAMPORTS,
 };
 
-const READONLY_COUNT: usize = 1;
 const DELEGATED_COUNT: usize = 2;
 const PENDING_COUNT: usize = 2;
 const FUNDING_BATCH: usize = 16;
@@ -36,15 +35,26 @@ const SCENARIO_TIMEOUT: Duration = Duration::from_secs(180);
 impl CacheLifecycle {
     /// Runs traffic and fault stages together, retaining discovery
     /// failures until teardown completes.
-    pub(super) async fn pressure(self) -> Result<()> {
-        let (accounts, stale, settlement) = self.prepare_accounts().await?;
+    pub(super) async fn pressure(&self, mode: Mode, pool: &[Pubkey]) -> Result<()> {
+        let (accounts, stale, settlement) = self.prepare_accounts(mode, pool).await?;
         let progress = TrafficProgress::default();
         let faults = async {
             progress.await_sent(0).await?;
             for held in stale {
                 held.release();
             }
-            self.churn(&accounts, &progress).await?;
+            churn_cache(&self.er, accounts.pool, accounts.evictions).await?;
+            match accounts.mode {
+                Mode::DiscoveryGap => {
+                    self.faults.stall(Selector::default().ws().response().notification());
+                    for key in &accounts.protected_keys {
+                        self.faults
+                            .stall(Selector::methods(&FETCHES).http().response().account(key));
+                    }
+                    self.faults.disconnect(Transport::Ws);
+                }
+                Mode::StaleFetch => self.stale_fetch(&accounts, &progress).await?,
+            }
             self.complete_settlement(&accounts, &progress, settlement).await
         };
         let (_, recovery) = time::timeout(
@@ -53,22 +63,33 @@ impl CacheLifecycle {
         )
         .await??;
 
-        let delegated = &accounts.keys[READONLY_COUNT..READONLY_COUNT + DELEGATED_COUNT];
-        ensure!(self.base.accounts(delegated).await? == accounts.base_delegated);
-        self.finish().await?;
+        ensure!(self.base.accounts(accounts.delegated()).await? == accounts.base_delegated);
+        self.faults.reset().await?;
         recovery
     }
 }
 
 /// Ordered readonly/delegated/pending residents, their protected images, and an eviction pool.
-struct CacheAccounts {
+struct CacheAccounts<'a> {
     funder: Keypair,
-    keys: Vec<Pubkey>,
+    mode: Mode,
+    mirror: Pubkey,
+    protected_keys: Vec<Pubkey>,
     protected: Vec<Option<Account>>,
     base_delegated: Vec<Option<Account>>,
-    pool: Vec<Pubkey>,
+    pool: &'a [Pubkey],
     sender: TxSender,
     evictions: f64,
+}
+
+impl CacheAccounts<'_> {
+    fn delegated(&self) -> &[Pubkey] {
+        &self.protected_keys[..DELEGATED_COUNT]
+    }
+
+    fn pending(&self) -> &[Pubkey] {
+        &self.protected_keys[DELEGATED_COUNT..]
+    }
 }
 
 /// Coordinates pressure against successful traffic, settlement release, and final drain.
@@ -95,27 +116,45 @@ impl CacheLifecycle {
             .intercept(Selector::method(method).ws().response().notification().account(key))
     }
 
+    pub(super) async fn prepare_pool(&self) -> Result<Vec<Pubkey>> {
+        let funder = self.base.funded_payer(PAYER_LAMPORTS).await?;
+        let owner = funder.pubkey();
+        let pool: Vec<_> = (0..CACHE_CAPACITY * 2).map(|_| Keypair::new().pubkey()).collect();
+        try_join_all(pool.chunks(FUNDING_BATCH).map(|chunk| async {
+            let transfers: Vec<_> =
+                chunk.iter().map(|key| system::transfer(&owner, key, 1_000_000)).collect();
+            self.base.submit_and_confirm(&funder, &transfers).await
+        }))
+        .await?;
+        Ok(pool)
+    }
+
     /// Holds stale reads and undelegation delivery before exposing the residents to pressure.
     #[instrument(skip_all, err)]
-    async fn prepare_accounts(&self) -> Result<(CacheAccounts, Vec<Held>, RuleHandle)> {
+    async fn prepare_accounts<'a>(
+        &self,
+        mode: Mode,
+        pool: &'a [Pubkey],
+    ) -> Result<(CacheAccounts<'a>, Vec<Held>, RuleHandle)> {
         let er = &self.er;
         let validator = er.identity();
         let funder = self.base.funded_payer(PAYER_LAMPORTS).await?;
         let owner = funder.pubkey();
         let payer = self.base.delegated_payer(&funder, validator, PAYER_LAMPORTS).await?;
-        let keys = self
+        let mut keys = self
             .base
             .cells(REDLINE, &funder)
             .create_many(
                 ACCOUNT_SPACE,
                 validator,
-                READONLY_COUNT + DELEGATED_COUNT + PENDING_COUNT,
+                1 + DELEGATED_COUNT + PENDING_COUNT,
             )
             .await?;
-        let protected_keys = &keys[READONLY_COUNT..];
+        let mirror = keys.remove(0);
+        let protected_keys = keys.as_slice();
         let (delegated, pending) = protected_keys.split_at(DELEGATED_COUNT);
         let er_written_keys = &protected_keys[1..];
-        let stale: Vec<_> = if matches!(self.mode, Mode::UndelegationReconnectGap) {
+        let stale: Vec<_> = if matches!(mode, Mode::DiscoveryGap) {
             Vec::new()
         } else {
             protected_keys
@@ -123,7 +162,7 @@ impl CacheLifecycle {
                 .map(|key| self.observe("programNotification", key))
                 .collect()
         };
-        let delegates: Vec<_> = (READONLY_COUNT..keys.len())
+        let delegates: Vec<_> = (1..=keys.len())
             .map(|index| {
                 REDLINE.delegate(
                     owner,
@@ -153,19 +192,14 @@ impl CacheLifecycle {
         let protected = er.local_accounts(&ACCOUNT_OWNERS, protected_keys).await?;
         ensure!(protected.iter().all(Option::is_some));
         let base_delegated = self.base.accounts(delegated).await?;
-        let pool: Vec<_> = (0..CACHE_CAPACITY * 2).map(|_| Keypair::new().pubkey()).collect();
-        try_join_all(pool.chunks(FUNDING_BATCH).map(|chunk| async {
-            let transfers: Vec<_> =
-                chunk.iter().map(|key| system::transfer(&owner, key, 1_000_000)).collect();
-            self.base.submit_and_confirm(&funder, &transfers).await
-        }))
-        .await?;
         let before = cache_evictions(&self.er).await?;
         let sender = er.sender(Rc::new(payer));
         Ok((
             CacheAccounts {
                 funder,
-                keys,
+                mode,
+                mirror,
+                protected_keys: keys,
                 protected,
                 base_delegated,
                 pool,
@@ -179,9 +213,13 @@ impl CacheLifecycle {
 
     /// Checks hash evolution and protected images on each warmed transaction during faults.
     #[instrument(skip_all, err)]
-    async fn traffic(&self, accounts: &CacheAccounts, progress: &TrafficProgress) -> Result<()> {
+    async fn traffic(
+        &self,
+        accounts: &CacheAccounts<'_>,
+        progress: &TrafficProgress,
+    ) -> Result<()> {
         let er = &self.er;
-        let protected_keys = &accounts.keys[READONLY_COUNT..];
+        let protected_keys = &accounts.protected_keys;
         let traffic_keys = &protected_keys[..1];
 
         let mut expected = accounts.protected.clone();
@@ -223,58 +261,47 @@ impl CacheLifecycle {
         Ok(())
     }
 
-    /// Forces eviction plus controlled reconnect/fetch races, or installs the discovery blackout.
+    /// A delayed stale response must not replace the newer subscription image.
     #[instrument(skip_all, err)]
-    async fn churn(&self, accounts: &CacheAccounts, progress: &TrafficProgress) -> Result<()> {
+    async fn stale_fetch(
+        &self,
+        accounts: &CacheAccounts<'_>,
+        progress: &TrafficProgress,
+    ) -> Result<()> {
         let er = &self.er;
-        let (readonly, protected_keys) = accounts.keys.split_at(READONLY_COUNT);
-        let pending = &protected_keys[DELEGATED_COUNT..];
-        let mut evictions = accounts.evictions;
-        if matches!(self.mode, Mode::UndelegationReconnectGap) {
-            churn_cache(&self.er, &accounts.pool, evictions).await?;
-            self.faults.stall(Selector::default().ws().response().notification());
-            for key in protected_keys {
-                self.faults.stall(Selector::methods(&FETCHES).http().response().account(key));
-            }
-            self.faults.disconnect(Transport::Ws);
-            return Ok(());
-        }
-        for (cycle, &target) in readonly.iter().enumerate() {
-            evictions = churn_cache(&self.er, &accounts.pool, evictions).await?;
-            let cold = er.local_accounts(&ACCOUNT_OWNERS, &[target]).await?;
-            ensure!(cold[0].is_none());
-            let reconnect = self.observe("accountSubscribe", &pending[0]);
-            self.faults.disconnect(Transport::Ws);
-            let reconnect = reconnect.wait(TIMEOUT).await?;
-            let registered = self.observe("accountSubscribe", &target);
-            let old = self
-                .faults
-                .intercept(Selector::methods(&FETCHES).http().response().account(&target));
-            let latest = BASE_REFRESH + 1 + cycle as u64;
-            let (read, ()) = try_join(er.account(&target), async {
-                registered.wait(TIMEOUT).await?.release();
-                let old = old.wait(TIMEOUT).await?;
-                let notification = self.observe("accountNotification", &target);
-                self.base.cells(REDLINE, &accounts.funder).write(latest, &[target]).await?;
-                notification.wait(TIMEOUT).await?.release();
-                await_local_value(er, "latest base value observed locally", &[target], latest)
-                    .await?;
-                old.release();
-                progress.await_sent(progress.sent.get()).await?;
-                reconnect.release();
-                Ok(())
-            })
-            .await?;
-            ensure!(crate::account_id(read) == Some(latest));
+        let target = accounts.mirror;
+        let pending = accounts.pending();
+        let cold = er.local_accounts(&ACCOUNT_OWNERS, &[target]).await?;
+        ensure!(cold[0].is_none());
+        let reconnect = self.observe("accountSubscribe", &pending[0]);
+        self.faults.disconnect(Transport::Ws);
+        let reconnect = reconnect.wait(TIMEOUT).await?;
+        let registered = self.observe("accountSubscribe", &target);
+        let old = self
+            .faults
+            .intercept(Selector::methods(&FETCHES).http().response().account(&target));
+        let latest = BASE_REFRESH + 1;
+        let (read, ()) = try_join(er.account(&target), async {
+            registered.wait(TIMEOUT).await?.release();
+            let old = old.wait(TIMEOUT).await?;
+            let notification = self.observe("accountNotification", &target);
+            self.base.cells(REDLINE, &accounts.funder).write(latest, &[target]).await?;
+            notification.wait(TIMEOUT).await?.release();
             await_local_value(er, "latest base value observed locally", &[target], latest).await?;
-            ensure!(self
-                .base
-                .accounts(pending)
-                .await?
-                .iter()
-                .all(|a| matches!(a, Some(a) if a.owner == DELEGATION_PROGRAM_ID)));
-        }
-
+            old.release();
+            progress.await_sent(progress.sent.get()).await?;
+            reconnect.release();
+            Ok(())
+        })
+        .await?;
+        ensure!(crate::account_id(read) == Some(latest));
+        await_local_value(er, "latest base value observed locally", &[target], latest).await?;
+        ensure!(self
+            .base
+            .accounts(pending)
+            .await?
+            .iter()
+            .all(|a| matches!(a, Some(a) if a.owner == DELEGATION_PROGRAM_ID)));
         Ok(())
     }
 
@@ -283,19 +310,19 @@ impl CacheLifecycle {
     #[instrument(skip_all, err)]
     async fn complete_settlement(
         &self,
-        accounts: &CacheAccounts,
+        accounts: &CacheAccounts<'_>,
         progress: &TrafficProgress,
         settlement: RuleHandle,
     ) -> Result<Result<()>> {
         let er = &self.er;
-        let (readonly, protected_keys) = accounts.keys.split_at(READONLY_COUNT);
-        let (delegated, pending) = protected_keys.split_at(DELEGATED_COUNT);
+        let readonly = &[accounts.mirror];
+        let pending = accounts.pending();
         progress.completed.set(true);
         settlement.remove();
         self.base
             .api()
             .await_accounts(pending, "base undelegation", |actual| {
-                for (actual, expected) in actual.iter().zip(&accounts.protected[delegated.len()..])
+                for (actual, expected) in actual.iter().zip(&accounts.protected[DELEGATED_COUNT..])
                 {
                     let actual = actual.as_ref().map(|a| (a.owner, &a.data));
                     let expected = expected.as_ref().map(|a| (program::id(), &a.data));
@@ -306,7 +333,7 @@ impl CacheLifecycle {
             .await?;
         let released_at = Instant::now();
         self.base.cells(REDLINE, &accounts.funder).write(BASE_REWRITE, pending).await?;
-        let recovery = if matches!(self.mode, Mode::UndelegationReconnectGap) {
+        let recovery = if matches!(accounts.mode, Mode::DiscoveryGap) {
             // Defer recovery failures until warmed traffic and teardown finish.
             await_local_value(
                 er,
@@ -362,11 +389,5 @@ impl CacheLifecycle {
         }
         progress.done.set(true);
         Result::Ok(recovery)
-    }
-
-    #[instrument(skip_all, err)]
-    async fn finish(self) -> Result<()> {
-        self.faults.reset().await?;
-        Ok(())
     }
 }

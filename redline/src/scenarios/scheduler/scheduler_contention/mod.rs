@@ -459,7 +459,7 @@ impl Scenario<(ScenarioReport, Result<()>)> for SchedulerContention {
     /// Verifies each measured batch and reports the last retained batch rather than pooled windows.
     async fn run(mut self) -> Result<(ScenarioReport, Result<()>)> {
         let (executors, contention_lanes) = self.calibrate().await?;
-        let options = crate::RunControl::from_config(&self.base.config())?;
+        let options = crate::RunControl::from_config(self.base.config())?;
         let deadline = options.deadline()?;
         let mut batches = Vec::new();
         let mut batch = 0;

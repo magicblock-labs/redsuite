@@ -11,6 +11,7 @@ use dlp_api::{args::CommitStateFromBufferArgs, error::DlpError, instruction_buil
 use keypair::Keypair;
 use rand::seq::SliceRandom;
 use redsuite_core::{
+    api::SendError,
     programs::CellHeader,
     random::{self, Rng},
     rpc_types::response::TransactionError,
@@ -323,14 +324,13 @@ impl CommitFixture<'_> {
             &signing,
             self.base.api().get_latest_blockhash().await?,
         );
-        let signature = self.base.api().send_transaction(&tx).await?;
-        let tx = self.base.api().await_transaction(&signature).await?;
+        let signature = tx.signatures[0];
+        // The confirmed execution result proves refusal without depending on the history index.
+        let outcome = self.base.api().try_send_and_confirm(&tx).await?;
+        let expected = TransactionError::InstructionError(index, error);
         ensure!(
-            transaction_meta(&tx)?.err
-                == Some(TransactionError::InstructionError(index, error.clone()).into()),
-            "expected instruction {index}: {error:?}; observed {:?}; logs {:?}",
-            transaction_meta(&tx)?.err,
-            transaction_logs(transaction_meta(&tx)?)
+            matches!(&outcome, Err(SendError::Execution(error)) if error.err == expected),
+            "base transaction {signature}: expected {expected:?}, observed {outcome:?}"
         );
         ensure!(self.base.accounts(&keys).await? == before);
         ensure!(self.er.local_images(&keys).await? == local);

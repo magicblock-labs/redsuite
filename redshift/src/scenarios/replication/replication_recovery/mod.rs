@@ -1,12 +1,10 @@
 use std::{
     cell::Cell,
-    fs,
-    path::Path,
     rc::Rc,
     time::{Duration, Instant},
 };
 
-use anyhow::{anyhow, ensure, Context};
+use anyhow::{ensure, Context};
 use pubkey::Pubkey;
 use signer::Signer;
 
@@ -18,7 +16,7 @@ use redsuite_core::{
         Accounts,
     },
     topology,
-    topology::{ReplicatedOptions, ReplicatedTopology, Verifier},
+    topology::{ReplicatedTopology, Verifier},
     wait, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
 use tokio::{task::JoinSet, time};
@@ -26,9 +24,13 @@ use tracing::{debug, instrument};
 
 use crate::{ACCOUNT_SPACE, PAYER_LAMPORTS};
 
+use super::observations::{
+    await_catch_up, await_leader_advance, leader_count, leader_metric, snapshots, verifier_count,
+    verifier_metric, BLOCKS, STATE_MISMATCHES, SUPERBLOCKS, TRANSACTIONS,
+};
+
 mod settlement;
 
-const VERIFIERS: usize = 2;
 const PAIRS: usize = 4;
 const PAYERS_PER_PAIR: usize = 3;
 const PROBES: usize = 4;
@@ -36,26 +38,18 @@ const PROBE_LAMPORTS: u64 = 1_000_000;
 const CHAIN_GAP: Duration = Duration::from_millis(100);
 const HEAVY_ITERS: u32 = 30;
 const STEADY: Duration = Duration::from_secs(8);
-const BLOCKTIME: Duration = Duration::from_millis(40);
+pub(crate) const BLOCKTIME: Duration = Duration::from_millis(40);
 // Retention removes one superblock every 512 slots; avoid producing a backlog.
-const SUPERBLOCK_SLOTS: u64 = 512;
+pub(crate) const SUPERBLOCK_SLOTS: u64 = 512;
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(90);
-const CATCH_UP_TIMEOUT: Duration = Duration::from_secs(120);
 const DETACH_TIMEOUT: Duration = Duration::from_secs(30);
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(120);
-const SEAL_TIMEOUT: Duration = Duration::from_secs(60);
 const ADVANCE_WINDOW: Duration = Duration::from_secs(2);
 const LAG_SAMPLE: Duration = Duration::from_millis(500);
 const RESTART_BUDGET: Duration = Duration::from_secs(16);
 const RECOVERY_TIMEOUT: Duration = Duration::from_secs(60);
 
-pub const TRANSACTIONS: &str = "engine_ledger_transactions";
-const BLOCKS: &str = "engine_ledger_blocks";
-const SUPERBLOCKS: &str = "engine_ledger_superblocks";
-const STATE_MISMATCHES: &str = "engine_replicator_client_state_mismatches";
-const CLIENT_SNAPSHOTS: &str =
-    r#"engine_replicator_operation_duration_micros_count{op="client_stage_snapshot"}"#;
 const SERVER_SNAPSHOTS: &str =
     r#"engine_replicator_operation_duration_micros_count{op="server_send_snapshot"}"#;
 const TRUNCATIONS: &str = r#"engine_ledger_operation_duration_micros_count{op="truncate"}"#;
@@ -135,84 +129,6 @@ impl Workload {
     }
 }
 
-pub async fn leader_metric(topology: &ReplicatedTopology, name: &str) -> Result<f64> {
-    let metrics = topology.leader().scrape_metrics().await?;
-    metrics
-        .get(name)
-        .with_context(|| format!("the leader exposes no {name} metric"))
-}
-
-async fn verifier_metric(verifier: &Verifier, name: &str) -> Result<f64> {
-    verifier
-        .scrape_metrics()
-        .await?
-        .get(name)
-        .with_context(|| format!("verifier `{}` exposes no {name} metric", verifier.label()))
-}
-
-async fn leader_count(topology: &ReplicatedTopology, name: &str) -> Result<f64> {
-    let metrics = topology.leader().scrape_metrics().await?;
-    Ok(metrics.get(name).unwrap_or(0.0))
-}
-
-async fn verifier_count(verifier: &Verifier, name: &str) -> Result<f64> {
-    Ok(verifier.scrape_metrics().await?.get(name).unwrap_or(0.0))
-}
-
-/// Waits for a fixed leader cutoff, surfacing mismatch log evidence if the verifier exits first.
-pub async fn await_catch_up(verifier: &Verifier, name: &str, target: f64) -> Result<Duration> {
-    let started = Instant::now();
-    let caught = wait::retry(
-        &format!(
-            "verifier `{}` {name} reaching the leader's {target:.0}",
-            verifier.label()
-        ),
-        CATCH_UP_TIMEOUT,
-        async || {
-            if !verifier.is_running() {
-                return Ok(false);
-            }
-            ensure!(verifier_metric(verifier, name).await? >= target);
-            Ok(true)
-        },
-    )
-    .await;
-    if !matches!(caught, Ok(true)) {
-        if let Some(line) = log_mentions_mismatch(verifier.log())? {
-            return Err(anyhow!(
-                "verifier `{}` stopped below the leader's {name} {target:.0}: {line}",
-                verifier.label()
-            ));
-        }
-        ensure!(
-            verifier.is_running(),
-            "verifier `{}` exited before reaching the leader's {name} {target:.0}",
-            verifier.label()
-        );
-    }
-    caught?;
-    Ok(started.elapsed())
-}
-
-pub(super) async fn await_leader_advance(
-    topology: &ReplicatedTopology,
-    name: &str,
-    by: f64,
-    what: &str,
-) -> Result<()> {
-    let from = leader_metric(topology, name).await?;
-    let target = from + by;
-    wait::retry(
-        &format!("{what} (leader {name} reaching {target:.0})"),
-        SEAL_TIMEOUT,
-        async || {
-            ensure!(leader_metric(topology, name).await? >= target);
-            Ok(())
-        },
-    )
-    .await
-}
-
 /// Checks the requested exit mode and that the stopped verifier no longer serves metrics.
 async fn stop_verifier(verifier: &mut Verifier, hard_kill: bool) -> Result<()> {
     let stop = verifier.stop(hard_kill).await?;
@@ -232,34 +148,6 @@ async fn blocks_advance(verifier: &Verifier) -> Result<f64> {
     let after = verifier_metric(verifier, BLOCKS).await?;
     ensure!(after > before);
     Ok(after - before)
-}
-
-fn strip_ansi(line: &str) -> String {
-    let mut cleaned = String::with_capacity(line.len());
-    let mut chars = line.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\u{1b}' {
-            if chars.peek() == Some(&'[') {
-                for next in chars.by_ref() {
-                    if next.is_ascii_alphabetic() {
-                        break;
-                    }
-                }
-            }
-            continue;
-        }
-        cleaned.push(ch);
-    }
-    cleaned
-}
-
-/// Preserves the first mismatch diagnostic, including when verifier shutdown prevents metric reads.
-pub fn log_mentions_mismatch(log: &Path) -> Result<Option<String>> {
-    let text = fs::read_to_string(log)?;
-    Ok(text
-        .lines()
-        .find(|line| line.to_ascii_lowercase().contains("mismatch"))
-        .map(strip_ansi))
 }
 
 /// Separate correctness and security registrations using the same leader/follower topology.
@@ -283,19 +171,7 @@ pub struct ReplicationRecovery {
 impl Scenario<(), Coverage> for ReplicationRecovery {
     /// Adds two verifier followers under the coverage-specific topology label.
     async fn setup(base: Rc<BaseCtx>, er: ErCtx, coverage: Coverage) -> Result<Self> {
-        let topology = topology::replicated(
-            &base,
-            er,
-            ReplicatedOptions {
-                label: match coverage {
-                    Coverage::Recovery => "retention",
-                    Coverage::Settlement => "replication-security",
-                }
-                .to_owned(),
-                verifiers: VERIFIERS,
-            },
-        )
-        .await?;
+        let topology = topology::replicated(&base, er).await?;
 
         Ok(Self { base, topology, coverage })
     }
@@ -357,7 +233,9 @@ impl ReplicationRecovery {
         for verifier in self.topology.verifiers() {
             ensure!(verifier.stream_connected().await);
         }
-        ensure!(self.topology.leader_connections().await? == (VERIFIERS as f64));
+        ensure!(
+            self.topology.leader_connections().await? == self.topology.verifiers().len() as f64
+        );
         Ok(())
     }
 
@@ -401,11 +279,11 @@ impl ReplicationRecovery {
         let restart_elapsed = restart_started.elapsed();
         ensure!(restart_elapsed <= RESTART_BUDGET);
         self.topology.verifier(0).wait_connected(CONNECT_TIMEOUT).await?;
-        let snapshots = verifier_count(self.topology.verifier(0), CLIENT_SNAPSHOTS).await?;
+        let snapshots = snapshots(self.topology.verifier(0)).await?;
         ensure!(snapshots == 0.0);
         let target = leader_metric(&self.topology, TRANSACTIONS).await?;
         let catch_up = await_catch_up(self.topology.verifier(0), TRANSACTIONS, target).await?;
-        self.await_leader_connections(VERIFIERS).await?;
+        self.await_leader_connections(self.topology.verifiers().len()).await?;
         self.verify_no_mismatch().await?;
         debug!(
             catch_up_secs = catch_up.as_secs_f64(),
@@ -471,7 +349,7 @@ impl ReplicationRecovery {
         self.topology.verifier_mut(1).start(READY_TIMEOUT).await?;
         self.topology.verifier(1).wait_connected(CONNECT_TIMEOUT).await?;
         debug!(phase = "snapshot connected", "verifier recovery progress");
-        let client_snapshots = verifier_count(self.topology.verifier(1), CLIENT_SNAPSHOTS).await?;
+        let client_snapshots = snapshots(self.topology.verifier(1)).await?;
         ensure!(client_snapshots >= 1.0);
         let server_snapshots =
             leader_count(&self.topology, SERVER_SNAPSHOTS).await? - server_snapshots_before;
@@ -479,7 +357,7 @@ impl ReplicationRecovery {
         let target = leader_metric(&self.topology, TRANSACTIONS).await?;
         debug!(target, "waiting for recovered verifier transactions");
         await_catch_up(self.topology.verifier(1), TRANSACTIONS, target).await?;
-        self.await_leader_connections(VERIFIERS).await?;
+        self.await_leader_connections(self.topology.verifiers().len()).await?;
         self.verify_no_mismatch().await?;
         let truncations = leader_count(&self.topology, TRUNCATIONS).await? - truncations_before;
         debug!(
@@ -516,7 +394,7 @@ impl ReplicationRecovery {
         self.topology.verifier_mut(1).reset_storage()?;
         self.topology.verifier_mut(1).start(READY_TIMEOUT).await?;
         self.topology.verifier(1).wait_connected(CONNECT_TIMEOUT).await?;
-        let client_snapshots = verifier_count(self.topology.verifier(1), CLIENT_SNAPSHOTS).await?;
+        let client_snapshots = snapshots(self.topology.verifier(1)).await?;
         ensure!(client_snapshots >= 1.0);
         let server_snapshots =
             leader_count(&self.topology, SERVER_SNAPSHOTS).await? - served_before;
@@ -524,7 +402,7 @@ impl ReplicationRecovery {
         let target = leader_metric(&self.topology, TRANSACTIONS).await?;
         await_catch_up(self.topology.verifier(1), TRANSACTIONS, target).await?;
         let blocks = blocks_advance(self.topology.verifier(1)).await?;
-        self.await_leader_connections(VERIFIERS).await?;
+        self.await_leader_connections(self.topology.verifiers().len()).await?;
         self.verify_no_mismatch().await?;
         debug!(
             client_snapshots,
@@ -552,7 +430,7 @@ impl ReplicationRecovery {
         }
         self.verify_no_mismatch().await?;
         self.verify_pairs(pairs).await?;
-        let mut verifier_superblocks = Vec::with_capacity(VERIFIERS);
+        let mut verifier_superblocks = Vec::with_capacity(self.topology.verifiers().len());
         for verifier in self.topology.verifiers() {
             verifier_superblocks.push(verifier_metric(verifier, SUPERBLOCKS).await?);
         }
@@ -613,36 +491,12 @@ impl ReplicationRecovery {
         Ok(())
     }
 
-    /// Checks live streams and mismatch evidence; settlement coverage first
-    /// reaches an authenticated seal.
+    /// Checks live recovery streams for state mismatches.
     async fn verify_no_mismatch(&self) -> Result<()> {
-        if matches!(self.coverage, Coverage::Settlement) {
-            if leader_metric(&self.topology, SUPERBLOCKS).await? < 1.0 {
-                await_leader_advance(&self.topology, SUPERBLOCKS, 1.0, "authenticated state seal")
-                    .await?;
-            }
-            self.catch_up_fleet(&[SUPERBLOCKS]).await?;
-        }
         for verifier in self.topology.verifiers() {
             ensure!(verifier.is_running());
             ensure!(verifier.stream_connected().await);
-            match self.coverage {
-                Coverage::Recovery => {
-                    ensure!(verifier_count(verifier, STATE_MISMATCHES).await? == 0.0)
-                }
-                Coverage::Settlement => {
-                    if let Some(mismatches) = verifier.scrape_metrics().await?.get(STATE_MISMATCHES)
-                    {
-                        ensure!(mismatches == 0.0);
-                    }
-                }
-            }
-            if let Some(line) = log_mentions_mismatch(verifier.log())? {
-                return Err(anyhow!(
-                    "verifier {}: replication mismatch: {line}",
-                    verifier.label()
-                ));
-            }
+            ensure!(verifier_count(verifier, STATE_MISMATCHES).await? == 0.0);
         }
         Ok(())
     }

@@ -16,48 +16,56 @@ use signer::Signer;
 use std::time::Duration;
 
 static RETRIES: ErGroup = ErGroup {
-    label: "transaction-retries",
-    settings: |_| {},
     proxy: true,
-    followers: 0,
+    ..ErGroup::new("transaction-retries")
 };
+static REPLAY: ErGroup = ErGroup::new("transaction-replay");
 static COMMITTOR: ErGroup = ErGroup {
-    label: "committor-faults",
-    settings: |_| {},
     proxy: true,
-    followers: 0,
+    ..ErGroup::new("committor-faults")
+};
+static CHAINLINK_FAULTS: ErGroup = ErGroup {
+    proxy: true,
+    ..ErGroup::new("chainlink-faults")
 };
 static CACHE: ErGroup = ErGroup {
-    label: "small-cache",
     settings: |p| {
         p.engine.accountsdb.lru_capacity = 256;
     },
     proxy: true,
-    followers: 0,
+    ..ErGroup::new("small-cache")
 };
 static STORAGE: ErGroup = ErGroup {
-    label: "storage",
     settings: |p| {
         p.engine.blockstore.blocktime = Duration::from_millis(50);
         p.engine.blockstore.superblock = 20;
     },
-    proxy: false,
-    followers: 0,
+    ..ErGroup::new("storage")
 };
 static RETENTION: ErGroup = ErGroup {
-    label: "retention",
     settings: |p| {
-        p.engine.blockstore.blocktime = Duration::from_millis(40);
-        p.engine.blockstore.superblock = 512;
+        p.engine.blockstore.blocktime = replication::replication_recovery::BLOCKTIME;
+        p.engine.blockstore.superblock = replication::replication_recovery::SUPERBLOCK_SLOTS;
         p.engine.ledger.size_limit = 1;
     },
-    proxy: false,
     followers: 2,
+    ..ErGroup::new("retention")
+};
+
+static LEDGER_RETENTION: ErGroup = ErGroup {
+    settings: |p| {
+        (RETENTION.settings)(p);
+        p.engine.blockstore.blocktime = Duration::from_millis(10);
+    },
+    ..ErGroup::new("ledger-retention")
 };
 
 static RUNTIME: ErGroup = ErGroup {
     label: replication::replicated_runtime::LABEL,
-    settings: replication::settings,
+    settings: |p| {
+        replication::settings(p);
+        p.engine.blockstore.superblock = 0;
+    },
     proxy: true,
     followers: 2,
 };
@@ -98,7 +106,7 @@ pub fn catalog() -> Vec<ScenarioEntry> {
         ),
         scenario!(
             storage::ledger_retention_consistency::LedgerRetentionConsistency,
-            exclusive(&RETENTION, &[Fixture::RedshiftProgram], ())
+            exclusive(&LEDGER_RETENTION, &[Fixture::RedshiftProgram], ())
         ),
         scenario!(
             replication::replication_recovery::ReplicationRecovery,
@@ -118,26 +126,11 @@ pub fn catalog() -> Vec<ScenarioEntry> {
         ),
         scenario!(
             chainlink::cache_lifecycle::CacheLifecycle,
-            exclusive(
-                &CACHE,
-                &[Fixture::RedlineProgram],
-                chainlink::cache_lifecycle::Mode::UndelegationReconnectGap
-            )
-        )
-        .named("cache_transport_recovery"),
-        scenario!(
-            chainlink::cache_lifecycle::CacheLifecycle,
-            exclusive(
-                &CACHE,
-                &[Fixture::RedlineProgram],
-                chainlink::cache_lifecycle::Mode::Churn
-            )
-        )
-        .named("cache_eviction_and_stale_fetch")
-        .ordered(1),
+            exclusive(&CACHE, &[Fixture::RedlineProgram], ())
+        ),
         scenario!(
             committor::intent_execution_and_accounting::IntentExecutionAndAccounting,
-            exclusive(&COMMITTOR, &[Fixture::RedshiftProgram], ())
+            shared(&COMMITTOR, &[Fixture::RedshiftProgram], ())
         ),
         scenario!(
             committor::commit_recovery::CommitRecovery,
@@ -150,7 +143,7 @@ pub fn catalog() -> Vec<ScenarioEntry> {
         .ordered(1),
         scenario!(
             committor::commit_snapshot_ordering::CommitSnapshotOrdering,
-            exclusive(&COMMITTOR, &[Fixture::RedlineProgram], ())
+            shared(&COMMITTOR, &[Fixture::RedlineProgram], ())
         )
         .ordered(1),
         scenario!(
@@ -167,6 +160,13 @@ pub fn catalog() -> Vec<ScenarioEntry> {
             shared(
                 &DEFAULT,
                 &[Fixture::RedlineProgram, Fixture::RedshiftProgram],
+                ()
+            )
+        ),
+        scenario!(
+            chainlink::program_upgrade_consistency::ProgramUpgradeConsistency,
+            fresh(
+                &[Fixture::RedlineProgram, Fixture::UpgradeProbe, Fixture::UpgradeProbeUpgraded],
                 ()
             )
         ),
@@ -194,7 +194,7 @@ pub fn catalog() -> Vec<ScenarioEntry> {
         scenario!(
             aperture::transaction_lifecycle::TransactionLifecycle,
             exclusive(
-                &RETRIES,
+                &REPLAY,
                 &[Fixture::RedshiftProgram],
                 aperture::transaction_lifecycle::Coverage::Replay
             )
@@ -217,21 +217,22 @@ pub fn catalog() -> Vec<ScenarioEntry> {
             shared(&DEFAULT, &[Fixture::RedlineProgram], ())
         ),
         scenario!(
-            chainlink::program_upgrade_consistency::ProgramUpgradeConsistency,
-            fresh(
-                &[Fixture::RedlineProgram, Fixture::UpgradeProbe, Fixture::UpgradeProbeUpgraded],
-                ()
-            )
-        ),
-        scenario!(
             chainlink::projected_token_lifecycle::ProjectedTokenLifecycle,
-            exclusive(&COMMITTOR, &[Fixture::RedlineProgram], TokenMode::Backing)
+            exclusive(
+                &CHAINLINK_FAULTS,
+                &[Fixture::RedlineProgram],
+                TokenMode::Backing
+            )
         )
         .named("projected_token_backing_lifecycle")
         .ordered(1),
         scenario!(
             chainlink::projected_token_lifecycle::ProjectedTokenLifecycle,
-            exclusive(&COMMITTOR, &[Fixture::RedlineProgram], TokenMode::Overlay)
+            exclusive(
+                &CHAINLINK_FAULTS,
+                &[Fixture::RedlineProgram],
+                TokenMode::Overlay
+            )
         )
         .named("magic_ata_overlay_lifecycle")
         .ordered(1)
@@ -243,7 +244,7 @@ pub fn catalog() -> Vec<ScenarioEntry> {
         .prepare_with(&RENT),
         scenario!(
             chainlink::activation_single_shot::ActivationSingleShot,
-            exclusive(&COMMITTOR, &[Fixture::RedshiftProgram], ())
+            exclusive(&CHAINLINK_FAULTS, &[Fixture::RedshiftProgram], ())
         )
         .ordered(1),
     ]

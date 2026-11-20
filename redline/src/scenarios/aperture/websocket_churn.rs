@@ -34,7 +34,7 @@ impl Scenario<(ScenarioReport, Result<()>)> for WebsocketChurn {
     /// Measures churn, closes idle sockets, and allows asynchronous local FD
     /// cleanup before checking it.
     async fn run(self) -> Result<(ScenarioReport, Result<()>)> {
-        let options = RunControl::from_config(&self.base.config())?;
+        let options = RunControl::from_config(self.base.config())?;
         let baseline = self
             .er
             .local_pid()

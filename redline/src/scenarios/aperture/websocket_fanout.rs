@@ -49,7 +49,7 @@ impl Scenario<(ScenarioReport, Result<()>)> for WebsocketFanout {
     }
     /// Tracks both copy destinations per reader and reports the worst subscriber-window latency.
     async fn run(self) -> Result<(ScenarioReport, Result<()>)> {
-        let options = RunControl::from_config(&self.base.config())?;
+        let options = RunControl::from_config(self.base.config())?;
         let mut remaining = options.duration;
         let mut cursor = 0;
         let mut received = 0;

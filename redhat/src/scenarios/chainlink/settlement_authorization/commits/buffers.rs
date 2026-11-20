@@ -50,7 +50,7 @@ pub(super) fn plan(seed: u64) -> Result<Plan> {
 
 impl SettlementAuthorization {
     /// Checks buffer authority, nonce/account binding, completeness, and rollback on failed use.
-    pub(in super::super) async fn check_buffers(&self) -> Result<()> {
+    pub(in super::super) async fn check_base_buffers(&self) -> Result<Keypair> {
         let plan = &self.commit_plan.buffers;
         let markers = &plan.markers;
         let mut fixtures = random::rng(
@@ -218,12 +218,12 @@ impl SettlementAuthorization {
         ensure!(self.base.accounts(&[chunks, buffer]).await?.iter().all(Option::is_none));
         fixture.commit(3, markers[4], true).await?;
         other.commit(2, markers[4], true).await?;
-        self.check_pending_outbox(&payer).await
+        Ok(payer)
     }
 
     /// Holds real buffered delivery while attacking its accepted outbox and substituted rows.
     /// The held work is resumed afterward to distinguish protection from a stuck pipeline.
-    async fn check_pending_outbox(&self, attacker: &Keypair) -> Result<()> {
+    pub(in super::super) async fn check_pending_outbox(&self, attacker: &Keypair) -> Result<()> {
         let plan = &self.commit_plan.buffers;
         let faults = self.er.faults()?;
         let mut large = Vec::new();

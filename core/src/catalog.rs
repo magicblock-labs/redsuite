@@ -1,6 +1,6 @@
 use std::{env, path::PathBuf, result};
 
-use anyhow::ensure;
+use anyhow::{ensure, Error};
 
 use clap::ValueEnum;
 use futures_util::future::LocalBoxFuture;
@@ -44,28 +44,23 @@ pub struct ErGroup {
     pub followers: usize,
 }
 
-pub static DEFAULT: ErGroup = ErGroup {
-    label: "default",
-    settings: |_| {},
-    proxy: false,
-    followers: 0,
-};
+pub static DEFAULT: ErGroup = ErGroup::new("default");
 
 impl ErGroup {
-    pub fn allowed_followers(&self) -> Result<Vec<Pubkey>> {
-        use signer::Signer;
-        (0..self.followers)
-            .map(|index| {
-                crate::topology::identity_for_label(&format!("{}-verifier{index}", self.label))
-                    .map(|key| key.pubkey())
-            })
-            .collect()
+    pub const fn new(label: &'static str) -> Self {
+        Self {
+            label,
+            settings: |_| {},
+            proxy: false,
+            followers: 0,
+        }
     }
 
     pub fn options(&self) -> ErOptions {
         ErOptions {
             label: self.label.to_owned(),
             settings: Box::new(self.settings),
+            followers: self.followers,
             ..ErOptions::default()
         }
     }
@@ -128,6 +123,7 @@ type ScenarioRunner = Box<
         String,
         &'static [Fixture],
         ExecutionConfig,
+        result::Result<BaseCtx, String>,
         Option<result::Result<ErCtx, String>>,
     ) -> ScenarioFuture,
 >;
@@ -186,10 +182,15 @@ impl ScenarioEntry {
         self,
         family: Family,
         config: ExecutionConfig,
-        er: Option<result::Result<ErCtx, String>>,
+        base: result::Result<&BaseCtx, &Error>,
+        er: Option<result::Result<&ErCtx, &Error>>,
     ) -> ScenarioFuture {
         let name = self.name(family);
-        (self.run)(name, self.fixtures, config, er)
+        let base = base
+            .map(|base| base.for_scenario(name.clone(), config.clone()))
+            .map_err(|error| format!("{error:#}"));
+        let er = er.map(|er| er.cloned().map_err(|error| format!("{error:#}")));
+        (self.run)(name, self.fixtures, config, base, er)
     }
 
     pub(crate) fn shared<S, V, Options>(
@@ -210,12 +211,13 @@ impl ScenarioEntry {
             order: 0,
             prepare: None,
             fixtures,
-            run: Box::new(move |name, fixtures, config, er| {
+            run: Box::new(move |name, fixtures, config, base, er| {
                 let er = er.unwrap_or_else(|| Err("shared scenario requires an ER group".into()));
                 Box::pin(run_shared_scenario(
                     name,
                     fixtures,
                     config,
+                    base,
                     er,
                     async move |base, er, stage| {
                         let scenario = S::setup(base, er, options).await?;
@@ -244,11 +246,12 @@ impl ScenarioEntry {
             order: 0,
             prepare: None,
             fixtures,
-            run: Box::new(move |name, fixtures, config, _er| {
+            run: Box::new(move |name, fixtures, config, base, _er| {
                 Box::pin(run_private_er_scenario(
                     name,
                     fixtures,
                     config,
+                    base,
                     async move |base, stage| {
                         let scenario = S::setup(base, options).await?;
                         *stage = "scenario";

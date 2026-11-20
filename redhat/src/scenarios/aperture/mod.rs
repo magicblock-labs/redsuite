@@ -17,8 +17,6 @@ pub use admission::TransactionAdmission;
 pub use amplification::UnpaidWork;
 pub use authority::TransactionAuthority;
 pub use protocol::ProtocolInputs;
-pub use signals::{
-    DivergenceSignals, LedgerIndexSignals, OutcomeSignals, PrunedReadSignals, SlowSubscriberSignals,
-};
+pub use signals::{DivergenceSignals, LedgerIndexSignals, OutcomeSignals, SlowSubscriberSignals};
 pub use simulation::SimulationIsolation;
 pub use structure::TransactionStructure;

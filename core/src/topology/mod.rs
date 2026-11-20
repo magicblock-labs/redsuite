@@ -15,11 +15,10 @@ pub use config::{
     SERVICE_OWNERS, VERIFIER_BIN_ENV,
 };
 pub use identity::{identity_for_label, identity_keypair};
-pub use private::{leader_er, private_er, PrivateEr, RestartOutcome};
+pub use private::{private_er, GroupEr, PrivateEr, RestartOutcome};
 pub(crate) use process::kill_pid;
 pub use replicated::{
-    latest_snapshot, replicated, ReplicatedOptions, ReplicatedTopology, Verifier, VerifierStop,
-    VerifierTiming,
+    latest_snapshot, replicated, ReplicatedTopology, Verifier, VerifierStop, VerifierTiming,
 };
 pub use shared::{base_only, running_base_programs};
 pub use state::{

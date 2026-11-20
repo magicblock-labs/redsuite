@@ -18,10 +18,12 @@ use super::{
     config::{BaseEndpoints, ErOptions, ErPlan, ErPorts, RestartConfig},
     identity, process,
     process::PortLease,
+    replicated::follower_label,
     state,
 };
 use crate::{
     api::Api,
+    catalog::ErGroup,
     context::{BaseCtx, ChainCtx, ErCtx},
     netfault::Proxy,
     report,
@@ -48,21 +50,62 @@ pub struct PrivateEr {
     ports: PortLease,
 }
 
+/// Owns the local process for an ER group; attached groups only borrow endpoints.
+pub struct GroupEr {
+    owner: Option<Rc<Mutex<PrivateEr>>>,
+    ctx: ErCtx,
+}
+
+impl GroupEr {
+    pub async fn boot(group: &ErGroup, base: &BaseCtx) -> Result<Self> {
+        if let Some(endpoints) = base.config().environment.as_ref().and_then(|env| env.er.as_ref())
+        {
+            return Ok(Self {
+                owner: None,
+                ctx: ErCtx::attach(endpoints).await?,
+            });
+        }
+
+        let mut options = group.options();
+        let proxy = if group.proxy {
+            let proxy = Rc::new(Proxy::spawn(BaseEndpoints::from_base(base)?).await?);
+            options.base_endpoints = Some(proxy.endpoints());
+            Some(proxy)
+        } else {
+            None
+        };
+        let er = private_er(base, options).await?;
+        er.wait_ready(config::ER_READY_TIMEOUT).await?;
+        let mut ctx = er.ctx().clone();
+        let owner = Rc::new(Mutex::new(er));
+        ctx.owner = Some(Rc::downgrade(&owner));
+        ctx.proxy = proxy;
+        Ok(Self { owner: Some(owner), ctx })
+    }
+
+    pub fn ctx(&self) -> &ErCtx {
+        &self.ctx
+    }
+
+    pub async fn finish(self) -> Result<()> {
+        if let Some(owner) = self.owner {
+            Rc::into_inner(owner)
+                .context("ER group still in use during teardown")?
+                .into_inner()
+                .finish()
+                .await?;
+        }
+        Ok(())
+    }
+}
+
 impl PrivateEr {
     pub fn ctx(&self) -> &ErCtx {
         &self.ctx
     }
 
-    pub fn with_proxy(mut self, proxy: Rc<Proxy>) -> Self {
-        self.ctx.proxy = Some(proxy);
-        self
-    }
-
-    pub fn shared(mut self) -> Rc<Mutex<Self>> {
-        Rc::new_cyclic(|owner| {
-            self.ctx.owner = Some(owner.clone());
-            Mutex::new(self)
-        })
+    pub(super) fn label(&self) -> &str {
+        self.proc.label()
     }
 
     pub fn pid(&self) -> u32 {
@@ -244,23 +287,12 @@ async fn await_magic_fee_vault(base: &BaseCtx, identity: &Pubkey) -> Result<()> 
 }
 
 pub async fn private_er(base: &BaseCtx, options: ErOptions) -> Result<PrivateEr> {
-    launch(base, options, Vec::new()).await
-}
-
-// A leader is a private ER whose replication listener admits followers.
-pub async fn leader_er(
-    base: &BaseCtx,
-    options: ErOptions,
-    allowed_followers: Vec<Pubkey>,
-) -> Result<PrivateEr> {
-    launch(base, options, allowed_followers).await
-}
-
-async fn launch(
-    base: &BaseCtx,
-    options: ErOptions,
-    allowed_followers: Vec<Pubkey>,
-) -> Result<PrivateEr> {
+    let allowed_followers = (0..options.followers)
+        .map(|index| {
+            identity::identity_for_label(&follower_label(&options.label, index))
+                .map(|identity| identity.pubkey())
+        })
+        .collect::<Result<Vec<_>>>()?;
     let dir = state::stack_dir();
     fs::create_dir_all(&dir)?;
     let er_bin = config::er_bin_path()?;
@@ -296,7 +328,7 @@ async fn launch(
             options.settings,
         )?,
     };
-    debug!(%options.label, "starting rollup");
+    debug!(%options.label, log = %log.display(), "starting rollup");
     ports.release();
     let child = plan.spawn(&log)?;
     let pid = child.id();

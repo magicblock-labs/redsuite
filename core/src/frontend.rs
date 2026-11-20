@@ -95,7 +95,11 @@ impl Command {
     pub fn run(self) -> Result<()> {
         match self {
             Command::Stack(Stack::Status) => topology::status(),
-            Command::Stack(Stack::Down) => topology::down(),
+            Command::Stack(Stack::Down) => {
+                topology::down()?;
+                println!("stack down");
+                Ok(())
+            }
             Command::Report(Report::Bmf { out }) => report::bmf(out.as_deref()),
         }
     }

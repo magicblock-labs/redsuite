@@ -17,19 +17,18 @@ use redsuite_core::{
     netfault::{Faults, RuleHandle, Selector},
     programs::REDLINE,
     random,
-    topology::{ReplicatedTopology, RestartConfig, Verifier},
+    topology::{RestartConfig, Verifier},
     wait, BaseCtx, ChainCtx, ErCtx, Result,
 };
 use signature::Signature;
 use signer::Signer;
 use solana_rent::Rent;
+use tokio::task;
 use tracing::instrument::WithSubscriber;
 
+use super::observations::SUPERBLOCKS;
+
 pub(super) const TIMEOUT: Duration = Duration::from_secs(60);
-pub(super) const CHECKPOINT: u64 = 16;
-const BLOCKS: &str = "engine_ledger_blocks";
-const SNAPSHOTS: &str =
-    r#"engine_replicator_operation_duration_micros_count{op="client_stage_snapshot"}"#;
 pub(super) const RENT: Pubkey = sdk_ids::sysvar::rent::ID;
 pub(super) const FEATURES: Pubkey =
     Pubkey::from_str_const("Feature111111111111111111111111111111111111");
@@ -205,42 +204,12 @@ fn rent_rule(faults: &Faults, rent: &Rent) -> Result<RuleHandle> {
     ))
 }
 
-pub(super) async fn snapshots(verifier: &Verifier) -> Result<f64> {
-    Ok(verifier.scrape_metrics().await?.get(SNAPSHOTS).unwrap_or(0.0))
-}
-
-pub(super) async fn fence(topology: &ReplicatedTopology) -> Result<()> {
-    use super::replication_recovery::{
-        await_catch_up, await_leader_advance, leader_metric, TRANSACTIONS,
-    };
-    await_leader_advance(topology, BLOCKS, 1.0, "runtime writes entering the ledger").await?;
-    let target = leader_metric(topology, TRANSACTIONS).await?;
-    for verifier in topology.verifiers().iter().filter(|verifier| verifier.is_running()) {
-        await_catch_up(verifier, TRANSACTIONS, target).await?;
-        let before = verifier
-            .scrape_metrics()
-            .await?
-            .get(BLOCKS)
-            .context("verifier block metric missing")?;
-        await_catch_up(verifier, BLOCKS, before + (CHECKPOINT + 1) as f64).await?;
-        ensure!(
-            verifier
-                .scrape_metrics()
-                .await?
-                .get("engine_replicator_client_state_mismatches")
-                .unwrap_or(0.0)
-                == 0.0
-        );
-    }
-    Ok(())
-}
-
 pub(super) async fn next_snapshot(er: &ErCtx) -> Result<PathBuf> {
     let storage = er.storage_dir().await?;
     let head = er
         .scrape_metrics()
         .await?
-        .get("engine_ledger_superblocks")
+        .get(SUPERBLOCKS)
         .context("leader superblock metric missing")?;
     wait::retry(
         "the next complete replication snapshot",
@@ -264,14 +233,28 @@ pub(super) async fn inspect(
     let stop = verifier.stop(false).await?;
     ensure!(stop.exit_code == Some(0) && !stop.needed_sigkill);
     async {
-        let temp = tempfile::tempdir()?;
-        let accounts = temp.path().join("accounts");
-        clonetree::clone_tree(verifier.accountsdb_dir(), &accounts, &Default::default())?;
-        let db = accountsdb::AccountsDB::new(accounts)?;
+        let accounts_dir = verifier.accountsdb_dir().to_owned();
+        let storage_dir = verifier.storage_dir().to_owned();
+        // Copying preallocated files must not stall the suite's async event loop.
+        let temp = task::spawn_blocking(move || {
+            let temp = tempfile::tempdir()?;
+            clonetree::clone_tree(
+                &accounts_dir,
+                temp.path().join("accounts"),
+                &Default::default(),
+            )?;
+            clonetree::clone_tree(
+                &storage_dir,
+                temp.path().join("ledger"),
+                &Default::default(),
+            )?;
+            Ok::<_, anyhow::Error>(temp)
+        })
+        .await??;
+        let db = accountsdb::AccountsDB::new(temp.path().join("accounts"))?;
         db.validate()?;
         check_images(&db, expected)?;
         let storage = temp.path().join("ledger");
-        clonetree::clone_tree(verifier.storage_dir(), &storage, &Default::default())?;
         let mut shutdown = nucleus::shutdown::ShutdownManager::default();
         let ledger = ledger::Ledger::init(storage, u64::MAX, &mut shutdown)?;
         let checked = async {
@@ -303,7 +286,7 @@ pub(super) fn check_images(db: &accountsdb::AccountsDB, expected: &Images) -> Re
         let image = db
             .loader()
             .read(key, |account| account.owned())?
-            .context("follower account missing")?;
+            .with_context(|| format!("follower account {key} ({mode:?}) missing"))?;
         ensure!(
             image.mode() == *mode
                 && image.owner() == account.owner
