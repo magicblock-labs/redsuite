@@ -271,11 +271,16 @@ async fn check_case(
             "AddressLookupMismatch"
         }
         Mutation::Accounts => {
-            let count = if matches!(format, Format::V1) { 65 } else { 39 };
-            while keys(&mut malformed).len() < count {
+            let (limit, gate) = match format {
+                Format::Legacy | Format::V0 => (usize::from(u8::MAX), "ParseError"),
+                Format::V1 => (64, "SanitizeError"),
+            };
+            let count = limit + 1;
+            let malformed_keys = keys(&mut malformed);
+            while malformed_keys.len() < count {
                 let key = random::pubkey(rng);
-                if !keys(&mut malformed).contains(&key) {
-                    keys(&mut malformed).push(key);
+                if !malformed_keys.contains(&key) {
+                    malformed_keys.push(key);
                     extra.push(key);
                 }
             }
@@ -283,11 +288,7 @@ async fn check_case(
             repaired = malformed.clone();
             keys(&mut repaired).pop();
             header(&mut repaired).num_readonly_unsigned_accounts -= 1;
-            if matches!(format, Format::V1) {
-                "SanitizeError"
-            } else {
-                "ParseError"
-            }
+            gate
         }
         Mutation::Instructions => {
             let instruction = instructions(&mut malformed)[0].clone();
