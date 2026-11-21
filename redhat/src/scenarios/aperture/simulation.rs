@@ -8,7 +8,6 @@ use message::VersionedMessage;
 use serde_json::Value;
 use signature::Signature;
 use signer::Signer;
-use tracing::debug;
 use transaction::{versioned::VersionedTransaction, Message};
 
 use redsuite_core::{
@@ -104,7 +103,6 @@ impl SimulationIsolation {
                 fixture
                     .check_control(VersionedMessage::Legacy(message), 1, 1, skip_preflight)
                     .await?;
-                debug!(sig_verify, "simulation leaves no admission");
             }
         }
         Ok(())
@@ -224,10 +222,6 @@ impl SimulationIsolation {
             ensure!(
                 fixture.er.local_program_accounts(topology::SERVICE_OWNERS).await? == service,
                 "{label}: simulation published task or outbox state"
-            );
-            debug!(
-                case = label,
-                "simulated service body leaves live state unchanged"
             );
         }
         let signature = fixture

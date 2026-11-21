@@ -126,21 +126,20 @@ impl ProtocolInputs {
             .await
             .with_context(|| label.to_owned())?;
         let accepted = slot_reply(reply.as_deref()).with_context(|| label.to_owned())?;
-        debug!(
-            case = label,
-            replied = reply.is_some(),
-            accepted,
-            bytes = body.len(),
-            "hostile protocol input"
-        );
         if let Some(expected) = expected {
             ensure!(
                 accepted == expected,
                 "{label}: accepted {accepted}, expected {expected}; reply {reply:?}"
             );
+        } else {
+            debug!(
+                case = label,
+                replied = reply.is_some(),
+                accepted,
+                "HTTP probe outcome"
+            );
         }
-        self.healthy().await?;
-        Ok(())
+        self.healthy().await.with_context(|| format!("after {label}"))
     }
 
     /// Exercises JSON nesting and framing ambiguity separately from body-size bounds.
@@ -250,15 +249,14 @@ impl ProtocolInputs {
             ),
             ("missing parameter", RpcRequest::GetAccountInfo, json!([])),
         ] {
-            let result: result::Result<Value, RpcError> =
-                self.er.api().try_call(method, &params).await?;
-            let error = result.err().context("hostile request acknowledged")?;
-            debug!(
-                case = label,
-                code = error.error.code.code(),
-                "hostile protocol request"
-            );
-            self.healthy().await?;
+            let result: result::Result<Value, RpcError> = self
+                .er
+                .api()
+                .try_call(method, &params)
+                .await
+                .with_context(|| format!("{label}: RPC probe"))?;
+            ensure!(result.is_err(), "{label}: request acknowledged: {result:?}");
+            self.healthy().await.with_context(|| format!("after {label}"))?;
         }
         Ok(())
     }
@@ -297,17 +295,17 @@ impl ProtocolInputs {
         ];
         for (label, frame, expected) in frames {
             let mut socket = RawWs::connect(self.er.ws_url()).await?;
-            let bytes = frame.len();
             let survived = socket.send_text(frame).await.is_ok() && socket.responsive(&cell).await;
-            debug!(case = label, bytes, survived, "hostile socket frame");
             if let Some(expected) = expected {
                 ensure!(
                     survived == expected,
                     "{label}: connection survived {survived}, expected {expected}"
                 );
+            } else {
+                debug!(case = label, survived, "WebSocket probe outcome");
             }
             let _ = socket.close().await;
-            self.healthy().await?;
+            self.healthy().await.with_context(|| format!("after {label}"))?;
         }
         Ok(())
     }
@@ -330,13 +328,8 @@ impl ProtocolInputs {
 
         let mut intruder = RawWs::connect(self.er.ws_url()).await?;
         for id in ids.iter().take(4) {
-            match intruder.try_account_unsubscribe(*id).await? {
-                Ok(removed) => ensure!(!removed, "cross-connection unsubscribe accepted for {id}"),
-                Err(error) => debug!(
-                    id,
-                    code = error.error.code.code(),
-                    "cross-connection unsubscribe refused"
-                ),
+            if let Ok(removed) = intruder.try_account_unsubscribe(*id).await? {
+                ensure!(!removed, "cross-connection unsubscribe accepted for {id}");
             }
         }
 
@@ -358,10 +351,6 @@ impl ProtocolInputs {
         .await
         .with_context(|| format!("attacked subscriptions lost delivery: {pending:?}"))??;
         ensure!(victim.malformed_frames() == 0 && intruder.malformed_frames() == 0);
-        debug!(
-            subscriptions = ids.len(),
-            "flood isolated and victim delivery intact"
-        );
         intruder.close().await?;
         victim.close().await?;
         self.healthy().await

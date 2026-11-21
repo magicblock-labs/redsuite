@@ -25,18 +25,15 @@ pub(super) fn emit(shared: Option<&Path>, launches: &[LaunchRecord]) {
         sources.insert(Path::new(&launch.log), (launch.label.clone(), Some(launch)));
     }
     for (path, (node, launch)) in sources {
-        info!(%node, log = %path.display(), "validator log");
+        let version = launch.map(|launch| launch.bin_version.as_str()).filter(|v| *v != "unknown");
+        info!(%node, log = %path.display(), version, "validator log");
         if !enabled!(Level::DEBUG) {
             continue;
         }
-        if let Some(launch) = launch {
-            debug!(%node, pid = launch.pid, role = %launch.role, version = %launch.bin_version,
-                fingerprint = %launch.bin_fingerprint, relaunches = launch.relaunches,
-                exit = launch.exit.as_deref(), "validator process");
-        }
         let mut entries = VecDeque::new();
-        for source in [path.with_extension("log.prev"), path.to_owned()] {
-            let content = match read_log_tail(&source) {
+        let previous = path.with_extension("log.prev");
+        for (previous_boot, source) in [(true, previous.as_path()), (false, path)] {
+            let content = match read_log_tail(source) {
                 Ok(content) => content,
                 Err(error) => {
                     if error.kind() != io::ErrorKind::NotFound {
@@ -59,11 +56,12 @@ pub(super) fn emit(shared: Option<&Path>, launches: &[LaunchRecord]) {
                 if entries.len() == MAX_LINES {
                     entries.pop_front();
                 }
-                entries.push_back((source.clone(), text));
+                entries.push_back((previous_boot, text));
             }
         }
-        for (source, text) in entries {
-            debug!(%node, log = %source.display(), validator_line = %text, "recent validator log");
+        for (previous_boot, text) in entries {
+            debug!(%node, previous_boot = previous_boot.then_some(true), validator_line = %text,
+                "recent validator log");
         }
     }
 }

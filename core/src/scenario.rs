@@ -220,7 +220,6 @@ impl RunRecord {
         Span::current().record("phase", self.phase);
         // The suite reports shared setup failures once at their source.
         if shared_setup_failed && self.phase == "topology" {
-            debug!(seed, "scenario blocked by shared setup");
             return;
         }
         match &self.outcome {

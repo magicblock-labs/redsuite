@@ -79,13 +79,7 @@ async fn run_rounds(
         let mut cases = cases()?;
         cases.shuffle(&mut random::rng(config.seed, &[OWNER, "order"], round));
         let round_seed = random::rng(config.seed, &[OWNER, "seed"], round).gen();
-        debug!(
-            seed = config.seed,
-            round,
-            round_seed,
-            order = ?cases.iter().map(|(family, entry)| entry.name(*family)).collect::<Vec<_>>(),
-            "continuous round"
-        );
+        debug!(round, round_seed, "continuous round started");
         let round_config = ExecutionConfig {
             seed: round_seed,
             ..config.clone()

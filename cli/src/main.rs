@@ -17,7 +17,7 @@ use redsuite_core::config::{Environment, ErEndpoints};
 use redsuite_core::{catalog::Family, config::ExecutionConfig, logging, Result};
 use suite::Suite;
 use tokio::{sync::watch, task::LocalSet};
-use tracing::{debug, error};
+use tracing::error;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
@@ -53,18 +53,6 @@ fn list(family: Family, selections: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn run_seed(seed: Option<u64>) -> u64 {
-    let seed = seed.unwrap_or_else(rand::random);
-    debug!(
-        seed,
-        runner = std::env::current_exe()
-            .and_then(|path| redsuite_core::report::binary_hash(&path))
-            .unwrap_or_else(|_| "unavailable".into()),
-        "run seed"
-    );
-    seed
-}
-
 async fn interruptible(
     run: impl AsyncFnOnce(watch::Receiver<bool>, Arc<OnceLock<Instant>>) -> Result<()>,
 ) -> Result<ExitCode> {
@@ -93,7 +81,7 @@ async fn checks(family: Family, command: Checks) -> Result<()> {
     match command {
         Checks::List { selections } => list(family, &selections),
         Checks::Run(args) => {
-            let seed = run_seed(args.seed);
+            let seed = args.seed.unwrap_or_else(rand::random);
             Suite::new(
                 family,
                 args.run,
@@ -163,7 +151,7 @@ async fn dispatch(command: Command) -> Result<ExitCode> {
             }
         },
         Command::Continuous(args) => {
-            let seed = run_seed(args.seed);
+            let seed = args.seed.unwrap_or_else(rand::random);
             return interruptible(async move |stop, stop_requested_at| {
                 let config = ExecutionConfig {
                     seed,

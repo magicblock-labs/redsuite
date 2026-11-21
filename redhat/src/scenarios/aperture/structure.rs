@@ -15,7 +15,6 @@ use redsuite_core::{
 use signature::Signature;
 use signer::Signer;
 use std::{rc::Rc, time::Duration};
-use tracing::debug;
 use transaction::versioned::VersionedTransaction;
 
 const ADMITTED: &str = "mbv_transaction_skip_preflight_count";
@@ -359,12 +358,6 @@ async fn check_case(
         }
         _ => {}
     }
-    debug!(
-        ?format,
-        ?mutation,
-        skip_preflight,
-        "transaction structure rejection"
-    );
     let mut payload = STANDARD.encode(&bytes);
     if matches!(mutation, Mutation::Encoding) {
         payload.insert(payload.len() / 2, '!');

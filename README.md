@@ -247,10 +247,10 @@ configuration or a fresh ER are skipped. The first failure stops admission and
 returns a nonzero status after running scenarios finish. Continuous runs do not
 write Redline reports.
 
-Each round logs its order and a seed derived from the run seed at `debug`. Pass
-the logged run seed to `--seed` on a fresh stack (`redsuite stack down`) to replay
-the same orders; a stack rejects seeded fixtures it has already created. Scenario
-timing and interleaving are not reproduced.
+At `debug`, each round logs its derived seed and the scenarios log as they
+start. Pass the suite's run seed to `--seed` on a fresh stack
+(`redsuite stack down`) to replay the same orders; a stack rejects seeded
+fixtures it has already created. Scenario timing and interleaving are not reproduced.
 
 At `debug`, periodic logs retain interval observations without keeping every
 request in memory.
@@ -296,7 +296,7 @@ harness also reclaims private rollups left behind by failed scenarios.
 
 At the default `info` level, the suite prints its selection and seed, then a
 summary with elapsed time on success. Set `RUST_LOG=debug` for per-scenario
-timings, probe details, workload progress, and scheduling.
+timings, workload progress, and observations that help explain a failure.
 Redshift and Redhat return console verdicts without persisting benchmark reports.
 Stage errors retain method context and scenario failures include their replay seed.
 Failures identify the relevant local validator logs. At `debug`, they also

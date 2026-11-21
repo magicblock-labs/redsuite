@@ -7,7 +7,7 @@ use std::{
 use super::{process, state};
 use crate::Result;
 use anyhow::Context;
-use tracing::{debug, warn};
+use tracing::warn;
 
 const STACK_STORAGE: &[&str] = &["base-ledger", "genesis-accounts"];
 
@@ -55,7 +55,6 @@ pub fn down() -> Result<()> {
     let mut known = Vec::new();
     if let Some(state) = state::read_state() {
         if process::proc_matches(state.base_pid, &state.base_bin) {
-            debug!(pid = state.base_pid, "stopping base");
             process::kill_pid(state.base_pid);
         }
         known.push(state.base_pid);
@@ -69,8 +68,7 @@ pub fn down() -> Result<()> {
         warn!(pid, %cmdline, "stopping orphaned topology process");
         process::kill_pid(pid);
     }
-    let removed = wipe_storage()?;
-    debug!(?removed, "stack down");
+    wipe_storage()?;
     Ok(())
 }
 

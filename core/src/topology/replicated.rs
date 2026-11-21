@@ -9,7 +9,6 @@ use anyhow::{ensure, Context};
 use futures_util::future::try_join_all;
 use signer::Signer;
 use tokio::time;
-use tracing::debug;
 
 use super::{
     config, config::VerifierPlan, identity, process, process::PortLease, state, RestartConfig,
@@ -342,7 +341,6 @@ pub async fn replicated(base: &BaseCtx, leader: ErCtx) -> Result<ReplicatedTopol
             params: config::verifier_params(&leader_params, identity, metrics_port, storage_dir),
         };
         let log = dir.join(format!("er-{label}.log"));
-        debug!(%label, "starting verifier");
         ports.release();
         let child = plan.spawn(&log)?;
         let pid = child.id();

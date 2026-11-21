@@ -323,7 +323,12 @@ async fn run_mode(base: &BaseCtx, er: &ErCtx, mode: Mode) -> Result<()> {
     resolve(&api, &mut records).await?;
     settle_after_restart(&api, mode, &mut records).await?;
     check_state(er, &format!("{label} after first restart"), &pool, &records).await?;
-    debug!(label, "first restart under load finished");
+    debug!(
+        case = label,
+        slot_before = first.slot_before,
+        slot_after = first.slot_after,
+        "ledger and state verified after first restart"
+    );
 
     let superblocks_before = superblocks(er).await?;
     let resumed = Lanes::start(api.clone(), &senders, &pool, next_id.clone());

@@ -1092,7 +1092,6 @@ impl Workload {
             .create_delegated(space, Pubkey::default(), 2)
             .await?;
         self.er.accounts(&[attacker, drained]).await?;
-        tracing::debug!(%confined, %delegated, %drained, %attacker, amount, "confined rent authority plan");
         let mut probe = self.keys;
         probe[TARGET] = delegated;
         self.run(
@@ -1456,7 +1455,6 @@ impl Scenario for EphemeralAccountSecurity {
         )
         .fill(&mut secret);
         let victim = Keypair::new_from_array(secret);
-        tracing::debug!(target = %target.pubkey(), victim = %victim.pubkey(), "ephemeral lifecycle plan");
         let mut rng = random::rng(
             seed,
             &["redhat", "ephemeral_account_security", "fixtures"],

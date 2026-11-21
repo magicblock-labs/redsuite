@@ -108,7 +108,6 @@ impl Runtime {
                 redsuite_core::dlp::DelegationRecord::try_from_bytes_with_discriminator_mut(
                     &mut account.data,
                 )?;
-            tracing::debug!(%record, original = record_data.lamports, minimum, "delegation funding fixture");
             record_data.lamports = minimum;
             accounts.push((record, account));
         }
@@ -135,9 +134,12 @@ impl Runtime {
             },
         );
         let image = self.er.account(&key).await?;
-        ensure!(rule.hits() != 0, "cold read bypassed the account fixture");
+        ensure!(
+            rule.hits() != 0,
+            "cold read of {key} bypassed the account fixture"
+        );
         rule.remove();
-        image.context("cold read did not materialize the account")
+        image.with_context(|| format!("cold read did not materialize {key}"))
     }
 
     pub async fn images(&self, accounts: &[(Pubkey, AccountMode)]) -> Result<Images> {

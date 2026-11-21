@@ -76,7 +76,7 @@ async fn slow_subscriber(base: Rc<BaseCtx>, er: ErCtx) -> Result<()> {
             Ok(frame) => frame,
             Err(error) => {
                 closed = true;
-                debug!(error = %format!("{error:#}"), "slow subscription closed by the server");
+                debug!(error = %format_args!("{error:#}"), "slow subscriber read failed");
                 break;
             }
         };

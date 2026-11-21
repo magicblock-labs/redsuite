@@ -114,7 +114,7 @@ async fn boot_base(config: ExecutionConfig) -> Result<StackState> {
         identity::write_vault_dump(&plan.genesis_accounts, &reserved.pubkey())?;
     }
     identity::reset_pool(&dir);
-    debug!(rpc_port = base_rpc_port, log = %base_log.display(), "starting base");
+    debug!(log = %base_log.display(), "starting base");
     base_ports.release();
     let base_pid = process::spawn_detached(plan.command(), &base_log)?;
     let state = StackState {

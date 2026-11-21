@@ -61,9 +61,9 @@ impl Scenario for TransactionAdmission {
                         "refused account read leaked {account:?}"
                     );
                     debug!(
-                        skip_preflight,
+                        account = %cold,
                         placeholder = account.is_some(),
-                        "failed account preparation stays unresolved without a client error"
+                        "refused base read returned without an RPC error"
                     );
                 }
                 Err(error) => {
@@ -191,10 +191,6 @@ impl Scenario for TransactionAdmission {
                     local[0]
                 );
                 ensure!(fixture.base.account(&cold).await? == source);
-                debug!(
-                    index,
-                    skip_preflight, "invalid hash preparation witnessed without execution"
-                );
                 message.recent_blockhash = fixture.er.api().get_latest_blockhash().await?;
                 let control = fixture
                     .check_control(VersionedMessage::Legacy(message), 7, 1, skip_preflight)

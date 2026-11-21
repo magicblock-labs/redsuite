@@ -317,7 +317,6 @@ where
 
     let mut jobs = FuturesUnordered::new();
     let mut admitted = 0u64;
-    let mut window = StreamingStats::new();
     let mut interval = time::interval(Duration::from_secs(5));
     interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     interval.tick().await;
@@ -333,14 +332,12 @@ where
                 biased;
                 _ = &mut stopped => break 'admit,
                 Some(job) = cooperative(jobs.next()), if !jobs.is_empty() => {
-                    let job: Job = job;
-                    if let Some(delivery) = job.delivery { window.push(delivery); }
                     last_completion = Instant::now();
                     tally.record(job);
                 },
                 _ = interval.tick() => {
-                    let stats = std::mem::take(&mut window).finalize(false);
-                    tracing::debug!(admitted, delivered = tally.delivered, failed = tally.failed, outstanding = jobs.len(), count = stats.count, p50_us = stats.median, p95_us = stats.quantile95, max_us = stats.max, "load interval");
+                    tracing::debug!(admitted, delivered = tally.delivered, failed = tally.failed,
+                        outstanding = jobs.len(), "load progress");
                     if !jobs.is_empty() && last_completion.elapsed() >= crate::transport::NETWORK_TIMEOUT { stalled = true; break 'admit; }
                 },
                 _ = &mut tick, if jobs.len() < concurrency => break,

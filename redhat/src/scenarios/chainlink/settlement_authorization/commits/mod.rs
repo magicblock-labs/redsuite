@@ -118,8 +118,9 @@ impl SettlementAuthorization {
                     _ => InstructionError::Custom(DlpError::NonceOutOfOrder as u32),
                 };
                 let signers = if *case == 5 { vec![] } else { vec![signer] };
-                tracing::debug!(case, buffered, attempted, nonce, "commit refusal");
-                fixture.rejected(&[instruction], &signers, expected).await?;
+                fixture.rejected(&[instruction], &signers, expected).await.with_context(|| {
+                    format!("commit refusal case {case}: nonce {attempted} after {nonce}, buffered={buffered}")
+                })?;
                 if buffered {
                     fixture.close_buffer(attempted).await?;
                 }
