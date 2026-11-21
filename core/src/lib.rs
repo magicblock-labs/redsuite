@@ -8,7 +8,6 @@ pub mod dlp;
 mod fixtures;
 pub mod frontend;
 pub mod host;
-#[path = "../../shared/logging.rs"]
 pub mod logging;
 pub mod netfault;
 pub mod prep;
@@ -33,9 +32,7 @@ pub use api::{Api, Metrics, MetricsDelta, SendBody};
 pub use context::{BaseCtx, ChainCtx, ErClient, ErCtx, TxSender};
 pub use report::ScenarioReport;
 pub use resources::LaunchRecord;
-pub use scenario::{
-    run_private_er_scenario, run_shared_scenario, PrivateErScenario, RunRecord, Scenario,
-};
+pub use scenario::{PrivateErScenario, RunRecord, Scenario};
 pub use solana_account_decoder_client_types as account_types;
 pub use solana_commitment_config as commitment;
 pub use solana_rpc_client_types as rpc_types;

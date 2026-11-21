@@ -31,7 +31,7 @@ mod storage;
 mod subscriber;
 
 use channels::{Channels, Probe};
-pub use history::{LedgerIndexSignals, PrunedReadSignals};
+pub use history::LedgerIndexSignals;
 pub use integrity::DivergenceSignals;
 pub use subscriber::SlowSubscriberSignals;
 
@@ -99,7 +99,7 @@ async fn outcomes(base: Rc<BaseCtx>, er: ErCtx) -> Result<()> {
     let probe = Probe::new(&refused, watch, None);
     channels.control_with_probe(&mut fixture, 9_101, &[], Some(&probe)).await?;
     fixture.not_admitted(&refused.signature, start, None).await?;
-    debug!(signature = %refused.signature, %error, hits = rule.hits(), channel = "rpc", "refused write attributed");
+    debug!(signature = %refused.signature, %error, "RPC refusal matched injected base read failure");
 
     rule.remove();
     faults.reset().await?;

@@ -1,17 +1,18 @@
 use std::ptr;
 
-use anyhow::ensure;
+use anyhow::{ensure, Context};
 use futures_util::{stream::FuturesUnordered, StreamExt};
 use rand::seq::SliceRandom;
 use redsuite_core::{
     catalog::{Er, Family, ScenarioEntry, ScenarioFuture, DEFAULT},
     config::ExecutionConfig,
     random::{self, Rng},
-    topology, ErCtx, Result,
+    topology::{self, GroupEr},
+    BaseCtx, ErCtx, Result,
 };
-use tracing::debug;
+use tracing::{debug, info};
 
-use super::{group::GroupEr, prepare};
+use super::prepare;
 use crate::catalog;
 
 const FAMILIES: [Family; 3] = [Family::Redshift, Family::Redhat, Family::Redline];
@@ -45,6 +46,7 @@ async fn settle(
 async fn run_round(
     cases: Vec<(Family, ScenarioEntry)>,
     config: &ExecutionConfig,
+    base: &BaseCtx,
     er: &ErCtx,
     limit: usize,
 ) -> Vec<String> {
@@ -57,7 +59,7 @@ async fn run_round(
         if !failed.is_empty() || config.stopped() {
             break;
         }
-        running.push(entry.run(family, config.clone(), Some(Ok(er.clone()))));
+        running.push(entry.run(family, config.clone(), Ok(base), Some(Ok(er))));
         if exclusive {
             settle(&mut running, 0, &mut failed).await;
         }
@@ -66,24 +68,23 @@ async fn run_round(
     failed
 }
 
-async fn run_rounds(config: &ExecutionConfig, er: &ErCtx, limit: usize) -> Result<()> {
+async fn run_rounds(
+    config: &ExecutionConfig,
+    base: &BaseCtx,
+    er: &ErCtx,
+    limit: usize,
+) -> Result<()> {
     let mut round = 0;
     while !config.stopped() {
         let mut cases = cases()?;
         cases.shuffle(&mut random::rng(config.seed, &[OWNER, "order"], round));
         let round_seed = random::rng(config.seed, &[OWNER, "seed"], round).gen();
-        debug!(
-            seed = config.seed,
-            round,
-            round_seed,
-            order = ?cases.iter().map(|(family, entry)| entry.name(*family)).collect::<Vec<_>>(),
-            "continuous round"
-        );
+        debug!(round, round_seed, "continuous round started");
         let round_config = ExecutionConfig {
             seed: round_seed,
             ..config.clone()
         };
-        let failed = run_round(cases, &round_config, er, limit).await;
+        let failed = run_round(cases, &round_config, base, er, limit).await;
         ensure!(
             failed.is_empty(),
             "round {round} of seed {} (round seed {round_seed}) failed: {}",
@@ -96,15 +97,18 @@ async fn run_rounds(config: &ExecutionConfig, er: &ErCtx, limit: usize) -> Resul
 }
 
 pub async fn run(config: ExecutionConfig, limit: usize) -> Result<()> {
-    let base = topology::base_only(config.clone()).await?;
     let selected = cases()?;
+    info!(
+        seed = config.seed,
+        scenarios = selected.len(),
+        concurrency = limit,
+        "continuous run started"
+    );
+    let base = topology::base_only(config.clone()).await.context("starting base stack")?;
     prepare(selected.iter().map(|(_, entry)| entry), &base).await?;
-    let base = Ok(base);
-    let group = GroupEr::boot(&DEFAULT, &base).await?;
-    let outcome = run_rounds(&config, group.ctx(), limit).await;
+    let group = GroupEr::boot(&DEFAULT, &base).await.context("starting continuous ER")?;
+    let outcome = run_rounds(&config, &base, group.ctx(), limit).await;
     let finished = group.finish().await;
-    if let Ok(base) = &base {
-        base.reclaim(OWNER);
-    }
+    base.reclaim(OWNER);
     outcome.and(finished)
 }

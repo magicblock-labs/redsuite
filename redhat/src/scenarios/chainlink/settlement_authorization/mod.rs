@@ -14,7 +14,7 @@ use redsuite_core::{
     rpc_types::response::TransactionError,
     system,
     transaction_types::UiTransactionError,
-    BaseCtx, ChainCtx, ErCtx, Result, Scenario, TxSender,
+    Account, BaseCtx, ChainCtx, ErCtx, Result, Scenario, TxSender,
 };
 use signer::Signer;
 use solana_instruction_error::InstructionError;
@@ -41,11 +41,10 @@ pub struct SettlementAuthorization {
     base: Rc<BaseCtx>,
     er: ErCtx,
     sender: TxSender,
-    pdas: Vec<Pubkey>,
+    pdas: [Pubkey; 2],
     foreign: Pubkey,
     mirrored: Pubkey,
     roles: Roles,
-    case_order: [usize; 13],
     commit_plan: commits::Plan,
     callback_plan: callbacks::Plan,
 }
@@ -81,12 +80,6 @@ impl Scenario for SettlementAuthorization {
             aliases,
             signer_alias: plan.gen_range(0..aliases),
         };
-        let mut case_order = std::array::from_fn(|index| index);
-        case_order.shuffle(&mut random::rng(
-            base.config().seed,
-            &["redhat", "settlement_authorization", "order"],
-            0,
-        ));
         let commit_plan = commits::plan(base.config().seed)?;
         let callback_plan = callbacks::plan(base.config().seed);
         let mut rng = random::rng(
@@ -95,13 +88,10 @@ impl Scenario for SettlementAuthorization {
             0,
         );
         let funder = base.seeded_payer(&mut rng, PAYER_LAMPORTS).await?;
-        let mut pdas = Vec::new();
-        for index in 0..2 {
-            pdas.push(
-                base.cells(REDSHIFT, &funder)
-                    .create_delegated(CellHeader::SIZE as u32, er.identity(), index)
-                    .await?,
-            );
+        let mut pdas = [Pubkey::default(); 2];
+        let cells = base.cells(REDSHIFT, &funder);
+        for (index, pda) in (0..).zip(&mut pdas) {
+            *pda = cells.create_delegated(CellHeader::SIZE as u32, er.identity(), index).await?;
         }
         er.await_clones(&pdas, CellHeader::SIZE).await?;
         let foreign = base
@@ -136,14 +126,37 @@ impl Scenario for SettlementAuthorization {
             foreign,
             mirrored,
             roles,
-            case_order,
             commit_plan,
             callback_plan,
         })
     }
 
-    /// Checks invocation privileges first, then settlement delivery and callback authority.
     async fn run(self) -> Result<()> {
+        // Only the ER branch stages intents. The direct base checks use separate
+        // authorities, accounts and buffers, so they do not move its shared state.
+        let (ordering, buffers, invocation) = tokio::join!(
+            self.check_commit_ordering(),
+            self.check_base_buffers(),
+            self.check_er_authorization(),
+        );
+        ordering.context("base commit successor ordering")?;
+        let payer = buffers.context("base commit buffer validation")?;
+        invocation?;
+        self.check_pending_outbox(&payer).await.context("pending buffered settlement")?;
+        self.check_callbacks().await.context("callback provenance")?;
+        self.check_capacity().await.context("shared settlement capacity")
+    }
+}
+
+impl SettlementAuthorization {
+    async fn check_er_authorization(&self) -> Result<()> {
+        self.check_invocation().await.context("settlement invocation authorization")?;
+        self.check_self_commit().await.context("mapped-signer self-commit")?;
+        self.check_fee_roles().await.context("settlement fee-vault roles")
+    }
+
+    /// Refusals must leave inputs intact, then the legitimate owners must still settle.
+    async fn check_invocation(&self) -> Result<()> {
         let payer = self.sender.payer().pubkey();
         let target = &self.pdas[self.roles.target..self.roles.target + 1];
         let aliases = vec![target[0]; self.roles.aliases];
@@ -195,7 +208,7 @@ impl Scenario for SettlementAuthorization {
         let entered_mirror = format!("Program {} invoke [2]", REDSHIFT.id());
         let mut wrong_context = MAGIC.commit(payer, None, &self.pdas, SettlementMode::Commit);
         wrong_context.accounts[1].pubkey = self.foreign;
-        let cases = [
+        let mut cases = [
             Case {
                 name: "aliased PDA signer escalation",
                 instructions: &[unsigned_cpi],
@@ -310,100 +323,119 @@ impl Scenario for SettlementAuthorization {
                 error: None,
             },
         ];
-        let mut cases = cases.map(Some);
-        let mut protected = self.pdas.clone();
-        protected.extend([payer, magic_api::MAGIC_CONTEXT_PUBKEY, self.foreign, self.mirrored]);
+        cases.shuffle(&mut random::rng(
+            self.base.config().seed,
+            &["redhat", "settlement_authorization", "order"],
+            0,
+        ));
+        let tracked = [
+            ("delegated test cell", self.pdas[0]),
+            ("delegated test cell", self.pdas[1]),
+            ("fee payer", payer),
+            ("Magic Context", magic_api::MAGIC_CONTEXT_PUBKEY),
+            ("foreign-owned cell", self.foreign),
+            ("read-only mirror", self.mirrored),
+        ];
+        let protected = tracked.map(|(_, key)| key);
         self.er.accounts(&protected).await?;
-        let case_count = cases.len();
-        for (
-            case_index,
-            Case {
-                name: case,
-                instructions,
-                refusals,
-                error: expected_error,
-            },
-        ) in self
-            .case_order
-            .map(|index| cases[index].take().expect("permission case missing from plan"))
-            .into_iter()
-            .enumerate()
-        {
-            let local = self.er.local_images(&protected).await?;
+        let local = self.er.local_images(&protected).await?;
+        for ((role, key), account) in tracked.iter().zip(&local) {
             ensure!(
-                local.iter().all(Option::is_some),
-                "#249: protected local image missing"
+                account.is_some(),
+                "{role} ({key}) not found in ER-local account scan before authorization probes"
             );
-            let base = self.base.accounts(&protected).await?;
+        }
+        let base = self.base.accounts(&protected).await?;
+        ensure!(
+            base.len() == protected.len(),
+            "expected {} base account results before authorization probes, got {}",
+            protected.len(),
+            base.len()
+        );
+        for Case {
+            name: case,
+            instructions,
+            refusals,
+            error: expected_error,
+        } in cases
+        {
             let signature = self.sender.submit(instructions).await?;
             let tx = self.er.api().await_transaction(&signature).await?;
-            let error = transaction_meta(&tx)?
-                .err
-                .as_ref()
-                .with_context(|| format!("{case}: attack unexpectedly succeeded"))?;
+            let meta = transaction_meta(&tx)?;
+            let error = meta.err.as_ref().with_context(|| {
+                format!("{case}: authorization probe {signature} unexpectedly succeeded")
+            })?;
             if let Some(expected_error) = expected_error {
                 let expected: UiTransactionError =
                     TransactionError::InstructionError(0, expected_error).into();
-                ensure!(error == &expected, "{case}: {error:?} against {expected:?}");
-            }
-            let observed = format!(
-                "{}\n{error:?}",
-                transaction_logs(transaction_meta(&tx)?).join("\n")
-            );
-            // Every group must match; alternatives within a group are ORed.
-            for alternatives in refusals {
-                ensure!(alternatives.iter().any(|needle| observed.contains(needle)));
-            }
-            let after = self.er.local_images(&protected).await?;
-            for (key, (before, after)) in protected.iter().zip(local.iter().zip(&after)) {
                 ensure!(
-                    before == after,
-                    "{case}: local state changed for {key}: {before:?} -> {after:?}"
+                    error == &expected,
+                    "{case} ({signature}): expected {expected:?}, got {error:?}"
                 );
             }
-            ensure!(
-                self.base.accounts(&protected).await? == base,
-                "{case}: base state changed"
-            );
-            for (program, targets) in
-                [(REDSHIFT, self.pdas.as_slice()), (REDHAT, std::slice::from_ref(&self.foreign))]
-            {
-                let publish = case_index % 2 == 1 || case_index + 1 == case_count;
-                let mut write = program.batch().nonce(case_index as u64 + 1).add(targets, 1);
-                if publish {
-                    write = write.settle(payer, targets, SettlementMode::Commit);
-                }
-                let signature = self
-                    .er
-                    .submit_and_confirm(
-                        self.sender.payer(),
-                        &[program.batch().inspect(targets).build(), write.build()],
-                    )
-                    .await?;
-                if publish {
-                    self.er
-                        .check_commit(&self.base, &signature, targets, false)
-                        .await?
-                        .check_success(case)?;
-                }
-                for key in targets {
-                    let index = protected.iter().position(|tracked| tracked == key).unwrap();
-                    let mut expected = local[index].clone().context("protected cell missing")?;
-                    let mut header = CellHeader::try_decode(&expected.data)?;
-                    header.value += 1;
-                    header.revision += 1;
-                    header.write(&mut expected.data)?;
-                    let actual = self.er.local_images(&[*key]).await?;
+            let logs = transaction_logs(meta);
+            let observed = format!("{error:?}");
+            // Every group must match; alternatives within a group are ORed.
+            for alternatives in refusals {
+                ensure!(
+                    alternatives.iter().any(|needle| {
+                        observed.contains(needle) || logs.iter().any(|line| line.contains(needle))
+                    }),
+                    "{case} ({signature}): expected refusal containing one of {alternatives:?}; observed {observed}; logs {logs:?}"
+                );
+            }
+            let check_unchanged = |chain, before: &[Option<Account>], after: &[Option<Account>]| {
+                ensure!(
+                    before.len() == after.len(),
+                    "{case} ({signature}): expected {} {chain} account results, got {}",
+                    before.len(),
+                    after.len()
+                );
+                for ((role, key), (before, after)) in tracked.iter().zip(before.iter().zip(after)) {
                     ensure!(
-                        actual == vec![Some(expected.clone())],
-                        "{case}: owner control {key}: {actual:?} against {expected:?}"
+                        before == after,
+                        "{case} ({signature}): {chain} state changed for {role} ({key}): {before:?} -> {after:?}"
                     );
-                    let mut committed = base[index].clone().context("base cell missing")?;
-                    if publish {
-                        committed.data = expected.data;
-                    }
-                    ensure!(self.base.account(key).await? == Some(committed));
                 }
+                Ok(())
+            };
+            check_unchanged("ER-local", &local, &self.er.local_images(&protected).await?)?;
+            check_unchanged("base", &base, &self.base.accounts(&protected).await?)?;
+        }
+        for (program, targets) in
+            [(REDSHIFT, self.pdas.as_slice()), (REDHAT, std::slice::from_ref(&self.foreign))]
+        {
+            let write =
+                program.batch().add(targets, 1).settle(payer, targets, SettlementMode::Commit);
+            let signature = self
+                .er
+                .submit_and_confirm(
+                    self.sender.payer(),
+                    &[program.batch().inspect(targets).build(), write.build()],
+                )
+                .await?;
+            self.er
+                .check_commit(&self.base, &signature, targets, false)
+                .await?
+                .check_success("owner recovery after authorization refusals")?;
+            for key in targets {
+                let index = protected
+                    .iter()
+                    .position(|tracked| tracked == key)
+                    .context("owner control is not a protected account")?;
+                let mut expected = local[index].clone().context("protected cell missing")?;
+                let mut header = CellHeader::try_decode(&expected.data)?;
+                header.value += 1;
+                header.revision += 1;
+                header.write(&mut expected.data)?;
+                let actual = self.er.local_images(&[*key]).await?;
+                ensure!(
+                    actual == vec![Some(expected.clone())],
+                    "owner control {key}: {actual:?} against {expected:?}"
+                );
+                let mut committed = base[index].clone().context("base cell missing")?;
+                committed.data = expected.data;
+                ensure!(self.base.account(key).await? == Some(committed));
             }
         }
 
@@ -443,16 +475,9 @@ impl Scenario for SettlementAuthorization {
         committed.data = expected.data;
         ensure!(self.base.account(&target[0]).await? == Some(committed));
 
-        self.check_self_commit().await?;
-        self.check_fee_roles().await?;
-        self.check_commit_ordering().await.context("#243: successor ordering")?;
-        self.check_buffers().await.context("#244: buffered settlement")?;
-        self.check_callbacks().await.context("#255: callback provenance")?;
-        self.check_capacity().await.context("#260: shared settlement capacity")
+        Ok(())
     }
-}
 
-impl SettlementAuthorization {
     /// Proves the delegated-payer self-commit exception with the validator's fee vault.
     async fn check_self_commit(&self) -> Result<()> {
         let mut rng = random::rng(

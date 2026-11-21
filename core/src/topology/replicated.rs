@@ -6,11 +6,13 @@ use std::{
 };
 
 use anyhow::{ensure, Context};
-use keypair::Keypair;
+use futures_util::future::try_join_all;
+use signer::Signer;
 use tokio::time;
-use tracing::debug;
 
-use super::{config, config::VerifierPlan, process, process::PortLease, state, RestartConfig};
+use super::{
+    config, config::VerifierPlan, identity, process, process::PortLease, state, RestartConfig,
+};
 use crate::{
     api::{Metrics, MetricsCollector},
     context::{BaseCtx, ErCtx},
@@ -25,12 +27,6 @@ pub const SERVER_CONNECTIONS: &str = "engine_replicator_server_connections";
 const VERIFIER_READY_TIMEOUT: Duration = Duration::from_secs(60);
 const CONNECT_POLL: Duration = Duration::from_millis(100);
 const SNAPSHOT_ARCHIVE: &str = "accountsdb.tar.zst";
-
-#[derive(Default)]
-pub struct ReplicatedOptions {
-    pub label: String,
-    pub verifiers: usize,
-}
 
 #[derive(Debug, Clone)]
 pub struct VerifierStop {
@@ -137,6 +133,17 @@ impl Verifier {
             exit_code: exit_status.code(),
             exit_signal: ExitStatusExt::signal(&exit_status),
         })
+    }
+
+    /// Requires a clean exit without escalating to SIGKILL.
+    pub async fn stop_gracefully(&mut self) -> Result<()> {
+        let stop = self.stop(false).await?;
+        ensure!(
+            stop.exit_code == Some(0) && !stop.needed_sigkill,
+            "verifier `{}` did not stop gracefully: {stop:?}",
+            self.label()
+        );
+        Ok(())
     }
 
     // A verifier killed before it archived a snapshot cannot reopen its
@@ -297,30 +304,33 @@ impl ReplicatedTopology {
     }
 }
 
-/// Starts fresh followers immediately. Callers with imported or different initial
-/// account state must first wait for a leader snapshot that includes that state.
-pub async fn replicated(
-    base: &BaseCtx,
-    leader: ErCtx,
-    options: ReplicatedOptions,
-) -> Result<ReplicatedTopology> {
-    ensure!(
-        options.verifiers != 0,
-        "a replicated topology needs at least one verifier"
-    );
-    let verifier_bin = config::find_verifier_bin()?;
-    let identities: Vec<Keypair> = (0..options.verifiers)
-        .map(|index| super::identity_for_label(&format!("{}-verifier{index}", options.label)))
-        .collect::<Result<_>>()?;
+pub(super) fn follower_label(leader: &str, index: usize) -> String {
+    format!("{leader}-verifier{index}")
+}
+
+/// Starts the followers admitted by this leader. Callers with imported initial
+/// state must first wait for a leader snapshot that includes that state.
+pub async fn replicated(base: &BaseCtx, leader: ErCtx) -> Result<ReplicatedTopology> {
     let owner = leader.owner().context("replication requires a group-owned leader")?;
-    let leader_params = owner.lock().await.params().clone();
+    let (label, leader_params) = {
+        let owner = owner.lock().await;
+        (owner.label().to_owned(), owner.params().clone())
+    };
+    let allowed = &leader_params.engine.replication.allowed_followers;
+    ensure!(!allowed.is_empty(), "{label} admits no followers");
+    let verifier_bin = config::find_verifier_bin()?;
 
     let dir = state::stack_dir();
     let (bin_version, bin_fingerprint) = report::binary_provenance(&verifier_bin);
 
-    let mut verifiers = Vec::with_capacity(options.verifiers);
-    for (index, identity) in identities.into_iter().enumerate() {
-        let label = format!("{}-verifier{index}", options.label);
+    let mut verifiers = Vec::with_capacity(allowed.len());
+    for (index, expected) in allowed.iter().enumerate() {
+        let label = follower_label(&label, index);
+        let identity = identity::identity_for_label(&label)?;
+        ensure!(
+            identity.pubkey() == expected.0,
+            "unexpected admitted identity for {label}"
+        );
         let storage_dir = dir.join(format!("er-{label}"));
         state::remove_storage(&storage_dir)?;
         let mut ports = PortLease::default();
@@ -331,7 +341,6 @@ pub async fn replicated(
             params: config::verifier_params(&leader_params, identity, metrics_port, storage_dir),
         };
         let log = dir.join(format!("er-{label}.log"));
-        debug!(%label, "starting verifier");
         ports.release();
         let child = plan.spawn(&log)?;
         let pid = child.id();
@@ -360,10 +369,11 @@ pub async fn replicated(
             metrics: MetricsCollector::new(metrics_url),
             ports,
         };
-        verifier.wait_ready(VERIFIER_READY_TIMEOUT).await?;
         verifiers.push(verifier);
     }
 
+    try_join_all(verifiers.iter().map(|verifier| verifier.wait_ready(VERIFIER_READY_TIMEOUT)))
+        .await?;
     Ok(ReplicatedTopology { verifiers, leader })
 }
 

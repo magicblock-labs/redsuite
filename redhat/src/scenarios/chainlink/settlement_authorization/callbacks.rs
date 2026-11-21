@@ -165,10 +165,12 @@ impl SettlementAuthorization {
         keys: &[Pubkey],
     ) -> Result<(Vec<Option<Account>>, Vec<Option<Account>>)> {
         let local = self.er.local_images(keys).await?;
-        ensure!(
-            local.iter().all(Option::is_some),
-            "protected callback image missing"
-        );
+        for (key, image) in keys.iter().zip(&local) {
+            ensure!(
+                image.is_some(),
+                "protected callback account {key} missing from the ER"
+            );
+        }
         Ok((local, self.base.accounts(keys).await?))
     }
 
@@ -523,7 +525,8 @@ impl SettlementAuthorization {
                 let mut base_handoff = handoff_before.clone();
                 base_handoff.owner = dlp::dlp_id();
                 ensure!(self.base.account(&handoff).await? == Some(base_handoff));
-                tracing::debug!(%handoff, outbox = %pending[0].0, "accepted callback survives destination redelegation");
+                tracing::debug!(%handoff, outbox = %pending[0].0,
+                    "releasing held callback after destination redelegation");
                 held.release();
                 Some(held_signature)
             } else {
@@ -764,10 +767,6 @@ impl SettlementAuthorization {
                 .collect();
             if index == 0 {
                 instructions.extend([attach, schedule]);
-                tracing::debug!(
-                    instruction = lead,
-                    "probing callback attachment before scheduling"
-                );
             } else {
                 let scheduled_slot = self.er.api().get_slot().await?;
                 let accepted = self.er.submit_and_confirm(payer, &[schedule]).await?;
@@ -787,10 +786,6 @@ impl SettlementAuthorization {
                 )
                 .await?;
                 instructions.push(attach);
-                tracing::debug!(
-                    instruction = lead,
-                    "probing callback attachment in a later transaction"
-                );
             }
             let before = self.callback_images(keys).await?;
             let signature = sender.submit(&instructions).await?;
@@ -805,7 +800,7 @@ impl SettlementAuthorization {
                         )
                         .into()
                     ),
-                "callback attachment scope {index}: {:?}",
+                "callback attachment scope {index}, instruction {lead}: {:?}",
                 meta.err
             );
             ensure!(

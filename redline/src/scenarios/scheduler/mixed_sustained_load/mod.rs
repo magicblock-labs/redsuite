@@ -243,7 +243,7 @@ impl Scenario<(ScenarioReport, Result<()>)> for MixedSustainedLoad {
             profile,
             pool,
             payer_bytes,
-            base_config: base.config(),
+            base_config: base.config().clone(),
             started,
         })
     }
@@ -288,13 +288,6 @@ impl Scenario<(ScenarioReport, Result<()>)> for MixedSustainedLoad {
         )
         .await?;
 
-        let outcome = &executed.outcome;
-        debug!(
-            outcome.delivered,
-            outcome.failed,
-            delivered_tps = outcome.achieved_rps(),
-            "load requests drained"
-        );
         let mut report = executed.report(self.profile, &load, setup, (rate, concurrency, threads));
         let validation = executed.check(er, self.profile, &self.pool, baseline, &mut report).await;
         let completion = load.completion(&validation);
@@ -454,13 +447,6 @@ impl Executed {
         }
         check!(engine_txs >= total as f64);
 
-        if let Some(rpc_handled) = rpc_handled {
-            debug!(rpc_handled, total, "RPC processing window");
-        }
-        if let Some(rpc_accepted) = rpc_accepted {
-            debug!(rpc_accepted, total, "RPC acceptance window");
-        }
-
         let accounts = read_final_state(er, pool, &self.last_ids).await?;
         let verified = verify_final_state(
             &accounts,
@@ -471,7 +457,9 @@ impl Executed {
         check_ok(verified, "workload final state changed after settling");
 
         debug!(
-            total,
+            delivered = total,
+            rpc_handled,
+            rpc_accepted,
             delivered_tps = outcome.achieved_rps(),
             executed_tps,
             "sustained workload finished",

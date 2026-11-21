@@ -10,12 +10,11 @@ use std::{
 
 pub use bmf::bmf;
 use json::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use tracing::warn;
 
 use crate::{
-    resources::LaunchRecord, runner::RunOutcome, scenario::RunRecord, stats::ObservationsStats,
-    topology, Result,
+    logging::strip_ansi, resources::LaunchRecord, runner::RunOutcome, scenario::RunRecord,
+    stats::ObservationsStats, topology, Result,
 };
 
 pub const SCHEMA_VERSION: u32 = 3;
@@ -293,12 +292,6 @@ pub(crate) fn binary_provenance(path: &Path) -> (String, String) {
     (binary_version(path), fingerprint(path))
 }
 
-pub fn binary_hash(path: &Path) -> std::io::Result<String> {
-    let mut hash = Sha256::new();
-    std::io::copy(&mut fs::File::open(path)?, &mut hash)?;
-    Ok(format!("{:x}", hash.finalize()))
-}
-
 // A validator prints its version and then its shutdown log lines; only the
 // first line names the build, and terminal colour codes are noise.
 fn binary_version(path: &Path) -> String {
@@ -313,22 +306,7 @@ fn binary_version(path: &Path) -> String {
 
 fn version_line(output: &str) -> Option<String> {
     let line = output.lines().map(str::trim).find(|line| !line.is_empty())?;
-    let mut cleaned = String::with_capacity(line.len());
-    let mut chars = line.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\u{1b}' {
-            if chars.peek() == Some(&'[') {
-                for next in chars.by_ref() {
-                    if next.is_ascii_alphabetic() {
-                        break;
-                    }
-                }
-            }
-            continue;
-        }
-        cleaned.push(ch);
-    }
-    Some(cleaned)
+    Some(strip_ansi(line).into_owned())
 }
 
 fn fingerprint(path: &Path) -> String {

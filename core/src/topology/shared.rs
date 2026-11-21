@@ -114,7 +114,7 @@ async fn boot_base(config: ExecutionConfig) -> Result<StackState> {
         identity::write_vault_dump(&plan.genesis_accounts, &reserved.pubkey())?;
     }
     identity::reset_pool(&dir);
-    debug!("starting base L1");
+    debug!(log = %base_log.display(), "starting base");
     base_ports.release();
     let base_pid = process::spawn_detached(plan.command(), &base_log)?;
     let state = StackState {
@@ -171,11 +171,9 @@ async fn await_base_ready(
     for account in required {
         ensure!(
             base.account(&account).await?.is_some(),
-            "required account missing on the freshly booted base — \
-                 genesis injection or the clone from {} failed; check \
-                 {}",
-            state.clone_url,
-            config::CLONE_URL_ENV
+            "required account {account} missing on the freshly booted base (RPC port {}, log: {})",
+            state.base_rpc_port,
+            base_log.display()
         );
     }
     Ok(())

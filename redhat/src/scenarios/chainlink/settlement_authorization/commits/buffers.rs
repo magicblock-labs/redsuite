@@ -50,7 +50,7 @@ pub(super) fn plan(seed: u64) -> Result<Plan> {
 
 impl SettlementAuthorization {
     /// Checks buffer authority, nonce/account binding, completeness, and rollback on failed use.
-    pub(in super::super) async fn check_buffers(&self) -> Result<()> {
+    pub(in super::super) async fn check_base_buffers(&self) -> Result<Keypair> {
         let plan = &self.commit_plan.buffers;
         let markers = &plan.markers;
         let mut fixtures = random::rng(
@@ -218,12 +218,12 @@ impl SettlementAuthorization {
         ensure!(self.base.accounts(&[chunks, buffer]).await?.iter().all(Option::is_none));
         fixture.commit(3, markers[4], true).await?;
         other.commit(2, markers[4], true).await?;
-        self.check_pending_outbox(&payer).await
+        Ok(payer)
     }
 
     /// Holds real buffered delivery while attacking its accepted outbox and substituted rows.
     /// The held work is resumed afterward to distinguish protection from a stuck pipeline.
-    async fn check_pending_outbox(&self, attacker: &Keypair) -> Result<()> {
+    pub(in super::super) async fn check_pending_outbox(&self, attacker: &Keypair) -> Result<()> {
         let plan = &self.commit_plan.buffers;
         let faults = self.er.faults()?;
         let mut large = Vec::new();
@@ -346,7 +346,6 @@ impl SettlementAuthorization {
                 let state = Chunks::try_from_slice(&image.data)?;
                 ensure!(state.count() == chunk_count && state.chunk_size() == chunk_size);
                 ensure!(chunk_count > 0 && !state.is_complete());
-                tracing::debug!(%pubkey, %buffer, commit_id, buffer_account_size, "held buffer preparation");
                 initialized.get_or_insert((pubkey, buffer, chunks, commit_id));
             }
         }
@@ -396,7 +395,7 @@ impl SettlementAuthorization {
         let mut bundle = OUTBOX_INTENT_DISCRIMINATOR.to_vec();
         bundle.extend(plan.forged_intent.to_le_bytes());
         bundle.resize(OUTBOX_INTENT_DISCRIMINATOR.len() + OUTBOX_BUNDLE_BODY, 0);
-        tracing::debug!(intent_id, %outbox, forged_intent = plan.forged_intent, %forged, "outbox substitution targets");
+        tracing::debug!(intent_id, %outbox, %buffer, "outbox delivery held during buffer write");
         let stage = ExecutionStage::SingleStage(PendingTransaction {
             signature: write_signature,
             blockhash: self.base.api().get_latest_blockhash().await?,
@@ -448,10 +447,12 @@ impl SettlementAuthorization {
             substitutions.into_iter().enumerate()
         {
             let local = self.er.local_images(&keys).await?;
-            ensure!(
-                local.iter().all(Option::is_some),
-                "{substitution}: protected outbox image missing"
-            );
+            for (key, image) in keys.iter().zip(&local) {
+                ensure!(
+                    image.is_some(),
+                    "{substitution}: protected outbox account {key} missing from the ER"
+                );
+            }
             let base = self.base.accounts(&keys).await?;
             for (operation, expected) in &operations {
                 for &unsigned in unsigned_variants {
@@ -476,7 +477,6 @@ impl SettlementAuthorization {
                     } else {
                         expected.clone()
                     };
-                    tracing::debug!(substitution, %row, unsigned, ?error, "forged outbox operation");
                     let tx = Signed::from_versioned(
                         &self.er,
                         attacker,
@@ -485,7 +485,9 @@ impl SettlementAuthorization {
                     )
                     .await?;
                     ensure!(tx.send_config(&self.er, true).await?? == tx.signature.to_string());
-                    tx.outcome(&self.er).await?;
+                    tx.outcome(&self.er)
+                        .await
+                        .with_context(|| format!("{substitution} on {row}, unsigned={unsigned}"))?;
                     ensure!(self.er.local_images(&keys).await? == local);
                     ensure!(self.base.accounts(&keys).await? == base);
                     ensure!(

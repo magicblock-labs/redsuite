@@ -159,8 +159,8 @@ Install Rust through `rustup`. In the RedSuite checkout, using the same shell:
 ```
 
 The wrapper caches the pinned runtime and release fixtures separately, then
-executes your command unchanged. It logs the selected runtime and fixture paths
-once per invocation and neither builds nor substitutes MagicBlock.
+executes your command unchanged. It reports the selected runtime and fixture
+paths at `debug` and neither builds nor substitutes MagicBlock.
 Runtime and fixture archives come from their independently pinned releases. When developing packaging
 recipes before their assets are published, use `REDSUITE_ASSETS_DIR` with
 [locally assembled archives](packaging/README.md#assemble-locally); ordinary
@@ -247,10 +247,10 @@ configuration or a fresh ER are skipped. The first failure stops admission and
 returns a nonzero status after running scenarios finish. Continuous runs do not
 write Redline reports.
 
-Each round logs its order and a seed derived from the run seed at `debug`. Pass
-the logged run seed to `--seed` on a fresh stack (`redsuite stack down`) to replay
-the same orders; a stack rejects seeded fixtures it has already created. Scenario
-timing and interleaving are not reproduced.
+At `debug`, each round logs its derived seed and the scenarios log as they
+start. Pass the suite's run seed to `--seed` on a fresh stack
+(`redsuite stack down`) to replay the same orders; a stack rejects seeded
+fixtures it has already created. Scenario timing and interleaving are not reproduced.
 
 At `debug`, periodic logs retain interval observations without keeping every
 request in memory.
@@ -294,13 +294,14 @@ harness also reclaims private rollups left behind by failed scenarios.
 
 ## 📊 Results and diagnostics
 
-At the default `info` level, scenarios log their start and pass verdict. Set
-`RUST_LOG=debug` for probe details, workload progress, seeds, and scheduling.
+At the default `info` level, the suite prints its selection and seed, then a
+summary with elapsed time on success. Set `RUST_LOG=debug` for per-scenario
+timings, workload progress, and observations that help explain a failure.
 Redshift and Redhat return console verdicts without persisting benchmark reports.
 Stage errors retain method context and scenario failures include their replay seed.
-Failures also print up to 20 recent WARN/ERROR lines per locally managed validator,
-reading at most 1 MiB from each current or previous-boot log. These excerpts can
-include earlier scenarios; full log paths are included for further inspection.
+Failures identify the relevant local validator logs. At `debug`, they also
+include up to eight recent WARN/ERROR lines per validator from current or
+previous-boot logs. These excerpts can include earlier scenarios.
 `RUST_LOG` also applies to launched validators. A failed run returns a nonzero
 exit status.
 

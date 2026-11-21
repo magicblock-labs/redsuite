@@ -2,6 +2,7 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     rc::Rc,
+    time::Duration,
 };
 
 use accountsdb::AccountsDB;
@@ -15,13 +16,14 @@ use pubkey::Pubkey;
 use redsuite_core::{
     api::transaction_meta,
     random,
-    topology::{self, ReplicatedOptions, ReplicatedTopology, RestartConfig},
+    topology::{self, ReplicatedTopology, RestartConfig},
     wait, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
 use solana_slot_hashes::SlotHashes;
 use tokio::{process::Command, time};
 use v42_calculator_interface::{builder::Expr, ID as CALCULATOR};
 
+use super::observations::{fence, snapshots};
 use super::runtime::{self, Images, Runtime, TIMEOUT};
 
 pub(crate) const LABEL: &str = "snapshot-bootstrap";
@@ -34,6 +36,8 @@ const ACCOUNTS: [(Pubkey, AccountMode); 3] = [
 
 pub(crate) fn settings(params: &mut LeaderParams) {
     super::settings(params);
+    params.engine.blockstore.blocktime = Duration::from_millis(20);
+    params.engine.blockstore.superblock = 64;
     params.programs = vec![LoadableProgram {
         id: magicblock_config::types::SerdePubkey(CALCULATOR),
         path: calculator_path(),
@@ -141,18 +145,10 @@ impl SnapshotBootstrap {
         .await?;
         er.submit_and_confirm(&payer, &[Expr::lit(VALUE + 1).compose(SCRATCH, &[])])
             .await?;
-        let topology = topology::replicated(
-            &self.fixture.base,
-            er.clone(),
-            ReplicatedOptions {
-                label: LABEL.into(),
-                verifiers: 1,
-            },
-        )
-        .await?;
+        let topology = topology::replicated(&self.fixture.base, er.clone()).await?;
         topology.wait_verifiers_connected(TIMEOUT).await?;
         ensure!(
-            runtime::snapshots(topology.verifier(0)).await? >= 1.0,
+            snapshots(topology.verifier(0)).await? >= 1.0,
             "empty verifier did not install a snapshot"
         );
         Ok(topology)
@@ -162,21 +158,17 @@ impl SnapshotBootstrap {
         let er = &self.fixture.er;
         let expected = self.fixture.images(&ACCOUNTS).await?;
         let signatures = self.fixture.signatures(&[SCRATCH]).await?;
-        runtime::fence(topology).await?;
+        fence(topology).await?;
         runtime::inspect(topology.verifier_mut(0), &expected, &signatures).await?;
 
         self.restart(&expected, RestartConfig::default()).await?;
         topology.verifier_mut(0).start(TIMEOUT).await?;
         topology.wait_verifiers_connected(TIMEOUT).await?;
-        runtime::fence(topology).await?;
+        fence(topology).await?;
         ensure!(
-            runtime::snapshots(topology.verifier(0)).await? == 0.0,
+            snapshots(topology.verifier(0)).await? == 0.0,
             "warm verifier downloaded another snapshot"
         );
-        runtime::inspect(topology.verifier_mut(0), &expected, &signatures).await?;
-
-        topology.verifier_mut(0).start(TIMEOUT).await?;
-        topology.wait_verifiers_connected(TIMEOUT).await?;
         let before = er.api().get_signatures_for_address(&SCRATCH, 32).await?;
         let output = time::timeout(
             TIMEOUT,
@@ -206,9 +198,25 @@ impl SnapshotBootstrap {
         let tx = er.api().await_transaction(&signature).await?;
         ensure!(transaction_meta(&tx)?.err.is_none());
         let expected = self.fixture.images(&ACCOUNTS).await?;
-        runtime::fence(topology).await?;
-        ensure!(runtime::snapshots(topology.verifier(0)).await? == 0.0);
-        runtime::inspect(topology.verifier_mut(0), &expected, &[(signature, tx.slot)]).await
+        fence(topology).await?;
+        ensure!(snapshots(topology.verifier(0)).await? == 0.0);
+
+        // Reuse the verifier identity but remove its state. The imported
+        // account still requires the archived baseline before replaying the tail.
+        let verifier = topology.verifier_mut(0);
+        verifier.stop_gracefully().await?;
+        verifier.reset_storage()?;
+        verifier.start(TIMEOUT).await?;
+        topology.wait_verifiers_connected(TIMEOUT).await?;
+        fence(topology).await?;
+        ensure!(
+            snapshots(topology.verifier(0)).await? >= 1.0,
+            "wiped verifier did not install a snapshot"
+        );
+
+        let mut signatures = signatures;
+        signatures.push((signature, tx.slot));
+        runtime::inspect(topology.verifier_mut(0), &expected, &signatures).await
     }
 
     async fn restart(&self, expected: &Images, config: RestartConfig) -> Result<()> {
@@ -243,7 +251,7 @@ fn non_genesis(archive: &Path, expected: &Images) -> Result<tempfile::TempDir> {
                     .is_some_and(|(slot, hash)| *slot > 0 && *hash != Default::default()),
             "fixture has no nonzero hash-chain anchor"
         );
-        let mut owners = topology::local_account_owners();
+        let mut owners = topology::local_account_owners().to_vec();
         owners.extend([runtime::FEATURES, sdk_ids::sysvar::ID, CALCULATOR]);
         owners.sort_unstable();
         owners.dedup();

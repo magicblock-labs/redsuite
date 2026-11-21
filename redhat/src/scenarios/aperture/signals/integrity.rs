@@ -2,11 +2,11 @@ use super::{
     channels::Channels, fixture, storage::PayloadFault, BaseCtx, ErCtx, Result, Scenario, TIMEOUT,
 };
 use anyhow::{bail, ensure, Context};
-use redshift::scenarios::replication::replication_recovery::{
+use redshift::scenarios::replication::observations::{
     await_catch_up, leader_metric, log_mentions_mismatch, TRANSACTIONS,
 };
 use redsuite_core::{
-    topology::{self, ReplicatedOptions, ReplicatedTopology},
+    topology::{self, ReplicatedTopology},
     transport::NETWORK_TIMEOUT,
     wait,
 };
@@ -53,15 +53,7 @@ impl Scenario for DivergenceSignals {
             },
         )
         .await?;
-        let topology = topology::replicated(
-            &base,
-            er,
-            ReplicatedOptions {
-                label: "signal-integrity".into(),
-                verifiers: 1,
-            },
-        )
-        .await?;
+        let topology = topology::replicated(&base, er).await?;
         Ok(Self { base, topology })
     }
 

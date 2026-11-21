@@ -12,7 +12,7 @@ use redsuite_core::{
     runner::{Pacing, RunOutcome, ThreadRunConfig},
     BaseCtx, ChainCtx, ErCtx, MetricsDelta, Result, Scenario, ScenarioReport,
 };
-use tracing::{debug, instrument};
+use tracing::instrument;
 
 use crate::ACCOUNT_SPACE;
 
@@ -58,7 +58,6 @@ const PROFILES: ProfileValues<Profile> = ProfileValues { lite: LITE, full: FULL 
 
 /// One thread-count measurement with optional validator-side execution timing.
 struct CellOutcome {
-    threads: usize,
     outcome: RunOutcome,
     tx_processing_avg_us: Option<f64>,
 }
@@ -97,7 +96,7 @@ impl Scenario<(ScenarioReport, Result<()>)> for LoadGeneratorThreadScaling {
     /// Splits the requested duration between single- and multi-thread driver phases after warmup.
     async fn run(self) -> Result<(ScenarioReport, Result<()>)> {
         self.warm_up().await?;
-        let options = crate::RunControl::from_config(&self.base.config())?;
+        let options = crate::RunControl::from_config(self.base.config())?;
         let mut cursor = self.profile.warmup;
         let mut cells = Vec::new();
         let result: Result<()> = async {
@@ -201,18 +200,11 @@ impl LoadGeneratorThreadScaling {
         *id_offset += self.profile.iterations;
 
         let cell = CellOutcome {
-            threads,
             outcome,
             tx_processing_avg_us: delta
                 .histogram_avg(TX_PROCESSING_HISTOGRAM)
                 .map(|seconds| seconds * 1e6),
         };
-        debug!(
-            cell.threads,
-            cell.outcome.delivery.median,
-            cell.tx_processing_avg_us,
-            "protocol boundary cell finished",
-        );
         cell.outcome.check_failures();
 
         Ok(cell)

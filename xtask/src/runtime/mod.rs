@@ -117,7 +117,7 @@ pub fn exec(command: impl IntoIterator<Item = OsString>, runtime_only: bool) -> 
             None => acquire(&config.fixture_name(), "fixtures", &config.fixtures.release)?,
         })
     };
-    tracing::info!(runtime = %runtime.display(), fixtures = ?fixtures, "using RedSuite dependencies");
+    tracing::debug!(runtime = %runtime.display(), fixtures = ?fixtures, "using RedSuite dependencies");
     let mut cmd = Command::new("bash");
     cmd.arg(root().join("xtask/assets/runtime-env"))
         .arg(runtime)

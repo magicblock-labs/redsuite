@@ -16,14 +16,13 @@ use redsuite_core::{
 };
 use signature::Signature;
 use signer::Signer;
-use tracing::instrument;
+use tracing::{debug, instrument};
 use transaction::Transaction;
 
 use crate::PAYER_LAMPORTS;
 
 const TIMEOUT: Duration = Duration::from_secs(30);
-// The 1,200-slot blockhash window already takes 60s at 50ms/slot;
-// allow additional time for delayed block production in CI.
+// Engine converts its one-minute hash lifetime to slots at the configured block time.
 const BLOCKHASH_EXPIRY_TIMEOUT: Duration = Duration::from_secs(180);
 const COPIES: usize = 32;
 
@@ -288,6 +287,12 @@ impl Mode {
                             ensure!(tx.valid(er).await?);
                         }
                         er.restart(RestartConfig::default()).await?;
+                        // A restart can evict pre-restart hashes independently of the
+                        // persisted signature history. Report which path this run exercises.
+                        for (tx, _) in &probes[first..] {
+                            let blockhash_valid = tx.valid(er).await?;
+                            debug!(signature = %tx.signature, blockhash_valid, "replay probe after restart");
+                        }
                     }
                     ensure!(state(er, &keys).await? == expected);
                     let start = er.api().get_slot().await? + 1;

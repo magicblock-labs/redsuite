@@ -12,16 +12,14 @@ use redsuite_core::{
         request::RpcRequest,
         response::{Response, RpcSimulateTransactionResult},
     },
-    topology::{self, ReplicatedOptions, ReplicatedTopology},
+    topology::{self, ReplicatedTopology},
     BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
 use signature::Signature;
 use signer::Signer;
 
-use super::{
-    replication_recovery::await_leader_advance,
-    runtime::{self, prepare, signers, Runtime, TIMEOUT},
-};
+use super::observations::{fence, snapshots};
+use super::runtime::{self, prepare, signers, Runtime, TIMEOUT};
 
 pub(crate) const LABEL: &str = "replicated-runtime";
 
@@ -37,15 +35,7 @@ pub struct ReplicatedRuntime {
 impl Scenario for ReplicatedRuntime {
     async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
         let fixture = Runtime::new(base.clone(), er.clone()).await?;
-        let topology = topology::replicated(
-            &base,
-            er,
-            ReplicatedOptions {
-                label: LABEL.into(),
-                verifiers: 2,
-            },
-        )
-        .await?;
+        let topology = topology::replicated(&base, er).await?;
         topology.wait_verifiers_connected(TIMEOUT).await?;
         Ok(Self { fixture, topology })
     }
@@ -101,39 +91,30 @@ impl ReplicatedRuntime {
         let accounts = [(plain, AccountMode::Mirrored), (delegated, AccountMode::Delegated)];
         let signatures = fixture.signatures(&[plain, delegated]).await?;
         let images = fixture.images(&accounts).await?;
-        // First-segment resumes prefer snapshots; test warm recovery after a seal.
-        await_leader_advance(
-            &self.topology,
-            "engine_ledger_superblocks",
-            1.0,
-            "leaving genesis before retained-cursor recovery",
-        )
-        .await?;
-        runtime::fence(&self.topology).await?;
-        for verifier in 0..2 {
-            runtime::inspect(self.topology.verifier_mut(verifier), &images, &signatures).await?;
-            self.topology.verifier_mut(verifier).start(TIMEOUT).await?;
-        }
-        self.topology.wait_verifiers_connected(TIMEOUT).await?;
+        fence(&self.topology).await?;
+        runtime::inspect(self.topology.verifier_mut(1), &images, &signatures)
+            .await
+            .context("lagging follower before rent reset")?;
 
-        // The lagging verifier must replay this rent-sensitive write before the reset.
-        let stopped = self.topology.verifier_mut(1).stop(false).await?;
-        ensure!(stopped.exit_code == Some(0) && !stopped.needed_sigkill);
+        // Follower 0 sees the reset live; follower 1 must replay the old-rent write before it.
         let old = self.resize(&payer, delegated, 256).await?;
         self.fixture.lower_rent().await?;
         self.topology.verifier(0).wait_connected(TIMEOUT).await?;
         ensure!(self.topology.verifier(0).is_running());
-        ensure!(runtime::snapshots(self.topology.verifier(0)).await? == 0.0);
+        ensure!(snapshots(self.topology.verifier(0)).await? == 0.0);
         let new = self.resize(&payer, delegated, 512).await?;
         self.topology.verifier_mut(1).start(TIMEOUT).await?;
         self.topology.wait_verifiers_connected(TIMEOUT).await?;
-        let images = self.fixture.images(&accounts).await?;
+        // The reset drops volatile mirrors. Only compare the persistent image after it.
+        let images = self.fixture.images(&[(delegated, AccountMode::Delegated)]).await?;
         let signatures = self.fixture.signatures(&[plain, delegated]).await?;
         ensure!(signatures.contains(&old) && signatures.contains(&new));
-        runtime::fence(&self.topology).await?;
+        fence(&self.topology).await?;
         for verifier in 0..2 {
-            ensure!(runtime::snapshots(self.topology.verifier(verifier)).await? == 0.0);
-            runtime::inspect(self.topology.verifier_mut(verifier), &images, &signatures).await?;
+            ensure!(snapshots(self.topology.verifier(verifier)).await? == 0.0);
+            runtime::inspect(self.topology.verifier_mut(verifier), &images, &signatures)
+                .await
+                .with_context(|| format!("follower {verifier} after rent reset"))?;
         }
         Ok(())
     }

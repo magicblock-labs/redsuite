@@ -148,11 +148,6 @@ impl Scenario for TransactionAuthority {
                     privileged == privileged_before,
                     "privileged state changed: {privileged:?} against {privileged_before:?}"
                 );
-                tracing::debug!(
-                    skip_preflight,
-                    impersonate,
-                    "private wire authority rejected before execution"
-                );
             }
             fixture.check_control(message, 1, 1, skip_preflight).await?;
         }
@@ -269,11 +264,6 @@ impl Scenario for TransactionAuthority {
                     privileged == privileged_before,
                     "privileged state changed: {privileged:?} against {privileged_before:?}"
                 );
-                tracing::debug!(
-                    case = label,
-                    skip_preflight,
-                    "privileged instruction rejected during execution"
-                );
                 let repaired = fixture.message(nonce + 1, 1, &[]).await?;
                 fixture
                     .check_control(VersionedMessage::Legacy(repaired), 1, 1, skip_preflight)
@@ -373,11 +363,10 @@ impl Scenario for TransactionAuthority {
                 .await?;
             if record.is_none() {
                 fixture.not_admitted(&tx.signature, start, Some(&control)).await?;
-                tracing::debug!(
-                    skip_preflight,
-                    acknowledged,
-                    "foreign writable account refused without an execution record"
-                );
+                if acknowledged {
+                    tracing::debug!(signature = %tx.signature, skip_preflight,
+                        "foreign write acknowledged without an execution record");
+                }
             }
         }
         Ok(())

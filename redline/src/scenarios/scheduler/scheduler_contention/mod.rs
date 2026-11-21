@@ -459,7 +459,7 @@ impl Scenario<(ScenarioReport, Result<()>)> for SchedulerContention {
     /// Verifies each measured batch and reports the last retained batch rather than pooled windows.
     async fn run(mut self) -> Result<(ScenarioReport, Result<()>)> {
         let (executors, contention_lanes) = self.calibrate().await?;
-        let options = crate::RunControl::from_config(&self.base.config())?;
+        let options = crate::RunControl::from_config(self.base.config())?;
         let deadline = options.deadline()?;
         let mut batches = Vec::new();
         let mut batch = 0;
@@ -469,11 +469,6 @@ impl Scenario<(ScenarioReport, Result<()>)> for SchedulerContention {
                     .measure_batch(batch, contention_lanes, deadline, options.stop.clone())
                     .await?;
                 self.check_batch(batch, &outcome).await?;
-                tracing::debug!(
-                    batch,
-                    chain_txs = outcome.phases.iter().map(|phase| phase.chain_txs).sum::<u64>(),
-                    "verified scheduler window"
-                );
                 batches.clear();
                 batches.push(outcome);
                 batch += 1;
@@ -641,10 +636,6 @@ impl SchedulerContention {
             outcome.phases.first().map_or(0, |phase| phase.chains) * self.profile.pairs as u64;
         check!(outcome.dependencies >= contention_chains as f64);
         verify_pairs(&self.er, &mut self.pairs, batch).await?;
-        debug!(
-            batch,
-            outcome.dependencies, "contention batch drained; all pairs match accepted fold",
-        );
 
         Ok(())
     }

@@ -7,6 +7,7 @@ use std::{
 use super::{process, state};
 use crate::Result;
 use anyhow::Context;
+use tracing::warn;
 
 const STACK_STORAGE: &[&str] = &["base-ledger", "genesis-accounts"];
 
@@ -52,39 +53,22 @@ fn describe_orphans(exclude: &[u32]) {
 
 pub fn down() -> Result<()> {
     let mut known = Vec::new();
-    match state::read_state() {
-        None => println!("no shared stack to stop"),
-        Some(state) => {
-            if process::proc_matches(state.base_pid, &state.base_bin) {
-                println!("stopping base (pid {})", state.base_pid);
-                process::kill_pid(state.base_pid);
-            }
-            known.push(state.base_pid);
-            if let Err(error) = fs::remove_file(state::state_path()) {
-                if error.kind() != ErrorKind::NotFound {
-                    return Err(error.into());
-                }
+    if let Some(state) = state::read_state() {
+        if process::proc_matches(state.base_pid, &state.base_bin) {
+            process::kill_pid(state.base_pid);
+        }
+        known.push(state.base_pid);
+        if let Err(error) = fs::remove_file(state::state_path()) {
+            if error.kind() != ErrorKind::NotFound {
+                return Err(error.into());
             }
         }
     }
     for (pid, cmdline) in process::orphaned_topology_processes(&state::stack_dir(), &known) {
-        println!("stopping orphaned topology process (pid {pid}): {cmdline}");
+        warn!(pid, %cmdline, "stopping orphaned topology process");
         process::kill_pid(pid);
     }
-    let wiped = wipe_storage()?;
-    if wiped.is_empty() {
-        println!("stack down");
-    } else {
-        let stack_dir = state::stack_dir();
-        let names: Vec<String> = wiped
-            .iter()
-            .map(|path| match path.strip_prefix(&stack_dir) {
-                Ok(name) => name.display().to_string(),
-                Err(_) => path.display().to_string(),
-            })
-            .collect();
-        println!("stack down, removed {}", names.join(", "));
-    }
+    wipe_storage()?;
     Ok(())
 }
 

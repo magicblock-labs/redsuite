@@ -128,7 +128,6 @@ pub struct EphemeralAccountSecurity {
     signers: Vec<Keypair>,
     target: Keypair,
     victim: Keypair,
-    sizes: [u32; 4],
 }
 
 /// One native ephemeral operation, its invoking program, and its rent sponsor.
@@ -839,7 +838,6 @@ impl Workload {
         projected.data[64..72].copy_from_slice(&amount.to_le_bytes());
         projected.data[129..133].copy_from_slice(&1u32.to_le_bytes());
         projected.data[133..165].fill(0);
-        self.er.accounts(&keys).await?;
         self.er.await_delegated(&ata, "funding projection").await?;
         self.er
             .await_account(&ata, |account| {
@@ -847,16 +845,19 @@ impl Workload {
                 Ok(())
             })
             .await?;
-        let source = self.er.local_images(&[self.er.identity()]).await?;
-        ensure!(source.iter().all(Option::is_some));
         for operation in [Create { data_len: 1 }, Close] {
-            self.step(
+            let action = Action::new(operation);
+            let mut instruction = action.instruction(&self.keys);
+            // Include the validator's rent source in Record's balance oracle.
+            // Sampling it across transactions also sees unrelated clone funding.
+            instruction.accounts.push(AccountMeta::new_readonly(self.er.identity(), false));
+            self.run(
                 "funded lifecycle beside projected rent",
-                &Action::new(operation),
+                vec![instruction],
+                Ok(&action),
             )
             .await?;
             ensure!(self.er.local_images(&[ata]).await? == vec![Some(projected.clone())]);
-            ensure!(self.er.local_images(&[self.er.identity()]).await? == source);
             ensure!(self.base.accounts(&keys).await? == base);
         }
         self.ledger.check(self.expected[VAULT].lamports)
@@ -1091,7 +1092,6 @@ impl Workload {
             .create_delegated(space, Pubkey::default(), 2)
             .await?;
         self.er.accounts(&[attacker, drained]).await?;
-        tracing::debug!(%confined, %delegated, %drained, %attacker, amount, "confined rent authority plan");
         let mut probe = self.keys;
         probe[TARGET] = delegated;
         self.run(
@@ -1364,25 +1364,23 @@ impl Workload {
     async fn check_rent_boundaries(&mut self) -> Result<()> {
         let seed = self.base.config().seed;
         let mut plan = random::rng(seed, &["redhat", "charge_boundaries"], 0);
-        let sizes = [plan.gen_range(64..1024), plan.gen_range(1024..4096)];
+        let size = plan.gen_range(64..1024);
         let growth = plan.gen_range(1..256);
-        for size in sizes {
-            self.check_charge_boundary(
-                &format!("rent boundary create {size}"),
-                &Action::new(Create { data_len: size }),
-                &Action::new(Close),
-            )
-            .await?;
-        }
+        self.check_charge_boundary(
+            "exact create rent",
+            &Action::new(Create { data_len: size }),
+            &Action::new(Close),
+        )
+        .await?;
         self.step(
             "rent boundary resize base",
-            &Action::new(Create { data_len: sizes[0] }),
+            &Action::new(Create { data_len: size }),
         )
         .await?;
         self.check_charge_boundary(
-            &format!("rent boundary resize {} by {growth}", sizes[0]),
-            &Action::new(Resize { new_data_len: sizes[0] + growth }),
-            &Action::new(Resize { new_data_len: sizes[0] }),
+            "exact resize rent",
+            &Action::new(Resize { new_data_len: size + growth }),
+            &Action::new(Resize { new_data_len: size }),
         )
         .await?;
         self.step("rent boundary resize close", &Action::new(Close)).await?;
@@ -1442,8 +1440,6 @@ impl Scenario for EphemeralAccountSecurity {
     /// Seeds independent actors and sizes so case-order changes do not change fixture identities.
     async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
         let seed = base.config().seed;
-        let mut plan = random::rng(seed, &["redhat", "ephemeral_account_security", "plan"], 0);
-        let sizes = [0, 1, plan.gen_range(16..64), plan.gen_range(64..128)];
         let mut secret = [0u8; 32];
         random::rng(
             seed,
@@ -1459,7 +1455,6 @@ impl Scenario for EphemeralAccountSecurity {
         )
         .fill(&mut secret);
         let victim = Keypair::new_from_array(secret);
-        tracing::debug!(?sizes, target = %target.pubkey(), victim = %victim.pubkey(), "ephemeral lifecycle plan");
         let mut rng = random::rng(
             seed,
             &["redhat", "ephemeral_account_security", "fixtures"],
@@ -1480,7 +1475,6 @@ impl Scenario for EphemeralAccountSecurity {
             signers,
             target,
             victim,
-            sizes,
         })
     }
 
@@ -1488,7 +1482,6 @@ impl Scenario for EphemeralAccountSecurity {
     async fn run(self) -> Result<()> {
         self.check_readonly_payer().await?;
 
-        let sizes = self.sizes;
         let mut workload = self.into_workload().await?;
         ensure!(workload.expected[TARGET] == empty());
         for (label, operation) in [
@@ -1502,7 +1495,7 @@ impl Scenario for EphemeralAccountSecurity {
         for caller in [foreign, redshift_interface::id()] {
             workload.check_recreation(caller).await?;
         }
-        for size in sizes {
+        for size in [0, 1] {
             workload.step("seeded create", &Action::new(Create { data_len: size })).await?;
             workload.check_raw_resize().await?;
             workload

@@ -18,7 +18,9 @@ use tracing::warn;
 use url::Url;
 
 use super::config;
-use crate::{api::Api, host::proc_running, resources::ResourceRecord, Result};
+use crate::{
+    api::Api, host::proc_running, logging::read_log_tail, resources::ResourceRecord, Result,
+};
 
 pub(super) const KILL_GRACE: Duration = Duration::from_secs(5);
 pub(super) const POLL: Duration = Duration::from_millis(250);
@@ -332,25 +334,31 @@ where
             liveness_checked = now;
             ensure!(
                 proc_running(pid),
-                "process exited while waiting for {what}; log tail:\n{}",
-                tail(log, 30)
+                "process {pid} exited while waiting for {what} (log: {}):\n{}",
+                log.display(),
+                startup_excerpt(log)
             );
         }
         ensure!(
             time::Instant::now() < deadline,
-            "timed out after {timeout:?} waiting for {what}; log tail:\n{}",
-            tail(log, 30)
+            "timed out after {timeout:?} waiting for {what} on process {pid} (log: {}):\n{}",
+            log.display(),
+            startup_excerpt(log)
         );
         time::sleep(interval).await;
     }
 }
 
-fn tail(path: &Path, lines: usize) -> String {
-    let Ok(content) = fs::read_to_string(path) else {
-        return format!("<no log at {}>", path.display());
+fn startup_excerpt(path: &Path) -> String {
+    let content = match read_log_tail(path) {
+        Ok(content) if content.is_empty() => return "<empty log>".into(),
+        Ok(content) => content,
+        Err(error) => return format!("<cannot read log: {error}>"),
     };
-    let all: Vec<&str> = content.lines().collect();
-    all[all.len().saturating_sub(lines)..].join("\n")
+    let content = content.trim_end();
+    let last_lines = content.rmatch_indices('\n').nth(7).map_or(0, |(index, _)| index + 1);
+    let start = last_lines.max(content.ceil_char_boundary(content.len().saturating_sub(4096)));
+    content[start..].to_owned()
 }
 
 pub(super) struct Owned {

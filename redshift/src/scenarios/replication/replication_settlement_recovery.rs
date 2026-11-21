@@ -1,5 +1,5 @@
-use super::{ReplicationRecovery, CONNECT_TIMEOUT};
-use crate::PAYER_LAMPORTS;
+use std::rc::Rc;
+
 use anyhow::{ensure, Context};
 use redsuite_core::{
     api::transaction_meta,
@@ -10,18 +10,39 @@ use redsuite_core::{
     random::{self, Rng},
     rpc_types::response::TransactionError,
     signed::audit_signatures,
-    topology::RestartConfig,
-    ChainCtx, Result,
+    topology::{self, ReplicatedTopology, RestartConfig},
+    BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
 use signer::Signer;
 use solana_instruction_error::InstructionError;
-use std::rc::Rc;
 
-impl ReplicationRecovery {
+use crate::PAYER_LAMPORTS;
+
+use super::observations::{fence, CONNECT_TIMEOUT};
+
+pub struct ReplicationSettlementRecovery {
+    base: Rc<BaseCtx>,
+    topology: ReplicatedTopology,
+}
+
+impl Scenario for ReplicationSettlementRecovery {
+    async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
+        let topology = topology::replicated(&base, er).await?;
+        Ok(Self { base, topology })
+    }
+
+    async fn run(self) -> Result<()> {
+        let outcome = self.check_settlement_replay().await;
+        outcome.and(self.topology.finish().await)
+    }
+}
+
+impl ReplicationSettlementRecovery {
     /// Replicates successful settlement/callback work and a rollback, then restarts the leader.
     /// Retained records and account images must stay unchanged before a
     /// fresh commit proves progress.
-    pub(super) async fn check_settlement_replay(&mut self) -> Result<()> {
+    async fn check_settlement_replay(&self) -> Result<()> {
+        self.topology.wait_verifiers_connected(CONNECT_TIMEOUT).await?;
         let mut rng = random::rng(
             self.base.config().seed,
             &["redhat", "replication_settlement"],
@@ -30,7 +51,7 @@ impl ReplicationRecovery {
         let marker = rng.gen_range(1..1_000_000u64);
         let funder = self.base.seeded_payer(&mut rng, PAYER_LAMPORTS).await?;
         let payer = self.base.seeded_payer(&mut rng, PAYER_LAMPORTS).await?;
-        let er = self.topology.leader().clone();
+        let er = self.topology.leader();
         let cell = self
             .base
             .cells(REDSHIFT, &payer)
@@ -133,11 +154,11 @@ impl ReplicationRecovery {
                 er.api().await_transaction(&signature).await?,
             )?);
         }
-        self.check_final_boundary(&[]).await?;
+        fence(&self.topology).await?;
         let restart = er.restart(RestartConfig::default()).await?;
         ensure!(restart.exit_code == Some(0) && !restart.needed_sigkill);
         self.topology.wait_verifiers_connected(CONNECT_TIMEOUT).await?;
-        self.check_final_boundary(&[]).await?;
+        fence(&self.topology).await?;
         ensure!(
             er.local_accounts(&[REDSHIFT.id()], &[cell]).await? == vec![Some(expected.clone())]
         );
@@ -147,7 +168,7 @@ impl ReplicationRecovery {
             ensure!(er.api().get_signature_status(signature).await?.is_some());
         }
         audit_signatures(
-            &er,
+            er,
             start,
             &signatures.iter().map(|signature| (signature, 1)).collect::<Vec<_>>(),
         )

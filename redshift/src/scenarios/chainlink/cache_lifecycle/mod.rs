@@ -60,21 +60,22 @@ async fn cache_evictions(er: &ErCtx) -> Result<f64> {
     er.scrape_metrics().await?.get(EVICTIONS).context("eviction metric missing")
 }
 
-async fn churn_cache(er: &ErCtx, pool: &[Pubkey], previous: f64) -> Result<f64> {
+async fn churn_cache(er: &ErCtx, pool: &[Pubkey], previous: f64) -> Result<()> {
     for chunk in pool.chunks(FETCH_BATCH) {
         er.accounts(chunk).await?;
     }
     let current = cache_evictions(er).await?;
     ensure!(current > previous);
-    Ok(current)
+    Ok(())
 }
 
-/// Independent fault profiles registered as separate scenarios.
-pub enum Mode {
+/// Fault profiles with separate account state and a shared eviction pool.
+#[derive(Clone, Copy)]
+enum Mode {
     /// Releases stale fetches amid eviction and reconnect churn.
-    Churn,
+    StaleFetch,
     /// Completes undelegation while HTTP/WS discovery paths are unavailable.
-    UndelegationReconnectGap,
+    DiscoveryGap,
 }
 
 /// Checks stale-fetch ordering or reconnect recovery while preserving pending/delegated residents.
@@ -82,22 +83,21 @@ pub enum Mode {
 /// checked alongside execution progress.
 pub struct CacheLifecycle {
     base: Rc<BaseCtx>,
-    mode: Mode,
     faults: Rc<Faults>,
     er: ErCtx,
 }
 
-impl Scenario<(), Mode> for CacheLifecycle {
-    async fn setup(base: Rc<BaseCtx>, er: ErCtx, mode: Mode) -> Result<Self> {
+impl Scenario for CacheLifecycle {
+    async fn setup(base: Rc<BaseCtx>, er: ErCtx, _: ()) -> Result<Self> {
         let faults = er.faults()?;
-        Ok(Self { base, er, mode, faults })
+        Ok(Self { base, er, faults })
     }
-    /// Runs a no-eviction transport baseline when requested, then the common pressure workload.
+    /// Runs the no-eviction baseline before sharing one pool between the pressure cases.
     async fn run(self) -> Result<()> {
-        if matches!(self.mode, Mode::UndelegationReconnectGap) {
-            self.transport_baseline().await?;
-        }
-        self.pressure().await
+        self.transport_baseline().await?;
+        let pool = self.prepare_pool().await?;
+        self.pressure(Mode::DiscoveryGap, &pool).await?;
+        self.pressure(Mode::StaleFetch, &pool).await
     }
 }
 

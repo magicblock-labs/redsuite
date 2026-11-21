@@ -15,7 +15,6 @@ use redsuite_core::{
 use signature::Signature;
 use signer::Signer;
 use std::{rc::Rc, time::Duration};
-use tracing::debug;
 use transaction::versioned::VersionedTransaction;
 
 const ADMITTED: &str = "mbv_transaction_skip_preflight_count";
@@ -169,7 +168,11 @@ impl Scenario for TransactionStructure {
             .context("admission counter missing from the validator metrics")?;
         let mut admitted_expected = 0.0;
         for (index, (format, mutation)) in cases.into_iter().enumerate() {
-            for skip_preflight in [false, true] {
+            // Structural checks run before the preflight branch. Exercise every
+            // mutation on the fast path and spot-check both paths at the account limit.
+            let modes: &[bool] =
+                if matches!(mutation, Mutation::Accounts) { &[true, false] } else { &[true] };
+            for &skip_preflight in modes {
                 let nonce = index as u64 * 2 + u64::from(skip_preflight) + 1;
                 check_case(
                     &mut fixture,
@@ -355,12 +358,6 @@ async fn check_case(
         }
         _ => {}
     }
-    debug!(
-        ?format,
-        ?mutation,
-        skip_preflight,
-        "transaction structure rejection"
-    );
     let mut payload = STANDARD.encode(&bytes);
     if matches!(mutation, Mutation::Encoding) {
         payload.insert(payload.len() / 2, '!');

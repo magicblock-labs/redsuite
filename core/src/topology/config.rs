@@ -3,6 +3,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     process::{Child, Command},
+    sync::LazyLock,
     time::Duration,
 };
 
@@ -33,31 +34,34 @@ pub const OUTBOX_INTENT_ID: Pubkey =
 pub const SERVICE_OWNERS: &[Pubkey] =
     &[fixture::magic::MAGIC_PROGRAM_ID, HYDRA_EPHEMERAL_ID, OUTBOX_INTENT_ID];
 
-pub fn local_account_owners() -> Vec<Pubkey> {
-    let mut owners = vec![
-        crate::system::system_id(),
-        crate::programs::REDSHIFT.id(),
-        crate::programs::REDHAT.id(),
-        crate::programs::REDLINE.id(),
-        fixture::magic::MAGIC_PROGRAM_ID,
-        DLP_ID,
-        COMMITTOR_ID,
-        HYDRA_EPHEMERAL_ID,
-        OUTBOX_INTENT_ID,
-        TOKEN_PROGRAM_ID,
-        EATA_PROGRAM_ID,
-        sdk_ids::bpf_loader::ID,
-        sdk_ids::bpf_loader_deprecated::ID,
-        sdk_ids::bpf_loader_upgradeable::ID,
-        sdk_ids::loader_v4::ID,
-        sdk_ids::native_loader::ID,
-        redshift_loader_v3_target().0,
-    ];
-    owners.extend(redline_alias_ids(REDLINE_ALIAS_COUNT));
-    owners.extend(redline_loader_v3_pair().map(|(key, _)| key));
-    owners.sort_unstable();
-    owners.dedup();
-    owners
+pub fn local_account_owners() -> &'static [Pubkey] {
+    static OWNERS: LazyLock<Vec<Pubkey>> = LazyLock::new(|| {
+        let mut owners = vec![
+            crate::system::system_id(),
+            crate::programs::REDSHIFT.id(),
+            crate::programs::REDHAT.id(),
+            crate::programs::REDLINE.id(),
+            fixture::magic::MAGIC_PROGRAM_ID,
+            DLP_ID,
+            COMMITTOR_ID,
+            HYDRA_EPHEMERAL_ID,
+            OUTBOX_INTENT_ID,
+            TOKEN_PROGRAM_ID,
+            EATA_PROGRAM_ID,
+            sdk_ids::bpf_loader::ID,
+            sdk_ids::bpf_loader_deprecated::ID,
+            sdk_ids::bpf_loader_upgradeable::ID,
+            sdk_ids::loader_v4::ID,
+            sdk_ids::native_loader::ID,
+            redshift_loader_v3_target().0,
+        ];
+        owners.extend(redline_alias_ids(REDLINE_ALIAS_COUNT));
+        owners.extend(redline_loader_v3_pair().map(|(key, _)| key));
+        owners.sort_unstable();
+        owners.dedup();
+        owners
+    });
+    &OWNERS
 }
 
 pub const HYDRA_EPHEMERAL_ID: Pubkey =
@@ -486,6 +490,7 @@ fn with_api_key(mut grpc_url: Url) -> Url {
 
 pub struct ErOptions {
     pub label: String,
+    pub followers: usize,
     pub settings: Settings,
     pub base_endpoints: Option<BaseEndpoints>,
 }
@@ -494,6 +499,7 @@ impl Default for ErOptions {
     fn default() -> Self {
         Self {
             label: String::new(),
+            followers: 0,
             settings: Box::new(|_| {}),
             base_endpoints: None,
         }

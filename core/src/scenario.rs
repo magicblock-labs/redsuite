@@ -11,7 +11,7 @@ use anyhow::{ensure, Error};
 
 use futures_util::FutureExt;
 use tokio::task::LocalSet;
-use tracing::{error, info, instrument, Span};
+use tracing::{debug, error, instrument, Span};
 
 use crate::{
     catalog::{Er, ErGroup, Fixture, ScenarioEntry},
@@ -109,7 +109,11 @@ pub struct RunRecord {
 
 impl RunRecord {
     pub fn not_run(name: String, reason: &str) -> Self {
-        Self::failed(name, "not run", reason.to_owned())
+        debug!(scenario = %name, reason, "scenario not run");
+        let mut record = Self::new(name);
+        record.phase = "not run";
+        record.outcome = Err(Error::msg(reason.to_owned()));
+        record
     }
 
     pub fn failed(name: String, phase: &'static str, reason: String) -> Self {
@@ -139,6 +143,7 @@ impl RunRecord {
         &mut self,
         fixtures: &[Fixture],
         config: ExecutionConfig,
+        base: result::Result<BaseCtx, String>,
         state: result::Result<State, String>,
         body: Body,
     ) -> Result<()>
@@ -154,14 +159,13 @@ impl RunRecord {
                     .setting("target", if attached { "attached" } else { "managed" }),
             );
         }
+        self.phase = "topology";
+        let base = Rc::new(base.map_err(Error::msg)?);
+        let state = state.map_err(Error::msg)?;
+        self.phase = "preflight";
         if config.environment.is_none() {
             preflight(fixtures)?;
         }
-        self.phase = "topology";
-        let mut base = topology::base_only(config).await?;
-        base.scenario = Some(self.name.clone());
-        let base = Rc::new(base);
-        let state = state.map_err(Error::msg)?;
         let resources = base.resources();
         self.phase = "setup";
         let started = Instant::now();
@@ -192,7 +196,13 @@ impl RunRecord {
         outcome
     }
 
-    fn conclude(&mut self, reports: bool, seed: u64, shared_log: Option<&Path>) {
+    fn conclude(
+        &mut self,
+        reports: bool,
+        seed: u64,
+        shared_log: Option<&Path>,
+        shared_setup_failed: bool,
+    ) {
         if reports {
             if let Err(error) = crate::report::persist_run(self) {
                 if self.outcome.is_ok() {
@@ -204,28 +214,29 @@ impl RunRecord {
             }
         }
         if self.passed() {
-            info!("passed");
+            debug!(seconds = self.wall_seconds, "passed");
             return;
         }
         Span::current().record("phase", self.phase);
-        match &self.outcome {
-            Err(error) => error!(seed, error = %format_args!("{error:#}"), "failed"),
-            Ok(()) => error!(seed, "verdict failed"),
+        // The suite reports shared setup failures once at their source.
+        if shared_setup_failed && self.phase == "topology" {
+            return;
         }
-        for launch in &self.launches {
-            info!(node = %launch.label, log = %launch.log,
-                version = %launch.bin_version,
-                binary_hash = %crate::report::binary_hash(std::path::Path::new(&launch.bin)).unwrap_or_else(|_| "unavailable".into()),
-                "node log");
+        match &self.outcome {
+            Err(error) => {
+                error!(seed, seconds = self.wall_seconds, error = %format_args!("{error:#}"), "failed")
+            }
+            Ok(()) => error!(seed, "verdict failed"),
         }
         diagnostics::emit(shared_log, &self.launches);
     }
 }
 
-pub async fn run_shared_scenario<V, Body>(
+pub(crate) async fn run_shared_scenario<V, Body>(
     name: String,
     fixtures: &[Fixture],
     config: ExecutionConfig,
+    base: result::Result<BaseCtx, String>,
     er: result::Result<ErCtx, String>,
     body: Body,
 ) -> RunRecord
@@ -241,10 +252,11 @@ where
         name,
         fixtures,
         config,
+        base,
         er,
         log,
         async move |base, er, stage| {
-            let er = er.for_scenario()?;
+            let er = er.for_scenario();
             let outcome = AssertUnwindSafe(body(base, er.clone(), stage)).catch_unwind().await;
             let reset = er.reset_faults().await;
             match outcome {
@@ -256,10 +268,11 @@ where
     .await
 }
 
-pub async fn run_private_er_scenario<V, Body>(
+pub(crate) async fn run_private_er_scenario<V, Body>(
     name: String,
     fixtures: &[Fixture],
     config: ExecutionConfig,
+    base: result::Result<BaseCtx, String>,
     body: Body,
 ) -> RunRecord
 where
@@ -270,6 +283,7 @@ where
         name,
         fixtures,
         config,
+        base,
         Ok(()),
         None,
         async move |base, (), stage| body(base, stage).await,
@@ -283,6 +297,7 @@ async fn execute<V, State, Body>(
     name: String,
     fixtures: &[Fixture],
     config: ExecutionConfig,
+    base: result::Result<BaseCtx, String>,
     state: result::Result<State, String>,
     shared_log: Option<PathBuf>,
     body: Body,
@@ -293,11 +308,12 @@ where
 {
     let persist = V::REPORTS && !config.continuous;
     let seed = config.seed;
+    let shared_setup_failed = base.is_err() || state.is_err();
     let run = async {
         let mut record = RunRecord::new(name);
-        info!("started");
-        record.outcome = record.run(fixtures, config, state, body).await;
-        record.conclude(persist, seed, shared_log.as_deref());
+        debug!("started");
+        record.outcome = record.run(fixtures, config, base, state, body).await;
+        record.conclude(persist, seed, shared_log.as_deref(), shared_setup_failed);
         record
     };
     // Dropping the LocalSet cancels scenario-owned readers and background tasks.

@@ -8,7 +8,7 @@ use solana_transaction_status_client_types::{
     EncodedConfirmedTransactionWithStatusMeta, UiTransactionStatusMeta,
 };
 use tokio::time::{self, MissedTickBehavior};
-use tracing::warn;
+use tracing::debug;
 
 use crate::{
     api::{custom_error_code, transaction_logs, transaction_meta, Api},
@@ -153,10 +153,13 @@ impl CommitReceipt {
     async fn verify(&self, base: &BaseCtx, expected: &[Pubkey], undelegate: bool) -> Result<()> {
         if let Some(message) = &self.error_message {
             if self.failure_is_duplicate_rejection() {
-                warn_duplicate_rejection(message);
+                log_duplicate_rejection(&self.signature, message);
                 return Ok(());
             }
-            return Err(anyhow!("commit intent failed: {message}"));
+            return Err(anyhow!(
+                "commit intent failed in receipt {}: {message}",
+                self.signature
+            ));
         }
         self.check_accounts(expected, undelegate)?;
         self.confirm(base.api()).await
@@ -176,21 +179,33 @@ impl CommitReceipt {
 
     pub fn check_accounts(&self, expected: &[Pubkey], expect_undelegation: bool) -> Result<()> {
         self.check_included(expected)?;
-        ensure!(self.excluded.as_slice() == []);
-        ensure!(self.requested_undelegation == expect_undelegation);
+        ensure!(
+            self.excluded.is_empty(),
+            "receipt {} excluded {:?}",
+            self.signature,
+            self.excluded
+        );
+        ensure!(
+            self.requested_undelegation == expect_undelegation,
+            "receipt {} requested_undelegation={}, expected {expect_undelegation}",
+            self.signature,
+            self.requested_undelegation
+        );
         Ok(())
     }
     /// Requires success and base signatures, without confirming those transactions.
     pub fn check_success(&self, phase: &str) -> Result<()> {
         ensure!(
             self.succeeded(),
-            "{phase}: settlement failed: {:?} (code {:?})",
+            "{phase}: settlement failed in receipt {}: {:?} (code {:?})",
+            self.signature,
             self.error_message,
             self.receipt_err_code
         );
         ensure!(
             !self.base_signatures.is_empty(),
-            "{phase}: missing base transactions"
+            "{phase}: receipt {} has no base transaction signatures",
+            self.signature
         );
         Ok(())
     }
@@ -217,8 +232,8 @@ impl CommitReceipt {
     }
 }
 
-pub fn warn_duplicate_rejection(error: &str) {
-    warn!(error = %format_args!("{error:#}"), "intent rejected as duplicate; verifying base state");
+pub fn log_duplicate_rejection(signature: &Signature, error: &str) {
+    debug!(%signature, %error, "intent rejected as duplicate; verifying base state");
 }
 
 // Builtin ic_msg lines arrive bare; tolerate a BPF-style prefix anyway.

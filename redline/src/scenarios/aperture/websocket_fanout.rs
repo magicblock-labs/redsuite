@@ -49,7 +49,7 @@ impl Scenario<(ScenarioReport, Result<()>)> for WebsocketFanout {
     }
     /// Tracks both copy destinations per reader and reports the worst subscriber-window latency.
     async fn run(self) -> Result<(ScenarioReport, Result<()>)> {
-        let options = RunControl::from_config(&self.base.config())?;
+        let options = RunControl::from_config(self.base.config())?;
         let mut remaining = options.duration;
         let mut cursor = 0;
         let mut received = 0;
@@ -141,13 +141,6 @@ impl Scenario<(ScenarioReport, Result<()>)> for WebsocketFanout {
                     superseded += observed.superseded;
                     peak = peak.max(observed.lag.max);
                     window_p95 = window_p95.max(observed.lag.quantile95);
-                    tracing::debug!(
-                        received = observed.observed,
-                        superseded = observed.superseded,
-                        p95_us = observed.lag.quantile95,
-                        max_us = observed.lag.max,
-                        "fanout subscriber window"
-                    );
                 }
                 for key in &self.keys {
                     let last = (cursor + 1..=cursor + outcome.delivered)
@@ -166,7 +159,6 @@ impl Scenario<(ScenarioReport, Result<()>)> for WebsocketFanout {
                 tracing::debug!(
                     delivered = outcome.delivered,
                     worst_subscriber_p95_us = window_p95,
-                    peak_lag_us = peak,
                     "fanout window"
                 );
                 report = ScenarioReport::ok()

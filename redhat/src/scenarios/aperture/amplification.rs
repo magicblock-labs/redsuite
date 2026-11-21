@@ -54,8 +54,11 @@ fn tally(observed: Vec<RuleHandle>) -> (u64, usize) {
 fn charged(label: &str, claims: u64, observed: Vec<RuleHandle>, distinct: usize) -> Result<()> {
     let (fetched, peak) = tally(observed);
     debug!(
-        label,
-        claims, fetched, peak, distinct, "remote work against claims"
+        case = label,
+        claimed = claims,
+        fetched,
+        peak_per_key = peak,
+        "remote account reads"
     );
     ensure!(
         fetched <= claims,
@@ -164,16 +167,12 @@ impl UnpaidWork {
             api.try_call_claimed::<Value>(RpcRequest::GetProgramAccounts, &params),
             time::timeout(TIMEOUT, api.get_slot()),
         );
-        let (claims, scan) = scan?;
+        let (claims, _) = scan?;
         canary.context("rpc starved by an oversized filter set")??;
-        debug!(
-            filters = count,
-            refused = scan.is_err(),
-            "oversized filter set"
-        );
+        let fetched = scans.hits();
         ensure!(
-            claims == 0 && scans.hits() == 0,
-            "filter scan claimed {claims} remote reads"
+            claims == 0 && fetched == 0,
+            "scan with {count} filters claimed {claims} remote reads and made {fetched}"
         );
         scans.remove();
         Ok(())
@@ -198,8 +197,10 @@ impl UnpaidWork {
         }
         fixture.confirmed_write(&mut control, subscription, 8_100).await?;
         let (fetched, _) = tally(observed);
-        debug!(accepted, fetched, "per-connection subscription flood");
-        ensure!(fetched == 0, "{fetched} local subscriptions reached base");
+        ensure!(
+            fetched == 0,
+            "{fetched} base reads from a subscription flood with {accepted} accepted"
+        );
         let _ = flooded.close().await;
         fixture.confirmed_write(&mut control, subscription, 8_101).await?;
         control.close().await
@@ -229,8 +230,8 @@ impl UnpaidWork {
                     peak = peak.max(busy(&er).await?);
                 }
                 debug!(
-                    stalled = STALLED,
-                    peak, "canaries landed while base reads stalled"
+                    peak_busy = peak,
+                    "control writes landed during stalled base reads"
                 );
                 stalls.into_iter().for_each(RuleHandle::remove);
                 Result::Ok(())

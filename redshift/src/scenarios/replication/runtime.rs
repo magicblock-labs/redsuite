@@ -8,7 +8,7 @@ use std::{
 use account::Account;
 use anyhow::{ensure, Context};
 use base64::{engine::general_purpose::STANDARD, Engine};
-use engine_account::AccountMode;
+use engine_account::{AccountMode, ReadableAccount, StateFlags};
 use json::{json, JsonValueTrait, Value};
 use keypair::Keypair;
 use pubkey::Pubkey;
@@ -17,19 +17,19 @@ use redsuite_core::{
     netfault::{Faults, RuleHandle, Selector},
     programs::REDLINE,
     random,
-    topology::{ReplicatedTopology, RestartConfig, Verifier},
+    topology::{RestartConfig, Verifier},
     wait, BaseCtx, ChainCtx, ErCtx, Result,
 };
 use signature::Signature;
 use signer::Signer;
 use solana_rent::Rent;
+use tempfile::TempDir;
+use tokio::task;
 use tracing::instrument::WithSubscriber;
 
+use super::observations::SUPERBLOCKS;
+
 pub(super) const TIMEOUT: Duration = Duration::from_secs(60);
-pub(super) const CHECKPOINT: u64 = 16;
-const BLOCKS: &str = "engine_ledger_blocks";
-const SNAPSHOTS: &str =
-    r#"engine_replicator_operation_duration_micros_count{op="client_stage_snapshot"}"#;
 pub(super) const RENT: Pubkey = sdk_ids::sysvar::rent::ID;
 pub(super) const FEATURES: Pubkey =
     Pubkey::from_str_const("Feature111111111111111111111111111111111111");
@@ -108,7 +108,6 @@ impl Runtime {
                 redsuite_core::dlp::DelegationRecord::try_from_bytes_with_discriminator_mut(
                     &mut account.data,
                 )?;
-            tracing::debug!(%record, original = record_data.lamports, minimum, "delegation funding fixture");
             record_data.lamports = minimum;
             accounts.push((record, account));
         }
@@ -135,9 +134,12 @@ impl Runtime {
             },
         );
         let image = self.er.account(&key).await?;
-        ensure!(rule.hits() != 0, "cold read bypassed the account fixture");
+        ensure!(
+            rule.hits() != 0,
+            "cold read of {key} bypassed the account fixture"
+        );
         rule.remove();
-        image.context("cold read did not materialize the account")
+        image.with_context(|| format!("cold read did not materialize {key}"))
     }
 
     pub async fn images(&self, accounts: &[(Pubkey, AccountMode)]) -> Result<Images> {
@@ -205,42 +207,12 @@ fn rent_rule(faults: &Faults, rent: &Rent) -> Result<RuleHandle> {
     ))
 }
 
-pub(super) async fn snapshots(verifier: &Verifier) -> Result<f64> {
-    Ok(verifier.scrape_metrics().await?.get(SNAPSHOTS).unwrap_or(0.0))
-}
-
-pub(super) async fn fence(topology: &ReplicatedTopology) -> Result<()> {
-    use super::replication_recovery::{
-        await_catch_up, await_leader_advance, leader_metric, TRANSACTIONS,
-    };
-    await_leader_advance(topology, BLOCKS, 1.0, "runtime writes entering the ledger").await?;
-    let target = leader_metric(topology, TRANSACTIONS).await?;
-    for verifier in topology.verifiers().iter().filter(|verifier| verifier.is_running()) {
-        await_catch_up(verifier, TRANSACTIONS, target).await?;
-        let before = verifier
-            .scrape_metrics()
-            .await?
-            .get(BLOCKS)
-            .context("verifier block metric missing")?;
-        await_catch_up(verifier, BLOCKS, before + (CHECKPOINT + 1) as f64).await?;
-        ensure!(
-            verifier
-                .scrape_metrics()
-                .await?
-                .get("engine_replicator_client_state_mismatches")
-                .unwrap_or(0.0)
-                == 0.0
-        );
-    }
-    Ok(())
-}
-
 pub(super) async fn next_snapshot(er: &ErCtx) -> Result<PathBuf> {
     let storage = er.storage_dir().await?;
     let head = er
         .scrape_metrics()
         .await?
-        .get("engine_ledger_superblocks")
+        .get(SUPERBLOCKS)
         .context("leader superblock metric missing")?;
     wait::retry(
         "the next complete replication snapshot",
@@ -255,23 +227,18 @@ pub(super) async fn next_snapshot(er: &ErCtx) -> Result<PathBuf> {
     .await
 }
 
-/// Inspection opens copies only; graceful shutdown preserves volatile mirrors too.
+/// Inspects account images and transaction records from the same stopped verifier.
 pub(super) async fn inspect(
     verifier: &mut Verifier,
     expected: &Images,
     signatures: &[(Signature, u64)],
 ) -> Result<()> {
-    let stop = verifier.stop(false).await?;
-    ensure!(stop.exit_code == Some(0) && !stop.needed_sigkill);
+    let (temp, accounts) = stop_and_copy(verifier, true).await?;
     async {
-        let temp = tempfile::tempdir()?;
-        let accounts = temp.path().join("accounts");
-        clonetree::clone_tree(verifier.accountsdb_dir(), &accounts, &Default::default())?;
         let db = accountsdb::AccountsDB::new(accounts)?;
         db.validate()?;
         check_images(&db, expected)?;
         let storage = temp.path().join("ledger");
-        clonetree::clone_tree(verifier.storage_dir(), &storage, &Default::default())?;
         let mut shutdown = nucleus::shutdown::ShutdownManager::default();
         let ledger = ledger::Ledger::init(storage, u64::MAX, &mut shutdown)?;
         let checked = async {
@@ -298,21 +265,55 @@ pub(super) async fn inspect(
     .await
 }
 
+pub(super) async fn inspect_delegated(
+    verifier: &mut Verifier,
+    key: Pubkey,
+    expected: Account,
+) -> Result<()> {
+    let (temp, accounts) = stop_and_copy(verifier, false).await?;
+    task::spawn_blocking(move || {
+        let _temp = temp;
+        tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
+            let db = accountsdb::AccountsDB::new(accounts)?;
+            check_image(&db, &key, &expected, AccountMode::Delegated)
+        })
+    })
+    .await?
+    .with_context(|| format!("checking persisted state on {}", verifier.label()))
+}
+
+/// Stops the verifier before copying. Inspectors must never open its original
+/// state, since they can alter it before a later restart.
+async fn stop_and_copy(verifier: &mut Verifier, with_ledger: bool) -> Result<(TempDir, PathBuf)> {
+    verifier.stop_gracefully().await?;
+    let accounts = verifier.accountsdb_dir().to_owned();
+    let ledger = with_ledger.then(|| verifier.storage_dir().to_owned());
+    // Copies of preallocated files can block other scenarios on the suite thread.
+    task::spawn_blocking(move || -> Result<_> {
+        let temp = tempfile::tempdir()?;
+        if let Some(ledger) = ledger {
+            let destination = temp.path().join("ledger");
+            clonetree::clone_tree(&ledger, &destination, &Default::default())?;
+            if let Ok(relative) = accounts.strip_prefix(&ledger) {
+                return Ok((temp, destination.join(relative)));
+            }
+        }
+        let destination = temp.path().join("accounts");
+        clonetree::clone_tree(accounts, &destination, &Default::default())?;
+        Ok((temp, destination))
+    })
+    .await?
+    .with_context(|| {
+        format!(
+            "copying stopped verifier `{}` for inspection",
+            verifier.label()
+        )
+    })
+}
+
 pub(super) fn check_images(db: &accountsdb::AccountsDB, expected: &Images) -> Result<()> {
     for (key, (account, mode)) in expected {
-        let image = db
-            .loader()
-            .read(key, |account| account.owned())?
-            .context("follower account missing")?;
-        ensure!(
-            image.mode() == *mode
-                && image.owner() == account.owner
-                && image.lamports() == account.lamports
-                && image.data() == account.data
-                && image.flags().contains(engine_account::StateFlags::EXECUTABLE)
-                    == account.executable,
-            "account image or mode differs for {key}"
-        );
+        check_image(db, key, account, *mode)?;
     }
     let features = db.program(&FEATURES, |_, _| ())?.map(|(key, _)| key).collect::<BTreeSet<_>>();
     ensure!(
@@ -324,5 +325,25 @@ pub(super) fn check_images(db: &accountsdb::AccountsDB, expected: &Images) -> Re
                 .collect::<BTreeSet<_>>(),
         "follower feature membership differs"
     );
+    Ok(())
+}
+
+fn check_image(
+    db: &accountsdb::AccountsDB,
+    key: &Pubkey,
+    account: &Account,
+    mode: AccountMode,
+) -> Result<()> {
+    let matches = db
+        .loader()
+        .read(key, |image| {
+            image.mode() == mode
+                && image.owner() == &account.owner
+                && image.lamports() == account.lamports
+                && image.data() == account.data
+                && image.flags().contains(StateFlags::EXECUTABLE) == account.executable
+        })?
+        .with_context(|| format!("follower account {key} ({mode:?}) missing"))?;
+    ensure!(matches, "account image or mode differs for {key}");
     Ok(())
 }

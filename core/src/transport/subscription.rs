@@ -192,7 +192,7 @@ impl<S: SubscriptionState + 'static> Connection<S> {
             .await;
             let mut router = reader_state.borrow_mut();
             if !router.requests.is_empty() {
-                tracing::warn!(%endpoint, %reason, pending = router.requests.len(), "websocket closed with pending requests");
+                tracing::debug!(%endpoint, %reason, pending = router.requests.len(), "websocket closed with pending requests");
             }
             router.close(&reason);
         });
