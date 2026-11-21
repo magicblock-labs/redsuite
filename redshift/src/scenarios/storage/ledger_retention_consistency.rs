@@ -21,7 +21,6 @@ use crate::PAYER_LAMPORTS;
 const RETENTION_TIMEOUT: Duration = Duration::from_secs(180);
 const SIGNATURE_WINDOW: usize = 1_000;
 const BLOCK_SETTLE_SLOTS: u64 = 2;
-const TRUNCATIONS: &str = r#"engine_ledger_operation_duration_micros_count{op="truncate"}"#;
 
 /// A known published transaction and its original slot, retained beyond ledger pruning.
 struct Sent {
@@ -95,28 +94,21 @@ impl LedgerRetentionConsistency {
     #[instrument(skip_all, err)]
     async fn prune(&self, history: &History) -> Result<()> {
         let landmark = history.sent.last().context("retention landmark missing")?;
-        let baseline = self.truncations().await?;
         wait::retry(
             "retention prunes the confirmed write",
             RETENTION_TIMEOUT,
             async || {
-                ensure!(self.truncations().await? > baseline, "no ledger truncation");
                 ensure!(
                     self.er.api().get_transaction(&landmark.signature).await?.is_none(),
                     "landmark {} is still retained",
                     landmark.slot
                 );
-                Ok(())
+                require_pruned_block(&self.er, landmark.slot).await
             },
         )
         .await?;
         debug!(slot = landmark.slot, "retention pruned a confirmed write");
         Ok(())
-    }
-
-    async fn truncations(&self) -> Result<u64> {
-        let metrics = self.er.scrape_metrics().await?;
-        Ok(metrics.get(TRUNCATIONS).unwrap_or(0.0) as u64)
     }
 
     async fn delegate_cell(&self) -> Result<Pubkey> {
@@ -244,14 +236,7 @@ impl History {
             }
         }
         for entry in pruned {
-            let error = er.api().try_get_block(entry.slot).await?.err().with_context(|| {
-                format!("pruned block {} is not reported as cleaned up", entry.slot)
-            })?;
-            ensure!(
-                error.error.code.code() == BLOCK_CLEANED_UP,
-                "pruned block {}: {error}",
-                entry.slot
-            );
+            require_pruned_block(er, entry.slot).await?;
         }
         for entry in retained {
             if entry.slot + BLOCK_SETTLE_SLOTS > tip {
@@ -271,5 +256,13 @@ impl History {
             .context("the delegated cell is missing on the er")?;
         ensure!(CellHeader::try_decode(&account.data)?.value == self.total);
         Ok(removed)
+    }
+}
+
+async fn require_pruned_block(er: &ErCtx, slot: u64) -> Result<()> {
+    match er.api().try_get_block(slot).await? {
+        Err(error) if error.error.code.code() == BLOCK_CLEANED_UP => Ok(()),
+        Err(error) => bail!("expected pruned block at slot {slot}: {error}"),
+        Ok(_) => bail!("block {slot} is not reported as cleaned up"),
     }
 }

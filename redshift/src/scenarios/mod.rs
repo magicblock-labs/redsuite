@@ -42,20 +42,21 @@ static STORAGE: ErGroup = ErGroup {
     },
     ..ErGroup::new("storage")
 };
-static RETENTION: ErGroup = ErGroup {
+static FOLLOWER_RECOVERY: ErGroup = ErGroup {
     settings: |p| {
-        p.engine.blockstore.blocktime = replication::replication_recovery::BLOCKTIME;
-        p.engine.blockstore.superblock = replication::replication_recovery::SUPERBLOCK_SLOTS;
-        p.engine.ledger.size_limit = 1;
+        p.engine.blockstore.superblock = 0;
+        p.engine.blockstore.checkpoint = replication::observations::CHECKPOINT_SLOTS;
     },
     followers: 2,
-    ..ErGroup::new("retention")
+    ..ErGroup::new("follower-recovery")
 };
 
 static LEDGER_RETENTION: ErGroup = ErGroup {
     settings: |p| {
-        (RETENTION.settings)(p);
         p.engine.blockstore.blocktime = Duration::from_millis(10);
+        // Match Engine's ledger pressure-check cadence.
+        p.engine.blockstore.superblock = 512;
+        p.engine.ledger.size_limit = 1;
     },
     ..ErGroup::new("ledger-retention")
 };
@@ -110,11 +111,7 @@ pub fn catalog() -> Vec<ScenarioEntry> {
         ),
         scenario!(
             replication::replication_recovery::ReplicationRecovery,
-            exclusive(
-                &RETENTION,
-                &[Fixture::RedlineProgram],
-                replication::replication_recovery::Coverage::Recovery
-            )
+            exclusive(&FOLLOWER_RECOVERY, &[Fixture::RedshiftProgram], ())
         ),
         scenario!(
             storage::checkpoint_recovery::CheckpointRecovery,

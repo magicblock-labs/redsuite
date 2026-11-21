@@ -136,6 +136,17 @@ impl Verifier {
         })
     }
 
+    /// Requires a clean exit without escalating to SIGKILL.
+    pub async fn stop_gracefully(&mut self) -> Result<()> {
+        let stop = self.stop(false).await?;
+        ensure!(
+            stop.exit_code == Some(0) && !stop.needed_sigkill,
+            "verifier `{}` did not stop gracefully: {stop:?}",
+            self.label()
+        );
+        Ok(())
+    }
+
     // A verifier killed before it archived a snapshot cannot reopen its
     // storage; wiping it lets the next start rejoin from the leader's
     // snapshot under the same identity, ports and configuration.

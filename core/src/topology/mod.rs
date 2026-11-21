@@ -19,6 +19,7 @@ pub use private::{private_er, GroupEr, PrivateEr, RestartOutcome};
 pub(crate) use process::kill_pid;
 pub use replicated::{
     latest_snapshot, replicated, ReplicatedTopology, Verifier, VerifierStop, VerifierTiming,
+    STREAM_CONNECTED,
 };
 pub use shared::{base_only, running_base_programs};
 pub use state::{

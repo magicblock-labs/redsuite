@@ -200,6 +200,20 @@ impl SnapshotBootstrap {
         let expected = self.fixture.images(&ACCOUNTS).await?;
         fence(topology).await?;
         ensure!(snapshots(topology.verifier(0)).await? == 0.0);
+
+        // Reuse the verifier identity but remove its state. The imported
+        // account still requires the archived baseline before replaying the tail.
+        let verifier = topology.verifier_mut(0);
+        verifier.stop_gracefully().await?;
+        verifier.reset_storage()?;
+        verifier.start(TIMEOUT).await?;
+        topology.wait_verifiers_connected(TIMEOUT).await?;
+        fence(topology).await?;
+        ensure!(
+            snapshots(topology.verifier(0)).await? >= 1.0,
+            "wiped verifier did not install a snapshot"
+        );
+
         let mut signatures = signatures;
         signatures.push((signature, tx.slot));
         runtime::inspect(topology.verifier_mut(0), &expected, &signatures).await

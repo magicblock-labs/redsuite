@@ -2,6 +2,7 @@ pub mod observations;
 pub mod replicated_runtime;
 pub mod replication_promotion;
 pub mod replication_recovery;
+pub mod replication_settlement_recovery;
 mod runtime;
 pub mod snapshot_bootstrap;
 

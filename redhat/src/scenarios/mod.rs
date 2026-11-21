@@ -8,8 +8,7 @@ use aperture::{
 };
 use magicblock_config::types::Remote;
 use redshift::scenarios::replication::{
-    observations::CHECKPOINT_SLOTS,
-    replication_recovery::{Coverage, ReplicationRecovery},
+    observations::CHECKPOINT_SLOTS, replication_settlement_recovery::ReplicationSettlementRecovery,
 };
 use redsuite_core::{
     catalog::{BasePreparation, ErGroup, Fixture, ScenarioEntry, DEFAULT},
@@ -85,14 +84,9 @@ static IDENTITIES: BasePreparation = BasePreparation {
 pub fn catalog() -> Vec<ScenarioEntry> {
     vec![
         scenario!(
-            ReplicationRecovery,
-            exclusive(
-                &REPLICATION,
-                &[Fixture::RedshiftProgram],
-                Coverage::Settlement
-            )
-        )
-        .named("replication_settlement_recovery"),
+            ReplicationSettlementRecovery,
+            exclusive(&REPLICATION, &[Fixture::RedshiftProgram], ())
+        ),
         scenario!(
             TransactionStructure,
             exclusive(&DEFAULT, &[Fixture::RedshiftProgram], ())

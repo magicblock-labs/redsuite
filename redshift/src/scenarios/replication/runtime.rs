@@ -8,7 +8,7 @@ use std::{
 use account::Account;
 use anyhow::{ensure, Context};
 use base64::{engine::general_purpose::STANDARD, Engine};
-use engine_account::AccountMode;
+use engine_account::{AccountMode, ReadableAccount, StateFlags};
 use json::{json, JsonValueTrait, Value};
 use keypair::Keypair;
 use pubkey::Pubkey;
@@ -23,6 +23,7 @@ use redsuite_core::{
 use signature::Signature;
 use signer::Signer;
 use solana_rent::Rent;
+use tempfile::TempDir;
 use tokio::task;
 use tracing::instrument::WithSubscriber;
 
@@ -224,34 +225,15 @@ pub(super) async fn next_snapshot(er: &ErCtx) -> Result<PathBuf> {
     .await
 }
 
-/// Inspection opens copies only; graceful shutdown preserves volatile mirrors too.
+/// Inspects account images and transaction records from the same stopped verifier.
 pub(super) async fn inspect(
     verifier: &mut Verifier,
     expected: &Images,
     signatures: &[(Signature, u64)],
 ) -> Result<()> {
-    let stop = verifier.stop(false).await?;
-    ensure!(stop.exit_code == Some(0) && !stop.needed_sigkill);
+    let (temp, accounts) = stop_and_copy(verifier, true).await?;
     async {
-        let accounts_dir = verifier.accountsdb_dir().to_owned();
-        let storage_dir = verifier.storage_dir().to_owned();
-        // Copying preallocated files must not stall the suite's async event loop.
-        let temp = task::spawn_blocking(move || {
-            let temp = tempfile::tempdir()?;
-            clonetree::clone_tree(
-                &accounts_dir,
-                temp.path().join("accounts"),
-                &Default::default(),
-            )?;
-            clonetree::clone_tree(
-                &storage_dir,
-                temp.path().join("ledger"),
-                &Default::default(),
-            )?;
-            Ok::<_, anyhow::Error>(temp)
-        })
-        .await??;
-        let db = accountsdb::AccountsDB::new(temp.path().join("accounts"))?;
+        let db = accountsdb::AccountsDB::new(accounts)?;
         db.validate()?;
         check_images(&db, expected)?;
         let storage = temp.path().join("ledger");
@@ -281,21 +263,55 @@ pub(super) async fn inspect(
     .await
 }
 
+pub(super) async fn inspect_delegated(
+    verifier: &mut Verifier,
+    key: Pubkey,
+    expected: Account,
+) -> Result<()> {
+    let (temp, accounts) = stop_and_copy(verifier, false).await?;
+    task::spawn_blocking(move || {
+        let _temp = temp;
+        tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
+            let db = accountsdb::AccountsDB::new(accounts)?;
+            check_image(&db, &key, &expected, AccountMode::Delegated)
+        })
+    })
+    .await?
+    .with_context(|| format!("checking persisted state on {}", verifier.label()))
+}
+
+/// Stops the verifier before copying. Inspectors must never open its original
+/// state, since they can alter it before a later restart.
+async fn stop_and_copy(verifier: &mut Verifier, with_ledger: bool) -> Result<(TempDir, PathBuf)> {
+    verifier.stop_gracefully().await?;
+    let accounts = verifier.accountsdb_dir().to_owned();
+    let ledger = with_ledger.then(|| verifier.storage_dir().to_owned());
+    // Copies of preallocated files can block other scenarios on the suite thread.
+    task::spawn_blocking(move || -> Result<_> {
+        let temp = tempfile::tempdir()?;
+        if let Some(ledger) = ledger {
+            let destination = temp.path().join("ledger");
+            clonetree::clone_tree(&ledger, &destination, &Default::default())?;
+            if let Ok(relative) = accounts.strip_prefix(&ledger) {
+                return Ok((temp, destination.join(relative)));
+            }
+        }
+        let destination = temp.path().join("accounts");
+        clonetree::clone_tree(accounts, &destination, &Default::default())?;
+        Ok((temp, destination))
+    })
+    .await?
+    .with_context(|| {
+        format!(
+            "copying stopped verifier `{}` for inspection",
+            verifier.label()
+        )
+    })
+}
+
 pub(super) fn check_images(db: &accountsdb::AccountsDB, expected: &Images) -> Result<()> {
     for (key, (account, mode)) in expected {
-        let image = db
-            .loader()
-            .read(key, |account| account.owned())?
-            .with_context(|| format!("follower account {key} ({mode:?}) missing"))?;
-        ensure!(
-            image.mode() == *mode
-                && image.owner() == account.owner
-                && image.lamports() == account.lamports
-                && image.data() == account.data
-                && image.flags().contains(engine_account::StateFlags::EXECUTABLE)
-                    == account.executable,
-            "account image or mode differs for {key}"
-        );
+        check_image(db, key, account, *mode)?;
     }
     let features = db.program(&FEATURES, |_, _| ())?.map(|(key, _)| key).collect::<BTreeSet<_>>();
     ensure!(
@@ -307,5 +323,25 @@ pub(super) fn check_images(db: &accountsdb::AccountsDB, expected: &Images) -> Re
                 .collect::<BTreeSet<_>>(),
         "follower feature membership differs"
     );
+    Ok(())
+}
+
+fn check_image(
+    db: &accountsdb::AccountsDB,
+    key: &Pubkey,
+    account: &Account,
+    mode: AccountMode,
+) -> Result<()> {
+    let matches = db
+        .loader()
+        .read(key, |image| {
+            image.mode() == mode
+                && image.owner() == &account.owner
+                && image.lamports() == account.lamports
+                && image.data() == account.data
+                && image.flags().contains(StateFlags::EXECUTABLE) == account.executable
+        })?
+        .with_context(|| format!("follower account {key} ({mode:?}) missing"))?;
+    ensure!(matches, "account image or mode differs for {key}");
     Ok(())
 }

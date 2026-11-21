@@ -9,7 +9,7 @@ use anyhow::{anyhow, ensure, Context};
 use futures_util::future::try_join_all;
 use redsuite_core::{
     logging::strip_ansi,
-    topology::{ReplicatedTopology, Verifier},
+    topology::{ReplicatedTopology, Verifier, STREAM_CONNECTED},
     wait, Result,
 };
 
@@ -17,11 +17,12 @@ use redsuite_core::{
 pub const CHECKPOINT_SLOTS: u64 = 16;
 const ADVANCE_TIMEOUT: Duration = Duration::from_secs(60);
 const CATCH_UP_TIMEOUT: Duration = Duration::from_secs(120);
+pub(super) const CONNECT_TIMEOUT: Duration = Duration::from_secs(90);
 
 pub const TRANSACTIONS: &str = "engine_ledger_transactions";
 pub(super) const BLOCKS: &str = "engine_ledger_blocks";
 pub(super) const SUPERBLOCKS: &str = "engine_ledger_superblocks";
-pub(super) const STATE_MISMATCHES: &str = "engine_replicator_client_state_mismatches";
+const STATE_MISMATCHES: &str = "engine_replicator_client_state_mismatches";
 const CLIENT_SNAPSHOTS: &str =
     r#"engine_replicator_operation_duration_micros_count{op="client_stage_snapshot"}"#;
 
@@ -38,15 +39,6 @@ pub(super) async fn verifier_metric(verifier: &Verifier, name: &str) -> Result<f
         .await?
         .get(name)
         .with_context(|| format!("verifier `{}` exposes no {name} metric", verifier.label()))
-}
-
-pub(super) async fn leader_count(topology: &ReplicatedTopology, name: &str) -> Result<f64> {
-    let metrics = topology.leader().scrape_metrics().await?;
-    Ok(metrics.get(name).unwrap_or(0.0))
-}
-
-pub(super) async fn verifier_count(verifier: &Verifier, name: &str) -> Result<f64> {
-    Ok(verifier.scrape_metrics().await?.get(name).unwrap_or(0.0))
 }
 
 /// Waits for a fixed leader cutoff, surfacing mismatch log evidence if the verifier exits first.
@@ -112,28 +104,38 @@ pub(super) async fn await_leader_advance(
 }
 
 pub(super) async fn snapshots(verifier: &Verifier) -> Result<f64> {
-    verifier_count(verifier, CLIENT_SNAPSHOTS).await
+    Ok(verifier.scrape_metrics().await?.get(CLIENT_SNAPSHOTS).unwrap_or(0.0))
+}
+
+/// Samples the write cutoff after the leader publishes another block.
+pub(super) async fn write_cutoff(topology: &ReplicatedTopology) -> Result<f64> {
+    await_leader_advance(topology, BLOCKS, 1.0, "writes entering the ledger").await?;
+    leader_metric(topology, TRANSACTIONS).await
+}
+
+pub(super) async fn check_stream(verifier: &Verifier) -> Result<()> {
+    let metrics = verifier.scrape_metrics().await?;
+    ensure!(
+        metrics.get(STREAM_CONNECTED).is_some_and(|value| value >= 1.0),
+        "verifier {} disconnected",
+        verifier.label()
+    );
+    let mismatches = metrics.get(STATE_MISMATCHES).unwrap_or(0.0);
+    ensure!(
+        mismatches == 0.0,
+        "verifier {} reported {mismatches:.0} state mismatches",
+        verifier.label()
+    );
+    Ok(())
 }
 
 pub(super) async fn fence(topology: &ReplicatedTopology) -> Result<()> {
-    await_leader_advance(topology, BLOCKS, 1.0, "runtime writes entering the ledger").await?;
-    let target = leader_metric(topology, TRANSACTIONS).await?;
+    let target = write_cutoff(topology).await?;
     try_join_all(topology.verifiers().iter().map(|verifier| async move {
         await_catch_up(verifier, TRANSACTIONS, target).await?;
         let before = verifier_metric(verifier, BLOCKS).await?;
         await_catch_up(verifier, BLOCKS, before + (CHECKPOINT_SLOTS + 1) as f64).await?;
-        ensure!(
-            verifier.stream_connected().await,
-            "{} disconnected",
-            verifier.label()
-        );
-        let mismatches = verifier_count(verifier, STATE_MISMATCHES).await?;
-        ensure!(
-            mismatches == 0.0,
-            "verifier {} reported {mismatches:.0} state mismatches",
-            verifier.label()
-        );
-        Ok::<_, anyhow::Error>(())
+        check_stream(verifier).await
     }))
     .await?;
     Ok(())
