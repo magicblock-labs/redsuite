@@ -400,6 +400,8 @@ impl CommitFixture {
             )
             .await?;
         ensure!(self.base_count(&cell).await? == 0);
+        self.base.delegate_payer(&self.payer, &payer, self.er.identity()).await?;
+        self.er.await_delegated(&payer.pubkey(), "standalone action payer").await?;
         let submission =
             faults.intercept(Selector::method("sendTransaction").http().response().account(&cell));
         let action = REDSHIFT
@@ -407,6 +409,7 @@ impl CommitFixture {
             .add(&[cell], i64::from(ACTION_COUNT))
             .action(cell, REDSHIFT.id());
         let mut bundle = IntentBundle::new(payer.pubkey());
+        bundle.validator = Some(self.er.identity());
         bundle.actions.push(Action::new(payer.pubkey(), action, ACTION_COMPUTE_UNITS));
         let intent_signature = self
             .er
