@@ -2,6 +2,7 @@ use std::{
     fs,
     os::unix::process::ExitStatusExt,
     path::{Path, PathBuf},
+    process::ExitStatus,
     rc::Rc,
     time::Duration,
 };
@@ -154,7 +155,12 @@ impl PrivateEr {
     /// Stops the ER without relaunching, checking for a snapshot gap before SIGTERM.
     /// `hard_kill` skips the check and sends SIGKILL without flushing.
     pub async fn stop(&mut self, hard_kill: bool) -> Result<()> {
-        let _ = self.prepare_shutdown(hard_kill).await?;
+        self.prepare_shutdown(hard_kill).await?;
+        self.stop_process(hard_kill).await?;
+        Ok(())
+    }
+
+    async fn stop_process(&mut self, hard_kill: bool) -> Result<(ExitStatus, bool)> {
         let (status, needed_sigkill) = self
             .proc
             .terminate(hard_kill)
@@ -162,9 +168,10 @@ impl PrivateEr {
             .context("private ER has no running process to stop")?;
         ensure!(
             hard_kill || (status.success() && !needed_sigkill),
-            "private ER shutdown failed: {status}, needed_sigkill={needed_sigkill}"
+            "private ER `{}` shutdown failed: {status}, needed_sigkill={needed_sigkill}",
+            self.proc.label()
         );
-        Ok(())
+        Ok((status, needed_sigkill))
     }
 
     /// Stops the ER and removes its storage once the child is reaped.
@@ -181,28 +188,22 @@ impl PrivateEr {
     }
 
     /// Stops and relaunches the ER on the same storage, identity and ports.
-    /// A failed snapshot wait terminates the old process and aborts the restart.
+    /// A failed snapshot wait or unclean graceful stop aborts the restart.
     pub async fn restart(&mut self, config: RestartConfig) -> Result<RestartOutcome> {
         let api = self.rpc_api();
-        let slot_before = match self.prepare_shutdown(config.hard_kill).await? {
+        let hard_kill = config.hard_kill;
+        let slot_before = match self.prepare_shutdown(hard_kill).await? {
             Some(slot) => Some(slot),
             None => api.get_slot().await.ok(),
         };
-        let (exit_status, needed_sigkill) = self
-            .proc
-            .terminate(config.hard_kill)
-            .await?
-            .context("private ER has no running process to restart")?;
-        let exit_code = exit_status.code();
-        let exit_signal = ExitStatusExt::signal(&exit_status);
-
+        let (exit_status, needed_sigkill) = self.stop_process(hard_kill).await?;
         self.start(config).await?;
         let slot_after = api.get_slot().await.ok();
 
         Ok(RestartOutcome {
             needed_sigkill,
-            exit_code,
-            exit_signal,
+            exit_code: exit_status.code(),
+            exit_signal: exit_status.signal(),
             slot_before,
             slot_after,
         })

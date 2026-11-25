@@ -22,7 +22,9 @@ use crate::{
     api::Api, host::proc_running, logging::read_log_tail, resources::ResourceRecord, Result,
 };
 
-pub(super) const KILL_GRACE: Duration = Duration::from_secs(5);
+// Engine gives each of its four shutdown tiers up to eight seconds.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(40);
+const KILL_GRACE: Duration = Duration::from_secs(5);
 pub(super) const POLL: Duration = Duration::from_millis(250);
 // Fine cadence for restart timing, where the interval is the measurement floor.
 pub(super) const RESTART_POLL: Duration = Duration::from_millis(5);
@@ -52,36 +54,34 @@ fn send_signal(pid: u32, signal: &str) {
     let _ = Command::new("kill").args([signal, &pid.to_string()]).status();
 }
 
-// The one termination primitive: signal, grace window, SIGKILL escalation,
-// reaped exit status. hard_kill=true sends SIGKILL immediately (the crash
-// path the ledger-restore scenarios use so nothing flushes on the way down).
-pub(super) async fn terminate(
-    child: &mut Child,
-    pid: u32,
-    hard_kill: bool,
-) -> Result<(ExitStatus, bool)> {
+// Intentional crash tests skip SIGTERM so the validator cannot flush on the way down.
+async fn terminate(child: &mut Child, hard_kill: bool) -> Result<(ExitStatus, bool)> {
     if let Some(status) = child.try_wait()? {
         return Ok((status, false));
     }
-    send_signal(pid, if hard_kill { "-KILL" } else { "-TERM" });
-    let grace_deadline = Instant::now() + KILL_GRACE;
-    let hard_deadline = if hard_kill { grace_deadline } else { grace_deadline + KILL_GRACE };
-    let mut escalated = hard_kill;
-    let mut needed_sigkill = false;
+    let pid = child.id();
+    if !hard_kill {
+        send_signal(pid, "-TERM");
+        if let Some(status) = wait_for_exit(child, SHUTDOWN_GRACE).await? {
+            return Ok((status, false));
+        }
+        warn!(pid, grace = ?SHUTDOWN_GRACE, "graceful shutdown timed out; sending SIGKILL");
+    }
+
+    send_signal(pid, "-KILL");
+    let status = wait_for_exit(child, KILL_GRACE)
+        .await?
+        .with_context(|| format!("process {pid} did not exit within {KILL_GRACE:?} of SIGKILL"))?;
+    Ok((status, !hard_kill))
+}
+
+async fn wait_for_exit(child: &mut Child, grace: Duration) -> Result<Option<ExitStatus>> {
+    let deadline = Instant::now() + grace;
     loop {
-        if let Some(status) = child.try_wait()? {
-            return Ok((status, needed_sigkill));
+        let status = child.try_wait()?;
+        if status.is_some() || Instant::now() >= deadline {
+            return Ok(status);
         }
-        if !escalated && Instant::now() >= grace_deadline {
-            warn!(pid, "graceful shutdown timed out; sending SIGKILL");
-            send_signal(pid, "-KILL");
-            escalated = true;
-            needed_sigkill = true;
-        }
-        ensure!(
-            Instant::now() < hard_deadline,
-            "process {pid} did not exit within {KILL_GRACE:?} of SIGKILL"
-        );
         time::sleep(RESTART_POLL).await;
     }
 }
@@ -417,7 +417,7 @@ impl Owned {
         let Some(child) = self.child.as_mut() else {
             return Ok(None);
         };
-        let outcome = terminate(child, self.pid, hard_kill).await?;
+        let outcome = terminate(child, hard_kill).await?;
         self.child = None;
         self.record.mark_finished();
         Ok(Some(outcome))
