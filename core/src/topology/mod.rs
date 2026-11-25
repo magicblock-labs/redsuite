@@ -16,7 +16,6 @@ pub use config::{
 };
 pub use identity::{identity_for_label, identity_keypair};
 pub use private::{private_er, GroupEr, PrivateEr, RestartOutcome};
-pub(crate) use process::kill_pid;
 pub use replicated::{
     latest_snapshot, replicated, ReplicatedTopology, Verifier, VerifierStop, VerifierTiming,
     STREAM_CONNECTED,

@@ -27,7 +27,12 @@ use crate::{args::Run, catalog};
 
 const GROUP_FAILED: &str = "earlier scenario in this ER group failed";
 
-type LaneResult = (&'static str, f64, Vec<RunRecord>);
+struct LaneResult {
+    label: &'static str,
+    seconds: f64,
+    records: Vec<RunRecord>,
+    teardown_failed: bool,
+}
 
 /// Compatible ER-group scenarios, or fresh scenarios whose concurrency is bounded independently.
 struct Lane {
@@ -71,22 +76,28 @@ impl Lane {
                 );
             }
         }
-        let elapsed = started.elapsed().as_secs_f64();
-        if let Some(Ok(group)) = group {
-            if let Err(error) = group.finish().await {
-                records.push(RunRecord::failed(
-                    format!("group/{label}/cleanup"),
-                    "cleanup",
-                    format!("group teardown failed: {error:#}"),
-                ));
-            }
-        }
+        let seconds = started.elapsed().as_secs_f64();
+        let teardown_failed = match group {
+            Some(Ok(group)) => group
+                .finish()
+                .await
+                .inspect_err(|error| {
+                    error!(group = label, error = %format_args!("{error:#}"), "ER group teardown failed");
+                })
+                .is_err(),
+            _ => false,
+        };
         debug!(
             lane = label,
-            seconds = format_args!("{elapsed:.2}"),
+            seconds = format_args!("{seconds:.2}"),
             "lane finished"
         );
-        (label, elapsed, records)
+        LaneResult {
+            label,
+            seconds,
+            records,
+            teardown_failed,
+        }
     }
 }
 
@@ -223,11 +234,20 @@ impl Suite {
             return join_all(lanes.into_iter().map(|lane| lane.run(self, base))).await;
         }
         let started = Instant::now();
-        let mut records = Vec::new();
+        let mut outcomes = Vec::with_capacity(lanes.len());
         for lane in lanes {
-            records.extend(lane.run(self, base).await.2);
+            outcomes.push(lane.run(self, base).await);
         }
-        vec![("serial", started.elapsed().as_secs_f64(), records)]
+        if outcomes.iter().any(|lane| !lane.records.is_empty()) {
+            self.report = self.report.take().map(|report| {
+                report.metric(
+                    "serial seconds",
+                    Unit::Seconds,
+                    started.elapsed().as_secs_f64(),
+                )
+            });
+        }
+        outcomes
     }
 
     pub async fn run(mut self) -> Result<()> {
@@ -246,20 +266,15 @@ impl Suite {
                 "shared base setup failed");
         }
         let lanes = self.execute(&base).await;
-        let mut records = Vec::new();
-        for (label, seconds, mut runs) in lanes {
-            if !runs.is_empty() {
-                self.report = self.report.map(|report| {
-                    report.metric(format!("{label} seconds"), Unit::Seconds, seconds)
-                });
+        let mut outcome = self.finish(&lanes);
+        if let Some(mut report) = self.report {
+            for lane in lanes.iter().filter(|lane| !self.serial && !lane.records.is_empty()) {
+                report = report.metric(
+                    format!("{} seconds", lane.label),
+                    Unit::Seconds,
+                    lane.seconds,
+                );
             }
-            records.append(&mut runs);
-        }
-        if let Ok(base) = &base {
-            base.reclaim(&self.selection);
-        }
-        let mut outcome = self.finish(&records);
-        if let Some(report) = self.report {
             let report = report.metric(
                 "wall seconds",
                 Unit::Seconds,
@@ -282,16 +297,16 @@ impl Suite {
         outcome
     }
 
-    /// Runs requested cleanup while keeping synthetic records out of the selected-scenario count.
-    fn finish(&self, records: &[RunRecord]) -> Result<()> {
+    fn finish(&self, lanes: &[LaneResult]) -> Result<()> {
         let cleanup = if self.cleanup && self.config.environment.is_none() {
             topology::down()
         } else {
             Ok(())
         }
         .inspect_err(|error| error!(error = %format_args!("{error:#}"), "stack cleanup failed"));
+        let teardown_failed = lanes.iter().filter(|lane| lane.teardown_failed).count();
         let (mut passed, mut failed, mut not_run) = (0, 0, 0);
-        for record in records {
+        for record in lanes.iter().flat_map(|lane| &lane.records) {
             match record.phase {
                 "not run" => not_run += 1,
                 _ if record.passed() => passed += 1,
@@ -299,8 +314,8 @@ impl Suite {
             }
         }
         ensure!(
-            failed == 0 && not_run == 0,
-            "{}: {passed} passed, {failed} failed, {not_run} not run",
+            failed == 0 && not_run == 0 && teardown_failed == 0,
+            "{}: {passed} passed, {failed} failed, {not_run} not run; {teardown_failed} group teardown failures",
             self.selection
         );
         cleanup

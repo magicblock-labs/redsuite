@@ -108,7 +108,5 @@ pub async fn run(config: ExecutionConfig, limit: usize) -> Result<()> {
     prepare(selected.iter().map(|(_, entry)| entry), &base).await?;
     let group = GroupEr::boot(&DEFAULT, &base).await.context("starting continuous ER")?;
     let outcome = run_rounds(&config, &base, group.ctx(), limit).await;
-    let finished = group.finish().await;
-    base.reclaim(OWNER);
-    outcome.and(finished)
+    outcome.and(group.finish().await)
 }

@@ -116,14 +116,6 @@ impl RunRecord {
         record
     }
 
-    pub fn failed(name: String, phase: &'static str, reason: String) -> Self {
-        let mut record = Self::new(name);
-        record.phase = phase;
-        error!(scenario = %record.name, phase, %reason, "scenario did not complete");
-        record.outcome = Err(Error::msg(reason));
-        record
-    }
-
     fn new(name: String) -> Self {
         Self {
             name,
@@ -166,14 +158,14 @@ impl RunRecord {
         if config.environment.is_none() {
             preflight(fixtures)?;
         }
-        let resources = base.resources();
         self.phase = "setup";
         let started = Instant::now();
         // A scenario panic must not skip cleanup or prevent sibling runs.
-        let result = AssertUnwindSafe(body(base, state, &mut self.phase)).catch_unwind().await;
+        let result = AssertUnwindSafe(body(base.clone(), state, &mut self.phase))
+            .catch_unwind()
+            .await;
         let wall = started.elapsed().as_secs_f64();
-        resources.reclaim(&self.name);
-        self.launches = resources.launches();
+        self.launches = base.launches().snapshot();
         self.wall_seconds = Some(wall);
         let (report, outcome) = match result {
             Ok(Ok(verdict)) => verdict.into_result(),

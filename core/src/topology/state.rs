@@ -8,6 +8,7 @@ use std::{
 
 use anyhow::Context;
 use json::{Deserialize, Serialize};
+use magicblock_config::config::EngineConfig;
 use tokio::task;
 use url::Url;
 
@@ -56,27 +57,44 @@ pub fn accountsdb_root() -> Option<PathBuf> {
     env::var_os(ACCOUNTSDB_ROOT_ENV).map(PathBuf::from)
 }
 
-pub(super) fn accountsdb_dir(storage_dir: &Path) -> PathBuf {
-    match (accountsdb_root(), storage_dir.file_name()) {
-        (Some(root), Some(name)) => root.join(name).join("accountsdb"),
-        _ => storage_dir.join("accountsdb"),
+/// The directories managed together even when the ledger and AccountsDB are on separate volumes.
+pub(super) struct Storage {
+    pub(super) ledger: PathBuf,
+    pub(super) accountsdb: PathBuf,
+}
+
+impl Storage {
+    pub(super) fn new(ledger: PathBuf) -> Self {
+        let accounts_root =
+            accountsdb_root().zip(ledger.file_name()).map(|(root, name)| root.join(name));
+        let accountsdb = accounts_root.as_ref().unwrap_or(&ledger).join("accountsdb");
+        Self { ledger, accountsdb }
+    }
+
+    pub(super) fn configure<R>(&self, engine: &mut EngineConfig<R>) {
+        engine.ledger.directory.clone_from(&self.ledger);
+        engine.accountsdb.directory.clone_from(&self.accountsdb);
+    }
+
+    pub(super) fn matches<R>(&self, engine: &EngineConfig<R>) -> bool {
+        engine.ledger.directory == self.ledger && engine.accountsdb.directory == self.accountsdb
+    }
+
+    pub(super) fn clear(&self) -> Result<()> {
+        let remove = |dir: &Path| {
+            remove_dir_if_present(dir).with_context(|| format!("removing {}", dir.display()))
+        };
+        let ledger = remove(&self.ledger);
+        let split = self
+            .accountsdb
+            .parent()
+            .filter(|root| *root != self.ledger)
+            .map_or(Ok(()), remove);
+        ledger.and(split)
     }
 }
 
-pub(super) fn split_accountsdb_dir(storage_dir: &Path) -> Option<PathBuf> {
-    let root = accountsdb_root()?;
-    Some(root.join(storage_dir.file_name()?))
-}
-
-pub(super) fn remove_storage(storage_dir: &Path) -> io::Result<()> {
-    remove_dir_if_present(storage_dir)?;
-    if let Some(split) = split_accountsdb_dir(storage_dir) {
-        remove_dir_if_present(&split)?;
-    }
-    Ok(())
-}
-
-pub(crate) fn remove_dir_if_present(dir: &Path) -> io::Result<()> {
+fn remove_dir_if_present(dir: &Path) -> io::Result<()> {
     match fs::remove_dir_all(dir) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
