@@ -1,0 +1,69 @@
+name: Package and attach a component
+
+on:
+  workflow_call:
+    inputs:
+      component:
+        description: RedSuite component (runner, runtime, or fixtures)
+        required: true
+        type: string
+
+env:
+  RUSTFLAGS: ''
+  CARGO_INCREMENTAL: '0'
+
+jobs:
+  build:
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ${{ fromJSON(inputs.component == 'fixtures' && '["ubuntu-22.04"]' || '["ubuntu-22.04","macos-15"]') }}
+    runs-on: ${{ matrix.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/package-component
+        id: package
+        with:
+          component: ${{ inputs.component }}
+          image: ${{ matrix.image }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.component == 'fixtures' && 'fixtures' || format('{0}-{1}', inputs.component, steps.package.outputs.platform) }}
+          path: target/${{ inputs.component }}-assets/*.tar.gz*
+          if-no-files-found: error
+          compression-level: 0
+
+  release:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ github.ref_name }}
+      COMPONENT: ${{ inputs.component }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+      - name: Attach release archives
+        shell: bash
+        run: |
+          create_flags=()
+          upload_flags=()
+          case "$COMPONENT" in
+            runner) notes=''; upload_flags+=(--clobber) ;;
+            fixtures) notes='Shared RedSuite fixtures.'; create_flags+=(--latest=false) ;;
+            runtime) notes='Pinned Agave/Yellowstone runtime.'; create_flags+=(--latest=false) ;;
+          esac
+
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --verify-tag --draft --title "$RELEASE_TAG" \
+              --notes "$notes" "${create_flags[@]}"
+          fi
+          gh release upload "$RELEASE_TAG" assets/*.tar.gz assets/*.tar.gz.sha256 "${upload_flags[@]}"
