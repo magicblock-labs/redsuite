@@ -194,21 +194,20 @@ For a manual source setup without the runtime wrapper, install the components
 selected by the manifest, put `solana-test-validator` and `cargo-build-sbf` on
 `PATH`, and select the pinned plugin as described in [gRPC setup](#grpc-setup).
 
-The `dlp_v2_lifecycle` scenario needs the DLP revision pinned by this workspace,
-which may not be deployed on mainnet yet. Build that checkout and select its
-program before booting a fresh stack:
+The DLP v2 scenarios use this branch's fixture programs and a validator with v2
+settlement support. From the RedSuite checkout, build the fixtures and run the
+scenarios against the delegation program revision pinned in RedSuite's `Cargo.lock`.
 
 ```bash
-cargo build-sbf --manifest-path /path/to/delegation-program/program/Cargo.toml
+export REDSUITE_FIXTURES_DIR="$PWD/target/deploy"
+./scripts/with-runtime cargo xtask programs
+./scripts/with-runtime cargo build-sbf \
+  --manifest-path /path/to/delegation-program/program/Cargo.toml -- --locked
 export REDSUITE_DLP_SO=/path/to/delegation-program/target/deploy/delegation_program.so
 ./scripts/with-runtime cargo run --locked -p redsuite -- stack down
-./scripts/with-runtime cargo run --locked -p redsuite -- redshift run dlp_v2_lifecycle
+./scripts/with-runtime cargo run --locked -p redsuite -- redshift run --serial \
+  dlp_v2_lifecycle dlp_v2_buffered_settlement dlp_mixed_settlement
 ```
-
-The same setup runs `dlp_v2_buffered_settlement` and `dlp_mixed_settlement`.
-
-The override only replaces the base-chain DLP program. V2 scenarios still require
-a validator that discovers v2 delegations and settles them through the committor.
 
 The first base-chain boot needs access to an RPC endpoint to clone its programs;
 this defaults to mainnet-beta. Later runs reuse the local base. Stop the stack

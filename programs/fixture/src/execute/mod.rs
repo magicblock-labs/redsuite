@@ -450,7 +450,33 @@ fn undelegate(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pro
         Configuration::default().with_length_encoding::<u32>(),
     )
     .map_err(|_| ProgramError::InvalidInstructionData)?;
-    undelegate_account(cell, program_id, buffer, payer, system, seeds)?;
+    if cell.owner == program_id {
+        // DLP v2 returns the allocated cell to its owner before invoking the callback.
+        if !buffer.is_signer || !payer.is_signer {
+            return Err(ProgramError::MissingRequiredSignature);
+        }
+        if buffer.owner != &dpi::id() || system.key != &sdk_ids::system_program::ID {
+            return Err(ProgramError::IncorrectProgramId);
+        }
+        let bytes = buffer.try_borrow_data()?;
+        let id = CellHeader::try_decode(&bytes).map_err(|_| ProgramError::InvalidAccountData)?.id;
+        let index = id.index.to_le_bytes();
+        if buffer.key != &dpi::undelegate_buffer_pda(cell.key).0
+            || cell.key != &id.pda(program_id).0
+            || !seeds
+                .iter()
+                .map(Vec::as_slice)
+                .eq([CellId::SEED, id.authority.as_ref(), &index])
+        {
+            return Err(ProgramError::InvalidSeeds);
+        }
+        if cell.data_len() != bytes.len() {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        cell.try_borrow_mut_data()?.copy_from_slice(&bytes);
+    } else {
+        undelegate_account(cell, program_id, buffer, payer, system, seeds)?;
+    }
     let state = CellHeader::try_decode(&cell.try_borrow_data()?)
         .map_err(|_| ProgramError::InvalidAccountData)?;
     if state.undelegation == UndelegationOutcome::Reject {
