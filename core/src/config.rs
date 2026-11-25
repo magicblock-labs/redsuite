@@ -57,6 +57,8 @@ impl LoopMode {
 
 #[derive(Clone, Debug, Default)]
 pub struct ExecutionConfig {
+    /// Require a live managed base instead of booting one during scenario setup.
+    pub require_running_base: bool,
     pub profile: Profile,
     pub loop_mode: LoopMode,
     pub seed: u64,

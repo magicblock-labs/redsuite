@@ -255,18 +255,19 @@ impl Suite {
         info!(selection = %self.selection, scenarios = self.total, seed = self.config.seed,
             serial = self.serial, "suite started");
         let base = async {
-            let ctx =
-                topology::base_only(self.config.clone()).await.context("starting base stack")?;
+            let ctx = topology::base_only(self.config.clone())
+                .await
+                .context("connecting to base stack")?;
             prepare(self.entries.iter(), &ctx).await?;
             Ok(ctx)
         }
         .await;
         if let Err(error) = &base {
             error!(selection = %self.selection, seed = self.config.seed, error = %format_args!("{error:#}"),
-                "shared base setup failed");
+                "base setup failed");
         }
         let lanes = self.execute(&base).await;
-        let mut outcome = self.finish(&lanes);
+        let mut outcome = self.finish(&lanes).await;
         if let Some(mut report) = self.report {
             for lane in lanes.iter().filter(|lane| !self.serial && !lane.records.is_empty()) {
                 report = report.metric(
@@ -297,9 +298,9 @@ impl Suite {
         outcome
     }
 
-    fn finish(&self, lanes: &[LaneResult]) -> Result<()> {
+    async fn finish(&self, lanes: &[LaneResult]) -> Result<()> {
         let cleanup = if self.cleanup && self.config.environment.is_none() {
-            topology::down()
+            topology::reset_base(false).await
         } else {
             Ok(())
         }

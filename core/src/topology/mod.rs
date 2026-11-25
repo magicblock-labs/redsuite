@@ -20,7 +20,7 @@ pub use replicated::{
     latest_snapshot, replicated, ReplicatedTopology, Verifier, VerifierStop, VerifierTiming,
     STREAM_CONNECTED,
 };
-pub use shared::{base_only, running_base_programs};
+pub use shared::{base_only, reset_base, running_base_programs};
 pub use state::{
     accountsdb_root, stack_dir, workspace_root, StackState, ACCOUNTSDB_ROOT_ENV, ROOT_ENV,
     STACK_DIR_ENV,

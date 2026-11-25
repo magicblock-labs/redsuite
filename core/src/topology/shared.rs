@@ -3,7 +3,7 @@ use std::{fs, path::Path};
 use anyhow::{ensure, Context};
 use keypair::Keypair;
 use signer::Signer;
-use tracing::debug;
+use tracing::{debug, info};
 use url::Url;
 
 use super::{
@@ -43,15 +43,37 @@ async fn ensure_base(config: ExecutionConfig) -> Result<StackState> {
                 && state.base_grpc_port != 0
                 && base_healthy(&state).await =>
         {
+            if config.require_running_base {
+                info!(
+                    pid = state.base_pid,
+                    rpc = %format_args!("http://127.0.0.1:{}", state.base_rpc_port),
+                    "using running base"
+                );
+            }
             Ok(state)
         }
         stale => {
+            ensure!(
+                !config.require_running_base,
+                "no healthy base at {} (this run requires a running base)",
+                state::stack_dir().display()
+            );
             if let Some(stale) = stale {
                 kill_stack(&stale);
             }
             boot_base(config).await
         }
     }
+}
+
+/// Serialize explicit stop/restart with the ordinary base startup path.
+pub async fn reset_base(restart: bool) -> Result<()> {
+    let _lock = state::acquire_lock().await?;
+    super::status::down()?;
+    if restart {
+        boot_base(ExecutionConfig::default()).await?;
+    }
+    Ok(())
 }
 
 fn base_ctx(state: &StackState, config: ExecutionConfig) -> Result<BaseCtx> {

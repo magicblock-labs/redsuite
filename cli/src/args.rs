@@ -79,6 +79,9 @@ pub struct Run {
 pub struct CheckRun {
     #[command(flatten)]
     pub run: Run,
+    /// Use an already-running managed base and fail if it is down.
+    #[arg(long)]
+    pub require_running_base: bool,
     #[arg(long, value_name = "U64")]
     pub seed: Option<u64>,
     /// Maximum concurrent fresh scenarios.
