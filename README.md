@@ -194,24 +194,12 @@ For a manual source setup without the runtime wrapper, install the components
 selected by the manifest, put `solana-test-validator` and `cargo-build-sbf` on
 `PATH`, and select the pinned plugin as described in [gRPC setup](#grpc-setup).
 
-The DLP v2 scenarios use this branch's fixture programs and a validator with v2
-settlement support. From the RedSuite checkout, build the fixtures and run the
-scenarios against the delegation program revision pinned in RedSuite's `Cargo.lock`.
-
-```bash
-export REDSUITE_FIXTURES_DIR="$PWD/target/deploy"
-./scripts/with-runtime cargo xtask programs
-./scripts/with-runtime cargo build-sbf \
-  --manifest-path /path/to/delegation-program/program/Cargo.toml -- --locked
-export REDSUITE_DLP_SO=/path/to/delegation-program/target/deploy/delegation_program.so
-./scripts/with-runtime cargo run --locked -p redsuite -- stack down
-./scripts/with-runtime cargo run --locked -p redsuite -- redshift run --serial \
-  dlp_v2_lifecycle dlp_v2_buffered_settlement dlp_mixed_settlement
-```
-
-The first base-chain boot needs access to an RPC endpoint to clone its programs;
-this defaults to mainnet-beta. Later runs reuse the local base. Stop the stack
-when finished with `redsuite stack down`.
+For DLP v2 integration, keep the `magicblock-validator` and `delegation-program`
+checkouts beside RedSuite. Use the delegation program revision pinned in
+RedSuite's `Cargo.lock` to reproduce CI. Run `just` in RedSuite to see the live
+bases and the commands to build the programs, manage each base, and run selected
+scenarios. The first base boot uses an RPC endpoint to clone supporting
+programs and defaults to mainnet-beta. [Justfile](Justfile)
 
 ## 🛠️ Choose a run
 
