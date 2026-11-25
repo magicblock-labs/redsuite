@@ -38,7 +38,7 @@ static CACHE: ErGroup = ErGroup {
 static STORAGE: ErGroup = ErGroup {
     settings: |p| {
         p.engine.blockstore.blocktime = Duration::from_millis(50);
-        p.engine.blockstore.superblock = 20;
+        p.engine.blockstore.superblock = 128;
     },
     ..ErGroup::new("storage")
 };
@@ -63,10 +63,7 @@ static LEDGER_RETENTION: ErGroup = ErGroup {
 
 static RUNTIME: ErGroup = ErGroup {
     label: replication::replicated_runtime::LABEL,
-    settings: |p| {
-        replication::settings(p);
-        p.engine.blockstore.superblock = 0;
-    },
+    settings: replication::settings,
     proxy: true,
     followers: 2,
 };

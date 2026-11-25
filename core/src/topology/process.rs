@@ -13,13 +13,18 @@ use std::{
 
 use anyhow::{anyhow, ensure, Context, Error};
 use rand::Rng;
+use serde::Serialize;
 use tokio::{net::TcpStream, time};
 use tracing::warn;
 use url::Url;
 
-use super::config;
+use super::{config, config::Plan, state::Storage};
 use crate::{
-    api::Api, host::proc_running, logging::read_log_tail, resources::ResourceRecord, Result,
+    api::Api,
+    host::proc_running,
+    logging::read_log_tail,
+    resources::{Launch, LaunchRecord, Launches},
+    Result,
 };
 
 // Engine gives each of its four shutdown tiers up to eight seconds.
@@ -95,7 +100,7 @@ pub(super) fn describe_exit(status: &ExitStatus) -> String {
     }
 }
 
-pub(crate) fn kill_pid(pid: u32) {
+pub(super) fn kill_pid(pid: u32) {
     if pid == 0 || !proc_running(pid) {
         return;
     }
@@ -366,22 +371,27 @@ pub(super) struct Owned {
     label: String,
     pid: u32,
     child: Option<Child>,
-    record: Rc<ResourceRecord>,
+    storage: Option<Storage>,
+    record: Rc<Launch>,
 }
 
 impl Owned {
     pub(super) fn new(
         kind: &'static str,
-        label: String,
         child: Child,
-        record: Rc<ResourceRecord>,
+        storage: Storage,
+        launches: &Launches,
+        mut launch: LaunchRecord,
     ) -> Self {
+        launch.pid = child.id();
+        launch.set_storage(&storage.ledger, &storage.accountsdb);
         Self {
             kind,
-            pid: child.id(),
-            label,
+            pid: launch.pid,
+            label: launch.label.clone(),
             child: Some(child),
-            record,
+            storage: Some(storage),
+            record: launches.record(launch),
         }
     }
 
@@ -399,6 +409,40 @@ impl Owned {
 
     pub(super) fn is_running(&self) -> bool {
         self.has_child() && proc_running(self.pid)
+    }
+
+    pub(super) fn storage(&self) -> Result<&Storage> {
+        self.storage
+            .as_ref()
+            .with_context(|| format!("{} has no managed storage", self.label))
+    }
+
+    pub(super) fn clear_storage(&self) -> Result<()> {
+        ensure!(
+            !self.has_child(),
+            "cannot remove storage while {} owns a child",
+            self.label
+        );
+        self.storage.as_ref().map_or(Ok(()), Storage::clear)
+    }
+
+    pub(super) fn discard_storage(&mut self) -> Result<()> {
+        self.clear_storage()?;
+        self.storage = None;
+        Ok(())
+    }
+
+    /// Transfers both directories between stopped nodes. The donor can no longer remove them.
+    pub(super) fn adopt_storage(&mut self, donor: &mut Self) -> Result<&Storage> {
+        ensure!(
+            !donor.has_child(),
+            "{} must be stopped before promotion",
+            donor.label
+        );
+        donor.storage()?;
+        self.discard_storage()?;
+        std::mem::swap(&mut self.storage, &mut donor.storage);
+        self.storage()
     }
 
     pub(super) fn exit_status(&mut self) -> Result<Option<ExitStatus>> {
@@ -419,39 +463,52 @@ impl Owned {
         };
         let outcome = terminate(child, hard_kill).await?;
         self.child = None;
-        self.record.mark_finished();
         Ok(Some(outcome))
     }
 
-    pub(super) fn relaunch(&mut self, child: Child) {
-        self.pid = child.id();
+    pub(super) fn relaunch<P: Serialize>(&mut self, plan: &Plan<P>, log: &Path) -> Result<()> {
+        ensure!(
+            !self.has_child(),
+            "{} must be stopped before starting",
+            self.label
+        );
+        let storage = self.storage()?;
+        let child = plan.spawn(log)?;
+        let pid = child.id();
+        self.record.relaunched(pid, &storage.ledger, &storage.accountsdb);
+        self.pid = pid;
         self.child = Some(child);
-        self.record.relaunched(self.pid);
+        Ok(())
     }
 }
 
 impl Drop for Owned {
     fn drop(&mut self) {
         let (kind, label, pid) = (self.kind, &self.label, self.pid);
-        let Some(mut child) = self.child.take() else {
-            return;
-        };
-        match child.try_wait().ok().flatten() {
-            Some(status) => {
-                let exit = describe_exit(&status);
-                warn!(kind, label, %exit, "process exited before cleanup");
-                self.record.record_exit(format!("died before cleanup: {exit}"));
-            }
-            None => {
+        if let Some(child) = self.child.as_mut() {
+            let exit = child.try_wait().and_then(|status| {
+                if let Some(status) = status {
+                    let exit = describe_exit(&status);
+                    warn!(kind, label, %exit, "process exited before cleanup");
+                    return Ok(format!("died before cleanup: {exit}"));
+                }
                 kill_pid(pid);
-                let exit = child.wait().ok().map(|status| describe_exit(&status));
-                self.record.record_exit(match exit {
-                    Some(exit) => format!("terminated by cleanup: {exit}"),
-                    None => "terminated by cleanup, status unknown".to_owned(),
-                });
+                child
+                    .wait()
+                    .map(|status| format!("terminated by cleanup: {}", describe_exit(&status)))
+            });
+            match exit {
+                Ok(exit) => self.record.record_exit(exit),
+                Err(error) => {
+                    warn!(kind, label, pid, %error, "could not reap child; preserving storage");
+                    return;
+                }
             }
+            self.child = None;
         }
-        self.record.mark_finished();
+        if let Err(error) = self.discard_storage() {
+            warn!(kind, label = self.label, error = %format_args!("{error:#}"), "storage cleanup failed");
+        }
     }
 }
 

@@ -11,7 +11,12 @@ use signer::Signer;
 use tokio::time;
 
 use super::{
-    config, config::VerifierPlan, identity, process, process::PortLease, state, RestartConfig,
+    config,
+    config::VerifierPlan,
+    identity, process,
+    process::PortLease,
+    state::{self, Storage},
+    RestartConfig,
 };
 use crate::{
     api::{Metrics, MetricsCollector},
@@ -150,28 +155,14 @@ impl Verifier {
     // storage; wiping it lets the next start rejoin from the leader's
     // snapshot under the same identity, ports and configuration.
     pub fn reset_storage(&mut self) -> Result<()> {
-        ensure!(
-            !(self.proc.has_child()),
-            "verifier `{}` must be stopped before its storage is reset",
-            self.proc.label()
-        );
-        self.remove_storage()
-    }
-
-    fn remove_storage(&self) -> Result<()> {
-        state::remove_storage(self.plan.storage_dir())
+        self.proc
+            .clear_storage()
             .with_context(|| format!("removing the storage of verifier `{}`", self.proc.label()))
     }
 
     pub async fn start(&mut self, ready_timeout: Duration) -> Result<Duration> {
-        ensure!(
-            !(self.proc.has_child()),
-            "verifier `{}` is already running (pid {})",
-            self.proc.label(),
-            self.proc.pid()
-        );
         let started = Instant::now();
-        self.proc.relaunch(self.plan.spawn(&self.log)?);
+        self.proc.relaunch(&self.plan, &self.log)?;
         self.wait_ready(ready_timeout).await?;
         Ok(started.elapsed())
     }
@@ -196,7 +187,7 @@ impl Verifier {
 
     async fn finish(&mut self) -> Result<()> {
         self.proc.terminate(false).await?;
-        self.remove_storage()
+        self.proc.discard_storage()
     }
 }
 
@@ -237,27 +228,11 @@ impl ReplicatedTopology {
     }
 
     pub async fn promote(&mut self, index: usize) -> Result<()> {
-        ensure!(
-            !self.verifier(index).proc.has_child(),
-            "verifier must be stopped before promotion"
-        );
-        let verifier = self.verifiers.remove(index);
-        let storage = verifier.storage_dir().to_owned();
-        let accounts = verifier.accountsdb_dir().to_owned();
-        self.leader
-            .owner()
-            .context("replication requires a group-owned leader")?
-            .lock()
-            .await
-            .start(RestartConfig {
-                before_start: Box::new(move |params| {
-                    params.engine.ledger.directory = storage.clone();
-                    params.engine.accountsdb.directory = accounts.clone();
-                    Ok(())
-                }),
-                ..Default::default()
-            })
-            .await
+        let owner = self.leader.owner().context("replication requires a group-owned leader")?;
+        let mut leader = owner.lock().await;
+        leader.adopt_storage(&mut self.verifiers[index].proc)?;
+        self.verifiers.remove(index);
+        leader.start(RestartConfig::default()).await
     }
 
     pub async fn leader_connections(&self) -> Result<f64> {
@@ -331,21 +306,20 @@ pub async fn replicated(base: &BaseCtx, leader: ErCtx) -> Result<ReplicatedTopol
             identity.pubkey() == expected.0,
             "unexpected admitted identity for {label}"
         );
-        let storage_dir = dir.join(format!("er-{label}"));
-        state::remove_storage(&storage_dir)?;
+        let storage = Storage::new(dir.join(format!("er-{label}")));
+        storage.clear()?;
         let mut ports = PortLease::default();
         let metrics_port = ports.single()?;
         let plan = VerifierPlan {
             bin: verifier_bin.clone(),
             config_path: config::config_path(&dir, &label),
-            params: config::verifier_params(&leader_params, identity, metrics_port, storage_dir),
+            params: config::verifier_params(&leader_params, identity, metrics_port, &storage),
         };
         let log = dir.join(format!("er-{label}.log"));
         ports.release();
         let child = plan.spawn(&log)?;
-        let pid = child.id();
-        let record = base.resources().register_launch(LaunchRecord {
-            label: label.clone(),
+        let launch = LaunchRecord {
+            label,
             role: "verifier".to_owned(),
             bin: plan.bin.display().to_string(),
             bin_version: bin_version.clone(),
@@ -353,23 +327,19 @@ pub async fn replicated(base: &BaseCtx, leader: ErCtx) -> Result<ReplicatedTopol
             identity: plan.identity().to_string(),
             metrics_port,
             upstream: Some(plan.upstream_address().to_string()),
-            storage_dir: plan.storage_dir().display().to_string(),
-            accountsdb_dir: state::split_accountsdb_dir(plan.storage_dir())
-                .map(|dir| dir.display().to_string()),
             log: log.display().to_string(),
             config: Some(plan.config_path.display().to_string()),
-            pid,
             ..LaunchRecord::default()
-        });
+        };
+        let proc = process::Owned::new("verifier", child, storage, base.launches(), launch);
         let metrics_url = format!("http://127.0.0.1:{metrics_port}").parse()?;
-        let verifier = Verifier {
-            proc: process::Owned::new("verifier", label, child, record),
+        verifiers.push(Verifier {
+            proc,
             plan,
             log,
             metrics: MetricsCollector::new(metrics_url),
             ports,
-        };
-        verifiers.push(verifier);
+        });
     }
 
     try_join_all(verifiers.iter().map(|verifier| verifier.wait_ready(VERIFIER_READY_TIMEOUT)))

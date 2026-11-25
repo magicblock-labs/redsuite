@@ -1,15 +1,9 @@
-use std::{
-    cell::{Cell, RefCell},
-    fs,
-    io::ErrorKind,
-    rc::Rc,
-};
+use std::{cell::RefCell, path::Path, rc::Rc};
 
 use json::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
-use tracing::warn;
 
-use crate::{host, report, topology};
+use crate::report;
 
 #[skip_serializing_none]
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,69 +31,43 @@ pub struct LaunchRecord {
     pub exit: Option<String>,
 }
 
-#[derive(Default)]
-pub struct Resources {
-    records: RefCell<Vec<Rc<ResourceRecord>>>,
+impl LaunchRecord {
+    pub(crate) fn set_storage(&mut self, ledger: &Path, accountsdb: &Path) {
+        self.storage_dir = ledger.display().to_string();
+        self.accountsdb_dir = Some(accountsdb.display().to_string());
+    }
 }
 
-impl Resources {
-    pub(crate) fn register_launch(&self, mut launch: LaunchRecord) -> Rc<ResourceRecord> {
+#[derive(Default)]
+pub(crate) struct Launches {
+    records: RefCell<Vec<Rc<Launch>>>,
+}
+
+impl Launches {
+    pub(crate) fn record(&self, mut launch: LaunchRecord) -> Rc<Launch> {
         launch.launched_at = report::utc_stamp();
-        let record = Rc::new(ResourceRecord {
-            finished: Cell::new(false),
-            launch: RefCell::new(launch),
-        });
+        let record = Rc::new(Launch(RefCell::new(launch)));
         self.records.borrow_mut().push(record.clone());
         record
     }
 
-    pub(crate) fn launches(&self) -> Vec<LaunchRecord> {
-        self.records
-            .borrow()
-            .iter()
-            .map(|record| record.launch.borrow().clone())
-            .collect()
-    }
-
-    pub(crate) fn reclaim(&self, owner: &str) {
-        for record in self.records.borrow().iter() {
-            let launch = record.launch.borrow();
-            if !record.finished.get() && host::proc_running(launch.pid) {
-                topology::kill_pid(launch.pid);
-                record.mark_finished();
-                warn!(owner, %launch.label, "reclaimed running rollup");
-            }
-            for dir in std::iter::once(&launch.storage_dir).chain(launch.accountsdb_dir.iter()) {
-                match fs::remove_dir_all(dir) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == ErrorKind::NotFound => {}
-                    Err(error) => {
-                        warn!(owner, dir, error = %format_args!("{error:#}"), "storage cleanup failed")
-                    }
-                }
-            }
-        }
+    pub(crate) fn snapshot(&self) -> Vec<LaunchRecord> {
+        self.records.borrow().iter().map(|record| record.0.borrow().clone()).collect()
     }
 }
 
-pub(crate) struct ResourceRecord {
-    finished: Cell<bool>,
-    launch: RefCell<LaunchRecord>,
-}
+pub(crate) struct Launch(RefCell<LaunchRecord>);
 
-impl ResourceRecord {
-    pub(crate) fn relaunched(&self, pid: u32) {
-        let mut launch = self.launch.borrow_mut();
+impl Launch {
+    pub(crate) fn relaunched(&self, pid: u32, ledger: &Path, accountsdb: &Path) {
+        let mut launch = self.0.borrow_mut();
         launch.pid = pid;
         launch.relaunches += 1;
-        self.finished.set(false);
-    }
-
-    pub(crate) fn mark_finished(&self) {
-        self.finished.set(true);
+        launch.set_storage(ledger, accountsdb);
+        launch.exit = None;
     }
 
     pub(crate) fn record_exit(&self, message: String) {
-        self.launch.borrow_mut().exit = Some(message);
+        self.0.borrow_mut().exit = Some(message);
     }
 }

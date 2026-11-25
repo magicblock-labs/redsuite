@@ -27,7 +27,7 @@ use crate::{
     config::{ErEndpoints, ExecutionConfig},
     netfault::{Faults, Proxy},
     report::{self, ScenarioReport},
-    resources::Resources,
+    resources::Launches,
     rpc_types::{request::RpcRequest, response::RpcIdentity},
     topology::{PrivateEr, RestartConfig, RestartOutcome},
     transport::NETWORK_TIMEOUT,
@@ -104,7 +104,7 @@ pub struct BaseCtx {
     api: Api,
     grpc: Option<(Url, String)>,
     blockhash: Rc<BlockhashCache>,
-    resources: Rc<Resources>,
+    launches: Launches,
     config: ExecutionConfig,
 }
 
@@ -135,7 +135,7 @@ impl BaseCtx {
             api: Api::new(rpc_url, ws_url),
             grpc,
             blockhash: Rc::new(BlockhashCache::new(BASE_BLOCKHASH_TTL)),
-            resources: Rc::new(Resources::default()),
+            launches: Launches::default(),
             config,
         }
     }
@@ -146,13 +146,13 @@ impl BaseCtx {
             api: self.api.clone().scoped(),
             grpc: self.grpc.clone(),
             blockhash: Rc::new(BlockhashCache::new(BASE_BLOCKHASH_TTL)),
-            resources: Rc::new(Resources::default()),
+            launches: Launches::default(),
             config,
         }
     }
 
-    pub(crate) fn resources(&self) -> Rc<Resources> {
-        self.resources.clone()
+    pub(crate) fn launches(&self) -> &Launches {
+        &self.launches
     }
 
     /// Persists a benchmark cell under this run without making it fatal on I/O failure.
@@ -160,10 +160,6 @@ impl BaseCtx {
         let name = self.scenario.as_deref().context("cell report outside a scenario run")?;
         report::persist_cell(name, label, report);
         Ok(())
-    }
-
-    pub fn reclaim(&self, owner: &str) {
-        self.resources.reclaim(owner);
     }
 
     pub fn grpc(&self) -> Option<(&Url, &str)> {

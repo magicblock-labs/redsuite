@@ -20,7 +20,7 @@ use super::{
     identity, process,
     process::PortLease,
     replicated::follower_label,
-    state,
+    state::{self, Storage},
 };
 use crate::{
     api::Api,
@@ -168,8 +168,12 @@ impl PrivateEr {
             .context("private ER has no running process to stop")?;
         ensure!(
             hard_kill || (status.success() && !needed_sigkill),
-            "private ER `{}` shutdown failed: {status}, needed_sigkill={needed_sigkill}",
-            self.proc.label()
+            "private ER `{}` shutdown failed: {status}, needed_sigkill={needed_sigkill}; \
+             log: {}; ledger: {}; AccountsDB: {}",
+            self.proc.label(),
+            self.log.display(),
+            self.storage_dir().display(),
+            self.plan.params.engine.accountsdb.directory.display(),
         );
         Ok((status, needed_sigkill))
     }
@@ -178,13 +182,13 @@ impl PrivateEr {
     /// Storage cleanup also runs after a failed snapshot wait; the wait error is retained.
     pub async fn finish(mut self) -> Result<()> {
         let stopped = if self.proc.has_child() { self.stop(false).await } else { Ok(()) };
-        let removed = if self.proc.has_child() { Ok(()) } else { self.remove_storage() };
+        let removed = if self.proc.has_child() { Ok(()) } else { self.proc.discard_storage() };
         stopped.and(removed)
     }
 
-    fn remove_storage(&self) -> Result<()> {
-        state::remove_storage(self.plan.storage_dir())
-            .with_context(|| format!("removing the storage of private ER `{}`", self.proc.label()))
+    pub(super) fn adopt_storage(&mut self, donor: &mut process::Owned) -> Result<()> {
+        self.proc.adopt_storage(donor)?.configure(&mut self.plan.params.engine);
+        Ok(())
     }
 
     /// Stops and relaunches the ER on the same storage, identity and ports.
@@ -215,8 +219,12 @@ impl PrivateEr {
             "private ER must be stopped before starting"
         );
         (config.before_start)(&mut self.plan.params)?;
+        ensure!(
+            self.proc.storage()?.matches(&self.plan.params.engine),
+            "restart settings cannot change managed storage paths"
+        );
         self.plan.params.ledger.reset = config.reset;
-        self.proc.relaunch(self.plan.spawn(&self.log)?);
+        self.proc.relaunch(&self.plan, &self.log)?;
         let api = self.rpc_api();
         process::wait_until_every(
             process::RESTART_POLL,
@@ -304,8 +312,8 @@ pub async fn private_er(base: &BaseCtx, options: ErOptions) -> Result<PrivateEr>
     let (rpc_port, ws_port) = ports.pair()?;
     let metrics_port = ports.single()?;
     let replication_port = ports.single()?;
-    let storage_dir = dir.join(format!("er-{}", options.label));
-    state::remove_storage(&storage_dir)?;
+    let storage = Storage::new(dir.join(format!("er-{}", options.label)));
+    storage.clear()?;
     let log = dir.join(format!("er-{}.log", options.label));
     let identity_pubkey = er_identity.pubkey();
     let role = if allowed_followers.is_empty() { "private-er" } else { "leader" };
@@ -324,7 +332,7 @@ pub async fn private_er(base: &BaseCtx, options: ErOptions) -> Result<PrivateEr>
                 metrics: metrics_port,
                 replication: replication_port,
             },
-            storage_dir,
+            &storage,
             allowed_followers,
             options.settings,
         )?,
@@ -332,10 +340,9 @@ pub async fn private_er(base: &BaseCtx, options: ErOptions) -> Result<PrivateEr>
     debug!(%options.label, log = %log.display(), "starting rollup");
     ports.release();
     let child = plan.spawn(&log)?;
-    let pid = child.id();
     let (bin_version, bin_fingerprint) = report::binary_provenance(&plan.bin);
-    let record = base.resources().register_launch(LaunchRecord {
-        label: options.label.clone(),
+    let launch = LaunchRecord {
+        label: options.label,
         role: role.to_owned(),
         bin: plan.bin.display().to_string(),
         bin_version,
@@ -345,15 +352,12 @@ pub async fn private_er(base: &BaseCtx, options: ErOptions) -> Result<PrivateEr>
         ws_port: Some(ws_port),
         metrics_port,
         replication_port: Some(replication_port),
-        storage_dir: plan.storage_dir().display().to_string(),
-        accountsdb_dir: state::split_accountsdb_dir(plan.storage_dir())
-            .map(|dir| dir.display().to_string()),
         log: log.display().to_string(),
-        pid,
         ..LaunchRecord::default()
-    });
+    };
 
-    let proc = process::Owned::new("private ER", options.label, child, record);
+    let proc = process::Owned::new("private ER", child, storage, base.launches(), launch);
+    let pid = proc.pid();
     let er_api = Api::new(
         format!("http://127.0.0.1:{rpc_port}").parse()?,
         format!("ws://127.0.0.1:{ws_port}").parse()?,

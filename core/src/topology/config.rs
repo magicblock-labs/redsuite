@@ -20,7 +20,7 @@ use signer::Signer;
 use tracing::warn;
 use url::Url;
 
-use super::{process, state};
+use super::{process, state::Storage};
 use crate::{catalog::Fixture, BaseCtx, ChainCtx, Result};
 
 const LEDGER_SIZE_LIMIT_UNREACHABLE: u64 = 1 << 60;
@@ -365,7 +365,7 @@ pub(super) fn leader_params(
     identity: Keypair,
     endpoints: &BaseEndpoints,
     ports: ErPorts,
-    storage_dir: PathBuf,
+    storage: &Storage,
     allowed_followers: Vec<Pubkey>,
     settings: Settings,
 ) -> Result<LeaderParams> {
@@ -380,19 +380,17 @@ pub(super) fn leader_params(
     params.aperture.listen = local(ports.rpc);
     params.metrics.address = local(ports.metrics);
     params.engine.authority = identity.into();
-    // engine.accountsdb.directory defaults to a compile-time constant
-    // path, not to the configured engine.ledger.directory — overriding
-    // only the ledger directory leaves the accountsdb at the global
-    // default. Set both, mirroring the engine's default
-    // <ledger dir>/accountsdb layout under this ER's storage dir.
-    params.engine.accountsdb.directory = state::accountsdb_dir(&storage_dir);
-    params.engine.ledger.directory = storage_dir;
+    storage.configure(&mut params.engine);
     params.engine.ledger.size_limit = LEDGER_SIZE_LIMIT_UNREACHABLE;
     params.engine.replication.bind_address = local(ports.replication);
     params.engine.replication.allowed_followers =
         allowed_followers.into_iter().map(SerdePubkey).collect();
     params.ledger.reset = true;
     settings(&mut params);
+    ensure!(
+        storage.matches(&params.engine),
+        "ER settings cannot change managed storage paths"
+    );
     Ok(params)
 }
 
@@ -401,7 +399,7 @@ pub(super) fn verifier_params(
     leader: &LeaderParams,
     identity: Keypair,
     metrics_port: u16,
-    storage_dir: PathBuf,
+    storage: &Storage,
 ) -> VerifierParams {
     let mut params = VerifierParams {
         metrics: Default::default(),
@@ -410,8 +408,7 @@ pub(super) fn verifier_params(
     };
     params.metrics.address = local(metrics_port);
     params.engine.authority = identity.into();
-    params.engine.accountsdb.directory = state::accountsdb_dir(&storage_dir);
-    params.engine.ledger.directory = storage_dir;
+    storage.configure(&mut params.engine);
     params.engine.ledger.size_limit = leader.engine.ledger.size_limit;
     params.engine.blockstore = leader.engine.blockstore;
     params.engine.replication.upstream_address = *leader.engine.replication.bind_address;

@@ -12,7 +12,7 @@ pub(super) fn settings(params: &mut magicblock_config::LeaderParams) {
         .remotes
         .retain(|remote| !matches!(remote, magicblock_config::types::Remote::Grpc(..)));
     params.engine.blockstore.blocktime = std::time::Duration::from_millis(40);
-    params.engine.blockstore.superblock = 128;
+    params.engine.blockstore.superblock = 0;
     params.engine.blockstore.checkpoint = observations::CHECKPOINT_SLOTS;
     params.engine.ledger.size_limit = i64::MAX as u64;
 }
