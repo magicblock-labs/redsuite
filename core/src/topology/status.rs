@@ -13,10 +13,7 @@ const STACK_STORAGE: &[&str] = &["base-ledger", "genesis-accounts"];
 
 pub fn status() -> Result<()> {
     let Some(state) = state::read_state() else {
-        println!(
-            "no shared stack ({} absent) — the first scenario boots it",
-            state::state_path().display()
-        );
+        println!("base stopped ({} absent)", state::state_path().display());
         describe_orphans(&[]);
         return Ok(());
     };
@@ -27,7 +24,7 @@ pub fn status() -> Result<()> {
     };
     let rpc_state = if process::rpc_listening(state.base_rpc_port) { "rpc up" } else { "rpc DOWN" };
     println!(
-        "base  pid {:<8} {proc_state:8} 127.0.0.1:{:<6} {rpc_state}   ({})",
+        "base  pid {:<8} {proc_state:8} http://127.0.0.1:{:<6} {rpc_state}   ({})",
         state.base_pid, state.base_rpc_port, state.base_bin
     );
     println!("ers   booted by each run for its ER groups, stopped when it ends");

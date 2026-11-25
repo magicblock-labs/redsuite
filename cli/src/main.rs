@@ -87,6 +87,7 @@ async fn checks(family: Family, command: Checks) -> Result<()> {
                 args.run,
                 ExecutionConfig {
                     seed,
+                    require_running_base: args.require_running_base,
                     ..ExecutionConfig::default()
                 },
                 args.serial,
@@ -166,7 +167,7 @@ async fn dispatch(command: Command) -> Result<ExitCode> {
             })
             .await;
         }
-        Command::Shared(command) => command.run()?,
+        Command::Shared(command) => command.run().await?,
     }
     Ok(ExitCode::SUCCESS)
 }

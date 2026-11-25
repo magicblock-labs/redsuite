@@ -21,3 +21,6 @@ redshift = { workspace = true }
 redhat = { workspace = true }
 tokio = { workspace = true }
 futures-util = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

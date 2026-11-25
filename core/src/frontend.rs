@@ -69,7 +69,7 @@ pub fn env_help() -> String {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Inspect the shared stack and leftover rollup processes.
+    /// Manage the local base chain and inspect scenario-owned rollups.
     #[command(subcommand)]
     Stack(Stack),
     /// Export benchmark reports.
@@ -79,8 +79,12 @@ pub enum Command {
 
 #[derive(Subcommand)]
 pub enum Stack {
+    /// Start the base, or show its current endpoint if it is already running.
+    Up,
     /// Show processes, endpoints, and log locations.
     Status,
+    /// Stop the stack, remove its storage, and start a fresh base.
+    Restart,
     /// Stop the stack and remove its storage, retaining logs.
     Down,
 }
@@ -96,11 +100,19 @@ pub enum Report {
 }
 
 impl Command {
-    pub fn run(self) -> Result<()> {
+    pub async fn run(self) -> Result<()> {
         match self {
+            Command::Stack(Stack::Up) => {
+                topology::base_only(Default::default()).await?;
+                topology::status()
+            }
             Command::Stack(Stack::Status) => topology::status(),
+            Command::Stack(Stack::Restart) => {
+                topology::reset_base(true).await?;
+                topology::status()
+            }
             Command::Stack(Stack::Down) => {
-                topology::down()?;
+                topology::reset_base(false).await?;
                 println!("stack down");
                 Ok(())
             }
