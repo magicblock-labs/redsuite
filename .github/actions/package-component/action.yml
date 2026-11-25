@@ -1,0 +1,158 @@
+name: Package a RedSuite component
+description: Reuse finished release archives or rebuild using cached inputs
+
+inputs:
+  component:
+    description: Component to package (runner, runtime, or fixtures)
+    required: true
+  image:
+    description: Hosted runner image used for the build
+    required: true
+
+outputs:
+  platform:
+    description: Native target triple reported by the packager
+    value: ${{ steps.recipe.outputs.platform }}
+
+runs:
+  using: composite
+  steps:
+    - name: Identify packaging inputs
+      id: inputs
+      shell: bash
+      env:
+        COMPONENT: ${{ inputs.component }}
+      run: |
+        # Hash tracked inputs so unrelated source changes don't rebuild components.
+        case "$COMPONENT" in
+          runner)
+            source=$(git rev-parse HEAD)
+            build=target/release
+            ;;
+          fixtures|runtime)
+            paths=(.cargo Cargo.toml Cargo.lock rust-toolchain.toml LICENSE shared xtask
+                   .github/actions/package-component .github/workflows/package-release.yml)
+            if [[ "$COMPONENT" == fixtures ]]; then
+              paths+=(programs)
+              build=target/sbf
+            else
+              build=target/package-cache
+            fi
+            source=$(git ls-tree HEAD -- "${paths[@]}" | git hash-object --stdin)
+            ;;
+        esac
+        printf 'source=%s\nbuild=%s\n' "$source" "$build" >> "$GITHUB_OUTPUT"
+
+    - name: Restore exact release archives
+      id: archives
+      uses: actions/cache@v6
+      with:
+        path: target/${{ inputs.component }}-assets
+        # Reuse finished archives only for identical inputs, never from a rolling cache.
+        key: redsuite-archives-v2-${{ inputs.component }}-${{ inputs.image }}-${{ runner.arch }}-${{ steps.inputs.outputs.source }}
+
+    - name: Cache Cargo dependencies
+      if: steps.archives.outputs.cache-hit != 'true'
+      uses: actions/cache@v6
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+        key: redsuite-cargo-v1-${{ inputs.image }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'shared/components.toml') }}-${{ inputs.component }}
+        restore-keys: |
+          redsuite-cargo-v1-${{ inputs.image }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'shared/components.toml') }}-
+          redsuite-cargo-v1-${{ inputs.image }}-${{ runner.arch }}-
+
+    - name: Cache the packaging tool build
+      if: steps.archives.outputs.cache-hit != 'true'
+      uses: actions/cache@v6
+      with:
+        path: target/debug
+        key: redsuite-xtask-v1-${{ inputs.image }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+        restore-keys: |
+          redsuite-xtask-v1-${{ inputs.image }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-
+          redsuite-xtask-v1-${{ inputs.image }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
+
+    - name: Restore component build outputs
+      id: build
+      if: steps.archives.outputs.cache-hit != 'true'
+      uses: actions/cache/restore@v6
+      with:
+        path: ${{ steps.inputs.outputs.build }}
+        key: redsuite-build-v1-${{ inputs.component }}-${{ inputs.image }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', '.cargo/**') }}-${{ hashFiles('Cargo.lock') }}-${{ steps.inputs.outputs.source }}
+        restore-keys: |
+          redsuite-build-v1-${{ inputs.component }}-${{ inputs.image }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', '.cargo/**') }}-${{ hashFiles('Cargo.lock') }}-
+          redsuite-build-v1-${{ inputs.component }}-${{ inputs.image }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', '.cargo/**') }}-
+
+    - name: Cache the fixture runtime and SBF toolchain
+      if: steps.archives.outputs.cache-hit != 'true' && inputs.component == 'fixtures'
+      uses: actions/cache@v6
+      with:
+        path: |
+          ~/.cache/solana
+          ~/.cache/redsuite/runtime
+        # Both directories already partition their contents by upstream version.
+        key: redsuite-fixture-tools-v1-${{ inputs.image }}-${{ runner.arch }}-${{ hashFiles('shared/components.toml') }}
+        restore-keys: |
+          redsuite-fixture-tools-v1-${{ inputs.image }}-${{ runner.arch }}-
+
+    - name: Load packaging metadata
+      id: recipe
+      shell: bash
+      env:
+        COMPONENT: ${{ inputs.component }}
+        CACHE_HIT: ${{ steps.archives.outputs.cache-hit }}
+      run: |
+        out="target/$COMPONENT-assets"
+        if [[ "$CACHE_HIT" != true ]]; then
+          mkdir -p "$out"
+          cargo build --locked -p xtask
+          target/debug/xtask package metadata > "$out/recipe"
+        fi
+        cat "$out/recipe" >> "$GITHUB_OUTPUT"
+
+    - name: Check component tag
+      if: github.ref_type == 'tag'
+      shell: bash
+      env:
+        COMPONENT: ${{ inputs.component }}
+        FIXTURE_TAG: ${{ steps.recipe.outputs.fixture_tag }}
+        RUNTIME_TAG: ${{ steps.recipe.outputs.runtime_tag }}
+      run: |
+        case "$COMPONENT" in
+          fixtures) test "$GITHUB_REF_NAME" = "$FIXTURE_TAG" ;;
+          runtime) test "$GITHUB_REF_NAME" = "$RUNTIME_TAG" ;;
+        esac
+
+    - name: Build release archives
+      if: steps.archives.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        COMPONENT: ${{ inputs.component }}
+      run: |
+        out="target/$COMPONENT-assets"
+        case "$COMPONENT" in
+          runner)
+            cargo build --release --locked -p redsuite
+            target/debug/xtask package runner target/release/redsuite "$out"
+            ;;
+          fixtures)
+            CARGO_TARGET_DIR="$PWD/target/sbf" \
+              target/debug/xtask package fixtures "$PWD" "$out"
+            ;;
+          runtime)
+            target/debug/xtask package runtime "$out"
+            ;;
+        esac
+
+    # Later release tags cannot read each other's rolling build outputs.
+    - name: Save component build outputs for future releases
+      if: >-
+        github.event_name == 'workflow_dispatch' &&
+        github.ref_name == github.event.repository.default_branch &&
+        steps.build.outputs.cache-primary-key != '' &&
+        steps.build.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v6
+      with:
+        path: ${{ steps.inputs.outputs.build }}
+        key: ${{ steps.build.outputs.cache-primary-key }}

@@ -15,7 +15,11 @@ It builds only the macOS Apple Silicon and Linux x86-64 runners and attaches
 `redsuite-runner-VERSION-PLATFORM.tar.gz` and checksum sidecars to the tag's
 GitHub Release, creating a draft if needed. Each archive includes the CLI,
 component pins, license, and source revision. Reruns replace matching assets.
-Manual workflow runs only upload Actions artifacts.
+
+To warm the release cache, run `gh workflow run bundles.yml --ref main` before
+tagging. Wait for the workflow to pass, then tag the commit it built. The tag
+run can reuse those exact archives without running Cargo. The manual run
+uploads Actions artifacts but does not change the GitHub Release.
 
 ## Update shared components
 
@@ -28,10 +32,12 @@ Build new components only when explicitly changing them:
   [fixture workflow](../.github/workflows/fixtures.yml) builds shared SBF programs
   for a `fixtures-VERSION` tag. Its runtime must already be published.
 
-Both workflows also support manual builds without release writes. Tag runs attach
-archives to a draft, without replacing existing assets. Publish the component
-release before selecting it in `runtime.release` or `fixtures.release` for the
-next runner release. Never overwrite an existing component version.
+Both workflows support the same cache warm-up: dispatch the relevant workflow
+on `main` before tagging. A tag run can reuse those archives if the component's
+build inputs are unchanged. Tag runs attach archives to a draft without
+replacing existing assets. Publish the component release before
+selecting it in `runtime.release` or `fixtures.release` for the next runner
+release. Never overwrite an existing component version.
 
 Fixture archives contain compiled programs, a license, and build provenance, not
 the source snapshot. They need not match the runner's commit. Maintainers must
