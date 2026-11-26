@@ -18,8 +18,8 @@ use tokio::time;
 use tracing::instrument;
 
 use super::{
-    await_fetched_value, await_local_value, cache_evictions, churn_cache, CacheLifecycle, Mode, BASE_REFRESH,
-    BASE_REWRITE, CACHE_CAPACITY, ER_WRITE, FETCHES,
+    await_fetched_value, await_local_value, cache_evictions, churn_cache, CacheLifecycle, Mode,
+    BASE_REFRESH, BASE_REWRITE, CACHE_CAPACITY, ER_WRITE, FETCHES,
 };
 use crate::{
     program::{self, layout, DELEGATION_PROGRAM_ID},
@@ -323,10 +323,21 @@ impl CacheLifecycle {
             Ok(())
         };
         // Released mirrors can be evicted; each probe must request acquisition again.
-        await_fetched_value(er, "completed accounts refetch current base state", pending, BASE_REWRITE)
-            .await?;
+        await_fetched_value(
+            er,
+            "completed accounts refetch current base state",
+            pending,
+            BASE_REWRITE,
+        )
+        .await?;
         self.base.cells(REDLINE, &accounts.funder).write(BASE_REFRESH, readonly).await?;
-        await_fetched_value(er, "final readonly mirrors synchronized", readonly, BASE_REFRESH).await?;
+        await_fetched_value(
+            er,
+            "final readonly mirrors synchronized",
+            readonly,
+            BASE_REFRESH,
+        )
+        .await?;
         let local = er.local_accounts(&ACCOUNT_OWNERS, readonly).await?;
         // Readonly entries may be evicted after the fetch.
         for local in local.into_iter().flatten() {
