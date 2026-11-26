@@ -385,7 +385,6 @@ pub(super) fn leader_params(
     params.engine.replication.bind_address = local(ports.replication);
     params.engine.replication.allowed_followers =
         allowed_followers.into_iter().map(SerdePubkey).collect();
-    params.ledger.reset = true;
     settings(&mut params);
     ensure!(
         storage.matches(&params.engine),
@@ -524,8 +523,6 @@ impl BaseEndpoints {
 pub struct RestartConfig {
     // SIGKILL instead of SIGTERM — no graceful drain (crash-recovery path).
     pub hard_kill: bool,
-    // reset=false relaunches in place; true wipes the ledger and skips replay.
-    pub reset: bool,
     pub ready_timeout: Duration,
     /// Runs on owned storage/configuration after the old process has stopped.
     pub before_start: Settings<Result<()>>,
@@ -535,7 +532,6 @@ impl Default for RestartConfig {
     fn default() -> Self {
         Self {
             hard_kill: false,
-            reset: false,
             ready_timeout: ER_READY_TIMEOUT,
             before_start: Box::new(|_| Ok(())),
         }

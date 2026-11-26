@@ -105,7 +105,6 @@ impl SnapshotBootstrap {
         self.restart(
             &expected,
             RestartConfig {
-                reset: true,
                 before_start: Box::new(move |params| {
                     for path in
                         [&params.engine.accountsdb.directory, &params.engine.ledger.directory]

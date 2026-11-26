@@ -191,7 +191,6 @@ impl Scenario for CheckpointRecovery {
                 .er
                 .restart(RestartConfig {
                     hard_kill: true,
-                    reset: false,
                     ready_timeout: CHECKPOINT_TIMEOUT,
                     ..Default::default()
                 })

@@ -223,7 +223,6 @@ impl PrivateEr {
             self.proc.storage()?.matches(&self.plan.params.engine),
             "restart settings cannot change managed storage paths"
         );
-        self.plan.params.ledger.reset = config.reset;
         self.proc.relaunch(&self.plan, &self.log)?;
         let api = self.rpc_api();
         process::wait_until_every(

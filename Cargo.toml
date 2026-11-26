@@ -55,7 +55,7 @@ serde_with = { version = "3", default-features = false, features = ["macros"] }
 thiserror = "2"
 derive_more = { version = "2", default-features = false, features = ["display"] }
 toml = "0.8"
-magicblock-config = { git = "https://github.com/magicblock-labs/magicblock-validator.git", rev = "10a3ef3c2610f16e6bfbda48beebf37a4329344e" }
+magicblock-config = { git = "https://github.com/magicblock-labs/magicblock-validator.git", rev = "bbe09e4344cf1ab1ff252cf785b7b747179e7109" }
 json = { package = "sonic-rs", version = "0.5" }
 rand = "0.8"
 base64 = "0.22"
