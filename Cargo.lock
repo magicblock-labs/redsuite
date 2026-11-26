@@ -2544,14 +2544,14 @@ dependencies = [
 
 [[package]]
 name = "magicblock-config"
-version = "1.0.1"
-source = "git+https://github.com/magicblock-labs/magicblock-validator.git?rev=10a3ef3c2610f16e6bfbda48beebf37a4329344e#10a3ef3c2610f16e6bfbda48beebf37a4329344e"
+version = "2.0.5"
+source = "git+https://github.com/magicblock-labs/magicblock-validator.git?rev=bbe09e4344cf1ab1ff252cf785b7b747179e7109#bbe09e4344cf1ab1ff252cf785b7b747179e7109"
 dependencies = [
  "clap",
  "derive_more",
  "figment",
  "humantime-serde",
- "magicblock-engine-nucleus 0.17.0",
+ "magicblock-engine-nucleus 0.26.4",
  "serde",
  "serde_with",
  "solana-keypair",
@@ -2627,18 +2627,6 @@ dependencies = [
 
 [[package]]
 name = "magicblock-engine-nucleus"
-version = "0.17.0"
-source = "git+https://github.com/magicblock-labs/magicblock-engine.git?rev=5538432a4bde44bb66e28857badfc2af66a1a396#5538432a4bde44bb66e28857badfc2af66a1a396"
-dependencies = [
- "serde",
- "serde_with",
- "solana-keypair",
- "solana-pubkey 4.2.0",
- "solana-signer",
-]
-
-[[package]]
-name = "magicblock-engine-nucleus"
 version = "0.24.0"
 source = "git+https://github.com/magicblock-labs/magicblock-engine.git?tag=0.24.0#4c6e2457a6d7d7930f832e8e748a7e55bbfbef73"
 dependencies = [
@@ -2654,6 +2642,18 @@ dependencies = [
  "tokio-util",
  "tracing",
  "wincode",
+]
+
+[[package]]
+name = "magicblock-engine-nucleus"
+version = "0.26.4"
+source = "git+https://github.com/magicblock-labs/magicblock-engine.git?tag=0.26.4#8ed0c927180d07e9303a776141a634c8c1b74491"
+dependencies = [
+ "serde",
+ "serde_with",
+ "solana-keypair",
+ "solana-pubkey 4.2.0",
+ "solana-signer",
 ]
 
 [[package]]
