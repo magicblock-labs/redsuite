@@ -361,6 +361,7 @@ impl Scenario for StaleDelegationSessionIsolation {
             &base,
             ErOptions {
                 label: LABEL_A.to_owned(),
+                followers: 0,
                 base_endpoints: Some(proxy.endpoints()),
                 settings: Box::new(|params| {
                     params.chainsync.websocket.0[0].max_connections = 1;
