@@ -34,6 +34,9 @@ const BLACKOUT_WRITE: u64 = 52;
 const RECOVERY_WRITE: u64 = 53;
 const RESTART_WRITE: u64 = 54;
 const RESTART_RECOVERY_WRITE: u64 = 55;
+const TIMEOUT_WRITE: u64 = 56;
+const TIMEOUT_RECOVERY_WRITE: u64 = 57;
+const CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(55);
 const ACTION_ESCROW_LAMPORTS: u64 = 500_000_000;
 const ACTION_COMPUTE_UNITS: u32 = 50_000;
 const ACTION_COUNT: u8 = 1;
@@ -214,6 +217,8 @@ impl CommitFixture {
         )
         .await?;
         self.follow_up_commit(5, RESTART_RECOVERY_WRITE, "post-restart").await?;
+        self.confirmation_timeout(&faults).await?;
+        self.follow_up_commit(7, TIMEOUT_RECOVERY_WRITE, "post-timeout").await?;
 
         Ok(())
     }
@@ -357,6 +362,40 @@ impl CommitFixture {
             .context("the delegated pda vanished from base")?;
         ensure!(on_base.data == snapshot);
         Ok(())
+    }
+
+    async fn confirmation_timeout(&self, faults: &Faults) -> Result<()> {
+        let nonce_before = crate::last_commit_id(self.base.as_ref(), &self.account).await?;
+        let submission = faults.intercept(
+            Selector::method("sendTransaction").http().response().account(&self.account),
+        );
+        let (snapshot, commit_signature) =
+            write_and_commit(&self.er, &self.payer, 6, TIMEOUT_WRITE, &self.account).await?;
+        let held = submission.wait(INTERCEPT_TIMEOUT).await?;
+        let landed = held.operation.signature()?;
+        let confirmations = withhold_confirmations(faults, &landed);
+        held.release();
+        prove_landed(self.base.as_ref(), &landed, &self.account, &snapshot).await?;
+        let settled = nonce_before + 1;
+        hold_nonces(
+            self.base.as_ref(),
+            &[self.account],
+            &[settled],
+            CONFIRMATION_TIMEOUT,
+        )
+        .await?;
+        for rule in confirmations {
+            rule.remove();
+        }
+        let receipt = self.settled_receipt(&commit_signature, None, "confirmation-timeout").await?;
+        ensure!(receipt.base_signatures == [landed]);
+        hold_nonces(
+            self.base.as_ref(),
+            &[self.account],
+            &[settled],
+            SETTLE_WINDOW,
+        )
+        .await
     }
 
     /// Requires the next snapshot and exactly one nonce advance after fault recovery.
