@@ -1,4 +1,4 @@
-use std::rc::Rc;
+use std::{rc::Rc, time::Duration};
 
 use anyhow::{ensure, Context};
 use instruction::Instruction;
@@ -13,7 +13,9 @@ use redsuite_core::{
         Action, CellHeader, CellId, Commit, IntentBundle, Refund, ResultCallback, SettlementMode,
         MAGIC, REDSHIFT,
     },
-    receipt, system, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
+    receipt,
+    rpc_types::response::TransactionError,
+    system, wait, BaseCtx, ChainCtx, ErCtx, Result, Scenario,
 };
 use signature::Signature;
 use signer::Signer;
@@ -27,6 +29,9 @@ const CALLBACK_FEE: u64 = 5_000;
 const TRANSFER_LAMPORTS: u64 = 1_000_000;
 const ACTION_COMPUTE_UNITS: u32 = 100_000;
 const ACTORS: usize = 3;
+const RENT_SHORT_LAMPORTS: u64 = 1_000;
+const BASE_HISTORY_TIMEOUT: Duration = Duration::from_secs(20);
+const RETRY_WINDOW: Duration = Duration::from_secs(8);
 
 /// Commit-stage combinations used to compare ownership transitions and after-settlement actions.
 #[derive(Clone, Copy)]
@@ -401,6 +406,83 @@ impl<'a> IntentFixture<'a> {
         Ok(())
     }
 
+    async fn rent_failures(&self) -> Result<f64> {
+        let metrics = self.er.scrape_metrics().await?;
+        Ok(metrics
+            .0
+            .iter()
+            .filter(|(key, _)| {
+                key.starts_with("mbv_committor_failed_intents_count{")
+                    && key.contains("insufficient_funds_for_rent")
+            })
+            .map(|(_, count)| count)
+            .sum())
+    }
+
+    /// A landed rent rejection fails the intent at once: one base attempt, no retry.
+    #[instrument(skip_all, err)]
+    async fn check_rent_rejection(&self) -> Result<()> {
+        let failures_before = self.rent_failures().await?;
+        let payer = self.base.funded_payer(PAYER_LAMPORTS).await?;
+        let key = payer.pubkey();
+        let (cell, [create, delegate]) = self
+            .base
+            .cells(REDSHIFT, &payer)
+            .prepare_delegated(self.er.identity(), prep::COMMIT_FREQUENCY_MS);
+        self.base
+            .submit_and_confirm(
+                &payer,
+                &[create, delegate, dlp::top_up_ephemeral_balance(&key, 500_000_000, 1)],
+            )
+            .await?;
+        self.er.await_delegated(&cell, "local delegation").await?;
+
+        let destination = Keypair::new().pubkey();
+        let transfer = REDSHIFT
+            .batch()
+            .transfer_from_escrow(destination, RENT_SHORT_LAMPORTS)
+            .action(cell, dlp::dlp_id());
+        let mut commit = Commit::new(SettlementMode::Commit, &[cell]);
+        commit.after_commit.push(Action::new(key, transfer, ACTION_COMPUTE_UNITS));
+        let mut bundle = IntentBundle::new(key);
+        bundle.validator = Some(self.er.identity());
+        bundle.commits.push(commit);
+        self.er
+            .submit_and_confirm(&payer, &[REDSHIFT.batch().intents(bundle).build()])
+            .await?;
+
+        let attempt = wait::retry("rent rejection on base", BASE_HISTORY_TIMEOUT, async || {
+            let attempts = self.base.api().get_signatures_for_address(&destination, 8).await?;
+            attempts.first().copied().context("no base attempt yet")
+        })
+        .await?;
+        let tx = self.base.api().await_transaction(&attempt).await?;
+        let error = transaction_meta(&tx)?.err.clone().map(TransactionError::from);
+        ensure!(
+            matches!(
+                error,
+                Some(TransactionError::InsufficientFundsForRent { .. })
+            ),
+            "unexpected base result: {error:?}"
+        );
+        wait::retry("terminal rent failure", RETRY_WINDOW, async || {
+            let failures = self.rent_failures().await?;
+            ensure!(
+                failures == failures_before + 1.0,
+                "rent failures {failures}"
+            );
+            Ok(())
+        })
+        .await?;
+        let attempts = self.base.api().get_signatures_for_address(&destination, 8).await?;
+        ensure!(
+            attempts.len() == 1,
+            "rent rejection sent to base {} times: {attempts:?}",
+            attempts.len()
+        );
+        Ok(())
+    }
+
     async fn prepare(base: &'a BaseCtx, er: &'a ErCtx) -> Result<Self> {
         let funder = base.funded_payer(PAYER_LAMPORTS).await?;
         let payers = base.funded_payers(ACTORS, PAYER_LAMPORTS).await?;
@@ -502,6 +584,6 @@ impl Scenario for IntentExecutionAndAccounting {
         for fail in [false, true] {
             suite.check_callback(fail).await?;
         }
-        Ok(())
+        suite.check_rent_rejection().await
     }
 }
